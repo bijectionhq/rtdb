@@ -73,21 +73,30 @@ fn tagged(tag: &str, form: &Edn) -> Result<Value> {
             Ok(Value::Timestamp { value: timestamp, unit: TimeUnit::Microsecond, timezone: Some(if tag == "inst" || tag == "xt/instant" { "UTC".into() } else { timezone }) })
         }
         "xt/duration" => {
-            let (months, days, nanos) = iso_interval(string(form)?)?;
+            let IsoParts { months, days, nanos, components } = iso_interval(string(form)?)?;
+            if components == 0 { return Err(error("xtql/invalid-literal", "Incomplete ISO duration")); }
             if months != 0 { return Err(error("xtql/invalid-literal", "Duration cannot contain calendar months")); }
-            let micros = i128::from(days) * 86_400_000_000 + nanos.div_euclid(1000);
-            Ok(Value::Duration { value: i64::try_from(micros).map_err(|_| error("xtql/invalid-literal", "Duration exceeds microsecond representation"))?, unit: TimeUnit::Microsecond })
+            let too_long = || error("xtql/invalid-literal", "Duration exceeds microsecond representation");
+            let micros = days.checked_mul(86_400_000_000).and_then(|micros| micros.checked_add(nanos.div_euclid(1000))).ok_or_else(too_long)?;
+            Ok(Value::Duration { value: i64::try_from(micros).map_err(|_| too_long())?, unit: TimeUnit::Microsecond })
         }
         "xt/interval" => {
-            let (months, days, nanoseconds) = iso_interval(string(form)?)?;
-            Ok(interval(months, days, i64::try_from(nanoseconds).map_err(|_| interval_overflow())?))
+            let IsoParts { months, days, nanos, .. } = iso_interval(string(form)?)?;
+            let overflow = |_| interval_overflow();
+            Ok(interval(i32::try_from(months).map_err(overflow)?, i32::try_from(days).map_err(overflow)?, i64::try_from(nanos).map_err(overflow)?))
         }
         "xt/period-duration" => {
             let values = form.vector().filter(|values| values.len() == 2).ok_or_else(|| error("xtql/invalid-literal", "Period-duration requires two strings"))?;
-            let (months, days, _) = iso_interval(string(&values[0])?)?;
-            let (duration_months, duration_days, nanos) = iso_interval(string(&values[1])?)?;
+            let IsoParts { months, days, .. } = iso_interval(string(&values[0])?)?;
+            let IsoParts { months: duration_months, days: duration_days, nanos, .. } = iso_interval(string(&values[1])?)?;
             if duration_months != 0 { return Err(error("xtql/invalid-literal", "Duration cannot contain calendar months")); }
-            let nanoseconds = i64::try_from(nanos.checked_add(i128::from(duration_days) * 86_400_000_000_000).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?;
+            // A PeriodDuration reaches past what an interval vector holds; the reference raises the
+            // projection's overflow error when it emits such a literal.
+            let overflow = |_| expression_overflow();
+            let months = i32::try_from(months).map_err(overflow)?;
+            let days = i32::try_from(days).map_err(overflow)?;
+            let nanoseconds = duration_days.checked_mul(86_400_000_000_000).and_then(|day_nanos| day_nanos.checked_add(nanos)).ok_or_else(expression_overflow)?;
+            let nanoseconds = i64::try_from(nanoseconds).map_err(overflow)?;
             Ok(if days == 0 && nanoseconds == 0 { Value::IntervalYearMonth(months) }
                 else if months == 0 && nanoseconds % 1_000_000 == 0 { Value::IntervalMonthDayMicro { months, days, nanoseconds } }
                 else { Value::IntervalMonthDayNano { months, days, nanoseconds } })
@@ -114,7 +123,11 @@ fn interval(months: i32, days: i32, nanoseconds: i64) -> Value {
     else { Value::IntervalMonthDayNano { months, days, nanoseconds } }
 }
 
-fn iso_interval(text: &str) -> Result<(i32, i32, i128)> {
+/// Unbounded parts: each caller owns the range its value type admits.
+struct IsoParts { months: i128, days: i128, nanos: i128, components: usize }
+
+/// `P` and `PT` read as zero, since `Interval.ZERO` prints as `P`.
+fn iso_interval(text: &str) -> Result<IsoParts> {
     let (sign, text) = if let Some(text) = text.strip_prefix('-') { (-1i128, text) } else { (1, text.strip_prefix('+').unwrap_or(text)) };
     let text = text.strip_prefix('P').ok_or_else(|| error("xtql/invalid-literal", "ISO interval requires P"))?;
     let mut time = false;
@@ -158,10 +171,9 @@ fn iso_interval(text: &str) -> Result<(i32, i32, i128)> {
             start = offset + ch.len_utf8();
         }
     }
-    if start != text.len() || components == 0 || text.ends_with('T') { return Err(error("xtql/invalid-literal", "Incomplete ISO interval")); }
-    Ok((i32::try_from(months.checked_mul(sign).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?,
-        i32::try_from(days.checked_mul(sign).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?,
-        nanos.checked_mul(sign).ok_or_else(interval_overflow)?))
+    if start != text.len() { return Err(error("xtql/invalid-literal", "Incomplete ISO interval")); }
+    Ok(IsoParts { months: months * sign, days: days * sign, nanos: nanos * sign, components })
 }
 
 fn interval_overflow() -> rtdb_types::Anomaly { error("xtql/invalid-literal", "Interval exceeds its physical representation") }
+fn expression_overflow() -> rtdb_types::Anomaly { error("xtdb.expression/overflow-error", "data exception - overflow error") }
