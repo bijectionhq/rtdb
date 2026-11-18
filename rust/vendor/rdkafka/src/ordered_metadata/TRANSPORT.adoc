@@ -127,3 +127,50 @@ The endpoint mock source fixture uses the configured bootstrap address and keeps
 Additional raw-view sources retain all supported versions, nullable names, original string-size ceilings, tag/suffix bytes, and validation before visitation.
 All previously published assertions remain unchanged.
 Compilation, formatting, project scripts and runtime tests were not executed under the Phase 1 work order.
+
+
+== Native connection observations
+
+Client::observe_native_connection samples an existing learned broker ID through that broker's actual op queue.
+Client::observe_native_endpoint samples an exact configured endpoint and requires hidden enable.ordered.metadata.bootstrap=true so ordinary discovery retains that configured owner.
+Neither call connects, resolves an address or chooses another broker.
+The C native record and each queued control are admitted independently on the producer's actual byte account before allocation and handoff.
+A disabled queue can complete cancellation inline while the caller still owns its record reference.
+Queued abandonment and teardown release the control, temporary target reference and record at their own final ownership boundaries.
+Accounted control allocation is fallible and rolls back its charge; legacy unaccounted op allocation retains its assert-on-failure policy.
+
+Only the pending control holds a broker reference.
+A ready record stores immutable copied native facts and does not retain that broker, so keeping it cannot prevent real decommission.
+The result's Rust owner borrows NativeClient and retains its account Arc; it must be dropped before that client.
+The caller owns polling/readiness deadlines and drops nonselected observations at the end of its attempt.
+A completed native request returned by into_metadata has the existing independent request/account lifetime.
+
+A new native owner serial is assigned before configured/learned broker publication under the existing client write lock.
+Configured creation is serialized by brokers_add0 and learned creation by broker_update.
+Internal and logical brokers do not consume the counter.
+Failed broker creation consumes its serial, and a saturated counter gives later owners zero without wraparound or changing ordinary native creation behavior.
+That serial is native provenance scoped to one live client, not a Java identity hash or an allocation address.
+The separate socket generation remains the connection witness; zero and saturated socket generations cannot qualify submission.
+
+NativeConnectionObservation::into_metadata consumes the observation and locates only its copied owner serial in the originating client's inventory.
+It verifies the observed native UP state/transport, current native UP state, same node/source, unchanged address/connect epochs and exact socket generation before constructing a request.
+A replacement owner with the same node ID and a restarted socket generation does not qualify.
+The accepted request reuses the actor enqueue and actual send-loop generation fence and never reconnects or retries after transport failure or timeout.
+The ID-only and configured-endpoint entry points retain their existing separate contracts.
+
+The copied snapshot exposes native source/state codes, socket/owner serials, native monotonic microseconds, transport presence, queue counts, maximum native in-flight window and whether the outgoing head was partially sent.
+State codes are the pinned librdkafka broker enum: INIT0, DOWN1, TRY_CONNECT2, CONNECT3, SSL_HANDSHAKE4, AUTH_LEGACY5, UP6, APIVERSION_QUERY7, AUTH_HANDSHAKE8, AUTH_REQ9 and REAUTH10.
+A native UP snapshot with no transport does not establish channel readiness.
+Native timestamps are not Java epoch milliseconds, and native queue counts are not NetworkClient's in-flight request deque.
+No native throttle average supplies Java's throttle deadline.
+Snapshots from different broker actors are not one serialized NetworkClient scan.
+
+The pinned NetworkClient/ClusterConnectionStates/InFlightRequests/Selector sources require Java random, throttle, channel, send-completion and reconnect chronology observations that these native facts alone do not establish.
+This transport does not implement ConnectionObservations or replace any missing Java observation with a guessed false, zero, native jitter or native count.
+The producer updater owns their qualification and remains a separate activation boundary.
+Client/broker construction and background memory, other controls, DNS/TLS/SASL machinery, native caches and allocator overhead still require their own admission proof.
+The fixed observation/control charges do not close whole-native, source-completeness or Phase2 gates.
+
+Additive native sources cover serial exhaustion, half-allocation cleanup, cancellation/publication, exact-owner/epoch/socket fences and a real broker decommission while its ready observation remains retained.
+The MockCluster source fixture establishes a learned native connection, uses the safe observation and consuming submission APIs, and retains the completed request after producer destruction.
+The fixtures have not been compiled or executed in the source-only phase.

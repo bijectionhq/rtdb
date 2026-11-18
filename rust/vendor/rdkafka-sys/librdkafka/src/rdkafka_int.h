@@ -283,12 +283,14 @@ rd_bool_t rd_kafka_byte_account_acquire(rd_kafka_byte_account_t *account,
                                          size_t bytes);
 void rd_kafka_byte_account_release(rd_kafka_byte_account_t *account,
                                    size_t bytes);
+void rd_kafka_connection_observation_cancel(rd_kafka_connection_observation_t *result);
 
 /**
  * Kafka handle, internal representation of the application's rd_kafka_t.
  */
 
 struct rd_kafka_s {
+        uint64_t rk_broker_owner_serial; /* Qualifying allocations require rk_lock(write). */
         rd_kafka_q_t *rk_rep; /* kafka -> application reply queue */
         rd_kafka_q_t *rk_ops; /* any -> rdkafka main thread ops */
         rd_kafka_byte_account_t *rk_byte_account;

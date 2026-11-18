@@ -5,6 +5,8 @@ use rdkafka_sys as sys;
 use crate::{client::{Client, ClientContext}, native_byte_account::NativeByteAccount, util::AsyncRuntime};
 
 mod wire;
+mod connection;
+pub use connection::{NativeConnectionObservation, NativeConnectionSnapshot};
 pub use wire::{Broker, Event, Int32Array, MetadataView, Partition, ProtocolError, RawBroker, RawEvent, RawMetadataView, RawTopic, Summary, Topic};
 
 /// A topic name borrowed for submission only; no allocation or NUL terminator is required.

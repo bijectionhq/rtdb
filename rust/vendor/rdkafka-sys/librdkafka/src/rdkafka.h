@@ -3154,6 +3154,36 @@ rd_kafka_t *rd_kafka_new_accounted_producer(rd_kafka_conf_t **confp,
                                             char *errstr, size_t errstr_size);
 
 typedef struct rd_kafka_ordered_metadata_s rd_kafka_ordered_metadata_t;
+typedef struct rd_kafka_connection_observation_s rd_kafka_connection_observation_t;
+/**
+ * Copied native facts from one broker actor, with monotonic microsecond timestamps.
+ * Source codes are CONFIGURED=0 and LEARNED=1.
+ * State codes are INIT=0, DOWN=1, TRY_CONNECT=2, CONNECT=3, SSL_HANDSHAKE=4,
+ * AUTH_LEGACY=5, UP=6, APIVERSION_QUERY=7, AUTH_HANDSHAKE=8, AUTH_REQ=9 and REAUTH=10.
+ * transport_present and partially_sent are zero or one; counts are native buffer queue entries.
+ * last_connect_attempt_us is zero until a native attempt is recorded.
+ * reconnect_at_us uses zero as the native reset sentinel.
+ * Socket/owner serials and address/connect epochs qualify native provenance, not Java observations.
+ * Altering this copy cannot change the immutable result or its submission target.
+ */
+typedef struct rd_kafka_connection_snapshot_s {
+        uint64_t owner_serial;
+        uint64_t connection_generation;
+        int64_t observed_at_us;
+        int64_t last_connect_attempt_us;
+        int64_t reconnect_at_us;
+        int32_t node_id;
+        int32_t source_code;
+        int32_t state_code;
+        int32_t nodename_epoch;
+        int32_t connect_epoch;
+        int32_t outgoing_count;
+        int32_t awaiting_response_count;
+        int32_t retry_count;
+        int32_t max_inflight;
+        int32_t transport_present;
+        int32_t partially_sent;
+} rd_kafka_connection_snapshot_t;
 typedef struct rd_kafka_ordered_metadata_topic_s {
         const void *name;
         size_t length;
@@ -3202,6 +3232,7 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_at(
 
 /**
  * Submits to the authenticated connection of an exact configured bootstrap endpoint.
+ * Source bootstrap use requires enable.ordered.metadata.bootstrap=true to retain configured owners through ordinary discovery.
  * host contains host_length nonzero bytes matching the configured hostname or address.
  * The length must be positive, and the formatted host and unsigned port must fit the native node name.
  * A missing or unavailable connection returns TRANSPORT without initiating a connection.
@@ -3212,6 +3243,59 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_at(
 RD_EXPORT
 rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_endpoint(
     rd_kafka_t *rk, const char *host, size_t host_length, uint16_t port,
+    const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
+    size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result);
+
+/**
+ * Queues a read-only snapshot on the exact existing nonnegative node ID's broker thread.
+ * Requires an accounted producer and a writable non-NULL result pointer.
+ * Record and control allocations are admitted before handoff; denial returns CRIT_SYS_RESOURCE.
+ * Does not connect or choose another broker. Missing learned owners return TRANSPORT.
+ * An unqualified producer/owner profile returns UNSUPPORTED_FEATURE; a negative node ID returns INVALID_ARG.
+ * On error *result is NULL; success returns one caller reference even if queue cancellation ran inline.
+ * Destroy that reference before its originating client and keep the account alive through native client teardown.
+ * Submission and result destruction must not race with client destruction.
+ * Native state codes, queue counts and monotonic microseconds are not Java Selector, throttle or clock observations.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_connection_observe_at(
+    rd_kafka_t *rk, int32_t node_id, rd_kafka_connection_observation_t **result);
+/**
+ * Observes an exact configured endpoint without connecting or resolving it.
+ * Requires enable.ordered.metadata.bootstrap=true; host validation follows rd_kafka_ordered_metadata_start_endpoint.
+ * Allocation, result and client-lifetime contracts follow rd_kafka_connection_observe_at.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_connection_observe_endpoint(
+    rd_kafka_t *rk, const char *host, size_t host_length, uint16_t port,
+    rd_kafka_connection_observation_t **result);
+/**
+ * Returns zero while pending without changing outputs; otherwise copies immutable native error and snapshot fields.
+ * All arguments must be non-NULL and result must have a live caller reference.
+ * Snapshot fields are meaningful only on success and never retain a broker reference after completion.
+ * Concurrent polls are supported while the caller keeps the result alive.
+ */
+RD_EXPORT
+int rd_kafka_connection_observation_poll(rd_kafka_connection_observation_t *result,
+    rd_kafka_resp_err_t *error, rd_kafka_connection_snapshot_t *snapshot);
+/**
+ * Releases the caller reference without waiting; NULL is accepted.
+ * Destruction requires exclusive ownership of that caller reference.
+ * A queued control retains its own record reference and charges until completion or cancellation.
+ */
+RD_EXPORT
+void rd_kafka_connection_observation_destroy(rd_kafka_connection_observation_t *result);
+/**
+ * Submits only to the observation's original client, exact owner serial and observed socket generation.
+ * Pending returns IN_PROGRESS; stale/missing/disconnected owners return TRANSPORT without fallback or reconnect.
+ * Zero owner or zero/exhausted socket generations return UNSUPPORTED_FEATURE.
+ * Accepted requests never retry after transport failure or timeout.
+ * Other request admission, topic, version, timeout and completion rules follow rd_kafka_ordered_metadata_start_endpoint.
+ * Borrows observation for this call; its originating client must still be alive.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_observed(
+    rd_kafka_t *rk, rd_kafka_connection_observation_t *observation,
     const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
     size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result);
 

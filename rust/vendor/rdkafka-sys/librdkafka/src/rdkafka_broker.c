@@ -3298,6 +3298,10 @@ rd_kafka_broker_op_serve(rd_kafka_broker_t *rkb, rd_kafka_op_t *rko) {
         rd_kafka_assert(rkb->rkb_rk, thrd_is_current(rkb->rkb_thread));
 
         switch (rko->rko_type) {
+        case RD_KAFKA_OP_CONNECTION_OBSERVATION:
+                rd_kafka_connection_observation_capture(
+                    rkb, rko->rko_u.connection_observation.result);
+                break;
         case RD_KAFKA_OP_NODE_UPDATE: {
                 rd_bool_t updated = rd_false;
                 char brokername[RD_KAFKA_NODENAME_SIZE];
@@ -4970,6 +4974,14 @@ rd_kafka_broker_t *rd_kafka_broker_internal(rd_kafka_t *rk) {
 }
 
 
+/* Requires rk_lock(write). */
+static uint64_t rd_kafka_broker_next_owner_serial(rd_kafka_t *rk) {
+        if (rk->rk_broker_owner_serial == UINT64_MAX)
+                return 0;
+        return ++rk->rk_broker_owner_serial;
+}
+
+
 /**
  * Adds a broker with refcount set to 1.
  * If 'source' is RD_KAFKA_INTERNAL an internal broker is added
@@ -4991,6 +5003,8 @@ rd_kafka_broker_t *rd_kafka_broker_add(rd_kafka_t *rk,
 #endif
 
         rkb = rd_calloc(1, sizeof(*rkb));
+        if (source == RD_KAFKA_CONFIGURED || source == RD_KAFKA_LEARNED)
+                rkb->rkb_owner_serial = rd_kafka_broker_next_owner_serial(rk);
 
         if (source != RD_KAFKA_LOGICAL) {
                 rd_kafka_mk_nodename(rkb->rkb_nodename,
@@ -6320,8 +6334,10 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
 
 #include "rdkafka_byte_account_test.h"
 #include "rdkafka_ordered_metadata.h"
+#include "rdkafka_connection_observation.h"
 #include "rdkafka_ordered_metadata_test.h"
 #include "rdkafka_api_versions_account_test.h"
+#include "rdkafka_connection_observation_test.h"
 
 /**
  * @name Unit tests

@@ -82,6 +82,7 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
         TAILQ_ENTRY(rd_kafka_broker_s) rkb_link;
 
         int32_t rkb_nodeid; /**< Broker Node Id, read only. */
+        uint64_t rkb_owner_serial; /* Immutable after publication. */
 #define RD_KAFKA_NODEID_UA -1
 
         rd_sockaddr_list_t *rkb_rsal;
@@ -725,5 +726,7 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
 int unittest_broker(void);
 int unittest_byte_account(void);
 int unittest_ordered_metadata(void);
+void rd_kafka_connection_observation_capture(
+    rd_kafka_broker_t *rkb, rd_kafka_connection_observation_t *result);
 
 #endif /* _RDKAFKA_BROKER_H_ */

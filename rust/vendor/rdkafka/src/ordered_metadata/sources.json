@@ -24,7 +24,12 @@
       "org/apache/kafka/common/protocol/types/RawTaggedField.java": "01bd6135373f8b7ff42e04ff94decf96322f83c7d9d27ff03d57db6cbd1b1b62",
       "org/apache/kafka/common/requests/AbstractResponse.java": "a6749f2df1fb6be881a3a08933df57cd5935af949dd611953f222789961daa88",
       "org/apache/kafka/common/message/ResponseHeaderData.java": "b60e81a96c9ed656d0c0029e1d5908427b2c77af3a749462882a0712d8077461",
-      "org/apache/kafka/common/requests/ResponseHeader.java": "320123cc6fd6d8817d5efe701ca2d353daf4d57e8a3252b85e1883ed941f1a59"
+      "org/apache/kafka/common/requests/ResponseHeader.java": "320123cc6fd6d8817d5efe701ca2d353daf4d57e8a3252b85e1883ed941f1a59",
+      "org/apache/kafka/clients/ClusterConnectionStates.java": "747127d9bf73cf201b36d058826024490c9254dd63cf0fa4c7932310f100d379",
+      "org/apache/kafka/clients/InFlightRequests.java": "ec55d608baaebb3b3438ef09202e5722fd1fa8205e02e5f3aac27b6f81d20c07",
+      "org/apache/kafka/clients/LeastLoadedNode.java": "7bbd70cd9498b3cc0b92578136287fb4c40a6400533cf09fae1edca266fd276c",
+      "org/apache/kafka/common/network/Selectable.java": "789321f776fd2440acf3161b7b6958d30b27187f87639c1d3afacfe4cbbdf57b",
+      "org/apache/kafka/common/network/Selector.java": "dba2ca9bf6e15b6b8a8565b1956b416c32295be1f7d38ef2467fdef58f078e8e"
     }
   },
   "native_baseline_commit": "e747c55a8f7705a1716cccaec4d2c3a97f7c4263",
@@ -47,5 +52,22 @@
     "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_mock.c": "8a853438de7537e263ae9a301353022ff210f754a4a19bd049a57eb02aa0be82",
     "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_mock_handlers.c": "df6f665f30cbb08cacbed0c82f500d89c9c6ec28c5f4514d07f57b51712c5e1d"
   },
-  "raw_string_api_baseline_commit": "65c7eaf41119d132d7182f0d086c68d5415f9dfb"
+  "raw_string_api_baseline_commit": "65c7eaf41119d132d7182f0d086c68d5415f9dfb",
+  "native_connection_observation_source_inputs": {
+    "rust/vendor/rdkafka-sys/librdkafka/src/rd.h": "a417aa7f7641acec7901e1e6362778778ab2e17850a65ad8b0556c51257a8a1c",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_int.h": "41c656b1d2ccd79abd854cc5e896a053ac1472d45bcb6bd30d4549d8dcaea44b",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_op.h": "cac677948d7004995cf5fef0cc12a496c6c113be34a2dfc9eb822d0793aee7ce",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_conf.h": "21db80ac03a4f8e88cce9a2f1b42e11a8738259fcfd427002299728f15f11387",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_queue.h": "a7fc9ba0648b77dc8f9d37e57f601075b93ef4607d1861f26830cb5b0ed426a4",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_queue.c": "c04b8248715327afdd856b59cd2277201138a1e19e5a401ab04c1a6eff3e428e",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_broker.c": "bd31dd4806b74353bccb28ba63df6d1924ea2842895b6a51795a1f852b6ab241",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_broker.h": "cdeedafc6aaa33499d5f3aed8168b7a43a4403a51a5f7ad62a657cc06aa63d2f",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka.c": "bdf87da6d05e91d61cc4740840589f465f7660e46b4823ccce74a3825b8f5d5b",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_buf.c": "ef705ebae4cfba4f63780fb0442c2a36ed9c1f3714a1c2787ccfe9ef451f04ed",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_buf.h": "0f72b8467a774cb705003c3a3827e3cd5d65ae76ab844296b63c27a208f3196b",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdbuf.c": "bfd0c063533f7f8fd28fc499bddb2006a5578893130fa61080ed91216506c9a8",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdbuf.h": "414b00889af471f96c4c75c500b6b1c1942051a7c979bfe8cf91a515f61957d2",
+    "rust/vendor/rdkafka-sys/librdkafka/src/tinycthread.h": "9494fc834ecefe6f8beb98b030e0aaaff2405cd19777b19dea6441228c616e62",
+    "rust/vendor/rdkafka-sys/librdkafka/src/tinycthread.c": "3d2ff8e4251f63ac6c7a7345ba4e16719ff5e9f8369e1dc432c3af0624d1a449"
+  }
 }

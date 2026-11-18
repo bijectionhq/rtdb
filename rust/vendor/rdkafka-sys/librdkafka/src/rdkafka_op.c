@@ -36,6 +36,7 @@
 #include "rdkafka_proto.h"
 #include "rdkafka_offset.h"
 #include "rdkafka_error.h"
+#include "rdkafka_broker.h"
 
 /* Current number of rd_kafka_op_t */
 rd_atomic32_t rd_kafka_op_cnt;
@@ -123,6 +124,7 @@ const char *rd_kafka_op2str(rd_kafka_op_type_t type) {
             [RD_KAFKA_OP_TERMINATE_TELEMETRY] =
                 "REPLY:RD_KAFKA_OP_TERMINATE_TELEMETRY",
             [RD_KAFKA_OP_ELECTLEADERS] = "REPLY:ELECTLEADERS",
+            [RD_KAFKA_OP_CONNECTION_OBSERVATION] = "REPLY:CONNECTION_OBSERVATION",
         };
 
         if (type & RD_KAFKA_OP_REPLY)
@@ -202,9 +204,10 @@ void rd_kafka_op_print(FILE *fp, const char *prefix, rd_kafka_op_t *rko) {
 }
 
 
-rd_kafka_op_t *rd_kafka_op_new_accounted(const char *source,
+static rd_kafka_op_t *rd_kafka_op_new_accounted0(const char *source,
                                          rd_kafka_op_type_t type,
-                                         rd_kafka_byte_account_t *account) {
+                                         rd_kafka_byte_account_t *account,
+                                         void *(*allocate)(size_t, size_t)) {
         rd_kafka_op_t *rko;
 #define _RD_KAFKA_OP_EMPTY                                                     \
         1234567 /* Special value to be able to assert                          \
@@ -289,6 +292,7 @@ rd_kafka_op_t *rd_kafka_op_new_accounted(const char *source,
                 sizeof(rko->rko_u.telemetry_broker),
             [RD_KAFKA_OP_TERMINATE_TELEMETRY] = _RD_KAFKA_OP_EMPTY,
             [RD_KAFKA_OP_ELECTLEADERS] = sizeof(rko->rko_u.admin_request),
+            [RD_KAFKA_OP_CONNECTION_OBSERVATION] = sizeof(rko->rko_u.connection_observation),
         };
         size_t tsize = op2size[type & ~RD_KAFKA_OP_FLAGMASK];
 
@@ -299,7 +303,11 @@ rd_kafka_op_t *rd_kafka_op_new_accounted(const char *source,
         tsize += sizeof(*rko) - sizeof(rko->rko_u);
         if (!rd_kafka_byte_account_acquire(account, tsize))
                 return NULL;
-        rko = rd_calloc(1, tsize);
+        rko = allocate(1, tsize);
+        if (!rko) {
+                rd_kafka_byte_account_release(account, tsize);
+                return NULL;
+        }
         rko->rko_byte_account = account;
         rko->rko_byte_charge = account ? tsize : 0;
         rko->rko_type = type;
@@ -311,6 +319,12 @@ rd_kafka_op_t *rd_kafka_op_new_accounted(const char *source,
         return rko;
 }
 
+
+rd_kafka_op_t *rd_kafka_op_new_accounted(const char *source,
+                                         rd_kafka_op_type_t type,
+                                         rd_kafka_byte_account_t *account) {
+        return rd_kafka_op_new_accounted0(source, type, account, account ? calloc : rd_calloc);
+}
 
 rd_kafka_op_t *rd_kafka_op_new0(const char *source, rd_kafka_op_type_t type) {
         return rd_kafka_op_new_accounted(source, type, NULL);
@@ -332,6 +346,14 @@ void rd_kafka_op_destroy(rd_kafka_op_t *rko) {
 
 
         switch (rko->rko_type & ~RD_KAFKA_OP_FLAGMASK) {
+        case RD_KAFKA_OP_CONNECTION_OBSERVATION:
+                if (rko->rko_u.connection_observation.result) {
+                        rd_kafka_connection_observation_cancel(rko->rko_u.connection_observation.result);
+                        rd_kafka_connection_observation_destroy(rko->rko_u.connection_observation.result);
+                }
+                if (rko->rko_u.connection_observation.broker)
+                        rd_kafka_broker_destroy(rko->rko_u.connection_observation.broker);
+                break;
         case RD_KAFKA_OP_FETCH:
                 rd_kafka_msg_destroy(NULL, &rko->rko_u.fetch.rkm);
                 /* Decrease refcount on rkbuf to eventually rd_free shared buf*/
@@ -1009,3 +1031,5 @@ void rd_kafka_fetch_op_app_prepare(rd_kafka_t *rk, rd_kafka_op_t *rko) {
 
         rd_kafka_update_app_pos(rk, rktp, pos, RD_DO_LOCK);
 }
+
+#include "rdkafka_connection_op_test.h"
