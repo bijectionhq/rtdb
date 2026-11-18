@@ -6,98 +6,140 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/server/src/config/bounded.rs:224"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Compiled only for hosts that are neither Unix nor Windows, which RTDB does not ship for; the JVM reads the environment through System.getenv on every platform it runs on.",
+   "reference": "No reference equivalent: platform build guard."
   },
   {
    "code": "rtdb.conformance/column-table-fixture-type",
    "classification": "native-gap",
    "sites": [
     "rust/crates/conformance/src/controls/table_column.rs:25"
-   ]
+   ],
+   "category": "harness",
+   "rationale": "Conformance control fixture rejects column types it cannot construct; never reached by a node.",
+   "reference": "No reference equivalent: conformance harness."
   },
   {
    "code": "rtdb.conformance/slt-format",
    "classification": "native-gap",
    "sites": [
     "rust/crates/conformance/src/sql_logic/format.rs:6"
-   ]
+   ],
+   "category": "harness",
+   "rationale": "sqllogictest record formatting in the conformance harness.",
+   "reference": "No reference equivalent: conformance harness."
   },
   {
    "code": "rtdb.conformance/slt-harness-gap",
    "classification": "native-gap",
    "sites": [
     "rust/crates/conformance/src/sql_logic/engine.rs:276"
-   ]
+   ],
+   "category": "harness",
+   "rationale": "sqllogictest engine reports records the harness cannot drive.",
+   "reference": "No reference equivalent: conformance harness."
   },
   {
    "code": "rtdb.conformance/slt-symbol-value",
    "classification": "native-gap",
    "sites": [
     "rust/crates/conformance/src/sql_logic/engine.rs:275"
-   ]
+   ],
+   "category": "harness",
+   "rationale": "sqllogictest engine cannot render symbol result cells.",
+   "reference": "No reference equivalent: conformance harness."
   },
   {
    "code": "rtdb.expr/async-required",
    "classification": "native-gap",
    "sites": [
     "rust/crates/expr/src/functions.rs:76"
-   ]
+   ],
+   "category": "internal-guard",
+   "rationale": "Only the synchronous expression API rejects a reached nonzero SLEEP. Query operators evaluate through evaluate_async, and static DML expansion excludes volatile expressions (rust/crates/tx/src/submission.rs:51), so SQL and XTQL SLEEP never reach it.",
+   "reference": "core/src/main/clojure/xtdb/expression.clj sleep codegen blocks the calling thread; RTDB suspends instead."
   },
   {
    "code": "rtdb.expr/regex-host-form",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/expr/src/evaluate/invocation/host.rs:785"
-   ]
+    "rust/crates/expr/src/evaluate/invocation/host.rs:809"
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "The reference splices the raw XTQL regexp-replace pattern form into generated code and evals it, so any Clojure host form runs. RTDB interprets a bounded subset of pure forms; full parity needs a Clojure interpreter and would carry the reference's code-injection behaviour.",
+   "reference": "core/src/main/clojure/xtdb/expression.clj:165 (parse-list-form 'regexp_replace keeps :pattern unevaluated) and :1174 (Pattern/compile ~pattern)."
   },
   {
    "code": "rtdb.format/decimal-metadata",
    "classification": "native-gap",
    "sites": [
     "rust/crates/format/src/ipc_decimal.rs:134"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Rejects malformed or conflicting internal decimal precision/scale field metadata in Arrow IPC; the JVM never writes such metadata.",
+   "reference": "No reference equivalent: RTDB-internal IPC metadata keys."
   },
   {
    "code": "rtdb.format/metadata-flavour",
    "classification": "native-gap",
    "sites": [
     "rust/crates/format/src/statistics.rs:154"
-   ]
+   ],
+   "category": "internal-guard",
+   "rationale": "Statistics are only grouped for numeric, temporal and duration columns once presence and byte-backed columns have returned; any other Arrow type here is an internal invariant breach.",
+   "reference": "core/src/main/kotlin/xtdb/metadata column metadata flavours (numbers, date-times, times-of-day, durations, bytes)."
   },
   {
    "code": "rtdb.format/non-byte-bloom",
    "classification": "native-gap",
    "sites": [
     "rust/crates/format/src/bloom.rs:67"
-   ]
+   ],
+   "category": "internal-guard",
+   "rationale": "Bloom insertion is only called for Utf8/Binary/FixedSizeBinary columns (rust/crates/format/src/statistics.rs:140); a non-byte cell is an internal invariant breach.",
+   "reference": "No reference equivalent: the JVM hashes the same byte-backed vectors."
   },
   {
    "code": "rtdb.format/storage-version",
    "classification": "native-gap",
    "sites": [
     "rust/crates/format/src/keys.rs:59"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Refuses storage written under an unknown storage version; not called on a production read path at this revision.",
+   "reference": "No reference equivalent: the reference roots storage at Storage/VERSION and does not read other versions."
   },
   {
    "code": "rtdb.metrics/cloudwatch-not-compiled",
    "classification": "native-gap",
    "sites": [
     "rust/crates/server/src/metric_export/mod.rs:49"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Build-feature guard: a server built without the cloudwatch feature cannot open a CloudWatch publisher.",
+   "reference": "No reference equivalent: the JVM module is selected by classpath."
   },
   {
    "code": "rtdb.metrics/missing-step-provider",
    "classification": "native-gap",
    "sites": [
     "rust/crates/plan/src/runtime.rs:54"
-   ]
+   ],
+   "category": "internal-guard",
+   "rationale": "Default trait method for providers without step accumulation; the production metrics Registry overrides sample_step (rust/crates/metrics/src/lib.rs:159).",
+   "reference": "No reference equivalent: Micrometer step registries."
   },
   {
    "code": "rtdb.node/prepared-session-statement",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/node/src/statement.rs:110"
-   ]
+    "rust/crates/node/src/statement.rs:221"
+   ],
+   "category": "internal-guard",
+   "rationale": "pgwire, Flight SQL and ADBC route session-control statements through the control parser before preparing; statements outside the grammar now report xtdb/sql-error.",
+   "reference": "core/src/main/antlr/xtdb/antlr/Sql.g4:16 directlyExecutableStatement; non-grammar statements are xtdb/sql-error parse failures (core/src/main/kotlin/xtdb/query/SqlParser.kt:29)."
   },
   {
    "code": "rtdb.query/boolean-setter",
@@ -105,28 +147,40 @@
    "sites": [
     "rust/crates/query/src/aggregate.rs:407",
     "rust/crates/query/src/aggregate.rs:527"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "BOOL_AND/BOOL_OR/EVERY over non-boolean emitted types: the reference reducing aggregate has no vector setter for them and throws.",
+   "reference": "core/src/main/clojure/xtdb/operator/group_by.clj:515 bool-agg-factory via reducing-agg-factory."
   },
   {
    "code": "rtdb.query/min-max-setter",
    "classification": "native-gap",
    "sites": [
     "rust/crates/query/src/aggregate.rs:514"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "MIN/MAX into decimal, small or unsigned integer, half-float or time vectors: the reference reducing aggregate's output vector has no matching setter and throws.",
+   "reference": "core/src/main/clojure/xtdb/operator/group_by.clj:195 min-max-factory -> reducing-agg-factory."
   },
   {
    "code": "rtdb.query/small-integer-sum",
    "classification": "native-gap",
    "sites": [
     "rust/crates/query/src/aggregate.rs:588"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "SUM into a byte or short accumulator: the reference Sum vector has no sumInto implementation for those widths.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/agg/Sum.kt:27 inVec.sumInto(outVec)."
   },
   {
    "code": "rtdb.query/variance-input",
    "classification": "native-gap",
    "sites": [
     "rust/crates/query/src/aggregate.rs:625"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "VAR_*/STDDEV_* over inputs other than int, long or double: the reference squareInto is only implemented on those vectors.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/agg/Variance.kt:32 inVec.squareInto(x2Vec)."
   },
   {
    "code": "rtdb.tls/unsupported-identifier",
@@ -134,23 +188,31 @@
    "sites": [
     "rust/crates/tls/src/identifiers.rs:205",
     "rust/crates/tls/src/identifiers.rs:209"
-   ]
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "CA certificate URI names with a named IPv6 interface scope or a trailing-dot host are resolved by the JDK's URIName against the host's interfaces and resolver; the result depends on the JVM host.",
+   "reference": "JDK sun.security.x509.URIName constructor (host resolution fallback)."
   },
   {
    "code": "rtdb.tx/removed-operation",
    "classification": "native-gap",
    "sites": [
     "rust/crates/tx/src/source.rs:200"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Historical xtql/call transaction legs are decoded for replay but cannot be re-encoded as source operations; the reference no longer has these operations.",
+   "reference": "No reference equivalent at the pinned revision: xtql and call tx-ops were removed."
   },
   {
    "code": "rtdb/arrow-type",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/columnar/src/cells/open.rs:63",
     "rust/crates/columnar/src/read_allocation.rs:119",
     "rust/crates/columnar/src/schema.rs:274"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Arrow types with no XTDB vector mapping (LargeUtf8, views, large lists, ...) in stored files or client batches.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/MergeFields.kt:72-96 unsupported(\"LargeList\"/\"Utf8View\"/...) throws UnsupportedOperationException."
   },
   {
    "code": "rtdb/avro-custom-logical-type",
@@ -208,7 +270,10 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/columnar/src/schema.rs:139"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Decimal logical types must be 32, 64, 128 or 256 bits wide to map onto Arrow decimal storage.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/ValueTypes.kt:73 Unsupported precision."
   },
   {
    "code": "rtdb/encoded-union-leg",
@@ -217,14 +282,10 @@
     "rust/crates/columnar/src/read_allocation.rs:113",
     "rust/crates/columnar/src/schema.rs:56",
     "rust/crates/columnar/src/schema.rs:252"
-   ]
-  },
-  {
-   "code": "rtdb/half-vector",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/columnar/src/cells/open.rs:56"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Run-end-encoded legs inside dense unions are rejected; XTDB unions carry plain legs only.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/MergeFields.kt:96 unsupported(\"RunEndEncoded\")."
   },
   {
    "code": "rtdb/jvm-half-float",
@@ -232,7 +293,10 @@
    "sites": [
     "rust/crates/columnar/src/hash.rs:78",
     "rust/crates/plan/src/expr.rs:39"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Half-precision floats: the reference vector factory errors on FloatingPoint HALF.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/Vector.kt:181 HALF -> error(\"half precision not supported\")."
   },
   {
    "code": "rtdb/kafka-address-list-size",
@@ -311,14 +375,20 @@
    "sites": [
     "rust/crates/columnar/src/schema.rs:35",
     "rust/crates/columnar/src/schema.rs:270"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Null, bottom and nested run-end layouts have no Arrow run-end encoding.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/MergeFields.kt:96 unsupported(\"RunEndEncoded\")."
   },
   {
    "code": "rtdb/too-many-union-legs",
    "classification": "native-gap",
    "sites": [
     "rust/crates/columnar/src/schema.rs:47"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Arrow dense-union type ids are a signed byte, so a union holds at most 127 legs.",
+   "reference": "Arrow columnar format: dense union type ids are int8."
   },
   {
    "code": "rtdb/unknown-arrow-extension",
@@ -326,36 +396,16 @@
    "sites": [
     "rust/crates/columnar/src/read_allocation.rs:86",
     "rust/crates/columnar/src/schema.rs:191"
-   ]
-  },
-  {
-   "code": "rtdb/unrepresentable-vector-schema",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/columnar/src/cells/descriptor.rs:412"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "An Arrow extension name outside the XTDB set in a stored file or client batch has no logical type.",
+   "reference": "No reference equivalent: the JVM ExtensionTypeRegistry leaves unknown extensions as their storage type."
   },
   {
    "code": "rtdb/unsupported-producer-node-list",
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/producer_metadata/node_selection.rs:103"
-   ]
-  },
-  {
-   "code": "rtdb/vector-depth",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/columnar/src/cells/snapshot.rs:13"
-   ]
-  },
-  {
-   "code": "rtdb/vector-schema-depth",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/columnar/src/cells/descriptor.rs:287",
-    "rust/crates/columnar/src/cells/open.rs:30",
-    "rust/crates/columnar/src/cells/write/owner/tree.rs:50"
    ]
   },
   {
@@ -370,7 +420,10 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/azure/src/credential.rs:34"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "AZURE_TOKEN_CREDENTIALS values outside the DefaultAzureCredential set; the Java Azure SDK rejects them with IllegalArgumentException at credential construction.",
+   "reference": "azure-identity DefaultAzureCredentialBuilder AZURE_TOKEN_CREDENTIALS validation."
   },
   {
    "code": "xtdb.expression/array-dimension-error",
@@ -421,14 +474,20 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/plan/src/interval_constructor.rs:36"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Interval constructor field/precision arguments are produced as literals by the SQL planner; a non-literal reaches the reference codegen with a nil :literal and fails.",
+   "reference": "core/src/main/clojure/xtdb/expression/temporal.clj:1246 and :1414 destructure (map :literal args)."
   },
   {
    "code": "xtdb.expression/non-literal-precision",
    "classification": "native-gap",
    "sites": [
     "rust/crates/plan/src/temporal_functions.rs:209"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "SQL grammar only admits an unsigned-integer precision; a non-literal XTQL precision fails the reference assertion.",
+   "reference": "core/src/main/clojure/xtdb/expression/temporal.clj:1721 (assert (integer? precision) \"precision must be literal for now\")."
   },
   {
    "code": "xtdb.expression/non-literal-scale",
@@ -442,35 +501,50 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/plan/src/temporal_functions.rs:189"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "SQL EXTRACT/DATE_TRUNC fields are keywords in the grammar; a non-literal XTQL field reaches the reference with a nil :literal and the field case throws IllegalArgumentException.",
+   "reference": "core/src/main/clojure/xtdb/expression/temporal.clj:1449 and :1561 destructure {field :literal}; core/src/main/antlr/xtdb/antlr/Sql.g4:343,390."
   },
   {
    "code": "xtdb.expression/non-literal-timezone",
    "classification": "native-gap",
    "sites": [
     "rust/crates/plan/src/temporal_functions.rs:195"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "The SQL DATE_TRUNC timezone is a character-string literal in the grammar; a non-literal XTQL timezone reaches ZoneId/of with nil and throws.",
+   "reference": "core/src/main/clojure/xtdb/expression/temporal.clj:1576 {trunc-tz :literal}; core/src/main/antlr/xtdb/antlr/Sql.g4:390 dateTruncTimeZone=characterString."
   },
   {
    "code": "xtdb.expression/range-bins-unit",
    "classification": "native-gap",
    "sites": [
     "rust/crates/plan/src/temporal_functions.rs:150"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Zoned RANGE_BINS inputs at a unit other than microseconds fail the reference assertion.",
+   "reference": "core/src/main/clojure/xtdb/expression/temporal.clj:2058 (assert (= from-unit to-unit origin-unit :micro))."
   },
   {
    "code": "xtdb.expression/set-equality",
    "classification": "native-gap",
    "sites": [
     "rust/crates/plan/src/equality.rs:14"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "= and <> between two sets throw UnsupportedOperationException in the reference.",
+   "reference": "core/src/main/clojure/xtdb/expression.clj:2435-2439 \"TODO: `==` on sets\"."
   },
   {
    "code": "xtdb.expression/transit-throwable-text",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/expr/src/transit_object/render.rs:93"
-   ]
+    "rust/crates/expr/src/transit_object/render.rs:94"
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "Printing an ExceptionInfo transit value embeds the JVM construction stack trace, which a native implementation cannot reproduce.",
+   "reference": "clojure.core print-method for Throwable (#error {... :trace [...]})."
   },
   {
    "code": "xtdb.expression/unsupported",
@@ -492,7 +566,10 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/plan/src/expr.rs:521"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "ROUND(smallint/tinyint, scale): the reference case only maps :i32 and :i64 to a decimal precision and throws IllegalArgumentException otherwise.",
+   "reference": "core/src/main/clojure/xtdb/expression.clj:1770-1778 (case int-col-type :i32 10 :i64 19)."
   },
   {
    "code": "xtdb.expression/unsupported-setting",
@@ -573,7 +650,10 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/pg-codec/src/binary.rs:26"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Binary-format parameters of duration, oid, regclass or regproc: those PgTypes do not override readBinary.",
+   "reference": "core/src/main/kotlin/xtdb/pgwire/PgType.kt:152 open fun readBinary = unsupported(\"readBinary\")."
   },
   {
    "code": "xtdb.pgwire/unsupported-execute",
@@ -594,49 +674,70 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/pg-codec/src/output.rs:129"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Result encodings a PgType does not implement.",
+   "reference": "core/src/main/kotlin/xtdb/pgwire/PgType.kt:154-155 open writeBinary/writeText = unsupported(...)."
   },
   {
    "code": "xtdb.postgres/unsupported-json-ld-value",
    "classification": "native-gap",
    "sites": [
     "rust/crates/pg-codec/src/text.rs:92"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "JSON-LD xt:timeZone, xt:period, xt:symbol, xt:table, xt:type and xt:field decode to JVM objects with no Arrow vector type, and unknown types are rejected by the decoder.",
+   "reference": "api/src/main/kotlin/xtdb/JsonLdSerde.kt:112-170 fromLdValue; core/src/main/kotlin/xtdb/arrow/ValueTypes.kt:132 \"unknown object type\"."
   },
   {
    "code": "xtdb.postgres/unsupported-map-key",
    "classification": "native-gap",
    "sites": [
     "rust/crates/pg-codec/src/text.rs:117"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Maps with non-string, non-keyword keys have no document type.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/ValueTypes.kt:114 \"Type Maps currently not supported\"."
   },
   {
    "code": "xtdb.postgres/unsupported-pgoutput-message",
    "classification": "native-gap",
    "sites": [
     "rust/crates/pg-source/src/decoder.rs:72"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "pgoutput message tags other than R, Y, B, C, I, U and D.",
+   "reference": "modules/postgres-source/src/main/kotlin/xtdb/postgres/PgOutputMessage.kt:78 \"Unknown pgoutput message type\"."
   },
   {
    "code": "xtdb.postgres/unsupported-symbol",
    "classification": "native-gap",
    "sites": [
     "rust/crates/pg-codec/src/text.rs:188"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Symbols have no Arrow vector type.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/ValueTypes.kt:132 \"unknown object type\"."
   },
   {
    "code": "xtdb.postgres/unsupported-text-type",
    "classification": "native-gap",
    "sites": [
     "rust/crates/pg-codec/src/text.rs:30"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Text values of oid, regclass or regproc columns: those PgTypes do not override readText.",
+   "reference": "core/src/main/kotlin/xtdb/pgwire/PgType.kt:153 open fun readText = unsupported(\"readText\"); modules/postgres-source/src/main/kotlin/xtdb/postgres/PgWireDriver.kt:52."
   },
   {
    "code": "xtdb.postgres/unsupported-transit-value",
    "classification": "native-gap",
    "sites": [
     "rust/crates/pg-codec/src/text.rs:185"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Transit tags that decode to JVM objects without an Arrow vector type.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/ValueTypes.kt:132 \"unknown object type\"."
   },
   {
    "code": "xtdb.sql/lead-lag-default-expr",
@@ -692,7 +793,10 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/format/src/columns.rs:174"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Stored column-metadata type descriptors outside the encodable set.",
+   "reference": "No reference equivalent: RTDB column-metadata encoding."
   },
   {
    "code": "xtdb/col-meta-unsigned-int",
@@ -706,21 +810,30 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/node/src/catalog.rs:89"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Ingest nodes have a fixed database set and no query surface; the reference refuses attach/detach there too.",
+   "reference": "core/src/main/kotlin/xtdb/api/IngestNode.kt:70-84 FixedDbCatalog error(\"can't attach a database to an ingest node\")."
   },
   {
    "code": "xtdb/sql-unsupported",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/sql/src/bind.rs:1256"
-   ]
+    "rust/crates/sql/src/bind.rs:1260"
+   ],
+   "category": "reference-failure",
+   "rationale": "All 66 binder sites are sqlparser-rs dialect constructs that Sql.g4 has no rule for, grammar alternatives that sql.clj has no visitor for or explicitly throws on (window names and frames, ranking windows, a second window function, CTE column aliases, schema-qualified wildcards, DISTINCT on non-distinct aggregates), or branches that RTDB pre-processing makes unreachable (RETURNING, LIKE ANY, session control). The reference reports most of these as an incorrect xtdb/sql-error parse failure, where RTDB reports unsupported.",
+   "reference": "core/src/main/antlr/xtdb/antlr/Sql.g4; core/src/main/clojure/xtdb/sql.clj:275, :904, :2140, :2189, :2413; core/src/main/clojure/xtdb/operator/group_by.clj:226-384."
   },
   {
    "code": "xtdb/unknown-function",
    "classification": "native-gap",
    "sites": [
     "rust/crates/expr/src/functions.rs:236"
-   ]
+   ],
+   "category": "internal-guard",
+   "rationale": "Evaluator fallback after planning: plan typing rejects unknown functions with xtdb.expression/function-type-mismatch, or types them null/bottom so evaluation returns before the fallback.",
+   "reference": "rust/crates/plan/src/expr.rs:131-133 planning fallback."
   },
   {
    "code": "xtdb/unsupported-cast",
@@ -734,14 +847,20 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/types/src/logical.rs:131"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Null and bottom have no run-end encoding.",
+   "reference": "core/src/main/kotlin/xtdb/arrow/MergeFields.kt:96 unsupported(\"RunEndEncoded\")."
   },
   {
    "code": "xtdb/unsupported-type-rendering",
    "classification": "native-gap",
    "sites": [
     "rust/crates/types/src/type_edn.rs:119"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Unsigned integers and half floats have no JVM type EDN rendering; the reference vector types never contain them.",
+   "reference": "api/src/main/kotlin/xtdb/arrow/ArrowTypes.kt:116; core/src/main/kotlin/xtdb/arrow/Vector.kt:181."
   }
  ]
 }
