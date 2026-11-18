@@ -22,6 +22,7 @@ mod allocation;
 mod clojure_index;
 pub mod jvm_number;
 pub mod java_text;
+pub mod transit_value;
 mod murmur3;
 
 pub use error::{Anomaly, AnomalyCategory, Result};
