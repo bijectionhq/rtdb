@@ -59,6 +59,7 @@ The directory provider reads requested regular-file entries as UTF-8 with their 
 An `allowed.paths` provider parameter limits resolution to the listed absolute roots and their descendants after canonicalization.
 Missing values preserve their original placeholder and inserted text is resolved once from the original option values.
 The lookup stages follow `ConfigTransformer`, `FileConfigProvider`, `DirectoryConfigProvider` and `AllowedPaths` from the Kafka 4.4.0 client sources.
+Provider construction follows the Java alias map's iteration order, including duplicate alias declarations.
 The Rust resolver retains configuration text in its UTF-8 representation and uses the requesting configuration's allocation budget.
 Kafka Connect source assignments also resolve provider placeholders on their `!Kafka` remote before parsing `max.poll.records` and constructing the native consumer.
 The assignment retains admitted expanded configuration through consumer destruction.

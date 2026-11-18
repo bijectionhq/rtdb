@@ -74,6 +74,19 @@ fn provider_classes_and_roots_are_checked_before_placeholder_demand() {
 }
 
 #[test]
+fn providers_configure_in_java_alias_map_order() {
+    let mut original = BTreeMap::from([
+        (PROVIDERS.into(), "z,a,z".into()),
+        ("config.providers.z.class".into(), FILE.into()),
+        ("config.providers.z.param.allowed.paths".into(), "relative-root".into()),
+        ("config.providers.a.class".into(), "example.Unregistered".into()),
+    ]);
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/config-provider-class");
+    original.remove("config.providers.a.class");
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/config-provider");
+}
+
+#[test]
 fn variable_capture_preserves_empty_fields_optional_path_and_ordinary_braces() {
     let input = "plain ${missing-colon} ${p::key} ${p:path:key:tail} ${:} ${nested${p:key} ${unfinished";
     let observed: Vec<_> = Variables::new(input).map(|var| (var.provider, var.path, var.key, &input[var.start..var.end])).collect();

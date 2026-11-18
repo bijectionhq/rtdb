@@ -36,23 +36,30 @@ pub(crate) fn resolve<'a>(
     };
     let text_bytes = original.iter().try_fold(0usize, |sum, (name, value)| add(add(sum, name.len())?, value.len()))?;
     reserve(add(product(text_bytes, 64)?, add(product(original.len(), 512)?, 4096)?)?)?;
+    let classes: Vec<_> = list(aliases).filter_map(|alias| {
+        original.get(&format!("{PROVIDERS}.{alias}.class")).map(|class| (alias, class.as_str()))
+    }).collect();
+    let order = rtdb_types::java_hash_map_order(
+        16,
+        classes.iter().map(|(alias, _)| alias),
+        |alias| string_hash(alias),
+        |left, right| left.encode_utf16().cmp(right.encode_utf16()),
+    ).ok_or_else(allocation)?;
     let mut providers = BTreeMap::new();
-    for alias in list(aliases) {
-        if providers.contains_key(alias) { continue; }
+    for index in order {
+        let (alias, class) = classes[index];
         let prefix = format!("{PROVIDERS}.{alias}.");
-        if let Some(class) = original.get(&format!("{prefix}class")) {
-            let allowed = original.get(&format!("{prefix}param.allowed.paths")).map(String::as_str);
-            let provider = match class.as_str() {
-                FILE => Provider::File(AllowedPaths::new(allowed, reserve)?),
-                DIRECTORY => Provider::Directory(AllowedPaths::new(allowed, reserve)?),
-                ENVIRONMENT => {
-                    let pattern = original.get(&format!("{prefix}param.allowlist.pattern")).map(String::as_str);
-                    Provider::Environment(Environment::capture(pattern, memory)?)
-                }
-                _ => return Err(Anomaly::unsupported("xtdb.kafka/config-provider-class", "Configured Kafka ConfigProvider class requires a native adapter")),
-            };
-            providers.insert(alias, provider);
-        }
+        let allowed = original.get(&format!("{prefix}param.allowed.paths")).map(String::as_str);
+        let provider = match class {
+            FILE => Provider::File(AllowedPaths::new(allowed, reserve)?),
+            DIRECTORY => Provider::Directory(AllowedPaths::new(allowed, reserve)?),
+            ENVIRONMENT => {
+                let pattern = original.get(&format!("{prefix}param.allowlist.pattern")).map(String::as_str);
+                Provider::Environment(Environment::capture(pattern, memory)?)
+            }
+            _ => return Err(Anomaly::unsupported("xtdb.kafka/config-provider-class", "Configured Kafka ConfigProvider class requires a native adapter")),
+        };
+        providers.insert(alias, provider);
     }
 
     let mut requests = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
@@ -102,6 +109,10 @@ pub(crate) fn resolve<'a>(
 fn list(value: &str) -> impl Iterator<Item = &str> {
     let items = value.trim_end_matches(',');
     items.split(',').take(if items.is_empty() { 0 } else { usize::MAX })
+}
+
+fn string_hash(value: &str) -> i32 {
+    value.encode_utf16().fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(i32::from(unit)))
 }
 
 struct Variable<'a> { provider: &'a str, path: &'a str, key: &'a str, start: usize, end: usize }
