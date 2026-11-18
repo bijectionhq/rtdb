@@ -382,8 +382,8 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
 
 pub(crate) fn decode_arguments(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
     let _value_reservation = memory.reserve(crate::ipc::allocation_bound(bytes)?)?;
-    let stream = crate::ipc::decode_stream(bytes, memory)?;
-    let schema = Arc::clone(&stream.schema);
+    let stream = rtdb_format::ipc::OwnedStream::read(bytes, memory)?;
+    let schema = Arc::clone(stream.schema());
     for (index, field) in schema.fields().iter().enumerate() {
         if !field.name().is_empty() && field.name() != &format!("${}", index + 1) && field.name() != &format!("?_{}", index) {
             return Err(Anomaly::incorrect("xtdb/invalid-param-names", "SQL argument fields must follow positional order"));
@@ -391,7 +391,7 @@ pub(crate) fn decode_arguments(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Resu
     }
     let types = schema.fields().iter().map(|field| from_field(field)).collect::<Result<_>>()?;
     let mut arguments = SqlArguments::new(types, Vec::new(), memory)?;
-    for page in &stream.pages {
+    for page in stream.pages() {
         if page.batch().schema() != schema { return Err(invalid("SQL argument stream changes schema")); }
         let rows = (0..page.batch().num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| read_value(field, page.batch().column(column).as_ref(), row)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
         arguments.append_page(SqlArguments::new(arguments.types().to_vec(), rows, memory)?)?;

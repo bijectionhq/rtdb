@@ -2,6 +2,8 @@
 
 All components in this crate are passive values or codecs.
 IPC inspection exposes allocation bounds for messages, streams and files, including compressed buffers' declared decoded lengths and row descriptors.
+Owned transaction streams admit Arrow buffers, field descriptors and validity work before reading complete frames.
+Materializing values from those batches has its own allocation scope.
 Immutable-file inspection reads compressed length prefixes without loading each encoded body, and records separate dictionary and page decoding bounds.
 File and stream readers validate LZ4 output length with a fixed scratch buffer before Arrow 58.4.1's decoder materializes it.
 Bounds include the complete framed metadata length and conservative decoder scratch allowances: 64 MiB for LZ4 frame buffers and their reallocation, and 1 MiB for Zstandard's bulk decoder context.

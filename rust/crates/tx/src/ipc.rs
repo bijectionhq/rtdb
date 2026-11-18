@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_format::ipc::OwnedStream;
 use rtdb_types::{Anomaly, Result};
 
 use crate::RetainedBytes;
@@ -31,18 +32,7 @@ pub(crate) fn encode<'a>(schema: &Schema, pages: impl IntoIterator<Item = &'a Re
 }
 
 pub(crate) fn decode(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Vec<OwnedBatch>> {
-    Ok(decode_stream(bytes, memory)?.pages)
-}
-
-pub(crate) struct DecodedStream { pub schema: arrow_schema::SchemaRef, pub pages: Vec<OwnedBatch>, _reservation: Arc<MemoryReservation> }
-
-pub(crate) fn decode_stream(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<DecodedStream> {
-    let bound = allocation_bound(bytes)?;
-    let reservation = memory.reserve(bound)?;
-    let reader = rtdb_format::ipc::ArrowStream::open(Arc::from(bytes), None)?;
-    let schema = reader.schema();
-    let pages = reader.map(|page| OwnedBatch::with_reservation(page?, Arc::clone(&reservation))).collect::<Result<_>>()?;
-    Ok(DecodedStream { schema, pages, _reservation: reservation })
+    Ok(OwnedStream::read(bytes, memory)?.into_pages())
 }
 
 pub(crate) fn allocation_bound(bytes: &[u8]) -> Result<usize> {

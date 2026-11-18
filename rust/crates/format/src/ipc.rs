@@ -8,7 +8,7 @@ use arrow_buffer::Buffer;
 use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::writer::{DictionaryTracker, FileWriter, IpcDataGenerator, IpcWriteOptions, StreamWriter, write_message};
 use arrow_schema::{Schema, SchemaRef};
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, Result};
 
 mod decoded_schema;
@@ -181,7 +181,7 @@ pub fn inspect_file_reserved<R: Read + Seek + ?Sized, G>(reader: &mut R, mut res
         let body_length = usize::try_from(block.bodyLength()).map_err(invalid)?;
         if usize::try_from(message.bodyLength()).map_err(invalid)? != body_length { return Err(invalid("Arrow block and message body lengths differ")); }
         let body_start = offset.checked_add(metadata_length as u64).ok_or_else(|| invalid("Arrow body offset overflow"))?;
-        let bound = message_bound(&message, metadata_length, body_length, |start| {
+        let bound = message_bound(&message, metadata_length, body_length, row_descriptors, |start| {
             reader.seek(SeekFrom::Start(body_start.checked_add(start as u64).ok_or_else(|| invalid("Arrow buffer offset overflow"))?)).map_err(invalid)?;
             let mut bytes = [0; 8]; reader.read_exact(&mut bytes).map_err(invalid)?;
             Ok(i64::from_le_bytes(bytes))
@@ -268,6 +268,35 @@ pub fn read_stream(bytes: Arc<[u8]>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     Ok((schema, reader.collect::<Result<Vec<_>>>()?))
 }
 
+/// Owns a complete IPC stream's schema and decoded Arrow buffers under one reservation.
+pub struct OwnedStream {
+    schema: SchemaRef,
+    pages: Vec<OwnedBatch>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl OwnedStream {
+    /// The input must end with an IPC end marker. Its allocation belongs to the caller.
+    pub fn read(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bound = stream_bound(bytes, true, arrow_descriptors)?;
+        let reservation = memory.reserve(bound)?;
+        let reader = ArrowStream::from_reader(bytes, None)?;
+        let schema = reader.schema();
+        let pages = reader.map(|page| OwnedBatch::with_reservation(page?, Arc::clone(&reservation))).collect::<Result<_>>()?;
+        Ok(Self { schema, pages, _reservation: reservation })
+    }
+
+    pub fn schema(&self) -> &SchemaRef { &self.schema }
+    pub fn pages(&self) -> &[OwnedBatch] { &self.pages }
+    pub fn into_pages(self) -> Vec<OwnedBatch> { self.pages }
+}
+
+fn row_descriptors(rows: usize) -> Result<usize> { allocation_mul(allocation_add(rows, 1)?, 4096) }
+
+fn arrow_descriptors(rows: usize) -> Result<usize> {
+    allocation_add(4096, allocation_mul(rows.div_ceil(8), 4)?)
+}
+
 /// Bounds message decoding scratch, including declared row descriptors and compressed buffer lengths.
 /// Reserve the returned byte count before invoking the Arrow reader and retain it through decoded-buffer use.
 pub fn message_allocation_bound(header: &[u8], body: &[u8]) -> Result<usize> {
@@ -275,15 +304,19 @@ pub fn message_allocation_bound(header: &[u8], body: &[u8]) -> Result<usize> {
 }
 
 fn framed_message_allocation_bound(header: &[u8], body: &[u8], metadata_length: usize) -> Result<usize> {
+    framed_message_bound(header, body, metadata_length, row_descriptors)
+}
+
+fn framed_message_bound(header: &[u8], body: &[u8], metadata_length: usize, field_bound: fn(usize) -> Result<usize>) -> Result<usize> {
     let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
     if let Some(schema) = message.header_as_schema() { validate_decimal_metadata(schema)?; }
-    message_bound(&message, metadata_length, body.len(), |start| {
+    message_bound(&message, metadata_length, body.len(), field_bound, |start| {
         let prefix: [u8; 8] = body.get(start..allocation_add(start, 8)?).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?.try_into().map_err(invalid)?;
         Ok(i64::from_le_bytes(prefix))
     })
 }
 
-fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_length: usize, mut compressed_length: impl FnMut(usize) -> Result<i64>) -> Result<usize> {
+fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_length: usize, field_bound: fn(usize) -> Result<usize>, mut compressed_length: impl FnMut(usize) -> Result<i64>) -> Result<usize> {
     let mut bound = allocation_add(8192, allocation_add(allocation_mul(header_length, 64)?, allocation_mul(body_length, 4)?)?)?;
     if usize::try_from(message.bodyLength()).map_err(invalid)? > body_length { return Err(invalid("Arrow message body is truncated")); }
     if let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) {
@@ -296,7 +329,7 @@ fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_le
             bound = allocation_add(bound, scratch)?;
         }
         if let Some(nodes) = batch.nodes() {
-            for node in nodes { bound = allocation_add(bound, allocation_mul(allocation_add(usize::try_from(node.length()).map_err(invalid)?, 1)?, 4096)?)?; }
+            for node in nodes { bound = allocation_add(bound, field_bound(usize::try_from(node.length()).map_err(invalid)?)?)?; }
         }
         if let Some(buffers) = batch.buffers() {
             for buffer in buffers {
@@ -346,21 +379,28 @@ fn validate_lz4_lengths(message: &arrow_ipc::Message<'_>, body: &[u8]) -> Result
 /// Bounds all messages retained by a decoded IPC stream, including dictionaries.
 /// The encoded input has a separate lifetime and must retain its own allocation charge.
 pub fn stream_allocation_bound(bytes: &[u8]) -> Result<usize> {
+    stream_bound(bytes, false, row_descriptors)
+}
+
+fn stream_bound(bytes: &[u8], terminated: bool, field_bound: fn(usize) -> Result<usize>) -> Result<usize> {
     let mut position = 0;
     let mut bound = 8192;
     while position < bytes.len() {
         let mut length = inspection_i32(bytes, &mut position)?;
         if length == -1 { length = inspection_i32(bytes, &mut position)?; }
-        if length == 0 { break; }
+        if length == 0 {
+            if terminated && position != bytes.len() { return Err(invalid("Bytes follow IPC stream end marker")); }
+            return Ok(bound);
+        }
         let end = allocation_add(position, usize::try_from(length).map_err(invalid)?)?;
         let header = bytes.get(position..end).ok_or_else(|| invalid("Arrow stream metadata is truncated"))?;
         let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
         let body_end = allocation_add(end, usize::try_from(message.bodyLength()).map_err(invalid)?)?;
         let body = bytes.get(end..body_end).ok_or_else(|| invalid("Arrow stream body is truncated"))?;
-        bound = allocation_add(bound, message_allocation_bound(header, body)?)?;
+        bound = allocation_add(bound, framed_message_bound(header, body, header.len(), field_bound)?)?;
         position = body_end;
     }
-    Ok(bound)
+    if terminated { Err(invalid("IPC stream has no end marker")) } else { Ok(bound) }
 }
 
 /// Bounds the footer, dictionaries and all record batches decoded from an immutable IPC file.

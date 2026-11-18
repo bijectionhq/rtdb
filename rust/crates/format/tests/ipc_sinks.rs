@@ -10,6 +10,28 @@ fn page() -> RecordBatch {
 }
 
 #[test]
+fn owned_stream_admits_wide_arrow_batches_without_row_value_materialization() {
+    use arrow_array::ArrayRef;
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_format::ipc::OwnedStream;
+
+    let fields = (0..1000).map(|index| Field::new(format!("v{index}"), DataType::Int64, true)).collect::<Vec<_>>();
+    let columns = (0..1000).map(|index| Arc::new(Int64Array::from_iter((0..100).map(|row| (row == index / 10).then_some(i64::from(index))))) as ArrayRef).collect();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let bytes = write_stream(&batch.schema(), std::slice::from_ref(&batch)).unwrap();
+    let memory = MemoryBudget::new(1 << 25);
+    let stream = OwnedStream::read(&bytes, &memory).unwrap();
+    let column = Arc::clone(stream.pages()[0].batch().column(992));
+    drop(stream);
+    assert_eq!(column.as_any().downcast_ref::<Int64Array>().unwrap().value(99), 992);
+    assert!(memory.used_bytes() > 0);
+    drop(column);
+    assert_eq!(memory.used_bytes(), 0);
+    assert!(OwnedStream::read(&bytes[..bytes.len() - 8], &memory).is_err());
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn file_and_stream_decoding_admit_logical_nulls_in_nested_dense_unions() {
     use std::collections::BTreeMap;
     use rtdb_format::{data::{EventBatch, StoredEvent, StoredOperation, build_event_batch}, ipc::{ArrowFile, ArrowStream}};

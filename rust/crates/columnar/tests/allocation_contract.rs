@@ -21,6 +21,28 @@ fn retains_within_bound(logical: LogicalType, values: Vec<Value>) {
 }
 
 #[test]
+fn an_arrow_batch_charges_shared_buffer_capacity_once() {
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, Field};
+
+    let shared = Int64Array::from_iter_values(0..8192);
+    let columns = (0..128).map(|index| Arc::new(shared.slice(index, 32)) as ArrayRef).collect();
+    let fields = (0..128).map(|index| Field::new(format!("v{index}"), DataType::Int64, false)).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let memory = MemoryBudget::new(1 << 17);
+    assert!(batch.get_array_memory_size() > memory.limit_bytes());
+    let error = OwnedBatch::with_reservation(batch.clone(), memory.reserve(1 << 15).unwrap()).unwrap_err();
+    assert_eq!(error.code, "rtdb/undersized-reservation");
+    let batch = OwnedBatch::with_reservation(batch, memory.reserve(1 << 17).unwrap()).unwrap();
+    let column = Arc::clone(batch.batch().column(100));
+    drop(batch);
+    assert_eq!(memory.used_bytes(), 1 << 17);
+    assert_eq!(column.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 100);
+    drop(column);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn scoped_budgets_share_one_limit_and_keep_independent_peaks_until_last_lease() {
     let root = MemoryBudget::new(100);
     let first = root.scope(); let second = root.scope();

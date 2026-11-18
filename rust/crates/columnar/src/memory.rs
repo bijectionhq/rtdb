@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
@@ -23,7 +23,7 @@ impl OwnedBatch {
 
     /// The reservation must cover all buffers retained by this batch.
     pub fn with_reservation(batch: RecordBatch, reservation: Arc<MemoryReservation>) -> Result<Self> {
-        if batch.get_array_memory_size() > reservation.bytes() {
+        if batch.get_array_memory_size() > reservation.bytes() && shared_allocation_size(&batch)? > reservation.bytes() {
             return Err(Anomaly::incorrect("rtdb/undersized-reservation", "Batch allocation exceeds its reservation"));
         }
         let arrays = batch.columns().iter().map(|array| {
@@ -70,6 +70,28 @@ impl OwnedBatch {
                 Self::with_reservation(batch, reservation)
             }
         }
+    }
+}
+
+fn shared_allocation_size(batch: &RecordBatch) -> Result<usize> {
+    let mut buffers = BTreeMap::new();
+    let mut descriptors = std::mem::size_of::<RecordBatch>();
+    for array in batch.columns() {
+        descriptors = descriptors.checked_add(array.get_array_memory_size().checked_sub(array.get_buffer_memory_size()).ok_or_else(allocation_overflow)?)
+            .ok_or_else(allocation_overflow)?;
+        collect_buffers(&array.to_data(), &mut buffers);
+    }
+    buffers.values().try_fold(descriptors, |size, capacity| size.checked_add(*capacity).ok_or_else(allocation_overflow))
+}
+
+fn collect_buffers(data: &ArrayData, buffers: &mut BTreeMap<usize, usize>) {
+    for buffer in data.buffers().iter().chain(data.nulls().map(NullBuffer::buffer)) {
+        buffers.entry(buffer.data_ptr().as_ptr() as usize)
+            .and_modify(|capacity| *capacity = (*capacity).max(buffer.capacity()))
+            .or_insert(buffer.capacity());
+    }
+    for child in data.child_data() {
+        collect_buffers(child, buffers);
     }
 }
 
