@@ -1,7 +1,7 @@
 use std::{ffi::{CStr, CString, c_char, c_void}, sync::Arc};
 use arrow_array::{Array, RecordBatch, StructArray, ffi::{FFI_ArrowArray, from_ffi}};
 use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
-use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_value, to_field};
+use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, estimate_read_value_bytes, from_field, read_value, to_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{Anomaly, LogicalType, Result};
 
@@ -67,6 +67,10 @@ pub(crate) fn export_schema(schema: &Schema, memory: &Arc<MemoryBudget>) -> Resu
     Ok(exported)
 }
 
+#[cfg(test)]
+use rtdb_columnar::OwnedBatch;
+
+#[cfg(test)]
 pub(crate) fn export_batch(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)> {
     let reservation = memory.reserve(super::add(schema_bound(batch.batch().schema().as_ref())?, batch.batch().get_array_memory_size())?)?;
     let schema = export_schema(batch.batch().schema().as_ref(), memory)?;

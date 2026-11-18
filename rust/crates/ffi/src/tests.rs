@@ -369,7 +369,7 @@ fn decimal_c_data_uses_signed_parameters_and_retains_detached_schema_children() 
             assert_eq!(imported.arguments.types(), &[ty.clone()]);
             assert_eq!(imported.arguments.rows().next().unwrap(), &[value]);
             drop(imported); assert_eq!(memory.used_bytes(), 0);
-            let mut schema = arrow::export_schema(&Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]), &memory).unwrap();
+            let schema = arrow::export_schema(&Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]), &memory).unwrap();
             let mut child = unsafe { std::mem::replace(&mut **schema.children, FFI_ArrowSchema::empty()) };
             drop(schema); assert!(memory.used_bytes() > 0); assert_eq!(child.format(), expected);
             let release = child.release.unwrap(); unsafe { release(&mut child); release(&mut child); }
