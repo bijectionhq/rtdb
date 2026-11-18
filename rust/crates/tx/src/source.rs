@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, from_field, read_value, struct_field_cell, to_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
@@ -48,12 +48,12 @@ impl SourceTransaction {
 
     /// Decodes current flat tx operations and the legacy one-row envelope without expanding SQL.
     pub fn decode(message: &SourceMessage, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let operation_bytes = match message {
-            SourceMessage::Protobuf(SourceBody::Tx(tx)) => tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?,
-            SourceMessage::LegacyTransaction(bytes) => bytes.as_slice(),
-            _ => return Err(invalid("Source message is not a transaction")),
+        let option_bytes = match message {
+            SourceMessage::Protobuf(SourceBody::Tx(tx)) => tx.default_tz.as_ref().map_or(0, String::len)
+                .checked_add(tx.user.as_ref().map_or(0, String::len)).ok_or_else(overflow)?,
+            _ => 0,
         };
-        let _value_reservation = memory.reserve(crate::ipc::allocation_bound(operation_bytes)?)?;
+        let _option_scratch = memory.reserve(option_bytes)?;
         let (pages, mut options, legacy) = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
                 let bytes = tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
@@ -65,8 +65,17 @@ impl SourceTransaction {
         };
         if pages.is_empty() && !legacy { return Self::from_operations(Vec::new(), options, memory); }
         let first = pages.first().ok_or_else(|| invalid("Transaction IPC stream has no record batch"))?;
+        let mut parsed_fields = memory.reserve(4096)?;
+        let parsed_fields = Arc::get_mut(&mut parsed_fields).expect("source decoding owns its reservation");
         if legacy {
             if first.batch().num_rows() != 1 || pages.len() != 1 { return Err(invalid("Legacy transaction must have one envelope row")); }
+            let batch = first.batch();
+            let option_fields = ["default-tz", "system-time", "user", "user-metadata"];
+            let bound = batch.schema().fields().iter().zip(batch.columns()).filter(|(field, _)| option_fields.contains(&field.name().as_str()))
+                .try_fold(parsed_fields.bytes(), |bytes, (field, column)| {
+                    bytes.checked_add(estimate_read_value_bytes(field, column.as_ref(), 0)?).ok_or_else(overflow)
+                })?;
+            parsed_fields.grow_to(bound)?;
             options.default_tz = match cell(first.batch(), "default-tz", 0)? { Value::Utf8(value) => value, _ => return Err(invalid("Legacy transaction has no timezone")) };
             options.system_time = optional_timestamp(cell(first.batch(), "system-time", 0)?)?;
             options.user = optional_string(optional_cell(first.batch(), "user", 0)?)?;
@@ -82,7 +91,7 @@ impl SourceTransaction {
                 list.value(0)
             } else { Arc::clone(column) };
             let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Transaction operations are not a union"))?;
-            for row in 0..union.len() { operations.push(decode_operation(union, row, memory)?); }
+            for row in 0..union.len() { operations.push(decode_operation(union, row, memory, parsed_fields)?); }
         }
         Self::from_operations(operations, options, memory)
     }
@@ -309,19 +318,24 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut SourceBatchArrays) -> Resul
     Ok(Arc::new(ListArray::try_new(field, OffsetBuffer::new(ScalarBuffer::from(offsets)), structs, None).map_err(|error| invalid(error.to_string()))?))
 }
 
-fn document_columns(data_type: &DataType) -> Result<Vec<String>> {
-    let element = match data_type {
-        DataType::List(element) | DataType::LargeList(element) | DataType::FixedSizeList(element, _) => element,
-        _ => return Err(invalid("Documents are not a list")),
-    };
-    let DataType::Struct(fields) = element.data_type() else { return Err(invalid("Document is not a struct")); };
-    Ok(fields.iter().map(|field| field.name().clone()).collect())
-}
-
-fn decode_operation(union: &UnionArray, row: usize, memory: &Arc<MemoryBudget>) -> Result<Operation> {
+fn decode_operation(union: &UnionArray, row: usize, memory: &Arc<MemoryBudget>, parsed_fields: &mut MemoryReservation) -> Result<Operation> {
     let (name, array, offset) = union_leg(union, row)?;
-    if name == "xtql" || name == "call" { return Ok(Operation::Removed(name)); }
+    let base = parsed_fields.bytes().checked_add(name.capacity()).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(overflow)?;
+    if name == "xtql" || name == "call" {
+        parsed_fields.grow_to(base)?;
+        return Ok(Operation::Removed(name));
+    }
     let body = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Transaction operation leg is not a struct"))?;
+    let value_fields: &[&str] = match name.as_str() {
+        "sql" => &["query", "args"],
+        "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
+        "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
+        "erase-docs" => &["table", "iids"],
+        _ => &[],
+    };
+    let bound = body.fields().iter().zip(body.columns()).filter(|(field, _)| value_fields.contains(&field.name().as_str()))
+        .try_fold(base, |bytes, (field, column)| bytes.checked_add(estimate_read_value_bytes(field, column.as_ref(), offset)?).ok_or_else(overflow))?;
+    parsed_fields.grow_to(bound)?;
     let value = |name| struct_cell(body, name, offset);
     let operation = match name.as_str() {
         "sql" => {
@@ -334,12 +348,11 @@ fn decode_operation(union: &UnionArray, row: usize, memory: &Arc<MemoryBudget>) 
             let docs_union = docs_array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
             let (table, docs_array, docs_offset) = union_leg(docs_union, offset)?;
             let table = parse_table(&table)?;
-            let field = Field::new("documents", docs_array.data_type().clone(), false);
-            let documents = match read_value(&field, docs_array.as_ref(), docs_offset)? {
-                Value::List(rows) => rows.into_iter().map(|row| match row { Value::Struct(document) => Ok(document), _ => Err(invalid("Document is not a struct")) }).collect::<Result<Vec<_>>>()?,
-                _ => return Err(invalid("Documents are not a list")),
-            };
-            let documents = Documents::with_column_order(documents, document_columns(docs_array.data_type())?, memory)?;
+            let lists = docs_array.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Documents are not a list"))?;
+            if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }
+            let rows = lists.value(docs_offset);
+            let structs = rows.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document is not a struct"))?;
+            let documents = Documents::read_arrow(structs, memory)?;
             let valid_from = optional_timestamp(value("_valid_from")?)?;
             let valid_to = optional_timestamp(value("_valid_to")?)?;
             let iids = match value("iids")? { Value::Null | Value::Undefined => None, values => Some(iids(values)?) };
@@ -536,6 +549,33 @@ mod tests {
         let encoded = tx.encode().unwrap();
         assert!(encoded.as_slice().len() < 1 << 20);
         assert!(memory.peak_bytes() < 1 << 27);
+    }
+
+    #[test]
+    fn source_reads_sparse_documents_with_one_row_of_decode_scratch() {
+        let memory = MemoryBudget::new(1 << 28);
+        let operations = (0..100).map(|id| {
+            let mut row = BTreeMap::from([("_id".into(), Value::I64(id))]);
+            for index in 0..10 {
+                row.insert(format!("field_{id}_{index}"), Value::Utf8(format!("value_{id}_{index}")));
+            }
+            TxOp::PutDocs {
+                table: TableRef::new("public", "wide_docs"),
+                documents: Documents::new(vec![row], &memory).unwrap(),
+                valid_from: None,
+                valid_to: None,
+            }
+        }).collect();
+        let source = SourceTransaction::new(operations, SubmitOptions::default(), &memory).unwrap();
+        let encoded = source.encode().unwrap();
+        drop(source);
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        let decoded = SourceTransaction::decode(&message, &memory).unwrap();
+        assert_eq!(decoded.operations.len(), 100);
+        let Operation::PutIids { documents, .. } = &decoded.operations[99] else { panic!("Expected decoded put"); };
+        assert_eq!(documents.columns().len(), 1001);
+        assert_eq!(documents.rows()[0]["field_99_9"], Value::Utf8("value_99_9".into()));
+        assert_eq!(documents.rows()[0]["field_0_0"], Value::Null);
     }
 
     #[test]
