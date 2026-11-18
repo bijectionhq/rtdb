@@ -45,7 +45,12 @@ pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Er
     Error::CorruptLog { path: path.to_path_buf(), offset, reason: reason.into() }
 }
 
-pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogRecord> {
+struct RecordHeader {
+    metadata: LogMetadata,
+    payload_size: usize,
+}
+
+fn read_record_header(file: &mut File, path: &Path, maximum: usize) -> Result<RecordHeader> {
     let offset = file.stream_position().map_err(|error| Error::io(path, error))?;
     let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
     let mut header = [0; HEADER_BYTES as usize];
@@ -59,14 +64,37 @@ pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize) -> Resul
         .ok_or_else(|| corrupt(path, offset, "record end overflows"))?;
     if end > length { return Err(corrupt(path, offset, format!("incomplete record ends at {end}, file length {length}"))); }
     let timestamp = Timestamp(i64::from_be_bytes(header[5..13].try_into().expect("fixed header size")));
-    let mut payload = vec![0; size as usize];
-    file.read_exact(&mut payload).map_err(|error| Error::io(path, error))?;
+    Ok(RecordHeader { metadata: LogMetadata { offset: LogOffset(offset as i64), timestamp }, payload_size: size as usize })
+}
+
+fn read_record_trailer(file: &mut File, path: &Path, offset: LogOffset) -> Result<()> {
     let mut trailer = [0; TRAILER_BYTES as usize];
     file.read_exact(&mut trailer).map_err(|error| Error::io(path, error))?;
-    if i64::from_be_bytes(trailer) != offset as i64 {
-        return Err(corrupt(path, offset, "record trailer does not name its start offset"));
+    if i64::from_be_bytes(trailer) != offset.0 {
+        return Err(corrupt(path, offset.0 as u64, "record trailer does not name its start offset"));
     }
-    Ok(LogRecord { metadata: LogMetadata { offset: LogOffset(offset as i64), timestamp }, payload: Bytes::from(payload) })
+    Ok(())
+}
+
+pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogRecord> {
+    let header = read_record_header(file, path, maximum)?;
+    let mut payload = vec![0; header.payload_size];
+    file.read_exact(&mut payload).map_err(|error| Error::io(path, error))?;
+    read_record_trailer(file, path, header.metadata.offset)?;
+    Ok(LogRecord { metadata: header.metadata, payload: Bytes::from(payload) })
+}
+
+pub(super) fn inspect_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogMetadata> {
+    let header = read_record_header(file, path, maximum)?;
+    let mut remaining = header.payload_size;
+    let mut scratch = [0; 8 * 1024];
+    while remaining > 0 {
+        let size = remaining.min(scratch.len());
+        file.read_exact(&mut scratch[..size]).map_err(|error| Error::io(path, error))?;
+        remaining -= size;
+    }
+    read_record_trailer(file, path, header.metadata.offset)?;
+    Ok(header.metadata)
 }
 
 fn inspect(file: &mut File, path: &Path, maximum: usize) -> Result<LogOffset> {
@@ -75,7 +103,7 @@ fn inspect(file: &mut File, path: &Path, maximum: usize) -> Result<LogOffset> {
     file.seek(SeekFrom::Start(0)).map_err(|error| Error::io(path, error))?;
     let mut latest = LogOffset(-1);
     while file.stream_position().map_err(|error| Error::io(path, error))? < length {
-        latest = read_record(file, path, maximum)?.metadata.offset;
+        latest = inspect_record(file, path, maximum)?.offset;
     }
     Ok(latest)
 }
@@ -237,7 +265,7 @@ impl Log for LocalLog {
             self.reads.run(move || {
                 let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
                 file.seek(SeekFrom::Start(after.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
-                read_record(&mut file, &path, maximum)?;
+                inspect_record(&mut file, &path, maximum)?;
                 file.stream_position().map_err(|error| Error::io(path.as_ref(), error))
             }).await?
         };

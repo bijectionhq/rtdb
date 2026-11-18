@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
 use super::{AppendReceipt, Log, LogOffset, LogRecord, LogTail};
-use super::local::{corrupt, read_record};
+use super::local::{corrupt, inspect_record, read_record};
 use crate::{Error, Result};
 
 #[derive(Clone, Debug)]
@@ -58,9 +58,9 @@ fn latest_in_file(file: &mut File, path: &Path, maximum: usize) -> Result<(LogOf
     let offset = i64::from_be_bytes(trailer);
     if offset < 0 || offset as u64 >= length { return Err(corrupt(path, length - 8, "final offset is outside the log")); }
     file.seek(SeekFrom::Start(offset as u64)).map_err(|error| Error::io(path, error))?;
-    let record = read_record(file, path, maximum)?;
+    let metadata = inspect_record(file, path, maximum)?;
     if file.stream_position().map_err(|error| Error::io(path, error))? != length { return Err(corrupt(path, offset as u64, "final record does not end at the observed file length")); }
-    Ok((record.metadata.offset, length))
+    Ok((metadata.offset, length))
 }
 
 fn unavailable(position: LogOffset) -> Error { Error::UnavailableLogRange { requested: position.0, first_retained: 0 } }
@@ -102,7 +102,7 @@ impl Log for ReadOnlyLocalLog {
                 if after > latest { return Err(unavailable(after)); }
                 let next = if after.0 == -1 { 0 } else {
                     file.seek(SeekFrom::Start(after.0 as u64)).map_err(|error| Error::io(self.path.as_ref(), error))?;
-                    read_record(&mut file, &self.path, self.options.maximum_message_bytes)?;
+                    inspect_record(&mut file, &self.path, self.options.maximum_message_bytes)?;
                     file.stream_position().map_err(|error| Error::io(self.path.as_ref(), error))?
                 };
                 (next, end)

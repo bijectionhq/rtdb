@@ -24,6 +24,77 @@ fn append(path: &Path, payload: &[u8], timestamp: i64) -> LogOffset {
     LogOffset(offset as i64)
 }
 
+fn overwrite(path: &Path, offset: u64, bytes: &[u8]) {
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn assert_corrupt_at<T>(result: rtdb_storage::Result<T>, expected_path: &Path, expected_offset: LogOffset, expected_reason: &str) {
+    match result.err().expect("expected a corrupt log error") {
+        Error::CorruptLog { path, offset, reason } => {
+            assert_eq!(path.as_path(), expected_path);
+            assert_eq!(offset, expected_offset.0 as u64);
+            assert_eq!(reason, expected_reason);
+        }
+        other => panic!("expected a corrupt log error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn local_cursors_resume_after_a_multichunk_frame_and_reach_the_same_tip() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("LOG");
+    let maximum = 2 * 8 * 1024 + 3;
+    let first = append(&path, &vec![42; maximum], -3);
+    let second = append(&path, b"", 9);
+    assert_eq!(second, LogOffset((maximum + 21) as i64));
+    let (writable, driver) = LocalLog::open(&path, LocalLogOptions { maximum_message_bytes: maximum, queue_capacity: 1 }).unwrap();
+    let read_only = ReadOnlyLocalLog::open(&path, ReadOnlyLocalLogOptions {
+        maximum_message_bytes: maximum,
+        maximum_poll_bytes: maximum,
+        ..options()
+    }).unwrap();
+    let logs: [&dyn Log; 2] = [writable.as_ref(), read_only.as_ref()];
+    for log in logs {
+        assert_eq!(log.latest().unwrap(), second);
+        let mut tail = log.tail(first).await.unwrap();
+        let records = tail.poll(Duration::ZERO).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].metadata.offset, second);
+        assert_eq!(records[0].metadata.timestamp, Timestamp(9));
+        assert!(records[0].payload.is_empty());
+        assert!(tail.poll(Duration::ZERO).await.unwrap().is_empty());
+        let mut at_tip = log.tail(second).await.unwrap();
+        assert!(at_tip.poll(Duration::ZERO).await.unwrap().is_empty());
+    }
+    drop(driver);
+    writable.close_and_wait().await;
+}
+
+#[tokio::test]
+async fn local_log_inspection_reports_corrupt_resume_and_tip_frames_at_their_byte_offsets() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("LOG");
+    let first = append(&path, b"first", 1);
+    let second = append(&path, b"second", 2);
+    overwrite(&path, second.0 as u64 - 8, &(first.0 + 1).to_be_bytes());
+
+    let writable = LocalLog::open(&path, LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 1 });
+    assert_corrupt_at(writable, &path, first, "record trailer does not name its start offset");
+
+    let read_only = ReadOnlyLocalLog::open(&path, options()).unwrap();
+    assert_eq!(read_only.latest().unwrap(), second);
+    assert_corrupt_at(read_only.tail(first).await, &path, first, "record trailer does not name its start offset");
+    let mut tail = read_only.tail(second).await.unwrap();
+    assert!(tail.poll(Duration::ZERO).await.unwrap().is_empty());
+
+    overwrite(&path, second.0 as u64, &[0]);
+    assert_corrupt_at(read_only.latest(), &path, second, "expected record separator 0x1e");
+    assert_corrupt_at(tail.poll(Duration::ZERO).await, &path, second, "expected record separator 0x1e");
+}
+
 #[tokio::test]
 async fn missing_log_is_observed_without_creating_a_file_or_directory() {
     let directory = tempfile::tempdir().unwrap();
