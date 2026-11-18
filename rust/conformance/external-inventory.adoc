@@ -20,6 +20,8 @@ Bindings omitted from execution, duplicated bindings and unbound runtime invocat
 Client helper declarations without a reviewed assertion mapping remain unresolved; the validator does not infer that a source candidate is merely a helper.
 
 SQL-logic evidence includes the existing runner's plan, original record streams, both JVM repetitions, native observations, process traces and executed-artifact closure.
+SQL-logic execution receipts record the engine's current storage format version as `environment.storage_version` and the configured query timezone as `environment.timezone` (`UTC`).
+The external inventory reader accepts receipts that omit `environment.storage_version`.
 `native_build` identifies the retained production-artifact manifest, its exact Cargo command/process/messages and copied executable bytes.
 `native_binary` names that retained executable, and native configuration additionally binds the build configuration, feature selection and actual SQL-logic options.
 The validator reparses retained original source bytes and compares every recorded identity, line, expectation and query-limit counter.

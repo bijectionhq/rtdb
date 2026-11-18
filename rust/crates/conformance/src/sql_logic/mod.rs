@@ -2,6 +2,7 @@ mod engine;
 mod format;
 
 use md5::Md5;
+use rtdb_format::keys::CURRENT_STORAGE_VERSION;
 use rtdb_types::Anomaly;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -189,6 +190,16 @@ fn record_unavailable(plan: &Plan, script: &Script, input: &Path, output: &Path,
     Ok(json!({"source":script.source,"selection":script.selection,"records":count,"execution_complete":true,"dispositions":{(reason):count}}))
 }
 
+fn execution_environment() -> Json {
+    json!({
+        "storage_version": CURRENT_STORAGE_VERSION.0,
+        "timezone": "UTC",
+        "locale": "en_US",
+        "source_clock": "2020-01-01T00:00:00Z plus one day per submitted transaction",
+        "query_clock": "wall_clock_or_CURRENT_TIMESTAMP_variable",
+    })
+}
+
 /// Executes every retained record in its script's production node lifetime, then joins that node.
 /// The caller must await completion; externally terminated runs have no completed execution receipt.
 /// Writes new files beneath an absent output directory and never changes source expectations.
@@ -223,7 +234,7 @@ pub async fn execute(plan_path: &Path, output: &Path) -> Result<Json, Error> {
     let execution = json!({"schema_version":1,"engine":"rust","selection":plan.selection,"plan_sha256":plan_sha,
         "artifact_revision":env!("RTDB_CONFORMANCE_REVISION"),"source_dirty":env!("RTDB_CONFORMANCE_DIRTY") != "false",
         "binary_sha256":digest(&std::env::current_exe()?)?,"execution_complete":complete,"complete_parity":false,"scripts":scripts,
-        "environment":{"timezone":"UTC","locale":"en_US","source_clock":"2020-01-01T00:00:00Z plus one day per submitted transaction","query_clock":"wall_clock_or_CURRENT_TIMESTAMP_variable"}});
+        "environment":execution_environment()});
     write_json(&output.join("execution.json"), &execution)?;
     Ok(execution)
 }
@@ -231,6 +242,13 @@ pub async fn execute(plan_path: &Path, output: &Path) -> Result<Json, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn execution_environment_records_storage_version_and_utc_query_configuration() {
+        let environment = execution_environment();
+        assert_eq!(environment["storage_version"].as_i64(), Some(i64::from(CURRENT_STORAGE_VERSION.0)));
+        assert_eq!(environment["timezone"].as_str(), Some("UTC"));
+    }
+
     #[test] fn pinned_md5_ignores_declared_size_and_keeps_hash_case() {
         let mut record: Record = serde_json::from_value(json!({"type":"query","expected":{"count":999,"md5":md5("1\n")}})).unwrap();
         assert!(expected_matches(&record, &json!({"text":"1\n"})));

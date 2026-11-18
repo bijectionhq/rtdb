@@ -2,7 +2,8 @@
   (:require [clojure.test :as t]
             [rtdb.conformance.sql-logic :as adapter]
             [xtdb.error :as err]
-            [xtdb.sql.logic-test.runner :as slt]))
+            [xtdb.sql.logic-test.runner :as slt])
+  (:import (xtdb.api.storage Storage)))
 
 (def options {:max_rows 100, :max_result_bytes 10000})
 (def empty-engine
@@ -10,6 +11,12 @@
     (get-engine-name [_] "xtdb")
     (execute-statement [this _ _] this)
     (execute-query [_ _ _] [[1]])))
+
+(t/deftest execution-environment-records-storage-version-and-utc-query-configuration
+  (let [environment (#'adapter/execution-environment)]
+    (t/is (integer? (:storage_version environment)))
+    (t/is (= Storage/VERSION (:storage_version environment)))
+    (t/is (= "UTC" (:timezone environment)))))
 
 (t/deftest pinned-halt-context-update-reports-error-and-does-not-stop
   (binding [slt/*opts* {:script-mode :validation}]

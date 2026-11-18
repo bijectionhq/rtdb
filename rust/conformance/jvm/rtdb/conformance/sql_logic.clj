@@ -12,7 +12,8 @@
            (java.nio.file Files LinkOption OpenOption Path StandardOpenOption)
            (java.nio.file.attribute FileAttribute)
            (java.security MessageDigest)
-           (java.util HexFormat)))
+           (java.util HexFormat)
+           (xtdb.api.storage Storage)))
 
 (set! *warn-on-reflection* true)
 
@@ -211,6 +212,13 @@
               *out* (Writer/nullWriter)]
       (tu/with-mock-clock (fn [] (tu/with-node (fn [] (slt/with-xtdb run))))))))
 
+(defn- execution-environment []
+  {:storage_version Storage/VERSION
+   :timezone "UTC"
+   :locale "en_US"
+   :source_clock "2020-01-01T00:00:00Z plus one day per submitted transaction"
+   :query_clock "wall_clock_or_CURRENT_TIMESTAMP_variable"})
+
 (defn -main [& arguments]
   (when-not (= 2 (count arguments)) (throw (err/incorrect ::arguments "Expected PLAN.json OUTPUT")))
   (let [plan-path (.normalize (.toAbsolutePath (.toPath (io/file (first arguments)))))
@@ -239,8 +247,7 @@
           execution {:schema_version 1, :engine "jvm", :selection (:selection plan), :plan_sha256 plan-sha,
                      :artifact_revision (:reference plan), :binary_sha256 (file-digest (.resolve output "runtime-artifacts.json")),
                      :execution_complete (every? :execution_complete scripts), :complete_parity false, :scripts scripts, :artifacts artifacts,
-                     :environment {:timezone "UTC", :locale "en_US", :source_clock "2020-01-01T00:00:00Z plus one day per submitted transaction",
-                                   :query_clock "wall_clock_or_CURRENT_TIMESTAMP_variable"}}]
+                     :environment (execution-environment)}]
       (when-not (= artifacts (runtime-artifacts)) (throw (err/incorrect ::runtime-changed "JVM artifacts changed during SQL logic execution")))
       (when-not (= plan-sha (file-digest plan-path)) (throw (err/incorrect ::plan-changed "SLT plan changed during execution")))
       (write-new! (.resolve output "execution.json") execution)
