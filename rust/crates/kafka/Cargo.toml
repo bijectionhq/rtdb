@@ -50,6 +50,7 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rtdb-trie.workspace = true
 
 [lints]
 workspace = true

@@ -4039,6 +4039,7 @@ dependencies = [
  "rtdb-replication",
  "rtdb-storage",
  "rtdb-tls",
+ "rtdb-trie",
  "rtdb-tx",
  "rtdb-types",
  "rtdb-validation-json",
