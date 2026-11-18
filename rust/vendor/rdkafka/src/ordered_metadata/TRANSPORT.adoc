@@ -185,6 +185,7 @@ Public parsed Metadata ownership and ordered native observation APIs retain thei
 
 Additive regression sources cover full/merged pointee lifetime, absent versus present empty arrays, old/new/new-only epoch winners, and source physical/logical partition counts.
 The actual native main actor also runs ordinary and admin parser fixtures and checks retained cache values after releasing their independent parsed arenas.
+Rack-aware topic-info copies initialize a zero rack count for every partition with an absent rack list before comparing assignments.
 Those fixtures use existing native actor queues and client teardown rather than fabricated actor identities or abandoned thread handles.
 The source fixtures have not been compiled or executed.
 

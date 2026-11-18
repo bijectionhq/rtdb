@@ -153,7 +153,38 @@ static int ut_cache_merge_preserves_empty_arrays_and_logical_count(void) {
         RD_UT_PASS();
 }
 
+static int ut_cache_topic_info_compares_absent_racks_as_empty(void) {
+        rd_kafka_metadata_partition_internal_t partitions[2] = RD_ZERO_INIT;
+        rd_kafka_topic_info_t *left, *same, *other;
+        char first_rack[] = "rack-a", other_rack[] = "rack-b";
+        char *racks[] = {first_rack};
+        int absent, equal, ordered;
+
+        partitions[0].id = 0;
+        partitions[1].id = 1;
+        partitions[1].racks = racks;
+        partitions[1].racks_cnt = 1;
+        left = rd_kafka_topic_info_new_with_rack("cache-owned", 2, partitions);
+        same = rd_kafka_topic_info_new_with_rack("cache-owned", 2, partitions);
+        racks[0] = other_rack;
+        other = rd_kafka_topic_info_new_with_rack("cache-owned", 2, partitions);
+
+        absent = left->partitions_internal &&
+                 !left->partitions_internal[0].racks &&
+                 left->partitions_internal[0].racks_cnt == 0;
+        equal = absent && rd_kafka_topic_info_cmp(left, same) == 0;
+        ordered = absent && rd_kafka_topic_info_cmp(left, other) < 0;
+        rd_kafka_topic_info_destroy(other);
+        rd_kafka_topic_info_destroy(same);
+        rd_kafka_topic_info_destroy(left);
+
+        RD_UT_ASSERT(absent && equal && ordered,
+                     "mixed rack presence keeps equal topics equal and compares concrete rack values");
+        RD_UT_PASS();
+}
+
 int unittest_metadata_cache_ownership(void) {
         return ut_cache_full_owns_present_and_empty_racks() + ut_cache_merge_owns_selected_pointees() +
-               ut_cache_merge_preserves_empty_arrays_and_logical_count() + unittest_metadata_cache_parsers();
+               ut_cache_merge_preserves_empty_arrays_and_logical_count() + unittest_metadata_cache_parsers() +
+               ut_cache_topic_info_compares_absent_racks_as_empty();
 }

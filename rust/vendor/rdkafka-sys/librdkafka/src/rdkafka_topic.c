@@ -2002,8 +2002,6 @@ rd_kafka_topic_info_t *rd_kafka_topic_info_new_with_rack(
                 rd_tmpabuf_add_alloc(&tbuf, sizeof(char *) * mdpi[i].racks_cnt);
         }
 
-        /* Only bother allocating this if at least one
-         * rack is there. */
         if (has_racks) {
                 rd_tmpabuf_add_alloc(
                     &tbuf, sizeof(rd_kafka_metadata_partition_internal_t) *
@@ -2023,8 +2021,9 @@ rd_kafka_topic_info_t *rd_kafka_topic_info_new_with_rack(
 
                 for (i = 0; i < partition_cnt; i++) {
                         size_t j;
-                        ti->partitions_internal[i].id    = mdpi[i].id;
-                        ti->partitions_internal[i].racks = NULL;
+                        ti->partitions_internal[i].id        = mdpi[i].id;
+                        ti->partitions_internal[i].racks     = NULL;
+                        ti->partitions_internal[i].racks_cnt = 0;
 
                         if (!mdpi[i].racks)
                                 continue;
