@@ -94,6 +94,7 @@ impl Dialect for SqlDialect {
     fn preserves_doubled_identifier_delimiters(&self) -> bool { true }
     fn supports_from_pipeline(&self) -> bool { true }
     fn supports_values_in_subqueries(&self) -> bool { true }
+    fn supports_scalar_values_rows(&self) -> bool { true }
     fn supports_user_as_identifier(&self) -> bool { true }
     fn supports_expression_derived_tables(&self) -> bool { true }
     fn supports_table_function_syntax(&self) -> bool { false }

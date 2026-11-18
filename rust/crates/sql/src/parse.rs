@@ -533,6 +533,22 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
 
     #[test]
+    fn values_row_ast_retains_scalar_and_tuple_syntax() {
+        use sqlparser::ast::Spanned;
+        let source = "VALUES 1, (2, 3), ROW(), ()";
+        let parsed = Parser::parse_sql(&SqlDialect::default(), source).unwrap();
+        let [ast::Statement::Query(query)] = parsed.as_slice() else { panic!("VALUES query") };
+        let ast::SetExpr::Values(values) = query.body.as_ref() else { panic!("VALUES constructor") };
+        assert_eq!(values.to_string(), source);
+        assert!(matches!(values.rows[0], ast::ValuesRow::Scalar(_)));
+        for (row, expected) in values.rows.iter().zip(["1", "(2, 3)", "ROW()", "()"]) {
+            let span = source_span(source, row.span());
+            assert_eq!(&source[span.start..span.end], expected);
+        }
+        assert!(Parser::parse_sql(&GenericDialect {}, "VALUES 1").is_err());
+    }
+
+    #[test]
     fn both_tokenizer_paths_keep_quoted_identifier_spelling_and_literal_unescaping() {
         let source = r#""é""😀", `a````b`, 'x''y'"#;
         let full = tokenize(source).unwrap();

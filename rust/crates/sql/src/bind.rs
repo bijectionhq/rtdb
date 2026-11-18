@@ -322,19 +322,21 @@ impl Context<'_> {
         Ok(input)
     }
 
-    fn values(&mut self, rows: &[ast::Parens<Vec<ast::Expr>>]) -> Result<Arc<Relation>> {
+    fn values(&mut self, rows: &[ast::ValuesRow]) -> Result<Arc<Relation>> {
         let prefix = self.symbol("xt.values")?;
         let mut bound = Vec::new();
         for row in rows {
             let mut input = Arc::new(Relation::unit());
-            let expressions = row.iter().map(|expr| self.relational_expr(expr, &mut input, &BTreeMap::new())).collect::<Result<Vec<_>>>()?;
+            let expressions = row.expressions().iter().map(|expr| self.relational_expr(expr, &mut input, &BTreeMap::new())).collect::<Result<Vec<_>>>()?;
             bound.push((input, expressions));
         }
         let width = bound.first().map_or(0, |(_, row)| row.len());
-        if bound.iter().any(|(_, row)| row.len() != width) { return Err(error("VALUES rows have different column counts")); }
+        if let Some((_, row)) = bound.iter().find(|(_, row)| row.len() != width) {
+            return Err(error(format!("Column count mismatch: expected {width}, given {}", row.len())));
+        }
         let fields = (0..width).map(|index| {
             let types: Vec<_> = bound.iter().map(|(_, row)| row[index].data_type()).collect();
-            self.binder.field(format!("column{}", index + 1), None, LogicalType::join_all(&types))
+            self.binder.field(format!("_column_{}", index + 1), None, LogicalType::join_all(&types))
         }).collect::<Result<Vec<_>>>()?;
         let schema = Schema::new(fields.clone())?;
         if bound.iter().all(|(input, _)| input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]])) {

@@ -3799,14 +3799,49 @@ impl fmt::Display for Top {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// An explicit `VALUES` clause and its rows.
 pub struct Values {
-    /// Was there an explicit `ROW` keyword (MySQL)?
-    /// <https://dev.mysql.com/doc/refman/8.0/en/values.html>
-    pub explicit_row: bool,
     /// `true` if `VALUE` (singular) keyword was used instead of `VALUES`.
     /// <https://dev.mysql.com/doc/refman/9.2/en/insert.html>
     pub value_keyword: bool,
-    /// The list of rows, each row is a list of expressions.
-    pub rows: Vec<Parens<Vec<Expr>>>,
+    /// Rows written as single expressions or parenthesized constructors.
+    pub rows: Vec<ValuesRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+/// One row in a `VALUES` constructor.
+pub enum ValuesRow {
+    /// An expression that supplies a single column.
+    Scalar(Expr),
+    /// A parenthesized row constructor with zero or more columns.
+    Tuple {
+        /// The optional `ROW` keyword preceding the constructor.
+        row_keyword: Option<AttachedToken>,
+        /// The column expressions and their delimiters.
+        expressions: Parens<Vec<Expr>>,
+    },
+}
+
+impl ValuesRow {
+    /// Returns the expressions in column order.
+    pub fn expressions(&self) -> &[Expr] {
+        match self {
+            Self::Scalar(expr) => core::slice::from_ref(expr),
+            Self::Tuple { expressions, .. } => &expressions.content,
+        }
+    }
+}
+
+impl fmt::Display for ValuesRow {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Scalar(expr) => expr.fmt(f),
+            Self::Tuple { row_keyword, expressions } => {
+                if row_keyword.is_some() { f.write_str("ROW")?; }
+                write!(f, "({})", display_comma_separated(expressions))
+            }
+        }
+    }
 }
 
 impl fmt::Display for Values {
@@ -3815,13 +3850,12 @@ impl fmt::Display for Values {
             true => f.write_str("VALUE")?,
             false => f.write_str("VALUES")?,
         };
-        let prefix = if self.explicit_row { "ROW" } else { "" };
         let mut delim = "";
         for row in &self.rows {
             f.write_str(delim)?;
             delim = ",";
             SpaceOrNewline.fmt(f)?;
-            Indent(format_args!("{prefix}({})", display_comma_separated(row))).fmt(f)?;
+            Indent(row).fmt(f)?;
         }
         Ok(())
     }

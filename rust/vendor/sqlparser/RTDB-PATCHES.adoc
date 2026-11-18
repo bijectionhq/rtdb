@@ -28,3 +28,6 @@ String literals use the dialect's existing unescape rules.
 
 The RTDB dialect disables dedicated `TABLE(expr)` parsing in table-factor position.
 `TABLE` then follows ordinary identifier and function-expression parsing.
+
+`VALUES` rows retain either a scalar expression or a row constructor in the AST.
+The RTDB dialect accepts both forms and allows empty row constructors.

@@ -113,7 +113,7 @@ async fn nested_xtql_and_sql_apply_parameters_share_a_hygienic_allocator() {
 
 #[tokio::test]
 async fn synthetic_inline_table_names_cannot_capture_real_ctes_or_literals() {
-    let sql = "WITH \"_rtdb_inline_xtql_0\" AS (VALUES (9)) SELECT real.column1,embedded.a FROM \"_rtdb_inline_xtql_0\" real CROSS JOIN (XTQL $$(rel [{:a 7}] [a])$$) embedded";
+    let sql = "WITH \"_rtdb_inline_xtql_0\" AS (VALUES (9)) SELECT real._column_1,embedded.a FROM \"_rtdb_inline_xtql_0\" real CROSS JOIN (XTQL $$(rel [{:a 7}] [a])$$) embedded";
     assert_eq!(query(sql,vec![]).await.unwrap(),[vec![V::I64(9),V::I64(7)]]);
     assert_eq!(query("SELECT 'XTQL $$(rel [{}] [])$$' AS text",vec![]).await.unwrap(),[vec![V::Utf8("XTQL $$(rel [{}] [])$$".into())]]);
 }

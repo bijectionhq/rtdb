@@ -47,7 +47,7 @@ use super::{
     RaiseStatementValue, ReferentialAction, RenameSelectItem, ReplaceSelectElement,
     ReplaceSelectItem, Select, SelectInto, SelectItem, SetExpr, SqlOption, Statement, Subscript,
     SymbolDefinition, TableAlias, TableAliasColumnDef, TableConstraint, TableFactor, TableObject,
-    TableOptionsClustered, TableWithJoins, Update, UpdateTableFromKind, Use, Values, ViewColumnDef,
+    TableOptionsClustered, TableWithJoins, Update, UpdateTableFromKind, Use, Values, ValuesRow, ViewColumnDef,
     WhileStatement, WildcardAdditionalOptions, With, WithFill,
 };
 
@@ -261,7 +261,6 @@ impl Spanned for FromPipeline {
 impl Spanned for Values {
     fn span(&self) -> Span {
         let Values {
-            explicit_row: _, // bool,
             value_keyword: _,
             rows,
         } = self;
@@ -270,6 +269,21 @@ impl Spanned for Values {
             [] => Span::empty(),
             [f] => f.span(),
             [f, .., l] => f.span().union(&l.span()),
+        }
+    }
+}
+
+impl Spanned for ValuesRow {
+    fn span(&self) -> Span {
+        match self {
+            Self::Scalar(expr) => expr.span(),
+            Self::Tuple { row_keyword, expressions } => {
+                let span = expressions.span();
+                match row_keyword {
+                    Some(keyword) => span.union(&keyword.0.span),
+                    None => span,
+                }
+            }
         }
     }
 }

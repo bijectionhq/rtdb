@@ -19812,26 +19812,45 @@ impl<'a> Parser<'a> {
         allow_empty: bool,
         value_keyword: bool,
     ) -> Result<Values, ParserError> {
-        let mut explicit_row = false;
+        let scalar_rows = self.dialect.supports_scalar_values_rows();
+        let rows = self.parse_comma_separated(|parser| parser.parse_values_row(allow_empty, scalar_rows))?;
+        Ok(Values { rows, value_keyword })
+    }
 
-        let rows = self.parse_comma_separated(|parser| {
-            if parser.parse_keyword(Keyword::ROW) {
-                explicit_row = true;
-            }
-            Ok(Parens {
-                opening_token: parser.expect_token(&Token::LParen)?.into(),
-                content: if allow_empty && parser.peek_token_ref().token == Token::RParen {
-                    vec![]
-                } else {
-                    parser.parse_comma_separated(Parser::parse_expr)?
+    fn parse_values_row(&mut self, allow_empty: bool, scalar_rows: bool) -> Result<ValuesRow, ParserError> {
+        let row_keyword = if self.peek_keyword(Keyword::ROW)
+            && (!scalar_rows || self.peek_nth_token_ref(1).token == Token::LParen)
+        {
+            Some(self.next_token().into())
+        } else {
+            None
+        };
+        let empty = self.peek_token_ref().token == Token::LParen && self.peek_nth_token_ref(1).token == Token::RParen;
+        if !scalar_rows || row_keyword.is_some() || empty {
+            return Ok(ValuesRow::Tuple {
+                row_keyword,
+                expressions: Parens {
+                    opening_token: self.expect_token(&Token::LParen)?.into(),
+                    content: if (allow_empty || scalar_rows) && self.peek_token_ref().token == Token::RParen {
+                        Vec::new()
+                    } else {
+                        self.parse_comma_separated(Parser::parse_expr)?
+                    },
+                    closing_token: self.expect_token(&Token::RParen)?.into(),
                 },
-                closing_token: parser.expect_token(&Token::RParen)?.into(),
-            })
-        })?;
-        Ok(Values {
-            explicit_row,
-            rows,
-            value_keyword,
+            });
+        }
+        let opening_token = self.peek_token();
+        Ok(match self.parse_expr()? {
+            Expr::Tuple(content) if opening_token.token == Token::LParen => ValuesRow::Tuple {
+                row_keyword: None,
+                expressions: Parens {
+                    opening_token: opening_token.into(),
+                    content,
+                    closing_token: self.get_current_token().clone().into(),
+                },
+            },
+            expr => ValuesRow::Scalar(expr),
         })
     }
 

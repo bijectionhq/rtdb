@@ -1138,6 +1138,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Whether `VALUES` allows single expressions and empty row constructors.
+    fn supports_scalar_values_rows(&self) -> bool {
+        false
+    }
+
     /// Whether `TABLE(expr)` has dedicated table-function syntax.
     fn supports_table_function_syntax(&self) -> bool {
         true

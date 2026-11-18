@@ -21,7 +21,7 @@ fn sqlparser_sort_enum_preserves_directions_and_null_order_at_every_binding_site
     for sql in [
         "SELECT n FROM (VALUES (1),(2)) t(n) ORDER BY n {order}",
         "VALUES (1),(2) ORDER BY 1 {order}",
-        "VALUES (1),(2) ORDER BY column1 {order}",
+        "VALUES (1),(2) ORDER BY _column_1 {order}",
         "SELECT ARRAY_AGG(n ORDER BY n {order}) FROM (VALUES (1),(2)) t(n)",
         "SELECT ROW_NUMBER() OVER (ORDER BY n {order}) FROM (VALUES (1),(2)) t(n)",
     ] {

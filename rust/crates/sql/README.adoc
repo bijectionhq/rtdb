@@ -386,6 +386,10 @@ The numeric catalogue includes `log10`, `sinh`, `cosh`, `tanh` and `mod`; expres
 `tests/math_catalogue.rs` covers nulls, result types and native numeric dispatch as unexecuted source.
 The catalogue regressions also preserve discarded scalar payloads and null arguments without losing the control or union selection that the reference evaluator still demands.
 
+VALUES accepts scalar rows, parenthesized rows and explicit `ROW` constructors.
+Each row supplies the same number of columns, including zero columns for an empty row constructor.
+Without an explicit column list, the result columns use `_column_1`, `_column_2` and subsequent names.
+
 == Series expression lowering
 
 SQL GENERATE_SERIES and RANGE accept two or three arguments and one optional schema qualifier.

@@ -30,6 +30,22 @@ async fn query(sql: &str, parameters: Vec<Value>) -> Result<Vec<Vec<Value>>> {
 }
 
 #[tokio::test]
+async fn values_rows_accept_scalar_expressions_and_keep_row_constructor_widths() {
+    assert_eq!(query("VALUES 40 + 1, (41) + 1, (43), ROW(44), $1", vec![Value::I64(45)]).await.unwrap(),
+        (41..=45).map(|value| vec![Value::I64(value)]).collect::<Vec<_>>());
+    assert_eq!(query("VALUES (1, 2), ROW(3, 4)", vec![]).await.unwrap(),
+        [vec![Value::I64(1), Value::I64(2)], vec![Value::I64(3), Value::I64(4)]]);
+    assert_eq!(query("VALUES ROW(), ()", vec![]).await.unwrap(), [vec![], vec![]]);
+    assert_eq!(query("SELECT 42 IN (VALUES 40 + 2, 43)", vec![]).await.unwrap(), [vec![Value::Bool(true)]]);
+    assert_eq!(query("SELECT q._column_1 FROM (VALUES 41 + 1) q", vec![]).await.unwrap(), [vec![Value::I64(42)]]);
+    let context = context();
+    let Statement::Query(values) = prepare("VALUES (1, 2)", &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("VALUES relation") };
+    assert_eq!(values.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["_column_1", "_column_2"]);
+    assert_eq!(query("VALUES 1, (2, 3)", vec![]).await.unwrap_err().message.as_deref(),
+        Some("Column count mismatch: expected 1, given 2"));
+}
+
+#[tokio::test]
 async fn scalar_subquery_in_select_and_where_preserves_empty_and_single_row_results() {
     assert_eq!(query("SELECT (SELECT 42) AS answer", vec![]).await.unwrap(), vec![vec![Value::I64(42)]]);
     assert_eq!(query("SELECT (SELECT x FROM (VALUES (1)) AS t(x) WHERE FALSE) AS answer", vec![]).await.unwrap(), vec![vec![Value::Null]]);
