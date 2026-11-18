@@ -88,6 +88,8 @@ A replay failure ends the driver; it does not reopen a follower after discarding
 
 The applied-progress monitor intentionally differs from the pinned `api/log/Watchers.kt` and `db.allium`'s `ProcessingErrorHaltsNode`.
 An already-satisfied prefix remains available after a fault or shutdown; unmet waits fail with the current fault or stopped outcome.
+The progress monitor publishes the stopped state and any terminal driver fault together.
+The first recorded fault takes precedence.
 Only an explicitly initialized replacement driver clears the current fault.
 This follows the object-boundaries monitor requirement, and runtime/reference compatibility remains unresolved rather than claimed.
 
@@ -128,6 +130,7 @@ Garbage-age effects of this timestamp choice require reference qualification.
 |`resolved_rows_seed_from_applied_rows_and_resolution_stops_until_adoption` |`BlockCutterTest`: part-filled promotion and paused resolution through readback.
 |`flush_timeout_rearms_when_persisted_transaction_changes_and_cuts_idle_empty_blocks` |`BlockFlusher.kt` exact deadline and persisted-transaction change behavior.
 |`applied_prefix_remains_readable_after_ingestion_failure_and_restart_releases_new_waits` |Object-boundaries monitor contract; explicitly differs from the pinned absorbing Watchers failure.
+|`admitted_replica_fault_reaches_an_unmet_waiter_and_preserves_the_applied_prefix` |A waiter for unapplied progress receives the fault that stopped replica processing.
 |`invalid_progress_does_not_partially_publish_source_or_token` |One atomic applied-progress value and strict source/transaction monotonicity.
 |===
 

@@ -249,12 +249,13 @@ impl ReplicationDriver {
         let shutdown = self.demote().await.map(|_| ());
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() { command.fail(stopped()); }
-        self.progress.stopped();
+        let outcome = result.and(shutdown);
+        let failure = outcome.as_ref().err()
+            .filter(|error| error.category != AnomalyCategory::Interrupted)
+            .cloned();
+        self.progress.driver_stopped(failure);
         self.publish_status(Role::Stopped);
-        match result.and(shutdown) {
-            Err(error) if error.category != AnomalyCategory::Interrupted => { self.progress.ingestion_failed(error.clone()); Err(error) }
-            outcome => outcome,
-        }
+        outcome
     }
     async fn run_inner(&mut self) -> Result<()> {
         if !self.config.enabled {

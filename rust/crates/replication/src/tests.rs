@@ -66,6 +66,34 @@ async fn shutting_down_a_live_leader_joins_the_append_pump_without_an_ingestion_
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_replica_fault_reaches_an_unmet_waiter_and_preserves_the_applied_prefix() {
+    let fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    let handle = fixture.handle.clone();
+    let driver = tokio::spawn(fixture.driver.run());
+    let cancellation = CancellationToken::new();
+    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None });
+    for record in [raw(0, 1, 0, claim), raw(1, 1, 1, resolved(0, 0))] {
+        fixture.replica.enqueue(record.payload, record.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    }
+    let applied = tokio::time::timeout(Duration::from_secs(5), handle.await_tx(TxId(0), &cancellation))
+        .await.unwrap().unwrap().unwrap();
+
+    let unmet = handle.await_tx(TxId(1), &cancellation);
+    tokio::pin!(unmet);
+    assert!(futures::poll!(&mut unmet).is_pending());
+    let record = raw(2, 1, 2, upload(0, 0));
+    fixture.replica.enqueue(record.payload, record.metadata.timestamp).await.unwrap().durable().await.unwrap();
+
+    let waiter_error = tokio::time::timeout(Duration::from_secs(5), unmet).await.unwrap().unwrap_err();
+    let driver_error = tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap_err();
+    assert_eq!(driver_error, Anomaly::fault("rtdb.replication/invalid-transition", "Block upload has no matching pending boundary"));
+    assert_eq!(waiter_error, driver_error);
+    assert_eq!(handle.progress().fault().as_ref(), Some(&driver_error));
+    assert_eq!(handle.status().role, Role::Stopped);
+    assert_eq!(handle.await_tx(TxId(0), &cancellation).await.unwrap().unwrap().tx_key(), applied.tx_key());
+}
+
 #[tokio::test]
 async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
     let fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;

@@ -54,7 +54,14 @@ impl ProgressMonitor {
 
     /// The owner calls this only after a replacement driver has successfully initialized.
     pub fn driver_restarted(&self) { self.state.send_modify(|state| { state.fault = None; state.stopped = false; }); }
-    pub fn stopped(&self) { self.state.send_modify(|state| state.stopped = true); }
+    pub fn stopped(&self) { self.driver_stopped(None); }
+
+    pub(crate) fn driver_stopped(&self, failure: Option<Anomaly>) {
+        self.state.send_modify(|state| {
+            if state.fault.is_none() { state.fault = failure; }
+            state.stopped = true;
+        });
+    }
 
     async fn until(&self, ready: impl Fn(&AppliedProgress) -> bool + Send, cancellation: &CancellationToken) -> Result<AppliedProgress> {
         let mut state = self.state.subscribe();
