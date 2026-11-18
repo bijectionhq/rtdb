@@ -13,6 +13,11 @@
             [xtdb.sql.with-test :as original-with]
             [xtdb.node-test :as original-node]
             [xtdb.sql-test :as original-sql]
+            [xtdb.update-test :as original-update]
+            [xtdb.operator.patch-test :as original-patch]
+            [xtdb.operator.group-by.percentile-test :as original-percentile]
+            [xtdb.operator.unnest-test :as original-unnest]
+            [xtdb.expression.pg-test :as original-pg-expression]
             [xtdb.test-util :as tu]
             [xtdb.protocols :as protocols]
             [xtdb.rust])
@@ -370,6 +375,92 @@
 (deftest-original-api original-series/test-generate-series-limit-batching-4412)
 (deftest-original-api original-identifiers/semi-reserved-keywords-are-usable-as-an-as-alias-6014)
 (deftest-original-api original-identifiers/semi-reserved-keywords-are-usable-as-a-derived-table-column-alias-6014)
+
+(deftest-original-api original-update/update-bulk-5030)
+
+(deftest-original-api original-node/test-multi-value-insert-423)
+
+(deftest-original-api original-node/test-dml-sees-in-tx-docs)
+
+(deftest-original-api original-node/test-delete-without-search-315)
+
+(deftest-original-api original-node/test-update-set-field-from-param-328)
+
+(deftest-original-api original-node/test-put-delete-with-implicit-tables-338)
+
+(deftest-original-api original-node/test-interval-literal-cce-271)
+
+(deftest-original-api original-node/test-overrides-range)
+
+(deftest-original-api original-node/test-current-timestamp-in-temporal-constraint-409)
+
+(deftest-original-api original-node/test-vector-type-mismatch-245)
+
+(deftest-original-api original-node/test-double-quoted-col-refs)
+
+(deftest-original-api original-node/test-select-left-join-2302)
+
+(deftest-original-api original-node/test-list-round-trip-2342)
+
+(deftest-original-api original-node/test-mutable-data-buffer-bug)
+
+(deftest-original-api original-node/test-differing-length-lists-441)
+
+(deftest-original-api original-node/test-normalising-nested-cols-2483)
+
+(deftest-original-api original-node/non-namespaced-keys-for-structs-2418)
+
+(deftest-original-api original-node/non-existant-column-no-nil-rows-2898)
+
+(deftest-original-api original-node/test-get-field-on-duv-with-struct-2425)
+
+(deftest-original-api original-node/distinct-null-2535)
+
+(deftest-original-api original-node/throw-on-unknown-query-type)
+
+(deftest-original-api original-node/test-array-agg-2946)
+
+(deftest-original-api original-node/test-ts-tz-zone-first-wins-3723)
+
+(deftest-original-api original-node/able-to-override-valid-time-in-put-docs)
+
+(deftest-original-api original-node/ingestion-stopped-on-null-col-ref-4259)
+
+(deftest-original-api original-node/test-merge-fields-npe-4721)
+
+(deftest-original-api original-node/test-info-schema-with-empty-set-children-4774)
+
+(deftest-original-api original-node/test-string-escaping-in-vectors)
+
+(deftest-original-api original-patch/test-patch-3879)
+
+(deftest-original-api original-patch/test-multi-entity-patch-sql)
+
+(deftest-original-api original-patch/test-patch-sql)
+
+(deftest-original-api original-patch/patching-lists-with-nils-4752)
+
+(deftest-original-api original-patch/test-patch-list-of-structs-with-nils)
+
+(deftest-original-api original-percentile/test-percentile-via-sql)
+
+(deftest-original-api original-unnest/test-vector-not-found-4343)
+
+(deftest-original-api original-unnest/unnest-ordinality-join-issue-4131)
+
+(deftest-original-api original-pg-expression/test-col-description)
+
+(deftest-original-api original-pg-expression/test-json-arrow-operator)
+
+(deftest-original-api original-pg-expression/test-json-arrow-text-operator)
+
+(deftest-original-api original-pg-expression/test-json-path-operator)
+
+(deftest-original-api original-pg-expression/test-json-path-text-operator)
+
+(deftest-original-api original-pg-expression/test-transit-field-access)
+
+(deftest-original-api original-pg-expression/test-format-type)
 
 (deftest unnest-actor-results
   (with-open [allocator (RootAllocator.)
