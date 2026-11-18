@@ -118,7 +118,7 @@ impl NativeSession {
 
     fn check_control_transaction(&self, allows_failed: bool) -> Result<()> {
         if self.state.status() == TransactionStatus::Failed && !allows_failed {
-            return Err(Anomaly::incorrect("xtdb/tx-failed", "Current transaction is aborted; roll back before issuing more statements"));
+            return Err(Anomaly::incorrect("xtdb/tx-failed", "current transaction is aborted, commands ignored until ROLLBACK is received"));
         }
         Ok(())
     }
@@ -224,15 +224,18 @@ impl NativeSession {
                 allocation.reserve(table.iter().try_fold(256usize, |bytes, identifier| size(bytes, size(identifier.text.len(), 128)?))?)?;
                 Ok(ControlResult::CopyIn { table: table.clone(), format: *format, allocation })
             }
-            ControlStatement::AttachDatabase { name, configuration_yaml } => {
-                self.check_database_control("attach", options)?;
-                let configuration = configuration_yaml.as_deref().map(rtdb_format::config::decode_database_yaml).transpose()?.unwrap_or_else(rtdb_format::config::default_database_config);
+            ControlStatement::AttachDatabase { name, configuration_yaml, source } => {
+                self.check_database_control("attach", name, options)?;
+                let configuration = configuration_yaml.as_deref().map(rtdb_format::config::decode_database_yaml).transpose()
+                    .map_err(|error| Anomaly::incorrect("xtdb/invalid-database-config", format!("Invalid database config in `ATTACH DATABASE`: {}", error.message.as_deref().unwrap_or("null")))
+                        .with_context("sql", source.clone().into()))?
+                    .unwrap_or_else(rtdb_format::config::default_database_config);
                 let result = self.service.node.attach_database(name.clone(), configuration, self.service.identity.as_ref(), cancellation).await?;
                 if let Some(error) = result.error() { return Err(error.clone()); }
                 Ok(ControlResult::Command { tag: "ATTACH DATABASE".into(), transaction: Some(CommitResult::Executed(result)), parameter_status: None, allocation })
             }
             ControlStatement::DetachDatabase { name } => {
-                self.check_database_control("detach", options)?;
+                self.check_database_control("detach", name, options)?;
                 let result = self.service.node.detach_database(name.clone(), self.service.identity.as_ref(), cancellation).await?;
                 if let Some(error) = result.error() { return Err(error.clone()); }
                 Ok(ControlResult::Command { tag: "DETACH DATABASE".into(), transaction: Some(CommitResult::Executed(result)), parameter_status: None, allocation })
@@ -244,9 +247,9 @@ impl NativeSession {
         evaluate_async(expression, &Schema::default(), &[], &EvalContext { parameters, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }).await
     }
 
-    fn check_database_control(&self, action: &str, options: ControlExecutionOptions) -> Result<()> {
-        if self.state.database() != "xtdb" { return Err(Anomaly::incorrect(format!("xtdb.pgwire/{action}-db-on-secondary"), format!("Can only {action} databases when connected to the primary 'xtdb' database."))); }
-        if self.state.status() != TransactionStatus::Idle && !options.implicit_transaction { return Err(Anomaly::incorrect(format!("xtdb.pgwire/{action}-db-in-tx"), format!("Cannot {action} a database in a transaction."))); }
+    fn check_database_control(&self, action: &str, name: &str, options: ControlExecutionOptions) -> Result<()> {
+        if self.state.database() != "xtdb" { return Err(Anomaly::incorrect(format!("xtdb.pgwire/{action}-db-on-secondary"), format!("Can only {action} databases when connected to the primary 'xtdb' database.")).with_context("db", self.state.database().into())); }
+        if self.state.status() != TransactionStatus::Idle && !options.implicit_transaction { return Err(Anomaly::incorrect(format!("xtdb.pgwire/{action}-db-in-tx"), format!("Cannot {action} a database in a transaction.")).with_context("db-name", name.into())); }
         Ok(())
     }
 
@@ -272,7 +275,11 @@ impl NativeSession {
         let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
         let (fields, rows) = match name {
             "snapshot_token" => (vec![(name, text.clone())], vec![vec![Value::Utf8(snapshot_token.unwrap_or_default())]]),
-            "clock_time" => (vec![(name, instant.clone())], vec![vec![timestamp(basis.current_time.as_micros()?)]]),
+            "clock_time" => {
+                let zone = Some(self.state.effective_timezone().to_owned());
+                (vec![(name, LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: zone.clone() }))],
+                 vec![vec![Value::Timestamp { value: basis.current_time.as_micros()?.0, unit: TimeUnit::Microsecond, timezone: zone }]])
+            }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
             "transaction_isolation" => (vec![(name, text.clone())], vec![vec![Value::Utf8("read committed".into())]]),
             "await_token" => (vec![(name, text.clone().maybe())], vec![vec![self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]]),

@@ -210,7 +210,7 @@ fn statement_captures_creation_catalog_for_prepare_schema_and_reexecution() {
     let deferred = handles::statement(deferred).unwrap();
     let dml = native.statement("INSERT INTO docs (_id, label) VALUES (3, 'third')");
     session.region.run(async {
-        session.state.lock().execute_control(&rtdb_plan::ControlStatement::AttachDatabase { name: "other".into(), configuration_yaml: None }, &[], &token).await?;
+        session.state.lock().execute_control(&rtdb_plan::ControlStatement::AttachDatabase { name: "other".into(), configuration_yaml: None, source: "ATTACH DATABASE other".into() }, &[], &token).await?;
         session.state.lock().state_mut().set_database("other")
     }).unwrap();
     let insert = native.statement("INSERT INTO docs (_id, label) VALUES (2, 'second')");

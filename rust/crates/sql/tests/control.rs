@@ -42,7 +42,7 @@ fn sql_parser_copy_attach_and_show_are_shared_typed_controls() {
     let ControlStatement::CopyIn { table, format } = parse("COPY foo.bar FROM STDIN WITH (FORMAT = 'arrow-stream')") else { panic!() };
     assert_eq!(table.iter().map(|name| name.normalized()).collect::<Vec<_>>(), ["foo", "bar"]);
     assert_eq!(format, Some(CopyFormat::ArrowStream));
-    assert_eq!(parse("ATTACH DATABASE \"MyDb\" WITH 'log: !InMemory'"), ControlStatement::AttachDatabase { name: "MyDb".into(), configuration_yaml: Some("log: !InMemory".into()) });
+    assert_eq!(parse("ATTACH DATABASE \"MyDb\" WITH 'log: !InMemory'"), ControlStatement::AttachDatabase { name: "MyDb".into(), configuration_yaml: Some("log: !InMemory".into()), source: "ATTACH DATABASE \"MyDb\" WITH 'log: !InMemory'".into() });
     assert!(parse("SHOW TIME ZONE").requires_read_transaction());
     assert!(!parse("SHOW latest_submitted_tx").requires_read_transaction());
     assert_eq!(parse_control("SELECT 1", &Default::default()).unwrap(), None);
@@ -63,7 +63,7 @@ fn copy_and_attach_use_control_character_string_bodies() {
         ("E'é\nline'", "é\nline"),
     ] {
         let source = format!("/* é\n */ ATTACH DATABASE db WITH {literal}");
-        assert_eq!(parse(&source), ControlStatement::AttachDatabase { name: "db".into(), configuration_yaml: Some(expected.into()) });
+        assert_eq!(parse(&source), ControlStatement::AttachDatabase { name: "db".into(), configuration_yaml: Some(expected.into()), source: source.clone() });
     }
     let ControlStatement::CopyIn { format, .. } = parse(r"COPY docs FROM STDIN WITH (FORMAT E'arrow\x2dstream')") else { panic!() };
     assert_eq!(format, None);

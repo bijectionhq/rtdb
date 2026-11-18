@@ -215,7 +215,7 @@ impl Session {
     fn transaction_mut(&mut self) -> Option<&mut Transaction> { match &mut self.lifecycle { Lifecycle::Open(tx) => tx.as_mut(), Lifecycle::Closed => None } }
     fn require_usable_transaction(&self) -> Result<()> {
         self.ensure_open()?;
-        if self.transaction().is_some_and(|tx| tx.failed) { return Err(Anomaly::incorrect("xtdb/tx-failed", "Current transaction is aborted; roll back before issuing more statements")); }
+        if self.transaction().is_some_and(|tx| tx.failed) { return Err(Anomaly::incorrect("xtdb/tx-failed", "current transaction is aborted, commands ignored until ROLLBACK is received")); }
         Ok(())
     }
     pub fn database(&self) -> &str { &self.database }

@@ -120,7 +120,7 @@ fn validate_basis(basis: Option<&TimeBasis>, catalog: &CatalogSnapshot) -> Resul
         for (index, snapshot) in database.partitions.iter().enumerate() {
             if let Some(requested) = basis.and_then(|basis| basis.databases.get(name)).and_then(|times| times.get(index)).copied().flatten() {
                 if snapshot.tx_basis().is_none_or(|head| requested > head.system_time.into()) {
-                    return Err(unindexed_tx(name, requested, snapshot.tx_basis()));
+                    return Err(unindexed_tx(requested, snapshot.tx_basis()));
                 }
             }
         }
@@ -128,11 +128,21 @@ fn validate_basis(basis: Option<&TimeBasis>, catalog: &CatalogSnapshot) -> Resul
     Ok(())
 }
 
-/// The anomaly for a read basis whose system time is after the latest completed transaction of `database`.
-pub fn unindexed_tx(database: &str, requested: Instant, latest: Option<TransactionKey>) -> Anomaly {
+/// The anomaly for a read basis whose system time is after a database's latest completed transaction.
+pub fn unindexed_tx(requested: Instant, latest: Option<TransactionKey>) -> Anomaly {
     let instant = |time: Instant| time.to_iso_string().unwrap_or_else(|_| format!("{time:?}"));
     let latest_text = latest.map_or_else(|| "nil".to_owned(), |key| format!("#xt/tx-key {{:tx-id {}, :system-time #xt/instant \"{}\"}}", key.tx_id.0, instant(key.system_time.into())));
-    Anomaly::incorrect("xtdb/unindexed-tx", format!("system-time ({}) is after the latest completed tx ({latest_text})", instant(requested)))
-        .with_context("db-name", database.into()).with_context("system-time", serde_json::json!(requested))
-        .with_context("latest-completed-tx", serde_json::json!(latest))
+    let error = Anomaly::incorrect("xtdb/unindexed-tx", format!("system-time ({}) is after the latest completed tx ({latest_text})", instant(requested)));
+    let context = || -> Result<Anomaly> {
+        use rtdb_types::transit_value::TransitValue as T;
+        let latest = match latest {
+            None => T::Null,
+            Some(key) => T::Tagged { tag: "xtdb/tx-key".into(), representation: Box::new(T::Map(vec![
+                (T::Keyword("tx-id".into()), T::Integer(key.tx_id.0)),
+                (T::Keyword("system-time".into()), T::instant(key.system_time.into())?),
+            ])) },
+        };
+        error.clone().with_transit_context("latest-completed-tx", &latest)?.with_transit_context("system-time", &T::instant(requested)?)
+    };
+    context().unwrap_or(error)
 }

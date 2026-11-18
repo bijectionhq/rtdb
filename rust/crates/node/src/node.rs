@@ -225,7 +225,7 @@ impl Node {
             let snapshot = database.partition.open_snapshot(head);
             let requested = basis.snapshot.databases.get(&name).and_then(|partitions| partitions.first()).copied().flatten();
             if let Some(requested) = requested.filter(|requested| snapshot.tx_basis().is_none_or(|head| *requested > head.system_time.into())) {
-                return Err(rtdb_query::unindexed_tx(&name, requested, snapshot.tx_basis()));
+                return Err(rtdb_query::unindexed_tx(requested, snapshot.tx_basis()));
             }
             let cap = requested.map(|time| time.as_micros()).transpose()?;
             let cap = match (cap, basis.snapshot_time) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };

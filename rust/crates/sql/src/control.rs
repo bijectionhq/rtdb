@@ -371,7 +371,7 @@ impl ControlParser<'_> {
         if self.eat("ATTACH") {
             self.expect("DATABASE")?; let name = self.identifier()?.normalized();
             let configuration_yaml = if self.eat("WITH") { Some(self.string()?) } else { None };
-            return Ok(ControlStatement::AttachDatabase { name, configuration_yaml });
+            return Ok(ControlStatement::AttachDatabase { name, configuration_yaml, source: self.source.trim().to_owned() });
         }
         if self.eat("DETACH") { self.expect("DATABASE")?; return Ok(ControlStatement::DetachDatabase { name: self.identifier()?.normalized() }); }
         self.expect("COPY")?;

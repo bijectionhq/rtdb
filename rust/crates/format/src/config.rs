@@ -48,7 +48,7 @@ pub fn decode_database_value(value: Yaml) -> Result<db::DatabaseConfig> {
     let critical = fields.boolean("critical")?.unwrap_or(false);
     let partitions = fields.integer("partitions")?.unwrap_or(1);
     if partitions < 1 { return Err(invalid(format!("partitions must be >= 1, got {partitions}"))); }
-    fields.finish()?;
+    fields.finish_known(&["critical", "externalSource", "log", "mode", "partitions", "storage"])?;
     Ok(db::DatabaseConfig { log: Some(log), storage: Some(storage), mode: Some(mode as i32), external_source, critical: Some(critical), partitions: Some(partitions) })
 }
 
@@ -219,6 +219,11 @@ impl YamlFields {
     }
     pub fn string_map(&mut self, key: &str) -> Result<Option<BTreeMap<String, String>>> {
         self.take(key).map(|value| Self::new(value, key)?.fields.into_iter().map(|(name, value)| Ok((name, scalar_string(&value, key)?))).collect()).transpose()
+    }
+    /// Rejects a leftover key with the reference YAML decoder's wording, which lists the keys the type declares.
+    pub fn finish_known(self, known: &[&str]) -> Result<()> {
+        if let Some(key) = self.fields.keys().next() { return Err(invalid(format!("Unknown property '{key}'. Known properties are: {}", known.join(", ")))); }
+        Ok(())
     }
     pub fn finish(self) -> Result<()> {
         if let Some(key) = self.fields.keys().next() { return Err(invalid(format!("Unknown field '{key}' in {}", self.context))); }

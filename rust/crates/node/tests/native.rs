@@ -1450,10 +1450,38 @@ async fn a_read_basis_after_the_latest_completed_tx_names_both_instants() {
         snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
     let error = node.query_context("xtdb", &basis_at(1_577_836_800_000_000), &Authority, &cancellation).await.err().unwrap();
     assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb/unindexed-tx", Some("system-time (2020-01-01T00:00:00Z) is after the latest completed tx (nil)")));
+    assert_eq!(serde_json::Value::Object(error.context.clone().into_iter().collect()), serde_json::json!({
+        "latest-completed-tx": rtdb_types::transit_value::to_json_value(&rtdb_types::transit_value::TransitValue::Null).unwrap(),
+        "system-time": rtdb_types::transit_value::to_json_value(&rtdb_types::transit_value::TransitValue::instant(rtdb_types::Instant::from(Timestamp(1_577_836_800_000_000))).unwrap()).unwrap(),
+    }));
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
     let error = node.query_context("xtdb", &basis_at(1_609_459_200_000_000), &Authority, &cancellation).await.err().unwrap();
     let message = error.message.unwrap();
     assert!(message.starts_with("system-time (2021-01-01T00:00:00Z) is after the latest completed tx (#xt/tx-key {:tx-id 0, :system-time #xt/instant \"1970-01-01T00:00:"), "{message}");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn clock_time_is_shown_in_the_session_zone_and_database_controls_report_their_target() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let parse = |sql| rtdb_sql::parse_control(sql, &Default::default()).unwrap().unwrap();
+    session.state_mut().set_timezone("Europe/Paris").unwrap();
+    let ControlResult::Rows(show) = session.execute_control(&parse("SHOW CLOCK_TIME"), &[], &token).await.unwrap() else { panic!() };
+    let shown = rows(show).await;
+    assert!(matches!(&shown[0][0], Value::Timestamp { timezone: Some(zone), .. } if zone == "Europe/Paris"), "{shown:?}");
+
+    let error = match session.execute_control(&parse("ATTACH DATABASE new_db WITH $$ somethingElse: $$ "), &[], &token).await { Ok(_) => panic!(), Err(error) => error };
+    assert_eq!(error.message.as_deref(), Some("Invalid database config in `ATTACH DATABASE`: Unknown property 'somethingElse'. Known properties are: critical, externalSource, log, mode, partitions, storage"));
+    assert_eq!(error.context["sql"], "ATTACH DATABASE new_db WITH $$ somethingElse: $$");
+
+    session.execute_control(&parse("BEGIN"), &[], &token).await.unwrap();
+    for (sql, code, name) in [("ATTACH DATABASE new_db", "xtdb.pgwire/attach-db-in-tx", "new_db"), ("DETACH DATABASE old_db", "xtdb.pgwire/detach-db-in-tx", "old_db")] {
+        let error = match session.execute_control(&parse(sql), &[], &token).await { Ok(_) => panic!(), Err(error) => error };
+        assert_eq!((error.code.as_str(), &error.context["db-name"]), (code, &serde_json::json!(name)));
+    }
+    session.execute_control(&parse("ROLLBACK"), &[], &token).await.unwrap();
     stop(&node, driver).await;
 }
