@@ -430,3 +430,26 @@ Before tick 40, `native/recovered-checkpoint.json` records both recovered positi
 3. The same nodes run the second ingest, compaction, layout checks, internal queries, pgwire, PATCH and Flight SQL.
 After shutdown, `native/execution.json` records the recovered prefix, 30 continuation ticks and one PATCH for each node.
 The runner's `result.json` records the internal and wire matches for the pinned case.
+
+=== Replay the closed native checkpoint on the JVM
+
+After Phase 2 begins, use clean implementation and pinned reference checkouts, a conformance binary built from that implementation revision, and a new output directory outside the checkouts and retained inputs.
+Keep the successful original JVM run's workspace and runtime artifacts available at their recorded paths.
+
+[source,shell]
+----
+python3 rust/conformance/run_mixed_iid_jvm_replay.py --phase-two \
+  --reference /absolute/path/to/pinned-reference \
+  --reference-run /absolute/retained/mixed-iid-reference \
+  --native /absolute/path/to/rtdb-conformance \
+  --output /absolute/new/mixed-iid-jvm-replay
+----
+
+1. The runner builds both closed native stores and verifies their execution receipt, physical logs and Arrow file digests.
+It makes writable copies for the JVM, preserving the local log names and mapping `storage/v06` to `objects/v06`.
+2. The JVM opens both copies and checks their adopted blocks and tick-39 transactions before submitting tick 40.
+Each node reaches its exact archived source tip and at least its archived replica tip.
+It uses the original C84 helpers for the continuation, internal queries, pgwire, PATCH and Flight SQL.
+3. The runner compares the typed observations with the retained original JVM case.
+`comparison.json` records the reached predicates and their C84 source lines.
+`result.json` gives the scoped match summary, and the original JUnit receipt identifies the independent reference invocation.

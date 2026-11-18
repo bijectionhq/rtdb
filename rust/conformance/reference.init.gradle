@@ -37,19 +37,27 @@ gradle.projectsEvaluated {
         argumentProviders.add({ ["-m", "rtdb.conformance.history", fixture.get(), output.get()] } as CommandLineArgumentProvider)
         outputs.upToDateWhen { false }
     }
-    root.tasks.register("rtdbConformanceMixedIidReference", JavaExec) { task ->
+    def configureMixedIidRuntime = { JavaExec task ->
         configureRuntime(task)
         def test = referenceTest.get()
-        dependsOn root.tasks.named("testClasses")
-        classpath = test.classpath + root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
-        jvmArgumentProviders.addAll(test.jvmArgumentProviders)
-        environment(test.environment)
-        environment("XTDB_REE_IIDS", "false")
-        environment("XTDB_WITHIN_FILE_RECENCY_BRANCHING", "false")
-        workingDir(root.file(root.providers.gradleProperty("rtdb.mixedIidWorkspace").get()))
-        mainClass = "clojure.main"
+        task.dependsOn root.tasks.named("testClasses")
+        task.classpath = test.classpath + root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
+        task.jvmArgumentProviders.addAll(test.jvmArgumentProviders)
+        task.environment(test.environment)
+        task.environment("XTDB_REE_IIDS", "false")
+        task.environment("XTDB_WITHIN_FILE_RECENCY_BRANCHING", "false")
+        task.workingDir(root.file(root.providers.gradleProperty("rtdb.mixedIidWorkspace").get()))
+        task.mainClass.set("clojure.main")
+        task.outputs.upToDateWhen { false }
+    }
+    root.tasks.register("rtdbConformanceMixedIidReference", JavaExec) { task ->
+        configureMixedIidRuntime(task)
         argumentProviders.add({ ["-m", "rtdb.conformance.mixed-iid-reference", output.get()] } as CommandLineArgumentProvider)
-        outputs.upToDateWhen { false }
+    }
+    root.tasks.register("rtdbConformanceMixedIidReplay", JavaExec) { task ->
+        configureMixedIidRuntime(task)
+        def request = root.providers.gradleProperty("rtdb.mixedIidRequest")
+        argumentProviders.add({ ["-m", "rtdb.conformance.mixed-iid-replay", request.get(), output.get()] } as CommandLineArgumentProvider)
     }
     root.tasks.register("rtdbConformanceParserWire", JavaExec) { task ->
         configureRuntime(task)
