@@ -246,6 +246,15 @@ pub fn parse_properties(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
 }
 
 fn parse_properties_text(text: &str) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    visit_properties_text(text, |key, value| {
+        values.insert(unescape(key)?, unescape(value)?);
+        Ok(())
+    })?;
+    Ok(values)
+}
+
+fn visit_properties_text(text: &str, mut entry: impl FnMut(&str, &str) -> Result<()>) -> Result<()> {
     let mut logical = Vec::new();
     let mut current = String::new();
     let mut continuation = false;
@@ -258,7 +267,6 @@ fn parse_properties_text(text: &str) -> Result<BTreeMap<String, String>> {
         if continuation { current.pop(); } else { logical.push(std::mem::take(&mut current)); }
     }
     if !current.is_empty() { logical.push(current); }
-    let mut result = BTreeMap::new();
     for line in logical {
         let mut escaped = false;
         let mut separator = line.len();
@@ -269,21 +277,28 @@ fn parse_properties_text(text: &str) -> Result<BTreeMap<String, String>> {
         let mut value = line[separator..].trim_start_matches([' ', '\t', '\u{c}']);
         if value.starts_with(['=', ':']) { value = &value[1..]; }
         value = value.trim_start_matches([' ', '\t', '\u{c}']);
-        result.insert(unescape(&line[..separator])?, unescape(value)?);
+        entry(&line[..separator], value)?;
     }
-    Ok(result)
+    Ok(())
 }
 
 fn unescape(input: &str) -> Result<String> {
+    String::from_utf16(&unescape_units(input)?).map_err(|_| Anomaly::incorrect("xtdb.kafka/properties-file", "Unpaired surrogate in Java properties value"))
+}
+
+fn unescape_units(input: &str) -> Result<Vec<u16>> {
     let mut result = Vec::<u16>::new();
     let mut characters = input.chars();
     while let Some(character) = characters.next() {
         let character = if character == '\\' {
             match characters.next() {
                 Some('u') => {
-                    let digits: String = characters.by_ref().take(4).collect();
-                    if digits.len() != 4 { return Err(Anomaly::incorrect("xtdb.kafka/properties-file", "Incomplete Java properties Unicode escape")); }
-                    result.push(u16::from_str_radix(&digits, 16).map_err(|_| Anomaly::incorrect("xtdb.kafka/properties-file", "Invalid Java properties Unicode escape"))?);
+                    let digits = [characters.next(), characters.next(), characters.next(), characters.next()];
+                    if digits[3].is_none() { return Err(Anomaly::incorrect("xtdb.kafka/properties-file", "Incomplete Java properties Unicode escape")); }
+                    let unit = digits.into_iter().flatten().try_fold(0u16, |unit, digit| {
+                        digit.to_digit(16).map(|digit| (unit << 4) | digit as u16)
+                    }).ok_or_else(|| Anomaly::incorrect("xtdb.kafka/properties-file", "Invalid Java properties Unicode escape"))?;
+                    result.push(unit);
                     continue;
                 }
                 Some('t') => '\t', Some('r') => '\r', Some('n') => '\n', Some('f') => '\u{c}', Some(character) => character, None => break,
@@ -292,5 +307,5 @@ fn unescape(input: &str) -> Result<String> {
         let mut units = [0; 2];
         result.extend(character.encode_utf16(&mut units).iter().copied());
     }
-    String::from_utf16(&result).map_err(|_| Anomaly::incorrect("xtdb.kafka/properties-file", "Unpaired surrogate in Java properties value"))
+    Ok(result)
 }

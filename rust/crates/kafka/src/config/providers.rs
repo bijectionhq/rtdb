@@ -8,7 +8,7 @@ use std::{
 
 use rtdb_types::{Anomaly, Result};
 
-use super::parse_properties_text;
+mod file_text;
 
 type Properties = BTreeMap<String, String>;
 type Values<'a> = BTreeMap<&'a str, String>;
@@ -170,8 +170,7 @@ impl Provider {
                 let Some(path) = allowed.path(path)? else { return Ok(BTreeMap::new()); };
                 let source = read_text(&path, reserve)?;
                 reserve(add(product(source.len(), 96)?, 4096)?)?;
-                let mut properties = parse_properties_text(&source)?;
-                Ok(keys.iter().filter_map(|&key| properties.remove(key).map(|value| (key, value))).collect())
+                file_text::selected(&source, keys)
             }
             Self::Directory(allowed) => {
                 let Some(path) = allowed.path(path)?.filter(|path| path.is_dir()) else { return Ok(BTreeMap::new()); };

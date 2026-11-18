@@ -1,6 +1,8 @@
 use super::*;
+#[cfg(unix)]
 use rtdb_types::{AllocationScope, MemoryBudget};
 
+#[cfg(unix)]
 fn properties(roots: &Path) -> Properties {
     BTreeMap::from([
         (PROVIDERS.into(), "file,dir,,".into()),
@@ -80,4 +82,17 @@ fn variable_capture_preserves_empty_fields_optional_path_and_ordinary_braces() {
         ("", "", "", "${:}"),
         ("nested${p", "", "key", "${nested${p:key}"),
     ]);
+}
+
+#[test]
+#[cfg(unix)]
+fn file_provider_projects_the_final_selected_property() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("client.properties");
+    let mut original = properties(root.path());
+    original.insert("setting".into(), format!("${{file:{}:selected}}", file.display()));
+    fs::write(&file, "selected=\\uD800\nselected=ready\nignored=\\uD801\n").unwrap();
+    assert_eq!(resolve(&original, &mut |_| Ok(())).unwrap()["setting"], "ready");
+    fs::write(&file, "selected=ready\nignored=\\u+001\n").unwrap();
+    assert_eq!(resolve(&original, &mut |_| Ok(())).unwrap_err().code, "xtdb.kafka/properties-file");
 }
