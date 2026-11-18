@@ -345,6 +345,8 @@ variant Detach : DbOp {
 ---- Source Log Messages
 
 -- Messages on the source log. Written by clients, by the leader (flush-block), and by the block upload and the compactor (tries-added).
+-- An append retains its encoded record for as long as the log holds those bytes.
+-- The encoder releases temporary memory before handing the record to the log.
 
 entity SourceMessage {
     msg_id: MessageId

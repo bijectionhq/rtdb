@@ -70,6 +70,31 @@ fn upload(index: i64, source: i64) -> ReplicaBody {
 }
 
 #[tokio::test]
+async fn log_records_retain_encoded_bytes_after_releasing_codec_scratch() {
+    let memory = MemoryBudget::new(1 << 20);
+    let source = Arc::new(MemoryLog::new(1 << 20));
+    let replica = Arc::new(MemoryLog::new(1 << 20));
+    let store = Arc::new(MemoryStore::default());
+    let cache = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+    let logs = PartitionLogs::new(source.clone(), replica.clone(), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION,
+        StorageEpoch(0), store, cache, Arc::clone(&memory)).unwrap();
+    let message = SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock::default()));
+    for index in 0..256 {
+        logs.append_source(&message, Timestamp(index)).await.unwrap();
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(index)), message: resolved(index, index) };
+        logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(index)).await.unwrap().durable().await.unwrap();
+    }
+    assert!(memory.used_bytes() < 1 << 18);
+    assert_eq!(source.latest().unwrap(), LogOffset(255));
+    assert_eq!(replica.latest().unwrap(), LogOffset(255));
+    drop(logs);
+    assert_ne!(memory.used_bytes(), 0);
+    drop(source);
+    drop(replica);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head() {
     let directory = tempfile::tempdir().unwrap();
     let options = || LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 2 };

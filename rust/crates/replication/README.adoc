@@ -21,6 +21,7 @@ The source submission API takes caller timestamps, and source-derived transactio
 Tokio timers drive term assertions, and each log tail provider implements its own poll timeouts.
 
 `PartitionLogs` is a passive capability over distinct source and replica logs, their epochs, a partition-scoped object store, its buffer pool, and a memory budget.
+The encoded bytes of a log record own their retained memory charge after the encoder releases temporary scratch.
 `BlockStore` is passive and reads or writes the same scoped storage namespace.
 Its `recover` operation loads the greatest published block index, every table file named by that block, the table and trie catalogs, the next live block, the applied source position, and the boundary's replica fence.
 Recovery itself does not require writable log capabilities.

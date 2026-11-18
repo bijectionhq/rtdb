@@ -27,6 +27,15 @@ impl ReplicaReceipt {
 
 struct EncodedPayload { bytes: Vec<u8>, _reservation: Arc<MemoryReservation> }
 impl AsRef<[u8]> for EncodedPayload { fn as_ref(&self) -> &[u8] { &self.bytes } }
+impl EncodedPayload {
+    fn encode(size: usize, memory: &Arc<MemoryBudget>, encode: impl FnOnce() -> Result<Vec<u8>>) -> Result<Bytes> {
+        let mut reservation = memory.reserve(encoded_allocation(size)?)?;
+        let bytes = encode()?;
+        let retained = bytes.capacity().checked_add(256).ok_or_else(size_overflow)?;
+        Arc::get_mut(&mut reservation).expect("payload encoding owns its reservation").shrink_to(retained)?;
+        Ok(Bytes::from_owner(Self { bytes, _reservation: reservation }))
+    }
+}
 
 pub struct PartitionLogs {
     source: Arc<dyn Log>, replica: Arc<dyn Log>,
@@ -73,10 +82,7 @@ impl PartitionLogs {
         Ok(())
     }
     pub async fn append_source(&self, message: &SourceMessage, now: Timestamp) -> Result<SourcePosition> {
-        let bound = encoded_allocation(message.encoded_len())?;
-        let reservation = self.memory.reserve(bound)?;
-        let bytes = message.encode()?;
-        let payload = Bytes::from_owner(EncodedPayload { bytes, _reservation: reservation });
+        let payload = EncodedPayload::encode(message.encoded_len(), &self.memory, || message.encode())?;
         self.append_source_encoded(payload, now).await
     }
     pub async fn append_source_encoded(&self, payload: Bytes, now: Timestamp) -> Result<SourcePosition> {
@@ -84,9 +90,7 @@ impl PartitionLogs {
         self.source_position(metadata)
     }
     pub async fn enqueue_replica(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp) -> Result<ReplicaReceipt> {
-        let reservation = self.memory.reserve(replica_encoding_bound(envelope)?)?;
-        let bytes = envelope.encode();
-        let payload = Bytes::from_owner(EncodedPayload { bytes, _reservation: reservation });
+        let payload = EncodedPayload::encode(envelope.encoded_len(), &self.memory, || Ok(envelope.encode()))?;
         let receipt = match self.replica.enqueue(payload.clone(), now).await {
             Ok(receipt) => receipt,
             Err(StorageError::MessageTooLarge { .. }) => {
@@ -94,9 +98,8 @@ impl PartitionLogs {
                 self.store.put(&ObjectKey::new(oversized_key(block, &payload_id)?)?, payload).await?;
                 let proxy = ReplicaEnvelope { term: envelope.term, term_sequence: envelope.term_sequence,
                     message: ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(self.storage_version.0), storage_epoch: Some(self.storage_epoch.0), block_index: Some(block.0), payload_id: Some(payload_id) }) };
-                let reservation = self.memory.reserve(replica_encoding_bound(&proxy)?)?;
-                let bytes = proxy.encode();
-                self.replica.enqueue(Bytes::from_owner(EncodedPayload { bytes, _reservation: reservation }), now).await?
+                let payload = EncodedPayload::encode(proxy.encoded_len(), &self.memory, || Ok(proxy.encode()))?;
+                self.replica.enqueue(payload, now).await?
             }
             Err(error) => return Err(error.into()),
         };
@@ -133,9 +136,6 @@ fn inspection_offsets(from: i64, to: i64, epoch: StorageEpoch) -> Result<(LogOff
 
 fn encoded_allocation(payload: usize) -> Result<usize> {
     payload.checked_add(64).and_then(|bytes| bytes.checked_mul(4)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_overflow)
-}
-pub(crate) fn replica_encoding_bound(envelope: &ReplicaEnvelope) -> Result<usize> {
-    encoded_allocation(envelope.encoded_len())
 }
 pub(crate) fn replica_decode_bound(payload_len: usize) -> Result<usize> {
     payload_len.checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_overflow)
