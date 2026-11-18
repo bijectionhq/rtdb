@@ -840,6 +840,40 @@ The Bail mismatch uses the existing same-cause cancellation.
 The LL inline path checks deletion before insertion and anchors a mismatch to the selected context.
 The current statement switches select eligible set tokens before entering those bodies.
 
+== Generated numeric expression root
+
+The private numeric action enters generated `expr(0)` using the source `parseExpr` root and the same SLL Bail and LL Default wrapper.
+Its root completes through the source precedence loop and finishes with `LT(-1)`.
+A semicolon may remain current after the completed expression.
+The expression root preserves the recognizer state set by its last generated action and leaves the EOF match flag clear.
+D89 selects the common-value branch using the retained predictor, including the required lookahead when BETWEEN competes with that branch.
+
+The reached common-value, literal and integer rules retain their primary labelled contexts and indexed raw tokens.
+Integer and float branches use their generated sign predicate and terminal sites.
+The reached precedence roles select additive and multiplicative continuations through d153 and d152.
+The numeric factor checks precedence 61 and invokes its right operand with 62.
+The numeric term checks precedence 60 and invokes its right operand with 61.
+These operands bound the adopted nested common-value calls at levels 0, 61 and 62.
+A same-precedence chain repeats through its owning loop.
+Parenthesized, unary-expression and other unadopted alternatives reach the private scope boundary after their generated choice.
+
+The typed action descriptors check the rule, state, transition and relevant operands against the loaded grammar.
+Call facts identify the actual target and follow state and carry the signed generated precedence.
+Prediction facts identify the state geometry and alternative count, including a loopback linked to the same precedence decision.
+Terminal facts constrain the reached atom or set and its target.
+Predicate facts check the actual transition and compare against the live signed precedence.
+LL sync uses the required block and star block semantics and the nullable precedence entry and loopback semantics.
+A nullable miss records the first context and state, and a matching token clears that capture.
+
+Recursive labels defer their outer attachment until source unroll.
+The actual-caller and top checks retain the saved invoking state, precedence frame and primary context ownership through nested calls.
+If literal entry fails after making its primary context current, the common-value finally unrolls that literal.
+If integer entry fails after becoming current, the literal's already-entered finally exits the integer.
+The common-value finally then unrolls the remaining literal through its saved expression parent.
+The guard binds that residue to the failed integer entry and its original call.
+A denial of outer attachment leaves the recursive precedence popped and saved caller restored.
+Both failure paths keep the original admission error category and execute the entered ancestor finally.
+
 == Finishing-alternative selection
 
 The adaptive caller constructs the candidate no-viable error and seeks the prediction origin before asking the current Local or Full facade for a finishing alternative.

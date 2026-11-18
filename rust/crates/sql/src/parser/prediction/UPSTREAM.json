@@ -225,7 +225,7 @@
     "url": "https://github.com/xtdb/xtdb/blob/c84f9334eb060ceb92d28ecdd4a06e6b625932fd/core/src/main/kotlin/xtdb/query/SqlParser.kt",
     "sha256": "8c92acc27d71359beb31c7821889dd5bb58c07eb1c08927d1b6375f8619966bc"
   },
-  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, required LL isolation block synchronization, LL inline recovery at nine isolation atom sites, and all four generated levelOfIsolation alternatives with their primary labelled context/terminal tree and ISOLATION-only commonTxMode caller through the same-session two-profile retry. The directSqlStatement and multiSqlStatement roots adopt generated statement tree assembly and EOF, with COMMIT, ROLLBACK, DISCARD and SET ROLE alternatives and the complete reached identifier rules. A private direct two-profile windowSpecification tree exercises nullable sync and a captured-context inline mismatch. A private SLL DATE/bracket dataType tree and regular-name fieldDefinition preserve recursive attachment and actual-current cleanup. A private class-initialization input decoder supplies the existing environment with exact loop-pruning and resolved assertion choices. Remaining generated schedules, actual host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
+  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, required LL isolation block synchronization, LL inline recovery at nine isolation atom sites, and all four generated levelOfIsolation alternatives with their primary labelled context/terminal tree and ISOLATION-only commonTxMode caller through the same-session two-profile retry. The directSqlStatement and multiSqlStatement roots adopt generated statement tree assembly and EOF, with COMMIT, ROLLBACK, DISCARD and SET ROLE alternatives and the complete reached identifier rules. The private numeric parseExpr root covers integer and float common values and bounded additive and multiplicative recursion. A private direct two-profile windowSpecification tree exercises nullable sync and a captured-context inline mismatch. A private SLL DATE/bracket dataType tree and regular-name fieldDefinition preserve recursive attachment and actual-current cleanup. A private class-initialization input decoder supplies the existing environment with exact loop-pruning and resolved assertion choices. Remaining generated schedules, actual host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -353,6 +353,16 @@
     "loop": "Decision 1 is called after sync at state 363 StarLoopEntry and state 365 StarLoopBack. State 367 has a separate optional semicolon branch, followed by EOF at 369.",
     "set_matches": [485, 578, 734, 1804, 1900, 2718],
     "modes": "Same-session SLL Bail and LL Default with throwing syntax listener, passive primary tree and scoped generated switch, sync and match sites.",
+    "qualification": "Static source and ATN inspection."
+  },
+  "numeric_expression_root": {
+    "predecessor": "b79f5ad1b23e8297494fb22ef94109e8320cd906",
+    "source_plan_sha256": "83a0e7982b417502d35ddde68da90df1c421589197ec0610ca10d6b8d0be8966",
+    "source_geometry_sha256": "f03f2912a685f10cc76cf72159921ba0ae5c78672b92e0cb902e5ae53336bc25",
+    "source_entry": "SqlParser.kt:60 calls generated Sql.java expr() at 6657–6659 with precedence zero.",
+    "generated": "Rule 33 common-value alternative, rule 34 literal/factor/term alternatives, rule 14 integer and float alternatives, and rule 13 integerLiteral with optional sign. Checked actions preserve reached decisions 55, 89, 98, 99, 151, 152 and 153.",
+    "recursion": "Primary recursion attaches to the saved caller during unroll. Adopted numeric operands have source precedence 0, 61 or 62. Scoped failure handling retains actual literal entry and nested integer-entry/ordinary-finally prefixes.",
+    "scope": "Private generated numeric parseExpr with shared two-profile prediction, lexer demands and no root EOF match. Unary and parenthesized recursion and SELECT remain outside the adopted slice.",
     "qualification": "Static source and ATN inspection."
   },
   "private_runtime_full_domain": {

@@ -1,16 +1,11 @@
 use crate::lexer::IndexedLexeme;
-use crate::parser::grammar::{ExpectedSymbol, StateKindView, TokenSet, TokenType, TransitionView};
+use crate::parser::grammar::{ExpectedSymbol, StateKindView, TransitionView};
 use super::{MismatchExpectation, ParserControl, ParserProfile, ParserSession, ParserState, PassError, PassResult, RuntimeError, RuntimeProblem, RuntimeResult};
+use super::generated_actions::{TerminalAction, TerminalExpectation};
 use super::required_block_sync::TokenReport;
 
 #[derive(Clone, Copy)]
 enum TerminalMatch { Atom, Set }
-
-#[derive(Clone, Copy)]
-enum TerminalExpectation {
-    Atom(TokenType),
-    Set(TokenSet),
-}
 
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
     pub(in crate::parser::prediction) fn match_isolation_atom(&mut self) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
@@ -79,6 +74,23 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             }
         })();
         let (number, expected) = self.finish(site)?;
+        self.match_validated_terminal(number, expected)
+    }
+
+    pub(super) fn match_terminal_action(&mut self, action: TerminalAction) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
+        if self.profile == ParserProfile::Kernel {
+            return self.finish(Err(RuntimeError::Control(RuntimeProblem::Aborted))).map_err(PassError::from);
+        }
+        self.generated_action_state(action.state, action.rule)?;
+        let expected = action.read(&self.environment.storage.grammar_view())
+            .ok_or(RuntimeError::Control(RuntimeProblem::PredictionSite));
+        let expected = self.finish(expected)?;
+        self.match_validated_terminal(action.state, expected)
+    }
+
+    fn match_validated_terminal(
+        &mut self, number: u32, expected: TerminalExpectation,
+    ) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
         if let TerminalExpectation::Atom(token) = expected && self.profile == ParserProfile::SllBail {
             return self.match_bail(token);
         }
@@ -93,9 +105,9 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             }
             return self.recover_inline(number).map_err(PassError::from);
         }
-        let current = match shape {
-            TerminalMatch::Atom => actual,
-            TerminalMatch::Set => self.lookahead_token(1)?.1,
+        let current = match expected {
+            TerminalExpectation::Atom(_) => actual,
+            TerminalExpectation::Set(_) => self.lookahead_token(1)?.1,
         };
         self.consume_match(current)?;
         Ok(matched)

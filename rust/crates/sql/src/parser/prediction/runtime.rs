@@ -30,6 +30,12 @@ mod generated_data_type;
 #[path = "generated_isolation.rs"]
 mod generated_isolation;
 
+#[path = "generated_actions.rs"]
+mod generated_actions;
+
+#[path = "generated_expr.rs"]
+mod generated_expr;
+
 #[path = "generated_names.rs"]
 mod generated_names;
 
@@ -144,6 +150,7 @@ pub(super) enum ContextClass {
     DateType, ArrayType, RegularIdentifier, DelimitedIdentifier,
     CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
     DiscardAll, DiscardPlans, DiscardTemp, DiscardSequences,
+    IntegerLiteral0, FloatLiteral, CommonValueExpr0, LiteralExpr, NumericFactorExpr, NumericTermExpr,
 }
 impl ContextClass {
     fn rule(self) -> u16 {
@@ -151,6 +158,9 @@ impl ContextClass {
             Self::CommitStatement | Self::RollbackStatement | Self::DiscardStatement | Self::SetRoleStatement => 2,
             Self::DiscardAll | Self::DiscardPlans | Self::DiscardTemp | Self::DiscardSequences => 3,
             Self::DateType | Self::ArrayType => 26,
+            Self::IntegerLiteral0 | Self::FloatLiteral => 14,
+            Self::CommonValueExpr0 => 33,
+            Self::LiteralExpr | Self::NumericFactorExpr | Self::NumericTermExpr => 34,
             Self::RegularIdentifier | Self::DelimitedIdentifier => 22,
             Self::IsolationLevelTxMode => 164,
             Self::ReadUncommittedIsolation | Self::ReadCommittedIsolation | Self::RepeatableReadIsolation | Self::SerializableIsolation => 175,
@@ -467,11 +477,15 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     }
 
     fn label_date_type(&mut self, entry: &TreeDataTypeEntry<'parse>) -> RuntimeResult<'sql, InvocationKey<'parse>> {
+        self.label_recursion_base(&entry.0, ContextClass::DateType)
+    }
+
+    fn label_recursion_base(&mut self, entry: &RecursionEntry<'parse>, class: ContextClass) -> RuntimeResult<'sql, InvocationKey<'parse>> {
         let result = (|| {
             self.ready()?;
-            let (saved, generic, rule) = self.active_entry(&entry.0)?;
+            let (saved, generic, rule) = self.active_entry(entry)?;
             let old = self.record(generic)?;
-            if generic != entry.0.key || rule != 26 || old.class.is_some()
+            if generic != entry.key || rule != class.rule() || old.class.is_some()
                 || old.children.is_some() || old.exception.is_some() || old.start.is_none()
             {
                 return Err(RuntimeError::Control(RuntimeProblem::Recursion));
@@ -479,12 +493,12 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
 
             let copy = InvocationRecord {
                 parent: old.parent, invoking: old.invoking, rule, start: old.start, stop: old.stop,
-                role: InvocationRole::RecursiveLabel, exception: None, class: Some(ContextClass::DateType), children: None,
+                role: InvocationRole::RecursiveLabel, exception: None, class: Some(class), children: None,
             };
             let key = InvocationKey::at(self.records.len());
             push(&mut self.records, copy, self.work)?;
             self.current = Some(key);
-            self.records[entry.0.key.index].role = InvocationRole::RecursiveEntry { saved, phase: RecursionPhase::Active { head: key } };
+            self.records[entry.key.index].role = InvocationRole::RecursiveEntry { saved, phase: RecursionPhase::Active { head: key } };
             Ok(key)
         })(); self.finish(result)
     }
@@ -496,10 +510,14 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     }
 
     fn push_data_type_array(&mut self, entry: &TreeDataTypeEntry<'parse>, replacement: RecursionReplacement<'parse>) -> RuntimeResult<'sql, ()> {
+        self.push_recursion_tree(&entry.0, replacement)
+    }
+
+    fn push_recursion_tree(&mut self, entry: &RecursionEntry<'parse>, replacement: RecursionReplacement<'parse>) -> RuntimeResult<'sql, ()> {
         let next = replacement.key;
         let previous = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Recursion));
         let previous = self.finish(previous)?;
-        self.push_recursion(&entry.0, replacement)?;
+        self.push_recursion(entry, replacement)?;
         self.append_child(next, ContextChild::Context(previous))
     }
 
