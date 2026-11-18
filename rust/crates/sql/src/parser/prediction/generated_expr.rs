@@ -1,6 +1,6 @@
 use super::generated_actions::{CallAction, PredicateAction, PredictionAction, SyncAction, SyncShape, TerminalAction, TokenAction};
 use super::{
-    ContextChild, ContextClass, InvocationKey, InvocationRole, ParserControl, ParserSession, ParserState,
+    ContextChild, ContextClass, InvocationKey, InvocationRecord, InvocationRole, ParserControl, ParserSession, ParserState,
     PassError, PassResult, RecursionEntry, RecursionPhase, RuntimeError, RuntimeProblem, RuntimeResult,
 };
 use super::super::{Alternative, PredictionMode};
@@ -9,10 +9,12 @@ use super::super::{Alternative, PredictionMode};
 #[path = "generated_expr_tests.rs"]
 mod tests;
 
+const DATE_TIME_LITERAL: u16 = 12;
 const INTEGER_LITERAL: u16 = 13;
 const LITERAL: u16 = 14;
 const DOLLAR_STRING_TEXT: u16 = 15;
 const CHARACTER_STRING: u16 = 16;
+const TIME_ZONE: u16 = 30;
 const EXPR: u16 = 33;
 const COMMON_VALUE: u16 = 34;
 const SIGN_TOKENS: &[i32] = &[24, 27];
@@ -35,6 +37,9 @@ const LITERAL_BASE: PredictionAction = prediction(LITERAL, 709, 55, 13, SyncShap
 const FLOAT_SIGN: SyncAction = SyncAction { state: 689, rule: LITERAL, shape: SyncShape::RequiredBlock };
 const INTEGER_SIGN: SyncAction = SyncAction { state: 684, rule: INTEGER_LITERAL, shape: SyncShape::RequiredBlock };
 const CHARACTER_STRING_BASE: SyncAction = SyncAction { state: 723, rule: CHARACTER_STRING, shape: SyncShape::RequiredBlock };
+const DATE_TIME_BASE: SyncAction = SyncAction { state: 681, rule: DATE_TIME_LITERAL, shape: SyncShape::RequiredBlock };
+const TIMESTAMP_OPTIONAL_ZONE: SyncAction = SyncAction { state: 678, rule: DATE_TIME_LITERAL, shape: SyncShape::RequiredBlock };
+const TIME_ZONE_BASE: SyncAction = SyncAction { state: 978, rule: TIME_ZONE, shape: SyncShape::RequiredBlock };
 const DOLLAR_BODY: SyncAction = SyncAction { state: 720, rule: CHARACTER_STRING, shape: SyncShape::RequiredBlock };
 const DOLLAR_TEXT_START: SyncAction = SyncAction { state: 712, rule: DOLLAR_STRING_TEXT, shape: SyncShape::RequiredPlusBlock };
 const DOLLAR_TEXT_BACKEDGE: SyncAction = SyncAction { state: 714, rule: DOLLAR_STRING_TEXT, shape: SyncShape::NullablePlusLoopback };
@@ -50,6 +55,18 @@ const LITERAL_INTEGER: CallAction = CallAction {
 };
 const LITERAL_CHARACTER_STRING: CallAction = CallAction {
     state: 693, rule: LITERAL, called: CHARACTER_STRING, start: 32, follow: 710, precedence: 0,
+};
+const LITERAL_DATE_TIME: CallAction = CallAction {
+    state: 695, rule: LITERAL, called: DATE_TIME_LITERAL, start: 24, follow: 710, precedence: 0,
+};
+const DATE_STRING: CallAction = CallAction {
+    state: 675, rule: DATE_TIME_LITERAL, called: CHARACTER_STRING, start: 32, follow: 682, precedence: 0,
+};
+const TIMESTAMP_ZONE: CallAction = CallAction {
+    state: 677, rule: DATE_TIME_LITERAL, called: TIME_ZONE, start: 60, follow: 679, precedence: 0,
+};
+const TIMESTAMP_STRING: CallAction = CallAction {
+    state: 680, rule: DATE_TIME_LITERAL, called: CHARACTER_STRING, start: 32, follow: 682, precedence: 0,
 };
 const DOLLAR_TEXT: CallAction = CallAction {
     state: 719, rule: CHARACTER_STRING, called: DOLLAR_STRING_TEXT, start: 30, follow: 721, precedence: 0,
@@ -76,6 +93,41 @@ const MATCH_FACTOR: TerminalAction = TerminalAction { state: 1640, rule: COMMON_
 const MATCH_TERM: TerminalAction = TerminalAction { state: 1643, rule: COMMON_VALUE, target: 1644, tokens: TokenAction::Set(SIGN_TOKENS) };
 const FACTOR_PREDICATE: PredicateAction = PredicateAction { state: 1639, rule: COMMON_VALUE, target: 1640, minimum: 61 };
 const TERM_PREDICATE: PredicateAction = PredicateAction { state: 1642, rule: COMMON_VALUE, target: 1643, minimum: 60 };
+
+const fn literal_atom(rule: u16, state: u32, token: i32, target: u32) -> TerminalAction {
+    TerminalAction { state, rule, target, tokens: TokenAction::Atom(token) }
+}
+
+const MATCH_DATE: TerminalAction = literal_atom(DATE_TIME_LITERAL, 674, 106, 675);
+const MATCH_TIMESTAMP: TerminalAction = literal_atom(DATE_TIME_LITERAL, 676, 316, 678);
+
+#[derive(Clone, Copy)]
+struct TimeZoneActions {
+    class: ContextClass,
+    prefix: TerminalAction,
+    spelling: SyncAction,
+    time: TerminalAction,
+    zone: TerminalAction,
+    timezone: TerminalAction,
+}
+
+const WITH_TIME_ZONE: TimeZoneActions = TimeZoneActions {
+    class: ContextClass::WithTimeZone,
+    prefix: literal_atom(TIME_ZONE, 966, 358, 970),
+    spelling: SyncAction { state: 970, rule: TIME_ZONE, shape: SyncShape::RequiredBlock },
+    time: literal_atom(TIME_ZONE, 967, 315, 968),
+    zone: literal_atom(TIME_ZONE, 968, 363, 971),
+    timezone: literal_atom(TIME_ZONE, 969, 318, 971),
+};
+
+const WITHOUT_TIME_ZONE: TimeZoneActions = TimeZoneActions {
+    class: ContextClass::WithoutTimeZone,
+    prefix: literal_atom(TIME_ZONE, 972, 359, 976),
+    spelling: SyncAction { state: 976, rule: TIME_ZONE, shape: SyncShape::RequiredBlock },
+    time: literal_atom(TIME_ZONE, 973, 315, 974),
+    zone: literal_atom(TIME_ZONE, 974, 363, 977),
+    timezone: literal_atom(TIME_ZONE, 975, 318, 977),
+};
 
 #[derive(Clone, Copy)]
 struct PrefixedStringLiteral {
@@ -184,6 +236,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 1 => (ContextClass::FloatLiteral, None),
                 2 => (ContextClass::IntegerLiteral0, None),
                 3 => (ContextClass::CharacterStringLiteral, None),
+                5 => (ContextClass::DateTimeLiteral0, None),
                 12 => (ContextClass::BooleanLiteral, None),
                 13 => (ContextClass::NullLiteral, None),
                 alternative => {
@@ -212,9 +265,55 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                     session.generated_call(LITERAL_CHARACTER_STRING)?;
                     session.character_string().map(|_| ())
                 }
+                ContextClass::DateTimeLiteral0 => {
+                    session.generated_call(LITERAL_DATE_TIME)?;
+                    session.date_time_literal().map(|_| ())
+                }
                 ContextClass::BooleanLiteral => session.match_tree_action(*local, MATCH_BOOLEAN),
                 ContextClass::NullLiteral => session.match_tree_action(*local, MATCH_NULL),
                 _ => unreachable!("selected literal class"),
+            }
+        })
+    }
+
+    fn date_time_literal(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(DATE_TIME_LITERAL, |session, local| {
+            let (class, prefix, string) = match session.lookahead_action(DATE_TIME_BASE)?.number() {
+                106 => (ContextClass::DateLiteral, MATCH_DATE, DATE_STRING),
+                316 => (ContextClass::TimestampLiteral, MATCH_TIMESTAMP, TIMESTAMP_STRING),
+                _ => return session.generated_no_viable().map_err(PassError::from),
+            };
+            *local = session.labelled_context(*local, class)?;
+            session.enter_outer_alt(*local)?;
+            session.match_tree_action(*local, prefix)?;
+            if class == ContextClass::TimestampLiteral
+                && matches!(session.lookahead_action(TIMESTAMP_OPTIONAL_ZONE)?.number(), 358 | 359)
+            {
+                session.generated_call(TIMESTAMP_ZONE)?;
+                session.with_or_without_time_zone()?;
+            }
+            session.generated_call(string)?;
+            session.character_string().map(|_| ())
+        })
+    }
+
+    fn with_or_without_time_zone(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(TIME_ZONE, |session, local| {
+            let actions = match session.lookahead_action(TIME_ZONE_BASE)?.number() {
+                358 => WITH_TIME_ZONE,
+                359 => WITHOUT_TIME_ZONE,
+                _ => return session.generated_no_viable().map_err(PassError::from),
+            };
+            *local = session.labelled_context(*local, actions.class)?;
+            session.enter_outer_alt(*local)?;
+            session.match_tree_action(*local, actions.prefix)?;
+            match session.lookahead_action(actions.spelling)?.number() {
+                315 => {
+                    session.match_tree_action(*local, actions.time)?;
+                    session.match_tree_action(*local, actions.zone)
+                }
+                318 => session.match_tree_action(*local, actions.timezone),
+                _ => session.generated_no_viable().map_err(PassError::from),
             }
         })
     }
@@ -353,6 +452,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             (None, InvocationRole::OrdinaryTreeAttachmentFailed, ParserState::State(28)) => return Ok(true),
             (Some(ContextClass::IntegerLiteral0), InvocationRole::Ordinary, ParserState::State(692)) => LITERAL_INTEGER,
             (Some(ContextClass::CharacterStringLiteral), InvocationRole::Ordinary, ParserState::State(693)) => LITERAL_CHARACTER_STRING,
+            (Some(ContextClass::DateTimeLiteral0), InvocationRole::Ordinary, ParserState::State(695)) => LITERAL_DATE_TIME,
             (Some(class), InvocationRole::Ordinary, ParserState::State(state)) => {
                 let Some(literal) = PREFIXED_STRINGS.into_iter().find(|literal| literal.class == class && literal.string.state == state) else {
                     return Ok(false);
@@ -368,6 +468,9 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         if child.rule == call.called && child.parent == Some(current) && child.invoking == ParserState::State(call.state) {
             return Ok(true);
         }
+        if call.called == DATE_TIME_LITERAL {
+            return self.is_failed_date_time_child(current, child);
+        }
         if call.called != CHARACTER_STRING || child.rule != DOLLAR_STRING_TEXT
             || child.invoking != ParserState::State(DOLLAR_TEXT.state) || child.stop.is_none()
         {
@@ -378,5 +481,40 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         Ok(string.rule == CHARACTER_STRING && string.class == Some(ContextClass::DollarString)
             && string.invoking == ParserState::State(call.state) && string.parent == Some(current)
             && string.start.is_some() && string.stop.is_some() && matches!(string.role, InvocationRole::Ordinary))
+    }
+
+    fn is_failed_date_time_child(
+        &self, literal: InvocationKey<'parse>, child: &InvocationRecord<'parse, 'sql>,
+    ) -> RuntimeResult<'sql, bool> {
+        let Some(parent) = child.parent else { return Ok(false); };
+        if child.stop.is_none() {
+            return Ok(false);
+        }
+        let (wrapper, rule, invoking) = if child.rule == DOLLAR_STRING_TEXT {
+            let string = self.record(parent)?;
+            if child.invoking != ParserState::State(DOLLAR_TEXT.state)
+                || string.rule != CHARACTER_STRING || string.class != Some(ContextClass::DollarString)
+                || !matches!(string.role, InvocationRole::Ordinary) || string.start.is_none() || string.stop.is_none()
+            {
+                return Ok(false);
+            }
+            let Some(wrapper) = string.parent else { return Ok(false); };
+            (wrapper, CHARACTER_STRING, string.invoking)
+        } else {
+            (parent, child.rule, child.invoking)
+        };
+        let wrapper = self.record(wrapper)?;
+        if wrapper.rule != DATE_TIME_LITERAL || wrapper.parent != Some(literal)
+            || wrapper.invoking != ParserState::State(LITERAL_DATE_TIME.state)
+            || !matches!(wrapper.role, InvocationRole::Ordinary) || wrapper.start.is_none() || wrapper.stop.is_none()
+        {
+            return Ok(false);
+        }
+        let matches_call = |call: CallAction| rule == call.called && invoking == ParserState::State(call.state);
+        Ok(match wrapper.class {
+            Some(ContextClass::DateLiteral) => matches_call(DATE_STRING),
+            Some(ContextClass::TimestampLiteral) => matches_call(TIMESTAMP_ZONE) || matches_call(TIMESTAMP_STRING),
+            _ => false,
+        })
     }
 }

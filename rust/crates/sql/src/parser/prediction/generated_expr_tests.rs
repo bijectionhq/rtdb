@@ -872,3 +872,252 @@ fn warmed_prefixed_literals_restore_their_exact_direct_and_dollar_child_residues
         assert_eq!(memory.used_bytes(), 0);
     }
 }
+
+#[test]
+fn date_and_timestamp_literals_preserve_raw_string_and_all_zone_trees_in_both_profiles() {
+    let ((), memory) = environment(|environment, work, _| {
+        for (prefix, class, zone, zone_class, raw, string_class) in [
+            ("dAtE", ContextClass::DateLiteral, &[][..], None, "'1901-01-01'", ContextClass::SqlStandardString),
+            ("TiMeStAmP", ContextClass::TimestampLiteral, &[][..], None, "E'2001-02-03T04:05:06'", ContextClass::CEscapesString),
+            ("TIMESTAMP", ContextClass::TimestampLiteral, &["WiTh", "TiMe", "ZoNe"][..], Some(ContextClass::WithTimeZone),
+                "$q$2001-02-03T04:05:06+00$q$", ContextClass::DollarString),
+            ("TIMESTAMP", ContextClass::TimestampLiteral, &["WITH", "TIMEZONE"][..], Some(ContextClass::WithTimeZone),
+                "'2001-02-03T04:05:06+00'", ContextClass::SqlStandardString),
+            ("TIMESTAMP", ContextClass::TimestampLiteral, &["WITHOUT", "TIME", "ZONE"][..], Some(ContextClass::WithoutTimeZone),
+                "'2001-02-03T04:05:06'", ContextClass::SqlStandardString),
+            ("TIMESTAMP", ContextClass::TimestampLiteral, &["WITHOUT", "TIMEZONE"][..], Some(ContextClass::WithoutTimeZone),
+                "'2001-02-03T04:05:06'", ContextClass::SqlStandardString),
+        ] {
+            let source = if zone.is_empty() {
+                format!("{prefix} {raw}; @")
+            } else {
+                format!("{prefix} {} {raw}; @", zone.join(" "))
+            };
+            let start = zone.len() + 1;
+            let stop = start + if string_class == ContextClass::DollarString { 2 } else { 0 };
+            both_profiles(environment, &source, work, |session, root| {
+                let value = expr_value(session, root, stop);
+                let tree = session.invocation_view();
+                let literal = tree.context(child_rule(tree.context(value).unwrap().children())).unwrap();
+                assert_eq!((literal.rule(), literal.class(), literal.parent(), literal.invoking_state()),
+                    (LITERAL, Some(ContextClass::DateTimeLiteral0), Some(value), ParserState::State(1140)));
+                let wrapper = tree.context(child_rule(literal.children())).unwrap();
+                assert_eq!((wrapper.rule(), wrapper.class(), wrapper.parent(), wrapper.invoking_state()),
+                    (DATE_TIME_LITERAL, Some(class), Some(literal.key()), ParserState::State(695)));
+                only_terminal(&wrapper.children()[..1], 0, prefix);
+                let string_index = if let Some(zone_class) = zone_class {
+                    assert_eq!(wrapper.children().len(), 3);
+                    let qualifier = tree.context(child_rule(&wrapper.children()[1..2])).unwrap();
+                    assert_eq!((qualifier.rule(), qualifier.class(), qualifier.parent(), qualifier.invoking_state()),
+                        (TIME_ZONE, Some(zone_class), Some(wrapper.key()), ParserState::State(677)));
+                    assert_eq!((qualifier.start().unwrap().index(), qualifier.stop().unwrap().index()), (1, zone.len()));
+                    assert_eq!(qualifier.children().len(), zone.len());
+                    for (index, raw) in zone.iter().enumerate() {
+                        only_terminal(&qualifier.children()[index..=index], index + 1, raw);
+                    }
+                    2
+                } else {
+                    assert_eq!(wrapper.children().len(), 2);
+                    1
+                };
+                let string = tree.context(child_rule(&wrapper.children()[string_index..])).unwrap();
+                let invoking = if class == ContextClass::DateLiteral { 675 } else { 680 };
+                assert_eq!((string.rule(), string.class(), string.parent(), string.invoking_state()),
+                    (CHARACTER_STRING, Some(string_class), Some(wrapper.key()), ParserState::State(invoking)));
+                assert_eq!((string.start().unwrap().index(), string.stop().unwrap().index()), (start, stop));
+                let first = string.start().unwrap().lexeme().span().start.byte;
+                let end = string.stop().unwrap().lexeme().span().end.byte;
+                assert_eq!(&source[first..end], raw);
+                assert_eq!((literal.start().unwrap().lexeme().span().start.byte, literal.stop().unwrap().lexeme().span().end.byte), (0, end));
+                assert_eq!((wrapper.start().unwrap().index(), wrapper.stop().unwrap().index()), (0, stop));
+                if string_class == ContextClass::DollarString {
+                    assert_eq!(string.children().len(), 3);
+                    only_terminal(&string.children()[..1], start, "$q$");
+                    let body = tree.context(child_rule(&string.children()[1..2])).unwrap();
+                    assert_eq!((body.rule(), body.invoking_state()), (DOLLAR_STRING_TEXT, ParserState::State(719)));
+                    only_terminal(body.children(), start + 1, "2001-02-03T04:05:06+00");
+                    only_terminal(&string.children()[2..], stop, "$q$");
+                } else {
+                    only_terminal(string.children(), start, raw);
+                }
+                assert_eq!(session.buffered_token(stop + 1).unwrap().lexeme().raw(), ";");
+                assert!(session.buffered_token(stop + 2).is_none());
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn date_time_rule14_preserves_the_rule16_rule12_and_rule30_recovery_boundaries() {
+    for (source, offending, index, bail_state, ll_state, message) in [
+        ("DATE )", ")", 1, 723, Some(ParserState::State(723)),
+            "mismatched input ')' expecting {CHARACTER_STRING, C_ESCAPES_STRING, DOLLAR_TAG}"),
+        ("TIMESTAMP ) 'x'", ")", 1, 723, None,
+            "extraneous input ')' expecting {CHARACTER_STRING, C_ESCAPES_STRING, 'WITH', 'WITHOUT', DOLLAR_TAG}"),
+        ("TIMESTAMP WITH TIME 'x'", "'x'", 3, 968, None, "missing 'ZONE' at ''x''"),
+    ] {
+        let (result, memory) = environment(|environment, work, _| {
+            let mut passes = Vec::new();
+            let result = with_bail_fallback(environment, source, work, |session, mode| {
+                let root = InvocationKey::at(session.records.len() + 1);
+                let action = session.scalar_literal(mode);
+                passes.push(mode);
+                let tree = session.invocation_view();
+                let literal = tree.context(root).unwrap();
+                assert_eq!(literal.class(), Some(ContextClass::DateTimeLiteral0));
+                let wrapper = tree.context(child_rule(literal.children())).unwrap();
+                let date = source.starts_with("DATE");
+                let (prefix, class) = if date { ("DATE", ContextClass::DateLiteral) } else { ("TIMESTAMP", ContextClass::TimestampLiteral) };
+                assert_eq!((wrapper.rule(), wrapper.class(), wrapper.parent(), wrapper.invoking_state()),
+                    (DATE_TIME_LITERAL, Some(class), Some(root), ParserState::State(695)));
+                only_terminal(&wrapper.children()[..1], 0, prefix);
+                let owner = if bail_state == 968 {
+                    let zone = tree.context(child_rule(&wrapper.children()[1..])).unwrap();
+                    assert_eq!((zone.rule(), zone.class(), zone.invoking_state()),
+                        (TIME_ZONE, Some(ContextClass::WithTimeZone), ParserState::State(677)));
+                    assert_eq!(zone.children().len(), 2);
+                    only_terminal(&zone.children()[..1], 1, "WITH");
+                    only_terminal(&zone.children()[1..], 2, "TIME");
+                    zone
+                } else if date || mode == PredictionMode::Sll {
+                    let string = tree.context(child_rule(&wrapper.children()[1..])).unwrap();
+                    assert_eq!((string.rule(), string.class(), string.invoking_state()),
+                        (CHARACTER_STRING, None, ParserState::State(if date { 675 } else { 680 })));
+                    assert!(string.children().is_empty());
+                    string
+                } else {
+                    assert_eq!(wrapper.children().len(), 1);
+                    wrapper
+                };
+                assert_eq!((owner.stop().unwrap().index(), wrapper.stop().unwrap().index(), literal.stop().unwrap().index()),
+                    (index - 1, index - 1, index - 1));
+
+                if mode == PredictionMode::Sll {
+                    assert!(matches!(action, Err(PassError::Cancelled(_))));
+                    let cause = tree.exception(owner.key()).unwrap();
+                    match cause {
+                        InvocationCause::NoViableAlternative(cause) => {
+                            assert_eq!(bail_state, 723);
+                            assert_eq!((cause.state, cause.start.index(), cause.offending.index()), (ParserState::State(723), index, index));
+                        }
+                        InvocationCause::InputMismatch(cause) => {
+                            assert_eq!(bail_state, 968);
+                            assert_eq!((cause.state, cause.offending.index()), (ParserState::State(968), index));
+                        }
+                    }
+                    assert!(std::ptr::eq(cause, tree.exception(wrapper.key()).unwrap()));
+                    assert!(std::ptr::eq(cause, tree.exception(root).unwrap()));
+                    assert!(session.buffered_token(index + 1).is_none());
+                } else {
+                    assert_eq!(tree.exception(owner.key()).is_some(), ll_state.is_some());
+                    assert!(tree.exception(root).is_none());
+                    let second = if !date && bail_state == 723 { Kind::CharacterString } else { Kind::Eof };
+                    assert_eq!(session.buffered_token(index + 1).unwrap().lexeme().kind(), second);
+                    assert!(session.buffered_token(index + 2).is_none());
+                }
+                assert_eq!((session.current(), session.input_index(), session.matched_eof), (None, Some(index), false));
+                action.map(|_| ())
+            });
+            assert_eq!(passes, [PredictionMode::Sll, PredictionMode::Ll]);
+            result
+        });
+        let Err(RuntimeError::ReportedTokenSyntax(report)) = result else { panic!("generated date-time literal report"); };
+        assert_eq!(report.cause().map(|cause| cause.state), ll_state);
+        assert_eq!((report.offending().index(), report.offending().lexeme().raw()), (index, offending));
+        assert_eq!(report.anomaly().code, "xtdb/sql-error");
+        assert!(report.anomaly().message.as_deref().unwrap().ends_with(message));
+        drop(report);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn warmed_date_time_literals_restore_direct_and_nested_failed_attachments() {
+    for (source, ordinal, parent, rule, invoking, start, stop) in [
+        ("DATE 'x'", 6, 5, DATE_TIME_LITERAL, 695, 0, None),
+        ("DATE 'x'", 8, 7, CHARACTER_STRING, 675, 1, Some(0)),
+        ("TIMESTAMP WITH TIME ZONE 'x'", 8, 7, TIME_ZONE, 677, 1, Some(0)),
+        ("DATE $q$x$q$", 10, 9, DOLLAR_STRING_TEXT, 719, 2, Some(1)),
+    ] {
+        let (result, memory) = environment(|environment, work, memory| {
+            let baseline = work.memory_budget().used_bytes();
+            {
+                let parse_work = AllocationScope::new(memory).unwrap();
+                with_bail_fallback(environment, source, &parse_work, |session, mode| {
+                    assert_eq!(mode, PredictionMode::Sll);
+                    session.numeric_expression().map(|_| ())
+                })?;
+            }
+            assert_eq!(memory.used_bytes(), baseline);
+            let arena = Layout::array::<InvocationRecord<'_, '_>>(16).unwrap().size() + 256;
+            let single = Layout::array::<ContextChild<'_, '_>>(1).unwrap().size() + 256;
+            let pair = Layout::array::<ContextChild<'_, '_>>(2).unwrap().size() + 256;
+            let capacity = arena + match rule {
+                DATE_TIME_LITERAL => single,
+                CHARACTER_STRING | TIME_ZONE => 3 * single,
+                DOLLAR_STRING_TEXT => 4 * single + pair,
+                _ => unreachable!("fixture attachment rule"),
+            };
+            {
+                let parse_work = AllocationScope::new(memory).unwrap();
+                with_parser_session(environment, source, &parse_work, |session| {
+                    session.profile = ParserProfile::SllBail;
+                    let held = memory.reserve(memory.limit_bytes() - memory.used_bytes() - capacity).unwrap();
+                    let action = session.numeric_expression();
+                    let Err(PassError::Runtime(RuntimeError::Prediction(PredictionError::Admission(error)))) = action
+                        else { panic!("date-time child attachment denial"); };
+                    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                    let denied_request = format!("Cannot reserve {single} bytes from budget ");
+                    assert!(error.message.as_deref().unwrap().starts_with(denied_request.as_str()));
+
+                    assert_eq!(session.records.len(), ordinal + 1);
+                    assert!(matches!(session.records[ordinal].role, InvocationRole::OrdinaryTreeAttachmentFailed));
+                    let tree = session.invocation_view();
+                    let expr = tree.context(InvocationKey::at(1)).unwrap();
+                    let literal = tree.context(InvocationKey::at(5)).unwrap();
+                    assert_eq!((literal.rule(), literal.class(), literal.parent()),
+                        (LITERAL, Some(ContextClass::DateTimeLiteral0), Some(expr.key())));
+                    assert_eq!(literal.stop().map(|token| token.index()), stop);
+                    let failed = tree.context(InvocationKey::at(ordinal)).unwrap();
+                    assert_eq!((failed.rule(), failed.class(), failed.parent(), failed.invoking_state()),
+                        (rule, None, Some(InvocationKey::at(parent)), ParserState::State(invoking)));
+                    assert_eq!((failed.start().unwrap().index(), failed.stop().map(|token| token.index())), (start, stop));
+                    assert!(expr.children().is_empty() && failed.children().is_empty());
+                    if rule == DATE_TIME_LITERAL {
+                        assert!(literal.children().is_empty());
+                    } else {
+                        let wrapper = tree.context(child_rule(literal.children())).unwrap();
+                        let (prefix, class) = if rule == TIME_ZONE {
+                            ("TIMESTAMP", ContextClass::TimestampLiteral)
+                        } else {
+                            ("DATE", ContextClass::DateLiteral)
+                        };
+                        assert_eq!((wrapper.key(), wrapper.class(), wrapper.invoking_state(), wrapper.stop().map(|token| token.index())),
+                            (InvocationKey::at(7), Some(class), ParserState::State(695), stop));
+                        only_terminal(&wrapper.children()[..1], 0, prefix);
+                        if rule == DOLLAR_STRING_TEXT {
+                            let string = tree.context(child_rule(&wrapper.children()[1..])).unwrap();
+                            assert_eq!((string.key(), string.class(), string.invoking_state(), string.stop().unwrap().index()),
+                                (InvocationKey::at(9), Some(ContextClass::DollarString), ParserState::State(675), 1));
+                            only_terminal(string.children(), 1, "$q$");
+                        } else {
+                            assert_eq!(wrapper.children().len(), 1);
+                        }
+                    }
+                    assert_eq!((session.current(), session.state(), session.input_index(), session.precedence()),
+                        (None, ParserState::State(695), Some(start), 0));
+                    assert!(matches!(session.records[0].role, InvocationRole::RecursiveEntry { phase: RecursionPhase::Closed, .. }));
+                    assert!(matches!(session.records[2].role, InvocationRole::RecursiveEntry { phase: RecursionPhase::Closed, .. }));
+                    assert!(!session.matched_eof);
+                    drop(held);
+                    Ok(())
+                })?;
+            }
+            assert_eq!(memory.used_bytes(), baseline);
+            Ok::<(), RuntimeError<'_>>(())
+        });
+        result.unwrap();
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}

@@ -888,6 +888,10 @@ UNKNOWN belongs to the separate Boolean predicate grammar.
 The CharacterStringLiteral alternative invokes the ordinary characterString rule at 693.
 The TIME, DURATION, UUID, URI and KEYWORD alternatives each retain a prefix terminal before their characterString child.
 Their prefix and call states are 696 and 697, 699 and 700, 701 and 702, 703 and 704, and 705 and 706, respectively.
+Decision 55's DATE and TIMESTAMP branch retains an ordinary DateTimeLiteral0 parent and the labelled dateTimeLiteral child invoked at 695.
+DATE matches its prefix at 674 and enters characterString at 675.
+TIMESTAMP matches its prefix at 676, checks for WITH or WITHOUT at 678 and enters characterString at 680.
+A zone child at 677 preserves its WITH or WITHOUT label and selects TIME ZONE or TIMEZONE at 970 or 976, respectively.
 The characterString child synchronizes at 723 and switches on its own current token.
 The standard and C-escaped branches install distinct primary labels and match their atoms at 716 and 717.
 The dollar branch installs its primary label and matches the opening token at 718.
@@ -901,6 +905,9 @@ When EOF is in the closing atom's follow set, LL reports a missing DM_END_TAG wi
 If the text rule's attachment is denied before its try, the entered string and literal finally operations leave the literal current.
 Common-value unroll authenticates that residue by following the failed text record through the exited dollar string to the original literal call.
 For a prefixed literal the same check binds the exited characterString context to the literal's prefix-specific call state.
+Common-value unroll recognizes a failed dateTimeLiteral attachment at call 695.
+For an attachment denied inside that rule the check binds the failed child through the exited dateTimeLiteral context.
+For a failed dollar text attachment the check also binds the exited characterString context to its DATE or TIMESTAMP call.
 
 Quote transformations, C escape interpretation and dollar-text assembly belong to the separate string visitor.
 The scalar expression and SELECT trees retain the raw token spellings and source spans.

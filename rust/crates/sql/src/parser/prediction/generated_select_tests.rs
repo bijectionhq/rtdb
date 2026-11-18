@@ -655,3 +655,139 @@ fn prefixed_string_projections_use_the_same_literal_trees_in_direct_and_multi_ro
     });
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn date_time_projections_preserve_wrapper_and_zone_children_in_both_statement_roots() {
+    let ((), memory) = environment(|environment, work, _| {
+        let direct = "SELECT DATE '1901-01-01' AS d, TIMESTAMP WITHOUT TIME ZONE $q$2001-02-03T04:05:06$q$ AS t;";
+        let multiple = format!("{direct} ROLLBACK;");
+        for (source, multi, statement_call, eof) in [(direct, false, 352, 16), (multiple.as_str(), true, 358, 18)] {
+            both_profiles(environment, source, work, multi, |session, root| {
+                let (_, _, list) = projection(session, root, 0, statement_call, 0, false);
+                assert_eq!(list.children().len(), 3);
+                for (item, start, stop, prefix, name, class) in [
+                    (0, 1, 2, "DATE", "d", ContextClass::DateLiteral),
+                    (2, 6, 12, "TIMESTAMP", "t", ContextClass::TimestampLiteral),
+                ] {
+                    let column = derived(session, list.key(), item, item == 0);
+                    let expr = child(session, column.key(), 0, 33, 2405);
+                    bounds(expr, start, stop);
+                    let value = child(session, expr.key(), 0, 34, 1000);
+                    let literal = child(session, value.key(), 0, 14, 1140);
+                    assert_eq!((literal.class(), literal.children().len()), (Some(ContextClass::DateTimeLiteral0), 1));
+                    bounds(literal, start, stop);
+                    let wrapper = child(session, literal.key(), 0, 12, 695);
+                    assert_eq!(wrapper.class(), Some(class));
+                    bounds(wrapper, start, stop);
+                    terminal(wrapper.children()[0], start, prefix);
+                    if class == ContextClass::DateLiteral {
+                        assert_eq!(wrapper.children().len(), 2);
+                        let string = child(session, wrapper.key(), 1, 16, 675);
+                        assert_eq!(string.class(), Some(ContextClass::SqlStandardString));
+                        terminal(string.children()[0], 2, "'1901-01-01'");
+                    } else {
+                        assert_eq!(wrapper.children().len(), 3);
+                        let zone = child(session, wrapper.key(), 1, 30, 677);
+                        assert_eq!((zone.class(), zone.children().len()), (Some(ContextClass::WithoutTimeZone), 3));
+                        bounds(zone, 7, 9);
+                        for (index, raw) in ["WITHOUT", "TIME", "ZONE"].into_iter().enumerate() {
+                            terminal(zone.children()[index], 7 + index, raw);
+                        }
+                        let string = child(session, wrapper.key(), 2, 16, 680);
+                        assert_eq!((string.class(), string.children().len()), (Some(ContextClass::DollarString), 3));
+                        bounds(string, 10, 12);
+                        terminal(string.children()[0], 10, "$q$");
+                        let content = child(session, string.key(), 1, 15, 719);
+                        terminal(content.children()[0], 11, "2001-02-03T04:05:06");
+                        terminal(string.children()[2], 12, "$q$");
+                    }
+                    let alias = child(session, column.key(), 1, AS_CLAUSE, 2406);
+                    terminal(alias.children()[0], stop + 1, "AS");
+                    let label = child(session, alias.key(), 1, COLUMN_LABEL, 2410);
+                    let identifier = child(session, label.key(), 0, 22, 852);
+                    terminal(identifier.children()[0], stop + 2, name);
+                }
+                let tree = session.invocation_view();
+                let root_view = tree.context(root).unwrap();
+                terminal(root_view.children()[1], 15, ";");
+                if multi {
+                    let rollback = child(session, root, 2, STATEMENT, 360);
+                    assert_eq!(rollback.class(), Some(ContextClass::RollbackStatement));
+                    terminal(root_view.children()[3], 17, ";");
+                }
+                complete_root(session, root, if multi { 1 } else { 0 }, eof);
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn warmed_select_restores_the_query_body_after_a_date_dollar_text_attachment_denial() {
+    let (result, memory) = environment(|environment, work, memory| {
+        let source = "SELECT DATE $q$text$q$";
+        let baseline = work.memory_budget().used_bytes();
+        {
+            let parse_work = AllocationScope::new(memory).unwrap();
+            with_bail_fallback(environment, source, &parse_work, |session, mode| {
+                assert_eq!(mode, PredictionMode::Sll);
+                session.direct_sql_statement().map(|_| ())
+            })?;
+        }
+        assert_eq!(memory.used_bytes(), baseline);
+        let arena16 = Layout::array::<InvocationRecord<'_, '_>>(16).unwrap().size() + 256;
+        let arena32 = Layout::array::<InvocationRecord<'_, '_>>(32).unwrap().size() + 256;
+        let single = Layout::array::<ContextChild<'_, '_>>(1).unwrap().size() + 256;
+        let pair = Layout::array::<ContextChild<'_, '_>>(2).unwrap().size() + 256;
+        let capacity = arena16 + arena32 + 11 * single + 2 * pair;
+        {
+            let parse_work = AllocationScope::new(memory).unwrap();
+            with_parser_session(environment, source, &parse_work, |session| {
+                session.profile = ParserProfile::SllBail;
+                let held = memory.reserve(memory.limit_bytes() - memory.used_bytes() - capacity).unwrap();
+                let action = session.direct_sql_statement();
+                let Err(PassError::Runtime(RuntimeError::Prediction(PredictionError::Admission(error)))) = action
+                    else { panic!("date dollar text attachment denial in SELECT"); };
+                assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                let denied_request = format!("Cannot reserve {single} bytes from budget ");
+                assert!(error.message.as_deref().unwrap().starts_with(denied_request.as_str()));
+                assert_eq!(session.records.len(), 22);
+                for ordinal in [5, 11, 13] {
+                    assert!(matches!(session.records[ordinal].role, InvocationRole::RecursiveEntry { phase: RecursionPhase::Closed, .. }));
+                }
+                assert!(matches!(session.records[21].role, InvocationRole::OrdinaryTreeAttachmentFailed));
+
+                let tree = session.invocation_view();
+                let body = tree.context(InvocationKey::at(6)).unwrap();
+                assert_eq!(body.class(), Some(ContextClass::QuerySpecification));
+                bounds(body, 0, 2);
+                let clause = child(session, body.key(), 0, SELECT_CLAUSE, 2455);
+                assert_eq!(clause.key(), InvocationKey::at(7));
+                bounds(clause, 0, 2);
+                let literal = tree.context(InvocationKey::at(16)).unwrap();
+                assert_eq!((literal.class(), literal.parent()), (Some(ContextClass::DateTimeLiteral0), Some(InvocationKey::at(12))));
+                bounds(literal, 1, 2);
+                let date = child(session, literal.key(), 0, 12, 695);
+                assert_eq!((date.key(), date.class()), (InvocationKey::at(18), Some(ContextClass::DateLiteral)));
+                bounds(date, 1, 2);
+                let string = child(session, date.key(), 1, 16, 675);
+                assert_eq!((string.key(), string.class(), string.children().len()), (InvocationKey::at(20), Some(ContextClass::DollarString), 1));
+                bounds(string, 2, 2);
+                terminal(string.children()[0], 2, "$q$");
+                let failed = tree.context(InvocationKey::at(21)).unwrap();
+                assert_eq!((failed.rule(), failed.parent(), failed.invoking_state()), (15, Some(string.key()), ParserState::State(719)));
+                bounds(failed, 3, 2);
+                assert_eq!((session.current(), session.state(), session.input_index(), session.precedence()),
+                    (None, ParserState::RootSentinel, Some(3), 0));
+                assert_eq!(session.syntax_errors, 0);
+                assert!(!session.matched_eof);
+                drop(held);
+                Ok(())
+            })?;
+        }
+        assert_eq!(memory.used_bytes(), baseline);
+        Ok::<(), RuntimeError<'_>>(())
+    });
+    result.unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+}

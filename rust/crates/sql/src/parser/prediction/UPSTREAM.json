@@ -399,6 +399,15 @@
     "scope": "Private raw prefixed string trees through the expression, direct statement and multi-statement roots in both profiles.",
     "qualification": "Static source and ATN inspection. Execution remains pending."
   },
+  "date_time_literal_trees": {
+    "predecessor": "36a667d8b235fe3a399dfcb53f87d509947bc21b",
+    "source_plan_sha256": "e4bc596b59815e81ab886c9551ec90588f5c86b01a0c10384c32e2c5f20b5b24",
+    "source_geometry_sha256": "6eefe57761f41db0f27650ffe68653999668a217b111b32b952d5866843e22f0",
+    "generated": "Rule 14 decision 55 alternative 5 invokes rule 12 at 695. DATE and TIMESTAMP retain the rule 16 calls at 675 and 680, with the optional rule 30 zone child at 677.",
+    "cleanup": "The exact date-time call identifies an exited rule 12 parent of a failed zone or string attachment. The failed dollar text case also identifies its exited rule 16 parent by its exact call.",
+    "scope": "Private raw date-time literal trees through the expression, direct statement and multi-statement roots in both profiles.",
+    "qualification": "Static source and ATN inspection. Execution remains pending."
+  },
   "private_runtime_full_domain": {
     "ownership": "One transferred PredictionStorage retained across exclusive sessions; real TokenStream, primary invocation records and witnessed signed precedence stack belong to one parse transient. No production classloader/cache/concurrency mapping is selected.",
     "recursion": "Five actual entries and all42 saved-parent constructors: immutable entry outer links, admitted primary records, active capabilities only after real LT1, source push/unroll prefixes, actual one top pop before LT(-1), no Recognizer-state restore.",
