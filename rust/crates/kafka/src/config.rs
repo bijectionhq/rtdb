@@ -2,10 +2,21 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use rtdb_format::generated::xtdb::kafka::proto as pb;
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, jvm_number::Number};
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod providers;
+
+pub(crate) fn trim_java(value: &str) -> &str { value.trim_matches(|ch| ch <= '\u{20}') }
+
+pub(crate) fn signed_integer(value: &str) -> Option<i64> {
+    let value = trim_java(value);
+    if value.chars().any(|ch| ch.len_utf16() == 2) { return None; }
+    match Number::parse_long(value).ok()? {
+        Number::Long(value) => Some(value),
+        _ => unreachable!("signed decimal parser returns a long"),
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct KafkaClusterConfig {

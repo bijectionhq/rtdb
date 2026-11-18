@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, time::Duration};
-use rtdb_types::{Result, jvm_number::Number};
+use rtdb_types::Result;
+use crate::config::{signed_integer, trim_java};
 use super::{error, overflow};
 
 pub(super) struct Settings {
@@ -26,17 +27,6 @@ impl Serializer {
         })
     }
     fn accepts(&self, value: Option<&[u8]>) -> bool { matches!(self, Self::Bytes) || value.is_none() }
-}
-
-fn trim_java(value: &str) -> &str { value.trim_matches(|ch| ch <= '\u{20}') }
-
-fn signed_integer(value: &str) -> Option<i64> {
-    let value = trim_java(value);
-    if value.chars().any(|ch| ch.len_utf16() == 2) { return None; }
-    match Number::parse_long(value).ok()? {
-        Number::Long(value) => Some(value),
-        _ => unreachable!("signed decimal parser returns a long"),
-    }
 }
 
 impl Settings {

@@ -1,12 +1,29 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt, ops::Deref, sync::Arc, time::Duration};
 use rdkafka::{Message, Offset, TopicPartitionList, client::ClientContext, consumer::{BaseConsumer, Consumer, ConsumerContext}, error::KafkaError, message::{Headers, Timestamp as KafkaTimestamp}, statistics::Statistics};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_replication::{DriverStatus, TermHandle};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{AllocationScope, Anomaly, Result};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use super::{ConnectConfig, ConversionContext, Converter, DateEnvironment, PluginRegistry, RecordIndexer, ResumeToken, SinkRecord, SourceConfig, SourceTransactions, error};
 use crate::KafkaClusterConfig;
+
+struct ConsumerConfiguration {
+    client: rdkafka::ClientConfig,
+    _providers: Option<AllocationScope>,
+}
+
+impl Deref for ConsumerConfiguration {
+    type Target = rdkafka::ClientConfig;
+
+    fn deref(&self) -> &Self::Target { &self.client }
+}
+
+impl fmt::Debug for ConsumerConfiguration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ConsumerConfiguration").finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SourceOptions {
@@ -105,14 +122,24 @@ impl SourceDriver {
         };
         after_close(result, converters.close().await)
     }
-    fn consumer_configuration(&mut self) -> Result<rdkafka::ClientConfig> {
+    fn consumer_configuration(&mut self) -> Result<ConsumerConfiguration> {
+        use crate::config::{providers, signed_integer};
+
         let mut properties = self.cluster.properties()?;
+        for key in ["key.deserializer", "value.deserializer", "enable.auto.commit"] { properties.remove(key); }
+        let scope = if providers::configured(&properties) {
+            let scope = AllocationScope::new(&self.memory)?;
+            if let std::borrow::Cow::Owned(resolved) = providers::resolve(&properties, &mut |bytes| scope.reserve(bytes))? {
+                properties = resolved;
+            }
+            Some(scope)
+        } else { None };
         if let Some(maximum) = properties.remove("max.poll.records") {
-            let maximum = maximum.parse::<usize>().map_err(|cause| error("invalid-config", cause))?;
-            if maximum == 0 { return Err(error("invalid-config", "max.poll.records must be positive")); }
-            self.options.maximum_batch_records = maximum.min(self.options.maximum_batch_records);
+            let maximum = signed_integer(&maximum).and_then(|value| i32::try_from(value).ok()).filter(|value| *value > 0)
+                .ok_or_else(|| error("invalid-config", "max.poll.records must be a positive signed integer"))?;
+            self.options.maximum_batch_records = (maximum as usize).min(self.options.maximum_batch_records);
         }
-        for key in ["key.deserializer", "value.deserializer"] { properties.remove(key); }
+        properties.retain(|name, _| !providers::control_property(name));
         let reset = properties.entry("auto.offset.reset".into()).or_insert_with(|| "error".into());
         if reset == "none" { *reset = "error".into(); }
         properties.insert("enable.auto.commit".into(), "false".into());
@@ -122,7 +149,14 @@ impl SourceDriver {
         properties.entry("group.id".into()).or_insert_with(|| "rtdb-kafka-connect-explicit-assignment".into());
         properties.insert("queued.max.messages.kbytes".into(), self.options.maximum_batch_bytes.div_ceil(1024).to_string());
         properties.insert("fetch.message.max.bytes".into(), self.options.maximum_record_bytes.to_string());
-        crate::client::prepare(&properties, &self.memory)
+        if let Some(scope) = scope.as_ref() {
+            let bound = properties.iter().try_fold(4096usize, |bytes, (name, value)| {
+                bytes.checked_add(name.len())?.checked_add(value.len())?.checked_add(256)
+            }).and_then(|bytes| bytes.checked_mul(8)).ok_or_else(overflow)?;
+            scope.reserve(bound)?;
+        }
+        let client = crate::client::prepare(&properties, &self.memory)?;
+        Ok(ConsumerConfiguration { client, _providers: scope })
     }
     async fn ingest(&mut self, term: &TermHandle, after: Option<ResumeToken>, converters: &mut Converters, plugin_charge: &Arc<MemoryReservation>) -> Result<()> {
         let registration = self.metrics.as_ref().map(|(identity, observer)| observer.register(identity, self.subscribe())).transpose()?;

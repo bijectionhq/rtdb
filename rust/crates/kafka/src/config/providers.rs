@@ -17,6 +17,14 @@ const PROVIDERS: &str = "config.providers";
 const FILE: &str = "org.apache.kafka.common.config.provider.FileConfigProvider";
 const DIRECTORY: &str = "org.apache.kafka.common.config.provider.DirectoryConfigProvider";
 
+pub(crate) fn configured(properties: &Properties) -> bool {
+    properties.get(PROVIDERS).is_some_and(|aliases| !aliases.is_empty())
+}
+
+pub(crate) fn control_property(name: &str) -> bool {
+    name == PROVIDERS || name.starts_with("config.providers.")
+}
+
 pub(crate) fn resolve<'a>(
     original: &'a Properties, reserve: &mut impl FnMut(usize) -> Result<()>,
 ) -> Result<Cow<'a, Properties>> {

@@ -44,3 +44,35 @@ fn source_tls_admission_uses_the_assignment_budget_before_opening_a_consumer() {
     assert_eq!(driver.consumer_configuration().unwrap_err().code, "rtdb/memory-budget-exceeded");
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+#[cfg(unix)]
+fn source_resolves_cluster_providers_before_cutting_batch_size_and_constructing_the_consumer() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.properties");
+    let ignored = root.path().join("ignored.properties");
+    let cluster = rdkafka::mocking::MockCluster::new(1).unwrap();
+    std::fs::write(&path, format!("brokers={}\nlimit=\u{661}\u{667} \n", cluster.bootstrap_servers())).unwrap();
+    std::fs::write(&ignored, "setting=\\uGGGG").unwrap();
+    let memory = MemoryBudget::new(32 << 20);
+    let mut driver = driver(&memory);
+    driver.cluster.properties_map = BTreeMap::from([
+        ("config.providers".into(), "file".into()),
+        ("config.providers.file.class".into(), "org.apache.kafka.common.config.provider.FileConfigProvider".into()),
+        ("config.providers.file.param.allowed.paths".into(), root.path().to_str().unwrap().into()),
+        ("bootstrap.servers".into(), format!("${{file:{}:brokers}}", path.display())),
+        ("max.poll.records".into(), format!("${{file:{}:limit}}", path.display())),
+        ("enable.auto.commit".into(), format!("${{file:{}:setting}}", ignored.display())),
+    ]);
+    let configuration = driver.consumer_configuration().unwrap();
+    assert_eq!(driver.options.maximum_batch_records, 17);
+    assert_eq!(configuration.get("bootstrap.servers"), Some(cluster.bootstrap_servers().as_str()));
+    assert_eq!(configuration.get("enable.auto.commit"), Some("false"));
+    assert!(!configuration.config_map().keys().any(|name| name.starts_with("config.providers")));
+    let consumer: BaseConsumer<SourceContext> = configuration.create_with_context(SourceContext { progress: Arc::clone(&driver.progress), topic: "topic".into(), partition: 0 }).unwrap();
+    assert!(memory.used_bytes() > 0);
+    drop(consumer);
+    drop(configuration);
+    drop(driver);
+    assert_eq!(memory.used_bytes(), 0);
+}
