@@ -1,4 +1,4 @@
-use crate::{Anomaly, ListKind, LogicalType, Result, ScalarType, TableRef, TimeUnit};
+use crate::{Anomaly, ListKind, LogicalType, Result, ScalarType, TableRef, TimeUnit, clojure_string_hasheq, clojure_symbol_hasheq};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -25,36 +25,12 @@ pub struct PgTypeDescriptor {
 
 /// Catalog OIDs for names use Clojure's string hasheq followed by Java's wrapping absolute value.
 pub fn pg_name_oid(name: &str) -> i32 {
-    let hash = java_string_hash(name);
-    if hash == 0 { 0 } else { (murmur_finish(murmur_block(0, hash), 4) as i32).wrapping_abs() }
+    clojure_string_hasheq(name).wrapping_abs()
 }
 
 /// Persisted table OIDs take precedence; virtual tables use the Clojure symbol hash.
 pub fn pg_table_oid(allocated: Option<i32>, table: &TableRef) -> i32 {
-    allocated.unwrap_or_else(|| {
-        let mut hash = 0;
-        let mut length = 0u32;
-        let mut units = table.table.encode_utf16();
-        while let Some(low) = units.next() {
-            length = length.wrapping_add(2);
-            if let Some(high) = units.next() { hash = murmur_block(hash, u32::from(low) | (u32::from(high) << 16)); length = length.wrapping_add(2); }
-            else { hash ^= murmur_key(u32::from(low)); }
-        }
-        let seed = murmur_finish(hash, length) as i32;
-        let hash = java_string_hash(&table.schema) as i32;
-        (seed ^ hash.wrapping_add(0x9e3779b9u32 as i32).wrapping_add(seed.wrapping_shl(6)).wrapping_add(seed >> 2)).wrapping_abs()
-    })
-}
-fn java_string_hash(text: &str) -> u32 { text.encode_utf16().fold(0u32, |hash, unit| hash.wrapping_mul(31).wrapping_add(u32::from(unit))) }
-fn murmur_key(value: u32) -> u32 { value.wrapping_mul(0xcc9e2d51).rotate_left(15).wrapping_mul(0x1b873593) }
-fn murmur_block(hash: u32, value: u32) -> u32 { (hash ^ murmur_key(value)).rotate_left(13).wrapping_mul(5).wrapping_add(0xe6546b64) }
-fn murmur_finish(mut hash: u32, bytes: u32) -> u32 {
-    hash ^= bytes;
-    hash ^= hash >> 16;
-    hash = hash.wrapping_mul(0x85ebca6b);
-    hash ^= hash >> 13;
-    hash = hash.wrapping_mul(0xc2b2ae35);
-    hash ^ (hash >> 16)
+    allocated.unwrap_or_else(|| clojure_symbol_hasheq(Some(&table.schema), &table.table).wrapping_abs())
 }
 
 impl PgType {

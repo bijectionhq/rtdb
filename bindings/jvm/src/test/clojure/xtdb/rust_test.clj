@@ -156,6 +156,8 @@
 
 (deftest-original-api original-node/test-explain-plan-shows-a-mark-joins-mark)
 
+(deftest-original-api original-node/test-explain-plan-sql)
+
 (deftest independent-quantified-subqueries-retain-unknown-and-empty-set-semantics
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]

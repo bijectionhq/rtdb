@@ -105,8 +105,17 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
 }
 
 fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
-    if let Expr::Binary { op: BinaryOp::And, left, right } = predicate {
-        return select(select(input, *left)?, *right);
+    if matches!(predicate, Expr::Binary { op: BinaryOp::And, .. }) {
+        let mut remaining = vec![predicate];
+        let mut conjuncts = Vec::new();
+        while let Some(expression) = remaining.pop() {
+            match expression {
+                Expr::Binary { op: BinaryOp::And, left, right } => { remaining.push(*right); remaining.push(*left); },
+                atom => conjuncts.push((atom.referenced_columns().len(), atom)),
+            }
+        }
+        conjuncts.sort_by_key(|(width, _)| *width);
+        return conjuncts.into_iter().try_fold(input, |relation, (_, atom)| select(relation, atom));
     }
     let columns = predicate.referenced_columns();
     if columns.is_empty() {
@@ -215,22 +224,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn window_and_unnest_keep_requested_and_expression_input_columns() {
-        use rtdb_plan::{NamedExpr, QualifiedTable, Scan, SortExpr, TableBinding, TemporalFilter, WindowExpr};
+    fn base_scan(columns: Vec<Field>) -> Arc<Relation> {
+        use rtdb_plan::{QualifiedTable, Scan, TableBinding, TemporalFilter};
         use rtdb_types::TableRef;
-
-        let [selected, partition, ordered, list_value, lagged, unused] = [0, 1, 2, 3, 4, 5].map(field);
-        let source = vec![selected.clone(), partition.clone(), ordered.clone(), list_value.clone(), lagged.clone(), unused];
         let table = TableBinding {
             name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") },
             oid: None,
-            columns: source.iter().map(|field| (field.name.clone(), field.data_type.clone())).collect(),
+            columns: columns.iter().map(|field| (field.name.clone(), field.data_type.clone())).collect(),
         };
-        let scan = Arc::new(Relation::scan(Scan {
-            table, columns: source, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+        Arc::new(Relation::scan(Scan {
+            table, columns, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
             clamp_valid_time: false, iids: None, predicates: Vec::new(),
-        }).unwrap());
+        }).unwrap())
+    }
+
+    #[test]
+    fn single_column_conjunct_reaches_the_scan_before_multi_column_selection() {
+        let [a, b] = [0, 1].map(field);
+        let projection = base_scan(vec![a.clone(), b.clone()]);
+        let multi = Expr::binary(BinaryOp::Eq, Expr::binary(BinaryOp::Add, a.expression(), b.expression()), Expr::Literal(Value::I64(12)));
+        let single = Expr::binary(BinaryOp::Eq, b.expression(), Expr::Literal(Value::I64(1)));
+        let input = Arc::new(projection.filter(Expr::binary(BinaryOp::And, multi.clone(), single.clone())).unwrap());
+        let prepared = prepare(input).unwrap();
+        let RelationNode::Filter { input, predicate } = prepared.node() else { panic!("Expected a remaining selection"); };
+        let RelationNode::Scan(scan) = input.node() else { panic!("Expected a scan"); };
+        assert_eq!(predicate, &multi);
+        assert_eq!(scan.predicates, [single]);
+    }
+
+    #[test]
+    fn window_and_unnest_keep_requested_and_expression_input_columns() {
+        use rtdb_plan::{NamedExpr, SortExpr, WindowExpr};
+
+        let [selected, partition, ordered, list_value, lagged, unused] = [0, 1, 2, 3, 4, 5].map(field);
+        let source = vec![selected.clone(), partition.clone(), ordered.clone(), list_value.clone(), lagged.clone(), unused];
+        let scan = base_scan(source);
         let list_expr = Expr::List(vec![list_value.expression()]);
         let list = Field { data_type: list_expr.data_type(), ..field(6) };
         let extended = Arc::new(scan.extend(vec![NamedExpr { field: list.clone(), expr: list_expr }]).unwrap());

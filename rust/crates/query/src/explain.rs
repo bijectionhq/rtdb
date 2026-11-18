@@ -1,9 +1,9 @@
-use std::{alloc::Layout, cell::RefCell, collections::BTreeMap, mem::size_of, sync::Arc};
+use std::{alloc::Layout, cell::RefCell, collections::{BTreeMap, BTreeSet}, mem::size_of, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{AggregateFunction, BinaryOp, ColumnId, Expr, Field, JoinKind, Relation, RelationNode, Schema, UnaryOp,
     RegexFormView, RegexFormKind as F, RegexFormIter, RegexFormPairIter,
     RegexLiteralView, RegexLiteralKind as LiteralKind, RegexLiteralIter, RegexLiteralPairIter, RegexFieldIter};
-use rtdb_types::{Keyword, LogicalType, Result, ScalarType, Value};
+use rtdb_types::{AllocationScope, CheckedIndex, ClojureKeyIndex, KeySemantics, Keyword, LogicalType, Result, ScalarType, Value, clojure_string_hasheq, clojure_symbol_hasheq};
 use crate::invalid;
 
 pub(crate) struct ExplainPlan { pub schema: Schema, rows: Vec<Vec<Value>>, retained_bytes: usize, _reservation: Arc<MemoryReservation> }
@@ -353,6 +353,34 @@ fn arguments<'work>(arguments: &[(usize, Expr)], columns: &Columns<'work>, work:
     }
     joined(work, "{", &values, ", ", "}")
 }
+
+enum ColumnName { Symbol, String }
+
+impl KeySemantics<&str> for ColumnName {
+    fn is_null(&self, _: &&str) -> bool { false }
+    fn hash(&mut self, name: &&str) -> Result<i32> {
+        Ok(match self { Self::Symbol => clojure_symbol_hasheq(None, name), Self::String => clojure_string_hasheq(name) })
+    }
+    fn equivalent(&mut self, left: &&str, right: &&str) -> Result<bool> { Ok(left == right) }
+}
+
+fn scan_names<'work>(fields: &[Field], work: &'work ExplainWork) -> Result<WorkValue<'work>> {
+    let scope = AllocationScope::new(&work.memory)?;
+    scope.reserve(fields.len().checked_mul(128).ok_or_else(size_error)?)?;
+    let mut seen = BTreeSet::new();
+    let symbols = fields.iter().map(|field| field.name.as_str()).filter(|name| seen.insert(*name)).collect();
+    let CheckedIndex::Unique(symbols) = ClojureKeyIndex::checked_set(symbols, &mut ColumnName::Symbol, Some(&scope))? else {
+        return Err(invalid("explain-columns", "Scan column names must be unique"));
+    };
+    let names = symbols.entries().map(|(_, name)| *name).collect();
+    let CheckedIndex::Unique(names) = ClojureKeyIndex::checked_set(names, &mut ColumnName::String, Some(&scope))? else {
+        return Err(invalid("explain-columns", "Scan column names must be unique"));
+    };
+    let mut result = ScratchVec::new(work);
+    for (_, name) in names.entries() { result.push(work.copy_text(name)?)?; }
+    strings(work, result)
+}
+
 fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Descriptor<'work>> {
     let mut children = ScratchVec::new(work);
     for child in relation.children() { children.push(describe(child, work)?)?; }
@@ -389,9 +417,7 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             let mut columns = Columns::new(work);
             for field in &scan.columns { columns.insert(field.id, work.copy_text(&field.name)?)?; }
             let table = work.pieces(&[RenderPiece::Text(&scan.table.name.database), RenderPiece::Text("."), RenderPiece::Text(&scan.table.name.table.schema), RenderPiece::Text("."), RenderPiece::Text(&scan.table.name.table.table)])?;
-            let mut names = ScratchVec::new(work);
-            for field in &scan.columns { names.push(work.copy_text(&field.name)?)?; }
-            let names = strings(work, names)?;
+            let names = scan_names(&scan.columns, work)?;
             let mut predicates = ScratchVec::new(work);
             for predicate in &scan.predicates { predicates.push(form(predicate, &columns, work)?)?; }
             map(work, [("table", text(table)?), ("columns", names), ("predicates", strings(work, predicates)?)])?

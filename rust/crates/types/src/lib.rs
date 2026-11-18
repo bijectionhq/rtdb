@@ -44,7 +44,7 @@ pub use version::{BuildInfo, compiled_build_info, runtime_version, runtime_revis
 pub use object_sort::ObjectSort;
 pub use memory::{MemoryBudget, MemoryReservation};
 pub use allocation::AllocationScope;
-pub use clojure_index::{CheckedIndex,ClojureKeyIndex,DuplicateKey,KeySemantics};
+pub use clojure_index::{CheckedIndex,ClojureKeyIndex,DuplicateKey,KeySemantics,clojure_string_hasheq,clojure_symbol_hasheq};
 pub use murmur3::murmur3_32;
 
 mod decimal_text;

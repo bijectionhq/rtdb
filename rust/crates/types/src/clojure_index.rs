@@ -1,6 +1,42 @@
 use crate::{AllocationScope,Anomaly,Result};
 mod hash;
 
+/// Clojure's hasheq for Java strings.
+pub fn clojure_string_hasheq(text: &str) -> i32 {
+    let hash = java_string_hash(text);
+    if hash == 0 { 0 } else { murmur_finish(murmur_block(0, hash), 4) as i32 }
+}
+
+/// Clojure's hasheq for optionally qualified symbols.
+pub fn clojure_symbol_hasheq(namespace: Option<&str>, name: &str) -> i32 {
+    let mut hash = 0;
+    let mut length = 0u32;
+    let mut units = name.encode_utf16();
+    while let Some(low) = units.next() {
+        length = length.wrapping_add(2);
+        if let Some(high) = units.next() {
+            hash = murmur_block(hash, u32::from(low) | (u32::from(high) << 16));
+            length = length.wrapping_add(2);
+        } else {
+            hash ^= murmur_key(u32::from(low));
+        }
+    }
+    let seed = murmur_finish(hash, length) as i32;
+    let namespace_hash = namespace.map_or(0, java_string_hash) as i32;
+    seed ^ namespace_hash.wrapping_add(0x9e3779b9u32 as i32).wrapping_add(seed.wrapping_shl(6)).wrapping_add(seed >> 2)
+}
+fn java_string_hash(text: &str) -> u32 { text.encode_utf16().fold(0u32, |hash, unit| hash.wrapping_mul(31).wrapping_add(u32::from(unit))) }
+fn murmur_key(value: u32) -> u32 { value.wrapping_mul(0xcc9e2d51).rotate_left(15).wrapping_mul(0x1b873593) }
+fn murmur_block(hash: u32, value: u32) -> u32 { (hash ^ murmur_key(value)).rotate_left(13).wrapping_mul(5).wrapping_add(0xe6546b64) }
+fn murmur_finish(mut hash: u32, bytes: u32) -> u32 {
+    hash ^= bytes;
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x85ebca6b);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2ae35);
+    hash ^ (hash >> 16)
+}
+
 /// Semantic key operations for checked Clojure collection construction.
 /// Entries may include values; these operations inspect only their keys.
 /// Successful hashes and equivalence results must stay stable during construction.

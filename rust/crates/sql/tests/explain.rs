@@ -142,7 +142,7 @@ async fn api_test_explain_projection_rename_and_scan_predicate_describe_executed
     assert_eq!(project["project"], Value::Utf8("[{v foo.1/v}]".into()));
     let Value::Struct(scan) = &rows[2]["explain"] else { panic!("Expected scan metadata") };
     assert_eq!(scan["table"], Value::Utf8("xtdb.public.foo".into()));
-    assert_eq!(scan["columns"], Value::List(vec![Value::Utf8("_id".into()), Value::Utf8("v".into())]));
+    assert_eq!(scan["columns"], Value::List(vec![Value::Utf8("v".into()), Value::Utf8("_id".into())]));
     assert_eq!(scan["predicates"], Value::List(vec![Value::Utf8("(== _id 1)".into())]));
     let measured = query(&context, "EXPLAIN ANALYZE SELECT v FROM foo WHERE _id = 1").await.unwrap();
     assert!(measured.iter().all(|row| row["row_count"] == Value::I64(1)));

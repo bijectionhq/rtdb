@@ -328,6 +328,8 @@ Private page and replay tests cover retained-buffer lifetime and cancellation wh
 These tests have not run.
 Full optimizer equivalence, including decorrelation, projection fusion, symbol allocation, and scan-column order, remains unqualified.
 Append projections, windows and UNNEST retain the input columns required by their expressions and those requested by their parents.
+For conjunctive filters, expressions with fewer column dependencies can reach the scan before multi-column expressions.
+Scan explanations use the reference traversal order of the symbol set and the resulting text set.
 Complete original-form retention for explanation strings remains a production gap.
 Aggregate descriptions retain supported factory spellings, explicit XTQL `all` spellings, and integer percentile literals.
 `AggregateAlias` and the validated owned `AggregateName` are immutable plan data with fixed canonical evaluators; each cursor normalizes its private descriptors without rewriting the retained plan.
