@@ -189,8 +189,8 @@ impl Context<'_> {
             ast::Expr::Function(function) => {
                 if aggregate_function(&function.name.to_string()).is_some() || percentile_kind(&function.name.to_string()).is_some() { return Err(error("Aggregates are not allowed in this context")); }
                 if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(unsupported("Window function or scalar function modifiers")); }
-                if let Some(query) = array_query(function) {
-                    return self.query_value(query, input, SubqueryValue::Array);
+                if let Some((query, value)) = function_query(function) {
+                    return self.query_value(query, input, value);
                 }
                 let units = match &function.args {
                     ast::FunctionArguments::List(arguments) => scalar_argument_units(arguments)?,
@@ -610,15 +610,22 @@ pub(crate) fn validate_in_list_item(expr: &ast::Expr) -> Result<()> {
 
 pub(crate) fn contains_subquery(expr: &ast::Expr) -> bool {
     matches!(expr, ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. } | ast::Expr::AnyOp { .. } | ast::Expr::AllOp { .. })
-        || matches!(expr, ast::Expr::Function(function) if array_query(function).is_some())
+        || matches!(expr, ast::Expr::Function(function) if function_query(function).is_some())
         || matches!(expr, ast::Expr::InList { list, .. } if list.len() > 8 || list.iter().any(row_constructor))
         || children(expr).into_iter().any(contains_subquery)
 }
 
-fn array_query(function: &ast::Function) -> Option<&ast::Query> {
+fn function_query(function: &ast::Function) -> Option<(&ast::Query, SubqueryValue)> {
     let [ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else { return None; };
     let ast::FunctionArguments::Subquery(query) = &function.args else { return None; };
-    (name.quote_style.is_none() && name.value.eq_ignore_ascii_case("array")).then_some(query)
+    if name.quote_style.is_some() { return None; }
+    let value = match name.value.to_ascii_lowercase().as_str() {
+        "array" => SubqueryValue::Array,
+        "nest_one" => SubqueryValue::NestOne,
+        "nest_many" => SubqueryValue::NestMany,
+        _ => return None,
+    };
+    Some((query, value))
 }
 
 fn row_constructor(expr: &ast::Expr) -> bool {

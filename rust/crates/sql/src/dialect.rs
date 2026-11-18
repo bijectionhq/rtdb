@@ -215,6 +215,27 @@ impl Dialect for SqlDialect {
             parser.next_token();
             return Some(parser.parse_dictionary_fields(Token::RParen));
         }
+        if word.quote_style.is_none()
+            && (word.value.eq_ignore_ascii_case("NEST_ONE") || word.value.eq_ignore_ascii_case("NEST_MANY"))
+            && parser.peek_nth_token_ref(1).token == Token::LParen
+        {
+            parser.next_token();
+            parser.next_token();
+            return Some((|| {
+                let query = parser.parse_query()?;
+                parser.expect_token(&Token::RParen)?;
+                Ok(ast::Expr::Function(ast::Function {
+                    name: ast::ObjectName::from(vec![word.to_ident(token.span)]),
+                    uses_odbc_syntax: false,
+                    parameters: ast::FunctionArguments::None,
+                    args: ast::FunctionArguments::Subquery(query),
+                    filter: None,
+                    null_treatment: None,
+                    over: None,
+                    within_group: Vec::new(),
+                }))
+            })());
+        }
         if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("NOW") {
             parser.next_token();
             return Some(parser.parse_time_functions(ast::ObjectName::from(vec![word.to_ident(token.span)])));

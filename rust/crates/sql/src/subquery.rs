@@ -16,6 +16,8 @@ pub(crate) enum SubqueryValue {
     Scalar,
     Exists,
     Array,
+    NestOne,
+    NestMany,
 }
 
 #[derive(Clone, Copy)]
@@ -276,8 +278,18 @@ impl Context<'_> {
 
     pub(crate) fn query_value(&mut self, query: &ast::Query, input: &mut ExpressionInput<'_>, value: SubqueryValue) -> Result<Expr> {
         let (dependent, arguments) = self.dependent(query, input)?;
-        if matches!(value, SubqueryValue::Exists) {
-            return self.apply_expression(input, existence_rows(dependent)?, arguments, ApplyKind::Exists);
+        let nest = match value {
+            SubqueryValue::Exists => return self.apply_expression(input, existence_rows(dependent)?, arguments, ApplyKind::Exists),
+            SubqueryValue::NestOne => Some(ApplyKind::Pull),
+            SubqueryValue::NestMany => Some(ApplyKind::PullMany),
+            SubqueryValue::Scalar | SubqueryValue::Array => None,
+        };
+        if let Some(kind) = nest {
+            let document = LogicalType::Struct(dependent.schema().fields().iter().map(|field| (field.name.clone(), field.data_type.clone())).collect());
+            let output = self.hidden_field(if kind == ApplyKind::PullMany { LogicalType::list(document).maybe() } else { document.maybe() })?;
+            let expression = output.expression();
+            input.attach(ExpressionAttachment::Apply { dependent, arguments, kind, output })?;
+            return Ok(expression);
         }
         let [field] = dependent.schema().fields() else {
             return Err(error(format!("Subquery arity error: expected a single column, got {}", dependent.schema().len())));
