@@ -79,6 +79,10 @@ impl EventBatch {
     pub fn len(&self) -> usize { self.batch.num_rows() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
+    pub fn iid(&self, row: usize) -> Result<Iid> {
+        IidView::new(self.batch.column(self.iid).as_ref())?.get(row)
+    }
+
     pub fn header(&self, row: usize) -> Result<EventHeader> {
         if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
         let op = match self.operation(row)?.0.name().as_str() {
@@ -86,7 +90,7 @@ impl EventBatch {
             name => return Err(invalid(format!("Unknown event operation: {name}"))),
         };
         Ok(EventHeader {
-            iid: IidView::new(self.batch.column(self.iid).as_ref())?.get(row)?,
+            iid: self.iid(row)?,
             system_from: self.timestamp(self.system_from, row)?,
             valid_time: Interval::new(self.timestamp(self.valid_from, row)?, self.timestamp(self.valid_to, row)?)?,
             op,

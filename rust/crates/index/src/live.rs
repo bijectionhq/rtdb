@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
@@ -10,7 +10,13 @@ use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Inter
 use crate::{Snapshot, TableMeta, merge_column_types};
 
 #[derive(Debug)]
-pub struct IndexBatch { owned: OwnedBatch, events: EventBatch, put_types: BTreeMap<String, LogicalType> }
+pub struct IndexBatch {
+    owned: OwnedBatch,
+    events: EventBatch,
+    put_types: BTreeMap<String, LogicalType>,
+    system_times: Option<(Timestamp, Timestamp)>,
+    canonical_iids: OnceLock<bool>,
+}
 
 #[derive(Clone, Copy)]
 enum EventBuild { Write, CopyInferred, CopyCaptured }
@@ -25,8 +31,12 @@ impl IndexBatch {
         let index = schema.index_of("op").map_err(invalid)?;
         let ty = from_field(schema.field(index))?;
         let put_types = ty.legs().into_iter().find_map(|leg| match leg { LogicalType::Struct(fields) => Some(fields), _ => None }).unwrap_or_default();
-        for row in 0..events.len() { events.header(row)?; }
-        Ok(Arc::new(Self { owned, events, put_types }))
+        let mut system_times: Option<(Timestamp, Timestamp)> = None;
+        for row in 0..events.len() {
+            let time = events.header(row)?.system_from;
+            system_times = Some(system_times.map_or((time, time), |(first, last)| (first.min(time), last.max(time))));
+        }
+        Ok(Arc::new(Self { owned, events, put_types, system_times, canonical_iids: OnceLock::new() }))
     }
     pub fn from_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::Write, budget)
@@ -58,7 +68,7 @@ impl IndexBatch {
             if let StoredOperation::Put(document) = &event.operation {
                 if !matches!(mode, EventBuild::CopyCaptured) {
                     let next = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
-                    fields = merge_column_types(&fields, &next);
+                    if fields != next { fields = merge_column_types(&fields, &next); }
                 }
                 has_put = true;
             }
@@ -77,6 +87,21 @@ impl IndexBatch {
         let _scratch = self.owned.reservation().budget().reserve(bound).ok()?;
         let value = read_execution_value(field, column.as_ref(), offset).ok()?;
         Some(value.entity_id().ok()?.iid() == iid)
+    }
+    fn has_system_time(&self, system_time: Timestamp) -> bool {
+        self.system_times.is_none_or(|times| times == (system_time, system_time))
+    }
+    fn has_canonical_iids(&self) -> Option<bool> {
+        if let Some(proof) = self.canonical_iids.get() { return Some(*proof); }
+        for row in 0..self.len() {
+            let header = self.events.header(row).ok()?;
+            if header.op == EventOp::Put && !self.put_id_matches(row, header.iid)? {
+                let _ = self.canonical_iids.set(false);
+                return Some(false);
+            }
+        }
+        let _ = self.canonical_iids.set(true);
+        Some(true)
     }
     pub fn view(&self) -> &EventBatch { &self.events }
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
@@ -126,12 +151,9 @@ impl LiveTable {
         let mut next = self.clone();
         next.column_types = merge_column_types(&next.column_types, &write.column_types);
         if let Some(batch) = &write.batch {
-            for row in 0..batch.len() {
-                let header = batch.view().header(row)?;
-                if header.system_from != system_time { return Err(invalid("Imported event system time differs from its transaction")); }
-                if next.canonical_entity_iids && header.op == EventOp::Put {
-                    next.canonical_entity_iids = batch.put_id_matches(row, header.iid).unwrap_or(false);
-                }
+            if !batch.has_system_time(system_time) { return Err(invalid("Imported event system time differs from its transaction")); }
+            if next.canonical_entity_iids {
+                next.canonical_entity_iids = batch.has_canonical_iids().unwrap_or(false);
             }
             let count = u32::try_from(batch.len()).map_err(invalid)?;
             let start = next.row_count;
@@ -148,6 +170,14 @@ impl LiveTable {
             Ok(EventRow { header: source.header()?, source })
         }).collect()
     }
+    pub fn block_pages(&self, memory: &Arc<MemoryBudget>) -> Result<BlockPages<'_>> {
+        let _reservation = memory.reserve(self.chunks.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Invalid block page inventory size"))?)?;
+        let empty = IndexBatch::copy_events_with_put_schema(&[], &self.column_types, memory)?;
+        let schema = empty.arrow().schema();
+        let sources = self.chunks.iter().all(|(_, batch)| batch.arrow().schema() == schema)
+            .then(|| self.chunks.iter().map(|(_, batch)| &batch.owned).collect());
+        Ok(BlockPages { table: self, sources, memory: Arc::clone(memory), _reservation })
+    }
     pub fn block_metadata(&self) -> Result<TableMeta> {
         let mut hlls: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for (_, batch) in &self.chunks {
@@ -162,7 +192,53 @@ impl LiveTable {
     }
 }
 
-impl IidReader for LiveTable { fn iid(&self, row: u32) -> Result<Iid> { Ok(self.row(row)?.header()?.iid) } }
+impl IidReader for LiveTable {
+    fn iid(&self, row: u32) -> Result<Iid> {
+        let source = self.row(row)?;
+        source.batch.view().iid(source.row)
+    }
+}
+
+pub struct BlockPages<'a> {
+    table: &'a LiveTable,
+    sources: Option<Vec<&'a OwnedBatch>>,
+    memory: Arc<MemoryBudget>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl BlockPages<'_> {
+    pub fn live_table(&self) -> &LiveTable { self.table }
+
+    /// Writes a leaf's distinct, ordered rows using the captured table layout.
+    pub fn copy(&self, rows: &[u32]) -> Result<OwnedBatch> {
+        if let Some(sources) = &self.sources {
+            let bytes = rows.len().checked_mul(32).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| invalid("Invalid block row selection size"))?;
+            let result = self.memory.reserve(bytes).and_then(|_scratch| {
+                let positions = rows.iter().map(|&row| {
+                    let index = self.table.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
+                    let start = self.table.chunks[index].0;
+                    Ok((index, (row - start) as usize))
+                }).collect::<Result<Vec<_>>>()?;
+                OwnedBatch::interleave_distinct_rows(sources, &positions, &self.memory)
+            });
+            match result {
+                Ok(batch) => return Ok(batch),
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+                Err(error) => return Err(error),
+            }
+        }
+        let mut bound = rows.len().checked_mul(256).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Page row allocation overflow"))?;
+        for &row in rows {
+            let source = self.table.row(row)?;
+            let schema = source.batch.arrow().schema();
+            let index = schema.index_of("op").map_err(invalid)?;
+            bound = bound.checked_add(estimate_read_value_bytes(schema.field(index), source.batch.arrow().column(index).as_ref(), source.row)?).ok_or_else(|| invalid("Page allocation size overflow"))?;
+        }
+        let _scratch = self.memory.reserve(bound)?;
+        let events = rows.iter().map(|&row| self.table.row(row)?.event()).collect::<Result<Vec<_>>>()?;
+        Ok(IndexBatch::copy_events_with_put_schema(&events, &self.table.column_types, &self.memory)?.owned.clone())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TableWrite { column_types: BTreeMap<String, LogicalType>, batch: Option<Arc<IndexBatch>> }
@@ -189,10 +265,8 @@ impl StagedWrite {
             return Err(invalid("Transaction key does not advance its predecessor"));
         }
         for write in tables.values() {
-            if let Some(batch) = write.batch() {
-                for row in 0..batch.len() {
-                    if batch.view().header(row)?.system_from != tx_key.system_time { return Err(invalid("Staged event has another transaction's system time")); }
-                }
+            if write.batch().is_some_and(|batch| !batch.has_system_time(tx_key.system_time)) {
+                return Err(invalid("Staged event has another transaction's system time"));
             }
         }
         Ok(Self { tx_key, predecessor, block_index, tables })
@@ -317,6 +391,37 @@ fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtd
 
 #[cfg(test)]
 #[test]
+fn block_pages_preserve_order_and_layout_across_live_batches() {
+    let memory = MemoryBudget::new(32 << 20);
+    let table = TableRef::new("public", "docs");
+    let rows = |start, time, text| (start..start + 2).map(|id| StoredEvent {
+        iid: EntityId::Integer(id).iid(),
+        system_from: Timestamp(time),
+        valid_time: Interval::ALL,
+        operation: StoredOperation::Put(BTreeMap::from([
+            ("_id".into(), Value::I64(id)),
+            ("value".into(), if text { Value::Utf8(id.to_string()) } else { Value::I64(id) }),
+        ])),
+        recency: None,
+    }).collect::<Vec<_>>();
+    let first = rows(0, 1, false);
+    for layout_changes in [false, true] {
+        let second = rows(2, 2, layout_changes);
+        let write = |events: &[StoredEvent]| TableWrite::new(BTreeMap::new(), Some(IndexBatch::copy_events(events, &BTreeMap::new(), &memory).unwrap()));
+        let live = LiveTable::new(table.clone(), BlockIndex(0), TrieConfig::default())
+            .append(&write(&first), Timestamp(1)).unwrap()
+            .append(&write(&second), Timestamp(2)).unwrap();
+        let pages = live.block_pages(&memory).unwrap();
+        assert_eq!(pages.sources.is_some(), !layout_changes);
+        let actual = pages.copy(&[3, 0, 2]).unwrap();
+        let selected = vec![second[1].clone(), first[0].clone(), second[0].clone()];
+        let expected = IndexBatch::copy_events_with_put_schema(&selected, live.column_types(), &memory).unwrap();
+        assert_eq!(actual.batch(), expected.arrow());
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn event_batches_build_wide_document_columns_with_bounded_scratch() {
     let memory = MemoryBudget::new(128 << 20);
     let events = (0..100).map(|id| {
@@ -389,4 +494,7 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
     assert_eq!(extended.row_count(), 2);
     assert!(!extended.has_canonical_entity_iids());
     assert!(empty.append(&first, first_time).unwrap().has_canonical_entity_iids());
+    let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
+    assert!(empty.append(&first, first_time).unwrap().has_canonical_entity_iids());
+    drop(blocker);
 }

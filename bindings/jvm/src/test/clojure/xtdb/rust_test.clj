@@ -107,8 +107,10 @@
     ((t/join-fixtures native-fixtures) (:test (meta original)))))
 
 (defmacro ^:private deftest-original-api [original & [local-name]]
-  `(deftest ~(or local-name (symbol (name original)))
-     (run-original-api-case (var ~original))))
+  (let [test-name (or local-name (symbol (name original)))
+        test-tags (select-keys (meta (resolve original)) [:integration])]
+    `(deftest ~(vary-meta test-name merge test-tags)
+       (run-original-api-case (var ~original)))))
 
 (deftest-original-api original-sql/multiple-query-tails)
 
@@ -451,6 +453,8 @@
 (deftest-original-api original-node/non-namespaced-keys-for-structs-2418)
 
 (deftest-original-api original-node/large-xt-stars-2484)
+
+(deftest-original-api original-node/log-backpressure-doesnt-halt-indexer-4285)
 
 (deftest wide-sparse-document-transactions-commit-and-retain-their-declared-columns
   (with-open [allocator (RootAllocator.)

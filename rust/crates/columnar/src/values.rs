@@ -40,7 +40,10 @@ fn build_values(logical: &LogicalType, values: &[Value], check_precision: bool) 
 pub(crate) fn accepts(logical: &LogicalType, value: &Value) -> bool {
     if matches!(value, Value::Undefined) { return matches!(logical.unencoded(), LogicalType::Nothing); }
     let plain = logical.unencoded();
-    plain.join(&value.logical_type()) == plain
+    let actual = value.logical_type();
+    plain == actual
+        || matches!(&plain, LogicalType::Maybe(inner) if **inner == actual || actual == LogicalType::Null)
+        || plain.join(&actual) == plain
 }
 
 /// Resolves a struct field's cell in its declared layout.

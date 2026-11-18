@@ -185,6 +185,7 @@ Decoded block/table catalogs share their immutable protobuf allocations and rese
 Semantic catalog generations, protobuf container overhead, and metadata serialization still need a complete retained-allocation audit.
 Backend tail batches can contain a large durable prefix; their maximum size is a backend obligation not yet enforced by the generic `LogTail` interface.
 The block writer reserves selected-cell decoding and Arrow building separately, drops page scratch after each write, and retains a separate metadata estimate until serialization.
+It copies leaf rows directly between matching Arrow layouts and reconciles differing input schemas against the captured table schema.
 The metadata estimate remains conservative and requires nested-schema allocation qualification.
 
 Promotion rollback, node/database shutdown composition, cross-node election faults, durable transport loss/reordering qualification, and external-source resume/confirmation require the complete node-level traces and Phase 2 fault/parity runs.

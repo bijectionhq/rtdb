@@ -5,7 +5,7 @@ mod snapshot;
 mod trie_catalog;
 
 pub use catalog::{TableCatalog, TableMeta, absent_type, merge_column_types};
-pub use live::{IndexBatch, LiveIndex, LiveTable, RowSource, StagedWrite, TableWrite, TransactionBuffer};
+pub use live::{BlockPages, IndexBatch, LiveIndex, LiveTable, RowSource, StagedWrite, TableWrite, TransactionBuffer};
 pub use partition::{BlockPreparation, PartitionState, PartitionValue};
 pub use snapshot::Snapshot;
 pub use trie_catalog::{CatalogTrie, Shard, TrieCatalog, TrieState};

@@ -284,7 +284,8 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
         for document in list.rows() {
             for (name, value) in document {
                 let (ty, present) = fields.get_mut(name.as_str()).expect("document fields have column names");
-                *ty = ty.join(&value.logical_type());
+                let actual = value.logical_type();
+                if *ty != actual { *ty = ty.join(&actual); }
                 *present = present.checked_add(1).ok_or_else(overflow)?;
             }
         }

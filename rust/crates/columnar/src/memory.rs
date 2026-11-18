@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
@@ -65,6 +65,33 @@ impl OwnedBatch {
     /// Cloned Arrow arrays retain the reservation through their allocation owners.
     pub fn batch(&self) -> &RecordBatch { &self.batch }
     pub fn reservation(&self) -> &Arc<MemoryReservation> { &self.reservation }
+
+    /// Copies distinct rows from batches with the same physical schema, in the specified order.
+    pub fn interleave_distinct_rows(
+        sources: &[&Self], rows: &[(usize, usize)], memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let first = sources.first().ok_or_else(|| Anomaly::incorrect("rtdb/interleave", "Row selection has no input batch"))?;
+        let schema = first.batch.schema();
+        let base = rows.len().checked_mul(128).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(allocation_overflow)?;
+        let bound = sources.iter().try_fold(base, |bytes, source| {
+            if source.batch.schema() != schema { return Err(Anomaly::incorrect("rtdb/interleave", "Input batch schemas differ")); }
+            source.batch.get_array_memory_size().checked_mul(4)
+                .and_then(|size| size.checked_add(bytes)).ok_or_else(allocation_overflow)
+        })?;
+        let mut reservation = memory.reserve(bound)?;
+        let mut seen = BTreeSet::new();
+        for &(batch, row) in rows {
+            if sources.get(batch).is_none_or(|source| row >= source.batch.num_rows()) || !seen.insert((batch, row)) {
+                return Err(Anomaly::incorrect("rtdb/interleave", "Row selection contains an invalid or repeated position"));
+            }
+        }
+        drop(seen);
+        let batches = sources.iter().map(|source| &source.batch).collect::<Vec<_>>();
+        let batch = arrow_select::interleave::interleave_record_batch(&batches, rows).map_err(super::arrow_error)?;
+        let size = batch.get_array_memory_size().checked_add(4096).ok_or_else(allocation_overflow)?;
+        Arc::get_mut(&mut reservation).expect("row copying owns its reservation").shrink_to(size)?;
+        Self::with_reservation(batch, reservation)
+    }
 
     pub fn column(&self, index: usize) -> Result<OwnedColumn> {
         let array = self.batch.columns().get(index).ok_or_else(|| Anomaly::incorrect("rtdb/column-index", "Column index exceeds batch width"))?;

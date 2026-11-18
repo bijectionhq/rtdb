@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
-use rtdb_index::{BlockPreparation, CatalogTrie, IndexBatch, LiveTable, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
+use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
@@ -232,7 +232,8 @@ impl BlockStore {
             let mut reservations = Vec::new();
             let temporary = tempfile::NamedTempFile::new().map_err(io_error)?;
             let mut writer = None;
-            write_node(live.trie().root(), live, &self.memory, &temporary, &mut writer, &mut metadata, &mut reservations, cancellation).await?;
+            let pages = live.block_pages(&self.memory)?;
+            write_node(live.trie().root(), &pages, &self.memory, &temporary, &mut writer, &mut metadata, &mut reservations, cancellation).await?;
             let file = writer.ok_or_else(|| invalid("Nonempty live table produced no pages"))?.finish()?;
             file.sync_all().map_err(io_error)?;
             let size = i64::try_from(file.metadata().map_err(io_error)?.len()).map_err(io_error)?;
@@ -269,36 +270,25 @@ impl BlockStore {
     }
 }
 
-fn write_node<'a>(node: &'a TrieNode, live: &'a LiveTable, memory: &'a Arc<MemoryBudget>, temporary: &'a tempfile::NamedTempFile, writer: &'a mut Option<ArrowFileWriter>, metadata: &'a mut MetadataBuilder, retained: &'a mut Vec<Arc<MemoryReservation>>, cancellation: &'a CancellationToken) -> BoxFuture<'a, Result<usize>> {
+fn write_node<'a>(node: &'a TrieNode, pages: &'a BlockPages<'a>, memory: &'a Arc<MemoryBudget>, temporary: &'a tempfile::NamedTempFile, writer: &'a mut Option<ArrowFileWriter>, metadata: &'a mut MetadataBuilder, retained: &'a mut Vec<Arc<MemoryReservation>>, cancellation: &'a CancellationToken) -> BoxFuture<'a, Result<usize>> {
     Box::pin(async move {
     check_cancelled(cancellation)?;
     match node {
         TrieNode::Branch { children, .. } => {
             let mut offsets = [None; 4];
             for (slot, child) in offsets.iter_mut().zip(children) {
-                if let Some(child) = child { *slot = Some(write_node(child, live, memory, temporary, writer, metadata, retained, cancellation).await?); }
+                if let Some(child) = child { *slot = Some(write_node(child, pages, memory, temporary, writer, metadata, retained, cancellation).await?); }
             }
             metadata.write_iid_branch(offsets)
         }
         TrieNode::Leaf(leaf) => {
-            let rows = leaf.sorted_rows(live)?;
-            let mut bound = rows.len().checked_mul(256).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Page row allocation overflow"))?;
-            for row in rows.iter() {
-                let source = live.row(*row)?;
-                let schema = source.batch.arrow().schema();
-                let index = schema.index_of("op").map_err(io_error)?;
-                bound = bound.checked_add(estimate_read_value_bytes(schema.field(index), source.batch.arrow().column(index).as_ref(), source.row)?).ok_or_else(|| invalid("Page allocation size overflow"))?;
-            }
-            let scratch = memory.reserve(bound)?;
-            let events = rows.iter().map(|row| live.row(*row)?.event()).collect::<Result<Vec<_>>>()?;
-            let batch = IndexBatch::copy_events_with_put_schema(&events, live.column_types(), memory)?;
-            if writer.is_none() { *writer = Some(ArrowFileWriter::new_reserved(temporary.reopen().map_err(io_error)?, batch.arrow().schema().as_ref(), memory)?); }
-            writer.as_mut().ok_or_else(|| invalid("Missing page writer"))?.write(batch.arrow())?;
-            let (node, metadata_charge) = metadata.write_leaf_reserved(batch.arrow(), memory)?;
+            let rows = leaf.sorted_rows(pages.live_table())?;
+            let batch = pages.copy(&rows)?;
+            if writer.is_none() { *writer = Some(ArrowFileWriter::new_reserved(temporary.reopen().map_err(io_error)?, batch.batch().schema().as_ref(), memory)?); }
+            writer.as_mut().ok_or_else(|| invalid("Missing page writer"))?.write(batch.batch())?;
+            let (node, metadata_charge) = metadata.write_leaf_reserved(batch.batch(), memory)?;
             retained.push(metadata_charge);
             drop(batch);
-            drop(events);
-            drop(scratch);
             tokio::task::yield_now().await;
             Ok(node)
         }

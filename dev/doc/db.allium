@@ -602,6 +602,7 @@ config {
 -- PRODUCE, on reading the boundary back:
 --   1. Finish the live index's block, yielding L0 tries — one per table that took rows in this block, and none at all for a table that took none.
 --      Each L0 page retains its computed metadata summary for the metadata file and releases temporary allocations for scanning that page.
+--      Each L0 page uses the table's captured column schema and the order of the leaf's rows.
 --      A block cut with no transactions in it therefore writes no tries whatsoever.
 --   2. Compute the trie layout those L0 tries imply, which is what the per-table block files record and what the trie catalog will hold once the adopt has added them.
 --   3. Build the per-table block files and upload one for EVERY table the table catalog knows, not only the tables from step 1.

@@ -34,3 +34,14 @@ tasks.withType<Test>().configureEach {
     systemProperty("io.netty.tryReflectionSetAccessible", "true")
     providers.systemProperty("xtdb.native.library").orNull?.let { systemProperty("xtdb.native.library", it) }
 }
+
+tasks.test {
+    useJUnitPlatform { excludeTags("integration") }
+}
+
+tasks.register<Test>("integration-test") {
+    val unitTests = tasks.test.get()
+    testClassesDirs = unitTests.testClassesDirs
+    classpath = unitTests.classpath
+    useJUnitPlatform { includeTags("integration") }
+}

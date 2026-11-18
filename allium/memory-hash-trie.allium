@@ -22,6 +22,7 @@
 --
 -- Critical invariants:
 --   - The trie stores INTEGER INDICES, not actual row data
+--   - Reading a row index obtains the stored IID directly from its event batch.
 --   - Indices reference rows in an external IID vector (Arrow VectorReader)
 --   - Within each leaf, indices are ordered by: (1) IID ascending, (2) row index DESCENDING
 --   - Row index descending means newer rows for the same IID appear first
