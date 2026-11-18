@@ -47,6 +47,7 @@ impl Importer<'_, '_, '_> {
         if options.map().is_none() { return Err(invalid("Logical relation options must be a map")); }
         let result = match (op, children) {
             ("table", []) => self.table(options)?,
+            ("scan", []) => self.scan(options)?,
             ("select" | "σ" | "sigma", [input]) => {
                 let input = self.lower(input)?;
                 let predicate = self.scalar(required(options, "predicate")?, &mut bind_input(&input))?;
@@ -81,6 +82,63 @@ impl Importer<'_, '_, '_> {
             (None, None, Some(parameter)) => self.argument_table(options, parameter),
             _ => Err(invalid("Logical table requires exactly one of :rows, :column, and :param")),
         }
+    }
+
+    fn scan(&mut self, options: &Edn) -> Result<Relation> {
+        let EdnKind::String(database) = &required(options, "db-name")?.kind else { return Err(invalid("Scan database name must be a string")); };
+        if !self.compiler.catalog.databases().contains(database) {
+            return Err(error("xtdb/unknown-db", format!("Unknown database: {database}")).with_context("db-name", database.clone().into()));
+        }
+        let name = QualifiedTable { database: database.clone(), table: crate::ast::table_ref(required(options, "table")?, true)? };
+        let table = self.compiler.catalog.table(&name)?;
+        let missing = table.is_none();
+        let table = table.unwrap_or(TableBinding { name, oid: None, columns: BTreeMap::new() });
+        let mut columns = Vec::new();
+        let mut variables = BTreeMap::new();
+        let mut predicates = Vec::new();
+        for column in sequence(required(options, "columns")?)? {
+            let name = if let Some([(name, predicate)]) = column.map() {
+                predicates.push(predicate);
+                column_name(name)?
+            } else { column_name(column)? };
+            if variables.contains_key(name) { continue; }
+            let field = self.compiler.binder.field(name, None, table.scan_column_type(name))?;
+            columns.push(field.clone());
+            variables.insert(name.to_owned(), field);
+        }
+        let mut bound = Bound { variables, ..Bound::unit() };
+        let predicates = predicates.into_iter().map(|predicate| self.scalar(predicate, &mut bound)).collect::<Result<Vec<_>>>()?;
+        let valid_time = self.scan_time(options.option("for-valid-time"))?;
+        let system_time = self.scan_time(options.option("for-system-time"))?;
+        let clamp_valid_time = match options.option("clamp-valid-time?").map(|form| &form.kind) {
+            None | Some(EdnKind::Nil) => false,
+            Some(EdnKind::Bool(value)) => *value,
+            _ => return Err(invalid("Scan clamp flag must be boolean")),
+        };
+        if missing { return Ok(Relation::empty(Schema::new(columns)?)); }
+        Relation::scan(Scan { table, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates })
+    }
+
+    fn scan_time(&mut self, form: Option<&Edn>) -> Result<PTemporal> {
+        let Some(form) = form.filter(|form| !matches!(form.kind, EdnKind::Nil)) else { return Ok(PTemporal::Default); };
+        if form.keyword() == Some("all-time") { return Ok(PTemporal::All); }
+        let mut endpoint = |form: &Edn| {
+            let mut input = Bound::unit();
+            if form.keyword() == Some("now") {
+                return self.compiler.expr(&Expr::Call { function: "current-timestamp".into(), arguments: vec![] }, &mut input, self.parameters);
+            }
+            self.scalar(form, &mut input)
+        };
+        let Some([mode, endpoints @ ..]) = form.vector() else { return Err(invalid("Expected a scan period vector")); };
+        let null = PExpr::Literal(Value::Null);
+        Ok(match (mode.keyword(), endpoints) {
+            (Some("at"), [time]) => PTemporal::At(endpoint(time)?),
+            (Some("in"), [from, to]) => PTemporal::FromTo { from: endpoint(from)?, to: endpoint(to)? },
+            (Some("from"), [from]) => PTemporal::FromTo { from: endpoint(from)?, to: null },
+            (Some("to"), [to]) => PTemporal::FromTo { from: null, to: endpoint(to)? },
+            (Some("between"), [from, to]) => PTemporal::Between { from: endpoint(from)?, to: endpoint(to)? },
+            _ => return Err(invalid("Invalid scan period")),
+        })
     }
 
     fn row_table(&mut self, options: &Edn, source: &Edn) -> Result<Relation> {

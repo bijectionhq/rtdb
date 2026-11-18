@@ -186,7 +186,7 @@ fn parse_from(&self, args: &[Edn]) -> Result<From> {
 }
 }
 
-fn table_ref(form: &Edn, in_options: bool) -> Result<TableRef> {
+pub(crate) fn table_ref(form: &Edn, in_options: bool) -> Result<TableRef> {
     match &form.kind {
         EdnKind::Keyword(name) => {
             let (schema, table) = name.split_once('/').unwrap_or(("public", name));

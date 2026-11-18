@@ -122,7 +122,8 @@
                                              :or {key-fn :kebab-case-keyword}}]
   (err/wrap-anomaly {}
     (with-open [connection (connect node {:database default-db})]
-      (when await-token (set-await-token! connection await-token))
+      (when-let [token (or await-token (.getAwaitToken node))]
+        (set-await-token! connection token))
       (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (or args {})))]
         (let [key-fn (serde/read-key-fn key-fn)
               rows (loop [rows (transient [])]

@@ -545,6 +545,18 @@
 
 (deftest-original-api original-scan/live-hash-trie-branches-get-expanded-3247)
 
+(deftest-original-api original-scan/test-simple-scan)
+
+(deftest-original-api original-scan/test-simple-scan-with-namespaced-attributes)
+
+(deftest-original-api original-scan/test-duplicates-in-scan-1)
+
+(deftest-original-api original-scan/test-iid-col-type-3016)
+
+(deftest-original-api original-scan/dont-use-fast-path-on-non-literals-2768)
+
+(deftest-original-api original-scan/test-past-point-point-queries-with-valid-time)
+
 (deftest-original-api original-pg-expression/test-col-description)
 
 (deftest-original-api original-pg-expression/test-json-arrow-operator)
