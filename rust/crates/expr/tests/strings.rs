@@ -41,6 +41,21 @@ fn test_str_retains_original_variadic_null_numeric_and_keyword_assertions() {
 }
 
 #[test]
+fn keyword_conversion_uses_the_spelling_rules_for_each_operation() {
+    let keyword = |name| V::Keyword(rtdb_types::Keyword::from_name(name));
+    let target = L::Scalar(S::Keyword);
+    for (input, name) in [("foo/bar", "foo/bar"), (":foo/bar", "foo/bar"), ("::foo/bar", ":foo/bar"), (":", ""), ("", "")] {
+        let value = text(input);
+        assert_eq!(rtdb_expr::cast(&value, &target, "UTC").unwrap(), keyword(name));
+        assert_eq!(call("keyword", &[value]), keyword(input));
+    }
+    let prefixed = keyword(":foo/bar");
+    assert_eq!(rtdb_expr::cast(&prefixed, &target, "UTC").unwrap(), prefixed);
+    assert_eq!(rtdb_expr::cast(&V::Null, &target, "UTC").unwrap(), V::Null);
+    assert_eq!(call("keyword", &[V::Null]), V::Null);
+}
+
+#[test]
 fn test_cast_any_to_text_retains_original_collections_binary_and_uri_assertions() {
     let object = |fields: &[(&str, V)]| V::Struct(fields.iter().map(|(key, value)| ((*key).into(), value.clone())).collect());
     for (value, expected) in [

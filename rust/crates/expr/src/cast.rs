@@ -136,7 +136,10 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
             _ => Err(inapplicable("boolean", &[value])),
         },
         S::Utf8 => Ok(Value::Utf8(crate::string::render::text(value)?)),
-        S::Keyword => match value { Value::Utf8(text) => Ok(Value::Keyword(rtdb_types::Keyword::from_name(text))), _ => Err(inapplicable("keyword", &[value])) },
+        S::Keyword => match value {
+            Value::Utf8(text) => Ok(Value::Keyword(rtdb_types::Keyword::from_name(text.strip_prefix(':').unwrap_or(text)))),
+            _ => Err(inapplicable("keyword", &[value])),
+        },
         S::Uuid => match value { Value::Utf8(text) => Ok(Value::Uuid(*uuid::Uuid::parse_str(text).map_err(|_| inapplicable("uuid", &[value]))?.as_bytes())), Value::FixedSizeBinary(bytes) | Value::Binary(bytes) => Ok(Value::Uuid(bytes.as_slice().try_into().map_err(|_| inapplicable("uuid", &[value]))?)), _ => Err(inapplicable("uuid", &[value])) },
         S::Uri => match value { Value::Utf8(text) => { rtdb_types::UriParts::parse(text)?; Ok(Value::Uri(text.clone())) }, _ => Err(inapplicable("uri", &[value])) },
         S::Timestamp { unit, timezone: target_zone } => {

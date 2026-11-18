@@ -160,7 +160,10 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         "upper" => Ok(Value::Utf8(text(&args[0])?.to_uppercase())),
         "length" => match &args[0] { Value::Utf8(text) => count(text.chars().count()), Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => count(bytes.len()), Value::List(items) => count(items.len()), value => Err(inapplicable(&name, &[value])) },
         "_iid" => Ok(Value::FixedSizeBinary(args[0].entity_id()?.iid().0.to_vec())),
-        "keyword" => cast(&args[0], &LogicalType::Scalar(ScalarType::Keyword), context.timezone),
+        "keyword" => match &args[0] {
+            Value::Utf8(text) => Ok(Value::Keyword(rtdb_types::Keyword::from_name(text))),
+            value => Err(inapplicable(&name, &[value])),
+        },
         "namespace" | "local_name" => {
             let Value::Keyword(keyword) = &args[0] else { return Err(inapplicable(&name, &[&args[0]])); };
             let parts = keyword.as_str().split_once('/');

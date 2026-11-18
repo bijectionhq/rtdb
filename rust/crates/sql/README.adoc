@@ -357,7 +357,7 @@ SECOND precision determines nanosecond versus micro-interval metadata for multi-
 TIME WITH TIME ZONE follows the pinned planner's timestamp-with-zone cast lowering.
 DURATION literals read ISO duration text during SQL binding and keep the signed-second range for formatting.
 Query evaluation converts a demanded duration literal to microseconds through the checked nanosecond range.
-KEYWORD literals remove one leading colon from the string before constructing a keyword.
+KEYWORD literals and casts from text to KEYWORD remove one leading colon before constructing a keyword.
 `PrepareOptions.default_timezone` supplies the zone label for prepared query and DML result types.
 The default is UTC; callers using another execution zone must supply it during preparation.
 Retained control expressions resolve that zone from `EvalContext` when executed.

@@ -219,6 +219,7 @@
 
 (deftest-original-api original-sql/insert-with-bad-select-shouldnt-stop-ingestion-3797)
 (deftest-original-api original-sql/test-boolean-cast)
+(deftest-original-api original-sql/test-keyword)
 (deftest-original-api original-sql/test-str)
 (deftest-original-api original-sql/null-valid-time-insertion-behaves-as-if-non-specified)
 (deftest-original-api original-sql/forbid-invalid-columns-update)
