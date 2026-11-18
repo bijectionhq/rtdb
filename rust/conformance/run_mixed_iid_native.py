@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from history_results import integer, verify_artifacts, verify_runtime_artifacts
+import mixed_iid_checkpoint as checkpoint
 from run_controls import HERE, REFERENCE, REPOSITORY, digest, git, run_process, validate_native_revision, write_json
 from run_history import input_receipt, verify_inputs
 from run_mixed_iid_reference import (
@@ -51,7 +52,7 @@ def receipt_digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def read_reference(directory):
+def read_reference(directory, *, replay_checkpoint=False):
     result_path = directory / "result.json"
     result_bytes = read_receipt_bytes(result_path)
     result = json.loads(result_bytes)
@@ -81,14 +82,22 @@ def read_reference(directory):
     require(process["completed"] is True and process["exit_code"] == 0, "D201 reference process did not complete")
     verify_runtime_artifacts(receipt_json["runtime-artifacts.json"])
     execution = receipt_json["execution.json"]
-    verify_execution(execution, directory / "workspace")
-    return {entry["id"]: entry["operands"] for entry in execution["assertions"]}, receipts
+    if replay_checkpoint:
+        verify_execution(execution, directory / "workspace", require_checkpoint=True)
+    else:
+        verify_execution(execution, directory / "workspace")
+    return {entry["id"]: entry["operands"] for entry in execution["assertions"]}, receipts, execution
 
 
-def verify_tape(record):
-    require(len(record["first_ticks"]) == 40 and len(record["ticks"]) == 30, "invalid native tick partitions")
-    previous_tx = -1
-    for tick, transaction in enumerate(record["first_ticks"] + record["ticks"]):
+def verify_tape(record, *, recovered=None):
+    require(len(record["ticks"]) == 30, "invalid native tick partitions")
+    if recovered is None:
+        require(len(record["first_ticks"]) == 40, "invalid native tick partitions")
+        start, ticks, previous_tx = 0, record["first_ticks"] + record["ticks"], -1
+    else:
+        require("first_ticks" not in record, "portable receipt must identify recovered history")
+        start, ticks, previous_tx = 40, record["ticks"], recovered["tx_id"]
+    for tick, transaction in enumerate(ticks, start=start):
         system_time = 1_577_836_800_000_000 + tick * 6 * 3_600_000_000
         delete = {"ids": [0, 1, 2], "valid_from_micros": system_time + 3_600_000_000} if tick % 10 == 0 else None
         tx_id = transaction["tx_id"]
@@ -268,15 +277,28 @@ def wire_observations(execution, reference):
     return report
 
 
-def verify_native(execution, output, revision, binary_sha256):
+def verify_native(execution, output, revision, binary_sha256, transfer=None, request_sha256=None):
     validate_native_revision(execution, revision)
-    require(execution["schema_version"] == 2 and execution["engine"] == "rust"
+    require(execution["schema_version"] == (3 if transfer else 2) and execution["engine"] == "rust"
             and execution["source_sha256"] == SOURCE_SHA256 and execution["binary_sha256"] == binary_sha256
             and execution["execution_complete"] is True and execution["complete_parity"] is False
             and execution["settings"] == SETTINGS,
             "invalid native mixed IID execution identity or physical settings")
+    if transfer:
+        require(execution["mode"] == "jvm-checkpoint" and execution["checkpoint_request_sha256"] == request_sha256
+                and set(execution["recovered"]) == {"control", "mixed"}
+                and json.loads(read_receipt_bytes(output / "recovered-checkpoint.json")) == execution["recovered"]
+                and execution["rewritten_files"] == checkpoint.native_rewrites(transfer),
+                "native mixed IID replay evidence differs from its request")
+        for name in ("reference_result_sha256", "reference_execution_sha256"):
+            require(execution[name] == transfer[name], "native mixed IID replay changed the reference identity")
     for side in ("control", "mixed"):
-        verify_tape(execution[side])
+        if transfer:
+            recovered = execution["recovered"][side]
+            checkpoint.verify_recovered(recovered, transfer["heads"][side])
+            verify_tape(execution[side], recovered=recovered)
+        else:
+            verify_tape(execution[side])
     verify_artifacts(output, {"layouts": [
         {"prefix": "mixed-iid", "layout": side, "artifacts": execution[side]["artifacts"]}
         for side in ("control", "mixed")
@@ -296,19 +318,35 @@ def run(args):
     require(digest(source) == SOURCE_SHA256, "original mixed IID source digest differs from C84")
     require(not any(args.output.is_relative_to(root) for root in (REPOSITORY, args.reference, args.reference_run)),
             "new native output must be outside the source checkouts and reference evidence")
-    reference, reference_receipts = read_reference(args.reference_run)
+    replay = getattr(args, "replay_checkpoint", False)
+    if replay:
+        reference, reference_receipts, reference_execution = read_reference(args.reference_run, replay_checkpoint=True)
+    else:
+        reference, reference_receipts, reference_execution = read_reference(args.reference_run)
     reference_result_sha256 = reference_receipts[args.reference_run / "result.json"]
     runner_inputs = input_receipt([Path(__file__).resolve(), HERE / "run_mixed_iid_reference.py", HERE / "run_history.py",
                                    HERE / "run_controls.py", HERE / "source_gate.py", HERE / "history_results.py",
                                    source, args.native])
+    if replay:
+        runner_inputs.extend(input_receipt([HERE / "mixed_iid_checkpoint.py", HERE / "recovery_results.py"]))
     inputs = runner_inputs + [{"path": str(path), "sha256": checksum} for path, checksum in reference_receipts.items()]
     args.output.mkdir(parents=True, exist_ok=False)
     args.created_output = True
     write_json(args.output / "inputs.json", {"reference_revision": REFERENCE, "implementation_revision": revision,
                                             "original_case": UNIQUE_ID, "inputs": inputs})
     native = args.output / "native"
-    process = run_process([args.native, "mixed-iid", native], REPOSITORY, args.output / "stdout.log",
-                          args.output / "stderr.log", args.timeout)
+    transfer = request_bytes = request_sha256 = None
+    command = [args.native, "mixed-iid", native]
+    if replay:
+        transfer = checkpoint.stage(args.reference_run / "checkpoint", native, reference_execution,
+                                    reference_result_sha256, reference_receipts[args.reference_run / "execution.json"])
+        request = args.output / "checkpoint-request.json"
+        write_json(request, transfer)
+        request_bytes = read_receipt_bytes(request)
+        require(json.loads(request_bytes) == transfer, "portable checkpoint request differs from its staged inputs")
+        request_sha256 = hashlib.sha256(request_bytes).hexdigest()
+        command = [args.native, "mixed-iid-replay", request, native]
+    process = run_process(command, REPOSITORY, args.output / "stdout.log", args.output / "stderr.log", args.timeout)
     write_json(args.output / "process.json", process)
     require(process["completed"] and process["exit_code"] == 0, "native mixed IID process did not complete")
     execution_path = native / "execution.json"
@@ -316,13 +354,18 @@ def run(args):
     execution_sha256 = hashlib.sha256(execution_bytes).hexdigest()
     execution = json.loads(execution_bytes)
     require(json.loads(read_receipt_bytes(args.output / "stdout.log")) == execution, "native mixed IID stdout differs from its receipt")
-    verify_native(execution, native, revision, digest(args.native))
+    if replay:
+        verify_native(execution, native, revision, digest(args.native), transfer, request_sha256)
+    else:
+        verify_native(execution, native, revision, digest(args.native))
     report = observations(execution, reference)
     wire_report = wire_observations(execution, reference)
     comparison = {
         "reference_result_sha256": reference_result_sha256,
         "observations": report, "wire_observations": wire_report,
     }
+    if replay:
+        comparison.update(mode="jvm-checkpoint", checkpoint_request_sha256=request_sha256)
     comparison_path = args.output / "comparison.json"
     comparison_bytes = (json.dumps(comparison, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     with comparison_path.open("xb") as stream:
@@ -334,21 +377,28 @@ def run(args):
             "history runner input changed during execution")
     require_revision(REPOSITORY, revision)
     require_revision(args.reference, REFERENCE)
+    if replay:
+        require(read_receipt_bytes(request) == request_bytes, "portable checkpoint request changed during replay")
+        checkpoint.verify_archive(args.reference_run / "checkpoint", transfer["checkpoint"], transfer["reference_rewrites"])
     require(all(result["equal"] for result in report), "native internal mixed IID results differ from D201")
     require(all(result["equal"] for result in wire_report), "native mixed IID wire observations differ from D201")
     require(read_receipt_bytes(execution_path) == execution_bytes, "native mixed IID execution changed after comparison")
     require(read_receipt_bytes(comparison_path) == comparison_bytes, "native mixed IID report changed after comparison")
-    write_json(args.output / "result.json", {
+    result = {
         "native_internal_match": True, "native_wire_match": True, "complete_parity": False,
         "case": UNIQUE_ID, "observations": len(report), "wire_observations": len(wire_report), "execution_sha256": execution_sha256,
         "reference_result_sha256": reference_result_sha256,
         "comparison_sha256": hashlib.sha256(comparison_bytes).hexdigest(),
-    })
+    }
+    if replay:
+        result.update(mode="jvm-checkpoint", checkpoint_request_sha256=request_sha256)
+    write_json(args.output / "result.json", result)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Compare native mixed IID internal and wire observations against the original C84 case.")
     parser.add_argument("--phase-two", action="store_true")
+    parser.add_argument("--replay-checkpoint", action="store_true")
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--reference-run", type=Path, required=True)
     parser.add_argument("--native", type=Path, required=True)

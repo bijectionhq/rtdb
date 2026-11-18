@@ -334,7 +334,6 @@ The runner verifies the live file bytes, runtime closure, exact assertion set, a
 The result binds the exact input, process, runtime, and execution receipt bytes that the runner verified.
 It also records SHA-256 digests for both process logs.
 A failed or incomplete worker run leaves its process logs and any available observations.
-Portable checkpoint transfer remains pending.
 
 The native comparison uses an independently written pair of local stores and a successful retained reference run from the command above.
 Both stores ingest the two original tick ranges with the reference block threshold, file-size target and default timezone.
@@ -364,3 +363,26 @@ After both PATCH operations, Flight SQL GetFlightInfo and DoGet capture the sign
 The runner compares the retained wire observations with the original JVM case after the native listeners and nodes have closed.
 The mixed Flight SQL result must span multiple batches under one declared fixed-size 16-byte binary field.
 All listeners bind to loopback on ephemeral ports and join before their node closes.
+
+=== Replay the closed JVM checkpoint
+
+Choose `--replay-checkpoint` to continue from the closed JVM files recorded by a version 2 reference execution receipt.
+
+[source,shell]
+----
+python3 rust/conformance/run_mixed_iid_native.py --phase-two --replay-checkpoint \
+  --reference /absolute/path/to/pinned-reference \
+  --reference-run /absolute/retained/mixed-iid-reference \
+  --native /absolute/path/to/rtdb-conformance \
+  --output /absolute/new/mixed-iid-replay
+----
+
+1. The runner retains the original archive and copy manifests in `checkpoint-request.json`.
+It stages both copies under the new native output using the original `log` names and mapping `objects/v06` to `storage/v06`.
+Each pre-open copy retains the original file bytes and the path below its log or object root.
+2. The native worker checks the copied inventory, digests, framed log tips and compacted rewrites before opening either node.
+Each node recovers at least through the archived replica tip and synchronizes to the exact archived source tip.
+Before tick 40, `native/recovered-checkpoint.json` records both recovered positions, adopted blocks and tick-39 transaction keys.
+3. The same nodes run the second ingest, compaction, layout checks, internal queries, pgwire, PATCH and Flight SQL.
+After shutdown, `native/execution.json` records the recovered prefix, 30 continuation ticks and one PATCH for each node.
+The runner's `result.json` records the internal and wire matches for the pinned case.

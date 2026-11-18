@@ -1,3 +1,4 @@
+mod checkpoint;
 mod wire;
 
 use super::{Error, artifacts, combine, flush, instant, store::Reads, support::{FixtureClock, Identity, RunningNode}, write_new};
@@ -10,7 +11,7 @@ use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, Catalog, ColumnId, E
 use rtdb_query::{PreparedQuery, QueryCursor};
 use rtdb_tx::{Documents, EntityIds, TxOp};
 use rtdb_types::{EntityId, LogicalType, RunEndWidth, ScalarType, StorageEpoch, TableRef, TimeUnit, Timestamp, TransactionKey, Value};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File}, io::Write, ops::Range, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 
@@ -90,7 +91,7 @@ async fn ingest(node: &Node, clock: &FixtureClock, ticks: Range<i64>) -> Result<
     Ok(committed)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 enum IidEncoding {
     #[serde(rename = "plain")]
     Plain,
@@ -98,14 +99,16 @@ enum IidEncoding {
     RunEndI32,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PageShape {
     rows: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     runs: Option<usize>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct FileShape {
     bytes: u64,
     sha256: String,
@@ -423,26 +426,69 @@ pub async fn execute(output: &Path) -> Result<Json, Error> {
     write_new(&output.join("closed-rewrite.json"), &rewritten)?;
     let rewrite_files = rewritten.as_array().ok_or("Missing rewritten files")?;
 
+    observe_reopened(output, control_clock, mixed_clock,
+                     FirstIngest::Authored { prefixes: &prefixes, rewritten: rewrite_files }).await
+}
+
+/// Runs the second native ingest and records observations on copies of the closed JVM checkpoint.
+/// `request` must be a canonical absolute regular file beside the existing canonical `output` directory.
+/// `output` must contain the writable copies declared in `request`.
+/// Returns the same JSON written to `output/execution.json` after both node owners join.
+pub async fn replay_checkpoint(request: &Path, output: &Path) -> Result<Json, Error> {
+    let replay = checkpoint::load(request, output)?;
+    let clock = || Arc::new(FixtureClock(AtomicI64::new(checkpoint::LAST_PREFIX_TIME.0)));
+    observe_reopened(output, clock(), clock(), FirstIngest::Recovered(&replay)).await
+}
+
+enum FirstIngest<'a> {
+    Authored { prefixes: &'a [Vec<Json>], rewritten: &'a [Json] },
+    Recovered(&'a checkpoint::Replay),
+}
+
+async fn observe_reopened(
+    output: &Path, control_clock: Arc<FixtureClock>, mixed_clock: Arc<FixtureClock>, first: FirstIngest<'_>,
+) -> Result<Json, Error> {
     let control = open(&layout_directory(output, "control"), control_clock.clone()).await?;
     let mixed = match open(&layout_directory(output, "mixed"), mixed_clock.clone()).await {
         Ok(mixed) => mixed,
         Err(error) => return combine(Err(error), control.close().await),
     };
-    let work = second_phase(&control.node, &mixed.node, &control_clock, &mixed_clock, output, rewrite_files).await;
+    let rewritten: &[Json] = match &first {
+        FirstIngest::Authored { rewritten, .. } => rewritten,
+        FirstIngest::Recovered(replay) => &replay.rewritten,
+    };
+    let work = async {
+        let recovery = if let FirstIngest::Recovered(replay) = &first {
+            let control_basis = checkpoint::observe_recovery(&control.node, &replay.heads.control).await?;
+            let mixed_basis = checkpoint::observe_recovery(&mixed.node, &replay.heads.mixed).await?;
+            let recovered = json!({"control":control_basis,"mixed":mixed_basis});
+            write_new(&output.join("recovered-checkpoint.json"), &recovered)?;
+            Some(recovered)
+        } else { None };
+        let (layout, control, mixed) = second_phase(&control.node, &mixed.node, &control_clock, &mixed_clock, output, rewritten).await?;
+        Ok::<_, Error>((layout, control, mixed, recovery))
+    }.await;
     let mixed_closed = mixed.close().await;
     let control_closed = control.close().await;
-    let (layout, mut control, mut mixed) = combine(work, combine(mixed_closed, control_closed))?;
-    for (name, receipt, prefix) in [("control", &mut control, &prefixes[0]), ("mixed", &mut mixed, &prefixes[1])] {
-        receipt["first_ticks"] = json!(prefix);
+    let (layout, mut control, mut mixed, recovery) = combine(work, combine(mixed_closed, control_closed))?;
+    for (index, (name, receipt)) in [("control", &mut control), ("mixed", &mut mixed)].into_iter().enumerate() {
+        if let FirstIngest::Authored { prefixes, .. } = &first { receipt["first_ticks"] = json!(prefixes[index]); }
         receipt["artifacts"] = json!(artifacts(&layout_directory(output, name))?);
     }
-    let execution = json!({"schema_version":2,"engine":"rust","source_sha256":SOURCE_SHA256,
+    let mut execution = json!({"schema_version":if recovery.is_some() { 3 } else { 2 },"engine":"rust","source_sha256":SOURCE_SHA256,
         "binary_sha256":crate::controls::digest_file(&std::env::current_exe()?)?,
         "artifact_revision":env!("RTDB_CONFORMANCE_REVISION"),"source_dirty":env!("RTDB_CONFORMANCE_DIRTY")!="false",
         "execution_complete":true,"complete_parity":false,
         "settings":{"timezone":"Europe/London","rows_per_block":200,"file_size_target":16384,
             "automatic_compaction":false,"automatic_gc":false,"plain_compaction":true},
         "rewritten_files":rewritten,"live_layout":layout,"control":control,"mixed":mixed});
+    if let FirstIngest::Recovered(replay) = first {
+        execution["mode"] = json!("jvm-checkpoint");
+        execution["checkpoint_request_sha256"] = json!(replay.request_sha256);
+        execution["reference_result_sha256"] = json!(replay.reference_result_sha256);
+        execution["reference_execution_sha256"] = json!(replay.reference_execution_sha256);
+        execution["recovered"] = json!(recovery);
+    }
     write_new(&output.join("execution.json"), &execution)?;
     Ok(execution)
 }

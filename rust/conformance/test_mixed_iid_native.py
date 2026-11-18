@@ -1,9 +1,11 @@
 import argparse
 import copy
 import json
+import struct
 import tempfile
 import unittest
 from hashlib import sha256
+from mixed_iid_checkpoint import LAST_PREFIX_TIME, native_rewrites, stage, verify_recovered
 from pathlib import Path
 from unittest.mock import patch
 
@@ -60,6 +62,65 @@ class MixedIidNativeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "PATCH differs"):
             verify_tape(record)
 
+    def test_continuation_tape_is_bound_to_the_recovered_prefix(self):
+        record = tape()
+        del record["first_ticks"]
+        recovered = {"archive_source_position": 80, "archive_replica_position": 90, "source_position": 80,
+                     "replica_position": 92, "tx_id": 40, "system_time_micros": LAST_PREFIX_TIME,
+                     "adopted_block": 5, "open_block": 6}
+        heads = {"source": 80, "replica": 90}
+        verify_recovered(recovered, heads)
+        verify_tape(record, recovered=recovered)
+        with self.assertRaisesRegex(ValueError, "tick-39 basis"):
+            verify_recovered(dict(recovered, system_time_micros=LAST_PREFIX_TIME - 1), heads)
+        with self.assertRaisesRegex(ValueError, "tick-39 basis"):
+            verify_recovered(dict(recovered, replica_position=89), heads)
+        with self.assertRaisesRegex(ValueError, "at tick 40"):
+            verify_tape(record, recovered=dict(recovered, tx_id=41))
+        with self.assertRaisesRegex(ValueError, "must identify recovered history"):
+            verify_tape(tape(), recovered=recovered)
+
+    def test_checkpoint_copy_preserves_exact_log_and_object_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            archive = root / "checkpoint"
+            payload = b"log"
+            framed = b"\x1e" + struct.pack(">iq", len(payload), 100) + payload + struct.pack(">q", 0)
+            archived = {
+                f"{side}/log/{log}": framed for side in ("control", "mixed") for log in ("LOG", "REPLICA_LOG")
+            }
+            for side in ("control", "mixed"):
+                archived[f"{side}/objects/v06/blocks/b00.binpb"] = f"catalog {side}".encode()
+            rewrite_path = "mixed/objects/v06/tables/public$readings/data/l01-b00.arrow"
+            archived[rewrite_path] = b"rewritten"
+            for path, data in archived.items():
+                target = archive / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            files = [{"path": path, "bytes": len(data), "sha256": sha256(data).hexdigest()} for path, data in archived.items()]
+            rewrite = {"path": "target/mixed-iid-encoding/" + rewrite_path,
+                       "bytes": len(archived[rewrite_path]), "sha256": sha256(archived[rewrite_path]).hexdigest(),
+                       "encoding": "run-end-i32", "pages": [{"rows": 2, "runs": 1}]}
+            execution = {"schema_version": 2, "checkpoint": {
+                "schema_version": 1, "stage": "after-rewrite-before-reopen", "files": files,
+            }, "rewritten_files": [{"before": dict(rewrite, bytes=5, sha256=sha256(b"plain").hexdigest(),
+                                                  encoding="plain", pages=[{"rows": 2}]),
+                                     "after": rewrite, "result": {"rows": 2, "runs": 1}}]}
+            output = root / "native"
+            request = stage(archive, output, execution, "a" * 64, "b" * 64)
+            self.assertEqual(request["checkpoint"], execution["checkpoint"])
+            self.assertEqual(request["heads"], {"control": {"source": 0, "replica": 0}, "mixed": {"source": 0, "replica": 0}})
+            self.assertEqual(request["reference_result_sha256"], "a" * 64)
+            self.assertEqual(request["reference_execution_sha256"], "b" * 64)
+            for transfer in request["copies"]:
+                self.assertEqual((output / transfer["destination"]).read_bytes(), archived[transfer["source"]])
+            self.assertEqual((output / "mixed-iid-control/log/LOG").read_bytes(), framed)
+            self.assertEqual(native_rewrites(request)[0]["path"], "storage/v06/tables/public$readings/data/l01-b00.arrow")
+            (archive / rewrite_path).write_bytes(b"incorrect")
+            with self.assertRaisesRegex(ValueError, "file bytes differ"):
+                stage(archive, root / "blocked", execution, "a" * 64, "b" * 64)
+            self.assertFalse((root / "blocked").exists())
+
     def test_typed_comparison_preserves_order_and_signed_iid_bytes(self):
         signed = {"kind": "fixed-size-binary", "signed_bytes": [-128] + [0] * 15}
         integer = {"kind": "i64", "value": 7}
@@ -88,6 +149,16 @@ class MixedIidNativeTests(unittest.TestCase):
                     run(args)
                 reference.assert_not_called()
                 process.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_phase_gate_precedes_checkpoint_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "native"
+            args = argparse.Namespace(phase_two=False, replay_checkpoint=True, output=output)
+            with patch("run_mixed_iid_native.checkpoint.stage") as stage_checkpoint:
+                with self.assertRaisesRegex(ValueError, "requires --phase-two"):
+                    run(args)
+                stage_checkpoint.assert_not_called()
             self.assertFalse(output.exists())
 
     def test_receipt_replacement_prevents_success(self):
