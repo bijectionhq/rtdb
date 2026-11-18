@@ -127,7 +127,7 @@ impl<'input> ExecutableSyntax<'input> {
     }
 }
 
-/// Extended Parse classification with the admission for lexical work and any parsed grammar.
+/// Extended Parse classification retaining the per-command allowance.
 #[derive(Debug)]
 pub struct ExtendedParse<'input> {
     pub statement: ExtendedStatement<'input>,
@@ -247,11 +247,13 @@ impl SqlPrepareSyntax {
 /// Lexes the complete input and classifies its nonempty ranges.
 /// A lone PREPARE validates every wrapper and its leaf and retains a copy of the input under the caller's budget.
 /// An ordinary range borrows the input for the caller's own parsing policy.
+/// The located token array holds its own reservation through classification and is released before return.
+/// A refused reservation can precede later lexical or grammar errors.
 pub fn parse_extended_statement<'input>(source: &'input str, memory: &Arc<MemoryBudget>) -> Result<ExtendedParse<'input>> {
     let allocation = memory.reserve(command_size(source.len())?)?;
-    let mut tokens = crate::parse::tokenize(source, Some(memory))?;
-    tokens.retain(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF));
-    let mut ranges = tokens.split(|token| token.token == Token::SemiColon).filter(|range| !range.is_empty());
+    let mut tokens = SplitTokens::tokenize_in(source, memory)?;
+    tokens.values.retain(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF));
+    let mut ranges = tokens.values.split(|token| token.token == Token::SemiColon).filter(|range| !range.is_empty());
     let statement = match (ranges.next(), ranges.next()) {
         (None, _) => ExtendedStatement::Empty,
         (_, Some(_)) => ExtendedStatement::Multiple,
@@ -483,6 +485,66 @@ mod tests {
         drop(allocation);
         drop(batch);
         assert_eq!(grammar_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn extended_parse_admits_replacement_token_array_before_releasing_previous_storage() {
+        let source = "SELECT/* café; */ 1 ";
+        let command = command_size(source.len()).unwrap();
+        let first = Layout::array::<TokenWithSpan>(4).unwrap().size() + 256;
+        let replacement = Layout::array::<TokenWithSpan>(8).unwrap().size() + 256;
+        let peak = command + first + replacement;
+
+        let short = MemoryBudget::new(peak - 1);
+        let error = parse_extended_statement(source, &short).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(short.peak_bytes(), command + first);
+        assert_eq!(short.used_bytes(), 0);
+
+        let exact = MemoryBudget::new(peak);
+        let parsed = parse_extended_statement(source, &exact).unwrap();
+        assert!(matches!(parsed.statement, ExtendedStatement::Ordinary("SELECT/* café; */ 1")));
+        assert_eq!(exact.peak_bytes(), peak);
+        assert_eq!(exact.used_bytes(), command);
+        drop(parsed);
+        assert_eq!(exact.used_bytes(), 0);
+    }
+
+    #[test]
+    fn extended_parse_preserves_malformed_ordinary_and_control_text_for_preparation() {
+        let memory = MemoryBudget::new(1 << 20);
+        let sql = "SELEC/* café; */ 1";
+        let control = "SET TIME /* café; */ ZONE (";
+        for statement in [sql, control] {
+            let source = format!(";; -- leading β\r\n{statement}; /* trailing */ ;");
+            let parsed = parse_extended_statement(&source, &memory).unwrap();
+            assert!(matches!(parsed.statement, ExtendedStatement::Ordinary(text) if text == statement));
+            drop(parsed);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+
+        let error = crate::parse_syntax_in(sql, &memory).err().expect("malformed ordinary SQL");
+        assert_eq!(error.code, "xtdb/sql-error");
+        let error = crate::parse_admitted_control_in(control, &Default::default(), &memory).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn extended_parse_checks_full_lexical_input_before_nested_prepare_grammar() {
+        let memory = MemoryBudget::new(1 << 20);
+        let malformed = "/* café */ PREPARE outer_q AS PREPARE inner_q AS SELECT 1 LIMIT ALL";
+        let error = parse_extended_statement(malformed, &memory).unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("LIMIT requires an unsigned integer or parameter"));
+        assert_eq!(memory.used_bytes(), 0);
+
+        let source = format!("{malformed}; -- trailing β\r\n@ 'unterminated");
+        let error = parse_extended_statement(&source, &memory).unwrap_err();
+        assert_eq!(error, crate::parse::tokenize(&source, Some(&memory)).unwrap_err());
+        assert_eq!(error.message.as_deref(), Some("Invalid character in SQL source"));
+        let invalid = source.find('@').unwrap();
+        assert_eq!(error.context["span"], serde_json::json!({"start": invalid, "end": invalid + 1}));
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]

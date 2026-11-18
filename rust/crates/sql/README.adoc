@@ -310,6 +310,11 @@ Binding compiles the final transaction options in option order and resolves a CL
 Before scanning the batch, Simple Query reserves an allowance for token payloads and tokenizer scratch.
 It charges the located token array separately as the array grows.
 Batch parsing releases both reservations before returning.
+Extended Parse keeps its command allowance and admits the temporary located token array separately.
+It reserves replacement array capacity before releasing the preceding array's charge.
+Located comment slots preserve source positions without retaining ignored comment text.
+The array reservation ends when classification and any nested PREPARE validation return.
+Extended Parse classification returns the original bounded text for ordinary SQL and controls.
 `parse_control_in` charges raw expression forms during binding.
 Flight SQL uses `parse_admitted_control_in` to classify the full input under a tokenizer allowance and admit located token capacity as it grows.
 A recognized control command reserves an estimate for parsing and binding, including simultaneous token copies and AST storage.
