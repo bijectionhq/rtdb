@@ -1,4 +1,5 @@
 mod checkpoint;
+mod export;
 pub(super) mod wire;
 
 use super::{Error, artifacts, combine, flush, instant, store::Reads, support::{FixtureClock, Identity, RunningNode}, write_new};
@@ -222,9 +223,9 @@ fn compacted_key(path: &Path, root: &Path) -> Result<Option<TrieKey>, Error> {
     Ok((key.level() > 0).then_some(key))
 }
 
-fn closed_rewrite(directory: &Path) -> Result<Json, Error> {
+fn closed_rewrite(directory: &Path, describe: fn(&Path) -> Result<Vec<Json>, Error>) -> Result<Vec<Json>, Error> {
     let root = physical_root()?;
-    let before = artifacts(directory)?;
+    let before = describe(directory)?;
     let mut paths = BTreeSet::new();
     let mut files = Vec::new();
     for file in &before {
@@ -235,7 +236,7 @@ fn closed_rewrite(directory: &Path) -> Result<Json, Error> {
             files.push(json!({"path":relative, "trie_key":trie_key.to_string(), "before":before, "after":after}));
         }
     }
-    let after = artifacts(directory)?;
+    let after = describe(directory)?;
     let retained_before = before.iter().filter(|file| !file["path"].as_str().is_some_and(|path| paths.contains(path)));
     let retained_after = after.iter().filter(|file| !file["path"].as_str().is_some_and(|path| paths.contains(path)));
     if !retained_before.eq(retained_after) { return Err("Closed IID rewrite changed non-data artifacts".into()); }
@@ -243,7 +244,7 @@ fn closed_rewrite(directory: &Path) -> Result<Json, Error> {
         pages.iter().any(|page| page["runs"].as_u64().zip(page["rows"].as_u64()).is_some_and(|(runs, rows)| runs < rows)))) {
         return Err("Closed IID rewrite produced no multi-row run".into());
     }
-    Ok(json!(files))
+    Ok(files)
 }
 
 async fn live_layout(node: &Node, directory: &Path, rewrites: &[Json]) -> Result<Json, Error> {
@@ -406,28 +407,60 @@ async fn second_phase(control: &Node, mixed: &Node, control_clock: &FixtureClock
                        "wire":{"pgwire":mixed_pgwire,"flight_sql":mixed_flight}})))
 }
 
+struct AuthoredPrefix {
+    ticks: [Vec<Json>; 2],
+    rewritten: Vec<Json>,
+}
+
+async fn authored_prefix(
+    output: &Path, clocks: [&Arc<FixtureClock>; 2], describe: fn(&Path) -> Result<Vec<Json>, Error>,
+) -> Result<AuthoredPrefix, Error> {
+    fs::create_dir(output)?;
+    let mut ticks = [Vec::new(), Vec::new()];
+    for ((side, clock), ticks) in ["control", "mixed"].into_iter().zip(clocks).zip(&mut ticks) {
+        let directory = layout_directory(output, side);
+        fs::create_dir(&directory)?;
+        let running = open(&directory, Arc::clone(clock)).await?;
+        let prefix = ingest(&running.node, clock, 0..40).await;
+        *ticks = combine(prefix, running.close().await)?;
+    }
+    let rewritten = closed_rewrite(&layout_directory(output, "mixed"), describe)?;
+    write_new(&output.join("closed-rewrite.json"), &json!(rewritten))?;
+    Ok(AuthoredPrefix { ticks, rewritten })
+}
+
+fn prefix_clocks() -> Result<[Arc<FixtureClock>; 2], Error> {
+    let time = instant("2020-01-01T00:00:00Z")?;
+    Ok(std::array::from_fn(|_| Arc::new(FixtureClock(AtomicI64::new(time.0)))))
+}
+
 /// Runs the native mixed IID fixture in a fresh directory and joins both local node owners.
 /// The parent of `output` must exist, and `output` must be a new directory.
 /// Returns the internal and wire observations from the same reopened nodes.
 /// Writes the returned JSON to `output/execution.json` after both nodes have joined.
 pub async fn execute(output: &Path) -> Result<Json, Error> {
-    fs::create_dir(output)?;
-    let clock = || -> Result<Arc<FixtureClock>, Error> { Ok(Arc::new(FixtureClock(AtomicI64::new(instant("2020-01-01T00:00:00Z")?.0)))) };
-    let (control_clock, mixed_clock) = (clock()?, clock()?);
-    let mut prefixes = Vec::new();
-    for (name, clock) in [("control", &control_clock), ("mixed", &mixed_clock)] {
-        let directory = layout_directory(output, name);
-        fs::create_dir(&directory)?;
-        let running = open(&directory, clock.clone()).await?;
-        let prefix = ingest(&running.node, clock, 0..40).await;
-        prefixes.push(combine(prefix, running.close().await)?);
-    }
-    let rewritten = closed_rewrite(&layout_directory(output, "mixed"))?;
-    write_new(&output.join("closed-rewrite.json"), &rewritten)?;
-    let rewrite_files = rewritten.as_array().ok_or("Missing rewritten files")?;
+    let [control_clock, mixed_clock] = prefix_clocks()?;
+    let prefix = authored_prefix(output, [&control_clock, &mixed_clock], artifacts).await?;
 
     observe_reopened(output, control_clock, mixed_clock,
-                     FirstIngest::Authored { prefixes: &prefixes, rewritten: rewrite_files }).await
+                     FirstIngest::Authored { prefixes: &prefix.ticks, rewritten: &prefix.rewritten }).await
+}
+
+/// Captures both closed native stores at the mixed IID rewrite boundary before tick 40.
+/// The output must be a new absolute directory beneath a canonical existing parent.
+/// Writes `output/closed-rewrite.json` and returns the manifest written to `output/execution.json`.
+/// A failure can leave partial output, so retries use a fresh directory.
+pub async fn capture_checkpoint(output: &Path) -> Result<Json, Error> {
+    let parent = output.parent().ok_or("Native checkpoint output has no parent")?;
+    let name = output.file_name().ok_or("Native checkpoint output must name a fresh directory")?;
+    if !parent.is_absolute() || parent.canonicalize()?.join(name) != output {
+        return Err("Native checkpoint output must be canonical and absolute".into());
+    }
+    let [control_clock, mixed_clock] = prefix_clocks()?;
+    let prefix = authored_prefix(output, [&control_clock, &mixed_clock], export::bounded_artifacts).await?;
+    let execution = export::manifest(output, &prefix)?;
+    write_new(&output.join("execution.json"), &execution)?;
+    Ok(execution)
 }
 
 /// Runs the second native ingest and records observations on copies of the closed JVM checkpoint.

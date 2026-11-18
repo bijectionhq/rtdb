@@ -33,10 +33,16 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string(&execution)?);
         return Ok(execution["execution_complete"] == true);
     }
-    if arguments.len() == 2 && arguments[0] == "mixed-iid" {
+    if arguments.len() == 2 && matches!(arguments[0].as_str(), "mixed-iid" | "mixed-iid-capture") {
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        let execution = runtime.block_on(rtdb_conformance::history::mixed_iid::execute(Path::new(&arguments[1])))?;
-        println!("{}", serde_json::to_string(&execution)?);
+        let output = Path::new(&arguments[1]);
+        if arguments[0] == "mixed-iid-capture" {
+            let execution = runtime.block_on(rtdb_conformance::history::mixed_iid::capture_checkpoint(output))?;
+            println!("{}", serde_json::to_string_pretty(&execution)?);
+        } else {
+            let execution = runtime.block_on(rtdb_conformance::history::mixed_iid::execute(output))?;
+            println!("{}", serde_json::to_string(&execution)?);
+        }
         return Ok(true);
     }
     if arguments.len() == 3 && arguments[0] == "mixed-iid-replay" {
@@ -68,7 +74,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(execution["execution_complete"] == true);
     }
     if arguments.len() != 4 || arguments[0] != "compare" {
-        return Err("usage: rtdb-conformance backend REQUEST.json OUTPUT | observe FIXTURE.json | history FIXTURE.json OUTPUT | mixed-iid OUTPUT | mixed-iid-replay REQUEST.json OUTPUT | parser-wire FIXTURE.json OUTPUT | recovery REQUEST.json OUTPUT | sql-logic PLAN.json OUTPUT | simulation-refused-claim PROJECTED.json OUTPUT | compare LEDGER.json REFERENCE.json RUST.json".into());
+        return Err("usage: rtdb-conformance backend REQUEST.json OUTPUT | observe FIXTURE.json | history FIXTURE.json OUTPUT | mixed-iid OUTPUT | mixed-iid-capture OUTPUT | mixed-iid-replay REQUEST.json OUTPUT | parser-wire FIXTURE.json OUTPUT | recovery REQUEST.json OUTPUT | sql-logic PLAN.json OUTPUT | simulation-refused-claim PROJECTED.json OUTPUT | compare LEDGER.json REFERENCE.json RUST.json".into());
     }
     let ledger: Ledger = read(&arguments[1])?;
     let reference: Vec<CaseReceipt> = read(&arguments[2])?;

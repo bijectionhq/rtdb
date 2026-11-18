@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File}, io::Read, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 const MAX_REQUEST: u64 = 8 << 20;
-const MAX_ENTRIES: usize = 4096;
-const MAX_BYTES: u64 = 64 << 20;
-const CASE: &str = "[engine:dev.clojurephant.jovial.clojure-test]/[namespace:xtdb.mixed-iid-encoding-test]/[name:a-scan-over-plain-and-run-end-encoded-iid-pages-answers-as-over-plain-ones-6258]";
+pub(super) const MAX_ENTRIES: usize = 4096;
+pub(super) const MAX_BYTES: u64 = 64 << 20;
+pub(super) const CASE: &str = "[engine:dev.clojurephant.jovial.clojure-test]/[namespace:xtdb.mixed-iid-encoding-test]/[name:a-scan-over-plain-and-run-end-encoded-iid-pages-answers-as-over-plain-ones-6258]";
 const JVM_CASE_DIRECTORY: &str = "target/mixed-iid-encoding/";
 pub(super) const LAST_PREFIX_TIME: Timestamp = Timestamp(1_578_679_200_000_000);
 
@@ -116,7 +116,7 @@ fn verify_file(path: &Path, expected: &ArchivedFile) -> Result<(), Error> {
     Ok(())
 }
 
-struct DigestWriter<'a>(&'a mut Sha256);
+pub(super) struct DigestWriter<'a>(pub(super) &'a mut Sha256);
 
 impl std::io::Write for DigestWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -239,9 +239,17 @@ fn verify_rewrites(root: &Path, rewrites: Vec<Rewrite>) -> Result<Vec<Json>, Err
     Ok(result)
 }
 
+fn open_checkpoint_log(root: &Path, name: &str) -> Result<Arc<ReadOnlyLocalLog>, Error> {
+    Ok(ReadOnlyLocalLog::open(root.join("log").join(name), ReadOnlyLocalLogOptions::default())?)
+}
+
+pub(super) fn read_log_tip(root: &Path, name: &str) -> Result<i64, Error> {
+    Ok(open_checkpoint_log(root, name)?.latest()?.0)
+}
+
 fn verify_log_heads(root: &Path, heads: &Heads) -> Result<(), Error> {
     for (name, expected) in [("LOG", heads.source), ("REPLICA_LOG", heads.replica)] {
-        let log = ReadOnlyLocalLog::open(root.join("log").join(name), ReadOnlyLocalLogOptions::default())?;
+        let log = open_checkpoint_log(root, name)?;
         if expected < 0 || log.latest()?.0 != expected { return Err(format!("Copied checkpoint log tip differs: {name}").into()); }
     }
     Ok(())

@@ -398,6 +398,16 @@ The runner compares the retained wire observations with the original JVM case af
 The mixed Flight SQL result must span multiple batches under one declared fixed-size 16-byte binary field.
 All listeners bind to loopback on ephemeral ports and join before their node closes.
 
+=== Capture the closed native checkpoint
+
+After Phase 2 begins, run `rtdb-conformance mixed-iid-capture /absolute/new/mixed-iid-capture` against a canonical existing parent directory.
+The command runs the first 40 ticks through both native writers, flushes and compacts, and joins both nodes before rewriting the mixed store's compacted data files.
+`execution.json` records the accepted prefix transactions, local log tips and selected `log` and `storage/v06` file inventories.
+It also records each rewritten Arrow file's path, size, digest, IID encoding and page shapes.
+Both stores remain closed, and the rewritten Arrow bytes stay in the mixed store.
+The command writes the same JSON bytes to stdout.
+The capture is the input to a subsequent transfer into a fresh JVM workspace.
+
 === Replay the closed JVM checkpoint
 
 Choose `--replay-checkpoint` to continue from the closed JVM files recorded by a version 2 reference execution receipt.
