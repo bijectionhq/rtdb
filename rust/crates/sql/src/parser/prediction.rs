@@ -10,12 +10,22 @@ mod adaptive;
 pub(super) use runtime::is_identifier_token;
 
 use rtdb_types::{AllocationScope, Anomaly};
-use super::grammar::{ArtifactIssue, Grammar, GrammarError};
-pub(crate) use context::{ContextKey, ContextShape, ContextView, MergeMode, MergeRound, PredictionContexts};
-pub(crate) use config::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, ConfigView, ConfigSetView, Configurations, ConflictKey, SetMode};
-pub(crate) use semantic::Semantic;
-pub(crate) use mode::{AlternativeChoice, ModeWorkspace, PredictionMode, SubsetsView};
-pub(crate) use storage::{PredictionAccess, PredictionStorage, with_prediction_storage};
+use super::grammar::{ArtifactIssue, GrammarError};
+#[cfg(test)]
+use super::grammar::Grammar;
+pub(super) use closure::SourceAssertions;
+pub(super) use runtime::{CapturedClassPolicy, DirectControlError, DirectControlRecognition, ParserEnvironment};
+use context::{ContextKey, MergeMode, MergeRound, PredictionContexts};
+#[cfg(test)]
+use context::ContextShape;
+use config::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, Configurations, SetMode};
+use semantic::Semantic;
+use mode::{AlternativeChoice, ModeWorkspace, PredictionMode};
+#[cfg(test)]
+use mode::SubsetsView;
+use storage::{PredictionStorage, with_prediction_storage};
+#[cfg(test)]
+use storage::PredictionAccess;
 
 type Result<T> = std::result::Result<T, PredictionError>;
 
@@ -44,14 +54,16 @@ impl From<GrammarError> for PredictionError {
     }
 }
 
-pub(crate) fn with_prediction_contexts<'g, 'scope, R>(
+#[cfg(test)]
+fn with_prediction_contexts<'g, 'scope, R>(
     grammar: &'g Grammar<'scope>, allocation: &'scope AllocationScope,
     use_contexts: impl for<'id> FnOnce(&mut PredictionContexts<'id, 'g, 'scope>) -> Result<R>,
 ) -> Result<R> {
     use_contexts(&mut PredictionContexts::new(grammar, allocation))
 }
 
-pub(crate) fn with_configurations<'id, 'g, 'scope, R>(
+#[cfg(test)]
+fn with_configurations<'id, 'g, 'scope, R>(
     contexts: &mut PredictionContexts<'id, 'g, 'scope>,
     use_configs: impl for<'cfg> FnOnce(&mut Configurations<'cfg, 'id, 'g, 'scope>, &mut PredictionContexts<'id, 'g, 'scope>) -> Result<R>,
 ) -> Result<R> {

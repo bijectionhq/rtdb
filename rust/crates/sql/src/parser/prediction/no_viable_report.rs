@@ -27,6 +27,7 @@ pub(super) struct ListenerDiagnostic {
 impl<'sql> NoViableDiagnostic<'sql> {
     pub(in crate::parser::prediction) fn cause(&self) -> NoViableAlternative<'sql> { self.cause }
     pub(in crate::parser::prediction) fn anomaly(&self) -> &Anomaly { &self.listener.anomaly }
+    pub(super) fn into_listener(self) -> ListenerDiagnostic { self.listener }
 }
 
 impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {

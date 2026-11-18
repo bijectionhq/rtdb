@@ -842,6 +842,21 @@ The Bail mismatch uses the existing same-cause cancellation.
 The LL inline path checks deletion before insertion and anchors a mismatch to the selected context.
 The current statement switches select eligible set tokens before entering those bodies.
 
+== Owned direct control results
+
+A parser can open its retained grammar and prediction storage under one explicit cache budget using a completed parser class policy.
+The direct control entry borrows this same environment exclusively for each invocation.
+`with_bail_fallback` runs the generated direct root in SLL mode and restarts it in LL mode on Bail cancellation, using the same session and token stream.
+The fixed entry returns an owned result.
+
+* Commit, Rollback, Discard and SetRole become control statements before the session closes.
+* A completed query returns a private unsupported-statement error.
+* An input mismatch carries the offending token occurrence and its numeric parser state when present.
+* A no-viable-alternative error also carries the start token occurrence.
+* A missing or unwanted token report carries the offending occurrence with a null cause.
+* A lexical recognition failure carries its source span.
+* A reported parser anomaly retains the listener's reservation until the failure is dropped.
+
 == Generated scalar expression root
 
 The private scalar expression action enters generated `expr(0)` using the source `parseExpr` root and the same SLL Bail and LL Default wrapper.

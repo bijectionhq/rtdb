@@ -1,8 +1,8 @@
-use std::{alloc::Layout, marker::PhantomData};
-use rtdb_types::{AllocationScope, Anomaly};
+use std::{alloc::Layout, marker::PhantomData, sync::Arc};
+use rtdb_types::{AllocationScope, Anomaly, MemoryBudget};
 use rtdb_types::java_text::JavaText;
 use crate::lexer::{IndexedLexeme, StreamError, TokenStream};
-use crate::parser::grammar::{Grammar, GrammarError, State, StateKindView, TokenSet, TokenType, TransitionView};
+use crate::parser::grammar::{Grammar, GrammarError, OwnedGrammar, State, StateKindView, TokenSet, TokenType, TransitionView};
 use super::{Alternative, FactoryError, PredictionError, PredictionMode, PredictionStorage, Result, Semantic, push};
 use super::adaptive;
 use super::closure::{ClosureOptions, ClosureRound, LoopEntryOption, SourceAssertions, with_closure_round_result};
@@ -12,6 +12,10 @@ use super::storage::{Retained, with_prediction_storage, with_prediction_storage_
 #[path = "bail_fallback.rs"]
 mod bail_fallback;
 pub(super) use bail_fallback::{PassError, PassResult, with_bail_fallback};
+
+#[path = "direct_control.rs"]
+mod direct_control;
+pub(in crate::parser) use direct_control::{DirectControlError, DirectControlRecognition};
 
 #[path = "inline_match.rs"]
 mod inline_match;
@@ -80,11 +84,11 @@ impl super::factory_error_sealed::Sealed for RuntimeError<'_> {}
 impl FactoryError for RuntimeError<'_> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct CapturedClassPolicy { options: ClosureOptions }
+pub(in crate::parser) struct CapturedClassPolicy { options: ClosureOptions }
 impl CapturedClassPolicy {
     pub(super) fn from_captured(options: ClosureOptions) -> Self { Self { options } }
 
-    pub(super) fn capture_parser_atn<'text, E>(
+    pub(in crate::parser) fn capture_parser_atn<'text, E>(
         parser_atn_assertions: SourceAssertions,
         get_safe_env: impl FnOnce(&'static str) -> std::result::Result<Option<JavaText<'text>>, E>,
     ) -> std::result::Result<Self, E> {
@@ -100,8 +104,14 @@ impl CapturedClassPolicy {
         } })
     }
 }
-pub(super) struct ParserEnvironment { storage: PredictionStorage, policy: CapturedClassPolicy }
+pub(in crate::parser) struct ParserEnvironment { storage: PredictionStorage, policy: CapturedClassPolicy }
 impl ParserEnvironment {
+    pub(in crate::parser) fn open_in(policy: CapturedClassPolicy, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let initialization = AllocationScope::new(memory).map_err(PredictionError::Admission)?;
+        let grammar = OwnedGrammar::load(memory)?;
+        Self::new(PredictionStorage::new(grammar, memory), policy, &initialization)
+    }
+
     pub(super) fn new(mut storage: PredictionStorage, policy: CapturedClassPolicy, initialization: &AllocationScope) -> Result<Self> {
         with_prediction_storage(&mut storage, initialization, |access| {
             let (dfas, configs, _) = access.dfa_parts();

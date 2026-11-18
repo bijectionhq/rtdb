@@ -18,7 +18,7 @@ mod tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LoopEntryOption { Enabled, Disabled }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SourceAssertions { Enabled, Disabled }
+pub(in crate::parser) enum SourceAssertions { Enabled, Disabled }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ClosureOptions { pub(super) pruning: LoopEntryOption, pub(super) assertions: SourceAssertions }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
