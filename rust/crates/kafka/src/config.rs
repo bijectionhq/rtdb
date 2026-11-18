@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs::File, io::Read, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs::File, io::Read, mem::size_of, path::PathBuf, sync::Arc, time::Duration};
 use rtdb_format::generated::xtdb::kafka::proto as pb;
 use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, Result, jvm_number::Number};
 use serde::{Deserialize, Serialize};
@@ -317,79 +317,98 @@ pub fn parse_properties(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
 
 fn parse_properties_text(text: &str) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
-    visit_properties_text(text, |key, value| {
+    let mut input = text.encode_utf16();
+    visit_properties_units(|| Ok(input.next()), &mut |_| Ok(()), |key, value, _| {
         values.insert(unescape(key)?, unescape(value)?);
         Ok(())
     })?;
     Ok(values)
 }
 
-fn visit_properties_text(text: &str, mut entry: impl FnMut(&str, &str) -> Result<()>) -> Result<()> {
-    let mut input = text.chars().peekable();
-    let mut line = String::new();
+fn visit_properties_units<R: FnMut(usize) -> Result<()>>(
+    mut input: impl FnMut() -> Result<Option<u16>>, reserve: &mut R,
+    mut entry: impl FnMut(&[u16], &[u16], &mut R) -> Result<()>,
+) -> Result<()> {
+    let mut line = Vec::new();
     let mut leading_space = true;
     let mut continued = false;
     let mut trailing_backslash = false;
-    while let Some(unit) = input.next() {
-        let newline = matches!(unit, '\n' | '\r');
+    let mut pending = None;
+    loop {
+        let current = match pending.take() { Some(unit) => Some(unit), None => input()? };
+        let Some(unit) = current else { break; };
+        let newline = matches!(unit, 0x0a | 0x0d);
         if leading_space {
-            if matches!(unit, ' ' | '\t' | '\u{c}') || (newline && !continued) { continue; }
+            if property_space(unit) || (newline && !continued) { continue; }
             leading_space = false;
             continued = false;
         }
-        if line.is_empty() && matches!(unit, '#' | '!') {
-            for comment in input.by_ref() {
-                if matches!(comment, '\n' | '\r') { break; }
+        if line.is_empty() && matches!(unit, 0x23 | 0x21) {
+            while let Some(comment) = input()? {
+                if matches!(comment, 0x0a | 0x0d) { break; }
             }
             leading_space = true;
             continue;
         }
         if !newline {
+            if line.len() == line.capacity() {
+                let capacity = line.capacity().checked_mul(2).ok_or_else(property_allocation)?.max(128);
+                reserve(capacity.checked_mul(size_of::<u16>()).ok_or_else(property_allocation)?)?;
+                line.try_reserve_exact(capacity - line.len()).map_err(|_| property_allocation())?;
+            }
             line.push(unit);
-            trailing_backslash = unit == '\\' && !trailing_backslash;
+            trailing_backslash = unit == 0x5c && !trailing_backslash;
             continue;
         }
         leading_space = true;
         if line.is_empty() { continue; }
-        if input.peek().is_none() { break; }
+        let Some(next) = input()? else { break; };
         if trailing_backslash {
             line.pop();
             trailing_backslash = false;
             continued = true;
-            if unit == '\r' { let _ = input.next_if_eq(&'\n'); }
+            if unit != 0x0d || next != 0x0a { pending = Some(next); }
         } else {
+            pending = Some(next);
             let (key, value) = property_parts(&line);
-            entry(key, value)?;
+            entry(key, value, reserve)?;
             line.clear();
         }
     }
     if !line.is_empty() {
         if trailing_backslash { line.pop(); }
         let (key, value) = property_parts(&line);
-        entry(key, value)?;
+        entry(key, value, reserve)?;
     }
     Ok(())
 }
 
-fn property_parts(line: &str) -> (&str, &str) {
+fn property_space(unit: u16) -> bool { matches!(unit, 0x09 | 0x0c | 0x20) }
+
+fn property_parts(line: &[u16]) -> (&[u16], &[u16]) {
     let mut escaped = false;
     let mut separator = line.len();
-    for (index, character) in line.char_indices() {
-        if !escaped && matches!(character, '=' | ':' | ' ' | '\t' | '\u{c}') { separator = index; break; }
-        escaped = !escaped && character == '\\';
+    for (index, &unit) in line.iter().enumerate() {
+        if !escaped && (matches!(unit, 0x3d | 0x3a) || property_space(unit)) { separator = index; break; }
+        escaped = !escaped && unit == 0x5c;
     }
-    let mut value = line[separator..].trim_start_matches([' ', '\t', '\u{c}']);
-    if value.starts_with(['=', ':']) { value = &value[1..]; }
-    (&line[..separator], value.trim_start_matches([' ', '\t', '\u{c}']))
+    let mut value = skip_property_space(&line[separator..]);
+    if matches!(value.first().copied(), Some(0x3d | 0x3a)) { value = &value[1..]; }
+    (&line[..separator], skip_property_space(value))
 }
 
-fn unescape(input: &str) -> Result<String> {
+fn skip_property_space(mut units: &[u16]) -> &[u16] {
+    while units.first().is_some_and(|&unit| property_space(unit)) { units = &units[1..]; }
+    units
+}
+
+fn unescape(input: &[u16]) -> Result<String> {
     String::from_utf16(&unescape_units(input)?).map_err(|_| Anomaly::incorrect("xtdb.kafka/properties-file", "Unpaired surrogate in Java properties value"))
 }
 
-fn unescape_units(input: &str) -> Result<Vec<u16>> {
+fn unescape_units(input: &[u16]) -> Result<Vec<u16>> {
     let mut result = Vec::<u16>::new();
-    let mut units = input.encode_utf16();
+    let mut units = input.iter().copied();
     while let Some(unit) = units.next() {
         let unit = if unit == u16::from(b'\\') {
             let Some(escaped) = units.next() else { break; };

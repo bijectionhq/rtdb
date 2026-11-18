@@ -155,6 +155,52 @@ fn file_provider_projects_the_final_selected_property() {
     assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/properties-file");
 }
 
+#[test]
+#[cfg(unix)]
+fn file_provider_checks_utf8_at_the_source_reader_demand_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("client.properties");
+    let mut original = properties(root.path());
+    original.insert("setting".into(), format!("${{file:{}:needed}}", file.display()));
+    let prefix = b"needed=\\u000X\n";
+    let failure = |bytes: &[u8]| {
+        fs::write(&file, bytes).unwrap();
+        resolve_test(&original).unwrap_err().code
+    };
+
+    let mut same_read = prefix.to_vec();
+    same_read.push(0xff);
+    assert_eq!(failure(&same_read), "xtdb.kafka/config-provider");
+
+    let mut later_read = prefix.to_vec();
+    later_read.resize(8192, b' ');
+    later_read.push(0xff);
+    assert_eq!(failure(&later_read), "xtdb.kafka/properties-file");
+
+    let mut newline_at_end = prefix[..prefix.len() - 1].to_vec();
+    newline_at_end.resize(8191, b' ');
+    newline_at_end.extend_from_slice(&[b'\n', 0xff]);
+    assert_eq!(failure(&newline_at_end), "xtdb.kafka/config-provider");
+
+    let mut supplementary = prefix.to_vec();
+    supplementary.resize(8191, b' ');
+    supplementary.extend_from_slice("😀".as_bytes());
+    supplementary.push(0xff);
+    assert_eq!(failure(&supplementary), "xtdb.kafka/config-provider");
+}
+
+#[test]
+#[cfg(unix)]
+fn file_provider_keeps_supplementary_values_split_by_reader_windows() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("client.properties");
+    let mut original = properties(root.path());
+    original.insert("setting".into(), format!("${{file:{}:needed}}", file.display()));
+    let expected = format!("{}😀", "x".repeat(8191 - "needed=".len()));
+    fs::write(&file, format!("needed={expected}\r\nignored=other\n")).unwrap();
+    assert_eq!(resolve_test(&original).unwrap()["setting"], expected);
+}
+
 fn resolve_test(original: &Properties) -> Result<Cow<'_, Properties>> {
     let memory = MemoryBudget::new(1 << 28);
     resolve(original, &memory, &mut |_| Ok(()))

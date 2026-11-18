@@ -54,6 +54,10 @@ For those options and serializer class names, the adapter trims outer code units
 Registry dead-letter producer options can declare Kafka `FileConfigProvider` and `DirectoryConfigProvider` classes through `config.providers` and their alias properties.
 A `${provider:path:key}` value is resolved before the producer parses its settings or prepares TLS material.
 The file provider decodes UTF-8 Java properties and validates escape syntax throughout the input before projecting the final requested values into native UTF-8 strings.
+Regular files use the pinned OpenJDK 25 byte and UTF-16 reader windows.
+The logical line reader's refill demand determines whether a decoding failure or an invalid property escape surfaces first.
+Supplementary pairs can span character windows, and the line layer carries both units until property decoding completes.
+Nonregular streams use the native whole-input reader and still need source channel readiness and close qualification.
 Both Properties readers retain the source continuation behavior across CR, LF and CRLF, including a comment after a continuation whose logical line is empty.
 The directory provider reads requested regular-file entries as UTF-8 with their original line endings.
 An `allowed.paths` provider parameter limits resolution to the listed absolute roots and their descendants after canonicalization.

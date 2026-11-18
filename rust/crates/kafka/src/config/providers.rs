@@ -217,9 +217,7 @@ impl Provider {
             _ if path.is_empty() => Ok(BTreeMap::new()),
             Self::File(allowed) => {
                 let Some(path) = allowed.path(path)? else { return Ok(BTreeMap::new()); };
-                let source = read_text(&path, reserve)?;
-                reserve(add(product(source.len(), 96)?, 4096)?)?;
-                file_text::selected(&source, keys)
+                file_text::selected_file(&path, keys, reserve)
             }
             Self::Directory(allowed) => {
                 let Some(path) = allowed.path(path)?.filter(|path| path.is_dir()) else { return Ok(BTreeMap::new()); };
@@ -240,6 +238,10 @@ impl Provider {
 
 fn read_text(path: &Path, reserve: &mut impl FnMut(usize) -> Result<()>) -> Result<String> {
     let file = File::open(path).map_err(|_| invalid("Kafka ConfigProvider file could not be opened"))?;
+    read_text_file(file, reserve)
+}
+
+fn read_text_file(file: File, reserve: &mut impl FnMut(usize) -> Result<()>) -> Result<String> {
     let bytes = super::read_allocated(file, reserve, |_| invalid("Kafka ConfigProvider file could not be read"), allocation)?;
     String::from_utf8(bytes).map_err(|_| invalid("Kafka ConfigProvider file is not valid UTF-8"))
 }

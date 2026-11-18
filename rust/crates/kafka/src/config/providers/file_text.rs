@@ -1,12 +1,33 @@
-use std::collections::BTreeSet;
+use std::{collections::{BTreeMap, BTreeSet}, fs::File, path::Path};
 
 use rtdb_types::{Anomaly, Result};
 
-use super::{Values, super::{unescape_units, visit_properties_text}};
+use super::{Values, add, invalid, product, read_text_file, super::{unescape_units, visit_properties_units}};
 
+mod reader;
+
+pub(super) fn selected_file<'a>(path: &Path, keys: &BTreeSet<&'a str>, reserve: &mut impl FnMut(usize) -> Result<()>) -> Result<Values<'a>> {
+    let file = File::open(path).map_err(|_| invalid("Kafka ConfigProvider file could not be opened"))?;
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        let text = read_text_file(file, reserve)?;
+        let mut input = text.encode_utf16();
+        return selected_units(|| Ok(input.next()), keys, reserve);
+    }
+    reserve(reader::SCRATCH_BYTES)?;
+    let mut reader = reader::Reader::new(file);
+    selected_units(|| reader.next_unit(), keys, reserve)
+}
+
+#[cfg(test)]
 pub(super) fn selected<'a>(text: &str, keys: &BTreeSet<&'a str>) -> Result<Values<'a>> {
-    let mut selected = std::collections::BTreeMap::new();
-    visit_properties_text(text, |key, value| {
+    let mut input = text.encode_utf16();
+    selected_units(|| Ok(input.next()), keys, &mut |_| Ok(()))
+}
+
+fn selected_units<'a>(input: impl FnMut() -> Result<Option<u16>>, keys: &BTreeSet<&'a str>, reserve: &mut impl FnMut(usize) -> Result<()>) -> Result<Values<'a>> {
+    let mut selected = BTreeMap::new();
+    visit_properties_units(input, reserve, |key, value, reserve| {
+        reserve(add(product(add(key.len(), value.len())?, 16)?, 512)?)?;
         let name = String::from_utf16(&unescape_units(key)?);
         let units = unescape_units(value)?;
         if let Some(&key) = name.ok().as_deref().and_then(|name| keys.get(name)) {
