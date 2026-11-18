@@ -493,13 +493,18 @@ pub fn function_type_with_args(name: &str, arguments: &[Expr]) -> Result<Logical
     let result = crate::interval_constructor::with_args(name, arguments, result)?;
     if !name.eq_ignore_ascii_case("round") { return Ok(result); }
     let source = types.first().unwrap_or(&LogicalType::Nothing);
-    let needs_constant = source.legs().iter().any(|leg| matches!(leg, LogicalType::Scalar(ScalarType::Decimal { .. } | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)));
-    let scale = if arguments.len() == 2 && needs_constant {
-        let value = match &arguments[1] {
+    let constant_scale_input = source.legs().iter().find_map(|leg| match leg {
+        LogicalType::Scalar(ScalarType::Decimal { .. }) => Some("DECIMAL"),
+        LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64) => Some("INTEGER"),
+        _ => None,
+    });
+    let scale = if let (Some(input), [_, scale]) = (constant_scale_input, arguments) {
+        let non_literal = || non_literal_round_scale(input);
+        let value = match scale {
             Expr::Literal(Value::I8(value)) => i64::from(*value), Expr::Literal(Value::I16(value)) => i64::from(*value),
             Expr::Literal(Value::I32(value)) => i64::from(*value), Expr::Literal(Value::I64(value)) => *value,
-            Expr::Unary { op: UnaryOp::Negate, expr } => match expr.as_ref() { Expr::Literal(Value::I64(value)) => value.checked_neg().ok_or_else(decimal_scale_error)?, _ => return Err(non_literal_round_scale()) },
-            _ => return Err(non_literal_round_scale()),
+            Expr::Unary { op: UnaryOp::Negate, expr } => match expr.as_ref() { Expr::Literal(Value::I64(value)) => value.checked_neg().ok_or_else(decimal_scale_error)?, _ => return Err(non_literal()) },
+            _ => return Err(non_literal()),
         };
         Some(i32::try_from(value).map_err(|_| decimal_scale_error())?)
     } else { None };
@@ -507,7 +512,9 @@ pub fn function_type_with_args(name: &str, arguments: &[Expr]) -> Result<Logical
     Ok(if types.iter().any(LogicalType::nullable) { result.maybe() } else { result })
 }
 
-fn non_literal_round_scale() -> Anomaly { Anomaly::unsupported("xtdb.expression/non-literal-scale", "ROUND with decimal or integer input requires a constant scale") }
+fn non_literal_round_scale(input: &str) -> Anomaly {
+    Anomaly::unsupported("xtdb.expression/non-literal-scale", format!("ROUND({input}, INTEGER) with non-constant scale is not supported. Use ROUND(val::DOUBLE, scale) for dynamic scales."))
+}
 fn decimal_scale_error() -> Anomaly { Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Decimal scale exceeds signed 32 bits") }
 fn round_type(source: &LogicalType, scale: Option<i32>, explicit: bool) -> Result<LogicalType> {
     if explicit && source.legs().iter().any(|leg| matches!(leg, LogicalType::Scalar(ScalarType::I8 | ScalarType::I16))) {

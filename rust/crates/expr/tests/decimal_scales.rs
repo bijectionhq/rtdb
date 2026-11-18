@@ -142,8 +142,12 @@ fn round_changes_decimal_metadata_and_rejects_dynamic_integer_scales() {
     }
     assert_eq!(scalar_call("floor", &[value(-125, 2)], &context).unwrap(), V::F64(-2.0));
     assert_eq!(scalar_call("ceil", &[value(125, 2)], &context).unwrap(), V::F64(2.0));
-    let args = [Expr::Literal(value(125, 2)), Expr::Parameter { index: 0, data_type: T::Scalar(S::I64) }];
-    assert_eq!(function_type_with_args("round", &args).unwrap_err().code, "xtdb.expression/non-literal-scale");
+    let scale = Expr::Parameter { index: 0, data_type: T::Scalar(S::I64) };
+    for (argument, input) in [(value(125, 2), "DECIMAL"), (V::I64(125), "INTEGER")] {
+        let error = function_type_with_args("round", &[Expr::Literal(argument), scale.clone()]).unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/non-literal-scale");
+        assert_eq!(error.message.as_deref(), Some(format!("ROUND({input}, INTEGER) with non-constant scale is not supported. Use ROUND(val::DOUBLE, scale) for dynamic scales.").as_str()));
+    }
 }
 
 fn equality_scope() -> rtdb_expr::EvaluationScope {

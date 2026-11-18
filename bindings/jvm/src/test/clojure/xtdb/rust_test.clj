@@ -241,6 +241,7 @@
 (deftest-original-api original-expr/test-round-type-preservation)
 (deftest-original-api original-expr/test-round-precision-fix)
 (deftest-original-api original-expr/test-round-half-up-mode)
+(deftest-original-api original-expr/test-round-decimal-constraints)
 (deftest-original-api original-expr/test-interval-comparison)
 (deftest-original-api original-expr/empty-array-column-compares-5948)
 (deftest-original-api original-expr/test-cast-temporal-to-string)
