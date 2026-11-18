@@ -99,9 +99,10 @@ impl Registry {
         #[cfg(feature = "kafka")]
         let mut sources = self.sources.lock();
         let mut count = 18usize.checked_add(provided_count).ok_or_else(overflow)?;
-        let mut labels = 0usize;
         #[cfg(feature = "kafka")]
-        { count = count.checked_add(sources.len().checked_mul(6).ok_or_else(overflow)?).ok_or_else(overflow)?; labels = sources.label_bytes()?; }
+        let labels = { count = count.checked_add(sources.len().checked_mul(6).ok_or_else(overflow)?).ok_or_else(overflow)?; sources.label_bytes()? };
+        #[cfg(not(feature = "kafka"))]
+        let labels = 0usize;
         let per_metric = self.node_id.len().checked_add(2048).ok_or_else(overflow)?;
         let bound = count.checked_mul(per_metric).and_then(|bytes| bytes.checked_add(labels)).and_then(|bytes| bytes.checked_add(provided_bytes)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let reservation = self.memory.reserve(bound)?;
