@@ -1,0 +1,20 @@
+{
+  "native_upstream_commit": "d5203d7b0c097d912d076681fd9e0922725b7575",
+  "derived_from": {
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_lz4.h": [
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_lz4.c"
+    ]
+  },
+  "source_inputs": {
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_lz4.h": "786b46e0f9935d3bca75542cee6325db7b5327ce16d2b5e3fe4073f79518d44d",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_lz4_test.h": "02700410d2ecb40a59f54dadf12474f681f652ba8fb3bc23567a356563c597ca",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_lz4.c": "be858dc18807c837ce5b4f6ac7c0678bdc5c39f652cedda02c77fb6524854271",
+    "rust/vendor/rdkafka-sys/librdkafka/src/lz4frame.h": "47501e4925d60c0f87c7bfc68c8b9e0e4d942eea786e35d2c5bfbf5e9deab561",
+    "rust/vendor/rdkafka-sys/librdkafka/src/lz4frame.c": "fba0cfc8bda03cab5fcbcf984332c172f8e2a6394cbcea85d608067cb2ad670a",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdxxhash.h": "aefdd236f35130495c18764cabed3f7b216906855fc5e6a9025cd2040bc84444",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msgset_reader.c": "62369d2615b05fb52db00d6fed1c6ba4d20ed070be63932e471351b3d1d245a6",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_decode.h": "8bb5b14ef933be1d03840f8526c89bde717ef6977ef301ece2a5e52ceb11b380",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_decode_test.h": "a95a533cdd34a78277ded0c445038fe2a551f34a9d5e80d501be248128f8040b",
+    "rust/crates/kafka/tests/native_fetch_decode_admission.rs": "8da26d1cc5202018ef63c5b5ece8752c0aef1fd84e77a7b03fe7c810b182b8c7"
+  }
+}

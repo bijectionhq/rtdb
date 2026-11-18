@@ -132,15 +132,15 @@ async fn retained_gzip_fetch_keeps_decoded_storage_until_final_message_drop() {
     retained_compressed_fetch("gzip").await;
 }
 
-#[tokio::test]
-async fn gzip_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
+async fn compressed_output_denial(codec: &str) {
     let cluster = MockCluster::new(1).unwrap();
-    let topic = "account-gzip-denial";
+    let topic = format!("account-{codec}-denial");
+    let topic = topic.as_str();
     cluster.create_topic(topic, 1, 1).unwrap();
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", cluster.bootstrap_servers())
         .set("message.max.bytes", "12000000")
-        .set("compression.type", "gzip").create().unwrap();
+        .set("compression.type", codec).create().unwrap();
     let first = producer.send(FutureRecord::to(topic).partition(0).payload("accepted").key("key"),
                               Duration::from_secs(5)).await.unwrap();
     let payload = vec![b'x'; 8 << 20];
@@ -155,7 +155,7 @@ async fn gzip_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
         match RetainedConsumerMessage::poll_from(&consumer, Duration::from_millis(100)) {
             Some(Ok(message)) => break message,
             Some(Err(error)) => panic!("error before accepted prefix: {error:?}"),
-            None => assert!(Instant::now() < deadline, "no accepted Gzip prefix arrived"),
+            None => assert!(Instant::now() < deadline, "no accepted {codec} prefix arrived"),
         }
     };
     assert_eq!(accepted.as_borrowed().offset(), first.offset);
@@ -163,11 +163,11 @@ async fn gzip_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
     loop {
         match consumer.poll(Duration::from_millis(100)) {
             Some(Err(KafkaError::MessageConsumption(RDKafkaErrorCode::CriticalSystemResource))) => break,
-            Some(Err(error)) => panic!("unexpected Gzip denial: {error:?}"),
+            Some(Err(error)) => panic!("unexpected {codec} denial: {error:?}"),
             Some(Ok(message)) => panic!("denied message was published at {}", message.offset()),
             None => (),
         }
-        assert!(Instant::now() < deadline, "no Gzip resource error arrived");
+        assert!(Instant::now() < deadline, "no {codec} resource error arrived");
     }
     assert_eq!(consumer.position().unwrap().find_partition(topic, 0).unwrap().offset(), Offset::Offset(failed.offset));
     let mut error = [0 as std::ffi::c_char; 512];
@@ -181,6 +181,21 @@ async fn gzip_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
     drop(accepted);
     assert!(weak.upgrade().is_none());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn gzip_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
+    compressed_output_denial("gzip").await;
+}
+
+#[tokio::test]
+async fn retained_lz4_fetch_keeps_decoded_storage_until_final_message_drop() {
+    retained_compressed_fetch("lz4").await;
+}
+
+#[tokio::test]
+async fn lz4_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
+    compressed_output_denial("lz4").await;
 }
 
 #[test]

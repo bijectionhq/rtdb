@@ -81,6 +81,7 @@
 
 #include "rdkafka_fetch_decode.h"
 #include "rdkafka_fetch_gzip.h"
+#include "rdkafka_fetch_lz4.h"
 
 
 static RD_INLINE int64_t
@@ -428,6 +429,19 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
 #endif
 
         case RD_KAFKA_COMPRESSION_LZ4: {
+#if !WITH_LZ4_EXT
+                if (decode_account) {
+                        err = rd_kafka_fetch_lz4(
+                            decode_account, MsgVersion >= 1, (char *)compressed,
+                            compressed_size,
+                            (size_t)msetr->msetr_rkb->rkb_rk->rk_conf.max_msg_size,
+                            &msetr->msetr_rkb->rkb_c.zbuf_grow,
+                            &iov.iov_base, &iov.iov_len, malloc);
+                        if (err)
+                                goto err;
+                        break;
+                }
+#endif
                 err =
                     rd_kafka_lz4_decompress(msetr->msetr_rkb,
                                             /* Proper HC? */
@@ -473,7 +487,11 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
          * allocated buffer (outbuf) and let messages keep a reference to
          * this new buffer. */
         if (decode_account && (codec == RD_KAFKA_COMPRESSION_SNAPPY ||
-                               codec == RD_KAFKA_COMPRESSION_GZIP)) {
+                               codec == RD_KAFKA_COMPRESSION_GZIP
+#if !WITH_LZ4_EXT
+                               || codec == RD_KAFKA_COMPRESSION_LZ4
+#endif
+                               )) {
                 rkbufz = rd_kafka_fetch_decode_shadow(
                     iov.iov_base, iov.iov_len, malloc);
                 if (!rkbufz) {

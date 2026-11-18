@@ -1,13 +1,13 @@
 = Native Fetch decode admission
 
-For an accounted native client, gzip and raw or Xerial Snappy Fetch output is admitted against the actual client's shared NativeByteAccount before output allocation.
+For an accounted native client, gzip, bundled LZ4 and raw or Xerial Snappy Fetch output is admitted against the actual client's shared NativeByteAccount before output allocation.
 The output owner retains its prefix and exact physical byte capacity until final native destruction.
 The bundled Snappy decoder uses stack decode state, without a separate heap decode context.
 Clients without an account use the original decoder and allocation paths.
-LZ4 and Zstd remain outside this scope.
+Zstd remains outside this scope, as does LZ4 built against an external liblz4.
 
 The broker actor remains the sole writer of its MessageSet reader transient.
-The reader takes admission authority from its actual client, so nested gzip or Snappy remains accounted even when its immediate input is an unaccounted outer-codec shadow.
+The reader takes admission authority from its actual client, so nested gzip, LZ4 or Snappy remains accounted even when its immediate input is an unaccounted outer-codec shadow.
 The passive output owner stores only its account pointer and immutable physical charge.
 The existing native client and SDK queue/event owners retain the account monitor through native final release.
 No new actor, callback lifetime, queue or waiter is introduced.
@@ -41,6 +41,13 @@ The accounted path returns BAD_COMPRESSION only after observing that full-output
 This is a bounded native correction, not a claimed return result from that nonreturning source path.
 Truncated-input regression sources exercise that correction without calling the legacy helper on its nonreturning cases.
 
+LZ4 follows the source helper's frame-info probe, legacy header-checksum repair, initial capacity estimate and 1.75x growth with a 1024-byte floor.
+Its decompression context is created through LZ4F's custom-memory hooks; each block request admits an aligned ownership prefix plus the request before fallible malloc, and its free returns the credit after the block is freed.
+Context, block and output requests share the client's account, so a denial inside LZ4F maps to CRIT_SYS_RESOURCE rather than BAD_COMPRESSION.
+Growth admits the replacement output before copying and frees the old output afterwards, so the peak charge covers both buffers.
+The context is freed before the output and its logical length are published.
+Input that ends before the frame does publishes the partial output, as the source helper does.
+
 Only after successful decompression does the private shadow constructor admit its native buffer root and one aligned segment header.
 It uses a preallocated segment and does not enter RdBuf's fallback allocation path.
 A failed root or segment malloc releases the metadata charge and leaves output ownership with the caller for cleanup.
@@ -62,14 +69,16 @@ The unexecuted native regression sources cover exact, one-byte-short, zero and o
 Public mock-cluster sources cover actual retained Snappy Fetch output and resource denial after an accepted prefix without advancing the failed offset or setting native fatal state.
 Five additive gzip native fixture functions cover aligned callback allocation, overflow and malloc rollback, exact observed peak and one-byte-short denial, every actual inflater/output malloc failure, wrappers, empty output, checksum errors, trailing bytes, first-member behavior, observed partial-input termination and the retained NUL byte through final Fetch-event destruction.
 Two additive public mock-cluster sources cover actual retained gzip Fetch output and expansion denial after an accepted prefix.
+LZ4 native fixtures cover callback admission, alignment and malloc rollback, known and unknown content sizes with growth, every-capacity denial without residual charge, and legacy header-checksum repair; two mock-cluster tests cover retained LZ4 Fetch output and expansion denial after an accepted prefix.
 All existing native and SDK test/assertion sources remain unchanged apart from additive unit registration.
 The `native_fetch_decoders_admit_and_return_every_charge` test runs these native fixtures.
 Valid empty output initializes its shadow reader over the pushed zero-length segment.
 
-The active stock Connect account shares this bounded gzip and Snappy storage with its existing native owners.
+The active stock Connect account shares this bounded gzip, LZ4 and Snappy storage with its existing native owners.
 Its finite ceiling can reject an expansion even when the compressed wire response fits receive.message.max.bytes.
 The capacity policy is not a guarantee that every expansion fits.
-LZ4's context and retained growth capacity, Zstd's candidate buffers and internals, individual Fetch/error ops and strings, native client/queue/thread construction, plugins, allocator overhead and whole-native bounds remain separate obligations.
+Zstd's candidate buffers and internals, individual Fetch/error ops and strings, native client/queue/thread construction, plugins, allocator overhead and whole-native bounds remain separate obligations.
 Runtime and Phase 2 gates remain open.
 link:fetch-decode-sources.json[The source record] pins the inspected source and link:fetch-decode-COPYRIGHT[the retained notices] includes both leading Snappy blocks and the available full licenses.
 link:gzip-sources.json[The gzip source record] pins the additive native adapter and exact lock-resolved zlib sources, with complete notices in link:gzip-COPYRIGHT[the gzip notice record].
+link:lz4-sources.json[The LZ4 source record] pins the adapter and the librdkafka and bundled LZ4 sources it follows, with their notices in link:lz4-COPYRIGHT[the LZ4 notice record].

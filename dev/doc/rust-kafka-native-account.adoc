@@ -16,8 +16,9 @@ No account-to-client reference cycle is introduced.
 The ceiling applies to implemented allocation classes: receive frames, selected request/control owners, ApiVersions arrays and the admitted Metadata parser, cache, rack-scratch and topic-info owners.
 An uncompressed fetched message retains its shared admitted receive frame until the last referencing event is destroyed.
 RetainedConsumerMessage also retains the originating consumer and destroys its event before releasing that consumer.
-Accounted gzip and raw or Xerial Snappy output and shadow metadata retain their exact physical charges through the last referencing Fetch event.
+Accounted gzip, bundled LZ4 and raw or Xerial Snappy output and shadow metadata retain their exact physical charges through the last referencing Fetch event.
 Gzip also admits each actual zlib allocator request, with inflater initialization preceding input validation, first-pass output overlapping the still-live inflater state and output retaining its terminal NUL byte.
+LZ4 also admits each decompression-context block it requests and the overlap of old and replacement output while its output grows.
 Output admission follows each codec's preceding length, framing or measuring demands; shadow metadata is demanded only after complete codec validation.
 A denied expansion preserves earlier accepted messages and the failed batch's offset through the existing nonfatal decompression error/backoff path.
 link:../../rust/vendor/rdkafka/src/native_byte_account/FETCH-DECODE.adoc[The decode contract] describes those ownership and error boundaries.
