@@ -56,6 +56,25 @@ async fn sql(context: &Arc<QueryContext>, query: &str) -> Result<Vec<Vec<Value>>
 }
 
 #[tokio::test]
+async fn group_by_set_quantifier_is_ignored() {
+    let context = multiple_query_tails_context();
+    let expected = vec![
+        vec![Value::I64(1), Value::I64(2)], vec![Value::I64(2), Value::I64(1)],
+        vec![Value::I64(3), Value::I64(1)], vec![Value::I64(4), Value::I64(1)],
+    ];
+    for quantifier in ["", "ALL ", "DISTINCT "] {
+        for query in [
+            format!("SELECT v, COUNT(*) AS n FROM foo GROUP BY {quantifier}v ORDER BY v"),
+            format!("FROM foo GROUP BY {quantifier}v SELECT v, COUNT(*) AS n ORDER BY v"),
+        ] {
+            assert_eq!(sql(&context, &query).await.unwrap(), expected, "{query}");
+        }
+    }
+    let error = prepare("SELECT v FROM foo GROUP BY ALL", &context.catalog, &PrepareOptions::default()).unwrap_err();
+    assert_eq!((error.category, error.code.as_str()), (rtdb_types::AnomalyCategory::Incorrect, "xtdb/sql-error"));
+}
+
+#[tokio::test]
 async fn multiple_query_tails() {
     let context = multiple_query_tails_context();
     let cases = [

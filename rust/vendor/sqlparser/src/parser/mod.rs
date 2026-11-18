@@ -13597,7 +13597,10 @@ impl<'a> Parser<'a> {
     /// Parse an optional `GROUP BY` clause, returning `Some(GroupByExpr)` when present.
     pub fn parse_optional_group_by(&mut self) -> Result<Option<GroupByExpr>, ParserError> {
         if self.parse_keywords(&[Keyword::GROUP, Keyword::BY]) {
-            let expressions = if self.parse_keyword(Keyword::ALL) {
+            let expressions = if self.dialect.supports_group_by_set_quantifier() {
+                let _ = self.parse_one_of_keywords(&[Keyword::ALL, Keyword::DISTINCT]);
+                Some(self.parse_comma_separated(Parser::parse_group_by_expr)?)
+            } else if self.parse_keyword(Keyword::ALL) {
                 None
             } else {
                 Some(self.parse_comma_separated(Parser::parse_group_by_expr)?)

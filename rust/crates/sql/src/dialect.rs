@@ -95,6 +95,7 @@ impl Dialect for SqlDialect {
     fn supports_from_pipeline(&self) -> bool { true }
     fn supports_values_in_subqueries(&self) -> bool { true }
     fn supports_records_query(&self) -> bool { true }
+    fn supports_group_by_set_quantifier(&self) -> bool { true }
     fn supports_scalar_values_rows(&self) -> bool { true }
     fn supports_user_as_identifier(&self) -> bool { true }
     fn supports_expression_derived_tables(&self) -> bool { true }

@@ -34,3 +34,6 @@ The RTDB dialect accepts both forms and allows empty row constructors.
 
 RTDB's dialect parses `RECORDS` followed by `{` or a placeholder as a query body holding one expression per row.
 The same prefix starts a statement and a parenthesized subquery, so an unquoted `records` column reference still parses as an identifier.
+
+RTDB's dialect reads an optional `ALL` or `DISTINCT` after `GROUP BY` as the SQL:2011 set quantifier and drops it, so grouping elements must follow.
+`GROUP BY ALL` without grouping elements is a syntax error rather than the dialect-specific group-by-all form.

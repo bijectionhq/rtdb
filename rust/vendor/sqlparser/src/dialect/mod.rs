@@ -1171,6 +1171,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if `GROUP BY` takes an optional `ALL` or `DISTINCT` before its grouping elements, as in SQL:2011.
+    fn supports_group_by_set_quantifier(&self) -> bool {
+        false
+    }
+
     /// Returns true if an unquoted `RECORDS` followed by `{` or a placeholder starts a query body.
     fn supports_records_query(&self) -> bool {
         false
