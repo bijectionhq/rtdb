@@ -1,11 +1,14 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use rdkafka::{
     client::{Client, ClientContext},
-    ordered_metadata::{MetadataTopic, OrderedMetadataError, OrderedMetadataRequest, RawMetadataView},
+    ordered_metadata::{
+        MetadataTopic, NativeConnectionObservation, OrderedMetadataError, OrderedMetadataRequest,
+        RawMetadataView,
+    },
 };
 
-use super::{Failure, Outcome, ProducerMetadata, RequestScope, Vector};
+use super::{Budget, Failure, MetadataRequest, Outcome, ProducerMetadata, RequestScope, Vector};
 
 /// The native destination established by the producer's connection selection.
 pub enum MetadataTarget<'a> {
@@ -40,6 +43,34 @@ impl MetadataExchange {
     }
 }
 
+impl MetadataRequest {
+    fn descriptors(&self) -> Outcome<Vector<MetadataTopic<'_>>> {
+        let mut budget = Budget(Arc::clone(&self.domain));
+        let mut topics = Vector::with_capacity(self.topics().len(), &mut budget)?;
+        for topic in self.topics() {
+            topics.push(MetadataTopic::new(topic), &mut budget)?;
+        }
+        Ok(topics)
+    }
+
+    /// Consumes the captured request and submits it through an observed exact native connection.
+    /// The observation must come from this producer's native client with auto topic creation enabled.
+    /// The caller qualifies source send eligibility separately before supplying the native connection.
+    /// The broker receives the retained encounter-order topics, or the broker-only request for an empty list.
+    /// The originating metadata budget admits temporary topic descriptors before native timeout or observation validation.
+    /// Pending or stale native observations and remaining capacity/timeout rules follow [`NativeConnectionObservation::into_metadata`].
+    /// A preparation failure reaches neither the native connection nor the wire.
+    /// The caller applies the producer's terminal admission policy on such a failure.
+    pub fn submit_observed(
+        self, observation: NativeConnectionObservation<'_>, response_capacity: usize, timeout: Duration,
+    ) -> std::result::Result<MetadataExchange, SubmissionFailure> {
+        let descriptors = self.descriptors().map_err(SubmissionFailure::Preparation)?;
+        let native = observation.into_metadata(descriptors.as_slice(), response_capacity, timeout)
+            .map_err(SubmissionFailure::Transport)?;
+        Ok(MetadataExchange { scope: self.scope(), request: native })
+    }
+}
+
 impl ProducerMetadata {
     /// Prepares the source request at signed milliseconds `now_ms` and submits it to the selected target.
     /// The client must be the accounted producer for this metadata state with auto topic creation enabled.
@@ -58,14 +89,7 @@ impl ProducerMetadata {
         timeout: Duration,
     ) -> std::result::Result<MetadataExchange, SubmissionFailure> {
         let request = self.request(now_ms).map_err(SubmissionFailure::Preparation)?;
-        let prepared: Outcome<_> = (|| {
-            let mut topics = Vector::with_capacity(request.topics().len(), &mut self.budget)?;
-            for topic in request.topics() {
-                topics.push(MetadataTopic::new(topic), &mut self.budget)?;
-            }
-            Ok(topics)
-        })();
-        let descriptors = self.completed(prepared).map_err(SubmissionFailure::Preparation)?;
+        let descriptors = self.completed(request.descriptors()).map_err(SubmissionFailure::Preparation)?;
         let topics = descriptors.as_slice();
         let native = match target {
             MetadataTarget::Bootstrap { host, port } => {

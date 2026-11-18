@@ -80,7 +80,11 @@ pub struct Settings {
 
 /// One source request scope and its admitted topic list in builder encounter order.
 /// Carry the scope unchanged to the corresponding response; automatic topic creation is enabled.
-pub struct MetadataRequest { scope: RequestScope, topics: Vector<Text> }
+pub struct MetadataRequest {
+    scope: RequestScope,
+    topics: Vector<Text>,
+    domain: Arc<MemoryBudget>,
+}
 impl MetadataRequest {
     pub fn scope(&self) -> RequestScope { self.scope }
     pub fn topics(&self) -> impl ExactSizeIterator<Item = &str> { self.topics.as_slice().iter().map(Text::as_str) }
@@ -228,7 +232,7 @@ impl ProducerMetadata {
                 RequestKind::Full => for name in self.active.iter() { topics.push(name.clone(), &mut self.budget)?; },
                 RequestKind::NewTopics => for (name, _) in self.new_topics.try_iter()? { topics.push(name.as_ref().expect("added producer topic is non-null").clone(), &mut self.budget)?; },
             }
-            Ok(MetadataRequest { scope, topics })
+            Ok(MetadataRequest { scope, topics, domain: Arc::clone(&self.budget.0) })
         })();
         self.completed(result)
     }

@@ -393,3 +393,4 @@ mod fatal;
 mod monitor;
 mod topic_wait;
 mod prepared_send;
+mod observed_exchange;

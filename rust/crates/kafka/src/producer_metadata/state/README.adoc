@@ -123,6 +123,10 @@ The native producer must match the metadata owner and enable automatic topic cre
 The temporary descriptor array is admitted through the metadata budget and borrows the request names until native submission copies them.
 Polling the native exchange returns the original scope with the borrowed response, even after the metadata owner has requested a later generation.
 The transport retains the response and its account through producer shutdown.
+The same captured request can be consumed through an already qualified native connection observation.
+It admits descriptors on its originating metadata budget and submits the existing scope and names without another request construction.
+A descriptor denial releases the captured request before native submission.
+The network owner applies the producer's terminal admission policy when that pre-submission step fails.
 The network owner still needs to qualify the target, manage the request lifecycle, process throttles and apply each response once.
 
 == NetworkClient refresh decisions
