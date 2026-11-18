@@ -1269,13 +1269,7 @@ fn apply_join(input: Arc<Relation>, dependent: Arc<Relation>, kind: ApplyKind, a
 }
 
 fn join(left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Option<Expr>) -> Result<Arc<Relation>> {
-    let schema = match kind {
-        JoinKind::Left => left.schema().concat(&right.schema().nullable()?)?,
-        JoinKind::Right => left.schema().nullable()?.concat(right.schema())?,
-        JoinKind::Full => left.schema().nullable()?.concat(&right.schema().nullable()?)?,
-        _ => left.schema().concat(right.schema())?,
-    };
-    Ok(Arc::new(Relation::new(schema, RelationNode::Join { left, right, kind, condition })?))
+    Ok(Arc::new(Relation::join(left, right, kind, condition)?))
 }
 
 

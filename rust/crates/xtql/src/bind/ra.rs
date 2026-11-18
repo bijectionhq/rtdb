@@ -61,11 +61,13 @@ impl Importer<'_, '_, '_> {
             ("union-all" | "∪", [left, right]) => self.set(SetOperator::Union, left, right)?,
             ("intersect" | "∩", [left, right]) => self.set(SetOperator::Intersect, left, right)?,
             ("difference" | "except" | "−", [left, right]) => self.set(SetOperator::Except, left, right)?,
-            ("cross-join", [left, right]) => {
-                let left = self.lower(left)?;
-                let right = self.lower(right)?;
-                Relation::new(left.schema().concat(right.schema())?, RelationNode::Join { left, right, kind: JoinKind::Cross, condition: None })?
-            }
+            ("cross-join" | "⨯", [left, right]) => self.join(JoinKind::Cross, options, left, right)?,
+            ("join" | "⋈", [left, right]) => self.join(JoinKind::Inner, options, left, right)?,
+            ("left-outer-join" | "⟕", [left, right]) => self.join(JoinKind::Left, options, left, right)?,
+            ("full-outer-join" | "⟗", [left, right]) => self.join(JoinKind::Full, options, left, right)?,
+            ("semi-join" | "⋉", [left, right]) => self.join(JoinKind::Semi, options, left, right)?,
+            ("anti-join" | "▷", [left, right]) => self.join(JoinKind::Anti, options, left, right)?,
+            ("single-join", [left, right]) => self.join(JoinKind::Single, options, left, right)?,
             ("distinct" | "δ", [input]) => {
                 let input = self.lower(input)?;
                 Relation::new(input.schema().clone(), RelationNode::Distinct { input })?
@@ -353,7 +355,7 @@ impl Importer<'_, '_, '_> {
             if let Some([(name, call)]) = column.map() {
                 calls.push((column_name(name)?, call));
             } else {
-                let field = self.aggregate_column(column, &mut bound)?;
+                let field = self.column_or_null(column, &mut bound)?;
                 groups.push(NamedExpr { expr: field.expression(), field });
             }
         }
@@ -377,7 +379,7 @@ impl Importer<'_, '_, '_> {
         let argument = match (function.canonical(), arguments) {
             (AggregateFunction::CountStar, []) => None,
             (AggregateFunction::CountStar, _) => return Err(invalid("Row count takes no argument")),
-            (_, [column]) => Some(self.aggregate_column(column, bound)?.expression()),
+            (_, [column]) => Some(self.column_or_null(column, bound)?.expression()),
             _ => return Err(invalid("Aggregate requires one input column")),
         };
         let input_type = argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Nothing);
@@ -387,7 +389,7 @@ impl Importer<'_, '_, '_> {
         Ok(AggregateExpr { field, function, argument, distinct, filter, order_by })
     }
 
-    fn aggregate_column(&mut self, column: &Edn, bound: &mut Bound) -> Result<Field> {
+    fn column_or_null(&mut self, column: &Edn, bound: &mut Bound) -> Result<Field> {
         let name = column_name(column)?;
         if let Some(field) = bound.variables.get(name) { return Ok(field.clone()); }
         let field = self.compiler.binder.field(name, None, LogicalType::Null)?;
@@ -395,6 +397,47 @@ impl Importer<'_, '_, '_> {
         bound.relation = Arc::new(Arc::clone(&bound.relation).extend(vec![NamedExpr { field: field.clone(), expr }])?);
         bound.variables.insert(name.to_owned(), field.clone());
         Ok(field)
+    }
+
+    fn join(&mut self, kind: JoinKind, options: &Edn, left: &Edn, right: &Edn) -> Result<Relation> {
+        let left = self.lower(left)?;
+        let right = self.lower(right)?;
+        let mut left_input = bind_input(&left);
+        let mut right_input = bind_input(&right);
+        let condition = if kind == JoinKind::Cross { None } else {
+            let variables = left_input.variables.iter().chain(&right_input.variables)
+                .map(|(name, field)| (name.clone(), field.clone())).collect();
+            let mut combined = Bound { variables, ..Bound::unit() };
+            let conditions = required(options, "conditions")?.vector().ok_or_else(|| invalid("Join conditions must be a vector"))?;
+            let predicates = conditions.iter().map(|condition| {
+                if let Some([(left, right)]) = condition.map() {
+                    let left = self.join_key(left, &mut left_input)?;
+                    let right = self.join_key(right, &mut right_input)?;
+                    Ok(PExpr::binary(BinaryOp::Eq, left, right))
+                } else { self.scalar(condition, &mut combined) }
+            }).collect::<Result<Vec<_>>>()?;
+            and(predicates)
+        };
+        let relation = Relation::join(left_input.relation, right_input.relation, kind, condition)?;
+        let mut outputs: BTreeMap<&str, NamedExpr> = BTreeMap::new();
+        for field in relation.schema().fields() {
+            if left.schema().get(field.id).is_none() && right.schema().get(field.id).is_none() { continue; }
+            let output = outputs.entry(&field.name).or_insert_with(|| NamedExpr { field: field.clone(), expr: field.expression() });
+            if output.field.id == field.id { continue; }
+            if !matches!(kind, JoinKind::Left | JoinKind::Single) { output.expr = field.expression(); }
+            if kind == JoinKind::Cross { output.field = field.clone(); }
+            else { output.field.data_type = output.field.data_type.join(&field.data_type); }
+        }
+        if outputs.len() == relation.schema().len() { return Ok(relation); }
+        let outputs = outputs.into_values().collect();
+        Arc::new(relation).project(outputs)
+    }
+
+    fn join_key(&mut self, form: &Edn, input: &mut Bound) -> Result<PExpr> {
+        if form.symbol().is_some_and(|name| !name.starts_with('?')) {
+            return Ok(self.column_or_null(form, input)?.expression());
+        }
+        self.scalar(form, input)
     }
 
     fn set(&mut self, operator: SetOperator, left: &Edn, right: &Edn) -> Result<Relation> {

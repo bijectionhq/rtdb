@@ -6,6 +6,7 @@
             [xtdb.issue-test :as original-issue]
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.operator.distinct-test :as original-distinct]
+            [xtdb.operator.join-test :as original-join]
             [xtdb.operator.project-test :as original-project]
             [xtdb.operator.rename-test :as original-rename]
             [xtdb.operator.select-test :as original-select]
@@ -199,6 +200,62 @@
 (deftest-original-api original-group-by/test-throws-for-incomparable-minmax-340)
 
 (deftest-original-api original-group-by/test-min-max-strings)
+
+(deftest-original-api original-join/test-cross-join)
+
+(deftest-original-api original-join/test-equi-join)
+
+(deftest-original-api original-join/test-equi-join-multi-col)
+
+(deftest-original-api original-join/test-theta-inner-join)
+
+(deftest-original-api original-join/test-semi-equi-join)
+
+(deftest-original-api original-join/test-semi-equi-join-multi-col)
+
+(deftest-original-api original-join/test-theta-semi-join)
+
+(deftest-original-api original-join/test-left-equi-join)
+
+(deftest-original-api original-join/test-left-equi-join-multi-col)
+
+(deftest-original-api original-join/test-left-theta-join)
+
+(deftest-original-api original-join/test-full-outer-join)
+
+(deftest-original-api original-join/test-full-outer-join-empty-rhs-schema-5669)
+
+(deftest-original-api original-join/test-full-outer-equi-join-multi-col)
+
+(deftest-original-api original-join/test-full-outer-join-theta)
+
+(deftest-original-api original-join/test-anti-equi-join)
+
+(deftest-original-api original-join/test-anti-equi-join-multi-col)
+
+(deftest-original-api original-join/test-anti-join-theta)
+
+(deftest-original-api original-join/test-join-on-true)
+
+(deftest-original-api original-join/test-loj-on-true)
+
+(deftest-original-api original-join/test-foj-on-true)
+
+(deftest-original-api original-join/test-semi-join-on-true)
+
+(deftest-original-api original-join/test-anti-join-on-true)
+
+(deftest-original-api original-join/test-equi-join-expr)
+
+(deftest-original-api original-join/test-single-join)
+
+(deftest-original-api original-join/can-join-on-lists-491)
+
+(deftest-original-api original-join/can-join-on-structs-491)
+
+(deftest-original-api original-join/full-outer-join-with-polymorphic-types)
+
+(deftest-original-api original-join/test-left-side-built-left-outer-join)
 
 (deftest-original-api original-set/first-tuple-in-rhs-is-taken-into-account-test)
 

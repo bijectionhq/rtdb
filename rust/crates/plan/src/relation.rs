@@ -41,6 +41,18 @@ pub struct MaterializedBinding { pub name: String, pub relation: Arc<Relation> }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinKind { Inner, Left, Right, Full, Semi, Anti, Cross, Single }
 
+impl JoinKind {
+    fn result_schema(self, left: &Schema, right: &Schema) -> Result<Schema> {
+        match self {
+            Self::Semi | Self::Anti => Ok(left.clone()),
+            Self::Left | Self::Single => left.concat(&right.nullable()?),
+            Self::Right => left.nullable()?.concat(right),
+            Self::Full => left.nullable()?.concat(&right.nullable()?),
+            Self::Inner | Self::Cross => left.concat(right),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluates the dependent relation for each input row with apply-local argument bindings.
 /// Scalar and Pull reject multiple dependent rows; Scalar, Pull, and PullMany yield null on no rows.
@@ -290,6 +302,10 @@ impl Relation {
     pub fn filter(self: Arc<Self>, predicate: Expr) -> Result<Self> {
         Self::new(self.schema.clone(), RelationNode::Filter { input: self, predicate })
     }
+    pub fn join(left: Arc<Self>, right: Arc<Self>, kind: JoinKind, condition: Option<Expr>) -> Result<Self> {
+        let schema = kind.result_schema(left.schema(), right.schema())?;
+        Self::new(schema, RelationNode::Join { left, right, kind, condition })
+    }
     pub fn sort(self: Arc<Self>, order_by: Vec<SortExpr>) -> Result<Self> {
         Self::new(self.schema.clone(), RelationNode::Sort { input: self, order_by })
     }
@@ -411,13 +427,7 @@ impl Relation {
             }
             RelationNode::Join { left, right, kind, condition } => {
                 if *kind == JoinKind::Cross && condition.is_some() { return invalid("Cross join cannot declare a condition"); }
-                let expected = match kind {
-                    JoinKind::Semi | JoinKind::Anti => left.schema.clone(),
-                    JoinKind::Left | JoinKind::Single => left.schema.concat(&right.schema.nullable()?)?,
-                    JoinKind::Right => left.schema.nullable()?.concat(&right.schema)?,
-                    JoinKind::Full => left.schema.nullable()?.concat(&right.schema.nullable()?)?,
-                    JoinKind::Inner | JoinKind::Cross => left.schema.concat(&right.schema)?,
-                };
+                let expected = kind.result_schema(left.schema(), right.schema())?;
                 if self.schema != expected { return invalid("Join schema does not describe its output"); }
             }
             RelationNode::Mark { input, dependent, arguments, comparison, output } => {

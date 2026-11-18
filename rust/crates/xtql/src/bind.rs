@@ -424,8 +424,7 @@ impl Compiler<'_, '_> {
             Relation::new(schema, RelationNode::Apply { input: left.relation, dependent: right.relation, arguments, kind: if outer { ApplyKind::Left } else { ApplyKind::Inner }, output: None })?
         } else {
             let condition = and(shared.iter().map(|(left, right)| PExpr::binary(BinaryOp::Eq, left.expression(), right.expression())).collect());
-            let schema = left.relation.schema().concat(&if outer { right.relation.schema().nullable()? } else { right.relation.schema().clone() })?;
-            Relation::new(schema, RelationNode::Join { left: left.relation, right: right.relation, kind: if outer { JoinKind::Left } else { JoinKind::Inner }, condition })?
+            Relation::join(left.relation, right.relation, if outer { JoinKind::Left } else { JoinKind::Inner }, condition)?
         };
         let mut variables = left.variables;
         for (name, mut field) in right.variables {
