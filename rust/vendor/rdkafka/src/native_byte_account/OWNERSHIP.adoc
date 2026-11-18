@@ -53,7 +53,9 @@ Successful construction moves the account into the same reviewed client, queue, 
 
 Uncompressed fetch message ops retain the admitted receive buffer until their final event release.
 RetainedConsumerMessage keeps its event and originating consumer alive through that release.
-Compressed message data may instead live in unadmitted decompression buffers and shadow buffers.
+Accounted raw and Xerial Snappy message data retain admitted output and shadow-buffer storage through their final Fetch event.
+link:FETCH-DECODE.adoc[The decode contract] describes allocation order, native final release and the existing resource-error path.
+Other compressed message data may instead live in unadmitted decompression buffers and shadow buffers.
 Individual fetch/error ops and strings, fetch request/list storage, aborted-transaction state and native client/queue/thread construction still require their own bounds.
 
 Receive admission denial follows the existing broker-down, ordinary error and reconnect/backoff path with CRIT_SYS_RESOURCE.

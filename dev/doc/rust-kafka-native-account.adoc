@@ -16,7 +16,11 @@ No account-to-client reference cycle is introduced.
 The ceiling applies to implemented allocation classes: receive frames, selected request/control owners, ApiVersions arrays and the admitted Metadata parser, cache, rack-scratch and topic-info owners.
 An uncompressed fetched message retains its shared admitted receive frame until the last referencing event is destroyed.
 RetainedConsumerMessage also retains the originating consumer and destroys its event before releasing that consumer.
-Decompression buffers, individual fetch/error ops and strings, request/list scratch, native client/queue/thread construction, allocator overhead and other native allocations require separate bounds.
+Accounted raw and Xerial Snappy output and shadow metadata retain their exact physical charges through the last referencing Fetch event.
+Admission occurs after the source length/framing demands and before allocation; shadow metadata is demanded only after complete codec validation.
+A denied expansion preserves earlier accepted messages and the failed batch's offset through the existing nonfatal decompression error/backoff path.
+link:../../rust/vendor/rdkafka/src/native_byte_account/FETCH-DECODE.adoc[The decode contract] describes those ownership and error boundaries.
+Other codec buffers, individual fetch/error ops and strings, request/list scratch, native client/queue/thread construction, allocator overhead and other native allocations require separate bounds.
 This profile establishes neither a whole-consumer nor a whole-producer allocation bound.
 
 An exhausted receive or handshake admission follows the existing native broker failure, ordinary error and reconnect/backoff route.
@@ -37,7 +41,7 @@ The captured provider/file scope remains retained beside configuration.
 The scalar probe omits unrelated setters and callbacks.
 Configurations containing plugin.library.paths retain their original unaccounted path until a separate one-native-configuration boundary is implemented.
 link:../../rust/crates/kafka/src/connect/driver/NATIVE-ACCOUNT.adoc[The Connect caller contract] describes limit compatibility, first-large-batch errors, ownership and uncovered allocation classes.
-Log-client activation and native codec storage remain separate work.
+Log-client activation and the remaining native codecs remain separate work.
 
 The new public regression sources are unexecuted in Phase 1.
 Compilation, native runtime checks, complete allocation coverage and Phase 2 gates remain open.

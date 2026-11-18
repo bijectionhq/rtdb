@@ -79,6 +79,8 @@
 #include "rdkafka_zstd.h"
 #endif
 
+#include "rdkafka_fetch_decode.h"
+
 
 static RD_INLINE int64_t
 rd_kafka_aborted_txns_pop_offset(rd_kafka_aborted_txns_t *aborted_txns,
@@ -278,6 +280,8 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
         int codec = Attributes & RD_KAFKA_MSG_ATTR_COMPRESSION_MASK;
         rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
         rd_kafka_buf_t *rkbufz;
+        rd_kafka_byte_account_t *decode_account =
+            msetr->msetr_rkb->rkb_rk->rk_byte_account;
 
         msetr->msetr_compression = codec;
 
@@ -306,6 +310,20 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
 
 #if WITH_SNAPPY
         case RD_KAFKA_COMPRESSION_SNAPPY: {
+                if (decode_account) {
+                        char errstr[128];
+                        err = rd_kafka_fetch_snappy(
+                            decode_account, compressed, compressed_size,
+                            &iov.iov_base, &iov.iov_len, errstr,
+                            sizeof(errstr), malloc);
+                        if (err) {
+                                rd_rkb_dbg(msetr->msetr_rkb, MSG, "SNAPPY",
+                                           "Snappy decompression at offset %"
+                                           PRId64 " failed: %s", Offset, errstr);
+                                goto err;
+                        }
+                        break;
+                }
                 const char *inbuf = compressed;
                 size_t inlen      = compressed_size;
                 int r;
@@ -445,7 +463,16 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
         /* Create a new buffer pointing to the uncompressed
          * allocated buffer (outbuf) and let messages keep a reference to
          * this new buffer. */
-        rkbufz = rd_kafka_buf_new_shadow(iov.iov_base, iov.iov_len, rd_free);
+        if (decode_account && codec == RD_KAFKA_COMPRESSION_SNAPPY) {
+                rkbufz = rd_kafka_fetch_decode_shadow(
+                    iov.iov_base, iov.iov_len, malloc);
+                if (!rkbufz) {
+                        rd_kafka_fetch_decode_free(iov.iov_base);
+                        err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+                        goto err;
+                }
+        } else
+                rkbufz = rd_kafka_buf_new_shadow(iov.iov_base, iov.iov_len, rd_free);
         rkbufz->rkbuf_rkb = msetr->msetr_rkbuf->rkbuf_rkb;
         rd_kafka_broker_keep(rkbufz->rkbuf_rkb);
 
@@ -1804,3 +1831,5 @@ int unittest_aborted_txns(void) {
 
         RD_UT_PASS();
 }
+
+#include "rdkafka_fetch_decode_test.h"

@@ -422,6 +422,7 @@ extern int unittest_metadata_cache_ownership(void);
 extern int unittest_metadata_cache_admission(void);
 extern int unittest_topic_info_admission(void);
 extern int unittest_metadata_rack_scratch(void);
+extern int unittest_fetch_decode_admission(void);
 extern int unittest_metadata_cache_topic_borrow(void);
 extern int unittest_metadata_tag_update_lock(void);
 extern int unittest_cgrp(void);
@@ -471,6 +472,7 @@ int rd_unittest(void) {
                 {"metadata_cache_admission", unittest_metadata_cache_admission},
                 {"topic_info_admission", unittest_topic_info_admission},
                 {"metadata_rack_scratch", unittest_metadata_rack_scratch},
+                {"fetch_decode_admission", unittest_fetch_decode_admission},
                 {"metadata_cache_topic_borrow", unittest_metadata_cache_topic_borrow},
                 {"metadata_tag_update_lock", unittest_metadata_tag_update_lock},
                 {"request", unittest_request},
