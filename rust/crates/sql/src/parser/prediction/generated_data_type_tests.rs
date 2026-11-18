@@ -1,10 +1,11 @@
 use std::{alloc::Layout, sync::Arc};
 use rtdb_types::{AllocationScope, MemoryBudget, MemoryReservation};
+use crate::lexer::ScanError;
 use crate::parser::grammar::OwnedGrammar;
 use crate::parser::prediction::{PredictionError, PredictionStorage};
 use crate::parser::prediction::closure::{ClosureOptions, LoopEntryOption, SourceAssertions};
 use super::*;
-use super::super::{CapturedClassPolicy, ParserControl, ParserEnvironment, ParserState, RecursionPhase, with_parser_session};
+use super::super::{CapturedClassPolicy, ParserControl, ParserEnvironment, ParserState, RecursionPhase, StreamError, with_parser_session};
 
 fn fixture<'sql>(
     source: &'sql str,
@@ -301,18 +302,35 @@ fn failed_ordinary_work_after_successful_tree_entry_cannot_skip_its_finally() {
 
 #[test]
 fn unsupported_base_and_array_spelling_stay_outside_the_private_adopter() {
-    for (source, state) in [("INT @", 939), ("DATE ARRAY @", 955)] {
+    for (source, state, unread) in [("INT @", 939, 1), ("DATE ARRAY @", 957, 2)] {
         fixture(source, |session, _, _| {
             let result = session.data_type_sll();
-            assert!(matches!(result, Err(PassError::Runtime(RuntimeError::Control(RuntimeProblem::PredictionSite)))));
+            assert!(matches!(result, Err(PassError::Runtime(RuntimeError::Control(RuntimeProblem::PredictionSite)))),
+                "{source}: {result:?} at {:?}", session.state());
             assert!(session.current().is_none());
             assert_eq!(session.state(), ParserState::State(state));
             assert_eq!(session.precedence.len(), 1);
             assert_eq!(session.syntax_errors, 0);
-            assert!(session.buffered_token(if state == 939 { 1 } else { 2 }).is_none());
+            assert!(session.buffered_token(unread).is_none());
             Ok(())
         });
     }
+}
+
+#[test]
+fn supported_bracket_prediction_keeps_its_lexer_demand() {
+    fixture("DATE[2] ARRAY @", |session, _, _| {
+        let result = session.data_type_sll();
+        let Err(PassError::Runtime(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(error))))) = result
+            else { panic!("expected lexing error: {result:?}"); };
+        assert_eq!(error.span().start.column, 14);
+        assert_eq!(error.span().end.column, 15);
+        assert_eq!(session.state(), ParserState::State(957));
+        assert!(session.current().is_none());
+        assert_eq!(session.precedence.len(), 1);
+        assert_eq!(session.syntax_errors, 0);
+        Ok(())
+    });
 }
 
 #[test]

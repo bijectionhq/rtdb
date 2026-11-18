@@ -98,6 +98,10 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             loop {
                 self.set_state(loop_state)?;
                 self.sync_required_block()?;
+                let (_, next) = self.lookahead_token(1)?;
+                if next == self.data_type_atom(942)? {
+                    return self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite))).map_err(PassError::from);
+                }
                 match self.adaptive_predict(83, PredictionMode::Sll)?.number() {
                     2 => break,
                     1 => (),

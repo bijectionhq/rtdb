@@ -710,6 +710,9 @@ A direct `fieldDefinition` action first calls the regular identifier branch and 
 It then calls the same data-type action with the actual field invocation and state 983.
 The captured field reference and the tree both borrow the primary records.
 Other type alternatives, ARRAY keyword syntax, other identifier alternatives, LL schedules and production adoption remain required.
+At each recursive loop entry the private adopter declines a current ARRAY token without starting another prediction.
+An unsupported ARRAY continuation reaches the recursive finally from the current loop state.
+If the current token is a bracket, the generated prediction retains its lexical demand and can discover a later lexical error.
 
 Recursive entry sets state, installs its existing witnessed precedence operand, reads the actual start token and leaves the outer child vector alone.
 The DATE label is a fresh primary record that copies its generic predecessor's outer links, start and stop.
