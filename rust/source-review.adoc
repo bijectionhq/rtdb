@@ -1392,6 +1392,10 @@ The native local restart regression checks committed progress on both replicas a
 The selected checkpoint cannot identify an older missing confirmation that an earlier run already superseded on disk.
 That older case and cross-engine execution remain pending.
 
+A caller can supply one replication timestamp source for the driver, its handle and its term appender.
+The clock is available to a simulation that controls delivered time.
+The original processor simulation still needs a recorded schedule and comparative replay.
+
 On own-term leader read-back, Rust follows `LeaderAppliesOwnTx` in `dev/doc/db.allium` by validating the staged head and applying its writes before applying the committed database attach or detach effect.
 The pinned JVM applies the catalog effect before taking the staged head.
 
@@ -1406,9 +1410,12 @@ Physical IID joins still use the stored bytes.
 A real source log fixture covers an explicit noncanonical IID, a later put under that same physical IID and both current and historical results before flush, after flush and after restart.
 Live and persisted scan page descriptors reserve capacity before allocation and retain that lease until the partition closes.
 The regression source checks refusal at replacement capacity before a data page is read and release when a successful scan exhausts the partition.
+The scan reserves the selected persisted data-file descriptor vector before allocating it and keeps the reservation with the descriptors.
+A persisted-file regression checks refusal after metadata admission and before a data-file read.
 The scan charges each event's history result vector before it grows and keeps the reservation through projection of the event's fragments.
+Query and compaction reserve replacement temporal ceiling capacity before allocation and borrow the current polygon ranges.
 Native database buffer pools charge keys and fetch coordination to the node budget and release an empty entry after its final failed or cancelled fetch.
-Retained trie candidates and file descriptors, sorted live-leaf storage, temporal ceiling growth and polygon scratch still require admission work.
+The trie candidate and metadata traversal containers and shared live-index allocations, including sorted live-leaf storage, still require admission work.
 Ordinary IID narrowing and broader metadata predicates remain open.
 
 Each reference control receipt binds the exact JVM runtime manifest, the verified runtime files and the artifact verifier source.

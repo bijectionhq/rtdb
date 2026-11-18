@@ -18,12 +18,16 @@
     },
     "storage_indexing_historical_visibility": {
       "status": "pending",
-      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. Ordinary IID narrowing, broader metadata predicates and retained scan allocation need source completion.",
+      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. Scan page and persisted file descriptor capacity, temporal ceiling growth and per-event history results have admission at their reached owners. Ordinary IID narrowing, broader metadata predicates, candidate and traversal scratch, and shared live-index allocations need source completion.",
       "implementation_paths": [
         "rust/crates/storage/src/lib.rs",
+        "rust/crates/storage/src/cache.rs",
         "rust/crates/index/src/live.rs",
         "rust/crates/index/src/snapshot.rs",
-        "rust/crates/query/src/scan.rs"
+        "rust/crates/query/src/scan.rs",
+        "rust/crates/query/src/scan_tasks.rs",
+        "rust/crates/temporal/src/lib.rs",
+        "rust/crates/maintenance/src/merge.rs"
       ]
     },
     "sql_xtql_execution": {
@@ -125,9 +129,9 @@
         "rust/crates/node/src/statement.rs": "4c53eb61b738383dc5a8aab5bd653f916ca2cd15a6bfdf9622c7d8d32f9bda27",
         "rust/crates/tx/src/submission.rs": "5f7ac36df849a45b7b870c7cf42c13162fc6e386f052ed85873681ab0032af54",
         "rust/crates/tx/src/resolver.rs": "27d628d04527d54645eb9d88b8a7276fa8dd11777557c96c62272c0752446e69",
-        "rust/crates/replication/src/appender.rs": "82f31a4c7b138737230db64388e0f9127c0a5c0318d90e02035649c8d72b8194",
+        "rust/crates/replication/src/appender.rs": "c62347b8038046ac8920a6b5491ce50654fb5970b15b8a12055c9fbcfad95296",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
-        "rust/crates/replication/src/driver.rs": "9d076d8cba5e8d1dda775b0b5baa9daa9946809562804058b4bfdc025862b9d9"
+        "rust/crates/replication/src/driver.rs": "9ec30959c7321eae5c6757acd752eed8b36fc7c8262aee4b1c77c64f070d139a"
       }
     },
     "replica_recovery": {
@@ -157,7 +161,7 @@
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
-        "rust/crates/replication/src/driver.rs": "9d076d8cba5e8d1dda775b0b5baa9daa9946809562804058b4bfdc025862b9d9",
+        "rust/crates/replication/src/driver.rs": "9ec30959c7321eae5c6757acd752eed8b36fc7c8262aee4b1c77c64f070d139a",
         "rust/crates/replication/src/blocks.rs": "97f681cfea4fa47b9e9e542988913de991a7c52cc2aa7d6512806acc4ce3058f",
         "rust/crates/server/src/resources.rs": "8bb66510352c189bd5e5c65d24c18848bf04ff1285f421d1c9ee00b6d127bf24",
         "rust/crates/node/src/backends.rs": "04c98d6847f658ab1f90c6e230b4d2f462b482da0dc0fe58fb18b95eae6679ac",
@@ -188,9 +192,9 @@
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/maintenance/src/driver.rs": "72ce0b9147fd994dfc003768e856e594f96d638de9b534129fdb2142c0e5d0a2",
         "rust/crates/maintenance/src/job.rs": "34e3d43ca7baef270ca9b6c4d4ee7b1eedeab56156bc6a85de0e741f34244274",
-        "rust/crates/maintenance/src/merge.rs": "c48d933439beed33360993769d1b3f91a7a200b911955d70c7b1f6d471906151",
+        "rust/crates/maintenance/src/merge.rs": "7068ecddc375ab352667f6b97fba2a93efd311aaa3ac6e2ea6d805142ce5ed01",
         "rust/crates/maintenance/src/publication.rs": "d9214c092e3a873df597dfad81f3ac2dc8b7b178c9b8f4b933ef090116a27740",
-        "rust/crates/replication/src/driver.rs": "9d076d8cba5e8d1dda775b0b5baa9daa9946809562804058b4bfdc025862b9d9",
+        "rust/crates/replication/src/driver.rs": "9ec30959c7321eae5c6757acd752eed8b36fc7c8262aee4b1c77c64f070d139a",
         "rust/crates/index/src/trie_catalog.rs": "517d3a6fd0478555db85153f92e97cdf0597aa0dcfa7be912677a3609c0bc8c8"
       }
     },
@@ -213,7 +217,7 @@
         "rust/crates/pg-source/src/stream.rs": "24f3c47d194ae231bdede32105bece10c303867cd7ba5a6672b1195fe4468261",
         "rust/crates/pg-source/src/indexer.rs": "8eda7ab84068564f692bdb98eb02f88d5e7acd1e745379e8ad6b1d465269f590",
         "rust/crates/pg-source/src/token.rs": "b7dbcb8f4b601ae64231b1e8c4d30d65373d5d0afc160c0f530fa56da188f0c0",
-        "rust/crates/replication/src/driver.rs": "9d076d8cba5e8d1dda775b0b5baa9daa9946809562804058b4bfdc025862b9d9"
+        "rust/crates/replication/src/driver.rs": "9ec30959c7321eae5c6757acd752eed8b36fc7c8262aee4b1c77c64f070d139a"
       }
     },
     "database_shutdown": {
