@@ -165,6 +165,7 @@ impl<M: StoreMemory> Drop for PredictionContexts<'_, '_, '_, M> { fn drop(&mut s
 
 pub(crate) struct ContextView<'a, 'id, 'g, 'scope, M: StoreMemory = Scoped<'scope>> { owner: &'a PredictionContexts<'id, 'g, 'scope, M>, key: ContextKey<'id> }
 impl<'id, 'g, 'scope, M: StoreMemory> ContextView<'_, 'id, 'g, 'scope, M> {
+    #[cfg(test)]
     pub(crate) fn shape(&self) -> ContextShape { self.owner.shape(self.key) }
     pub(crate) fn is_empty(&self) -> bool { self.owner.is_empty(self.key) }
     pub(super) fn has_empty_path(&self) -> bool {
@@ -196,6 +197,7 @@ impl<'id, 'g, 'scope, M: StoreMemory> MergeRound<'_, 'id, 'g, 'scope, M> {
 }
 
 impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
+    #[cfg(test)]
     pub(super) fn new(grammar: &'g Grammar<'scope>, allocation: &'scope AllocationScope) -> Self {
         Self::open(grammar, allocation, StoreRef::Local(ContextStore::new(Scoped(allocation))))
     }
@@ -372,6 +374,7 @@ impl<'id, 'g, 'scope, M: StoreMemory> PredictionContexts<'id, 'g, 'scope, M> {
         self.finish(result)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_merge_round<R>(&mut self, use_round: impl for<'round> FnOnce(&mut MergeRound<'round, 'id, 'g, 'scope, M>) -> Result<R>) -> Result<R> {
         self.with_merge_round_result(use_round)
     }

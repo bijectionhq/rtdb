@@ -1,5 +1,5 @@
 use rtdb_types::AllocationScope;
-use super::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, Configurations, ContextKey, PredictionContexts, PredictionError, Problem, Result, Semantic, SetMode, reserve, vector};
+use super::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, Configurations, ContextKey, PredictionContexts, PredictionError, Result, Semantic, SetMode, reserve, vector};
 use super::context::{finish_hash, update_hash};
 use super::storage::StoreMemory;
 #[cfg(test)]
@@ -63,13 +63,18 @@ impl Drop for ModeWorkspace<'_, '_, '_> { fn drop(&mut self) { let _ = self.allo
 
 pub(crate) struct SubsetsView<'a, 'cfg, 'id> { groups: &'a [Group<'cfg, 'id>] }
 impl SubsetsView<'_, '_, '_> {
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize { self.groups.len() }
+    #[cfg(test)]
     pub(crate) fn get(&self, index: usize) -> Option<AlternativeSet> { self.groups.get(index).map(|group| group.alternatives) }
     pub(crate) fn has_conflict(&self) -> bool { self.groups.iter().any(|group| group.alternatives.count() > 1) }
+    #[cfg(test)]
     pub(crate) fn has_singleton(&self) -> bool { self.groups.iter().any(|group| group.alternatives.count() == 1) }
+    #[cfg(test)]
     pub(crate) fn all_conflict(&self) -> bool { !self.has_singleton() }
+    #[cfg(test)]
     pub(crate) fn all_equal(&self) -> Result<bool> {
-        let Some(first) = self.groups.first() else { return Err(PredictionError::Artifact(Problem::EmptySubsets)); };
+        let Some(first) = self.groups.first() else { return Err(PredictionError::Artifact(super::Problem::EmptySubsets)); };
         Ok(self.groups[1..].iter().all(|group| group.alternatives == first.alternatives))
     }
     pub(crate) fn union(&self) -> AlternativeSet {
@@ -77,6 +82,7 @@ impl SubsetsView<'_, '_, '_> {
         for group in self.groups { result.union(group.alternatives); }
         result
     }
+    #[cfg(test)]
     pub(crate) fn unique(&self) -> Option<Alternative> {
         let union = self.union();
         if union.count() == 1 { union.first() } else { None }
@@ -153,6 +159,7 @@ impl<'cfg, 'id, 'scope> ModeWorkspace<'cfg, 'id, 'scope> {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn has_state_with_one_alt<M: StoreMemory>(&mut self, configs: &mut Configurations<'cfg, 'id, '_, 'scope, M>, set: ConfigSetKey<'cfg>) -> Result<bool> {
         let result = self.ready().and_then(|()| configs.ready());
         self.finish(configs, result)?;

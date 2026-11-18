@@ -145,6 +145,7 @@ pub(super) struct ClosureRound<'call, 'round, 'cfg, 'id, 'g, 'scope, M: StoreMem
     aborted: bool,
 }
 
+#[cfg(test)]
 pub(super) fn with_closure_round<'cfg, 'id, 'g, 'scope, M: StoreMemory, R>(
     configs: &mut Configurations<'cfg, 'id, 'g, 'scope, M>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>,
     decision: Decision<'_, '_>, options: ClosureOptions,
@@ -378,6 +379,7 @@ impl<'call, 'round, 'cfg, 'id, 'g, 'scope, M: StoreMemory> ClosureRound<'call, '
         if P::FULL { self.assertion(!self.configs.view_set(output).dips_outer(), SourceAssertionSite::FullNoOuter)?; }
         Ok(())
     }
+    #[cfg(test)]
     fn epsilon_target(&mut self, config: ConfigKey<'cfg>, state: State<'g, 'scope>, index: usize, transition: TransitionView<'g, 'scope>, collect: bool, in_context: bool, eof: bool) -> Result<Option<ConfigKey<'cfg>>> {
         self.epsilon_target_using(config, state, index, transition, collect, in_context, eof, &mut LocalPolicy)
     }

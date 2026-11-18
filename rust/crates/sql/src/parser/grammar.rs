@@ -73,7 +73,11 @@ impl GrammarData {
     }
 }
 
-enum GrammarStorage<'owner> { Owned(GrammarData), Borrowed(&'owner GrammarData) }
+enum GrammarStorage<'owner> {
+    #[cfg(test)]
+    Owned(GrammarData),
+    Borrowed(&'owner GrammarData),
+}
 
 pub(crate) struct OwnedGrammar {
     data: GrammarData,
@@ -102,16 +106,22 @@ impl Drop for Grammar<'_> {
 }
 
 impl<'scope> Grammar<'scope> {
+    #[cfg(test)]
     pub(crate) fn load(allocation: &'scope AllocationScope) -> Result<Self> {
         Ok(Self::from_data(GrammarData::load(allocation)?, allocation))
     }
 
+    #[cfg(test)]
     fn from_data(data: GrammarData, allocation: &'scope AllocationScope) -> Self {
         Self { storage: GrammarStorage::Owned(data), allocation }
     }
 
     fn data(&self) -> &GrammarData {
-        match &self.storage { GrammarStorage::Owned(data) => data, GrammarStorage::Borrowed(data) => data }
+        match &self.storage {
+            #[cfg(test)]
+            GrammarStorage::Owned(data) => data,
+            GrammarStorage::Borrowed(data) => data,
+        }
     }
 
     pub(crate) fn state(&self, number: u32) -> Result<State<'_, 'scope>> {
@@ -289,8 +299,10 @@ impl<'g, 'scope> State<'g, 'scope> {
 
 impl<'g, 'scope> Rule<'g, 'scope> {
     pub(crate) fn number(self) -> u16 { self.id.0 }
+    #[cfg(test)]
     pub(crate) fn name(self) -> &'static str { self.grammar.data().vocabulary.rules[usize::from(self.id.0)] }
     pub(crate) fn start(self) -> State<'g, 'scope> { self.grammar.view(self.grammar.data().rules[usize::from(self.id.0)].start) }
+    #[cfg(test)]
     pub(crate) fn stop(self) -> State<'g, 'scope> { self.grammar.view(self.grammar.data().rules[usize::from(self.id.0)].stop) }
 }
 

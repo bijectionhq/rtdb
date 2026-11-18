@@ -8,17 +8,11 @@ use super::required_block_sync::TokenReport;
 enum TerminalMatch { Atom, Set }
 
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
+    #[cfg(test)]
     pub(in crate::parser::prediction) fn match_isolation_atom(&mut self) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
         self.match_generated_terminal(TerminalMatch::Atom, |state| match state {
             ParserState::State(number @ (2882 | 2883)) => Some((number, 164)),
             ParserState::State(number @ 3007..=3013) => Some((number, 175)),
-            _ => None,
-        })
-    }
-
-    pub(super) fn match_window_atom(&mut self) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
-        self.match_generated_terminal(TerminalMatch::Atom, |state| match state {
-            ParserState::State(number @ (2218 | 2220)) => Some((number, 96)),
             _ => None,
         })
     }

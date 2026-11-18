@@ -27,7 +27,12 @@ impl InternedStateKey<'_> { fn at(id: InternedId) -> Self { Self { id, brand: Ph
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DfaTarget<'cfg> { Error, Interned(InternedStateKey<'cfg>) }
 #[derive(Clone, Copy)]
-pub(super) enum Candidate<'cfg> { Error, Draft(DraftKey<'cfg>), Existing(InternedStateKey<'cfg>) }
+pub(super) enum Candidate<'cfg> {
+    Error,
+    Draft(DraftKey<'cfg>),
+    #[cfg(test)]
+    Existing(InternedStateKey<'cfg>),
+}
 #[derive(Clone, Copy)]
 enum StoredTarget { Error, Interned(InternedId) }
 
@@ -120,7 +125,9 @@ impl<M: StoreMemory> DfaStore<M> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Phase { Synthetic, UnnumberedDraft, NumberedUnpublished(i32), Interned(i32) }
+#[cfg(test)]
 pub(super) struct DecisionView<'a> { decision: &'a DecisionDfa<Retained> }
+#[cfg(test)]
 impl DecisionView<'_> {
     pub(super) fn number(&self) -> u16 { self.decision.number }
     pub(super) fn atn_start(&self) -> u32 { self.decision.atn_start }
@@ -138,6 +145,7 @@ impl StateView<'_> {
             },
         }
     }
+    #[cfg(test)]
     pub(super) fn number(&self) -> i32 { match self.phase() { Phase::Synthetic | Phase::UnnumberedDraft => -1, Phase::NumberedUnpublished(number) | Phase::Interned(number) => number } }
     pub(super) fn acceptance(&self) -> Acceptance<'_> {
         match &self.state.body {
@@ -253,6 +261,7 @@ impl<'cfg, 'g, 'scope> PredictionDfas<'cfg, 'g, 'scope> {
         })();
         self.finish_config(result, configs)
     }
+    #[cfg(test)]
     pub(super) fn view_draft(&self, decision: u16, draft: DraftKey<'cfg>) -> Result<StateView<'_>> {
         let state = self.state(decision, draft.id)?;
         Ok(StateView { state })
@@ -347,6 +356,7 @@ impl<'cfg, 'g, 'scope> PredictionDfas<'cfg, 'g, 'scope> {
                 if phase != Phase::UnnumberedDraft { return Err(PredictionError::Artifact(Problem::DfaPhase)); }
                 (draft.id, set, false)
             }
+            #[cfg(test)]
             Candidate::Existing(key) => (key.id.0, self.interned(decision, key.id)?, true),
         };
         let set = configs.bind_set(set)?;
@@ -412,14 +422,17 @@ impl<'cfg, 'g, 'scope> PredictionDfas<'cfg, 'g, 'scope> {
         })();
         self.finish_all(result, configs, contexts)
     }
+    #[cfg(test)]
     pub(super) fn view_decision(&self, number: u16) -> Result<DecisionView<'_>> {
         self.decision(number).map(|decision| DecisionView { decision })
     }
+    #[cfg(test)]
     pub(super) fn state_count(&mut self, decision: u16) -> Result<usize> {
         self.ready()?;
         let result = self.decision(decision).map(|decision| decision.states.len);
         self.finish(result)
     }
+    #[cfg(test)]
     pub(super) fn state_at(&mut self, decision: u16, number: i32) -> Result<Option<InternedStateKey<'cfg>>> {
         self.ready()?;
         let result = (|| {

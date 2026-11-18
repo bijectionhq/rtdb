@@ -29,7 +29,9 @@ impl ListenerDiagnostic {
 }
 
 impl<'sql> NoViableDiagnostic<'sql> {
+    #[cfg(test)]
     pub(in crate::parser::prediction) fn cause(&self) -> NoViableAlternative<'sql> { self.cause }
+    #[cfg(test)]
     pub(in crate::parser::prediction) fn anomaly(&self) -> &Anomaly { &self.listener.anomaly }
     pub(super) fn into_listener(self) -> ListenerDiagnostic { self.listener }
 }

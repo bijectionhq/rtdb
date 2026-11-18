@@ -22,9 +22,9 @@ use context::ContextShape;
 use config::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, Configurations, SetMode};
 use semantic::Semantic;
 use mode::{AlternativeChoice, ModeWorkspace, PredictionMode};
+use storage::PredictionStorage;
 #[cfg(test)]
-use mode::SubsetsView;
-use storage::{PredictionStorage, with_prediction_storage};
+use storage::with_prediction_storage;
 #[cfg(test)]
 use storage::PredictionAccess;
 
@@ -40,7 +40,7 @@ pub(crate) enum PredictionError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Problem { Capacity, Context, LocalClosure, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, EmptySubsets, DfaDecision, DfaPhase, ClosurePhase, Grammar(ArtifactIssue) }
+pub(crate) enum Problem { Capacity, Context, LocalClosure, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, #[cfg(test)] EmptySubsets, DfaDecision, DfaPhase, ClosurePhase, Grammar(ArtifactIssue) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SourceAssertionSite { ReachStopEmpty, PopDepth, FalloffDepth, FullNoOuter }

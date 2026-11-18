@@ -218,6 +218,7 @@ const NUMERIC_TERM: NumericTail = NumericTail {
 };
 
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
+    #[cfg(test)]
     pub(in crate::parser::prediction) fn numeric_expression(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         let mode = self.generated_mode()?;
         self.numeric_expr_zero(mode)

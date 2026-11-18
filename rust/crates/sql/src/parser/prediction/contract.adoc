@@ -2,7 +2,7 @@
 
 This private parser component implements adaptive SLL and LL prediction from ANTLR 4.13.2 over real SQL tokens, ordered configurations and retained DFA storage.
 `UPSTREAM.json` pins the primary sources, and link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
-Complete generated SQL rule recognition and production parser integration remain required beyond the bounded statement, isolation, window and recursive DATE paths.
+Complete generated SQL rule recognition and production parser integration remain required beyond the bounded statement and expression paths.
 
 == Owner and keys
 
@@ -400,8 +400,8 @@ Its append-only parse-branded records are the actual context control identities 
 They remain through bounded control clearing and are destroyed before the work scope can drop.
 There is no parallel invocation graph, semantic stack, token provider, buffer replacement or per-transition collector.
 Ordinary construction rejects left-recursive rules.
-Entry checks an unentered ordinary context or a field definition awaiting its name, and validates its captured parent, invoking state and call binding.
-Ordinary exit accepts the entered ordinary or field-definition context, including a current child whose tree attachment failed after its start.
+Entry checks an unentered ordinary context and validates its captured parent, invoking state and call binding.
+Ordinary exit accepts the entered ordinary context, including a current child whose tree attachment failed after its start.
 It restores invoking state and parent after the real stop demand.
 Source-null start/stop facts retain their partial failure prefixes.
 
@@ -420,7 +420,7 @@ A pending Bail cancellation reserves rewind for the wrapper.
 The bounded cleanup theorem uses the existing stream's immutable buffered prefix: a successfully entered parent makes nested `LT(1)` and `LT(-1)` cached reads.
 Root initialization and constructor/precedence admission retain their real failure stages, including rule-start state before failed precedence growth.
 Entered ordinary children execute their source finally before recursive parents.
-The generated tree sections below cover the reached ordinary isolation and recursive DATE post-current entry effects.
+The generated tree sections below cover the reached ordinary post-current entry effects.
 Additional tree and listener effects require their own failed-child cleanup review.
 This precursor does not replace that review with fabricated failed-child fixtures or an extra ordinary-scope stack.
 
@@ -580,7 +580,7 @@ Only after the second seek succeeds does reset clear recovery, current context, 
 This profile has no trace listener and the pinned interpreter's reset has no state effects.
 Recognizer state, previous invocation records, buffered tokens and retained DFA history persist.
 The wrapper then selects the LL strategy, listener and prediction profile, and calls the same action once more.
-The adapter runs generated isolation and direct-statement actions for caught adaptive no-viable and inline mismatch cancellation.
+The adapter runs generated direct-statement actions for caught adaptive no-viable and inline mismatch cancellation.
 Further generated rule bodies, recognition and recovery branches, and production adoption remain required.
 
 == SLL Bail token matches
@@ -600,13 +600,11 @@ The existing wrapper can use that cancellation after rule finally.
 Invalidating a cancellation preserves its originating recovery condition.
 A runtime fault during token demand propagates before any inline exception assignment or cancellation.
 
-A real decision 371 can select the REPEATABLE alternative before demanding its following occurrence.
-Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
 Further generated context and terminal attachment, expected-token capabilities and production adoption remain open.
 
 == Required block synchronization
 
-The generated `commonTxMode` block at 2886 and `levelOfIsolation` block at 3014 share the same sync operation as the direct statement blocks at 354 and 574.
+The direct statement blocks at 354 and 574 share one required sync operation.
 SLL Bail sync returns without reading input.
 LL first observes the current token type and derives the within-rule lookahead set from the actual ATN.
 The block sets lack epsilon, so the source's later expected-token queries return the same set.
@@ -630,10 +628,8 @@ Notification increments the syntax error count after the parser message is compl
 The report leaves the cursor at the offending token and can be followed by the caller's existing finally operations.
 Additional nullable decisions, loop synchronization and full generated rule adoption remain required.
 
-== Inline match recovery in the isolation rules
+== Inline match recovery
 
-The ISOLATION branch of `commonTxMode` uses the atom states 2882 and 2883.
-`levelOfIsolation` uses the atom states 3007 through 3013.
 The session checks the current invocation and obtains each expected token from the actual ATN atom.
 SLL and LL matches return the first current occurrence on success.
 Both profiles reach successful matching with recovery clear, so the inherited `reportMatch` step has no recovery state to clear.
@@ -651,19 +647,15 @@ The required sync sites have no epsilon and an accepted sync clears the source's
 These inline paths therefore use the ordinary constructor.
 The existing generated catch assigns the cause to the local record and reports it through the admitted listener path.
 The source error and finally ordering remains the same for native input and allocation failures.
-The bounded window path below adopts nullable sync context capture.
 Additional sync shapes, match sites and full generated rule adoption remain required.
 
-== Generated isolation contexts and retry
+== Generated contexts and retry
 
-The private generated path implements all four alternatives of `levelOfIsolation`, decision 371, and the ISOLATION branch of its `commonTxMode` caller in both profiles.
 The session's profile selects the prediction and error strategy before the generated context is allocated.
 The existing retry wrapper can run the generated action and invoke the same rule bodies in LL after a surviving SLL Bail cancellation.
 The action can observe primary context keys within the wrapper's callback and return results independent of the parse brand.
 Build-tree behavior is fixed on and parse-tree listeners are absent.
 SLL syntax listener dispatch is empty and LL uses the existing throwing listener.
-The caller checks its actual first token at state 2886 and the ISOLATION atom before selecting its branch.
-TIME, TIMEZONE and the direct generated no-viable branch are outside this entry's domain and return a private site error when reached.
 Additional generated paths and production parser entry adoption remain required.
 
 Each primary invocation record owns its optional exact labelled class and optional ordered child vector.
@@ -701,58 +693,10 @@ A listener failure or cancellation during a match returns before terminal attach
 A lexer or native allocation failure in the body bypasses recognition assignment and cannot authorize LL retry.
 
 If the child enter's parent append fails after current and start are set, that child body and child finally were never entered.
-The already-entered common caller's finally therefore exits the actual child once.
-For ISOLATION LEVEL SERIALIZABLE it records the child's stop at LEVEL, restores state 2884 and current to the labelled common caller, and leaves that parent's stop unset.
+The already-entered caller's finally therefore exits the actual child once.
 No extra pop, repair or invented child finally follows the original native error.
 
-== Generated recursive DATE trees
-
-The private SLL action covers the DATE base of `dataType(0)` and its bracket continuations with optional maximum cardinality.
-A direct `fieldDefinition` action first calls the regular identifier branch and stores its labelled context as the field-name reference.
-It then calls the same data-type action with the actual field invocation and state 983.
-The captured field reference and the tree both borrow the primary records.
-Other type alternatives, ARRAY keyword syntax, other identifier alternatives, LL schedules and production adoption remain required.
-At each recursive loop entry the private adopter declines a current ARRAY token without starting another prediction.
-An unsupported ARRAY continuation reaches the recursive finally from the current loop state.
-If the current token is a bracket, the generated prediction retains its lexical demand and can discover a later lexical error.
-
-Recursive entry sets state, installs its existing witnessed precedence operand, reads the actual start token and leaves the outer child vector alone.
-The DATE label is a fresh primary record that copies its generic predecessor's outer links, start and stop.
-The source assigns the DATE label as current directly, so no first child attachment or parent-tail replacement occurs there.
-After the DATE terminal, the base assigns its actual `LT(-1)` stop before the array loop.
-
-A bracket continuation selects the source adaptive alternatives and constructs a fresh ArrayType with the entry's immutable saved outer pair.
-The push reparents the previous record, changes its invoking state, reads its stop, then installs the new current record and inherited start.
-It attaches the previous record only after that prefix.
-A denied attachment leaves the new current record for the entered recursive finally.
-The bracket arm checks its signed precedence and matches the actual bracket tokens, with a real cardinality call when the lookahead is an unsigned integer.
-
-If cardinality entry sets current and start but its parent append fails, its try and finally have yet to start.
-The primary record preserves that specific failed attachment fact.
-The recursive cleanup checks the actual top entry and accepts that direct failed cardinality child at call state 951 in addition to its current head.
-A child which entered its body still needs its own ordinary finally.
-The context-only C4 recursion facade keeps its existing current-head checks and other generated sites remain outside this tree adopter.
-
-Recursive finally pops one precedence operand and reads `LT(-1)` for the actual current record.
-It restores the saved outer current and reparents that actual record before admitting any final child attachment.
-Recognizer state stays where the reached body left it.
-Cleanup closes the entry before that attachment, so a later error cannot repeat the pop.
-An outer attachment requires a saved parent.
-
-After a denied four-slot append to the ArrayType, the actual cardinality is the record being unrolled.
-The surrounding field can still admit a two-slot vector and attach that record while ordinary execution remains sealed.
-If that append is denied too, the later finally failure escapes and the field's own already-entered finally still executes.
-Parse-tree listeners remain absent in this wrapper profile.
-
-== Nullable window synchronization and captured inline mismatch
-
-The private two-profile `windowSpecification` root uses its generated parentheses matches at 2218 and 2220 and the actual `windowSpecificationDetails` call at 2219.
-Both rules enter their unlabelled primary contexts before their try and use actual-current exit in their finally.
-The unlabelled outer alternatives keep the same current records and the source's alternative-number setter has no effect.
-The four details optionals use source sync states 2223, 2226, 2229 and 2232, decisions 235 through 238.
-Each site has a separate generated `LA(1)` option guard after sync, including the identifier bitsets in the first guard.
-The supported details path skips all four optionals.
-A selected optional branch sets its actual call state and returns a private unsupported site result before entering the unadopted rule.
+== Nullable synchronization capture
 
 The parser session is a passive transient with one writer and a branded primary context region.
 Its Default strategy state contains an optional pair of the actual context key and ATN state.
@@ -760,24 +704,6 @@ A reached sync whose within-rule set accepts `LA(1)` clears this pair, including
 When the set misses and contains epsilon, the first nullable sync saves the pair and later nullable misses preserve it.
 The ordinary match and normal rule exit preserve the pair.
 The wrapper installs a fresh Default strategy after SLL Bail and reset, with an absent pair.
-
-On `(: :)`, SLL reaches inline Bail at 2220 after exiting the details rule and leaves the second colon undemanded.
-In LL the first optional records the details context at 2223.
-Its next three syncs preserve that record, and the details finally returns to the window at the first colon.
-Inline recovery then reads the second colon and tests the current match's deletion set of `RPAREN`.
-Its next `LA(1)` and contextual LOOK from successor 2221 use the live root and find EOF as the insertion set.
-The alternate constructor keeps the captured details context and state 2223, then reads the actual first colon as the offending token.
-
-The passive pending error binds the generated catch to its live owner, match state 2220 and offending cursor.
-The window catch assigns the single branded exception on its own primary record and begins recovery.
-The handler uses that assigned exception's state and details context for its fallible expected-token lookup, after planning the offending token display and before any notification.
-The details parent link supplies invoking transition 2219 and follow 2220, expanding the expected set to 119 token types.
-The throwing listener receives the first colon and the original numeric cause state.
-The outward diagnostic borrows the original SQL token and owns its diagnostic fields.
-The throwing listener interrupts recovery.
-The window finally records the opening parenthesis as the stop.
-Deletion and insertion reports keep their null causes and leave before consumption or synthesis.
-Additional generated window branches and production parser entry adoption remain required.
 
 == Direct statement root and ROLLBACK
 
@@ -866,20 +792,10 @@ The Bail mismatch uses the existing same-cause cancellation.
 The LL inline path checks deletion before insertion and anchors a mismatch to the selected context.
 The current statement switches select eligible set tokens before entering those bodies.
 
-== Owned direct control results
+== Owned parser environment
 
 A parser can open its retained grammar and prediction storage under one explicit cache budget using a completed parser class policy.
-The direct control entry borrows this same environment exclusively for each invocation.
-`with_bail_fallback` runs the generated direct root in SLL mode and restarts it in LL mode on Bail cancellation, using the same session and token stream.
-The fixed entry returns an owned result.
-
-* Commit, Rollback, Discard and SetRole become control statements before the session closes.
-* A completed query returns a private unsupported-statement error.
-* An input mismatch carries the offending token occurrence and its numeric parser state when present.
-* A no-viable-alternative error also carries the start token occurrence.
-* A missing or unwanted token report carries the offending occurrence with a null cause.
-* A lexical recognition failure carries its source span.
-* A reported parser anomaly retains the listener's reservation until the failure is dropped.
+`with_bail_fallback` runs the generated root in SLL mode and restarts it in LL mode on Bail cancellation, using the same session and token stream.
 
 == Generated scalar expression root
 

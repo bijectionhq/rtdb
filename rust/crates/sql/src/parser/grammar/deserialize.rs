@@ -1,5 +1,5 @@
 use rtdb_types::AllocationScope;
-use super::{DecisionData, DecisionId, ExpectedSymbol, Grammar, GrammarData, GrammarError, IssueKind, Result, RuleData, RuleId, StateData, StateId, StateKind, TokenSet, TokenType, Transition, bytes, issue, vector};
+use super::{DecisionData, DecisionId, ExpectedSymbol, GrammarData, GrammarError, IssueKind, Result, RuleData, RuleId, StateData, StateId, StateKind, TokenSet, TokenType, Transition, bytes, issue, vector};
 use super::source::{Vocabulary, Words};
 use super::token::MAX_TOKEN;
 
@@ -126,8 +126,9 @@ struct GrammarBuilder<'a, 'scope> {
     allocation: &'scope AllocationScope,
 }
 
-pub(super) fn load<'scope>(words: &[i32], layout: Layout, vocabulary: Vocabulary, allocation: &'scope AllocationScope) -> Result<Grammar<'scope>> {
-    Ok(Grammar::from_data(load_data(words, layout, vocabulary, allocation)?, allocation))
+#[cfg(test)]
+pub(super) fn load<'scope>(words: &[i32], layout: Layout, vocabulary: Vocabulary, allocation: &'scope AllocationScope) -> Result<super::Grammar<'scope>> {
+    Ok(super::Grammar::from_data(load_data(words, layout, vocabulary, allocation)?, allocation))
 }
 
 pub(super) fn load_data(words: &[i32], layout: Layout, vocabulary: Vocabulary, allocation: &AllocationScope) -> Result<GrammarData> {

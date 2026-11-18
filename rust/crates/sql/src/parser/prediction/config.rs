@@ -78,6 +78,7 @@ impl ConfigData {
 }
 
 pub(crate) enum ConfigChange<'id, 'g, 'scope> {
+    #[cfg(test)]
     Same,
     State(State<'g, 'scope>),
     Semantic(Semantic),
@@ -162,6 +163,7 @@ impl<'id, 'g, 'scope, M: StoreMemory> ConfigView<'_, '_, 'id, 'g, 'scope, M> {
     pub(crate) fn semantic(&self) -> Semantic { self.owner.data(self.key).semantic }
     pub(crate) fn outer_depth(&self) -> i32 { self.owner.data(self.key).depth() }
     pub(crate) fn suppressed(&self) -> bool { self.owner.data(self.key).suppressed() }
+    #[cfg(test)]
     pub(crate) fn packed_outer(&self) -> i32 { self.owner.data(self.key).outer }
 }
 
@@ -170,7 +172,9 @@ impl<'cfg, M: StoreMemory> ConfigSetView<'_, 'cfg, '_, '_, '_, M> {
     pub(crate) fn len(&self) -> usize { self.owner.set(self.key).ordered.len() }
     pub(crate) fn entry(&self, index: usize) -> Option<ConfigKey<'cfg>> { self.owner.set(self.key).ordered.get(index).copied().map(ConfigKey::at) }
     pub(crate) fn mode(&self) -> SetMode { self.owner.set(self.key).facts.mode }
+    #[cfg(test)]
     pub(crate) fn unique(&self) -> Option<Alternative> { self.owner.set(self.key).facts.unique }
+    #[cfg(test)]
     pub(crate) fn conflicting(&self) -> Option<ConflictKey<'cfg>> { self.owner.set(self.key).facts.conflicting.map(ConflictKey::at) }
     pub(crate) fn has_semantic(&self) -> bool { self.owner.set(self.key).facts.semantic }
     pub(crate) fn dips_outer(&self) -> bool { self.owner.set(self.key).facts.outer }
@@ -199,6 +203,7 @@ impl<'cfg, M: StoreMemory> ConfigSetView<'_, 'cfg, '_, '_, '_, M> {
 }
 
 impl<'cfg, 'id, 'g, 'scope> Configurations<'cfg, 'id, 'g, 'scope> {
+    #[cfg(test)]
     pub(super) fn new(grammar: &'g Grammar<'scope>, allocation: &'scope AllocationScope) -> Self {
         Self::open(grammar, allocation, StoreRef::Local(ConfigurationStore::new(Scoped(allocation))))
     }
@@ -248,6 +253,7 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
     fn data(&self, key: ConfigKey<'cfg>) -> ConfigData { *self.store.objects.get(key.id.0).expect("branded config retains its occupied slot") }
     pub(crate) fn view(&self, key: ConfigKey<'cfg>) -> ConfigView<'_, 'cfg, 'id, 'g, 'scope, M> { ConfigView { owner: self, key } }
     pub(crate) fn view_set(&self, key: ConfigSetKey<'cfg>) -> ConfigSetView<'_, 'cfg, 'id, 'g, 'scope, M> { ConfigSetView { owner: self, key } }
+    #[cfg(test)]
     pub(crate) fn conflict(&self, key: ConflictKey<'cfg>) -> AlternativeSet { *self.store.conflicts.get(key.id.0).expect("branded conflict retains its occupied slot") }
 
     pub(crate) fn alternative(&mut self, decision: Decision<'g, 'scope>, ordinal: usize) -> Result<Alternative> {
@@ -277,6 +283,7 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
         let result = (|| {
             let mut data = self.data(key);
             let state = match change {
+                #[cfg(test)]
                 ConfigChange::Same => None,
                 ConfigChange::Semantic(semantic) => { data.semantic = semantic; None },
                 ConfigChange::State(state) => Some(state),
@@ -355,6 +362,7 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn copy_set(&mut self, source: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<ConfigSetKey<'cfg>> {
         self.check_context(contexts)?;
         let result = (|| {
@@ -368,6 +376,7 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
         })();
         self.finish(result)
     }
+    #[cfg(test)]
     pub(crate) fn clear(&mut self, set: ConfigSetKey<'cfg>) -> Result<()> {
         self.ready()?;
         let result = match self.set_mut(set) {
@@ -392,6 +401,7 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
         let result = store.conflicts.insert(alternatives, &store.memory).map(|id| ConflictKey::at(ConflictId(id)));
         self.finish(result)
     }
+    #[cfg(test)]
     pub(crate) fn equivalent_config(&mut self, left: ConfigKey<'cfg>, right: ConfigKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<bool> {
         self.check_context(contexts)?;
         let result = self.equal_config(left, right, contexts);
@@ -402,6 +412,7 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
         let result = self.equal_config_using(incoming, stored, contexts, EqualityPolicy::LinkedFrames);
         self.finish(result)
     }
+    #[cfg(test)]
     fn equal_config(&self, left: ConfigKey<'cfg>, right: ConfigKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<bool> {
         self.equal_config_using(left, right, contexts, EqualityPolicy::ScopedFrames)
     }
@@ -410,6 +421,7 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
         let (a, b) = (self.data(left), self.data(right));
         Ok(a.state == b.state && a.alt == b.alt && contexts.equivalent_using(ContextKey::from_stored(a.context), ContextKey::from_stored(b.context), policy)? && a.semantic == b.semantic && a.suppressed() == b.suppressed())
     }
+    #[cfg(test)]
     pub(crate) fn equivalent_set(&mut self, left: ConfigSetKey<'cfg>, right: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<bool> {
         self.equivalent_set_using(left, right, contexts, EqualityPolicy::ScopedFrames)
     }

@@ -42,7 +42,7 @@ impl StoreMemory for Retained {
 
 pub(super) enum Block<T, M: StoreMemory> {
     Empty(PhantomData<M>),
-    Allocated { values: Vec<T>, lease: M::Lease, memory: PhantomData<M> },
+    Allocated { values: Vec<T>, _lease: M::Lease, memory: PhantomData<M> },
 }
 impl<T, M: StoreMemory> Block<T, M> {
     pub(super) fn new() -> Self { Self::Empty(PhantomData) }
@@ -51,7 +51,7 @@ impl<T, M: StoreMemory> Block<T, M> {
         let bytes = capacity.checked_mul(std::mem::size_of::<T>())
             .filter(|bytes| *bytes <= isize::MAX as usize).ok_or_else(capacity_error)?;
         let lease = memory.admit(bytes)?;
-        Ok(Self::Allocated { values: Vec::with_capacity(capacity), lease, memory: PhantomData })
+        Ok(Self::Allocated { values: Vec::with_capacity(capacity), _lease: lease, memory: PhantomData })
     }
     pub(super) fn capacity(&self) -> usize {
         match self { Self::Empty(_) => 0, Self::Allocated { values, .. } => values.capacity() }
@@ -62,6 +62,7 @@ impl<T, M: StoreMemory> Block<T, M> {
             _ => panic!("prediction block capacity was admitted before append"),
         }
     }
+    #[cfg(test)]
     pub(super) fn clear(&mut self) { if let Self::Allocated { values, .. } = self { values.clear(); } }
     pub(super) fn reserve(&mut self, additional: usize, memory: &M) -> Result<()> {
         let required = self.len().checked_add(additional).ok_or_else(capacity_error)?;
@@ -103,7 +104,9 @@ pub(super) struct Pool<T, M: StoreMemory> {
 }
 impl<T, M: StoreMemory> Pool<T, M> {
     pub(super) fn new() -> Self { Self { slots: Block::new(), free: None, queue: None, live: 0 } }
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize { self.live }
+    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool { self.live == 0 }
     #[cfg(test)]
     pub(super) fn values(&self) -> impl Iterator<Item = &T> {
@@ -189,13 +192,29 @@ impl<T, M: StoreMemory> Pool<T, M> {
     }
 }
 
-pub(super) enum StoreRef<'owner, T> { Local(T), Borrowed(&'owner mut T) }
+pub(super) enum StoreRef<'owner, T> {
+    #[cfg(test)]
+    Local(T),
+    Borrowed(&'owner mut T),
+}
 impl<T> Deref for StoreRef<'_, T> {
     type Target = T;
-    fn deref(&self) -> &T { match self { Self::Local(value) => value, Self::Borrowed(value) => value } }
+    fn deref(&self) -> &T {
+        match self {
+            #[cfg(test)]
+            Self::Local(value) => value,
+            Self::Borrowed(value) => value,
+        }
+    }
 }
 impl<T> DerefMut for StoreRef<'_, T> {
-    fn deref_mut(&mut self) -> &mut T { match self { Self::Local(value) => value, Self::Borrowed(value) => value } }
+    fn deref_mut(&mut self) -> &mut T {
+        match self {
+            #[cfg(test)]
+            Self::Local(value) => value,
+            Self::Borrowed(value) => value,
+        }
+    }
 }
 
 pub(crate) struct PredictionStorage {
@@ -211,6 +230,7 @@ impl PredictionStorage {
         Self { dfas: DfaStore::new(Retained::new(memory)), configs: ConfigurationStore::new(Retained::new(memory)), contexts: ContextStore::new(Retained::new(memory)), grammar, #[cfg(test)] roots: FixtureRoots::new() }
     }
     pub(super) fn grammar_view(&self) -> crate::parser::grammar::Grammar<'_> { self.grammar.view() }
+    #[cfg(test)]
     pub(crate) fn with_contexts<R>(
         &mut self, work: &AllocationScope,
         use_contexts: impl for<'id, 'access> FnOnce(&mut PredictionContexts<'id, 'access, 'access, Retained>) -> Result<R>,
@@ -243,6 +263,7 @@ impl<'cfg, 'id, 'g, 'scope> PredictionAccess<'cfg, 'id, 'g, 'scope> {
     pub(super) fn dfa_parts(&mut self) -> (&mut PredictionDfas<'cfg, 'g, 'scope>, &mut Configurations<'cfg, 'id, 'g, 'scope, Retained>, &mut PredictionContexts<'id, 'g, 'scope, Retained>) {
         (&mut self.dfas, &mut self.configs, &mut self.contexts)
     }
+    #[cfg(test)]
     pub(crate) fn parts(&mut self) -> (&mut Configurations<'cfg, 'id, 'g, 'scope, Retained>, &mut PredictionContexts<'id, 'g, 'scope, Retained>) {
         (&mut self.configs, &mut self.contexts)
     }

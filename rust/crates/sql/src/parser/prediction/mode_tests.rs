@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_types::MemoryBudget;
 use crate::parser::grammar::{Grammar, TransitionView};
 use super::*;
-use super::super::{with_configurations, with_prediction_contexts};
+use super::super::{Problem, with_configurations, with_prediction_contexts};
 
 fn fixture<R>(limit: usize, run: impl for<'cfg, 'id, 'g, 'scope> FnOnce(&mut Configurations<'cfg, 'id, 'g, 'scope>, &mut PredictionContexts<'id, 'g, 'scope>, &Arc<MemoryBudget>) -> Result<R>) -> R {
     let grammar_memory = MemoryBudget::new(8 << 20);

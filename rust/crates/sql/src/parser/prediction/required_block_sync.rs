@@ -1,4 +1,3 @@
-use rtdb_types::Anomaly;
 use crate::lexer::{IndexedLexeme, Kind};
 use crate::parser::grammar::{ExpectedSymbol, TokenSet, TokenType};
 use super::no_viable_report::{ListenerDiagnostic, listener_diagnostic, message_buffer, message_size, quoted_len, write_quoted};
@@ -33,14 +32,17 @@ pub(in crate::parser::prediction) struct TokenDiagnostic<'sql> {
 }
 
 impl<'sql> TokenDiagnostic<'sql> {
+    #[cfg(test)]
     pub(in crate::parser::prediction) fn offending(&self) -> IndexedLexeme<'sql> { self.report.offending() }
+    #[cfg(test)]
     pub(in crate::parser::prediction) fn cause(&self) -> Option<InputMismatch<'sql>> {
         match &self.report {
             TokenReport::Unwanted(_) | TokenReport::Missing(_) => None,
             TokenReport::Mismatch(cause) => Some(*cause),
         }
     }
-    pub(in crate::parser::prediction) fn anomaly(&self) -> &Anomaly { &self.listener.anomaly }
+    #[cfg(test)]
+    pub(in crate::parser::prediction) fn anomaly(&self) -> &rtdb_types::Anomaly { &self.listener.anomaly }
     pub(super) fn into_listener(self) -> ListenerDiagnostic { self.listener }
 }
 
