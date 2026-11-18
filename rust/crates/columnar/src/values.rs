@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, ListArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
-use arrow_schema::{DataType, Field, UnionMode};
+use arrow_schema::{DataType, Field, Fields, UnionMode};
 use rtdb_types::{Anomaly, DecimalValue, IntervalUnit, ListKind, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
 
 use crate::{from_field, to_field};
@@ -53,6 +53,12 @@ pub fn struct_field_cell<'a>(fields: &'a BTreeMap<String, Value>, name: &str, lo
     })
 }
 
+pub fn build_struct_array(fields: Fields, arrays: &[ArrayRef], length: usize, nulls: Option<NullBuffer>) -> Result<ArrayRef> {
+    let data = arrow_data::ArrayData::builder(DataType::Struct(fields)).len(length).nulls(nulls)
+        .child_data(arrays.iter().map(|array| array.to_data()).collect()).build().map_err(super::arrow_error)?;
+    Ok(make_array(data))
+}
+
 fn validity(values: &[Value]) -> Option<NullBuffer> {
     let valid: Vec<_> = values.iter().map(|v| !matches!(v, Value::Null | Value::Undefined)).collect();
     valid.iter().any(|v| !v).then(|| NullBuffer::from(valid))
@@ -74,9 +80,7 @@ fn build(logical: &LogicalType, values: &[Value], check_precision: bool) -> Resu
                 }).collect::<Vec<_>>();
                 build(child_type, &child_values, check_precision)
             }).collect::<Result<Vec<_>>>()?;
-            let data = arrow_data::ArrayData::builder(DataType::Struct(fields.clone())).len(values.len()).nulls(validity(values))
-                .child_data(arrays.iter().map(|array| array.to_data()).collect()).build().map_err(super::arrow_error)?;
-            Ok(make_array(data))
+            build_struct_array(fields.clone(), &arrays, values.len(), validity(values))
         }
         LogicalType::List { kind, element } => build_list(logical, kind, element, values, check_precision),
         LogicalType::Union(_) => build_union(logical, values, check_precision),

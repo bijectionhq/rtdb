@@ -7,6 +7,34 @@ use rtdb_types::{Anomaly, Result};
 
 pub use rtdb_types::{MemoryBudget, MemoryReservation};
 
+/// Holds the retained arrays of one batch while admitting only one column's construction scratch.
+pub struct BatchBuilder { reservation: Arc<MemoryReservation> }
+
+impl BatchBuilder {
+    pub fn new(metadata: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { reservation: memory.reserve(metadata)? })
+    }
+
+    pub fn column(&mut self, temporary: usize, build: impl FnOnce() -> Result<ArrayRef>) -> Result<ArrayRef> {
+        let reservation = Arc::get_mut(&mut self.reservation).expect("batch construction owns its reservation");
+        let retained = reservation.bytes();
+        reservation.grow_to(retained.checked_add(temporary).ok_or_else(allocation_overflow)?)?;
+        let array = build()?;
+        reservation.shrink_to(retained.checked_add(array.get_array_memory_size()).ok_or_else(allocation_overflow)?)?;
+        Ok(array)
+    }
+
+    pub fn finish(self, batch: RecordBatch) -> Result<OwnedBatch> {
+        OwnedBatch::with_reservation(batch, self.reservation)
+    }
+
+    pub fn finish_with_metadata(mut self, batch: RecordBatch, metadata: usize) -> Result<OwnedBatch> {
+        let retained = batch.get_array_memory_size().checked_add(metadata).ok_or_else(allocation_overflow)?;
+        Arc::get_mut(&mut self.reservation).expect("batch construction owns its reservation").shrink_to(retained)?;
+        self.finish(batch)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OwnedBatch {
     batch: RecordBatch,

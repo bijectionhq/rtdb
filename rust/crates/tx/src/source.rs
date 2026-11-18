@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
+use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
@@ -142,27 +142,11 @@ impl SourceTransaction {
                 bytes.checked_add(size).ok_or_else(overflow)
             })
         })?;
-        let mut arrays = SourceBatchArrays { reservation: self.memory.reserve(metadata_bound)? };
+        let mut arrays = BatchBuilder::new(metadata_bound, &self.memory)?;
         let union = named_union(entries, |leg| operation_leg(leg, &mut arrays))?;
         let schema = Arc::new(Schema::new(vec![Field::new("tx-ops", union.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![union]).map_err(|error| invalid(error.to_string()))?;
-        OwnedBatch::with_reservation(batch, arrays.reservation)
-    }
-}
-
-struct SourceBatchArrays {
-    reservation: Arc<MemoryReservation>,
-}
-
-impl SourceBatchArrays {
-    fn append(&mut self, temporary: usize, build: impl FnOnce() -> Result<ArrayRef>) -> Result<ArrayRef> {
-        let reservation = Arc::get_mut(&mut self.reservation).expect("source batch construction owns its reservation");
-        let retained = reservation.bytes();
-        reservation.grow_to(retained.checked_add(temporary).ok_or_else(overflow)?)?;
-        let array = build()?;
-        let retained = retained.checked_add(array.get_array_memory_size()).ok_or_else(overflow)?;
-        reservation.shrink_to(retained)?;
-        Ok(array)
+        arrays.finish(batch)
     }
 }
 
@@ -258,7 +242,7 @@ fn named_union<T>(
     Ok(Arc::new(UnionArray::try_new(UnionFields::new((0..fields.len()).map(|id| id as i8), fields), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(|error| invalid(error.to_string()))?))
 }
 
-fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut SourceBatchArrays) -> Result<ArrayRef> {
+fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
     let (values, documents): (Vec<_>, Vec<_>) = values.into_iter().map(|value| (value.body, value.documents)).unzip();
     let mut ty = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
     if let LogicalType::Struct(fields) = &mut ty {
@@ -268,7 +252,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut SourceBatchArray
         if fields.contains_key("iids") { fields.insert("iids".into(), LogicalType::list(LogicalType::Scalar(ScalarType::FixedSizeBinary(16)))); }
         if fields.contains_key("args") { fields.insert("args".into(), LogicalType::Scalar(ScalarType::Binary).maybe()); }
     }
-    let array = arrays.append(estimate_builder_bytes(&ty, &values)?, || copy_array(&ty, &values))?;
+    let array = arrays.column(estimate_builder_bytes(&ty, &values)?, || copy_array(&ty, &values))?;
     if documents.iter().all(Option::is_none) { return Ok(array); }
     let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
     let structs = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document operation is not a struct"))?;
@@ -279,7 +263,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut SourceBatchArray
     Ok(Arc::new(StructArray::try_new(fields.into(), columns, structs.nulls().cloned()).map_err(|error| invalid(error.to_string()))?))
 }
 
-fn document_leg(lists: Vec<&Documents>, arrays: &mut SourceBatchArrays) -> Result<ArrayRef> {
+fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
     let mut fields = BTreeMap::<&str, (LogicalType, usize)>::new();
     let mut order = Vec::new();
     let mut offsets = vec![0i32];
@@ -309,7 +293,7 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut SourceBatchArrays) -> Resul
         let ty = if present < length || present == 0 { ty.maybe() } else { ty };
         let values = || lists.iter().flat_map(|list| list.rows()).map(|document| struct_field_cell(document, name, &ty));
         let estimate = estimate_builder_bytes_refs(&ty, values())?;
-        let array = arrays.append(estimate, || copy_array(&ty, &values().cloned().collect::<Vec<_>>()))?;
+        let array = arrays.column(estimate, || copy_array(&ty, &values().cloned().collect::<Vec<_>>()))?;
         columns.push(array);
         schema.push(Arc::new(to_field(name, &ty)?));
     }

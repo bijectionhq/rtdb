@@ -33,6 +33,7 @@ Ingress derives those annotations from the real IPC decimal metadata and rejects
 Egress removes the annotations and writes the true signed 32-bit parameters in the IPC schema and file footer.
 Nonpositive precision and scale greater than precision remain representable metadata; ordinary column writes validate coefficients against the declared precision and physical width.
 Typed event and metadata copies preserve existing coefficients with exact decimal parameters, including coefficients larger than their declared precision.
+Owned event batches build one document column at a time under the same admission contract as source transaction batches.
 Captured event schemas reject values outside their declared type legs.
 `tests/ipc_decimal_metadata.rs` changes nested FlatBuffer metadata directly and retains those accepted and rejected boundaries as unexecuted regression source.
 `tests/decimal_scales.rs` covers all physical widths, nested fields, independent union scales, empty/null zero-precision pages, protobuf column metadata and incremental sinks.

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, TimestampMicrosecondArray, UnionArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
-use rtdb_columnar::{IidView, build_array, build_iids, copy_array, read_value, to_field};
+use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, read_value, struct_field_cell, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,17 +126,32 @@ impl EventBatch {
 
 /// All rows must either carry recency or omit it; the caller supplies the put schema captured with the rows.
 pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
-    event_batch(events, put_fields, iid_encoding, false)
+    event_batch(events, put_fields, iid_encoding, false, None)
 }
 
 /// Reconstructs stored cells under their captured put schema, preserving raw decimal coefficients.
 /// Every value must belong to that schema; no decimal parameter or coefficient is converted.
-/// The caller reserves column-builder bounds, document clones and event-array overhead before calling.
+/// The caller admits column construction and event-array overhead before calling.
 pub fn copy_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
-    event_batch(events, put_fields, iid_encoding, true)
+    event_batch(events, put_fields, iid_encoding, true, None)
 }
 
-fn event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool) -> Result<RecordBatch> {
+/// Builds an owned index batch with scratch for one document column at a time.
+/// `copy` selects the stored-cell writer, which preserves existing decimal coefficients.
+pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    let metadata = put_fields.as_ref().map_or(Ok(4096), |fields| {
+        fields.iter().try_fold(4096usize, |bytes, (name, ty)| {
+            ty.retained_bytes()?.checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
+                .and_then(|bytes| bytes.checked_mul(8)).and_then(|size| bytes.checked_add(size)).ok_or_else(event_size)
+        })
+    })?;
+    let headers = events.len().checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(event_size)?;
+    let mut builder = BatchBuilder::new(metadata.checked_add(headers).ok_or_else(event_size)?, memory)?;
+    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder))?;
+    builder.finish_with_metadata(batch, metadata)
+}
+
+fn event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>) -> Result<RecordBatch> {
     let mut puts = Vec::new();
     let mut deletes = 0usize;
     let mut erases = 0usize;
@@ -150,7 +165,7 @@ fn event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, Logic
             StoredOperation::Put(document) => {
                 if !has_put { return Err(invalid("Put event has no declared put schema")); }
                 let offset = puts.len();
-                puts.push(Value::Struct(document.clone()));
+                puts.push(document);
                 (0, offset)
             }
             StoredOperation::Delete => { let offset = deletes; deletes += 1; (delete_id, offset) }
@@ -162,9 +177,9 @@ fn event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, Logic
     let mut op_fields = Vec::new();
     let mut children: Vec<ArrayRef> = Vec::new();
     if let Some(fields) = put_fields {
-        let ty = LogicalType::Struct(fields);
-        op_fields.push(Arc::new(to_field("put", &ty)?));
-        children.push(if copy { copy_array(&ty, &puts)? } else { build_array(&ty, &puts)? });
+        let documents = put_columns(&puts, fields, copy, builder)?;
+        op_fields.push(Arc::new(Field::new("put", documents.data_type().clone(), false)));
+        children.push(documents);
     }
     op_fields.extend([Arc::new(Field::new("delete", DataType::Null, true)), Arc::new(Field::new("erase", DataType::Null, true))]);
     children.extend([Arc::new(NullArray::new(deletes)) as ArrayRef, Arc::new(NullArray::new(erases)) as ArrayRef]);
@@ -191,6 +206,33 @@ fn event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, Logic
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)
 }
 
+fn put_columns(
+    documents: &[&BTreeMap<String, Value>],
+    fields: BTreeMap<String, LogicalType>,
+    copy: bool,
+    mut builder: Option<&mut BatchBuilder>,
+) -> Result<ArrayRef> {
+    if documents.iter().any(|doc| doc.keys().any(|name| !fields.contains_key(name))) {
+        return Err(Anomaly::incorrect("rtdb/column-type-mismatch", "Document has a field outside its declared layout"));
+    }
+    let mut schema = Vec::with_capacity(fields.len());
+    let mut columns = Vec::with_capacity(fields.len());
+    for (name, ty) in fields {
+        let values = || documents.iter().map(|doc| struct_field_cell(doc, &name, &ty));
+        let build = || {
+            let values = values().cloned().collect::<Vec<_>>();
+            if copy { copy_array(&ty, &values) } else { build_array(&ty, &values) }
+        };
+        let column = match builder.as_deref_mut() {
+            Some(builder) => builder.column(estimate_builder_bytes_refs(&ty, values())?, build)?,
+            None => build()?,
+        };
+        schema.push(Arc::new(to_field(&name, &ty)?));
+        columns.push(column);
+    }
+    build_struct_array(schema.into(), &columns, documents.len(), None)
+}
+
 /// Keeps the declared recency column even when a page is empty.
 pub fn build_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
     event_batch_with_recency(events, put_fields, iid_encoding, recency, false)
@@ -203,7 +245,7 @@ pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<
 
 fn event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
     if events.iter().any(|event| event.recency.is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
-    let batch = event_batch(events, put_fields, iid_encoding, copy)?;
+    let batch = event_batch(events, put_fields, iid_encoding, copy, None)?;
     if recency && events.is_empty() {
         let mut fields = batch.schema().fields().to_vec();
         fields.push(Arc::new(Field::new("_recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false)));
@@ -217,3 +259,5 @@ fn event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-event-data", error.to_string())
 }
+
+fn event_size() -> Anomaly { invalid("Event batch allocation exceeds addressable memory") }
