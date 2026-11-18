@@ -68,8 +68,8 @@ A newer term ends the old region, transfers those retained records to follower a
 A completed resolution returns its resolver before the driver enqueues the new transaction and drains held readbacks.
 
 For this term's transaction readback, the driver removes the oldest staged transaction before validating its ID.
-It applies the staged write atomically, publishes applied progress, and completes the transaction receipt.
-The selected external transaction's receipt carries the original fault if ID validation, partition apply, or progress publication fails.
+It applies the staged write atomically, applies any committed database operation carried by the readback, then publishes applied progress and completes the transaction receipt.
+If the selected transaction has a receipt, it carries the original fault from ID validation, partition apply, database-operation application, or progress publication.
 External transactions still queued receive `xtdb/leader-term-ended` during demotion.
 Transactions from earlier terms import their encoded tables through `rtdb-tx::decode_replica`.
 A missing legacy source position uses the transaction ID for ordinary databases and preserves the current source position for external-source databases.
@@ -109,7 +109,9 @@ Oversized-envelope admission precedes payload fetch, following the format/spec b
 The pinned JVM `LogProcessor.kt` resolves the payload before applying the term fence.
 A fenced pointer to a missing object therefore has different failure behavior.
 
-Committed database-operation application preserves the pinned role distinction: the leader applies it before its transaction and propagates a caller failure; a follower applies it after its transaction and swallows a caller failure.
+A leader applies a database operation carried by an inherited record before importing that transaction.
+A follower imports the transaction before applying its committed database operation.
+A leader propagates caller failures from database-operation application, and a follower swallows them.
 The shared `ApplyDbOpToCatalog` deferred specification currently describes swallowing the fault for both roles.
 
 Boundary-timestamp table transitions make partial immutable retries deterministic.

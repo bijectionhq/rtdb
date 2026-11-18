@@ -555,23 +555,23 @@ impl ReplicationDriver {
                 ReplicaBody::ResolvedTx(message) => {
                     let leading = self.leader.is_some();
                     let own = self.leader.as_ref().is_some_and(|leader| leader.term == record.envelope.term);
-                    if leading {
-                        if let Some(operation) = &message.db_op { self.effects.apply_db_op(operation).await?; }
-                    }
                     if own {
                         let head = self.leader.as_mut().and_then(|leader| leader.resolver.as_mut()).and_then(TxResolver::take_head);
                         let mismatch = || Anomaly::fault("xtdb.indexer/leader-read-back-mismatch", "Replica transaction does not match the oldest staged transaction")
                             .with_context("replica-tx-id", message.tx_id.unwrap_or_default().into());
                         let Some(head) = head else { return Err(mismatch()); };
-                        let applied = (|| {
+                        let applied = async {
                             if head.result().tx_key().tx_id != TxId(message.tx_id.unwrap_or_default()) {
                                 return Err(mismatch());
                             }
                             self.partition.apply(head.writes())?;
+                            if message.committed.unwrap_or(false) {
+                                if let Some(operation) = &message.db_op { self.effects.apply_db_op(operation).await?; }
+                            }
                             let result = Arc::new(head.result().clone());
                             self.progress.applied(Some(head.source_position()), Some(Arc::clone(&result)), head.external_token().map(<[u8]>::to_vec))?;
                             Ok(result)
-                        })();
+                        }.await;
                         let result = match applied {
                             Ok(result) => result,
                             Err(error) => {
@@ -588,6 +588,9 @@ impl ReplicationDriver {
                         };
                         if let Some(leader) = &mut self.leader { complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Transaction(result))); }
                     } else {
+                        if leading {
+                            if let Some(operation) = &message.db_op { self.effects.apply_db_op(operation).await?; }
+                        }
                         let value = self.partition.value();
                         let (writes, result) = rtdb_tx::decode_replica(message, value.live().latest_completed_tx(), value.live().block_index(), &self.resolve.memory)?;
                         self.partition.apply(&writes)?;

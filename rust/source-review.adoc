@@ -1382,7 +1382,8 @@ Both Rust and the pinned JVM publish the final block catalog before appending it
 A restart can therefore resume at a published catalog's boundary with no pending block while a surviving follower still waits for the upload.
 Closing that durable-publication gap and checking follower progress across the crash remain open.
 
-On own-term leader read-back, Rust and the pinned JVM apply database attach or detach effects before checking the staged head, while `LeaderAppliesOwnTx` in `dev/doc/db.allium` places validation and apply before the catalog effect.
+On own-term leader read-back, Rust follows `LeaderAppliesOwnTx` in `dev/doc/db.allium` by validating the staged head and applying its writes before applying the committed database attach or detach effect.
+The pinned JVM applies the catalog effect before taking the staged head.
 
 A persisted page can be excluded as a source of matches for a direct document-column `IS NOT NULL` predicate when its root count is known to be zero.
 The existing selector retains pages that can constrain or erase matching history.

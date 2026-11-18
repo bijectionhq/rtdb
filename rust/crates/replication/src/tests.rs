@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceMessage}, keys::CURRENT_STORAGE_VERSION, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::TransactionBuffer;
@@ -11,9 +12,11 @@ use rtdb_storage::{MemoryStore, ObjectStore, cache::BufferPool, log::{LocalLog, 
 use rtdb_trie::TrieConfig;
 use rtdb_tx::{Documents, ResolveContext, SourceTransaction, SubmitOptions, TransactionAuthorization, TxOp};
 use rtdb_types::{Anomaly, BlockIndex, Interval, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError::Empty;
 use tokio_util::sync::CancellationToken;
 
-use super::{TailPoll, read_replay_head, source_decode_bound, start_poll};
+use super::{Applied, TailPoll, read_replay_head, source_decode_bound, start_poll};
 use crate::*;
 use crate::logs::replica_decode_bound;
 
@@ -497,6 +500,138 @@ async fn losing_same_term_claim_never_promotes_after_durability() {
     assert!(fixture.driver.leader.is_none());
 }
 
+struct HeldDatabaseEffect {
+    called: Mutex<Option<oneshot::Sender<DbOp>>>,
+    release: Mutex<Option<oneshot::Receiver<Result<()>>>>,
+}
+
+#[async_trait]
+impl DatabaseEffects for HeldDatabaseEffect {
+    fn check_db_op(&self, _: &DbOp) -> Result<()> { Ok(()) }
+
+    async fn apply_db_op(&self, operation: &DbOp) -> Result<()> {
+        let release = self.release.lock().take().unwrap();
+        self.called.lock().take().unwrap().send(operation.clone()).unwrap();
+        release.await.unwrap()
+    }
+
+    fn secondary_databases(&self) -> Result<BTreeMap<String, DatabaseConfig>> { Ok(BTreeMap::new()) }
+}
+
+async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp) -> (TransactionKey, oneshot::Receiver<Result<Applied>>, LogRecord) {
+    fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
+    fixture.driver.promote().await.unwrap();
+
+    let snapshot = fixture.driver.partition.value().snapshot();
+    let resolve = Arc::clone(&fixture.driver.resolve);
+    let effects = Arc::clone(&fixture.driver.effects);
+    let resolver = fixture.driver.leader.as_mut().unwrap().resolver_mut().unwrap();
+    let verdict = super::check_db_op(effects.as_ref(), resolver, operation);
+    let staged = resolver.resolve_db_op(snapshot, SourcePosition(1), Timestamp(100), operation.clone(), verdict, &resolve).unwrap();
+    let key = staged.result().tx_key();
+    let (completion, receipt) = oneshot::channel();
+    fixture.driver.enqueue_resolved(staged, Some(completion)).await.unwrap();
+
+    let mut tail = fixture.logs.replica_tail(fixture.driver.read_position).await.unwrap();
+    let mut records = tail.poll(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(records.len(), 1);
+    let readback = records.pop().unwrap();
+    let envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+    assert!(matches!(envelope.message, ReplicaBody::ResolvedTx(message)
+        if message.tx_id == Some(key.tx_id.0) && message.committed == Some(true) && message.db_op.as_ref() == Some(operation)));
+    (key, receipt, readback)
+}
+
+async fn attach_readback_fixture() -> (Fixture, DbOp, oneshot::Receiver<DbOp>, oneshot::Sender<Result<()>>) {
+    let mut fixture = fixture(ReplicationConfig {
+        may_lead: false, assertion_interval: Duration::from_secs(3600), ..Default::default()
+    }, 1 << 27).await;
+    let (entered, called) = oneshot::channel();
+    let (finish, release) = oneshot::channel();
+    fixture.driver.effects = Arc::new(HeldDatabaseEffect { called: Mutex::new(Some(entered)), release: Mutex::new(Some(release)) });
+    let operation = DbOp::AttachDatabase(proto::AttachDatabase {
+        db_name: Some("secondary".into()), config: Some(DatabaseConfig::default()),
+    });
+    (fixture, operation, called, finish)
+}
+
+#[tokio::test]
+async fn own_attach_readback_mismatch_leaves_partition_catalog_and_progress_unchanged() {
+    let (mut fixture, operation, mut called, _finish) = attach_readback_fixture().await;
+    let (key, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation).await;
+    let before = fixture.driver.partition.value();
+    let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+    let ReplicaBody::ResolvedTx(message) = &mut envelope.message else { panic!("expected an attach readback"); };
+    let mismatched_id = key.tx_id.0 + 1;
+    message.tx_id = Some(mismatched_id);
+    readback.payload = envelope.encode().into();
+
+    let error = {
+        let consumed = fixture.driver.consume(readback);
+        tokio::pin!(consumed);
+        let std::task::Poll::Ready(Err(error)) = futures::poll!(&mut consumed) else {
+            panic!("mismatched readback did not fail immediately");
+        };
+        error
+    };
+    assert_eq!(error, Anomaly::fault("xtdb.indexer/leader-read-back-mismatch", "Replica transaction does not match the oldest staged transaction")
+        .with_context("replica-tx-id", mismatched_id.into()));
+    assert!(matches!(called.try_recv(), Err(Empty)));
+    assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
+    let progress = fixture.handle.progress().current();
+    assert_eq!(progress.source_position, SourcePosition(-1));
+    assert!(progress.tx_key.is_none());
+    assert!(progress.latest_result.is_none());
+    assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn own_attach_readback_applies_before_the_effect_and_awaits_it_before_progress_and_receipt() {
+    for effect in [Ok(()), Err(Anomaly::incorrect("test/attach-failed", "Applying the database attach failed"))] {
+        let (mut fixture, operation, mut called, finish) = attach_readback_fixture().await;
+        let (key, mut receipt, readback) = queued_attach_readback(&mut fixture, &operation).await;
+        let partition = Arc::clone(&fixture.driver.partition);
+        let progress = Arc::clone(fixture.handle.progress());
+
+        let result = {
+            let consumed = fixture.driver.consume(readback);
+            tokio::pin!(consumed);
+            assert!(futures::poll!(&mut consumed).is_pending());
+            assert_eq!(called.try_recv().unwrap(), operation);
+            assert_eq!(partition.value().live().latest_completed_tx(), Some(key));
+            let before = progress.current();
+            assert_eq!(before.source_position, SourcePosition(-1));
+            assert!(before.tx_key.is_none());
+            assert!(before.latest_result.is_none());
+            assert!(matches!(receipt.try_recv(), Err(Empty)));
+
+            finish.send(effect.clone()).unwrap();
+            consumed.await
+        };
+        let after = progress.current();
+        match effect {
+            Ok(()) => {
+                result.unwrap();
+                assert_eq!(after.source_position, SourcePosition(1));
+                assert_eq!(after.tx_key, Some(key));
+                let Applied::Transaction(applied) = receipt.try_recv().unwrap().unwrap() else {
+                    panic!("expected a transaction receipt");
+                };
+                assert_eq!(applied.tx_key(), key);
+            }
+            Err(error) => {
+                assert_eq!(result.unwrap_err(), error);
+                assert_eq!(after.source_position, SourcePosition(-1));
+                assert!(after.tx_key.is_none());
+                assert!(after.latest_result.is_none());
+                assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
+            }
+        }
+        fixture.driver.demote().await.unwrap();
+    }
+}
+
 struct CommitExternal;
 #[async_trait]
 impl rtdb_tx::TransactionWriter for CommitExternal {
@@ -549,7 +684,6 @@ async fn queued_external_readback() -> (Fixture, [ExternalReceipt; 2], LogRecord
             }
         }
     }).await.unwrap();
-    use tokio::sync::oneshot::error::TryRecvError::Empty;
     assert!(matches!(first.receiver.try_recv(), Err(Empty)));
     assert!(matches!(sibling.receiver.try_recv(), Err(Empty)));
     (fixture, [first, sibling], readback, key)
