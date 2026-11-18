@@ -182,3 +182,11 @@ async fn gzip_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
     assert!(weak.upgrade().is_none());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn native_fetch_decoders_admit_and_return_every_charge() {
+    unsafe extern "C" {
+        fn unittest_fetch_decode_admission() -> std::ffi::c_int;
+    }
+    assert_eq!(unsafe { unittest_fetch_decode_admission() }, 0);
+}

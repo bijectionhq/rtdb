@@ -63,7 +63,8 @@ Public mock-cluster sources cover actual retained Snappy Fetch output and resour
 Five additive gzip native fixture functions cover aligned callback allocation, overflow and malloc rollback, exact observed peak and one-byte-short denial, every actual inflater/output malloc failure, wrappers, empty output, checksum errors, trailing bytes, first-member behavior, observed partial-input termination and the retained NUL byte through final Fetch-event destruction.
 Two additive public mock-cluster sources cover actual retained gzip Fetch output and expansion denial after an accepted prefix.
 All existing native and SDK test/assertion sources remain unchanged apart from additive unit registration.
-These fixtures have not been compiled or run in Phase 1.
+The `native_fetch_decoders_admit_and_return_every_charge` test runs these native fixtures.
+Valid empty output initializes its shadow reader over the pushed zero-length segment.
 
 The active stock Connect account shares this bounded gzip and Snappy storage with its existing native owners.
 Its finite ceiling can reject an expansion even when the compressed wire response fits receive.message.max.bytes.

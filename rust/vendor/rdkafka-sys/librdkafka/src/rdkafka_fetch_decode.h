@@ -124,6 +124,7 @@ static rd_kafka_buf_t *rd_kafka_fetch_decode_shadow(
         char *extra;
         size_t extra_size = RD_ROUNDUP(sizeof(rd_segment_t), 8);
         size_t charge = rd_kafka_fetch_decode_shadow_size();
+        int reader;
         if (!rd_kafka_byte_account_acquire(account, charge))
                 return NULL;
         shadow = allocate(sizeof(*shadow));
@@ -145,7 +146,10 @@ static rd_kafka_buf_t *rd_kafka_fetch_decode_shadow(
         rd_buf_push(&shadow->rkbuf_buf, payload, size,
                     rd_kafka_fetch_decode_free);
         shadow->rkbuf_totlen = size;
-        rd_slice_init_full(&shadow->rkbuf_reader, &shadow->rkbuf_buf);
+        reader = rd_slice_init_seg(&shadow->rkbuf_reader, &shadow->rkbuf_buf,
+                                   TAILQ_FIRST(&shadow->rkbuf_buf.rbuf_segments),
+                                   0, size);
+        rd_assert(reader == 0);
         rd_refcnt_init(&shadow->rkbuf_refcnt, 1);
         shadow->rkbuf_byte_account = account;
         shadow->rkbuf_byte_charge = charge;
