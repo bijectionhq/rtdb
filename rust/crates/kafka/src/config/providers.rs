@@ -61,22 +61,39 @@ pub(crate) fn resolve<'a>(
         };
         providers.insert(alias, provider);
     }
-
-    let mut requests = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
-    for value in original.values() {
-        for variable in Variables::new(value) {
-            if providers.contains_key(variable.provider) {
-                requests.entry((variable.provider, variable.path)).or_default().insert(variable.key);
-            }
-        }
-    }
-    if requests.is_empty() {
+    if providers.is_empty() {
         return Ok(Cow::Borrowed(original));
     }
+
+    let options: Vec<_> = original.iter().collect();
+    let option_order = rtdb_types::java_hash_map_order(
+        16, options.iter().map(|(name, _)| *name), |name| string_hash(name),
+        |left, right| left.encode_utf16().cmp(right.encode_utf16()),
+    ).ok_or_else(allocation)?;
+    let mut provider_encounters = Vec::new();
+    let mut requests = BTreeMap::<&str, ProviderRequests<'_>>::new();
+    for index in option_order {
+        for variable in Variables::new(options[index].1) {
+            provider_encounters.push(variable.provider);
+            let requested = requests.entry(variable.provider).or_default();
+            requested.path_encounters.push(variable.path);
+            requested.keys_by_path.entry(variable.path).or_default().insert(variable.key);
+        }
+    }
+
     let mut lookups = BTreeMap::new();
-    for ((alias, path), keys) in requests {
-        let values = providers[alias].get(path, &keys, reserve)?;
-        lookups.insert((alias, path), values);
+    for index in request_order(&provider_encounters) {
+        let alias = provider_encounters[index];
+        let Some(provider) = providers.get(alias) else { continue; };
+        let requested = &requests[alias];
+        for index in request_order(&requested.path_encounters) {
+            let path = requested.path_encounters[index];
+            let values = provider.get(path, &requested.keys_by_path[path], reserve)?;
+            lookups.insert((alias, path), values);
+        }
+    }
+    if lookups.is_empty() {
+        return Ok(Cow::Borrowed(original));
     }
     let replacement = |variable: &Variable<'a>| {
         lookups.get(&(variable.provider, variable.path))?.get(variable.key).map(String::as_str)
@@ -113,6 +130,19 @@ fn list(value: &str) -> impl Iterator<Item = &str> {
 
 fn string_hash(value: &str) -> i32 {
     value.encode_utf16().fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(i32::from(unit)))
+}
+
+#[derive(Default)]
+struct ProviderRequests<'a> {
+    path_encounters: Vec<&'a str>,
+    keys_by_path: BTreeMap<&'a str, BTreeSet<&'a str>>,
+}
+
+fn request_order(encounters: &[&str]) -> Vec<usize> {
+    rtdb_types::java_hash_map_compute_if_absent_order(
+        encounters, |key| string_hash(key),
+        |left, right| left.encode_utf16().cmp(right.encode_utf16()),
+    )
 }
 
 struct Variable<'a> { provider: &'a str, path: &'a str, key: &'a str, start: usize, end: usize }

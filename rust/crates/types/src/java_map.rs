@@ -5,6 +5,9 @@ struct Entry<'a, K> { key: &'a K, source: usize, hash: i32, previous: Option<usi
 struct Bucket { head: Option<usize>, tail: Option<usize>, len: usize, root: Option<usize> }
 struct Replay<'a, K, C> { entries: Vec<Entry<'a, K>>, compare_keys: C, buckets: BTreeMap<usize, Bucket>, capacity: usize, threshold: usize }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Insertion { Put, ComputeIfAbsent }
+
 /// Returns OpenJDK HashMap iteration indices after insertion, replacement and collision-tree ordering.
 /// `hash` returns the raw Java `hashCode`; comparable keys share one class and use its `Comparable` ordering.
 /// Non-comparable keys must already be deduplicated and use a stable per-object identity tie order.
@@ -13,13 +16,21 @@ struct Replay<'a, K, C> { entries: Vec<Entry<'a, K>>, compare_keys: C, buckets: 
 pub fn indices<'a, K: Eq + 'a>(initial: usize, keys: impl IntoIterator<Item = &'a K>, hash: impl Fn(&K) -> i32, compare_keys: impl Fn(&K, &K) -> Ordering) -> Option<Vec<usize>> {
     let capacity = initial.max(1).checked_next_power_of_two()?.min(1 << 30);
     let mut replay = Replay { entries: Vec::new(), compare_keys, buckets: BTreeMap::new(), capacity, threshold: capacity * 3 / 4 };
-    for (source, key) in keys.into_iter().enumerate() { replay.insert(key, source, hash(key)); }
-    let mut order = Vec::with_capacity(replay.entries.len());
-    for bucket in replay.buckets.values() {
-        let mut next = bucket.head;
-        while let Some(index) = next { order.push(replay.entries[index].source); next = replay.entries[index].next; }
+    for (source, key) in keys.into_iter().enumerate() {
+        replay.insert(key, source, hash(key), Insertion::Put);
     }
-    Some(order)
+    Some(replay.into_order())
+}
+
+/// Returns OpenJDK default HashMap iteration indices after non-null `computeIfAbsent` calls.
+/// Repeated keys retain the first input index and may trigger a resize on lookup.
+/// Key comparison and allocation obligations match [`indices`].
+pub fn compute_if_absent_indices<'a, K: Eq + 'a>(keys: impl IntoIterator<Item = &'a K>, hash: impl Fn(&K) -> i32, compare_keys: impl Fn(&K, &K) -> Ordering) -> Vec<usize> {
+    let mut replay = Replay { entries: Vec::new(), compare_keys, buckets: BTreeMap::new(), capacity: 16, threshold: 12 };
+    for (source, key) in keys.into_iter().enumerate() {
+        replay.insert(key, source, hash(key), Insertion::ComputeIfAbsent);
+    }
+    replay.into_order()
 }
 
 /// Returns iteration indices after individual insertions followed by OpenJDK `HashMap.putAll`.
@@ -31,7 +42,7 @@ pub fn put_all_indices<'a, K: Eq + 'a>(initial: Option<usize>, keys: impl IntoIt
     let capacity = initial.unwrap_or(16).max(1).checked_next_power_of_two()?.min(1 << 30);
     let mut replay = Replay { entries: Vec::new(), compare_keys, buckets: BTreeMap::new(), capacity, threshold: if capacity == 1 << 30 { i32::MAX as usize } else { capacity * 3 / 4 } };
     let mut offset = 0;
-    for key in keys { replay.insert(key, offset, hash(key)); offset += 1; }
+    for key in keys { replay.insert(key, offset, hash(key), Insertion::Put); offset += 1; }
     if !additions.is_empty() {
         if offset == 0 {
             let requested = if additions.len() >= (1 << 30) * 3 / 4 { 1 << 30 } else { (additions.len() * 4).div_ceil(3) };
@@ -41,36 +52,54 @@ pub fn put_all_indices<'a, K: Eq + 'a>(initial: Option<usize>, keys: impl IntoIt
         } else {
             while additions.len() > replay.threshold && replay.capacity < 1 << 30 { replay.resize(); }
         }
-        for (index, key) in additions.iter().enumerate() { replay.insert(*key, offset + index, hash(*key)); }
+        for (index, key) in additions.iter().enumerate() { replay.insert(*key, offset + index, hash(*key), Insertion::Put); }
     }
-    let mut order = Vec::with_capacity(replay.entries.len());
-    for bucket in replay.buckets.values() {
-        let mut next = bucket.head;
-        while let Some(index) = next { order.push(replay.entries[index].source); next = replay.entries[index].next; }
-    }
-    Some(order)
+    Some(replay.into_order())
 }
 
 impl<'a, K: Eq, C: Fn(&K, &K) -> Ordering> Replay<'a, K, C> {
-    fn insert(&mut self, key: &'a K, source: usize, hash: i32) {
+    fn into_order(self) -> Vec<usize> {
+        let mut order = Vec::with_capacity(self.entries.len());
+        for bucket in self.buckets.values() {
+            let mut next = bucket.head;
+            while let Some(index) = next {
+                order.push(self.entries[index].source);
+                next = self.entries[index].next;
+            }
+        }
+        order
+    }
+
+    fn insert(&mut self, key: &'a K, source: usize, hash: i32, insertion: Insertion) {
         let hash = hash ^ ((hash as u32 >> 16) as i32);
+        if insertion == Insertion::ComputeIfAbsent && self.entries.len() > self.threshold {
+            self.resize();
+        }
         let slot = hash as u32 as usize & (self.capacity - 1);
         let mut bucket = self.buckets.remove(&slot).unwrap_or_default();
-        if let Some(index) = self.find(&bucket, hash, key) { self.entries[index].source = source; self.buckets.insert(slot, bucket); return; }
+        if let Some(index) = self.find(&bucket, hash, key) {
+            if insertion == Insertion::Put {
+                self.entries[index].source = source;
+            }
+            self.buckets.insert(slot, bucket);
+            return;
+        }
         let index = self.entries.len(); self.entries.push(Entry { key, source, hash, previous: None, next: None, parent: None, left: None, right: None, red: false });
+        let treeify_at = match insertion { Insertion::Put => 9, Insertion::ComputeIfAbsent => 8 };
         if bucket.root.is_some() {
             let root = bucket.root.unwrap();
             let parent = self.tree_insert(root, index);
             self.link_after(&mut bucket, Some(parent), index);
             let root = self.balance(root, index); self.front(&mut bucket, root);
         } else {
-            let tail = bucket.tail; self.link_after(&mut bucket, tail, index);
-            if bucket.len >= 9 && self.capacity >= 64 { self.treeify(&mut bucket); }
+            let previous = match insertion { Insertion::Put => bucket.tail, Insertion::ComputeIfAbsent => None };
+            self.link_after(&mut bucket, previous, index);
+            if bucket.len >= treeify_at && self.capacity >= 64 { self.treeify(&mut bucket); }
         }
-        let resize_for_chain = bucket.root.is_none() && bucket.len >= 9 && self.capacity < 64;
+        let resize_for_chain = bucket.root.is_none() && bucket.len >= treeify_at && self.capacity < 64;
         self.buckets.insert(slot, bucket);
         if resize_for_chain { self.resize(); }
-        if self.entries.len() > self.threshold { self.resize(); }
+        if insertion == Insertion::Put && self.entries.len() > self.threshold { self.resize(); }
     }
     fn find(&self, bucket: &Bucket, hash: i32, key: &K) -> Option<usize> {
         if let Some(root) = bucket.root {
@@ -195,6 +224,26 @@ impl<'a, K: Eq, C: Fn(&K, &K) -> Ordering> Replay<'a, K, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_if_absent_prepends_collisions_and_keeps_first_index() {
+        let keys = [0, 16, 0, 32, -1];
+        assert_eq!(compute_if_absent_indices(&keys, |key| *key, Ord::cmp), [4, 3, 1, 0]);
+    }
+
+    #[test]
+    fn compute_if_absent_resizes_before_an_existing_key_lookup() {
+        let keys = [16, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16];
+        assert_eq!(compute_if_absent_indices(&keys[..13], |key| *key, Ord::cmp), (0..13).collect::<Vec<_>>());
+        assert_eq!(compute_if_absent_indices(&keys, |key| *key, Ord::cmp), (1..13).chain([0]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn compute_if_absent_treeifies_the_head_inserted_chain_after_resizing_twice() {
+        let keys: Vec<_> = (0..10).collect();
+        assert_eq!(compute_if_absent_indices(&keys[..9], |_| 0, Ord::cmp), (0..9).rev().collect::<Vec<_>>());
+        assert_eq!(compute_if_absent_indices(&keys, |_| 0, Ord::cmp), [6, 9, 8, 7, 5, 4, 3, 2, 1, 0]);
+    }
 
     #[test]
     fn bulk_default_constructor_presizes_before_first_insertion() {

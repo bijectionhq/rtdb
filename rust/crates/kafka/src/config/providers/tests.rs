@@ -87,6 +87,50 @@ fn providers_configure_in_java_alias_map_order() {
 }
 
 #[test]
+#[cfg(unix)]
+fn provider_lookup_order_includes_unknown_aliases_and_repeated_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let malformed = root.path().join("malformed");
+    let absent = root.path().join("absent");
+    fs::write(&malformed, b"key=\\uXYZ1\n").unwrap();
+    let mut original = BTreeMap::from([
+        (PROVIDERS.into(), "a,p".into()),
+        ("config.providers.a.class".into(), FILE.into()),
+        ("config.providers.p.class".into(), FILE.into()),
+        ("setting".into(), format!("${{a:{}:key}}${{p:{}:key}}", malformed.display(), absent.display())),
+    ]);
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/config-provider");
+    let setting = original.get_mut("setting").unwrap();
+    for alias in 'b'..='l' {
+        setting.push_str(&format!("${{{alias}:unused}}"));
+    }
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/config-provider");
+    original.get_mut("setting").unwrap().push_str("${a:key}");
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/properties-file");
+}
+
+#[test]
+#[cfg(unix)]
+fn paths_follow_hash_collision_order_after_extracting_options() {
+    let root = tempfile::tempdir().unwrap();
+    let absent = root.path().join("Aa");
+    let malformed = root.path().join("BB");
+    fs::write(&malformed, b"key=\\uXYZ1\n").unwrap();
+    let mut original = BTreeMap::from([
+        (PROVIDERS.into(), "p".into()),
+        ("config.providers.p.class".into(), FILE.into()),
+        ("a".into(), format!("${{p:{}:key}}", malformed.display())),
+        ("p".into(), format!("${{p:{}:key}}", absent.display())),
+    ]);
+    assert_eq!(string_hash(absent.to_str().unwrap()), string_hash(malformed.to_str().unwrap()));
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/properties-file");
+    let a = original.remove("a").unwrap();
+    let p = original.insert("p".into(), a).unwrap();
+    original.insert("a".into(), p);
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/config-provider");
+}
+
+#[test]
 fn variable_capture_preserves_empty_fields_optional_path_and_ordinary_braces() {
     let input = "plain ${missing-colon} ${p::key} ${p:path:key:tail} ${:} ${nested${p:key} ${unfinished";
     let observed: Vec<_> = Variables::new(input).map(|var| (var.provider, var.path, var.key, &input[var.start..var.end])).collect();
