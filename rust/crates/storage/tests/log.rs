@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rtdb_storage::{Error, log::{LocalLog, LocalLogOptions, Log, LogOffset, MemoryLog}};
+use rtdb_storage::{Error, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, LogRecord, MemoryLog}};
 use rtdb_types::Timestamp;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -127,6 +127,40 @@ async fn local_offsets_are_byte_positions_and_reopen_preserves_them() {
     let mut tail = reopened.tail(first.offset).await.unwrap();
     assert_eq!(tail.poll(Duration::ZERO).await.unwrap()[0].metadata, second);
     drop(driver);
+}
+
+#[tokio::test]
+async fn local_tail_delivers_a_capped_prefix_and_resumes_at_the_exact_byte_offset() {
+    let directory = tempfile::tempdir().unwrap();
+    let (log, driver) = LocalLog::open(directory.path().join("LOG"), options()).unwrap();
+    let shutdown = CancellationToken::new();
+    let writer = tokio::spawn(driver.run(shutdown.clone()));
+    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+    let mut appends = Vec::new();
+    let mut expected_offset = 0;
+    for position in 0..1025 {
+        let payload = if position % 2 == 0 { Bytes::from_static(b"a") } else { Bytes::from_static(b"xyz") };
+        let timestamp = Timestamp(position);
+        let receipt = log.enqueue(payload.clone(), timestamp).await.unwrap();
+        let metadata = LogMetadata { offset: LogOffset(expected_offset), timestamp };
+        expected_offset += 21 + payload.len() as i64;
+        appends.push((receipt, LogRecord { metadata, payload }));
+    }
+    let mut expected = Vec::new();
+    for (receipt, record) in appends {
+        assert_eq!(receipt.durable().await.unwrap(), record.metadata);
+        expected.push(record);
+    }
+
+    let first = tail.poll(Duration::ZERO).await.unwrap();
+    assert_eq!(first.as_slice(), &expected[..1024]);
+    let remainder = tail.poll(Duration::ZERO).await.unwrap();
+    assert_eq!(remainder.as_slice(), &expected[1024..]);
+    assert!(tail.poll(Duration::ZERO).await.unwrap().is_empty());
+    assert_eq!(log.read_range(LogOffset(0), LogOffset(expected_offset)).await.unwrap(), expected);
+    shutdown.cancel();
+    writer.await.unwrap().unwrap();
+    log.close_and_wait().await;
 }
 
 #[tokio::test]

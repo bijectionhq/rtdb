@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 const HEADER_BYTES: u64 = 13;
 const TRAILER_BYTES: u64 = 8;
 const RECORD_SEPARATOR: u8 = 0x1e;
+const MAXIMUM_POLL_RECORDS: usize = 1024;
+const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 
 pub struct LocalLogOptions {
     pub maximum_message_bytes: usize,
@@ -278,18 +280,26 @@ struct LocalTail {
     reads: Arc<IoRegion>,
 }
 
-#[async_trait]
-impl LogTail for LocalTail {
-    async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>> {
+impl LocalTail {
+    async fn poll_with_payload_limit(&mut self, timeout: Duration, payload_limit: usize) -> Result<Vec<LogRecord>> {
         let tip = await_tip(&self.progress, self.after, timeout).await?;
         if tip <= self.after { return Ok(Vec::new()); }
         let (path, maximum, next) = (self.path.clone(), self.maximum, self.next);
+        let payload_limit = payload_limit.max(maximum);
         let (records, next) = self.reads.run(move || {
             let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
             file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path.as_ref(), error))?;
             let mut records = Vec::new();
+            let mut payload_bytes = 0usize;
             while file.stream_position().map_err(|error| Error::io(path.as_ref(), error))? <= tip.0 as u64 {
-                records.push(read_record(&mut file, &path, maximum)?);
+                if records.len() == MAXIMUM_POLL_RECORDS
+                    || payload_bytes.checked_add(maximum).is_none_or(|bytes| bytes > payload_limit)
+                {
+                    break;
+                }
+                let record = read_record(&mut file, &path, maximum)?;
+                payload_bytes += record.payload.len();
+                records.push(record);
             }
             let next = file.stream_position().map_err(|error| Error::io(path.as_ref(), error))?;
             Ok::<_, Error>((records, next))
@@ -298,5 +308,51 @@ impl LogTail for LocalTail {
         self.after = last.metadata.offset;
         self.next = next;
         Ok(records)
+    }
+}
+
+#[async_trait]
+impl LogTail for LocalTail {
+    async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>> {
+        self.poll_with_payload_limit(timeout, DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_tail_checks_room_for_a_maximum_size_message_before_reading_the_next_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (log, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions {
+            maximum_message_bytes: 6,
+            queue_capacity: 5,
+        }).unwrap();
+        let shutdown = CancellationToken::new();
+        let writer = tokio::spawn(driver.run(shutdown.clone()));
+        let payloads: [&'static [u8]; 5] = [b"ab", b"wxyz", b"x", b"uvwxyz", b"y"];
+        let mut metadata = Vec::new();
+        for (position, &payload) in payloads.iter().enumerate() {
+            metadata.push(log.enqueue(Bytes::from_static(payload), Timestamp(position as i64)).await.unwrap().durable().await.unwrap());
+        }
+        let mut tail = LocalTail {
+            path: Arc::clone(&log.path),
+            progress: Arc::clone(&log.progress),
+            maximum: log.maximum_message_bytes,
+            after: LogOffset(-1),
+            next: 0,
+            reads: Arc::clone(&log.reads),
+        };
+        for (limit, from, to) in [(8, 0, 2), (5, 2, 3), (5, 3, 4), (5, 4, 5)] {
+            let batch = tail.poll_with_payload_limit(Duration::ZERO, limit).await.unwrap();
+            let observed: Vec<_> = batch.iter().map(|record| record.payload.as_ref()).collect();
+            assert_eq!(observed.as_slice(), &payloads[from..to]);
+            assert!(batch.iter().zip(&metadata[from..to]).all(|(record, expected)| record.metadata == *expected));
+        }
+        assert!(tail.poll_with_payload_limit(Duration::ZERO, 5).await.unwrap().is_empty());
+        shutdown.cancel();
+        writer.await.unwrap().unwrap();
+        log.close_and_wait().await;
     }
 }

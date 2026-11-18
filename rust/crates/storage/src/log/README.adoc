@@ -12,6 +12,11 @@ A memory tail returns up to 1,024 consecutive records per poll.
 The total payload is limited to the greater of 128 MiB and the maximum accepted message size.
 The next poll resumes after the last delivered record.
 
+A writable local tail returns up to 1,024 consecutive records per poll.
+Its payload limit is the greater of 128 MiB and the maximum accepted message size.
+It reads a record only when the remaining budget covers a maximum-size message.
+The next poll resumes at the first unread byte position.
+
 `ReadOnlyLocalLog` is a passive view of an external append-only file.
 Its cursor is a single-owner transient; polling performs bounded file reads inline and sleeps on the caller's task between attempts.
 Opening and tailing do not create files or directories, acquire writer locks, or start background tasks.
