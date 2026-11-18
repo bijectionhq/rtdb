@@ -61,7 +61,10 @@ Decimal C formats carry true signed 32-bit precision and scale for all four coef
 Native carrier metadata is absent from exports and rejected on imports.
 Replacement C format strings share each schema child's retained release owner, so moving a child out of its parent preserves both its format and reservation.
 
-ADBC result schema requests emit operators against the preparation snapshot and report type errors without opening a cursor.
+ADBC parameter schema requests admit the Arrow fields before constructing them and return one empty-name nullable Null field per positional parameter.
+ADBC query schema requests acquire a preparation context for each call and report type errors without opening a cursor.
+Result schema inference releases its temporary vector of unknown parameter types and the vector's reservation before converting result fields to Arrow.
+DML result schema requests return an empty schema without acquiring that context.
 ADBC cursor schemas retain the advertised result layout.
 Each runtime page passes through the passive `rtdb-columnar::DeclaredBatch` adapter before C export, following `ResultCursor.toArrowReader` and `ConformingUnloader`.
 Present NULL vectors acquire the target physical layout while the exported schema preserves its advertised nullability flags.

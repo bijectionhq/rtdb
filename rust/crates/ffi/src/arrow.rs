@@ -3,7 +3,7 @@ use arrow_array::{Array, RecordBatch, StructArray, ffi::{FFI_ArrowArray, from_ff
 use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
 use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_value, to_field};
 use rtdb_tx::SqlArguments;
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, LogicalType, Result};
 
 pub(crate) fn logical_schema(schema: &rtdb_plan::Schema) -> Result<Schema> {
     Ok(Schema::new(schema.fields().iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?))
@@ -14,6 +14,15 @@ impl OwnedSchema {
         let bound = schema.fields().iter().try_fold(4096, |bytes, field| super::add(bytes, super::add(super::mul(field.name.len(), 4)?, super::mul(field.data_type.retained_bytes()?, 16)?)?))?;
         let reservation = memory.reserve(bound)?;
         Ok(Self { schema: logical_schema(schema)?, _reservation: reservation })
+    }
+    pub fn parameters(count: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        u32::try_from(count.saturating_sub(1))
+            .map_err(|_| Anomaly::incorrect("rtdb.node/preparation-size", "Prepared statement retained size exceeds usize"))?;
+        let unknown = LogicalType::Null;
+        let field_bytes = super::mul(unknown.retained_bytes()?, 16)?;
+        let reservation = memory.reserve(super::add(4096, super::mul(count, field_bytes)?)?)?;
+        let fields = (0..count).map(|_| to_field("", &unknown)).collect::<Result<Vec<_>>>()?;
+        Ok(Self { schema: Schema::new(fields), _reservation: reservation })
     }
     pub fn empty(memory: &Arc<MemoryBudget>) -> Result<Self> { Self::logical(&Default::default(), memory) }
 }

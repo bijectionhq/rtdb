@@ -7,7 +7,7 @@ use rtdb_plan::ControlStatement;
 use rtdb_query::QueryCursor;
 use rtdb_sql::{AdmittedControl, parse_admitted_control_in};
 use rtdb_tx::{Documents, SqlArguments, TxOp};
-use rtdb_types::{Anomaly, Result, TableRef, Value};
+use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
 use crate::{arrow::ImportedRows, region::EmbeddedRegion};
 
@@ -121,11 +121,17 @@ impl StatementHandle {
             match &state.source {
                 Source::Sql { prepared, .. } => {
                     let prepared = prepared.as_ref().ok_or_else(not_prepared)?;
-                    if parameters { return crate::arrow::OwnedSchema::logical(&prepared.parameter_schema()?, self.session.region.memory()); }
+                    if parameters { return crate::arrow::OwnedSchema::parameters(prepared.parameter_count(), self.session.region.memory()); }
                     if prepared.is_dml() { return crate::arrow::OwnedSchema::empty(self.session.region.memory()); }
                     let context = session.prepare_context_for(&self.creation_database, token).await?;
-                    let types = vec![rtdb_types::LogicalType::Null; prepared.parameter_count()];
-                    crate::arrow::OwnedSchema::logical(prepared.result_schema(&context, &types)?.schema(), self.session.region.memory())
+                    let result = {
+                        context.check_cancelled()?;
+                        let count = prepared.parameter_count();
+                        let _parameter_types = context.memory.reserve(super::mul(count, std::mem::size_of::<LogicalType>())?)?;
+                        let types = vec![LogicalType::Null; count];
+                        prepared.result_schema(&context, &types)?
+                    };
+                    crate::arrow::OwnedSchema::logical(result.schema(), self.session.region.memory())
                 }
                 Source::Show { statement: control, prepared } => {
                     if !*prepared { return Err(not_prepared()); }

@@ -527,6 +527,96 @@ fn adbc_set_and_show_round_trip_after_the_caller_releases_the_sql() {
 }
 
 #[test]
+fn adbc_prepared_schemas_admit_positional_fields_and_unknown_binding_types() {
+    let mut native = Native::open_yaml(
+        b"server: null\nflightSql: null\nnodeId: ffi-schema-budget\nindexer: {enabled: false}\ncompactor: {threads: 0}\ngarbageCollector: {enabled: false}\n",
+    );
+    let operation = native.operation();
+    let statement = native.statement("SELECT COALESCE(?, CAST(42 AS BIGINT)) AS typed_value, ? AS unspecified_value");
+    let mut error = 0;
+    ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+
+    let session = handles::session(native.session).unwrap();
+    let memory = session.region.memory();
+    let baseline = native.memory_used();
+    let headroom = memory.limit_bytes() - baseline;
+    let type_bytes = 2 * std::mem::size_of::<rtdb_types::LogicalType>();
+    let parameter_bytes = 4096 + 16 * type_bytes;
+    let pressure = memory.reserve(headroom - parameter_bytes + 1).unwrap();
+    let mut parameters = FFI_ArrowSchema::empty();
+    let status = unsafe { rtdb_v1_statement_schema(statement, operation, 1, &mut parameters, &mut error) };
+    incorrect(status, error, "rtdb/memory-budget-exceeded");
+    assert!(parameters.release.is_none());
+    assert_eq!(memory.limit_bytes() - native.memory_used(), parameter_bytes - 1);
+    drop(pressure);
+
+    ok(unsafe { rtdb_v1_statement_schema(statement, operation, 1, &mut parameters, &mut error) }, error);
+    let fields = Schema::try_from(&parameters).unwrap();
+    assert_eq!(fields.fields().len(), 2);
+    for field in fields.fields() {
+        assert_eq!(field.name(), "");
+        assert_eq!(field.data_type(), &DataType::Null);
+        assert!(field.is_nullable());
+    }
+    assert_eq!(native.memory_used() - baseline, arrow::schema_bound(&fields).unwrap());
+    drop(parameters);
+    assert_eq!(native.memory_used(), baseline);
+
+    let token = handles::cancellation(operation, &session).unwrap();
+    let context = session.region.run(async {
+        let mut connection = session.state.lock();
+        connection.prepare_context_for("xtdb", &token).await
+    }).unwrap();
+    let context_bytes = native.memory_used() - baseline;
+    assert!(context_bytes > 0);
+    drop(context);
+    assert_eq!(native.memory_used(), baseline);
+
+    let pressure = memory.reserve(headroom - context_bytes - type_bytes + 1).unwrap();
+    let mut result = FFI_ArrowSchema::empty();
+    let status = unsafe { rtdb_v1_statement_schema(statement, operation, 0, &mut result, &mut error) };
+    let Handle::Error(diagnostic) = handles::get(error).unwrap() else { panic!("expected diagnostic") };
+    let request = format!("Cannot reserve {type_bytes} bytes from budget");
+    assert!(diagnostic.error.message.as_deref().is_some_and(|message| message.starts_with(&request)));
+    incorrect(status, error, "rtdb/memory-budget-exceeded");
+    assert!(result.release.is_none());
+    assert_eq!(memory.limit_bytes() - native.memory_used(), context_bytes + type_bytes - 1);
+    drop(pressure);
+
+    ok(unsafe { rtdb_v1_statement_schema(statement, operation, 0, &mut result, &mut error) }, error);
+    let fields = Schema::try_from(&result).unwrap();
+    assert_eq!(fields.fields().len(), 2);
+    assert_eq!(fields.field(0).name(), "typed_value");
+    assert_eq!(fields.field(0).data_type(), &DataType::Int64);
+    assert_eq!(fields.field(1).name(), "unspecified_value");
+    assert_eq!(fields.field(1).data_type(), &DataType::Null);
+    assert_eq!(native.memory_used() - baseline, arrow::schema_bound(&fields).unwrap());
+    drop(result);
+    assert_eq!(native.memory_used(), baseline);
+}
+
+#[test]
+fn adbc_prepared_dml_schema_returns_no_result_fields_without_a_read_context() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let statement = native.statement("INSERT INTO docs (_id) VALUES (?)");
+    let mut error = 0;
+    ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+    ok(unsafe { rtdb_v1_cancel(operation, &mut error) }, error);
+
+    let mut result = FFI_ArrowSchema::empty();
+    ok(unsafe { rtdb_v1_statement_schema(statement, operation, 0, &mut result, &mut error) }, error);
+    assert!(Schema::try_from(&result).unwrap().fields().is_empty());
+    let mut parameters = FFI_ArrowSchema::empty();
+    ok(unsafe { rtdb_v1_statement_schema(statement, operation, 1, &mut parameters, &mut error) }, error);
+    let schema = Schema::try_from(&parameters).unwrap();
+    assert_eq!(schema.fields().len(), 1);
+    assert_eq!(schema.field(0).name(), "");
+    assert_eq!(schema.field(0).data_type(), &DataType::Null);
+    assert!(schema.field(0).is_nullable());
+}
+
+#[test]
 fn adbc_statement_replacement_keeps_the_previous_lease_during_admission() {
     let mut native = Native::open_yaml(
         b"server: null\nflightSql: null\nnodeId: ffi-source-budget\nindexer: {enabled: false}\ncompactor: {threads: 0}\ngarbageCollector: {enabled: false}\n",
