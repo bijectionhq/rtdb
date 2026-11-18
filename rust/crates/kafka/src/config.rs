@@ -119,6 +119,14 @@ pub fn producer_properties(properties: &BTreeMap<String, String>, pipelined: boo
 
 pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
     let mut properties = properties.clone();
+    if let Some(wait) = properties.remove("fetch.max.wait.ms") {
+        let wait = signed_integer(&wait).and_then(|wait| i32::try_from(wait).ok()).filter(|wait| *wait >= 0)
+            .ok_or_else(|| Anomaly::incorrect("xtdb.kafka/invalid-config", "fetch.max.wait.ms must be a nonnegative signed integer"))?;
+        if properties.get("fetch.wait.max.ms").is_some_and(|native| signed_integer(native) != Some(i64::from(wait))) {
+            return Err(Anomaly::incorrect("xtdb.kafka/conflicting-config", "Java and native maximum fetch wait settings disagree"));
+        }
+        properties.insert("fetch.wait.max.ms".into(), wait.to_string());
+    }
     if let Some(jaas) = properties.remove("sasl.jaas.config") {
         let (module, mut options) = parse_jaas(&jaas)?;
         match module.as_str() {

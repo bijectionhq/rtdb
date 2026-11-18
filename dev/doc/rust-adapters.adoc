@@ -64,6 +64,7 @@ Kafka Connect source assignments also resolve provider placeholders on their `!K
 The assignment retains admitted expanded configuration through consumer destruction.
 Kafka log and Connect client construction admit cluster properties-file reads and merge storage before allocation.
 The cluster-level file uses Java Properties' ISO-8859-1 input profile.
+Java `fetch.max.wait.ms` is translated to the native client's `fetch.wait.max.ms` after provider resolution.
 
 Kafka `EnvVarConfigProvider` captures process environment entries when the provider is constructed and filters their names during configuration.
 The allowlist uses the native Java whole-region matcher, with Java's default dot behavior for `.*`.

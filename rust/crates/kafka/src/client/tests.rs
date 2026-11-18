@@ -16,6 +16,21 @@ fn ssl_options() -> BTreeMap<String, String> {
 }
 
 #[test]
+fn java_fetch_wait_is_translated_before_native_consumer_configuration() {
+    let memory = MemoryBudget::new(1 << 20);
+    let mut properties = BTreeMap::from([("fetch.max.wait.ms".into(), " +\u{661}\u{665}\u{660} ".into())]);
+    let prepared = prepare(&properties, &memory).unwrap();
+    assert_eq!(prepared.get("fetch.max.wait.ms"), None);
+    let native = prepared.create_native_config().unwrap();
+    assert_eq!(native.get("fetch.wait.max.ms").unwrap(), "150");
+    properties.insert("fetch.wait.max.ms".into(), "151".into());
+    assert_eq!(prepare(&properties, &memory).unwrap_err().code, "xtdb.kafka/conflicting-config");
+    properties.remove("fetch.wait.max.ms");
+    properties.insert("fetch.max.wait.ms".into(), "-1".into());
+    assert_eq!(prepare(&properties, &memory).unwrap_err().code, "xtdb.kafka/invalid-config");
+}
+
+#[test]
 fn java_tls_options_are_consumed_and_unknown_native_properties_are_preserved() {
     let memory = MemoryBudget::new(32 << 20);
     let mut options = ssl_options();
