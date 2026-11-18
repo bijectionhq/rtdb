@@ -30,6 +30,9 @@ mod generated_data_type;
 #[path = "generated_isolation.rs"]
 mod generated_isolation;
 
+#[path = "generated_window.rs"]
+mod generated_window;
+
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
@@ -125,6 +128,7 @@ pub(super) enum InvocationCause<'sql> {
 
 enum InvocationException<'parse, 'sql> {
     Owned(InvocationCause<'sql>),
+    CapturedMismatch { cause: InvocationCause<'sql>, context: InvocationKey<'parse> },
     Shared(InvocationKey<'parse>),
 }
 
@@ -167,10 +171,17 @@ struct PendingNoViableReport<'parse, 'sql> {
     mode: PredictionMode,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NextTokensCapture<'parse> { context: InvocationKey<'parse>, state: u32 }
+
+#[derive(Clone, Copy)]
+enum MismatchExpectation<Context> { Current(TokenSet), Captured(Context) }
+
 struct PendingInputMismatch<'parse, 'sql> {
     invocation: InvocationKey<'parse>,
+    match_state: ParserState,
     cause: InputMismatch<'sql>,
-    expected: TokenSet,
+    expectation: MismatchExpectation<NextTokensCapture<'parse>>,
 }
 
 enum BailRecovery { Clear, Entered }
@@ -208,7 +219,8 @@ impl ParserProfile {
 pub(super) struct ParserSession<'parse, 'sql, 'env, 'work> {
     environment: &'env mut ParserEnvironment, input: TokenStream<'sql, 'work>, records: Vec<InvocationRecord<'parse, 'sql>>,
     current: Option<InvocationKey<'parse>>, state: ParserState, precedence: Vec<PrecedenceFrame<'parse>>,
-    matched_eof: bool, control: ParserControl<'parse, 'sql>, syntax_errors: i32, profile: ParserProfile, work: &'work AllocationScope,
+    matched_eof: bool, control: ParserControl<'parse, 'sql>, syntax_errors: i32, profile: ParserProfile,
+    next_tokens_capture: Option<NextTokensCapture<'parse>>, work: &'work AllocationScope,
 }
 impl Drop for ParserSession<'_, '_, '_, '_> { fn drop(&mut self) { let _ = self.work; } }
 pub(super) fn with_parser_session<'sql, 'env, 'work, R>(
@@ -218,7 +230,7 @@ pub(super) fn with_parser_session<'sql, 'env, 'work, R>(
     let input = TokenStream::new(sql, work).map_err(PredictionError::Admission)?;
     let mut precedence = Vec::new();
     push(&mut precedence, PrecedenceFrame::Base0, work)?;
-    let mut session = ParserSession { environment, input, records: Vec::new(), current: None, state: ParserState::RootSentinel, precedence, matched_eof: false, control: ParserControl::Ready, syntax_errors: 0, profile: ParserProfile::Kernel, work };
+    let mut session = ParserSession { environment, input, records: Vec::new(), current: None, state: ParserState::RootSentinel, precedence, matched_eof: false, control: ParserControl::Ready, syntax_errors: 0, profile: ParserProfile::Kernel, next_tokens_capture: None, work };
     use_session(&mut session)
 }
 
@@ -545,17 +557,21 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
         result
     }
 
-    fn capture_input_mismatch(&mut self) -> RuntimeResult<'sql, (InvocationKey<'parse>, InputMismatch<'sql>)> {
+    fn capture_input_mismatch(&mut self, state: ParserState) -> RuntimeResult<'sql, (InvocationKey<'parse>, InputMismatch<'sql>)> {
         let current = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation));
         let invocation = self.finish(current)?;
-        let state = self.state;
         let offending = self.lookahead(1)?.expect("positive lookahead");
         Ok((invocation, InputMismatch { offending, state }))
     }
 
-    fn pend_input_mismatch<T>(&mut self, expected: TokenSet) -> RuntimeResult<'sql, T> {
-        let (invocation, cause) = self.capture_input_mismatch()?;
-        self.control = ParserControl::PendingInputMismatch(PendingInputMismatch { invocation, cause, expected });
+    fn pend_input_mismatch<T>(&mut self, expectation: MismatchExpectation<NextTokensCapture<'parse>>) -> RuntimeResult<'sql, T> {
+        let match_state = self.state;
+        let offending_state = match expectation {
+            MismatchExpectation::Current(_) => match_state,
+            MismatchExpectation::Captured(capture) => ParserState::State(capture.state),
+        };
+        let (invocation, cause) = self.capture_input_mismatch(offending_state)?;
+        self.control = ParserControl::PendingInputMismatch(PendingInputMismatch { invocation, match_state, cause, expectation });
         Err(RuntimeError::InputMismatch(cause))
     }
 
@@ -612,12 +628,12 @@ impl<'a, 'parse, 'sql> InvocationView<'a, 'parse, 'sql> {
     pub(super) fn exception(&self, invocation: InvocationKey<'parse>) -> Option<&InvocationCause<'sql>> {
         let exception = self.records.get(invocation.index)?.exception.as_ref()?;
         let owner = match exception {
-            InvocationException::Owned(cause) => return Some(cause),
+            InvocationException::Owned(cause) | InvocationException::CapturedMismatch { cause, .. } => return Some(cause),
             InvocationException::Shared(owner) => owner,
         };
         let exception = self.records.get(owner.index)?.exception.as_ref()?;
         match exception {
-            InvocationException::Owned(cause) => Some(cause),
+            InvocationException::Owned(cause) | InvocationException::CapturedMismatch { cause, .. } => Some(cause),
             InvocationException::Shared(_) => None,
         }
     }

@@ -2,7 +2,7 @@ use rtdb_types::AllocationScope;
 use crate::lexer::{IndexedLexeme, Kind};
 use crate::parser::grammar::TokenType;
 use super::{
-    BailRecovery, InvocationCause, InvocationException, InvocationKey, ParserControl, ParserEnvironment, ParserProfile, ParserSession,
+    BailRecovery, InvocationCause, InvocationException, InvocationKey, MismatchExpectation, ParserControl, ParserEnvironment, ParserProfile, ParserSession,
     PrecedenceFrame, RuntimeError, RuntimeProblem, RuntimeResult, with_parser_session,
 };
 use super::required_block_sync::TokenReport;
@@ -72,7 +72,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         self.finish(entered)?;
         let (matched, actual) = self.lookahead_token(1)?;
         if actual != expected {
-            let (current, cause) = self.capture_input_mismatch()?;
+            let (current, cause) = self.capture_input_mismatch(self.state)?;
             self.records[current.index].exception = Some(InvocationException::Owned(InvocationCause::InputMismatch(cause)));
             return self.cancel_bail(current, BailRecovery::Clear);
         }
@@ -109,11 +109,19 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             && self.profile == ParserProfile::LlDefault
             && local == report.invocation
             && self.current == Some(local)
-            && self.state == report.cause.state
+            && self.state == report.match_state
             && self.input.index() == Some(report.cause.offending.index())
         {
-            let (cause, expected) = (report.cause, report.expected);
-            self.records[local.index].exception = Some(InvocationException::Owned(InvocationCause::InputMismatch(cause)));
+            let cause = report.cause;
+            let owned = InvocationCause::InputMismatch(cause);
+            let (exception, expected) = match report.expectation {
+                MismatchExpectation::Current(expected) => (InvocationException::Owned(owned), MismatchExpectation::Current(expected)),
+                MismatchExpectation::Captured(capture) => (
+                    InvocationException::CapturedMismatch { cause: owned, context: capture.context },
+                    MismatchExpectation::Captured(local),
+                ),
+            };
+            self.records[local.index].exception = Some(exception);
             self.control = ParserControl::InErrorRecovery;
             return self.report_token_syntax(TokenReport::Mismatch(cause), expected).map_err(PassError::from);
         }
@@ -153,6 +161,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         self.precedence.clear();
         self.precedence.push(PrecedenceFrame::Base0);
         self.profile = ParserProfile::LlDefault;
+        self.next_tokens_capture = None;
         self.control = ParserControl::Ready;
         Ok(())
     }

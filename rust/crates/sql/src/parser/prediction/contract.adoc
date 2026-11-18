@@ -2,7 +2,7 @@
 
 This private parser component implements adaptive SLL and LL prediction from ANTLR 4.13.2 over real SQL tokens, ordered configurations and retained DFA storage.
 `UPSTREAM.json` pins the primary sources, and link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
-Complete generated SQL rule recognition and production parser integration remain required beyond the bounded isolation and recursive DATE paths.
+Complete generated SQL rule recognition and production parser integration remain required beyond the bounded isolation, window and recursive DATE paths.
 
 == Owner and keys
 
@@ -600,7 +600,7 @@ A runtime fault during token demand propagates before any inline exception assig
 
 A real decision 371 can select the REPEATABLE alternative before demanding its following occurrence.
 Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
-Generated context and terminal attachment beyond the bounded isolation and recursive DATE paths, further expected-token capabilities and production adoption remain open.
+Generated context and terminal attachment beyond the bounded isolation, window and recursive DATE paths, further expected-token capabilities and production adoption remain open.
 
 == Required isolation block synchronization
 
@@ -626,7 +626,7 @@ Both report messages quote the raw token spelling or `<EOF>` and use the pinned 
 Recovery starts before parser message admission.
 Notification increments the syntax error count after the parser message is complete and before the listener admits its retained diagnostic.
 The report leaves the cursor at the offending token and can be followed by the caller's existing finally operations.
-Nullable decisions, loop synchronization and full generated rule adoption remain required.
+Additional nullable decisions, loop synchronization and full generated rule adoption remain required.
 
 == Inline match recovery in the isolation rules
 
@@ -649,7 +649,8 @@ The required sync sites have no epsilon and an accepted sync clears the source's
 These inline paths therefore use the ordinary constructor.
 The existing generated catch assigns the cause to the local record and reports it through the admitted listener path.
 The source error and finally ordering remains the same for native input and allocation failures.
-Nullable sync context capture, additional match sites and full generated rule adoption remain required.
+The bounded window path below adopts nullable sync context capture.
+Additional sync shapes, match sites and full generated rule adoption remain required.
 
 == Generated isolation contexts and retry
 
@@ -737,6 +738,41 @@ After a denied four-slot append to the ArrayType, the actual cardinality is the 
 The surrounding field can still admit a two-slot vector and attach that record while ordinary execution remains sealed.
 If that append is denied too, the later finally failure escapes and the field's own already-entered finally still executes.
 Parse-tree listeners remain absent in this wrapper profile.
+
+== Nullable window synchronization and captured inline mismatch
+
+The private two-profile `windowSpecification` root uses its generated parentheses matches at 2218 and 2220 and the actual `windowSpecificationDetails` call at 2219.
+Both rules enter their unlabelled primary contexts before their try and use actual-current exit in their finally.
+The unlabelled outer alternatives keep the same current records and the source's alternative-number setter has no effect.
+The four details optionals use source sync states 2223, 2226, 2229 and 2232, decisions 235 through 238.
+Each site has a separate generated `LA(1)` option guard after sync, including the identifier bitsets in the first guard.
+The supported details path skips all four optionals.
+A selected optional branch sets its actual call state and returns a private unsupported site result before entering the unadopted rule.
+
+The parser session is a passive transient with one writer and a branded primary context region.
+Its Default strategy state contains an optional pair of the actual context key and ATN state.
+A reached sync whose within-rule set accepts `LA(1)` clears this pair, including the existing required-block path.
+When the set misses and contains epsilon, the first nullable sync saves the pair and later nullable misses preserve it.
+The ordinary match and normal rule exit preserve the pair.
+The wrapper installs a fresh Default strategy after SLL Bail and reset, with an absent pair.
+
+On `(: :)`, SLL reaches inline Bail at 2220 after exiting the details rule and leaves the second colon undemanded.
+In LL the first optional records the details context at 2223.
+Its next three syncs preserve that record, and the details finally returns to the window at the first colon.
+Inline recovery then reads the second colon and tests the current match's deletion set of `RPAREN`.
+Its next `LA(1)` and contextual LOOK from successor 2221 use the live root and find EOF as the insertion set.
+The alternate constructor keeps the captured details context and state 2223, then reads the actual first colon as the offending token.
+
+The passive pending error binds the generated catch to its live owner, match state 2220 and offending cursor.
+The window catch assigns the single branded exception on its own primary record and begins recovery.
+The handler uses that assigned exception's state and details context for its fallible expected-token lookup, after planning the offending token display and before any notification.
+The details parent link supplies invoking transition 2219 and follow 2220, expanding the expected set to 119 token types.
+The throwing listener receives the first colon and the original numeric cause state.
+The outward diagnostic borrows the original SQL token and owns its diagnostic fields.
+The throwing listener interrupts recovery.
+The window finally records the opening parenthesis as the stop.
+Deletion and insertion reports keep their null causes and leave before consumption or synthesis.
+Additional generated window branches and production parser entry adoption remain required.
 
 == Finishing-alternative selection
 

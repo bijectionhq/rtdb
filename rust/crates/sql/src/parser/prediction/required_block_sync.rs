@@ -3,7 +3,8 @@ use crate::lexer::{IndexedLexeme, Kind};
 use crate::parser::grammar::{ExpectedSymbol, StateKindView, TokenSet};
 use super::no_viable_report::{ListenerDiagnostic, listener_diagnostic, message_buffer, message_size, quoted_len, write_quoted};
 use super::{
-    InputMismatch, ParserControl, ParserProfile, ParserSession, ParserState,
+    InputMismatch, InvocationCause, InvocationException, InvocationKey, InvocationView, MismatchExpectation,
+    ParserControl, ParserProfile, ParserSession, ParserState,
     RuntimeError, RuntimeProblem, RuntimeResult,
 };
 use super::super::PredictionError;
@@ -79,6 +80,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         })();
         let expected = self.finish(next)?;
         if expected.contains(ExpectedSymbol::Token(first)) {
+            self.next_tokens_capture = None;
             return Ok(());
         }
 
@@ -87,16 +89,16 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             return self.report_unwanted_token(expected);
         }
 
-        self.pend_input_mismatch(expected)
+        self.pend_input_mismatch(MismatchExpectation::Current(expected))
     }
 
     pub(super) fn report_unwanted_token<T>(&mut self, expected: TokenSet) -> RuntimeResult<'sql, T> {
         self.control = ParserControl::InErrorRecovery;
         let offending = self.input.lt(1)?.expect("positive lookahead");
-        self.report_token_syntax(TokenReport::Unwanted(offending), expected)
+        self.report_token_syntax(TokenReport::Unwanted(offending), MismatchExpectation::Current(expected))
     }
 
-    pub(super) fn report_token_syntax<T>(&mut self, report: TokenReport<'sql>, expected: TokenSet) -> RuntimeResult<'sql, T> {
+    pub(super) fn report_token_syntax<T>(&mut self, report: TokenReport<'sql>, expectation: MismatchExpectation<InvocationKey<'parse>>) -> RuntimeResult<'sql, T> {
         let prefix = match &report {
             TokenReport::Unwanted(_) => "extraneous input ",
             TokenReport::Missing(_) => "missing ",
@@ -109,10 +111,25 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         let spelling = if token.kind() == Kind::Eof { "<EOF>" } else { token.raw() };
         let message = {
             let grammar = self.environment.storage.grammar_view();
-            let (first, second) = if missing {
-                (expected.display_len(&grammar)?, quoted_len(spelling)?)
-            } else {
-                (quoted_len(spelling)?, expected.display_len(&grammar)?)
+            let quoted_before_expected = if missing { None } else { Some(quoted_len(spelling)?) };
+            let expected = match expectation {
+                MismatchExpectation::Current(expected) => expected,
+                MismatchExpectation::Captured(owner) => {
+                    let exception = self.record(owner)?.exception.as_ref();
+                    let Some(InvocationException::CapturedMismatch { cause: InvocationCause::InputMismatch(cause), context }) = exception else {
+                        return Err(RuntimeError::Control(RuntimeProblem::Invocation));
+                    };
+                    let ParserState::State(state) = cause.state else {
+                        return Err(RuntimeError::Control(RuntimeProblem::PredictionSite));
+                    };
+                    let invocation = InvocationView { records: &self.records, current: Some(*context) };
+                    grammar.state(state)?.expected_tokens(invocation.invocations(&grammar), self.work)?
+                }
+            };
+            let expected_len = expected.display_len(&grammar)?;
+            let (first, second) = match quoted_before_expected {
+                None => (expected_len, quoted_len(spelling)?),
+                Some(quoted) => (quoted, expected_len),
             };
             let capacity = message_size([prefix.len(), first, separator.len(), second])?;
             self.work.reserve(capacity).map_err(PredictionError::Admission)?;
