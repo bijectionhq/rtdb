@@ -32,18 +32,28 @@ fn both_profiles<'sql>(
     environment: &mut ParserEnvironment, source: &'sql str, work: &AllocationScope,
     mut check: impl for<'parse, 'env, 'work> FnMut(&ParserSession<'parse, 'sql, 'env, 'work>, InvocationKey<'parse>),
 ) {
-    with_bail_fallback(environment, source, work, |session, mode| {
-        assert_eq!(mode, PredictionMode::Sll);
-        let root = session.numeric_expression()?;
-        check(session, root);
-        Ok(())
-    }).unwrap();
-    with_parser_session(environment, source, work, |session| {
-        session.profile = ParserProfile::LlDefault;
-        let root = session.numeric_expression().unwrap();
-        check(session, root);
-        Ok(())
-    }).unwrap();
+    let memory = work.memory_budget();
+    let retained = memory.used_bytes();
+    {
+        let parse_work = AllocationScope::new(memory).unwrap();
+        with_bail_fallback(environment, source, &parse_work, |session, mode| {
+            assert_eq!(mode, PredictionMode::Sll);
+            let root = session.numeric_expression()?;
+            check(session, root);
+            Ok(())
+        }).unwrap();
+    }
+    assert_eq!(memory.used_bytes(), retained);
+    {
+        let parse_work = AllocationScope::new(memory).unwrap();
+        with_parser_session(environment, source, &parse_work, |session| {
+            session.profile = ParserProfile::LlDefault;
+            let root = session.numeric_expression().unwrap();
+            check(session, root);
+            Ok(())
+        }).unwrap();
+    }
+    assert_eq!(memory.used_bytes(), retained);
 }
 
 fn child_rule<'parse>(children: &[ContextChild<'parse, '_>]) -> InvocationKey<'parse> {
@@ -228,6 +238,11 @@ fn generated_expr_error_retry_distinguishes_ll_deletion_mismatch_and_lexer_deman
                 passes.push(mode);
                 let tree = session.invocation_view();
                 let context = tree.context(root).unwrap();
+                let invoking = match mode {
+                    PredictionMode::Sll => ParserState::RootSentinel,
+                    PredictionMode::Ll => ParserState::State(1001),
+                };
+                assert_eq!(context.invoking_state(), invoking);
                 assert!(context.class().is_none());
                 assert_eq!(context.start().unwrap().index(), 0);
                 assert!(context.stop().is_none());

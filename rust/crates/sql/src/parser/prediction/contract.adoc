@@ -846,6 +846,8 @@ The private numeric action enters generated `expr(0)` using the source `parseExp
 Its root completes through the source precedence loop and finishes with `LT(-1)`.
 A semicolon may remain current after the completed expression.
 The expression root preserves the recognizer state set by its last generated action and leaves the EOF match flag clear.
+The LL retry enters the expression root with an empty context and base precedence, carrying the recognizer state left by the SLL attempt as its invoking state.
+The reached generated action sets the current recognizer state for reporting.
 D89 selects the common-value branch using the retained predictor, including the required lookahead when BETWEEN competes with that branch.
 
 The reached common-value, literal and integer rules retain their primary labelled contexts and indexed raw tokens.
