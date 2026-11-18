@@ -50,6 +50,16 @@ impl ParsedPair {
     }
     pub(in crate::connect::avro) fn parse_with_logical(text: &str, references: &[String], options: &BTreeMap<String, String>, policy: SourcePolicy, logical: &mut dyn LogicalEnvironment, context: &mut ConversionContext) -> Result<Self> {
         let canonical = super::parse_with_logical(text, references, policy, logical, context)?;
+        Self::assemble(canonical, text, references, options, context)
+    }
+    pub(in crate::connect::avro) fn parse_java_text(text: JavaText<'_>, references: &[JavaText<'_>], options: &BTreeMap<String, String>, policy: SourcePolicy, context: &mut ConversionContext) -> Result<Self> {
+        Self::parse_java_text_with_logical(text, references, options, policy, &mut logical::Unregistered, context)
+    }
+    pub(in crate::connect::avro) fn parse_java_text_with_logical(text: JavaText<'_>, references: &[JavaText<'_>], options: &BTreeMap<String, String>, policy: SourcePolicy, logical: &mut dyn LogicalEnvironment, context: &mut ConversionContext) -> Result<Self> {
+        let super::java_text::ParsedInput { canonical, inputs } = super::java_text::parse(text, references, policy, logical, context)?;
+        Self::assemble(canonical, inputs.root(), inputs.references(), options, context)
+    }
+    fn assemble(canonical: CanonicalSource, text: &str, references: &[String], options: &BTreeMap<String, String>, context: &mut ConversionContext) -> Result<Self> {
         let (datum, charge) = admit_native(canonical.native.bound()?, context, || {
             AvroDatumPlan::parse_with_name_policy(text, references, options, Some(&NativePolicy))
                 .map_err(|cause| Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-avro-native-profile", cause.to_string()))

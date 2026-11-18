@@ -69,6 +69,7 @@ link:NATIVE-ADMISSION.adoc[] records the counted native copy/ownership bound.
 == Current input and activation profile
 
 The current decoder accepts a declared bounded standard JSON UTF8 scalar-text profile.
+link:JAVA-TEXT.adoc[] records the additive borrowed JavaText canonical/datum entry and its admitted lossless native projection within that same profile.
 A document has at most 256 KiB, a decoded text/name at most 50000 UTF16 units and a numeric token at most 1000 bytes including punctuation.
 Exceeding those native profile caps reports unsupported-avro-input-profile; they are not presented as exact Jackson constraint errors or its full accepted domain.
 The native demand-depth limit 128 also remains an explicit partial resource boundary.

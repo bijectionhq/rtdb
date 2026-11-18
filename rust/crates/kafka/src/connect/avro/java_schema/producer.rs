@@ -3,6 +3,7 @@ use super::*;
 mod input;
 mod native_bound;
 mod pair;
+mod java_text;
 use native_bound::NativeFootprint;
 pub(in crate::connect::avro) use pair::{AdmittedSource, ParsedPair, PairSelection};
 

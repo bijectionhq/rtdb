@@ -1,0 +1,5 @@
+eb45c1650db37862bf6b663663cf00f5632e4a5dc72f39382fb2b92acfefd08c  avro-1.11.4/org/apache/avro/Schema.java
+14943374b68207aff9e9e8c84d5d97fdf2e6ba9909cd12ee71e551fb5c9a5f81  confluent-7.8.0/io/confluent/kafka/schemaregistry/avro/AvroSchema.java
+e54d1344405fa1b4bf07448fbe2762a6074dfe5f5f6ddbff9ab81be5677c02e6  native-carriers/rust/crates/types/src/java_text.rs
+4bab4043ba47b40fec6a660f09b335708ff069e7fff63ece37cab9da77133639  native-carriers/rust/crates/types/src/java_text/iter.rs
+fde7c7e06cef62280ea48d6f2b9529b4716f8ce9b5745dfb6997bc661d414289  native-carriers/rust/crates/kafka/src/connect/avro/java_schema/text.rs

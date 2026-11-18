@@ -1,0 +1,38 @@
+{
+  "source_only": true,
+  "runtime_discovery": false,
+  "primary_source_count": 2,
+  "native_carrier_source_count": 3,
+  "avro": "1.11.4",
+  "confluent_avro_schema": "7.8.0",
+  "source_snapshot": "/tmp/rtdb-avro-java-text-input-sources",
+  "source_intervals": {
+    "Schema.java": [
+      "115-123",
+      "1445-1499"
+    ],
+    "AvroSchema.java": [
+      "110-122"
+    ]
+  },
+  "native_admission": {
+    "group_control": "16*(reference_count*sizeof(String)+(reference_count+1)*sizeof(Arc<MemoryReservation>))+4096",
+    "per_document_copy": "16*exact projected UTF8 bytes+256",
+    "control_drops_after_payload_and_vector_storage": true,
+    "no_later_document_text_scanned_by_control_admission": true
+  },
+  "input_profile": "Existing bounded standard JSON scalar text:256KiB/native UTF8 document,50000 decoded UTF16 units/text,1000 numeric token bytes,native depth128.",
+  "projection": "Exact Unicode scalar UTF16-to-UTF8; unmatched units rejected, with no question-mark or replacement projection.",
+  "input_lifetime": "Caller retains the charged stable source owners for synchronous assembly; only independently owned canonical/native payloads escape.",
+  "pairing": "Canonical assembly and native parsing use the exact same projections; actual reference/field/recursive identity validation is shared with the existing producer.",
+  "next_reader_boundary": "Reuse independently reviewed ReaderSymbols/InternAuthority with a separate Avro Schema.FACTORY root and String Reader adapter; no Registry factory state reuse or guessed symbol engine.",
+  "native_byte_measure": "NativeFootprint records projected UTF8 byte lengths, not UTF16 unit counts.",
+  "regression_function_count": 11,
+  "existing_assertions_preserved": true,
+  "remaining_integration": [
+    "complete source String Reader and unmatched-unit input",
+    "Registry nullable DTO branch activation with actual parser/profile owner",
+    "custom logical classes and typed graph/default/union/arbitrary-key conversion",
+    "source provenance through data/SMT/writer consumers"
+  ]
+}

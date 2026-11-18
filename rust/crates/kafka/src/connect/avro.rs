@@ -95,6 +95,18 @@ impl AvroDatumPlan {
         java_schema::ParsedPair::parse_with_logical(text, references, options, policy, logical, context)
             .map(java_schema::ParsedPair::into_datum)
     }
+    /// Borrows charged, stable source documents through same-input canonical/native assembly.
+    /// Uses the bounded scalar-only standard-JSON input profile; unmatched units require the source JavaText Reader path.
+    pub fn parse_admitted_java_text(
+        text: rtdb_types::java_text::JavaText<'_>,
+        references: &[rtdb_types::java_text::JavaText<'_>],
+        options: &BTreeMap<String, String>,
+        policy: SourcePolicy,
+        context: &mut ConversionContext,
+    ) -> Result<Self> {
+        java_schema::ParsedPair::parse_java_text(text, references, options, policy, context)
+            .map(java_schema::ParsedPair::into_datum)
+    }
     fn retain_source(&self, context: &mut ConversionContext) -> Result<()> {
         if let Some(source) = &self.source { source.retain(context)?; }
         Ok(())

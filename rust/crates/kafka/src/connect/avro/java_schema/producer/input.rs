@@ -2,11 +2,11 @@ use super::*;
 use serde_json::value::RawValue;
 use crate::connect::json_value::RawObject;
 use rtdb_types::jvm_number::{Error as NumberError, Number};
-const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
+pub(super) const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 const MAX_TEXT_UNITS: usize = 50_000;
 const MAX_NUMBER_BYTES: usize = 1000;
 
-fn profile_limit() -> Anomaly { Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-avro-input-profile", "Input exceeds the bounded standard-JSON schema document profile") }
+pub(super) fn profile_limit() -> Anomaly { Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-avro-input-profile", "Input exceeds the bounded standard-JSON schema document profile") }
 
 pub(super) fn parse(text: &str, context: &mut ConversionContext) -> Result<JsonNode> {
     if text.len() > MAX_DOCUMENT_BYTES { return Err(profile_limit()); }

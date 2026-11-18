@@ -1,0 +1,57 @@
+= Borrowed JavaText input ownership
+
+AvroDatumPlan::parse_admitted_java_text accepts a non-null borrowed JavaText root and ordered JavaText references.
+It constructs the actual canonical arena and native datum through the same-input ParsedPair owner.
+The caller keeps the original document owners alive and charged during this synchronous construction.
+Missing/null Registry schema text must take its source branch before this non-null input seam; it is not converted to empty text.
+
+== Projection, assembly and lifetime
+
+ProjectedInputs is a passive call-local owner of temporary native UTF8 root/reference text, captured payload reservations and a trailing control reservation.
+The checked control bound admits sixteen times the requested String/Arc vector slots plus4096 before allocating either vector.
+That operation uses only the reference count and scans no later document text.
+Per document, the adapter counts the exact UTF8 byte length of scalar UTF16, checks the existing256KiB native document cap, and admits sixteen times that byte length plus256 before String allocation.
+It combines valid supplementary pairs, preserves every resulting scalar and rejects unmatched units without a replacement character.
+The second traversal writes into the pre-reserved String capacity.
+Root/reference payloads drop before their captured leases; the control lease drops after both vector backings.
+
+Producer projects, decodes, measures and assembles each reference before demanding the next input's representation, then processes the root.
+An earlier undefined reference therefore fails before a later unmatched-unit document or root is projected.
+Control-count/resource admission can fail before document parsing; native allocation failure order is not a JVM OOME-equivalence claim.
+The native footprint receives the actual projected byte lengths rather than UTF16 unit counts.
+
+ParsedPair shares one native assembly/validation function between the established &str entry and this JavaText entry.
+The new entry supplies only the exact projections decoded to construct that canonical arena.
+It accepts no outside native/source graph and retains actual root/definition/field/recursive associations.
+ProjectedInputs remains alive through the native parse and pairing checks, then drops before the returned datum is published.
+The existing canonical arena and native completion charge retain the actual returned heap after the construction context drops.
+No projection String tree, input borrow or callback is retained in the cached datum.
+The existing source LogicalEnvironment stage and its distinct raw logicalType property are reused unchanged.
+
+== Current input and Reader boundary
+
+This additive seam retains the existing bounded standard-JSON scalar-text/native-depth profile.
+It does not install a new Jackson lexer, canonicalizer or factory state.
+Raw unmatched units require the actual JavaText Reader and report avro-java-text-reader-required.
+An escaped unmatched unit in JSON remains outside the established decoder's accepted text domain and is rejected there.
+Empty text reaches the existing JSON decoder and fails there rather than becoming an absent schema.
+
+Schema.java115–123 owns a distinct JsonFactory with ALLOW_COMMENTS enabled.
+Parser.parse(String) calls that factory, reads a tree, assembles Schema, checks released buffered dangling content, and closes its parser in finally.
+The current standard-JSON cursor does not reproduce that complete String Reader, comment, buffer/recycler, symbol-root or constraint/error-timing behavior.
+The following integration reuses the independently reviewed ReaderSymbols/InternAuthority capability with a distinct Avro factory/root, rather than borrowing Registry factory state or inventing a second canonicalizer.
+Registry DTO activation waits for that actual source Reader boundary and the coordinated parser/profile owner.
+
+== Source and regression scope
+
+link:java_text/sources.sha256[] pins two primary source files and three existing native carrier files.
+link:java_text/COPYRIGHT[] retains both full primary pre-package prefixes, and link:java_text/source-profile.json[] records the explicit projection and Reader boundaries.
+The complete canonical producer's link:sources.sha256[source manifest], link:COPYRIGHT[source notices] and link:NATIVE-ADMISSION.adoc[native copy bound] remain in force.
+The existing link:../../names/LICENSE-APACHE[Apache license] remains retained.
+
+Eleven additive source regression functions cover cross-backing scalar projection, unmatched and pair-split rejection, admission before copy, projection-owner leases, earlier-reference failure order, recursive root/reference pairing, byte counting and source relations, actual datum/decode retention, supplied logical environments and empty/escaped-unmatched decoder boundaries.
+All committed test bodies/assertions, including LogicalType and A09 observations, remain unchanged.
+No compiler, formatter, test, runtime or project helper was executed.
+
+This seam does not activate JavaNames or the Registry parser.
+Full String Reader input, custom logical class/value consumers, typed graph/default/union/arbitrary-key conversion, parameter encounter geometry and data/SMT/writer provenance remain coordinated integration work.

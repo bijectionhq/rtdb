@@ -45,7 +45,8 @@ ConnectData currently contains the existing public schema/value projection, with
 Future typed source-schema/default/data IDs must remain in the graph/value owner that still demands them; the datum owner alone does not establish that later export boundary.
 
 Exact JavaString Connect text carriers are available in the typed arena, and link:../logical/LOGICAL.adoc[] records source LogicalType construction in the admitted datum producer.
-Exact document input, remaining custom logical/profile consumers, canonical typed graph/default/cycle integration, generalized unions, arbitrary-key conversion and SMT/writer provenance remain required before full activation.
+link:JAVA-TEXT.adoc[] records the borrowed JavaText datum entry within the existing scalar-only decoder profile.
+The complete source String Reader, unmatched-unit input, remaining custom logical/profile consumers, canonical typed graph/default/cycle integration, generalized unions, arbitrary-key conversion and SMT/writer provenance remain required before full activation.
 Schema.parse's constructed LogicalType object and AvroData's raw case-insensitive logicalType property remain separate source values and consumer stages.
 The existing A09 assertion conflict and every prior fixture body remain unchanged.
 
