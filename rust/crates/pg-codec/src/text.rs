@@ -122,7 +122,15 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
             match tag.as_str() {
                 "u" => read_text(2950, string()?)?, "f" => decimal(string()?)?,
                 "r" => { let text = string()?; rtdb_types::UriParts::parse(text)?; Value::Uri(text.to_owned()) },
-                "m" => Value::Timestamp { value: string()?.parse::<i64>().map_err(invalid)?.checked_mul(1000).ok_or_else(|| invalid("Transit date overflow"))?, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) },
+                "m" => {
+                    let millis = match representation.as_ref() {
+                        T::Integer(millis) => *millis,
+                        T::String(millis) => millis.parse::<i64>().map_err(invalid)?,
+                        _ => return Err(invalid("Transit date requires epoch milliseconds")),
+                    };
+                    let micros = millis.checked_mul(1000).ok_or_else(|| invalid("Transit date overflow"))?;
+                    Value::Timestamp { value: micros, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }
+                }
                 "time/instant" => { let mut value = timestamp(string()?)?; if let Value::Timestamp { timezone, .. } = &mut value { *timezone = Some("UTC".into()); } value },
                 "time/zoned-date-time" => zoned_timestamp(string()?)?, "time/offset-date-time" => timestamp(string()?)?,
                 "time/date-time" => read_text(1114, string()?)?, "time/date" => read_text(1082, string()?)?, "time/time" => read_text(1083, string()?)?, "time/duration" => read_text(11112, string()?)?,

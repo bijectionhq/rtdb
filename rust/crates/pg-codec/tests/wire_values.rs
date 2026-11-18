@@ -133,6 +133,23 @@ fn timestamp_binary_writers_keep_local_truncation_and_zoned_flooring() {
 }
 
 #[test]
+fn transit_legacy_dates_accept_epoch_milliseconds_in_json_and_messagepack() {
+    use rtdb_format::transit::{TransitValue as T, decode_json, decode_msgpack, encode_msgpack};
+    use rtdb_pg_codec::from_transit;
+
+    let tagged = |representation| T::Tagged { tag: "m".into(), representation: Box::new(representation) };
+    let value = Value::Timestamp { value: -1000, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    let msgpack = encode_msgpack(&tagged(T::Integer(-1))).unwrap();
+    assert_eq!(from_transit(decode_msgpack(&msgpack).unwrap()).unwrap(), value);
+    assert_eq!(from_transit(decode_json(br#"["~#'","~m-1"]"#).unwrap()).unwrap(), value);
+
+    for representation in [T::Bool(false), T::Integer(i64::MAX), T::String("not milliseconds".into())] {
+        let error = from_transit(tagged(representation)).unwrap_err();
+        assert_eq!(error.code, "xtdb.postgres/invalid-column-value");
+    }
+}
+
+#[test]
 fn millisecond_date_text_uses_truncated_epoch_days_in_each_output_family() {
     for (millis, expected) in [(-86_400_001, "1969-12-31"), (-86_399_999, "1970-01-01"), (-1, "1970-01-01"), (0, "1970-01-01"), (86_399_999, "1970-01-01"), (86_400_001, "1970-01-02")] {
         let value = Value::DateMilli(millis);

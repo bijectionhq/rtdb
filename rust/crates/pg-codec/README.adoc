@@ -34,6 +34,7 @@ The Transit interval reader returns null when its outer lexical grammar does not
 JSON output preserves integer and decimal digits.
 Untagged fractional JSON input opens as double precision, while JSON-LD decimal tags retain exact decimal input.
 JSON-LD and Transit use the pinned scalar and container representations.
+Transit legacy dates accept signed epoch milliseconds and convert them to UTC timestamps for storage and query arguments.
 
 Several pinned encoders differ from PostgreSQL's usual binary representations.
 Interval and timestamp-range output remain textual in both formats, and OID/regclass/regproc output remains unsigned decimal ASCII in both formats.

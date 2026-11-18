@@ -44,6 +44,16 @@
     (protocols/-execute-tx node [{:op :sql, :sql "INSERT INTO docs (_id) VALUES (3)", :arg-rows []}] {})
     (is (= [{:xt/id 1} {:xt/id 2}] (xt/q node "SELECT _id FROM docs ORDER BY _id")))))
 
+(deftest transit-java-dates-work-as-documents-and-sql-arguments
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (let [date #inst "1969-12-31T23:59:59.999Z"]
+      (xt/execute-tx node [[:put-docs :docs {:xt/id 1, :v date}]
+                           [:sql "INSERT INTO docs RECORDS {_id: 2, v: ?}" [date]]])
+      (is (= [{:xt/id 1, :v #xt/zdt "1969-12-31T23:59:59.999Z[UTC]"}
+              {:xt/id 2, :v #xt/zdt "1969-12-31T23:59:59.999Z[UTC]"}]
+             (xt/q node ["SELECT _id, v FROM docs WHERE v = ? ORDER BY _id" date]))))))
+
 (defn- with-native-node [f]
   (let [[log-type {:keys [instant-src]}] (:log tu/*node-opts*)]
     (with-open [node (case log-type
