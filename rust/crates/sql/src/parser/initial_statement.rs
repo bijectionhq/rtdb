@@ -4,6 +4,9 @@ use super::prediction::{CapturedClassPolicy, InitialStatementDiagnostic, ParserE
 
 const LEGACY_STATEMENT: &str = "sql parser error: Expected: an SQL statement, found: ";
 
+#[derive(Clone, Copy)]
+pub(super) enum InitialRoot { Direct, Batch }
+
 /// Looks up a Direct diagnostic for a vendor SQL parser error from this same source.
 /// The first token must be an unquoted ASCII identifier absent from both keyword vocabularies.
 /// Returns a retained unwanted-token or statement-head mismatch diagnostic when its offending byte range matches.
@@ -11,6 +14,20 @@ const LEGACY_STATEMENT: &str = "sql parser error: Expected: an SQL statement, fo
 /// Admission failures after eligibility are returned to the caller.
 pub fn initial_statement_diagnostic(
     source: &str, error: &Anomaly, memory: &Arc<MemoryBudget>,
+) -> Result<Option<InitialStatementDiagnostic>> {
+    project_initial(source, error, memory, InitialRoot::Direct)
+}
+
+/// Uses the multi-statement grammar for an initial error from the same complete input batch.
+/// Eligibility, admission and listener ownership follow `initial_statement_diagnostic`.
+pub fn initial_batch_diagnostic(
+    source: &str, error: &Anomaly, memory: &Arc<MemoryBudget>,
+) -> Result<Option<InitialStatementDiagnostic>> {
+    project_initial(source, error, memory, InitialRoot::Batch)
+}
+
+fn project_initial(
+    source: &str, error: &Anomaly, memory: &Arc<MemoryBudget>, root: InitialRoot,
 ) -> Result<Option<InitialStatementDiagnostic>> {
     let Some(span) = legacy_statement_span(source, error) else { return Ok(None); };
     if !crate::lexer::is_first_identifier(source, &span, memory) { return Ok(None); }
@@ -22,7 +39,7 @@ pub fn initial_statement_diagnostic(
         Err(_) => return Ok(None),
     };
     let work = AllocationScope::new(memory)?;
-    parser.initial_statement_diagnostic(source, &span, &work)
+    parser.initial_statement_diagnostic(source, &span, root, &work)
 }
 
 fn legacy_statement_span(source: &str, error: &Anomaly) -> Option<Range<usize>> {

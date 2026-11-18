@@ -7,6 +7,7 @@ use super::{
     ParserState, PredictionError, RuntimeError, RuntimeProblem, RuntimeResult, with_bail_fallback,
 };
 use super::no_viable_report::ListenerDiagnostic;
+use crate::parser::initial_statement::InitialRoot;
 
 /// An initial statement syntax report holding its listener allocation until drop.
 #[derive(Debug)]
@@ -131,10 +132,13 @@ impl DirectControlError {
 
 impl ParserEnvironment {
     pub(in crate::parser) fn initial_statement_diagnostic(
-        &mut self, source: &str, span: &Range<usize>, work: &AllocationScope,
+        &mut self, source: &str, span: &Range<usize>, root: InitialRoot, work: &AllocationScope,
     ) -> rtdb_types::Result<Option<InitialStatementDiagnostic>> {
         let result = with_bail_fallback(self, source, work, |session, _| {
-            session.direct_sql_statement()?;
+            match root {
+                InitialRoot::Direct => session.direct_sql_statement()?,
+                InitialRoot::Batch => session.multi_sql_statement()?,
+            };
             Ok(())
         });
         match result {

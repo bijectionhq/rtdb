@@ -978,6 +978,29 @@ fn prepare_error_detail(frame: &(u8, Vec<u8>)) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn simple_query_reports_initial_mismatch_and_unwanted_token_with_the_received_sql() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for (sql, message) in [
+        ("SELEC 1", "line 1:0 mismatched input 'SELEC'"),
+        ("  -- comment\n extra SELECT 1 ;", "line 2:1 extraneous input 'extra'"),
+    ] {
+        let frames = client.query(sql).await;
+        assert_eq!(tags(&frames), b"EZ");
+        assert_eq!(frames[1].1, b"I");
+        assert!(frames[0].1.split(|&byte| byte == 0).any(|field| field == b"C08P01"));
+        let detail = prepare_error_detail(&frames[0]);
+        assert_eq!(detail["code"], "xtdb/sql-error");
+        assert_eq!(detail["data"], serde_json::json!({"sql": sql}));
+        let prefix = format!("Errors parsing SQL statement:\n  - {message} expecting ");
+        assert!(detail["message"].as_str().unwrap().starts_with(&prefix));
+    }
+    assert_eq!(rows(&client.query("SELECT 42::bigint AS answer").await), [vec![Some(b"42".to_vec())]]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn extended_control_errors_preserve_coordinates_and_the_registered_statement() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

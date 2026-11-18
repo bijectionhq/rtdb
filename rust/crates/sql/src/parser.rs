@@ -2,7 +2,7 @@ mod grammar;
 mod initial_statement;
 mod prediction;
 
-pub use initial_statement::initial_statement_diagnostic;
+pub use initial_statement::{initial_batch_diagnostic, initial_statement_diagnostic};
 pub use prediction::InitialStatementDiagnostic;
 
 pub(crate) fn is_unquoted_identifier(text: &str) -> bool {

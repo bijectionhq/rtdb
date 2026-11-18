@@ -73,6 +73,7 @@ external entity SqlParser {
     -- Ordinary SQL in a Simple Query message has its full grammar checked before a statement can affect the session.
     -- Native pgwire reports lexical errors in that message before grammar errors.
     -- Grammar validation reports the first invalid statement in source order.
+    -- An initial Simple Query statement error distinguishes a mismatch from an unwanted token and carries the received SQL in its structured detail.
     -- Each parsed statement resolves its operands when the connection reaches it.
     -- Native Extended Parse lexes the full input before classifying the statement.
     -- If classification cannot reserve memory, existing prepared statements remain registered.

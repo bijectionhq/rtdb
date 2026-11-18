@@ -362,6 +362,7 @@ impl ProtocolSession {
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
+        let received = source;
         let normalized = normalized_simple_text(source);
         let keyword = keyword_prefix(normalized);
         let marker = simple_query_marker(normalized)
@@ -396,10 +397,23 @@ impl ProtocolSession {
             let allocation = memory.reserve(normalized.0.len() + normalized.1.len())?;
             (Cow::Owned([normalized.0, normalized.1].concat()), Some(allocation))
         };
-        let mut batch = if keyword == KeywordPrefix::LocaleDependent {
-            rtdb_sql::parse_statement_batch_with_frontend_response(&source, &memory, legacy_keyword_probe)?
+        let batch = if keyword == KeywordPrefix::LocaleDependent {
+            rtdb_sql::parse_statement_batch_with_frontend_response(&source, &memory, legacy_keyword_probe)
         } else {
-            rtdb_sql::parse_statement_batch(&source, &memory)?
+            rtdb_sql::parse_statement_batch(&source, &memory)
+        };
+        let mut batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                let Some(diagnostic) = rtdb_sql::initial_batch_diagnostic(&source, &error, &memory)? else { return Err(error); };
+                let listener = diagnostic.anomaly();
+                let bytes = received.len().checked_add(listener.code.len())
+                    .and_then(|bytes| bytes.checked_add(listener.message.as_ref().map_or(0, String::len)))
+                    .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| protocol("SQL error detail too large"))?;
+                let _detail = memory.reserve(bytes)?;
+                let error = listener.clone().with_context("sql", received.into());
+                return writer.error(&error, self.environment()?.fallback(), false).await;
+            }
         };
         while let Some(statement) = batch.next_for_execution() {
             let start_transaction = match &statement {
