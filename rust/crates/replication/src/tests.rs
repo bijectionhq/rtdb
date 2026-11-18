@@ -375,3 +375,129 @@ async fn losing_same_term_claim_never_promotes_after_durability() {
     fixture.driver.claim_finished(Ok(ReplicaMetadata { position: rtdb_types::ReplicaPosition(1), timestamp: Timestamp(1) })).await.unwrap();
     assert!(fixture.driver.leader.is_none());
 }
+
+struct CommitExternal;
+#[async_trait]
+impl rtdb_tx::TransactionWriter for CommitExternal {
+    async fn write(&mut self, _: &mut rtdb_tx::OpenTransaction<'_>) -> Result<rtdb_tx::WriterResult> {
+        Ok(rtdb_tx::WriterResult::Committed { user_metadata: None })
+    }
+}
+
+async fn queue_external_write(fixture: &mut Fixture, token: &[u8]) -> (ExternalReceipt, TransactionKey) {
+    let receipt = fixture.handle.term().unwrap()
+        .submit_external(Box::new(CommitExternal), Some(Timestamp(100)), Some(token.to_vec()))
+        .await.unwrap();
+    let command = fixture.driver.commands.try_recv().unwrap();
+    fixture.driver.command(command).await.unwrap();
+    let resolution = &mut fixture.driver.leader.as_mut().unwrap().resolution;
+    let (resolver, result) = super::pending_resolution(resolution).await;
+    let key = result.as_ref().unwrap().result().tx_key();
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    (receipt, key)
+}
+
+async fn queued_external_readback() -> (Fixture, [ExternalReceipt; 2], LogRecord, TransactionKey) {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, external_source: true, ..Default::default() }, 1 << 27).await;
+    fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
+    fixture.driver.promote().await.unwrap();
+    let (mut first, key) = queue_external_write(&mut fixture, b"first").await;
+    let (mut sibling, sibling_key) = queue_external_write(&mut fixture, b"sibling").await;
+    let mut tail = fixture.logs.replica_tail(fixture.driver.read_position).await.unwrap();
+    let readback = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut first = None;
+        loop {
+            for raw in tail.poll(Duration::from_secs(5)).await.unwrap() {
+                let record = fixture.logs.decode_replica(raw.clone()).unwrap().unwrap();
+                match &record.envelope.message {
+                    ReplicaBody::ResolvedTx(message) => {
+                        if let Some(readback) = first.take() {
+                            assert_eq!(message.tx_id, Some(sibling_key.tx_id.0));
+                            return readback;
+                        }
+                        assert_eq!(message.tx_id, Some(key.tx_id.0));
+                        first = Some(raw);
+                    }
+                    ReplicaBody::NoOp(message) if message.src_msg_id.is_none() => {
+                        if first.is_none() {
+                            fixture.driver.consume(raw).await.unwrap();
+                        }
+                    }
+                    _ => panic!("unexpected record in external transaction readback"),
+                }
+            }
+        }
+    }).await.unwrap();
+    use tokio::sync::oneshot::error::TryRecvError::Empty;
+    assert!(matches!(first.receiver.try_recv(), Err(Empty)));
+    assert!(matches!(sibling.receiver.try_recv(), Err(Empty)));
+    (fixture, [first, sibling], readback, key)
+}
+
+async fn assert_external_readback_fault(
+    fixture: &mut Fixture,
+    [first, sibling]: [ExternalReceipt; 2],
+    readback: LogRecord,
+    expected: Anomaly,
+) {
+    let driver_result = fixture.driver.consume(readback).await;
+    let first = first.applied();
+    let sibling = sibling.applied();
+    tokio::pin!(first, sibling);
+    let first_result = futures::poll!(&mut first);
+    let sibling_result = futures::poll!(&mut sibling);
+
+    tokio::time::timeout(Duration::from_secs(5), fixture.driver.demote()).await.unwrap().unwrap();
+
+    assert_eq!(driver_result.unwrap_err(), expected);
+    let std::task::Poll::Ready(Err(receipt_error)) = first_result else {
+        panic!("the popped transaction receipt did not fail before demotion");
+    };
+    assert_eq!(receipt_error, expected);
+    assert!(sibling_result.is_pending());
+    let sibling_error = tokio::time::timeout(Duration::from_secs(5), sibling).await.unwrap().unwrap_err();
+    assert_eq!(sibling_error, super::term_ended());
+}
+
+#[tokio::test]
+async fn own_external_partition_apply_fault_reaches_the_popped_transaction_receipt() {
+    let (mut fixture, receipts, readback, _) = queued_external_readback().await;
+    let partition = fixture.driver.partition.value();
+    let competing_key = TransactionKey { tx_id: TxId(7), system_time: Timestamp(7) };
+    let competing_write = rtdb_index::StagedWrite::new(
+        competing_key,
+        partition.live().latest_completed_tx(),
+        partition.live().block_index(),
+        BTreeMap::new(),
+    ).unwrap();
+    fixture.driver.partition.apply(&competing_write).unwrap();
+    let installed = fixture.driver.partition.value();
+
+    let expected = Anomaly::incorrect("rtdb.index/invalid-live-index", "Staged transaction no longer follows this live index");
+    assert_external_readback_fault(&mut fixture, receipts, readback, expected).await;
+
+    assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &installed));
+    assert_eq!(installed.live().latest_completed_tx(), Some(competing_key));
+    let progress = fixture.handle.progress().current();
+    assert_eq!(progress.source_position, SourcePosition(-1));
+    assert!(progress.tx_key.is_none());
+    assert!(progress.latest_result.is_none());
+    assert!(progress.external_token.is_none());
+}
+
+#[tokio::test]
+async fn own_external_progress_fault_reaches_the_popped_transaction_receipt() {
+    let (mut fixture, receipts, readback, key) = queued_external_readback().await;
+    let previous_token = b"published";
+    fixture.handle.progress().applied(Some(SourcePosition(0)), None, Some(previous_token.to_vec())).unwrap();
+
+    let expected = Anomaly::fault("rtdb.replication/source-regression", "Applied source watermark moved backwards");
+    assert_external_readback_fault(&mut fixture, receipts, readback, expected).await;
+
+    assert_eq!(fixture.driver.partition.value().live().latest_completed_tx(), Some(key));
+    let progress = fixture.handle.progress().current();
+    assert_eq!(progress.source_position, SourcePosition(0));
+    assert!(progress.tx_key.is_none());
+    assert!(progress.latest_result.is_none());
+    assert_eq!(progress.external_token.as_deref(), Some(&previous_token[..]));
+}

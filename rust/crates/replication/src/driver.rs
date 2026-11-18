@@ -508,18 +508,29 @@ impl ReplicationDriver {
                         let mismatch = || Anomaly::fault("xtdb.indexer/leader-read-back-mismatch", "Replica transaction does not match the oldest staged transaction")
                             .with_context("replica-tx-id", message.tx_id.unwrap_or_default().into());
                         let Some(head) = head else { return Err(mismatch()); };
-                        if head.result().tx_key().tx_id != TxId(message.tx_id.unwrap_or_default()) {
-                            let error = mismatch();
-                            if let Some(leader) = &mut self.leader {
-                                for pending in &leader.pending {
-                                    if matches!(&pending.body, WriteBody::Resolved(tx) if Arc::ptr_eq(tx, &head)) { pending.finish(Err(error.clone())); break; }
-                                }
+                        let applied = (|| {
+                            if head.result().tx_key().tx_id != TxId(message.tx_id.unwrap_or_default()) {
+                                return Err(mismatch());
                             }
-                            return Err(error);
-                        }
-                        self.partition.apply(head.writes())?;
-                        let result = Arc::new(head.result().clone());
-                        self.progress.applied(Some(head.source_position()), Some(Arc::clone(&result)), head.external_token().map(<[u8]>::to_vec))?;
+                            self.partition.apply(head.writes())?;
+                            let result = Arc::new(head.result().clone());
+                            self.progress.applied(Some(head.source_position()), Some(Arc::clone(&result)), head.external_token().map(<[u8]>::to_vec))?;
+                            Ok(result)
+                        })();
+                        let result = match applied {
+                            Ok(result) => result,
+                            Err(error) => {
+                                if let Some(leader) = &self.leader {
+                                    let pending = leader.pending.iter().find(|pending| {
+                                        matches!(&pending.body, WriteBody::Resolved(tx) if Arc::ptr_eq(tx, &head))
+                                    });
+                                    if let Some(pending) = pending {
+                                        pending.finish(Err(error.clone()));
+                                    }
+                                }
+                                return Err(error);
+                            }
+                        };
                         if let Some(leader) = &mut self.leader { complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Transaction(result))); }
                     } else {
                         let value = self.partition.value();

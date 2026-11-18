@@ -180,7 +180,6 @@ entity TxResolver {
     latest_completed_tx: TransactionKey?
 
     -- The staged transactions, oldest first (resolution order).
-    -- Stage appends; ApplyResolvedTx removes the head after importing it.
     staged: StagedTx with resolver = this
 
     is_empty: staged.count = 0
@@ -510,7 +509,8 @@ rule ApplyResolvedTx {
     -- This is where a committed transaction becomes queryable: durably replicated AND confirmed unfenced.
     --
     -- It imports from the QUEUE HEAD, which still holds the transaction's rows, so nothing is re-read from the replica record.
-    -- The head must match the transaction just read back; a mismatch is a fault.
+    -- The leader takes the head before checking that its transaction ID matches the record.
+    -- When ID validation, partition apply, or applied progress publication fails, any external handle for the selected transaction receives the original fault.
     --
     -- The DURABLE head advance ALONE makes the transaction queryable.
     -- The shared external snapshot is a lazily-advanced cache, rebuilt on the next demanding read, and is not refreshed here.
@@ -543,7 +543,6 @@ rule ApplyResolvedTx {
         if staged_tx.durability != null:
             HandleCompleted(staged_tx.durability)
 
-        -- Drop the head, AFTER importing it.
         not exists staged_tx
 }
 

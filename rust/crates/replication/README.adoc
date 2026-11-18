@@ -69,6 +69,8 @@ A completed resolution returns its resolver before the driver enqueues the new t
 
 For this term's transaction readback, the driver removes the oldest staged transaction before validating its ID.
 It applies the staged write atomically, publishes applied progress, and completes the transaction receipt.
+The selected external transaction's receipt carries the original fault if ID validation, partition apply, or progress publication fails.
+External transactions still queued receive `xtdb/leader-term-ended` during demotion.
 Transactions from earlier terms import their encoded tables through `rtdb-tx::decode_replica`.
 A missing legacy source position uses the transaction ID for ordinary databases and preserves the current source position for external-source databases.
 A null external token preserves the last non-null token.
