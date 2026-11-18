@@ -106,6 +106,7 @@ Logical relation output preserves operator page boundaries, and a literal page s
 SQL and logical relation requests use the same transaction settings for the snapshot token, snapshot time, query clock, and time zone.
 Literal pages can declare their Arrow column types when the pages do not carry enough rows to infer a schema.
 Logical group-by uses native aggregates with exact column symbols, including distinct factories, filters, and array ordering.
+Ordered-set percentiles use the native continuous or discrete aggregate with literal or parameter fractions.
 Logical joins bind each equijoin expression to its own input and run the native cross, inner, outer, semi, anti, or single join.
 Logical mark joins apply eligibility conditions before evaluating the three-valued mark across each probe row's candidates.
 Logical row numbering can count across a relation or restart at each operator page.

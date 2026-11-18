@@ -683,7 +683,8 @@ fn aggregate_type(function: &AggregateFunction, input: LogicalType, grouped: boo
         AggregateFunction::Every | AggregateFunction::Any => LogicalType::Scalar(ScalarType::Bool).maybe(),
         AggregateFunction::ArrayAgg if !grouped => LogicalType::list(input).maybe(),
         AggregateFunction::ArrayAgg | AggregateFunction::VecAgg => LogicalType::list(input),
-        AggregateFunction::Percentile { .. } => return Err(error("xtql/invalid-expression", "Ordered-set aggregates require the SQL WITHIN GROUP syntax")),
+        AggregateFunction::Percentile { kind: rtdb_plan::PercentileKind::Continuous, .. } => LogicalType::Scalar(ScalarType::F64).maybe(),
+        AggregateFunction::Percentile { kind: rtdb_plan::PercentileKind::Discrete, .. } => input.maybe(),
         AggregateFunction::Sum => promoted().ok_or_else(|| error("xtql/invalid-expression", "Cannot compute SUM over the input type"))?.maybe(),
         AggregateFunction::Min | AggregateFunction::Max => input.maybe(),
     })

@@ -1,5 +1,6 @@
 use super::*;
 use crate::{Edn, EdnKind};
+use rtdb_plan::{PercentileFraction, PercentileKind};
 
 /// Imports a Clojure logical relation into the native plan using exact column symbols.
 /// Named parameter bindings describe the caller's typed argument positions.
@@ -342,37 +343,40 @@ impl Importer<'_, '_, '_> {
     fn row_limit(&mut self, form: Option<&Edn>) -> Result<Option<PExpr>> {
         let Some(form) = form.filter(|form| !matches!(form.kind, EdnKind::Nil)) else { return Ok(None); };
         if let Some(name) = form.symbol().filter(|name| name.starts_with('?')) {
-            let parameter = self.parameters.get(&self.compiler.symbols.parameter(name)).cloned()
-                .ok_or_else(|| error("xtdb/expected-number", "Expected: number, got: null").with_context("param", name.into()))?;
-            return Ok(Some(parameter));
+            return self.numeric_parameter(name).map(Some);
         }
         self.scalar(form, &mut Bound::unit()).map(Some)
     }
 
+    fn numeric_parameter(&self, name: &str) -> Result<PExpr> {
+        self.parameters.get(&self.compiler.symbols.parameter(name)).cloned()
+            .ok_or_else(|| error("xtdb/expected-number", "Expected: number, got: null").with_context("param", name.into()))
+    }
+
     fn sort_specs(options: &Edn, mut expression: impl FnMut(&Edn) -> Result<PExpr>) -> Result<Vec<SortExpr>> {
-        let mut order_by = Vec::new();
-        for spec in options.option("order-specs").map(sequence).transpose()?.unwrap_or_default() {
-            let (column, order) = match spec.vector().ok_or_else(|| invalid("Sort specification must be a vector"))? {
-                [column] => (column, None),
-                [column, order] if order.map().is_some() => (column, Some(order)),
-                _ => return Err(invalid("Sort requires a column and optional ordering")),
-            };
-            let direction = order.and_then(|order| order.option("direction"));
-            let descending = match direction.map(Edn::keyword) {
-                Some(Some("desc")) => true,
-                None | Some(Some("asc")) => false,
-                _ => return Err(invalid("Expected :asc or :desc")),
-            };
-            let null_ordering = order.and_then(|order| order.option("null-ordering"));
-            let nulls_first = match null_ordering.map(Edn::keyword) {
-                Some(Some("nulls-first")) => true,
-                None | Some(Some("nulls-last")) => false,
-                _ => return Err(invalid("Expected :nulls-first or :nulls-last")),
-            };
-            let expr = expression(column)?;
-            order_by.push(SortExpr { expr, descending, nulls_first });
-        }
-        Ok(order_by)
+        options.option("order-specs").map(sequence).transpose()?.unwrap_or_default().iter()
+            .map(|spec| Self::sort_spec(spec, &mut expression)).collect()
+    }
+
+    fn sort_spec(spec: &Edn, expression: impl FnOnce(&Edn) -> Result<PExpr>) -> Result<SortExpr> {
+        let (column, order) = match spec.vector().ok_or_else(|| invalid("Sort specification must be a vector"))? {
+            [column] => (column, None),
+            [column, order] if order.map().is_some() => (column, Some(order)),
+            _ => return Err(invalid("Sort requires a column and optional ordering")),
+        };
+        let direction = order.and_then(|order| order.option("direction"));
+        let descending = match direction.map(Edn::keyword) {
+            Some(Some("desc")) => true,
+            None | Some(Some("asc")) => false,
+            _ => return Err(invalid("Expected :asc or :desc")),
+        };
+        let null_ordering = order.and_then(|order| order.option("null-ordering"));
+        let nulls_first = match null_ordering.map(Edn::keyword) {
+            Some(Some("nulls-first")) => true,
+            None | Some(Some("nulls-last")) => false,
+            _ => return Err(invalid("Expected :nulls-first or :nulls-last")),
+        };
+        Ok(SortExpr { expr: expression(column)?, descending, nulls_first })
     }
 
     fn group_by(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
@@ -402,23 +406,51 @@ impl Importer<'_, '_, '_> {
             return Err(invalid("Aggregate requires a function name"));
         };
         let function = function.symbol().ok_or_else(|| invalid("Aggregate function must be a symbol"))?;
-        let (function, distinct) = aggregate_function(function).ok_or_else(|| invalid(format!("Unknown aggregate function: {function}")))?;
         let (arguments, options) = match arguments.split_last() {
             Some((options, arguments)) if options.map().is_some() => (arguments, Some(options)),
             _ => (arguments, None),
         };
-        let argument = match (function.canonical(), arguments) {
-            (AggregateFunction::CountStar, []) => None,
-            (AggregateFunction::CountStar, _) => return Err(invalid("Row count takes no argument")),
-            (_, [column]) => Some(self.column_or_null(column, bound)?.expression()),
-            _ => return Err(invalid("Aggregate requires one input column")),
+        let spelling = normal(function);
+        let (function, argument, distinct, order_by) = match spelling.as_str() {
+            "percentile_cont" | "percentile_disc" => {
+                let kind = if spelling == "percentile_cont" { PercentileKind::Continuous } else { PercentileKind::Discrete };
+                let [fraction, spec] = arguments else { return Err(invalid("Percentile requires one fraction and one sort specification")); };
+                let fraction = self.percentile_fraction(fraction)?;
+                let sort = Self::sort_spec(spec, |column| Ok(self.column_or_null(column, bound)?.expression()))?;
+                let function = AggregateFunction::Percentile { kind, fraction, descending: sort.descending };
+                (function, Some(sort.expr), false, Vec::new())
+            }
+            _ => {
+                let (function, distinct) = aggregate_function(function).ok_or_else(|| invalid(format!("Unknown aggregate function: {function}")))?;
+                let argument = match (function.canonical(), arguments) {
+                    (AggregateFunction::CountStar, []) => None,
+                    (AggregateFunction::CountStar, _) => return Err(invalid("Row count takes no argument")),
+                    (_, [column]) => Some(self.column_or_null(column, bound)?.expression()),
+                    _ => return Err(invalid("Aggregate requires one input column")),
+                };
+                let order_by = options.map(|options| Self::sort_specs(options, |column| Ok(self.column_or_null(column, bound)?.expression())))
+                    .transpose()?.unwrap_or_default();
+                (function, argument, distinct, order_by)
+            }
         };
         let input_type = argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Nothing);
         let field = self.compiler.binder.field(name, None, aggregate_type(&function, input_type, grouped)?)?;
         let filter = options.and_then(|options| options.option("filter")).map(|predicate| self.scalar(predicate, bound)).transpose()?;
-        let order_by = options.map(|options| Self::sort_specs(options, |column| Ok(self.column_or_null(column, bound)?.expression())))
-            .transpose()?.unwrap_or_default();
         Ok(AggregateExpr { field, function, argument, distinct, filter, order_by })
+    }
+
+    fn percentile_fraction(&self, form: &Edn) -> Result<PercentileFraction> {
+        match &form.kind {
+            EdnKind::Integer(value) => Ok(PercentileFraction::Integer(*value)),
+            EdnKind::Float(value) => Ok(PercentileFraction::Literal(*value)),
+            EdnKind::Decimal(value) | EdnKind::BigInteger(value) => value.parse::<f64>().map(PercentileFraction::Literal)
+                .map_err(|_| invalid("Percentile fraction must be a number")),
+            EdnKind::Symbol(name) if name.starts_with('?') => match self.numeric_parameter(name)? {
+                PExpr::Parameter { index, .. } => Ok(PercentileFraction::Parameter { index }),
+                _ => Err(invalid("Percentile fraction requires a parameter position")),
+            },
+            _ => Err(invalid("Percentile fraction must be a number or parameter")),
+        }
     }
 
     fn column_or_null(&mut self, column: &Edn, bound: &mut Bound) -> Result<Field> {

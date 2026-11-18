@@ -694,6 +694,43 @@
 
 (deftest-original-api original-percentile/test-percentile-via-sql)
 
+(deftest-original-api original-percentile/test-percentile-cont-basic)
+
+(deftest-original-api original-percentile/test-percentile-cont-interpolation)
+
+(deftest-original-api original-percentile/test-percentile-cont-single-value)
+
+(deftest-original-api original-percentile/test-percentile-cont-with-nulls)
+
+(deftest-original-api original-percentile/test-percentile-cont-empty)
+
+(deftest-original-api original-percentile/test-percentile-cont-desc)
+
+(deftest-original-api original-percentile/test-percentile-cont-grouped)
+
+(deftest-original-api original-percentile/test-percentile-disc-basic)
+
+(deftest-original-api original-percentile/test-percentile-disc-desc)
+
+(deftest-original-api original-percentile/test-percentile-disc-grouped)
+
+(deftest-original-api original-percentile/test-percentile-disc-strings)
+
+(deftest-original-api original-percentile/test-percentile-cont-float-input)
+
+(deftest-original-api original-percentile/test-percentile-cont-all-nulls)
+
+(deftest-original-api original-percentile/test-percentile-across-batches)
+
+(deftest logical-percentile-uses-named-fraction-and-filter
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (is (= [{:p 30.0}]
+           (rust/query-ra node
+                          '[:group-by {:columns [{p (percentile_cont ?fraction [v {:direction :asc}] {:filter keep})}]}
+                            [:table {:rows [{:v 10 :keep true} {:v 30 :keep true} {:v 50 :keep true} {:v 70 :keep false}]}]]
+                          {:args {:fraction 0.5}})))))
+
 (deftest-original-api original-unnest/test-vector-not-found-4343)
 
 (deftest-original-api original-unnest/unnest-ordinality-join-issue-4131)
