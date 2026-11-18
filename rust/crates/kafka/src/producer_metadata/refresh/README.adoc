@@ -27,7 +27,21 @@ The integration fixture imports the production source directly.
 
 The producer owns serialization, metadata response routing, snapshot construction, topic retention, waiter notification and actual send readiness.
 The metadata updater's empty-broker retry and rebootstrap handling remain integration obligations.
-The production math/random provider, retained snapshot and whole-native-producer allocation bound remain unfinished.
+The production provider must still qualify the Java clocks and thread histories, the platform's Math.log and Math.pow results, and the whole-native-producer allocation bound.
+
+== OpenJDK thread-local jitter
+
+`JavaThreadLocalSeeds` uses the pinned OpenJDK 25 class's wall and monotonic clock mixing and atomic seed advance for a platform thread's initial demand.
+The clock constructor represents the class path with `java.util.secureRandomSeed` disabled.
+With that option enabled, the caller supplies the observed class value after the secure replacement and any prior demands.
+The caller supplies the class history and thread identity, including the zero-probe precondition.
+An already initialized thread can resume from its observed original seed.
+Virtual-thread carrier initialization and other users of the shared class seeder require their source observations.
+
+`JavaThreadLocalRandom` preserves the two seed advances through `Random.nextDouble`, with the pinned `ThreadLocalRandom.next` bit selection.
+Bounds are validated before either advance.
+Scaling follows `RandomSupport.boundedNextDouble`, including the finite-width and overflow-width branches and upper-bound rounding correction.
+The four additive source fixtures check class clock order, independent thread sequences, invalid ranges and exact floating-point results.
 
 `sources.json` pins the consulted Kafka/OpenJDK sources and licenses.
 `COPYRIGHT` retains complete leading source notices, and license files are copied verbatim.

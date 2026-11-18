@@ -1,3 +1,7 @@
+#[path = "refresh/jitter.rs"]
+mod jitter;
+pub use jitter::{JavaThreadLocalRandom, JavaThreadLocalSeeds};
+
 /// Caller-owned observations of the pinned JVM's math and random operations.
 /// Implementations must preserve Java Math results and nextDouble's origin-inclusive, bound-exclusive range.
 pub trait JavaBackoffObservations {
