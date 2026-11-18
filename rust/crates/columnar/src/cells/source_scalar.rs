@@ -36,6 +36,29 @@ impl LongLongLane {
     }
 }
 
+impl ExecutionVector {
+    pub(crate) fn adopt_source_uuid(&self) -> Result<Option<Self>> {
+        let (ReaderView::Direct(node), Address::Identity { .. }) = (&self.view, &self.address) else {
+            return Ok(None);
+        };
+        let Some(scalar) = node.descriptor.scalar() else { return Ok(None); };
+        let Some(SourceScalarDeclaration::FixedBinary(inner_width)) = scalar.source_declaration() else {
+            return Ok(None);
+        };
+        let NodeLayout::Scalar(storage) = &node.storage else { return Err(layout()); };
+        let native_scalar::NativeScalarData::Fixed(bytes) = &storage.data else { return Err(layout()); };
+        let field = scalar.field();
+        let metadata = SourceScalarMetadata::new(
+            field.name(),
+            field.is_nullable(),
+            SourceScalarDeclaration::Uuid { inner_width },
+            self.budget(),
+        )?;
+        let node = open::finish_source_fixed(metadata, node.count, storage.validity.clone(), bytes.clone())?;
+        Ok(Some(Self::direct(node)))
+    }
+}
+
 pub(crate) struct SourceScalarReader<'a> {
     declaration: SourceScalarDeclaration,
     backing: &'a [u8],

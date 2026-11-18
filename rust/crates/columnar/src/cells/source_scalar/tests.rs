@@ -104,6 +104,126 @@ fn direct_declarations_retain_raw_parameters_and_independent_uuid_widths() {
 }
 
 #[test]
+fn uuid_adopts_the_actual_fixed_binary_buffers_and_outlives_the_inner() {
+    let parent = memory();
+    let memory = parent.scope();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(24), true, &memory);
+    let bytes = *b"0123456789abcdefghijklmn";
+    output.write_null().unwrap();
+    output.write_bytes(&bytes).unwrap();
+    let inner = output.finish().unwrap();
+    let inner_charge = inner.node().owner.metadata.bytes();
+    let retained_before = memory.used_bytes();
+
+    let uuid = inner.adopt_source_uuid().unwrap().unwrap();
+    let uuid_charge = uuid.node().owner.metadata.bytes();
+    assert!(Arc::ptr_eq(inner.budget(), &memory));
+    assert!(Arc::ptr_eq(uuid.budget(), &memory));
+    assert_eq!(memory.used_bytes(), retained_before + uuid_charge);
+    assert_eq!(parent.used_bytes(), memory.used_bytes());
+    assert_eq!(uuid.value_count(), 2);
+    assert_eq!(uuid.descriptor().name(), inner.descriptor().name());
+    assert!(uuid.reader_nullable());
+    assert_eq!(declaration(&uuid), SourceScalarDeclaration::Uuid { inner_width: 24 });
+    assert_eq!(uuid.descriptor().scalar_field().unwrap().data_type(), &DataType::FixedSizeBinary(16));
+    assert_eq!(uuid.logical_type().unwrap(), &LogicalType::Scalar(ScalarType::Uuid).maybe());
+    assert!(std::ptr::eq(data(&inner).bytes.as_slice(), data(&uuid).bytes.as_slice()));
+    assert_eq!(data(&inner).append, data(&uuid).append);
+    let inner_validity = storage(&inner).validity.as_ref().unwrap();
+    let uuid_validity = storage(&uuid).validity.as_ref().unwrap();
+    assert!(std::ptr::eq(inner_validity.bytes.as_slice(), uuid_validity.bytes.as_slice()));
+    assert_eq!(inner_validity.append, uuid_validity.append);
+    assert_eq!(inner_validity.byte_append, uuid_validity.byte_append);
+    let inner_reader = SourceScalarReader::new(&inner).unwrap().unwrap();
+    assert_eq!(inner_reader.get_bytes(1).unwrap().demand_native().unwrap(), &bytes);
+    drop(inner);
+
+    assert_eq!(memory.used_bytes(), retained_before + uuid_charge - inner_charge);
+    assert_eq!(parent.used_bytes(), memory.used_bytes());
+    let reader = SourceScalarReader::new(&uuid).unwrap().unwrap();
+    let destination = MemoryBudget::new(8192 + 4 * bytes.len());
+    assert!(reader.binary_object(0, &destination).unwrap().unwrap().is_none());
+    assert_eq!(destination.peak_bytes(), 0);
+    let value = reader.binary_object(1, &destination).unwrap().unwrap().unwrap();
+    assert_eq!(reader.get_bytes(1).unwrap().demand_native().unwrap(), &bytes);
+    drop(uuid);
+    assert_eq!(value.value(), &Value::Uuid(*b"0123456789abcdef"));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(parent.used_bytes(), 0);
+    drop(value);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
+fn uuid_adoption_preserves_signed_width_and_defers_object_failures() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(-1), true, &memory);
+    output.ensure_capacity(1).unwrap();
+    let inner = output.finish().unwrap();
+    let uuid = inner.adopt_source_uuid().unwrap().unwrap();
+    assert_eq!(declaration(&uuid), SourceScalarDeclaration::Uuid { inner_width: -1 });
+    let reader = SourceScalarReader::new(&uuid).unwrap().unwrap();
+    let destination = MemoryBudget::new(0);
+    assert!(reader.binary_object(0, &destination).unwrap().unwrap().is_none());
+    read_reference(reader.binary_object0(0, &destination).unwrap(), SourceScalarReadFailure::NegativeViewLength(-1));
+    assert_eq!(destination.peak_bytes(), 0);
+
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(8), false, &memory);
+    output.write_bytes(&[42; 8]).unwrap();
+    let short = output.finish().unwrap().adopt_source_uuid().unwrap().unwrap();
+    assert!(!short.reader_nullable());
+    assert!(storage(&short).validity.is_none());
+    let destination = MemoryBudget::new(4096 + 4 * 8);
+    let reader = SourceScalarReader::new(&short).unwrap().unwrap();
+    read_reference(reader.binary_object(0, &destination).unwrap(), SourceScalarReadFailure::UuidSecondLongUnderflow);
+    assert_eq!(destination.peak_bytes(), 4096 + 4 * 8);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
+fn uuid_adoption_carries_wrapped_count_without_admitting_rows() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(0), false, &memory);
+    output.ensure_capacity(i32::MAX).unwrap();
+    output.write_undefined().unwrap();
+    let inner = output.finish().unwrap();
+    let uuid = inner.adopt_source_uuid().unwrap().unwrap();
+    assert_eq!(inner.value_count(), i32::MIN);
+    assert_eq!(uuid.value_count(), inner.value_count());
+    assert_eq!(uuid.checked_len().unwrap_err().code, "rtdb/vector-length");
+    assert_eq!(declaration(&uuid), SourceScalarDeclaration::Uuid { inner_width: 0 });
+    let reader = SourceScalarReader::new(&uuid).unwrap().unwrap();
+    assert!(reader.get_bytes(i32::MIN).unwrap().demand_native().unwrap().is_empty());
+}
+
+#[test]
+fn uuid_adoption_rejects_other_receivers_and_preserves_the_inner_on_budget_failure() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(8), false, &memory);
+    output.write_bytes(&[37; 8]).unwrap();
+    let inner = output.finish().unwrap();
+    let selected = inner.select(&Selection::All).unwrap();
+    let uuid = inner.adopt_source_uuid().unwrap().unwrap();
+    let field = Arc::new(Field::new("sdk", DataType::FixedSizeBinary(8), false));
+    let sdk = ScalarWriter::new(field, Arc::clone(&memory)).unwrap().finish().unwrap();
+    let retained_before = memory.used_bytes();
+    let blocker = block(&memory, 0);
+    assert!(sdk.adopt_source_uuid().unwrap().is_none());
+    assert!(selected.adopt_source_uuid().unwrap().is_none());
+    assert!(uuid.adopt_source_uuid().unwrap().is_none());
+    assert_eq!(inner.adopt_source_uuid().unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(memory.used_bytes(), retained_before + blocker.bytes());
+    let reader = SourceScalarReader::new(&inner).unwrap().unwrap();
+    assert_eq!(reader.get_bytes(0).unwrap().demand_native().unwrap(), &[37; 8]);
+    drop(blocker);
+    assert_eq!(memory.used_bytes(), retained_before);
+    let retry = inner.adopt_source_uuid().unwrap().unwrap();
+    assert!(std::ptr::eq(data(&inner).bytes.as_slice(), data(&retry).bytes.as_slice()));
+    drop(retry);
+    assert_eq!(memory.used_bytes(), retained_before);
+}
+
+#[test]
 fn strict_sdk_factories_and_raw_reader_provenance_stay_separate() {
     let memory = memory();
     for data_type in [DataType::FixedSizeBinary(-1), DataType::Time32(arrow_schema::TimeUnit::Microsecond), DataType::Time64(arrow_schema::TimeUnit::Second)] {
