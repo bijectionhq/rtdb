@@ -43,3 +43,8 @@ Registry accepts these names through its prefixed properties.
 Kafka applies Java ConfigDef trimming; Registry preserves raw provider and algorithm names and treats an empty name as the default.
 
 `rust/crates/kafka/TLS.adoc` records TLS policy coverage, retained-memory ownership, and remaining source and qualification work.
+
+== Dead-letter producer option text
+
+The adapter decodes `buffer.memory`, `batch.size`, `max.request.size`, `max.block.ms`, `linger.ms`, `delivery.timeout.ms`, `request.timeout.ms`, `send.buffer.bytes` and `receive.buffer.bytes` as Java signed decimal text, including BMP digits and `-0`.
+For those options and serializer class names, the adapter trims outer code units up to U+0020 before validation.

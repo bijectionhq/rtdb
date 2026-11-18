@@ -1,5 +1,5 @@
 use std::{collections::BTreeMap, time::Duration};
-use rtdb_types::Result;
+use rtdb_types::{Result, jvm_number::Number};
 use super::{error, overflow};
 
 pub(super) struct Settings {
@@ -14,7 +14,7 @@ pub(super) struct Settings {
 enum Serializer { Bytes, NullOnly }
 impl Serializer {
     fn parse(name: Option<&String>) -> Result<Self> {
-        Ok(match name.map(String::as_str).unwrap_or("org.apache.kafka.common.serialization.ByteArraySerializer") {
+        Ok(match name.map(|value| trim_java(value)).unwrap_or("org.apache.kafka.common.serialization.ByteArraySerializer") {
             "org.apache.kafka.common.serialization.ByteArraySerializer" => Self::Bytes,
             "org.apache.kafka.common.serialization.StringSerializer" | "org.apache.kafka.common.serialization.BooleanSerializer" |
             "org.apache.kafka.common.serialization.ShortSerializer" | "org.apache.kafka.common.serialization.IntegerSerializer" |
@@ -27,17 +27,32 @@ impl Serializer {
     }
     fn accepts(&self, value: Option<&[u8]>) -> bool { matches!(self, Self::Bytes) || value.is_none() }
 }
+
+fn trim_java(value: &str) -> &str { value.trim_matches(|ch| ch <= '\u{20}') }
+
+fn signed_integer(value: &str) -> Option<i64> {
+    let value = trim_java(value);
+    if value.chars().any(|ch| ch.len_utf16() == 2) { return None; }
+    match Number::parse_long(value).ok()? {
+        Number::Long(value) => Some(value),
+        _ => unreachable!("signed decimal parser returns a long"),
+    }
+}
+
 impl Settings {
     pub fn parse(options: &BTreeMap<String, String>) -> Result<Self> {
         let number = |name: &str, default: u64, maximum: u64| -> Result<u64> {
-            let value = options.get(name).map(|value| value.trim().parse::<u64>().map_err(|_| error("dlq", format!("Producer {name} must be nonnegative")))).transpose()?.unwrap_or(default);
+            let value = options.get(name).map(|value| {
+                signed_integer(value).and_then(|value| u64::try_from(value).ok())
+                    .ok_or_else(|| error("dlq", format!("Producer {name} must be nonnegative")))
+            }).transpose()?.unwrap_or(default);
             if value > maximum { return Err(error("dlq", format!("Producer {name} exceeds its range"))); }
             Ok(value)
         };
         for name in ["interceptor.classes", "partitioner.class", "sasl.login.class", "sasl.login.callback.handler.class", "sasl.client.callback.handler.class"] {
             if options.get(name).is_some_and(|value| !value.trim().is_empty()) { return Err(error("dlq", format!("Producer {name} requires a native adapter"))); }
         }
-        if options.get("ssl.engine.factory.class").is_some_and(|value| value.trim_matches(|ch| ch <= '\u{20}') != "org.apache.kafka.common.security.ssl.DefaultSslEngineFactory") {
+        if options.get("ssl.engine.factory.class").is_some_and(|value| trim_java(value) != "org.apache.kafka.common.security.ssl.DefaultSslEngineFactory") {
             return Err(error("dlq", "Producer ssl.engine.factory.class requires a native adapter"));
         }
         let key_serializer = Serializer::parse(options.get("key.serializer"))?;
@@ -75,7 +90,8 @@ impl Settings {
                 "ssl.ca.location" | "ssl.ca.pem" | "ssl.key.location" | "ssl.key.pem" |
                 "ssl.certificate.location" | "ssl.certificate.pem" => name.as_str(),
                 "send.buffer.bytes" | "receive.buffer.bytes" => {
-                    let size = value.trim().parse::<i32>().ok().filter(|size| *size >= -1).ok_or_else(|| error("dlq", format!("Producer {name} must be -1 or a nonnegative integer")))?;
+                    let size = signed_integer(value).and_then(|value| i32::try_from(value).ok())
+                        .filter(|size| *size >= -1).ok_or_else(|| error("dlq", format!("Producer {name} must be -1 or a nonnegative integer")))?;
                     let native = if name == "send.buffer.bytes" { "socket.send.buffer.bytes" } else { "socket.receive.buffer.bytes" };
                     properties.insert(native.into(), size.max(0).to_string());
                     continue;
@@ -159,6 +175,31 @@ mod tests {
             options.insert(java.into(), "-2".into()); assert!(Settings::parse(&options).is_err());
             options.insert(java.into(), "2147483648".into()); assert!(Settings::parse(&options).is_err());
             options.remove(java);
+        }
+    }
+
+    #[test]
+    fn java_integer_options_preserve_bmp_digits_signed_zero_and_configdef_trimming() {
+        let mut options = BTreeMap::from([
+            ("bootstrap.servers".into(), "localhost:9092".into()),
+            ("max.block.ms".into(), "\u{0}+\u{661}\u{662}\u{1f}".into()),
+            ("max.request.size".into(), "\t\u{ff11}\u{ff10}\u{ff10}\u{ff10} ".into()),
+            ("send.buffer.bytes".into(), "-\u{661}".into()),
+            ("receive.buffer.bytes".into(), "\u{ff11}\u{ff12}".into()),
+            ("batch.size".into(), "-0".into()),
+            ("key.serializer".into(), "\torg.apache.kafka.common.serialization.ByteArraySerializer\u{1f}".into()),
+        ]);
+        let settings = Settings::parse(&options).unwrap();
+        assert_eq!(settings.maximum_block, Duration::from_millis(12));
+        assert_eq!(settings.maximum_record_bytes, 1000);
+        assert_eq!(settings.properties["socket.send.buffer.bytes"], "0");
+        assert_eq!(settings.properties["socket.receive.buffer.bytes"], "12");
+        assert_eq!(settings.properties["batch.size"], "1");
+        assert!(settings.validate_bytes(Some(b"key"), Some(b"value")).is_ok());
+
+        for invalid in ["\u{a0}12", "\u{1d7d9}2", "9223372036854775808", "-1"] {
+            options.insert("max.block.ms".into(), invalid.into());
+            assert!(Settings::parse(&options).is_err());
         }
     }
 
