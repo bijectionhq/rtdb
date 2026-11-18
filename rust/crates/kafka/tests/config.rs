@@ -36,6 +36,21 @@ fn java_properties_keep_iso_8859_1_continuations_and_escaped_separators() {
 }
 
 #[test]
+fn java_properties_distinguish_an_empty_continuation_from_a_pending_final_line() {
+    for source in [b"\\".as_slice(), b"\\\n", b"\\\r"] {
+        assert_eq!(parse_properties(source).unwrap().get("").map(String::as_str), Some(""));
+    }
+    for source in [b"\\\r\n".as_slice(), b"\\\n\n", b"\\\n  \t"] {
+        assert!(parse_properties(source).unwrap().is_empty());
+    }
+    let source = b"\\\n # hidden\r\nname=part\\\r\n #suffix\r\nother : =literal";
+    let properties = parse_properties(source).unwrap();
+    assert_eq!(properties.len(), 2);
+    assert_eq!(properties["name"], "part#suffix");
+    assert_eq!(properties["other"], "=literal");
+}
+
+#[test]
 fn property_file_overrides_map_and_debug_does_not_expose_credentials() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("kafka.properties");

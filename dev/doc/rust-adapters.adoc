@@ -54,6 +54,7 @@ For those options and serializer class names, the adapter trims outer code units
 Registry dead-letter producer options can declare Kafka `FileConfigProvider` and `DirectoryConfigProvider` classes through `config.providers` and their alias properties.
 A `${provider:path:key}` value is resolved before the producer parses its settings or prepares TLS material.
 The file provider decodes UTF-8 Java properties and validates escape syntax throughout the input before projecting the final requested values into native UTF-8 strings.
+Both Properties readers retain the source continuation behavior across CR, LF and CRLF, including a comment after a continuation whose logical line is empty.
 The directory provider reads requested regular-file entries as UTF-8 with their original line endings.
 An `allowed.paths` provider parameter limits resolution to the listed absolute roots and their descendants after canonicalization.
 Missing values preserve their original placeholder and inserted text is resolved once from the original option values.

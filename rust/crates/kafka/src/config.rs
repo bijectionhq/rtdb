@@ -255,31 +255,62 @@ fn parse_properties_text(text: &str) -> Result<BTreeMap<String, String>> {
 }
 
 fn visit_properties_text(text: &str, mut entry: impl FnMut(&str, &str) -> Result<()>) -> Result<()> {
-    let mut logical = Vec::new();
-    let mut current = String::new();
-    let mut continuation = false;
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    for line in text.split('\n') {
-        let line = line.trim_start_matches([' ', '\t', '\u{c}']);
-        if !continuation && (line.is_empty() || line.starts_with(['#', '!'])) { continue; }
-        current.push_str(line);
-        continuation = current.chars().rev().take_while(|character| *character == '\\').count() % 2 == 1;
-        if continuation { current.pop(); } else { logical.push(std::mem::take(&mut current)); }
-    }
-    if !current.is_empty() { logical.push(current); }
-    for line in logical {
-        let mut escaped = false;
-        let mut separator = line.len();
-        for (index, character) in line.char_indices() {
-            if !escaped && matches!(character, '=' | ':' | ' ' | '\t' | '\u{c}') { separator = index; break; }
-            escaped = !escaped && character == '\\';
+    let mut input = text.chars().peekable();
+    let mut line = String::new();
+    let mut leading_space = true;
+    let mut continued = false;
+    let mut trailing_backslash = false;
+    while let Some(unit) = input.next() {
+        let newline = matches!(unit, '\n' | '\r');
+        if leading_space {
+            if matches!(unit, ' ' | '\t' | '\u{c}') || (newline && !continued) { continue; }
+            leading_space = false;
+            continued = false;
         }
-        let mut value = line[separator..].trim_start_matches([' ', '\t', '\u{c}']);
-        if value.starts_with(['=', ':']) { value = &value[1..]; }
-        value = value.trim_start_matches([' ', '\t', '\u{c}']);
-        entry(&line[..separator], value)?;
+        if line.is_empty() && matches!(unit, '#' | '!') {
+            for comment in input.by_ref() {
+                if matches!(comment, '\n' | '\r') { break; }
+            }
+            leading_space = true;
+            continue;
+        }
+        if !newline {
+            line.push(unit);
+            trailing_backslash = unit == '\\' && !trailing_backslash;
+            continue;
+        }
+        leading_space = true;
+        if line.is_empty() { continue; }
+        if input.peek().is_none() { break; }
+        if trailing_backslash {
+            line.pop();
+            trailing_backslash = false;
+            continued = true;
+            if unit == '\r' { let _ = input.next_if_eq(&'\n'); }
+        } else {
+            let (key, value) = property_parts(&line);
+            entry(key, value)?;
+            line.clear();
+        }
+    }
+    if !line.is_empty() {
+        if trailing_backslash { line.pop(); }
+        let (key, value) = property_parts(&line);
+        entry(key, value)?;
     }
     Ok(())
+}
+
+fn property_parts(line: &str) -> (&str, &str) {
+    let mut escaped = false;
+    let mut separator = line.len();
+    for (index, character) in line.char_indices() {
+        if !escaped && matches!(character, '=' | ':' | ' ' | '\t' | '\u{c}') { separator = index; break; }
+        escaped = !escaped && character == '\\';
+    }
+    let mut value = line[separator..].trim_start_matches([' ', '\t', '\u{c}']);
+    if value.starts_with(['=', ':']) { value = &value[1..]; }
+    (&line[..separator], value.trim_start_matches([' ', '\t', '\u{c}']))
 }
 
 fn unescape(input: &str) -> Result<String> {
@@ -288,24 +319,26 @@ fn unescape(input: &str) -> Result<String> {
 
 fn unescape_units(input: &str) -> Result<Vec<u16>> {
     let mut result = Vec::<u16>::new();
-    let mut characters = input.chars();
-    while let Some(character) = characters.next() {
-        let character = if character == '\\' {
-            match characters.next() {
+    let mut units = input.encode_utf16();
+    while let Some(unit) = units.next() {
+        let unit = if unit == u16::from(b'\\') {
+            let Some(escaped) = units.next() else { break; };
+            match char::from_u32(u32::from(escaped)) {
                 Some('u') => {
-                    let digits = [characters.next(), characters.next(), characters.next(), characters.next()];
+                    let digits = [units.next(), units.next(), units.next(), units.next()];
                     if digits[3].is_none() { return Err(Anomaly::incorrect("xtdb.kafka/properties-file", "Incomplete Java properties Unicode escape")); }
-                    let unit = digits.into_iter().flatten().try_fold(0u16, |unit, digit| {
-                        digit.to_digit(16).map(|digit| (unit << 4) | digit as u16)
-                    }).ok_or_else(|| Anomaly::incorrect("xtdb.kafka/properties-file", "Invalid Java properties Unicode escape"))?;
-                    result.push(unit);
-                    continue;
+                    digits.into_iter().flatten().try_fold(0u16, |value, digit| {
+                        char::from_u32(u32::from(digit))?.to_digit(16).map(|digit| (value << 4) | digit as u16)
+                    }).ok_or_else(|| Anomaly::incorrect("xtdb.kafka/properties-file", "Invalid Java properties Unicode escape"))?
                 }
-                Some('t') => '\t', Some('r') => '\r', Some('n') => '\n', Some('f') => '\u{c}', Some(character) => character, None => break,
+                Some('t') => u16::from(b'\t'),
+                Some('r') => u16::from(b'\r'),
+                Some('n') => u16::from(b'\n'),
+                Some('f') => 0x0c,
+                _ => escaped,
             }
-        } else { character };
-        let mut units = [0; 2];
-        result.extend(character.encode_utf16(&mut units).iter().copied());
+        } else { unit };
+        result.push(unit);
     }
     Ok(result)
 }
