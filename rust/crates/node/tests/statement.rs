@@ -419,3 +419,84 @@ async fn prepared_series_uses_the_nodes_captured_endpoint_policy() {
         assert_eq!(value,Value::List((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
     }
 }
+
+#[test]
+fn programmatic_and_postgres_preparation_keep_their_syntax_and_cancellation_order() {
+    let malformed = "SELECT @";
+    let memory = MemoryBudget::new(malformed.len() + 255);
+    let context = context(None, &memory);
+    let Err(programmatic) = PreparedSql::prepare(malformed, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic)
+        else { panic!("programmatic source admission"); };
+    let Err(postgres) = PreparedSql::prepare_postgres(malformed, &context, Vec::new(), &[])
+        else { panic!("PostgreSQL source error"); };
+    assert_eq!(programmatic.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(postgres, rtdb_sql::parse_in(malformed, &memory).unwrap_err());
+    assert_eq!(postgres.code, "xtdb/sql-error");
+
+    context.cancellation.cancel();
+    let Err(programmatic) = PreparedSql::prepare(malformed, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic)
+        else { panic!("programmatic cancellation"); };
+    let Err(postgres_after_cancel) = PreparedSql::prepare_postgres(malformed, &context, Vec::new(), &[])
+        else { panic!("PostgreSQL source error after cancellation"); };
+    assert_eq!(programmatic.code, "xtdb/query-cancelled");
+    assert_eq!(postgres_after_cancel, postgres);
+
+    let Err(query) = PreparedSql::prepare_postgres("SELECT 1", &context, Vec::new(), &[])
+        else { panic!("PostgreSQL OID admission"); };
+    let Err(dml) = PreparedSql::prepare_postgres("DELETE FROM docs", &context, Vec::new(), &[])
+        else { panic!("PostgreSQL DML cancellation"); };
+    assert_eq!(query.code, "rtdb/memory-budget-exceeded");
+    assert!(query.message.as_deref().unwrap().starts_with("Cannot reserve 1024 bytes"));
+    assert_eq!(dml.code, "xtdb/query-cancelled");
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(memory.peak_bytes(), 0);
+}
+
+#[test]
+fn postgres_dml_reuses_the_admitted_syntax_and_retains_the_exact_source() {
+    let calls = [r#"(regexp-replace "abc" "a" "x")"#; 32].join(" ");
+    let source = format!("-- original source\nINSERT INTO docs (_id, v) SELECT $1, v FROM (XTQL $$(-> (rel [{{}}] []) (return {{:v (coalesce {calls})}}))$$) AS src; ");
+    let parse_probe = MemoryBudget::new(1 << 20);
+    let parsed = rtdb_sql::parse_in(&source, &parse_probe).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].kind(), rtdb_sql::StatementKind::Dml);
+    let parameter_count = parsed[0].parameter_count();
+    assert_eq!(parameter_count, 1);
+    let parse_peak = parse_probe.peak_bytes();
+    let syntax_bytes = parse_probe.used_bytes();
+    assert!(syntax_bytes > 0);
+    drop(parsed);
+    assert_eq!(parse_probe.used_bytes(), 0);
+
+    let prepare = |memory: &Arc<MemoryBudget>| {
+        PreparedSql::prepare_postgres(&source, &context(None, memory), vec!["public".into()], &[23])
+    };
+    let probe = MemoryBudget::new(1 << 20);
+    let prepared = prepare(&probe).unwrap();
+    assert!(prepared.is_dml());
+    assert!(prepared.notices().is_empty());
+    let retained = probe.used_bytes();
+    let source_bytes = source.len() + 256;
+    let parameter_bytes = (parameter_count + 1) * 1024;
+    let exact_limit = parse_peak.max(syntax_bytes + source_bytes + parameter_bytes + retained);
+    assert_eq!(probe.peak_bytes(), exact_limit);
+    assert!(exact_limit < syntax_bytes + source_bytes + parse_peak);
+    drop(prepared);
+    assert_eq!(probe.used_bytes(), 0);
+
+    let memory = MemoryBudget::new(exact_limit);
+    let prepared = prepare(&memory).unwrap();
+    assert_eq!(prepared.source(), source);
+    assert_eq!(prepared.parameter_count(), parameter_count);
+    let TxOp::Sql { sql, args: None } = prepared.dml_operation(None).unwrap() else { panic!("durable SQL operation"); };
+    assert_eq!(sql, source);
+    assert_eq!(memory.used_bytes(), retained);
+    assert_eq!(memory.peak_bytes(), exact_limit);
+    drop(prepared);
+    assert_eq!(memory.used_bytes(), 0);
+
+    let short = MemoryBudget::new(exact_limit - 1);
+    let Err(error) = prepare(&short) else { panic!("prepared statement admission"); };
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(short.used_bytes(), 0);
+}

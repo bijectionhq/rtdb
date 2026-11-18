@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{ColumnId, Field, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
-use rtdb_sql::{PrepareOptions, StatementKind};
+use rtdb_sql::{ParsedStatement, PrepareOptions, StatementKind};
 use rtdb_tx::{SqlArguments, TxOp};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, MemoryBudget, PgType, Result, Value};
 
@@ -27,14 +27,18 @@ enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType> }, Dml }
 pub struct PreparedSql(Arc<PreparedData>);
 
 impl PreparedSql {
-    pub fn prepare(source: &str, context: &Arc<QueryContext>, options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
-        Self::prepare_inner(source, context, options, policy, false, false)
+    pub fn prepare(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
+        let source_reservation = admit_source(source, context, &mut options)?;
+        let parsed = one_statement(source, &context.memory)?;
+        Self::prepare_parsed(parsed, context, options, policy, false, false, source_reservation)
     }
 
     pub fn prepare_postgres(source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
         let parsed = one_statement(source, &context.memory)?;
         if parsed.kind() == StatementKind::Dml {
-            return Self::prepare_inner(source, context, PrepareOptions { search_path, ..Default::default() }, ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty());
+            let mut options = PrepareOptions { search_path, ..Default::default() };
+            let source_reservation = admit_source(parsed.source(), context, &mut options)?;
+            return Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty(), source_reservation);
         }
         let count = parsed.parameter_count();
         let _parameters = context.memory.reserve(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?)?;
@@ -46,15 +50,15 @@ impl PreparedSql {
                 None => { dynamic = true; }
             }
         }
-        Self::prepare_inner(source, context, options, ResultSignaturePolicy::PostgreSql, dynamic, parameter_oids.is_empty())
+        let source_reservation = admit_source(parsed.source(), context, &mut options)?;
+        Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, dynamic, parameter_oids.is_empty(), source_reservation)
     }
 
-    fn prepare_inner(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy, dynamic_pg: bool, dml_notices: bool) -> Result<Self> {
-        context.check_cancelled()?;
-        options.default_timezone = context.timezone.clone();
-        options.generate_series_end_exclusive = context.options.generate_series_end_exclusive;
-        let source_reservation = context.memory.reserve(source.len().checked_add(256).ok_or_else(size_error)?)?;
-        let parsed = one_statement(source, &context.memory)?;
+    fn prepare_parsed(
+        parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, options: PrepareOptions, policy: ResultSignaturePolicy,
+        dynamic_pg: bool, dml_notices: bool, source_reservation: Arc<MemoryReservation>,
+    ) -> Result<Self> {
+        let source = parsed.source();
         let count = parsed.parameter_count();
         if options.parameter_types.keys().any(|index| *index >= count) { return Err(parameter_error("Declared parameter lies outside the statement")); }
         let parameter_bytes = options.parameter_types.values().try_fold(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
@@ -163,7 +167,14 @@ impl PreparedSql {
     }
 }
 
-fn one_statement<'input>(source: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<rtdb_sql::ParsedStatement<'input>> {
+fn admit_source(source: &str, context: &QueryContext, options: &mut PrepareOptions) -> Result<Arc<MemoryReservation>> {
+    context.check_cancelled()?;
+    options.default_timezone = context.timezone.clone();
+    options.generate_series_end_exclusive = context.options.generate_series_end_exclusive;
+    context.memory.reserve(source.len().checked_add(256).ok_or_else(size_error)?)
+}
+
+fn one_statement<'input>(source: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<ParsedStatement<'input>> {
     let mut parsed = rtdb_sql::parse_in(source, memory)?;
     if parsed.len() != 1 { return Err(Anomaly::incorrect("xtdb/sql-error", "A prepared statement must contain exactly one SQL statement")); }
     Ok(parsed.remove(0))

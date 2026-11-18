@@ -20,11 +20,14 @@ pub struct ParsedStatement<'input> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatementKind { Query, Dml, Session }
 
-impl ParsedStatement<'_> {
+impl<'input> ParsedStatement<'input> {
     /// Binds this syntax against the caller's catalog using its original source and raw metadata budget.
     pub fn bind(self, catalog: &dyn rtdb_plan::Catalog, options: &crate::PrepareOptions) -> Result<rtdb_plan::PreparedStatement> {
         crate::bind::bind(self, catalog, options)
     }
+
+    /// Returns the source input for this statement's byte offsets.
+    pub fn source(&self) -> &'input str { self.source }
 
     pub fn parameter_count(&self) -> usize { self.parameter_count }
     /// Identifies parsed reads and table mutations that cannot change database/storage configuration or execute a named prepared statement.
