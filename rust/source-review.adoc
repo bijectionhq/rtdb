@@ -523,6 +523,8 @@ Registered Transit collections retain incremental map/set construction, cache id
 Their independent review repaired tagged-value hash multiplication.
 Registered temporal objects and XML legacy Date parsing have independent review, including empty range destructuring, ASCII duration case folding and cutover-day carry corrections.
 Registered Path and the shared Java UTF8 decoder have bounded root source review for the default UTF8 Unix and standard runtime-image providers.
+Evaluation and registered-object construction share the borrowed admission policy used by name rendering and invalid VectorType diagnostics.
+Generic text rendering still needs the source Date locale and time-zone policies and ExceptionInfo construction state.
 Other platform/provider environments and remaining registered objects are still required work.
 
 Projection, expansion, materialized bindings, mark selection and sort-key projection preserve complete semantic pages and have bounded independent source reviews.
@@ -1240,6 +1242,8 @@ The identifier tree retains all 87 nonreserved keyword alternatives and their fo
 The generated expression root shares its integer, float, additive and multiplicative path with derived SELECT columns.
 The LL retry preserves the state left by the SLL expression attempt as its root invocation state.
 The direct and multi-statement roots reach constant SELECT with EXPLAIN, quantifiers, optional list entries and aliases.
+Boolean, NULL, standard SQL strings and C-escaped strings share the private expression root and derived-column action while retaining their raw token occurrences.
+Adaptive decision scratch drops when the decision finishes, while the token stream and invocation records stay live through the parse.
 The SELECT list and explicit alias fixtures preserve the reached sync and error sites, including lexical failure during LL recovery.
 Production parsing still requires the remaining grammar and the host cache and diagnostic boundaries.
 
@@ -1248,12 +1252,15 @@ Lexical validation precedes range construction, with both arrays charged while t
 The token array drops before execution, the ranges retain their reservation across the batch, and the input frame holds the source text.
 Token payloads and tokenizer scratch still need admission.
 Whole-batch AST validation before execution remains required.
+PostgreSQL preparation consumes the classified AST with its original source and budget after parameter handling.
+The durable DML operation retains that source, and query execution still binds against its own snapshot.
 
 The direct source scalar reader materializes raw FixedBinary and UUID objects through its signed byte view.
 UUID demand copies the complete admitted inner span before the first or second relative read can fail.
 The returned UUID retains its own reservation after the temporary copy and its reservation drop.
 The borrowed Slice reader adds the signed start to the signed row before the underlying fixed-width reader calculates the byte offset, preserving the source wrapping operations.
 The returned byte view and pointer borrow the original owner through native span validation.
+The direct and first Slice guarded object paths read the signed validity byte before payload admission and return null without a destination lease.
 Existing-inner and selected-reader ownership still require source work.
 
 == Kafka connection state and paired Avro source checkpoint
