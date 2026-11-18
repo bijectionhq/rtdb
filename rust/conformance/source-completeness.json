@@ -235,7 +235,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete the remaining registered object families and their semantic equality, rendering and inspection consumers. Complete semantic STR and cast rendering and FORMAT beyond the reviewed root LocalDate, LocalTime and bounded ExceptionInfo arguments, including source Date locale and time-zone policy and the ExceptionInfo construction state used by readable text. Complete required Path provider environments."
+      "requirement": "Complete the remaining registered object families and their semantic equality, rendering and inspection consumers. Complete semantic STR and cast rendering and FORMAT beyond the reviewed root LocalDate, LocalTime, Duration, DayOfWeek, Month and bounded ExceptionInfo arguments, including source Date locale and time-zone policy and the ExceptionInfo construction state used by readable text. Complete required Path provider environments."
     },
     {
       "id": "physical-expression-schedules",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Extend the reviewed two-profile statement roots, control statements and constant SELECT tree schedules beyond numeric expressions, Boolean and NULL literals, raw and prefixed character strings, DATE and TIMESTAMP literals, aliases, the identifier family, isolation and empty-details windows, and the SLL DATE array and field paths. Extend native synchronization, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, host policy capture and production cache ownership. Reconcile the remaining whole-batch diagnostics, locale-dependent probes and deferred PREPARE execution through Extended Execute, and admit parsed ownership across every frontend."
+      "requirement": "Extend the reviewed two-profile statement roots, control statements and constant SELECT tree schedules beyond numeric expressions, Boolean and NULL literals, raw and prefixed character strings, raw binary strings, DATE, TIMESTAMP and INTERVAL literals, aliases, the identifier family, isolation and empty-details windows, and the SLL DATE array and field paths. Extend native synchronization, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, host policy capture and production cache ownership. Reconcile the remaining whole-batch diagnostics and locale-dependent probes. Retain classified SQL PREPARE children through Extended Execute and admit parsed ownership across every frontend."
     },
     {
       "id": "source-signed-binary-width",
@@ -287,7 +287,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete admission before retained tokenizer payload and scratch allocation, lexer and parser growth, AST construction and catalog-dependent binding. Preserve token-array replacement overlap, the overlap of retained tokens and syntax during Simple Query batch construction, and each syntax reservation until its tree is consumed. Complete coverage of retained syntax and control payload growth beyond the per-statement estimate. Reuse classified syntax during initial preparation in the remaining frontends and retain prepared outputs through their last owner. Cover remaining production preparation and operand allocations with the caller-owned finite budget."
+      "requirement": "Complete admission before retained tokenizer payload and scratch allocation, lexer and parser growth, AST construction and catalog-dependent binding. Preserve the located slots of elided comments, token-array replacement overlap, the overlap of retained tokens and syntax during Simple Query batch construction, and each syntax reservation until its tree is consumed or discarded. Complete coverage of retained syntax and control payload growth beyond the per-statement estimate. Reuse classified syntax during initial preparation in the remaining frontends and retain prepared outputs through their last owner. Cover remaining production preparation and operand allocations with the caller-owned finite budget."
     },
     {
       "id": "azure-desktop-credentials",
@@ -318,7 +318,7 @@
         "compaction_gc_adapters",
         "client_operational_surfaces"
       ],
-      "requirement": "Activate the same-input Avro pairing with exact JavaString schema input and source LogicalType construction, admitted graph/default and union materialization, MapEntry, qualified identity witnesses, and writer/SMT/cache owners. Preserve and reconcile the explicit null-default assertion conflict and qualify traversal beyond the native depth limit. Carry actual HTTP reads into the observed Registry parser windows with persistent symbol state, admitted nullable UTF16 schema, reference and rule consumers, and branch-specific version, cache and failure timing. Bind the existing connection timing, preferred DNS address, logical in-flight deque and source jitter to qualified live DNS, socket, clock, Selector and request lifecycle events, including Math results and throttle deadlines. Drive the updater, exact native connection request, fatal broadcasts and topic wait from the live sender, then apply the fixed partition, queue budget and append time in DLQ enqueue. Finish cache borrower locking and extend native admission beyond the parsed Metadata and fixed observation/control arenas to retained cache entries, live copies, rack scratch, admin output, construction, security and outbound/compression owners."
+      "requirement": "Activate the same-input Avro pairing with exact JavaString schema input and source LogicalType construction, admitted graph/default and union materialization, MapEntry, qualified identity witnesses, and writer/SMT/cache owners. Preserve and reconcile the explicit null-default assertion conflict and qualify traversal beyond the native depth limit. Carry actual HTTP reads into the observed Registry parser windows with persistent symbol state, admitted nullable UTF16 schema, reference and rule consumers, and branch-specific version, cache and failure timing. Bind the existing connection timing, preferred DNS address, logical in-flight deque and source jitter to qualified live DNS, socket, clock, Selector and request lifecycle events, including Math results and throttle deadlines. Drive the updater, exact native connection request, fatal broadcasts and topic wait from the live sender, then apply the fixed partition, queue budget and append time in DLQ enqueue. Audit remaining cache borrowers and extend native admission beyond the parsed Metadata and fixed observation/control arenas to retained cache entries, live copies, rack scratch, admin output, construction, security and outbound/compression owners."
     },
     {
       "id": "final-design-closure",
