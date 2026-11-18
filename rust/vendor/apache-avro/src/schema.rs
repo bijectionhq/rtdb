@@ -1733,7 +1733,7 @@ impl Parser<'_> {
 
         let namespace = &name.namespace;
 
-        if let Some(aliases) = aliases {
+        if let Some(aliases) = aliases.as_ref().filter(|_| self.name_policy.map_or(true, |policy| policy.named_aliases_are_references())) {
             aliases.iter().for_each(|alias| {
                 let alias_fullname = alias.fully_qualified_name(namespace);
                 self.resolving_schemas
@@ -1756,7 +1756,7 @@ impl Parser<'_> {
 
         let namespace = &fully_qualified_name.namespace;
 
-        if let Some(aliases) = aliases {
+        if let Some(aliases) = aliases.as_ref().filter(|_| self.name_policy.map_or(true, |policy| policy.named_aliases_are_references())) {
             aliases.iter().for_each(|alias| {
                 let alias_fullname = alias.fully_qualified_name(namespace);
                 self.resolving_schemas.remove(&alias_fullname);

@@ -22,6 +22,19 @@ pub trait SchemaNamePolicy {
         true
     }
 
+    /// Indexes named definition aliases for schema reference lookup by default.
+    /// Returning false retains alias metadata while resolving references by declared names only.
+    fn named_aliases_are_references(&self) -> bool {
+        true
+    }
+
+    /// Returns nominal references for logical Decimal definitions backed by named Fixed schemas when enabled.
+    /// The default preserves cloned logical-schema references.
+    /// The caller supplies the original Decimal definitions under their Fixed names to [`ResolvedSchema::new_with_known_schemata`] or an equivalent resolver.
+    fn logical_fixed_references_are_named(&self) -> bool {
+        false
+    }
+
     /// Validates one enum symbol before duplicate and default checks.
     fn enum_symbol(&self, symbol: &str) -> AvroResult<()>;
 
@@ -215,6 +228,13 @@ impl Parser<'_> {
     }
 
     fn scoped_reference(&self, parsed: &Schema) -> Schema {
+        if self.name_policy.is_some_and(|policy| policy.logical_fixed_references_are_named()) {
+            if let Schema::Decimal(decimal) = parsed {
+                if let Schema::Fixed(fixed) = decimal.inner.as_ref() {
+                    return Schema::Ref { name: fixed.name.clone() };
+                }
+            }
+        }
         let parsed = parsed.name().and_then(|name| self.parsed_schemas.get(name)).unwrap_or(parsed);
         match parsed {
             Schema::Record(record) => Schema::Ref { name: record.name.clone() },

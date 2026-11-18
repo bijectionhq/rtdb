@@ -1,0 +1,16 @@
+= Scoped declared and logical reference policies
+
+SchemaNamePolicy keeps named_aliases_are_references enabled and logical_fixed_references_are_named disabled by default.
+Existing global parsing and scoped policies retain their prior behavior.
+
+A policy can exclude named aliases from resolving/parsed reference indexes while retaining RecordSchema, EnumSchema and FixedSchema alias metadata.
+Declared names then remain independent when an alias matches another declaration, and an alias cannot resolve an in-progress recursive reference.
+Field alias indexing remains controlled separately by record_field_lookup_uses_aliases.
+
+A policy can preserve a named logical Decimal(Fixed) use as Schema::Ref instead of cloning the logical definition at every use.
+The caller retains and resolves that name through the original logical-definition owner.
+Schema::name and ordinary ResolvedSchema traversal do not discover Decimal's inner name automatically, so a consumer of this option supplies its known named logical schemas explicitly.
+The original definition retains its physical Fixed name, properties and reader aliases.
+
+Four additive regression functions cover default controls, parsed/resolving aliases, alias/declaration collisions and the owned logical-reference path.
+They are source fixtures only under the Phase 1 work order; no compiler or regression execution has been performed.

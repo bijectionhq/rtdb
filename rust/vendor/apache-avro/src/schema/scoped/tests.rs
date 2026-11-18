@@ -356,3 +356,67 @@ fn scoped_raw_field_lookup_keeps_reader_field_alias_compatibility() {
     assert!(!reader.lookup.contains_key("original"));
     assert!(crate::schema_compatibility::SchemaCompatibility::can_read(&Schema::Record(writer), &Schema::Record(reader)).is_ok());
 }
+
+struct DeclaredReferences;
+impl SchemaNamePolicy for DeclaredReferences {
+    fn name(&self, text: &str, namespace: &Namespace) -> AvroResult<Name> { OpenNames { fallback: true }.name(text, namespace) }
+    fn record_field(&self, name: &str) -> AvroResult<()> { OpenNames { fallback: true }.record_field(name) }
+    fn enum_symbol(&self, symbol: &str) -> AvroResult<()> { OpenNames { fallback: true }.enum_symbol(symbol) }
+    fn reference_fallback(&self, name: &str, namespace: &Namespace) -> AvroResult<Option<Name>> { OpenNames { fallback: true }.reference_fallback(name, namespace) }
+    fn named_aliases_are_references(&self) -> bool { false }
+    fn logical_fixed_references_are_named(&self) -> bool { true }
+}
+
+#[test]
+fn scoped_declared_references_exclude_alias_bindings_while_retaining_reader_metadata() {
+    let references = [r#"{"type":"enum","name":"ns.E","aliases":["OldE"],"symbols":["OK"]}"#];
+    assert!(Schema::parse_str_with_list_with_name_policy("\"ns.OldE\"", references, &OpenNames { fallback: true }).is_ok());
+    assert!(Schema::parse_str_with_list_with_name_policy("\"ns.OldE\"", references, &DeclaredReferences).is_err());
+    let (root, parsed) = Schema::parse_str_with_list_with_name_policy("\"ns.E\"", references, &DeclaredReferences).unwrap();
+    assert!(matches!(root, Schema::Ref { name } if name.fullname(None) == "ns.E"));
+    let Schema::Enum(enumeration) = &parsed[0] else { panic!("expected enum") };
+    assert_eq!(enumeration.aliases.as_ref().unwrap()[0].fullname(None), "ns.OldE");
+}
+
+#[test]
+fn scoped_declared_references_do_not_register_a_resolving_record_alias() {
+    let aliased = r#"{"type":"record","name":"ns.R","aliases":["OldR"],"fields":[{"name":"next","type":["null","OldR"]}]}"#;
+    assert!(Schema::parse_str_with_list_with_name_policy(aliased, Vec::<&str>::new(), &OpenNames { fallback: true }).is_ok());
+    assert!(Schema::parse_str_with_list_with_name_policy(aliased, Vec::<&str>::new(), &DeclaredReferences).is_err());
+    let declared = r#"{"type":"record","name":"ns.R","aliases":["OldR"],"fields":[{"name":"next","type":["null","R"]}]}"#;
+    let (root, _) = Schema::parse_str_with_list_with_name_policy(declared, Vec::<&str>::new(), &DeclaredReferences).unwrap();
+    ResolvedSchema::try_from(&root).unwrap();
+    let Schema::Record(record) = root else { panic!("expected record") };
+    let Schema::Union(union) = &record.fields[0].schema else { panic!("expected union") };
+    assert!(matches!(&union.variants()[1], Schema::Ref { name } if name == &record.name));
+}
+
+#[test]
+fn scoped_declared_names_remain_distinct_when_an_alias_matches_another_definition() {
+    let references = [r#"{"type":"fixed","name":"ns.A","aliases":["B"],"size":1}"#,
+        r#"{"type":"fixed","name":"ns.B","size":2}"#];
+    let (root, parsed) = Schema::parse_str_with_list_with_name_policy("[\"ns.A\",\"ns.B\"]", references, &DeclaredReferences).unwrap();
+    let Schema::Union(union) = root else { panic!("expected union") };
+    assert!(matches!(&union.variants()[0], Schema::Ref { name } if name.fullname(None) == "ns.A"));
+    assert!(matches!(&union.variants()[1], Schema::Ref { name } if name.fullname(None) == "ns.B"));
+    assert!(matches!(&parsed[0], Schema::Fixed(value) if value.size == 1));
+    assert!(matches!(&parsed[1], Schema::Fixed(value) if value.size == 2));
+}
+
+#[test]
+fn scoped_logical_fixed_references_can_preserve_nominal_identity_with_the_original_owner() {
+    let text = r#"{"type":"record","name":"R","fields":[{"name":"definition","type":{"type":"fixed","name":"Money","aliases":["OldMoney"],"size":2,"logicalType":"decimal","precision":4,"scale":2}},{"name":"reference","type":"Money"}]}"#;
+    let (ordinary, _) = Schema::parse_str_with_list_with_name_policy(text, Vec::<&str>::new(), &OpenNames { fallback: true }).unwrap();
+    let Schema::Record(ordinary) = ordinary else { panic!("expected record") };
+    assert!(matches!(&ordinary.fields[1].schema, Schema::Decimal(_)));
+    let (nominal, _) = Schema::parse_str_with_list_with_name_policy(text, Vec::<&str>::new(), &DeclaredReferences).unwrap();
+    let Schema::Record(nominal) = nominal else { panic!("expected record") };
+    let Schema::Decimal(decimal) = &nominal.fields[0].schema else { panic!("expected decimal") };
+    let Schema::Fixed(fixed) = decimal.inner.as_ref() else { panic!("expected fixed") };
+    assert_eq!(fixed.aliases.as_ref().unwrap()[0].fullname(None), "OldMoney");
+    assert!(matches!(&nominal.fields[1].schema, Schema::Ref { name } if name == &fixed.name));
+    let known = HashMap::from([(fixed.name.clone(), &nominal.fields[0].schema)]);
+    ResolvedSchema::new_with_known_schemata(vec![&nominal.fields[1].schema], &None, &known).unwrap();
+    assert!(OpenNames { fallback: true }.named_aliases_are_references());
+    assert!(!OpenNames { fallback: true }.logical_fixed_references_are_named());
+}
