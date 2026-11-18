@@ -278,3 +278,26 @@ The adapter captures runtime artifacts before execution and checks them again be
 The separate `rtdbConformanceHistoryAdapterTest` Gradle task exercises measurement ownership, successful/failed read accounting, canonical type tags and fixture identity validation.
 The runner and adapter sources remain under review, and no history runner, adapter test or comparison test has executed.
 Successful history selection does not reconcile the complete assertion ledger.
+
+== Mixed plain and run-end IID reference
+
+After Phase 2 opens, the reference observer selects the original mixed-IID test in the clean C84 checkout through Jovial.
+Run the command from the clean implementation checkout and choose a new output directory outside both checkouts.
+The original test controls the node lifecycle, transactions, flushes, compaction, data rewrite, relational queries, PATCH, pgwire and Flight SQL clients.
+The Gradle worker uses the reference test runtime and a fresh working directory outside both source checkouts.
+
+[source,shell]
+----
+python3 rust/conformance/run_mixed_iid_reference.py --phase-two \
+  --reference /absolute/path/to/pinned-reference \
+  --output /absolute/new/mixed-iid-reference
+----
+
+The receipt names the exact JUnit invocation and retains observations from each of its 14 original assertions.
+Result rows retain order, typed values, missing fields, and signed bytes for each fixed-size IID.
+It records the physical layout, page row and run counts, and byte digests at each original rewrite.
+At the original live-trie check it inspects the mixed-layout data files for `readings` that the test identified as live above level zero.
+The runner verifies the live file bytes, runtime closure, exact assertion set, and successful Jovial outcome before publishing the scoped reference result.
+A failed or incomplete worker run leaves its process logs and any available observations.
+This source prepares the reference side of the parity case.
+Portable checkpoint transfer and the paired native run, including both wire clients, remain pending.

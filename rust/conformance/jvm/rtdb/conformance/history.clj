@@ -68,7 +68,9 @@
          (sort-by :path)
          vec)))
 
-(defn- runtime-artifacts []
+(defn runtime-artifacts
+  "Returns a SHA-256 manifest for the running JVM's classpath entries, bin/java and lib/modules."
+  []
   (mapv (fn [^File file]
           (let [path (.toPath file)]
             (if (.isDirectory file)
