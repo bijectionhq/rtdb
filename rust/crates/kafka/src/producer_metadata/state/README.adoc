@@ -58,6 +58,8 @@ Primitive integer and UUID lookup operations have no externally supplied callbac
 The ordered receive operation consumes the oldest accepted body before field validation, applies the versioned throttle to the remaining flights and connection deadline, then applies metadata through the monitor with the captured request scope.
 Updater completion follows successful application.
 Native completion errors leave their logical flights available to the disconnect stage.
+Ordered send admits a logical flight envelope before touching the native request.
+Rejection releases proposed replacement capacity while preserving the current queue and admission.
 The sender must drive these stages and use `PreparedSend` for actual enqueue retries.
 ** Construction, broker/thread growth, automatic native metadata caches, ApiVersions sort storage, TLS/SASL, ordinary outbound owners and compression overlap need their own finite admitted domain.
 Receive-frame and ordered-request accounting do not bound those owners.

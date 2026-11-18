@@ -80,3 +80,27 @@ fn capacity_growth_admits_while_the_old_queue_is_live_and_denial_keeps_its_entri
     drop(queue);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn rejected_submission_releases_prospective_storage_without_installing_a_flight() {
+    let memory = MemoryBudget::new(1 << 16);
+    let mut queue = InFlightQueue::<i32>::new(1, memory.clone()).unwrap();
+    let rejected = queue.submit(|| {
+        assert!(memory.used_bytes() > 0);
+        Err("socket closed")
+    }).unwrap();
+    assert_eq!(rejected, Err("socket closed"));
+    assert_eq!(queue.count(), 0);
+    assert_eq!(memory.used_bytes(), 0);
+
+    let full = memory.reserve(memory.limit_bytes()).unwrap();
+    assert!(queue.submit::<()>(|| panic!("admission denied before submit")).is_err());
+    drop(full);
+    assert_eq!(memory.used_bytes(), 0);
+
+    queue.submit(|| Ok::<_, ()>(PendingRequest::new(1, 5, 10, true))).unwrap().unwrap();
+    assert!(queue.submit::<()>(|| panic!("capacity denied before submit")).is_err());
+    assert_eq!(queue.complete_next().unwrap().into_payload(), 1);
+    drop(queue);
+    assert_eq!(memory.used_bytes(), 0);
+}

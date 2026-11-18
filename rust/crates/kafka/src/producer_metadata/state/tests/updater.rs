@@ -16,8 +16,10 @@ enum Demand {
     Fatal,
 }
 
+type SendFixture<'a> = &'a mut dyn FnMut(MetadataRequest, i64);
+
 #[derive(Default)]
-struct Network {
+struct Network<'a> {
     demands: Vec<Demand>,
     draws: usize,
     ready_node: Option<i32>,
@@ -28,10 +30,10 @@ struct Network {
     connectable: bool,
     unsupported_version: bool,
     reject_fatal: bool,
-    accepted_request: Option<MetadataRequest>,
+    send: Option<SendFixture<'a>>,
 }
 
-impl ConnectionObservations<Node> for Network {
+impl ConnectionObservations<Node> for Network<'_> {
     fn next_offset(&mut self, bound: i32) -> rtdb_types::Result<i32> {
         assert_eq!(bound, 1);
         self.demands.push(Demand::Offset);
@@ -74,7 +76,7 @@ impl ConnectionObservations<Node> for Network {
     }
 }
 
-impl MetadataNetwork for Network {
+impl MetadataNetwork for Network<'_> {
     fn is_connecting(&mut self, _: &Node) -> rtdb_types::Result<bool> {
         self.demands.push(Demand::Connecting);
         Ok(self.connecting)
@@ -85,12 +87,12 @@ impl MetadataNetwork for Network {
         Ok(())
     }
 
-    fn send_metadata(&mut self, _: &Node, request: MetadataRequest, _: i64) -> rtdb_types::Result<SendMetadata> {
+    fn send_metadata(&mut self, _: &Node, request: MetadataRequest, now_ms: i64) -> rtdb_types::Result<SendMetadata> {
         self.demands.push(Demand::Send(request.scope()));
         if self.unsupported_version {
             Ok(SendMetadata::UnsupportedVersion(Anomaly::unsupported("fixture/metadata-version", "No usable Metadata version")))
         } else {
-            self.accepted_request = Some(request);
+            if let Some(send) = &mut self.send { send(request, now_ms); }
             Ok(SendMetadata::Accepted)
         }
     }
@@ -168,7 +170,7 @@ fn updater() -> MetadataUpdater {
 
 fn tick(
     updater: &mut MetadataUpdater, producer: &mut ProducerMetadata, now_ms: i64, math: &mut Math,
-    shuffle: &mut Shuffle, network: &mut Network,
+    shuffle: &mut Shuffle, network: &mut Network<'_>,
 ) -> i64 {
     updater.maybe_update(producer, now_ms, math, &mut NoIdentityWitness, shuffle, network).unwrap()
 }
@@ -192,23 +194,30 @@ fn observed_response_retires_the_request_and_publishes_the_matching_scope_once()
     let mut shuffle = Shuffle::default();
     let mut producer = producer_with_cluster(&mut math, &mut shuffle, true);
     producer.add_topic("original", 90, &mut NoIdentityWitness).unwrap();
-    let mut updater = updater();
-    let mut network = Network { ready_node: Some(-1), capacity: true, ..Network::default() };
-    assert_eq!(tick(&mut updater, &mut producer, 100, &mut math, &mut shuffle, &mut network), 300);
-    let request = network.accepted_request.take().unwrap();
-    assert_eq!(updater.in_progress(), Some(request.scope()));
-    let monitor = MetadataMonitor::new(producer).unwrap();
+    let request_timeout_ms = 5000;
+    let mut updater = MetadataUpdater::new(UpdateSettings {
+        request_timeout_ms, reconnect_backoff_ms: 50, bootstrap_enabled: true, rebootstrap_enabled: true,
+    });
+    let expected_scope = producer.request(100).unwrap().scope();
     let queue_budget = MemoryBudget::new(1 << 16);
     let mut flights = InFlightQueue::new(1, queue_budget.clone()).unwrap();
+    let port = port.parse().unwrap();
+    {
+        let mut send = |request: MetadataRequest, sent_ms| {
+            let observation = ready_observation(&native, host, port);
+            request.submit_in_flight(&mut flights, observation, 65536, sent_ms, request_timeout_ms).unwrap();
+        };
+        let mut network = Network { ready_node: Some(-1), capacity: true, send: Some(&mut send), ..Network::default() };
+        assert_eq!(tick(&mut updater, &mut producer, 100, &mut math, &mut shuffle, &mut network), i64::from(request_timeout_ms));
+    }
+    assert_eq!(updater.in_progress(), Some(expected_scope));
+    let monitor = MetadataMonitor::new(producer).unwrap();
     let connection_backoffs = ConnectionBackoffs::new(ConnectionSettings {
         reconnect_ms: 10, reconnect_max_ms: 10, setup_ms: 20, setup_max_ms: 20,
     }, &mut math);
     let mut connection = connection_backoffs.connecting::<()>(99, &mut math);
     connection.ready(&connection_backoffs, &mut math);
 
-    let observation = ready_observation(&native, host, port.parse().unwrap());
-    let exchange = request.submit_observed(observation, 65536, Duration::from_secs(5)).unwrap();
-    flights.add(PendingRequest::new(exchange, 100, 300, true)).unwrap();
     assert!(flights.complete_send().unwrap().is_none());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut poll = |flights: &mut InFlightQueue<MetadataExchange>| {

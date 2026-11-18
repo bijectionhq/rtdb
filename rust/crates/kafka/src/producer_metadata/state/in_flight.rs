@@ -61,6 +61,28 @@ impl<T> InFlightQueue<T> {
     /// Queue admission covers envelope storage; the network caller enforces [`Self::can_send_more`] before accepting a send.
     /// A denial drops the proposed request and leaves all existing requests intact.
     pub fn add(&mut self, request: PendingRequest<T>) -> Result<()> {
+        let replacement = self.reserve_slot()?;
+        self.install_request(request, replacement);
+        Ok(())
+    }
+
+    pub(super) fn submit<E>(
+        &mut self, send: impl FnOnce() -> std::result::Result<PendingRequest<T>, E>,
+    ) -> Result<std::result::Result<(), E>> {
+        if !self.can_send_more() {
+            return Err(Anomaly::incorrect("rtdb/kafka-in-flight-capacity", "Connection has no eligible in-flight request slot"));
+        }
+        let replacement = self.reserve_slot()?;
+        match send() {
+            Ok(request) => {
+                self.install_request(request, replacement);
+                Ok(Ok(()))
+            }
+            Err(rejected) => Ok(Err(rejected)),
+        }
+    }
+
+    fn reserve_slot(&self) -> Result<Option<Storage<T>>> {
         if self.count() == i32::MAX {
             return Err(Anomaly::unsupported("rtdb/kafka-in-flight-size", "Java request queues require a signed int length"));
         }
@@ -70,13 +92,20 @@ impl<T> InFlightQueue<T> {
             let lease = self.budget.reserve(bytes::<PendingRequest<T>>(next)?)?;
             let mut requests = VecDeque::new();
             requests.try_reserve_exact(next).map_err(|_| allocation_failed())?;
+            Ok(Some(Storage { requests, _lease: lease }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn install_request(&mut self, request: PendingRequest<T>, replacement: Option<Storage<T>>) {
+        if let Some(mut replacement) = replacement {
             if let Some(mut previous) = self.storage.take() {
-                requests.append(&mut previous.requests);
+                replacement.requests.append(&mut previous.requests);
             }
-            self.storage = Some(Storage { requests, _lease: lease });
+            self.storage = Some(replacement);
         }
         self.storage.as_mut().expect("queue storage admitted").requests.push_back(request);
-        Ok(())
     }
 
     /// Returns the source connection request count in the signed int domain.

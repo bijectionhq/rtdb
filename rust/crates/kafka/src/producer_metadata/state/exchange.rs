@@ -11,7 +11,8 @@ use rdkafka::{
 
 use super::{
     Budget, Failure, IdentityWitness, InFlightQueue, JavaShuffleObservations, MetadataMonitor,
-    MetadataRequest, MetadataUpdater, Outcome, ProducerMetadata, RequestScope, ResponseAction, Vector,
+    MetadataRequest, MetadataUpdater, Outcome, PendingRequest, ProducerMetadata, RequestScope,
+    ResponseAction, Vector,
 };
 
 /// The native destination established by the producer's connection selection.
@@ -115,6 +116,27 @@ impl MetadataRequest {
         let native = observation.into_metadata(descriptors.as_slice(), response_capacity, timeout)
             .map_err(SubmissionFailure::Transport)?;
         Ok(MetadataExchange { scope: self.scope(), request: native })
+    }
+
+    /// Admits the logical flight before sending the original request on the observed connection.
+    /// Run after the selector has qualified this connection for send.
+    /// The observation, configured client and `response_capacity` follow [`Self::submit_observed`].
+    /// `sent_ms` is the signed source millisecond send time and `timeout_ms` is the positive request timeout in milliseconds.
+    /// Queue and descriptor admission failures precede native submission errors.
+    /// Rejection preserves the queue and drops replacement capacity proposed for this send.
+    pub fn submit_in_flight(
+        self,
+        flights: &mut InFlightQueue<MetadataExchange>,
+        observation: NativeConnectionObservation<'_>,
+        response_capacity: usize,
+        sent_ms: i64,
+        timeout_ms: i32,
+    ) -> std::result::Result<(), SubmissionFailure> {
+        let millis = u64::try_from(timeout_ms).map_err(|_| SubmissionFailure::Transport(OrderedMetadataError::InvalidTimeout))?;
+        flights.submit(|| {
+            self.submit_observed(observation, response_capacity, Duration::from_millis(millis))
+                .map(|exchange| PendingRequest::new(exchange, sent_ms, timeout_ms, true))
+        }).map_err(|failure| SubmissionFailure::Preparation(failure.into()))?
     }
 }
 
