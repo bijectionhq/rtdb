@@ -57,7 +57,8 @@ impl Service {
             return execute_control_update(native, control.statement(), arguments.as_ref(), &token).await;
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
-        let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
+        let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
+            .map_err(|error| initial_prepare_status(source, error, &context.memory))?;
         execute_prepared_update(native, &prepared, arguments).await
     }
 

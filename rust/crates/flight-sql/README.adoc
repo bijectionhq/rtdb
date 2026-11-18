@@ -61,7 +61,7 @@ The node's PostgreSQL TLS configuration does not apply to this endpoint.
 
 GetFlightInfo captures a query's SQL, database, optional parameter IPC, and explicit read basis into the Kotlin-compatible JSON ticket inside `TicketStatementQuery`.
 It keeps the connection borrowed through statement classification, basis capture, and schema preparation against that basis.
-GetFlightInfo, GetSchema and CreatePreparedStatement use the same selected Direct parser diagnostics for initial preparation.
+GetFlightInfo, GetSchema, CreatePreparedStatement and DoPut statement updates use the same selected Direct parser diagnostics for initial preparation.
 When the vendor parser rejects a first unquoted ASCII identifier outside both vocabularies, the frontend compares the byte range and accepts a matching extraneous-input or statement-head mismatch report.
 The gRPC description carries the report’s line, column and message.
 Anomaly metadata includes the message, category `incorrect` and code `xtdb/sql-error` when its encoding fits the 4 KiB limit.

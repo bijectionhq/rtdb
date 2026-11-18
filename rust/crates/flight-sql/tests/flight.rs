@@ -297,6 +297,26 @@ async fn schema_and_prepare_report_direct_parser_errors_and_keep_the_flight_sess
 }
 
 #[tokio::test]
+async fn uploaded_statement_errors_keep_direct_diagnostics_and_allow_the_next_update() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for (sql, diagnostic) in [
+        ("SELEC 1", "mismatched input 'SELEC'"),
+        ("extra SELECT 1", "extraneous input 'extra'"),
+    ] {
+        let command = CommandStatementUpdate { query: sql.into(), transaction_id: None };
+        let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+        let data = arrow_flight::FlightData { flight_descriptor: Some(descriptor), ..Default::default() };
+        let request = client.request(futures::stream::iter([data]));
+        let error = client.client.do_put(request).await.unwrap_err();
+        assert_initial_sql_diagnostic(&error, diagnostic);
+    }
+    client.update("INSERT INTO docs (_id,n) VALUES (1,42)", None).await;
+    assert_eq!(integer(&client.query("SELECT n FROM docs WHERE _id = 1").await[0], 0, 0), 42);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn get_schema_keeps_the_existing_later_statement_error_and_span() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
