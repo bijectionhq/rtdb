@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use super::*;
 
 #[cfg(test)]
@@ -9,10 +10,15 @@ pub(crate) enum SourceScalarReadFailure {
     ValidityByteBounds { offset: i32, capacity: usize },
     LongLongLaneBounds { offset: i32, capacity: usize },
     LongLongReceiverClass { declaration: SourceScalarDeclaration },
+    PointerComparisonNegativeLength { operand: PointerComparisonOperand, length: i64 },
+    PointerComparisonBounds { operand: PointerComparisonOperand, offset: i64, length: i64, capacity: usize },
     NegativeViewLength(i64),
     UuidFirstLongUnderflow,
     UuidSecondLongUnderflow,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerComparisonOperand { Left, Right }
 
 #[derive(Debug)]
 pub(crate) enum SourceScalarReadError { Reference(SourceScalarReadFailure), Native(Anomaly) }
@@ -180,6 +186,21 @@ impl<'a> SourceBytePointer<'a> {
     pub(super) fn int(backing: &'a [u8], row: i32) -> Self { Self { backing, offset: i64::from(row.wrapping_mul(4)), length: 4 } }
     pub(crate) fn offset(&self) -> i64 { self.offset }
     pub(crate) fn length(&self) -> i64 { self.length }
+    pub(crate) fn compare_to(&self, right: &SourceBytePointer<'_>) -> SourceScalarReadResult<Ordering> {
+        let left = self.comparison_span(PointerComparisonOperand::Left)?;
+        let right = right.comparison_span(PointerComparisonOperand::Right)?;
+        Ok(left.cmp(right))
+    }
+    fn comparison_span(&self, operand: PointerComparisonOperand) -> SourceScalarReadResult<&'a [u8]> {
+        let length = usize::try_from(self.length)
+            .map_err(|_| SourceScalarReadError::Reference(SourceScalarReadFailure::PointerComparisonNegativeLength {
+                operand, length: self.length,
+            }))?;
+        retained_span(self.backing, self.offset, length)
+            .ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::PointerComparisonBounds {
+                operand, offset: self.offset, length: self.length, capacity: self.backing.len(),
+            }))
+    }
     pub(crate) fn demand_native(&self) -> SourceScalarReadResult<&'a [u8]> {
         let length = usize::try_from(self.length).map_err(|_| unretained())?;
         demand(self.backing, self.offset, length)
@@ -195,8 +216,12 @@ impl<'a> SourceByteView<'a> {
 }
 
 fn demand(backing: &[u8], offset: i64, length: usize) -> SourceScalarReadResult<&[u8]> {
-    let offset = usize::try_from(offset).map_err(|_| unretained())?;
-    let end = offset.checked_add(length).ok_or_else(unretained)?;
-    backing.get(offset..end).ok_or_else(unretained)
+    retained_span(backing, offset, length).ok_or_else(unretained)
+}
+
+fn retained_span(backing: &[u8], offset: i64, length: usize) -> Option<&[u8]> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.checked_add(length)?;
+    backing.get(offset..end)
 }
 fn unretained() -> SourceScalarReadError { SourceScalarReadError::Native(Anomaly::incorrect("rtdb/unretained-byte-view", "Source byte view exceeds retained native storage")) }

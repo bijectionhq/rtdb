@@ -302,7 +302,7 @@ Time getBytes retains its source unsupported-method failure; raw Time primitive,
 `SourceScalarReadError::Reference` preserves unsupported methods, negative view lengths and the first or second UUID long-read underflow producer.
 `demand_native()` separately checks the complete retained span and returns native `rtdb/unretained-byte-view` admission before borrowing payload bytes.
 Facts and admitted slices borrow the actual writer/vector region and may outlive intermediate reader/view variables while that owner borrow remains live.
-Raw addresses, mutable backing aliases, relative ByteBuffer cursors, pointer comparison and hash operations remain outside this surface.
+Raw addresses, mutable backing aliases, relative ByteBuffer cursors, pointer equality and hash operations remain outside this surface.
 Existing checked Cell and ScalarReader logical row gates remain separate, using actual native widths at their native byte-admission boundary.
 The checked UUID `Value` adapter requires exactly 16 bytes.
 
@@ -320,7 +320,13 @@ The returned exclusive borrow refers to the same slot.
 The replacement backing outlives the lifetime carried by the pointer.
 The exclusive borrow of the slot can end earlier.
 A byte slice previously demanded from the slot continues to borrow its original backing after retargeting.
-Signed pointer facts are installed before retained-span validation at `demand_native`.
+Retargeting installs the signed pointer facts without checking the retained span.
+
+`compare_to` compares two backed pointer facts under the Arrow 19 enabled-bounds profile.
+It checks the full left span before the full right span, rejecting each negative length before its capacity check.
+Reference failures identify the operand, with signed offset, length and retained capacity for a span outside capacity.
+After both spans have passed, comparison orders unsigned bytes lexicographically.
+If the shorter span is a prefix of the longer span, it sorts first.
 
 `SourceScalarReader::binary_object0` materializes a FixedBinary or UUID object from its signed byte address.
 The same raw demand applies to null rows and wrapped row offsets.
@@ -396,7 +402,8 @@ The four parameterized `SourceScalarDeclaration` cases and strict SDK constructi
 `SourceBytePointer::from_int_arrow19_default` requires the retained Int constructor class under a direct native reader with identity addressing.
 The mutable scalar `source_int_pointer` bridge also permits inspection of a `NativeAborted` prefix without changing its gate.
 Pointer formation retains a signed wrapped i32 row-times-four offset and length four without checking count, validity or payload span.
-Only `demand_native` admits the retained bytes; facts and demanded bytes borrow the actual owner and expose no raw address or mutable alias.
+`demand_native` borrows bytes after checking the retained span, and `compare_to` checks both spans before comparing them.
+Facts and demanded bytes borrow the actual owner and expose no raw address or mutable alias.
 Rounded padding can therefore be demanded through this source pointer path even when the ordinary checked cell boundary rejects that logical row.
 An Int-produced pointer can supply the slot retargeted by a direct source scalar reader or first signed Slice.
 Int source getBytes, primitive null/NPE/object/metadata reads, mutable aliases and retargeting from an Int reader remain outside this byte-fact surface.

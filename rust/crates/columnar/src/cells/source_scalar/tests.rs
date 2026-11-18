@@ -1791,3 +1791,128 @@ fn reused_int_pointer_accepts_uuid_inner_width_and_time_pointer_forwarding() {
     drop((int, uuid, time));
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn source_pointer_comparison_orders_unsigned_bytes_at_lane_and_tail_boundaries() {
+    let memory = memory();
+    for (width, differing_byte) in [(80usize, 7), (76, 65), (76, 73), (79, 78)] {
+        let declaration = SourceScalarDeclaration::FixedBinary(i32::try_from(width).unwrap());
+        let mut high = [0x35u8; 80];
+        let mut low = high;
+        high[differing_byte] = 0x80;
+        low[differing_byte] = 0x7f;
+        let mut left = writer(declaration, false, &memory);
+        left.write_bytes(&high[..width]).unwrap();
+        let mut right = writer(declaration, false, &memory);
+        right.write_bytes(&low[..width]).unwrap();
+        let right = right.finish().unwrap();
+
+        let blocker = block(&memory, 0);
+        let used = memory.used_bytes();
+        let peak = memory.peak_bytes();
+        let high = left.source_reader().unwrap().unwrap().get_pointer(0);
+        let low = SourceScalarReader::new(&right).unwrap().unwrap().slice(-1, 0).get_pointer(1);
+        assert_eq!(high.compare_to(&low).unwrap(), Ordering::Greater);
+        assert_eq!(low.compare_to(&high).unwrap(), Ordering::Less);
+        assert_eq!(memory.used_bytes(), used);
+        assert_eq!(memory.peak_bytes(), peak);
+        drop((blocker, left, right));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn source_pointer_comparison_orders_equal_prefixes_by_length() {
+    let memory = memory();
+    let mut short = writer(SourceScalarDeclaration::FixedBinary(5), false, &memory);
+    short.write_bytes(&[255, 17, 51, 8, 0]).unwrap();
+    let mut copy = writer(SourceScalarDeclaration::FixedBinary(5), false, &memory);
+    copy.write_bytes(&[255, 17, 51, 8, 0]).unwrap();
+    let copy = copy.finish().unwrap();
+    let mut long = writer(SourceScalarDeclaration::FixedBinary(6), false, &memory);
+    long.write_bytes(&[255, 17, 51, 8, 0, 0]).unwrap();
+    let empty_owner = writer(SourceScalarDeclaration::FixedBinary(0), false, &memory);
+    let empty_copy = writer(SourceScalarDeclaration::FixedBinary(0), false, &memory).finish().unwrap();
+
+    let shorter = short.source_reader().unwrap().unwrap().get_pointer(0);
+    let equal = SourceScalarReader::new(&copy).unwrap().unwrap().get_pointer(0);
+    let longer = long.source_reader().unwrap().unwrap().get_pointer(0);
+    let zero = empty_owner.source_reader().unwrap().unwrap().get_pointer(i32::MIN);
+    let zero_copy = SourceScalarReader::new(&empty_copy).unwrap().unwrap().get_pointer(i32::MAX);
+    assert_eq!(shorter.compare_to(&equal).unwrap(), Ordering::Equal);
+    assert_eq!(shorter.compare_to(&longer).unwrap(), Ordering::Less);
+    assert_eq!(longer.compare_to(&shorter).unwrap(), Ordering::Greater);
+    assert_eq!(zero.compare_to(&zero_copy).unwrap(), Ordering::Equal);
+    assert_eq!(zero.compare_to(&longer).unwrap(), Ordering::Less);
+    assert_eq!(longer.compare_to(&zero).unwrap(), Ordering::Greater);
+    drop((short, copy, long, empty_owner, empty_copy));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn source_pointer_comparison_validates_both_operands_in_arrow_order() {
+    let memory = memory();
+    let signed = writer(SourceScalarDeclaration::FixedBinary(-1), false, &memory);
+    let empty_owner = writer(SourceScalarDeclaration::FixedBinary(0), false, &memory);
+    let mut oversized = writer(SourceScalarDeclaration::FixedBinary(256), false, &memory);
+    oversized.write_bytes(&[0x80]).unwrap();
+    let oversized = oversized.finish().unwrap();
+    let capacity = data(&oversized).bytes.as_slice().len();
+    assert!(capacity < 256);
+    let mut valid = writer(SourceScalarDeclaration::FixedBinary(1), false, &memory);
+    valid.write_bytes(&[0x7f]).unwrap();
+    valid.write_bytes(&[0x80]).unwrap();
+    valid.write_bytes(&[0x20]).unwrap();
+    let valid = valid.finish().unwrap();
+
+    let blocker = block(&memory, 0);
+    let used = memory.used_bytes();
+    let peak = memory.peak_bytes();
+    let negative = signed.source_reader().unwrap().unwrap().slice(i32::MAX, 0).get_pointer(1);
+    assert_eq!((negative.offset(), negative.length()), (i64::from(i32::MIN), -1));
+    let oversized_reader = SourceScalarReader::new(&oversized).unwrap().unwrap();
+    let oversized_pointer = oversized_reader.get_pointer(0);
+    let empty = empty_owner.source_reader().unwrap().unwrap().get_pointer(0);
+    let valid_reader = SourceScalarReader::new(&valid).unwrap().unwrap();
+    let left = valid_reader.get_pointer(0);
+    let left_negative = SourceScalarReadFailure::PointerComparisonNegativeLength {
+        operand: PointerComparisonOperand::Left, length: -1,
+    };
+    let right_negative = SourceScalarReadFailure::PointerComparisonNegativeLength {
+        operand: PointerComparisonOperand::Right, length: -1,
+    };
+    let left_bounds = SourceScalarReadFailure::PointerComparisonBounds {
+        operand: PointerComparisonOperand::Left, offset: 0, length: 256, capacity,
+    };
+    let right_bounds = SourceScalarReadFailure::PointerComparisonBounds {
+        operand: PointerComparisonOperand::Right, offset: 0, length: 256, capacity,
+    };
+    read_reference(negative.compare_to(&oversized_pointer), left_negative);
+    read_reference(negative.compare_to(&negative), left_negative);
+    read_reference(oversized_pointer.compare_to(&negative), left_bounds);
+    read_reference(left.compare_to(&negative), right_negative);
+    read_reference(left.compare_to(&oversized_pointer), right_bounds);
+    read_reference(empty.compare_to(&oversized_pointer), right_bounds);
+    read_reference(left.compare_to(&valid_reader.get_pointer(-1)),
+        SourceScalarReadFailure::PointerComparisonBounds {
+            operand: PointerComparisonOperand::Right, offset: -1, length: 1,
+            capacity: data(&valid).bytes.as_slice().len(),
+        });
+    read_native(oversized_pointer.demand_native());
+
+    let mut slot = valid_reader.get_pointer(1);
+    let slot_address = std::ptr::from_ref(&slot);
+    let old_bytes = slot.demand_native().unwrap();
+    let reused = oversized_reader.get_pointer_into(0, &mut slot);
+    assert_eq!(std::ptr::from_ref(reused), slot_address);
+    read_reference(left.compare_to(reused), right_bounds);
+    let slice = valid_reader.slice(3, -1);
+    let reused = slice.get_pointer_into(-1, &mut slot);
+    assert_eq!(std::ptr::from_ref(reused), slot_address);
+    assert_eq!(left.compare_to(reused).unwrap(), Ordering::Greater);
+    assert_eq!(old_bytes, &[0x80u8]);
+    assert_eq!(memory.used_bytes(), used);
+    assert_eq!(memory.peak_bytes(), peak);
+    drop((blocker, signed, empty_owner, oversized, valid));
+    assert_eq!(memory.used_bytes(), 0);
+}
