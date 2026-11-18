@@ -31,6 +31,11 @@ struct Importer<'a, 'b, 'c> {
     memory: &'b Arc<MemoryBudget>,
 }
 
+enum TableRow<'a> {
+    Literal(BTreeMap<&'a str, &'a Edn>),
+    Argument(PExpr),
+}
+
 impl Importer<'_, '_, '_> {
     fn relation(mut self, form: &Edn) -> Result<Arc<Relation>> { self.lower(form) }
 
@@ -49,6 +54,7 @@ impl Importer<'_, '_, '_> {
             }
             ("project" | "π" | "pi" | "map" | "ⲭ" | "chi", [input]) => self.project(options, input, matches!(op, "map" | "ⲭ" | "chi"))?,
             ("sort", [input]) => self.sort(options, input)?,
+            ("union-all" | "∪", [left, right]) => self.union_all(left, right)?,
             ("distinct" | "δ", [input]) => {
                 let input = self.lower(input)?;
                 Relation::new(input.schema().clone(), RelationNode::Distinct { input })?
@@ -69,22 +75,36 @@ impl Importer<'_, '_, '_> {
     }
 
     fn table(&mut self, options: &Edn) -> Result<Relation> {
-        let source = required(options, "rows")?;
+        match (options.option("rows"), options.option("column"), options.option("param")) {
+            (Some(rows), None, None) => self.row_table(options, rows),
+            (None, Some(column), None) => self.column_table(options, column),
+            (None, None, Some(parameter)) => self.argument_table(options, parameter),
+            _ => Err(invalid("Logical table requires exactly one of :rows, :column, and :param")),
+        }
+    }
+
+    fn row_table(&mut self, options: &Edn, source: &Edn) -> Result<Relation> {
+        let mut input = Bound::unit();
+        let mut inferred = BTreeSet::new();
         let rows = sequence(source)?.iter().map(|row| {
+            if row.symbol().is_some_and(|name| name.starts_with('?')) {
+                let parameter = self.scalar(row, &mut input)?;
+                inferred.extend(struct_names(&parameter.data_type()));
+                return Ok(TableRow::Argument(parameter));
+            }
             let mut columns = BTreeMap::new();
             for (name, cell) in row.map().ok_or_else(|| invalid("Table rows must be maps"))? {
                 let name = name.symbol().or_else(|| name.keyword()).ok_or_else(|| invalid("Table field name must be a symbol or keyword"))?;
                 if columns.insert(name, cell).is_some() { return Err(invalid("Duplicate logical table field")); }
             }
-            Ok(columns)
+            inferred.extend(columns.keys().map(|name| (*name).to_owned()));
+            Ok(TableRow::Literal(columns))
         }).collect::<Result<Vec<_>>>()?;
-        let columns = match options.option("output-cols") {
-            Some(columns) => sequence(columns)?.iter().map(column_name).collect::<Result<Vec<_>>>()?,
-            None => rows.iter().flat_map(|row| row.keys().copied()).collect::<BTreeSet<_>>().into_iter().collect(),
-        };
-        let mut input = Bound::unit();
-        let rows = rows.into_iter().map(|row| columns.iter().map(|column| {
-            row.get(*column).map(|form| self.scalar(form, &mut input)).transpose().map(|value| value.unwrap_or(PExpr::Literal(Value::Null)))
+        let columns = output_names(options, inferred)?;
+        let rows = rows.into_iter().map(|row| columns.iter().map(|column| match &row {
+            TableRow::Literal(fields) => fields.get(column.as_str()).map(|form| self.scalar(form, &mut input))
+                .transpose().map(|value| value.unwrap_or(PExpr::Literal(Value::Null))),
+            TableRow::Argument(parameter) => Ok(get_field(parameter, column)),
         }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
         let fields = columns.into_iter().enumerate().map(|(position, name)| {
             let types = rows.iter().map(|row| row[position].data_type()).collect::<Vec<_>>();
@@ -92,6 +112,47 @@ impl Importer<'_, '_, '_> {
             self.compiler.binder.field(name, None, data_type)
         }).collect::<Result<Vec<_>>>()?;
         Relation::new(Schema::new(fields)?, RelationNode::Values { rows })
+    }
+
+    fn column_table(&mut self, options: &Edn, column: &Edn) -> Result<Relation> {
+        let Some([(name, form)]) = column.map() else { return Err(invalid("Table column must be a one-entry map")); };
+        let name = column_name(name)?;
+        let expr = self.scalar(form, &mut Bound::unit())?;
+        let element = self.compiler.binder.field(name, None, list_element(&expr.data_type()))?;
+        let input = Relation::new(Schema::new(vec![element.clone()])?, RelationNode::ColumnTable { expr, element: element.clone() })?;
+        let Some(columns) = options.option("output-cols") else { return Ok(input); };
+        let expressions = sequence(columns)?.iter().map(|column| {
+            let column = column_name(column)?;
+            if column == name { return Ok(NamedExpr { field: element.clone(), expr: element.expression() }); }
+            Ok(NamedExpr { field: self.compiler.binder.field(column, None, LogicalType::Null)?, expr: PExpr::Literal(Value::Null) })
+        }).collect::<Result<Vec<_>>>()?;
+        Arc::new(input).project(expressions)
+    }
+
+    fn argument_table(&mut self, options: &Edn, parameter: &Edn) -> Result<Relation> {
+        if !parameter.symbol().is_some_and(|name| name.starts_with('?')) { return Err(invalid("Table argument requires a parameter symbol")); }
+        let expr = self.scalar(parameter, &mut Bound::unit())?;
+        for ty in expr.data_type().legs() {
+            let invalid_type = || error("illegal-param-type", "Table param must be of type struct list");
+            match ty {
+                LogicalType::Null | LogicalType::Nothing => (),
+                LogicalType::List { kind: ListKind::List, element } => {
+                    if element.legs().iter().any(|ty| !matches!(ty, LogicalType::Null | LogicalType::Nothing | LogicalType::Struct(_))) {
+                        return Err(invalid_type());
+                    }
+                }
+                _ => return Err(invalid_type()),
+            }
+        }
+        let element_type = list_element(&expr.data_type());
+        let columns = output_names(options, struct_names(&element_type))?;
+        let element = self.compiler.binder.field("xt$document", None, element_type)?;
+        let input = Arc::new(Relation::new(Schema::new(vec![element.clone()])?, RelationNode::ColumnTable { expr, element: element.clone() })?);
+        let expressions = columns.iter().map(|name| {
+            let expr = get_field(&element.expression(), name);
+            Ok(NamedExpr { field: self.compiler.binder.field(name, None, expr.data_type())?, expr })
+        }).collect::<Result<Vec<_>>>()?;
+        input.project(expressions)
     }
 
     fn project(&mut self, options: &Edn, input: &Edn, is_map: bool) -> Result<Relation> {
@@ -151,10 +212,46 @@ impl Importer<'_, '_, '_> {
         if order_by.is_empty() { return input.limit(offset, fetch); }
         Relation::new(input.schema().clone(), RelationNode::SortLimit { input, order_by, offset, fetch })
     }
+
+    fn union_all(&mut self, left: &Edn, right: &Edn) -> Result<Relation> {
+        let left = self.lower(left)?;
+        let right = self.lower(right)?;
+        let left_fields = left.schema().fields();
+        let right_fields = right.schema().fields();
+        let names = |fields: &[Field]| fields.iter().map(|field| field.name.clone()).collect::<BTreeSet<_>>();
+        if names(left_fields) != names(right_fields) { return Err(error("union-incompatible-cols", "union incompatible cols")); }
+        let mut schema = Vec::with_capacity(left_fields.len());
+        let mut projections = Vec::with_capacity(left_fields.len());
+        for field in left_fields {
+            let right = right.schema().resolve(&[Identifier::quoted(&field.name)])?;
+            let mut output = field.clone();
+            output.data_type = output.data_type.join(&right.data_type);
+            schema.push(output);
+            projections.push(NamedExpr { field: right.clone(), expr: right.expression() });
+        }
+        let right = if projections.iter().map(|projection| &projection.field).eq(right_fields.iter()) { right }
+            else { Arc::new(right.project(projections)?) };
+        Relation::new(Schema::new(schema)?, RelationNode::Set { left, right, operator: SetOperator::Union, all: true })
+    }
 }
 
 fn bind_input(relation: &Arc<Relation>) -> Bound {
     Bound { relation: Arc::clone(relation), variables: relation.schema().fields().iter().map(|field| (field.name.clone(), field.clone())).collect() }
+}
+
+fn output_names(options: &Edn, inferred: BTreeSet<String>) -> Result<Vec<String>> {
+    match options.option("output-cols") {
+        Some(columns) => sequence(columns)?.iter().map(|column| column_name(column).map(str::to_owned)).collect(),
+        None => Ok(inferred.into_iter().collect()),
+    }
+}
+
+fn struct_names(data_type: &LogicalType) -> BTreeSet<String> {
+    data_type.legs().into_iter().filter_map(|ty| match ty { LogicalType::Struct(fields) => Some(fields.into_keys()), _ => None }).flatten().collect()
+}
+
+fn get_field(object: &PExpr, name: &str) -> PExpr {
+    PExpr::Field { expr: Box::new(object.clone()), name: name.to_owned(), data_type: field_type(&object.data_type(), name) }
 }
 
 fn required<'a>(options: &'a Edn, name: &str) -> Result<&'a Edn> {

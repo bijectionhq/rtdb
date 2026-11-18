@@ -10,7 +10,9 @@
             [xtdb.time :as time])
   (:import [clojure.lang IReduceInit]
            [java.io ByteArrayInputStream ByteArrayOutputStream]
+           [org.apache.arrow.vector.types.pojo Field]
            [xtdb.api.query IKeyFn]
+           [xtdb.arrow VectorType]
            [xtdb.rust NativeConnection NativeDatabase NativeException NativeRows NativeStatement]
            [xtdb.util NormalForm]))
 
@@ -118,18 +120,21 @@
 
 (defn query-ra [^NativeDatabase node relation {:keys [args default-db await-token key-fn preserve-pages? with-types?]
                                              :or {key-fn :kebab-case-keyword}}]
-  (when with-types?
-    (throw (err/unsupported :rtdb.ra/result-types "Logical relation type reporting is unavailable")))
   (err/wrap-anomaly {}
     (with-open [connection (connect node {:database default-db})]
       (when await-token (set-await-token! connection await-token))
-      (with-open [result (.queryLogicalRelation connection (pr-str relation) (write-request (or args {})))]
-        (let [key-fn (serde/read-key-fn key-fn)]
-          (loop [rows (transient [])]
-            (if-let [bytes (.next ^NativeRows result)]
-              (let [page (read-rows bytes key-fn)]
-                (recur (if preserve-pages? (conj! rows page) (reduce conj! rows page))))
-              (persistent! rows))))))))
+      (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (or args {})))]
+        (let [key-fn (serde/read-key-fn key-fn)
+              rows (loop [rows (transient [])]
+                     (if-let [bytes (.next result)]
+                       (let [page (read-rows bytes key-fn)]
+                         (recur (if preserve-pages? (conj! rows page) (reduce conj! rows page))))
+                       (persistent! rows)))]
+          (if with-types?
+            {:res rows
+             :types (into {} (map (fn [^Field field] [(symbol (.getName field)) (VectorType/fromField field)]))
+                          (.getFields (.schema result)))}
+            rows))))))
 
 (defn- merge-node-token! [^NativeDatabase database next-token]
   (loop []

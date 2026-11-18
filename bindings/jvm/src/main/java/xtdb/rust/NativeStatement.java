@@ -73,7 +73,7 @@ public final class NativeStatement extends NativeResource implements AdbcStateme
         Opened opened = open();
         return new QueryResult(-1, new NativeArrowReader(connection, opened.cursor(), opened.operation()));
     }
-    public NativeRows executeRows() throws AdbcException { Opened opened = open(); return new NativeRows(abi, opened.cursor(), opened.operation()); }
+    public NativeRows executeRows() throws AdbcException { Opened opened = open(); return new NativeRows(connection, opened.cursor(), opened.operation()); }
     @Override public UpdateResult executeUpdate() throws AdbcException {
         try (NativeConnection.Operation operation = connection.operation(); Arena arena = Arena.ofConfined()) {
             running.set(operation);

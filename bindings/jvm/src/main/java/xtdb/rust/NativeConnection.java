@@ -77,7 +77,7 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
             MemorySegment source = NativeAbi.text(arena, plan);
             MemorySegment bindings = NativeAbi.bytes(arena, arguments);
             long cursor = abi.handle("session_query_ra", handle(), operation.id(), source, source.byteSize(), bindings, bindings.byteSize());
-            return new NativeRows(abi, cursor, operation);
+            return new NativeRows(this, cursor, operation);
         } catch (Throwable error) { try { operation.close(); } catch (AdbcException close) { error.addSuppressed(close); } throw error; }
     }
     @Override public String getCurrentCatalog() throws AdbcException { handle(); return catalog; }

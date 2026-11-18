@@ -8,6 +8,7 @@ import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -21,10 +22,14 @@ final class NativeArrowReader extends ArrowReader {
         super(connection.allocator); this.abi = connection.abi; this.cursor = new AtomicLong(cursor); this.operation = operation;
     }
     @Override protected Schema readSchema() throws IOException {
+        try { return cursorSchema(abi, allocator, cursor.get()); }
+        catch (AdbcException error) { throw new IOException(error); }
+    }
+    static Schema cursorSchema(NativeAbi abi, BufferAllocator allocator, long cursor) throws AdbcException {
         try (ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
-            try { abi.call("cursor_schema", cursor.get(), NativeAbi.address(schema.memoryAddress())); return Data.importSchema(allocator, schema, null, false); }
+            try { abi.call("cursor_schema", cursor, NativeAbi.address(schema.memoryAddress())); return Data.importSchema(allocator, schema, null, false); }
             finally { if (schema.snapshot().release != 0) schema.release(); }
-        } catch (AdbcException error) { throw new IOException(error); }
+        }
     }
     @Override public boolean loadNextBatch() throws IOException {
         prepareLoadNextBatch();

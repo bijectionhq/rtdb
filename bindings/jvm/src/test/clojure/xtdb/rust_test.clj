@@ -128,6 +128,20 @@
 
 (deftest-original-api original-table/test-table-handles-exprs)
 
+(deftest-original-api original-table/test-table)
+
+(deftest-original-api original-table/test-table-handles-symbols)
+
+(deftest-original-api original-table/test-incorrect-relation-params)
+
+(deftest-original-api original-table/do-not-leak-memory-on-expression-errors)
+
+(deftest-original-api original-table/test-absent-columns)
+
+(deftest-original-api original-table/test-single-col)
+
+(deftest-original-api original-table/test-table-with-map-params)
+
 (deftest-original-api original-sql/disallow-slashes-in-delimited-identifiers-3799)
 
 (deftest-original-api original-sql/test-char-type)

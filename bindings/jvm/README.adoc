@@ -100,4 +100,5 @@ The embedded Clojure API carries OID, REGCLASS and REGPROC values as typed Trans
 Native requests preserve the JVM numeric widths of Byte, Short, Integer and Float in transaction documents and query arguments.
 
 The embedded native connection accepts logical relation EDN with named Transit arguments on its normal read basis.
+The logical relation cursor exposes its declared result types through the Arrow schema, independently of row availability.
 Native logical relation tests run with the original Clojure assertions and the native relation cursor.
