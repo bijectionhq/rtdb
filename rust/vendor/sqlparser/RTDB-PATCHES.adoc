@@ -8,6 +8,9 @@ The parser records each WHERE and SELECT tail in source order, including GROUP B
 The syntax tree retains the usual expression nodes and their spans, and the existing set-operation parser consumes each FROM-first specification as one operand.
 The flag defaults to false, preserving the upstream dialects' FROM-first syntax.
 
+RTDB's dialect recognizes VALUES as a subquery prefix in the same parser decision as SELECT and WITH.
+The parsed scalar and quantified subqueries retain the original VALUES body and token locations.
+
 RTDB's admitted SQL batch parser and statement splitter use the tokenizer's boundary mode to emit line-comment tokens with empty prefix and body strings.
 Each comment still occupies one token with its original location and participates in the same buffer growth.
 Full SQL tokenization and tokens expanded from optimizer hints retain their original comment text.

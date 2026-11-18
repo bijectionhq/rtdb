@@ -511,12 +511,38 @@ async fn apply_binds_per_row_parameters_and_scalar_empty_returns_null() {
 }
 
 #[tokio::test]
+async fn single_join_preserves_probe_rows_and_checks_cardinality_in_memory_and_on_disk() {
+    for join_build_rows in [0, i64::MAX] {
+        for build in [&[2, 3][..], &[2, 2][..]] {
+            let options = QueryOptions { join_build_rows, ..Default::default() };
+            let context = query_context(options);
+            let left = numbers(0, "probe", &[1, 2]);
+            let right = numbers(1, "build", build);
+            let condition = Expr::binary(BinaryOp::Eq, left.schema().fields()[0].expression(), right.schema().fields()[0].expression());
+            let schema = left.schema().concat(&right.schema().nullable().unwrap()).unwrap();
+            let plan = Arc::new(Relation::new(schema, RelationNode::Join { left, right, kind: JoinKind::Single, condition: Some(condition) }).unwrap());
+            let result = collect(plan, Arc::clone(&context)).await;
+            if build[0] == build[1] {
+                assert_eq!(result.unwrap_err().code, "xtdb.single-join/cardinality-violation");
+            } else {
+                let mut rows = result.unwrap();
+                rows.sort_by_key(|row| match row[0] { Value::I64(value) => value, _ => panic!("Expected probe key") });
+                assert_eq!(rows, [vec![Value::I64(1), Value::Null], vec![Value::I64(2), Value::I64(2)]]);
+            }
+            assert_eq!(context.spill_peak_bytes() > 0, join_build_rows == 0);
+            assert_eq!(context.memory.used_bytes(), 0);
+            assert_eq!(context.spill_bytes(), 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn scalar_apply_rejects_multiple_rows_and_pull_many_distinguishes_empty_document() {
     let input = Arc::new(Relation::unit());
     let dependent = numbers(1, "v", &[1, 2]);
     let output = field(2, "answer", scalar(ScalarType::I64).maybe());
     let plan = Arc::new(Relation::new(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Apply { input: Arc::clone(&input), dependent, arguments: vec![], kind: ApplyKind::Scalar, output: Some(output) }).unwrap());
-    assert_eq!(collect(plan, query_context(QueryOptions::default())).await.unwrap_err().code, "rtdb.query/cardinality-violation");
+    assert_eq!(collect(plan, query_context(QueryOptions::default())).await.unwrap_err().code, "xtdb.single-join/cardinality-violation");
     for (dependent, expected) in [(Arc::new(Relation::empty(Schema::default())), Value::Null), (Arc::new(Relation::unit()), Value::List(vec![Value::Struct(BTreeMap::new())]))] {
         let output = field(2, "answer", LogicalType::list(LogicalType::Struct(BTreeMap::new())).maybe());
         let plan = Arc::new(Relation::new(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Apply { input: Arc::clone(&input), dependent, arguments: vec![], kind: ApplyKind::PullMany, output: Some(output) }).unwrap());

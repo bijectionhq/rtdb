@@ -24,6 +24,23 @@ fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp:
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
 
 #[tokio::test]
+async fn insert_queries_build_independent_subqueries_before_probing_an_empty_input() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    for source in [
+        "INSERT INTO docs (_id, v) SELECT 1, (SELECT 1 / 0) WHERE FALSE",
+        "INSERT INTO docs (_id, v) SELECT 2, ARRAY(SELECT 1 / 0) WHERE FALSE",
+    ] {
+        let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+        let resolved = resolver.resolve_source(
+            state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![sql(source)], &context), &context,
+        ).await.unwrap();
+        assert_eq!(resolved.result().error().unwrap().code, "xtdb.expression/division-by-zero", "{source}");
+        assert!(!resolved.writes().tables().contains_key(&table()), "{source}");
+    }
+}
+
+#[tokio::test]
 async fn replayed_unsigned_argument_payloads_bind_signed_and_keep_source_bytes() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();

@@ -40,3 +40,7 @@ pub use runtime_schema::RuntimeSchema;
 fn invalid(code: &str, message: impl std::fmt::Display) -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect(format!("rtdb.query/{code}"), message.to_string())
 }
+
+fn cardinality_violation() -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::incorrect("xtdb.single-join/cardinality-violation", "cardinality violation")
+}

@@ -39,7 +39,7 @@ pub struct NamedExpr { pub field: Field, pub expr: Expr }
 pub struct MaterializedBinding { pub name: String, pub relation: Arc<Relation> }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JoinKind { Inner, Left, Right, Full, Semi, Anti, Cross }
+pub enum JoinKind { Inner, Left, Right, Full, Semi, Anti, Cross, Single }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluates the dependent relation for each input row with apply-local argument bindings.
@@ -407,7 +407,7 @@ impl Relation {
                 if *kind == JoinKind::Cross && condition.is_some() { return invalid("Cross join cannot declare a condition"); }
                 let expected = match kind {
                     JoinKind::Semi | JoinKind::Anti => left.schema.clone(),
-                    JoinKind::Left => left.schema.concat(&right.schema.nullable()?)?,
+                    JoinKind::Left | JoinKind::Single => left.schema.concat(&right.schema.nullable()?)?,
                     JoinKind::Right => left.schema.nullable()?.concat(&right.schema)?,
                     JoinKind::Full => left.schema.nullable()?.concat(&right.schema.nullable()?)?,
                     JoinKind::Inner | JoinKind::Cross => left.schema.concat(&right.schema)?,

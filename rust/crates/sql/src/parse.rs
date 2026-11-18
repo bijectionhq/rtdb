@@ -2,7 +2,7 @@ use rtdb_plan::{Identifier, SourceSpan};
 use rtdb_types::{Anomaly, MemoryBudget, Result};
 use std::{ops::ControlFlow, sync::Arc};
 use sqlparser::ast::VisitMut;
-use sqlparser::{ast as ast, dialect::GenericDialect, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan, TokenizeBufferError, Tokenizer}};
+use sqlparser::{ast as ast, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan, TokenizeBufferError, Tokenizer}};
 use crate::dialect::SqlDialect;
 
 #[derive(Clone, Debug)]
@@ -344,7 +344,7 @@ pub(super) fn parse_statement_syntax<'input>(
     let (tokens, parameters) = crate::inline_xtql::extract(prefix, sql)?;
     let (tokens, settings) = crate::settings::extract(tokens, sql)?;
     let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
-    let (tokens, materialized) = crate::materialized::cte_tokens(quantified_values(tokens, sql)?, sql)?;
+    let (tokens, materialized) = crate::materialized::cte_tokens(tokens, sql)?;
     let (mut tokens, mut temporal) = extract_temporal(tokens, sql)?;
     let mut statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
         let patch = word(tokens.first(), "PATCH");
@@ -413,37 +413,6 @@ pub(super) fn parse_statement_syntax<'input>(
     crate::materialized::restore(&mut statement, &mut temporal, materialized, sql)?;
     let tree = StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames };
     Ok(DeferredStatementSyntax { span, tree, parameters })
-}
-
-pub(crate) fn quantified_values(tokens: Vec<TokenWithSpan>, source: &str) -> Result<Vec<TokenWithSpan>> {
-    let mut insertions = std::collections::BTreeMap::new();
-    for index in 0..tokens.len() {
-        if !["ANY", "ALL", "SOME"].into_iter().any(|name| word(tokens.get(index), name))
-            || tokens.get(index + 1).is_none_or(|token| token.token != Token::LParen)
-            || !word(tokens.get(index + 2), "VALUES") { continue; }
-        let mut depth = 1usize;
-        let mut end = index + 2;
-        while end < tokens.len() {
-            match tokens[end].token {
-                Token::LParen => depth += 1,
-                Token::RParen => { depth -= 1; if depth == 0 { break; } },
-                _ => {},
-            }
-            end += 1;
-        }
-        if end == tokens.len() { return Err(sql_error("Unclosed quantified subquery", source, tokens[index].span)); }
-        for (at, text) in [(index + 2, "SELECT * FROM ("), (end, ") AS _rtdb_quantified_values")] {
-            let injected = Tokenizer::new(&GenericDialect {}, text).tokenize().map_err(|error| Anomaly::fault("rtdb.sql/lexer", error.to_string()))?;
-            insertions.insert(at, injected.into_iter().filter(|token| !matches!(token, Token::Whitespace(_))).map(|token| TokenWithSpan { token, span: tokens[at].span }).collect::<Vec<_>>());
-        }
-    }
-    if insertions.is_empty() { return Ok(tokens); }
-    let mut result = Vec::new();
-    for (index, token) in tokens.into_iter().enumerate() {
-        if let Some(inserted) = insertions.remove(&index) { result.extend(inserted); }
-        result.push(token);
-    }
-    Ok(result)
 }
 
 fn standard(tokens: Vec<TokenWithSpan>, source: &str) -> Result<ast::Statement> {

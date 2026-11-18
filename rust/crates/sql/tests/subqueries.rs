@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
-use rtdb_plan::{Relation, RelationNode, Statement};
+use rtdb_plan::{JoinKind, Relation, RelationNode, Statement};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_sql::{PrepareOptions, prepare};
 use rtdb_storage::{MemoryStore, cache::BufferPool};
@@ -17,8 +17,8 @@ async fn query(sql: &str, parameters: Vec<Value>) -> Result<Vec<Vec<Value>>> {
     let context = context();
     let options = PrepareOptions { parameter_types: parameters.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
     let prepared = prepare(sql, &context.catalog, &options)?;
-    let Statement::Query(relation) = prepared.statement else { panic!("expected query") };
-    let mut cursor = PreparedQuery::new(relation)?.execute(context, parameters).await?;
+    let query = PreparedQuery::from_prepared(prepared, &context.memory)?;
+    let mut cursor = query.execute(context, parameters).await?;
     let mut result = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let schema = batch.batch().schema();
@@ -78,6 +78,42 @@ async fn array_query_requires_one_column_and_a_subquery_scope() {
     ] {
         let error = query(source, vec![]).await.unwrap_err();
         assert_eq!(error.message.as_deref(), Some(message), "{source}");
+    }
+}
+
+#[tokio::test]
+async fn independent_scalar_subqueries_build_before_probing_an_empty_input() {
+    for source in [
+        "SELECT (SELECT 1 / 0) WHERE FALSE",
+        "SELECT (SELECT 1 / 0) FROM (VALUES (1)) t(n) WHERE n = 2",
+        "SELECT ARRAY(SELECT 1 / 0) WHERE FALSE",
+        "SELECT (VALUES (1 / 0)) LIMIT 0",
+        "SELECT ARRAY(VALUES (1 / 0)) LIMIT 0",
+        "SELECT (SELECT n FROM (VALUES (1),(2),(1 / 0)) t(n))",
+    ] {
+        let error = query(source, vec![]).await.unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/division-by-zero", "{source}");
+    }
+    for source in [
+        "SELECT (SELECT 1 / t.n) FROM (VALUES (0)) t(n) WHERE FALSE",
+        "SELECT ARRAY(SELECT 1 / t.n) FROM (VALUES (0)) t(n) WHERE FALSE",
+        "SELECT (SELECT 1 / 0) LIMIT 0",
+        "SELECT ARRAY(SELECT 1 / 0) LIMIT 0",
+        "SELECT (SELECT n FROM (VALUES (1),(2)) t(n)) WHERE FALSE",
+    ] {
+        assert_eq!(query(source, vec![]).await.unwrap(), Vec::<Vec<Value>>::new(), "{source}");
+    }
+}
+
+#[tokio::test]
+async fn scalar_cardinality_is_checked_per_probe_for_both_join_modes() {
+    for source in [
+        "SELECT (SELECT n FROM (VALUES (1),(2)) t(n))",
+        "SELECT (SELECT n + a FROM (VALUES (1),(2)) t(n)) FROM (VALUES (0)) q(a)",
+    ] {
+        let error = query(source, vec![]).await.unwrap_err();
+        assert_eq!(error.code, "xtdb.single-join/cardinality-violation", "{source}");
+        assert_eq!(error.message.as_deref(), Some("cardinality violation"), "{source}");
     }
 }
 
@@ -157,7 +193,9 @@ async fn lexical_parameters_remain_distinct_from_subquery_captures() {
 #[tokio::test]
 async fn subquery_helper_ids_are_hidden_from_current_and_outer_name_resolution() {
     fn helper(input: &Relation) -> Option<String> {
-        if let RelationNode::Apply { output: Some(field), .. } = input.node() { return Some(field.name.clone()); }
+        if let RelationNode::Join { right, kind: JoinKind::Single, .. } = input.node() {
+            return right.schema().fields().first().map(|field| field.name.clone());
+        }
         input.children().into_iter().find_map(|child| helper(child))
     }
     let context = context();

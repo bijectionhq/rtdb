@@ -522,7 +522,7 @@ impl PageCursor for Apply {
             let result = match self.kind {
                 ApplyKind::Exists => Value::Bool(first.is_some()),
                 ApplyKind::Scalar | ApplyKind::Pull => {
-                    if cursor.next().await?.is_some() { return Err(invalid("cardinality-violation", "Scalar subquery returned more than one row")); }
+                    if cursor.next().await?.is_some() { return Err(crate::cardinality_violation()); }
                     if let Some(row) = &first { output_scope.reserve(self.document_bound(row)?)?; }
                     first.as_ref().map_or(Value::Null, |row| if self.kind == ApplyKind::Scalar { row.values[0].clone() } else { self.document(row) })
                 }

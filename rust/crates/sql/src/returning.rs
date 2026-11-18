@@ -37,7 +37,7 @@ impl ReturningClause<'_> {
         }
         tokens.extend(ignored_xtql(self.items, source)?);
         let (tokens, _) = crate::wildcard::extract(tokens, source)?;
-        let (tokens, materialized) = crate::materialized::cte_tokens(crate::parse::quantified_values(tokens, source)?, source)?;
+        let (tokens, materialized) = crate::materialized::cte_tokens(tokens, source)?;
         let (tokens, mut temporal) = crate::parse::extract_temporal(tokens, source)?;
         let mut materialized = crate::materialized::MarkerVisitor::new(materialized, source)?;
         materialized.apply_temporal(&mut temporal)?;

@@ -21041,6 +21041,7 @@ impl<'a> Parser<'a> {
     fn is_subquery_keyword(&self, keyword: Keyword) -> bool {
         matches!(keyword, Keyword::SELECT | Keyword::WITH)
             || (keyword == Keyword::FROM && self.dialect.supports_from_pipeline())
+            || (keyword == Keyword::VALUES && self.dialect.supports_values_in_subqueries())
     }
 
     pub(crate) fn parse_show_stmt_options(&mut self) -> Result<ShowStatementOptions, ParserError> {

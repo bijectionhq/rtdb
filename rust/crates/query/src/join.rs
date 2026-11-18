@@ -18,7 +18,7 @@ struct JoinPlan { layout: JoinLayout,build_left: bool,kind: JoinKind,execution: 
 impl JoinCursor {
     pub fn new(build: BoxPageCursor,probe: DeferredInput,mut layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution) -> Result<Self> {
         if kind == JoinKind::Cross { return Err(invalid("join-kind","Cross join requires its page-pair cursor")); }
-        if kind == JoinKind::Full || kind == JoinKind::Left && !build_left || kind == JoinKind::Right && build_left { layout.with_null_build(build_left)?; }
+        if matches!(kind, JoinKind::Full | JoinKind::Single) || kind == JoinKind::Left && !build_left || kind == JoinKind::Right && build_left { layout.with_null_build(build_left)?; }
         Ok(Self { phase: Phase::Build { input: build,probe },plan: JoinPlan { layout,build_left,kind,execution } })
     }
 }
@@ -26,7 +26,7 @@ impl JoinPlan {
     fn build_layout(&self) -> &JoinInput { if self.build_left { &self.layout.left } else { &self.layout.right } }
     fn probe_layout(&self) -> &JoinInput { if self.build_left { &self.layout.right } else { &self.layout.left } }
     fn track_build(&self) -> bool { self.kind == JoinKind::Full || self.kind == JoinKind::Left && self.build_left || self.kind == JoinKind::Right && !self.build_left }
-    fn preserve_probe(&self) -> bool { self.kind == JoinKind::Full || self.kind == JoinKind::Left && !self.build_left || self.kind == JoinKind::Right && self.build_left }
+    fn preserve_probe(&self) -> bool { matches!(self.kind, JoinKind::Full | JoinKind::Single) || self.kind == JoinKind::Left && !self.build_left || self.kind == JoinKind::Right && self.build_left }
     fn blooms(&self) -> bool { matches!(self.kind,JoinKind::Inner | JoinKind::Semi) || self.track_build() && self.kind != JoinKind::Full }
     fn joined(&self,build: &OwnedRow,probe: &OwnedRow) -> Result<OwnedRow> {
         let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
@@ -85,6 +85,7 @@ impl JoinPlan {
                 for build_index in index.candidates(self.probe_layout().hash(probe)?) {
                     let build = &rows.page.rows()[build_index];
                     if !self.accepted(&comparisons,build,probe).await? { continue; }
+                    if matched && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
                     matched = true;
                     if let Some(unmatched) = unmatched { unmatched[build_index] = 0; }
                     if self.kind == JoinKind::Semi { break; }
@@ -182,7 +183,7 @@ pub(crate) fn build_left(left: &Relation,right: &Relation,kind: JoinKind,executi
         JoinKind::Left => row_count(left,execution)? < row_count(right,execution)?,
         JoinKind::Right => row_count(left,execution)? <= row_count(right,execution)?,
         JoinKind::Inner | JoinKind::Full => true,
-        JoinKind::Semi | JoinKind::Anti => false,
+        JoinKind::Semi | JoinKind::Anti | JoinKind::Single => false,
         JoinKind::Cross => return Err(invalid("join-kind","Cross join has no hash build side")),
     })
 }

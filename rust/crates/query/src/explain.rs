@@ -409,7 +409,7 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             ("valid-to", text(work_patch_endpoint(to, expression(to)?)?)?),
         ])?,
         RelationNode::Join { kind, condition, .. } => {
-            op = match kind { JoinKind::Inner => "inner-join", JoinKind::Cross => "cross-join", JoinKind::Left | JoinKind::Right => "left-join", JoinKind::Full => "full-join", JoinKind::Semi => "semi-join", JoinKind::Anti => "anti-join" };
+            op = match kind { JoinKind::Inner => "inner-join", JoinKind::Cross => "cross-join", JoinKind::Left | JoinKind::Right => "left-join", JoinKind::Full => "full-join", JoinKind::Semi => "semi-join", JoinKind::Anti => "anti-join", JoinKind::Single => "single-join" };
             let condition = match condition { Some(condition) => expression(condition)?, None => work.copy_text("")? };
             map(work, [("condition", text(work.pieces(&[RenderPiece::Text("["), RenderPiece::Text(condition.as_str()), RenderPiece::Text("]")])?)?)])?
         }

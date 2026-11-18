@@ -1,5 +1,5 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, Identifier, NamedExpr, Relation, RelationNode, Schema, UnaryOp};
+use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, Identifier, JoinKind, NamedExpr, Relation, RelationNode, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast;
 use crate::bind::{Context, HiddenColumn, aggregate_relation, error};
@@ -101,9 +101,18 @@ impl ExpressionAttachment {
         let relation = match self {
             Self::Apply { dependent, arguments, kind, output } => {
                 let schema = input.schema().concat(&Schema::new(vec![output.clone()])?)?;
-                Relation::new(schema, RelationNode::Apply {
-                    input, dependent, arguments, kind, output: Some(output),
-                })?
+                let node = if kind == ApplyKind::Scalar && arguments.is_empty() {
+                    let [source] = dependent.schema().fields() else {
+                        return Err(error("Scalar subquery requires a single column"));
+                    };
+                    let field = Field { data_type: source.data_type.clone(), ..output };
+                    let expr = source.expression();
+                    let right = Arc::new(dependent.project(vec![NamedExpr { field, expr }])?);
+                    RelationNode::Join { left: input, right, kind: JoinKind::Single, condition: None }
+                } else {
+                    RelationNode::Apply { input, dependent, arguments, kind, output: Some(output) }
+                };
+                Relation::new(schema, node)?
             }
             Self::Materialize(expression) => {
                 let mut expressions = input.schema().fields().iter()
@@ -406,6 +415,7 @@ fn existence_rows(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     match relation.node() {
         RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Sort { input, .. }
         | RelationNode::Mark { input, .. }
+        | RelationNode::Join { left: input, kind: JoinKind::Single, condition: None, .. }
         | RelationNode::Apply { input, kind: ApplyKind::Scalar | ApplyKind::Exists | ApplyKind::Pull | ApplyKind::PullMany, .. } => existence_rows(Arc::clone(input)),
         RelationNode::Limit { input, offset, fetch } => Ok(Arc::new(existence_rows(Arc::clone(input))?.limit(offset.clone(), fetch.clone())?)),
         RelationNode::Values { rows } => Ok(Arc::new(Relation::new(Schema::default(), RelationNode::Values { rows: vec![Vec::new(); rows.len()] })?)),

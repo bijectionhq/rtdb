@@ -28,6 +28,18 @@ async fn query(context: &Arc<QueryContext>, sql: &str) -> Result<Vec<BTreeMap<St
 fn op(name: &str) -> Value { Value::Keyword(Keyword::from_name(name)) }
 
 #[tokio::test]
+async fn analyze_distinguishes_independent_scalar_join_and_correlated_apply() {
+    let context = context(2);
+    for (source, expected) in [
+        ("EXPLAIN ANALYZE SELECT (SELECT 7) FROM (VALUES (1),(2)) t(n)", "single-join"),
+        ("EXPLAIN ANALYZE SELECT (SELECT t.n + 7) FROM (VALUES (1),(2)) t(n)", "apply-single-join"),
+    ] {
+        let rows = query(&context, source).await.unwrap();
+        assert!(rows.iter().any(|row| row.get("op") == Some(&op(expected))), "{source}: {rows:?}");
+    }
+}
+
+#[tokio::test]
 async fn explain_temporal_casts_retain_requested_precision_and_interval_fields() {
     let context = context(2);
     for (sql,options) in [

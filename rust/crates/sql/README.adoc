@@ -170,7 +170,7 @@ Exact failure timing, diagnostic equivalence, and all execution observations rem
 
 == Subqueries
 
-Scalar subqueries, EXISTS, IN, ANY, SOME and ALL lower to the shared Apply operator.
+Scalar subqueries, EXISTS, IN, ANY, SOME and ALL bind through shared subquery scopes.
 An `ARRAY(query)` expression requires one output column and collects every row in the query's output order.
 The vector aggregate preserves duplicate and null elements and returns an empty list when the query returns no rows.
 Array constructors by query use the same lexical captures as scalar subqueries.
@@ -184,7 +184,9 @@ UPDATE retains the original target-column identities separately from subquery he
 The source mapping is `xtdb.sql-test/test-subqueries`, `test-in-subquery`, `test-scalar-subquery-with-expressions`, and the array-quantifier paths in `xtdb.sql/visitQuantifiedComparisonExpr`.
 `tests/subqueries.rs` contains native result assertions for correlation, nested CTEs, cardinality, null truth tables, parameter numbering, wildcard output, grouping and outer joins.
 Full upstream plan golden comparison and optimizer-dependent error elision remain qualification work.
-The lowering preserves dependent evaluation without implementing the reference decorrelation optimizer.
+An independent scalar subquery becomes a single join with a right build side.
+The join consumes that side once before probing its left rows, produces a nullable value for zero matches, and rejects multiple matches for a probe row.
+A correlated scalar subquery keeps its captures and evaluates its dependent relation for each reached outer row.
 Full outer join conditions, temporal scan clauses, RECORDS expressions and standalone control values still reject relational subqueries.
 
 LATERAL derived tables and implicitly lateral UNNEST capture preceding FROM columns in the binding scope.

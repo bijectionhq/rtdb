@@ -275,7 +275,7 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
             if let Some(condition) = condition { type_of(condition, &left.concat(&right)?)?; }
             match kind {
                 JoinKind::Semi | JoinKind::Anti => left,
-                JoinKind::Left => left.concat(&right.nullable()?)?,
+                JoinKind::Left | JoinKind::Single => left.concat(&right.nullable()?)?,
                 JoinKind::Right => left.nullable()?.concat(&right)?,
                 JoinKind::Full => left.nullable()?.concat(&right.nullable()?)?,
                 _ => left.concat(&right)?,
