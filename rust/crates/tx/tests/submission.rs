@@ -4,6 +4,41 @@ use rtdb_tx::*;
 use rtdb_types::{LogicalType, ScalarType, Value};
 
 #[test]
+fn submitted_sql_admits_temporary_syntax_before_lexing() {
+    let submit = |sql: &str, memory: &std::sync::Arc<MemoryBudget>| {
+        prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: None }], SubmitOptions::default(), "xtdb", memory)
+    };
+    let calibration = MemoryBudget::new(1 << 20);
+    let scope = rtdb_expr::EvaluationScope::new(&calibration).unwrap();
+    let scope_bytes = calibration.used_bytes();
+    drop(scope);
+
+    let malformed = "INSERT INTO docs (_id) VALUES (@)";
+    let syntax_bytes = rtdb_sql::statement_syntax_estimate(malformed.len()).unwrap();
+    let short = MemoryBudget::new(scope_bytes + syntax_bytes - 1);
+    let error = submit(malformed, &short).err().unwrap();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(short.peak_bytes(), scope_bytes);
+    assert_eq!(short.used_bytes(), 0);
+
+    let exact = MemoryBudget::new(scope_bytes + syntax_bytes);
+    let expected = rtdb_sql::parse_in(malformed, &calibration).unwrap_err();
+    assert_eq!(expected.code, "xtdb/sql-error");
+    assert_eq!(submit(malformed, &exact).err().unwrap(), expected);
+    assert_eq!(exact.peak_bytes(), scope_bytes + syntax_bytes);
+    assert_eq!(exact.used_bytes(), 0);
+
+    let dependent = "UPDATE docs SET v = v + 1";
+    let syntax_bytes = rtdb_sql::statement_syntax_estimate(dependent.len()).unwrap();
+    let memory = MemoryBudget::new(scope_bytes + syntax_bytes);
+    let request = submit(dependent, &memory).unwrap();
+    assert_eq!(memory.peak_bytes(), scope_bytes + syntax_bytes);
+    assert!(memory.used_bytes() > 0 && memory.used_bytes() < scope_bytes);
+    drop(request);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn volatile_and_query_clock_sql_remain_in_source_log_for_transaction_time_evaluation() {
     for sql in ["INSERT INTO foo (_id, v) VALUES (1, PG_SLEEP(60.0))", "INSERT INTO foo (_id, v) VALUES (1, CAST(TIME '12:00:00' AS TIMESTAMP))"] {
         let memory = MemoryBudget::new(1 << 25);
