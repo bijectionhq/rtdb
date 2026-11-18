@@ -10,7 +10,7 @@ use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, Term, TermSequenc
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::{PartitionLogs, ReplicaMetadata, progress::term_ended};
+use crate::{PartitionLogs, ReplicaMetadata, ReplicationClock, progress::term_ended};
 
 pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>), Message(ReplicaBody) }
 #[derive(Clone, Debug)]
@@ -61,12 +61,12 @@ impl AppenderHandle {
 
 pub(crate) struct ReplicaAppender {
     logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, sequence: TermSequence,
-    queue: mpsc::UnboundedReceiver<AppendRequest>, assertion_interval: Duration, cancellation: CancellationToken,
+    queue: mpsc::UnboundedReceiver<AppendRequest>, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock,
 }
 impl ReplicaAppender {
-    pub fn new(logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, assertion_interval: Duration, cancellation: CancellationToken) -> (AppenderHandle, Self) {
+    pub fn new(logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock) -> (AppenderHandle, Self) {
         let (sender, queue) = mpsc::unbounded_channel();
-        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation })
+        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock })
     }
     pub async fn run(mut self, mut first: Option<Arc<PendingWrite>>) -> Result<()> {
         let mut timer = tokio::time::interval(self.assertion_interval);
@@ -86,7 +86,7 @@ impl ReplicaAppender {
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
-                    match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), now()), &self.cancellation, &mut receipts).await {
+                    match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), (self.clock)()), &self.cancellation, &mut receipts).await {
                         Ok(Some(receipt)) => receipts.push(track_receipt(receipt, None, None)),
                         Ok(None) => break Ok(()),
                         Err(error) => break Err(error),
@@ -110,7 +110,7 @@ impl ReplicaAppender {
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
-                    match observe_enqueue(self.logs.enqueue_replica(&envelope, request.write.block, now()), &self.cancellation, &mut receipts).await {
+                    match observe_enqueue(self.logs.enqueue_replica(&envelope, request.write.block, (self.clock)()), &self.cancellation, &mut receipts).await {
                         Ok(Some(receipt)) => receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable)),
                         Ok(None) => { request.write.finish(Err(term_ended())); if let Some(sender) = request.durable { let _ = sender.send(Err(term_ended())); } break Ok(()); }
                         Err(error) => { request.write.finish(Err(error.clone())); if let Some(sender) = request.durable { let _ = sender.send(Err(error.clone())); } break Err(error); }
@@ -190,7 +190,7 @@ mod tests {
         let source = Arc::new(MemoryLog::new(1 << 20));
         let replica = Arc::new(ReceiptFailure { readable: MemoryLog::new(1 << 20) });
         let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0), rtdb_format::keys::CURRENT_STORAGE_VERSION, StorageEpoch(0), store, cache, Arc::clone(&memory)).unwrap();
-        let (handle, appender) = ReplicaAppender::new(logs, Arc::clone(&memory), Term(1), interval, CancellationToken::new());
+        let (handle, appender) = ReplicaAppender::new(logs, Arc::clone(&memory), Term(1), interval, CancellationToken::new(), Arc::new(now));
         (handle, appender, memory)
     }
     #[tokio::test]

@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceMessage}, keys::CURRENT_STORAGE_VERSION, log::proto::{self, resolved_tx::DbOp}};
+use rtdb_format::{database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::CURRENT_STORAGE_VERSION, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::TransactionBuffer;
 use rtdb_storage::{MemoryStore, ObjectStore, cache::BufferPool, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, LogRecord, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_trie::TrieConfig;
@@ -30,21 +30,34 @@ impl DatabaseEffects for NoEffects {
 struct AllowRoles;
 impl TransactionAuthorization for AllowRoles { fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Ok(()) } }
 struct Fixture {
-    driver: ReplicationDriver, handle: ReplicationHandle, logs: Arc<PartitionLogs>, store: Arc<MemoryStore>, blocks: Arc<BlockStore>, memory: Arc<MemoryBudget>, replica: Arc<MemoryLog>,
+    driver: ReplicationDriver, handle: ReplicationHandle, logs: Arc<PartitionLogs>, store: Arc<MemoryStore>, blocks: Arc<BlockStore>, memory: Arc<MemoryBudget>, source: Arc<MemoryLog>, replica: Arc<MemoryLog>,
 }
 async fn fixture(config: ReplicationConfig, replica_message_limit: usize) -> Fixture {
+    fixture_with_clock(config, replica_message_limit, None).await
+}
+
+async fn fixture_with_clock(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>) -> Fixture {
     let memory = MemoryBudget::new(1 << 30);
     let source = Arc::new(MemoryLog::new(1 << 28));
     let replica = Arc::new(MemoryLog::new(replica_message_limit));
     let store = Arc::new(MemoryStore::default());
     let cache = Arc::new(BufferPool::new(store.clone(), 1 << 27));
-    let logs = PartitionLogs::new(source, replica.clone(), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
+    let logs = PartitionLogs::new(source.clone(), replica.clone(), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0)).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
-    let (handle, driver) = ReplicationDriver::new(config, Arc::clone(&logs), Arc::clone(&blocks), recovered, progress, resolve, Arc::new(NoEffects), CancellationToken::new()).unwrap();
-    Fixture { driver, handle, logs, store, blocks, memory, replica }
+    let effects = Arc::new(NoEffects);
+    let cancellation = CancellationToken::new();
+    let (handle, driver) = match clock {
+        Some(clock) => ReplicationDriver::new_with_clock(
+            config, Arc::clone(&logs), Arc::clone(&blocks), recovered, progress, resolve, effects, cancellation, clock,
+        ),
+        None => ReplicationDriver::new(
+            config, Arc::clone(&logs), Arc::clone(&blocks), recovered, progress, resolve, effects, cancellation,
+        ),
+    }.unwrap();
+    Fixture { driver, handle, logs, store, blocks, memory, source, replica }
 }
 fn raw(position: i64, term: i64, sequence: i64, body: ReplicaBody) -> LogRecord {
     LogRecord { metadata: LogMetadata { offset: LogOffset(position), timestamp: Timestamp(position * 100 + 1) },
@@ -1024,6 +1037,71 @@ impl rtdb_tx::TransactionWriter for CommitExternal {
     async fn write(&mut self, _: &mut rtdb_tx::OpenTransaction<'_>) -> Result<rtdb_tx::WriterResult> {
         Ok(rtdb_tx::WriterResult::Committed { user_metadata: None })
     }
+}
+
+#[tokio::test]
+async fn one_clock_stamps_the_boot_claim_external_transaction_and_source_flush() {
+    let time = Arc::new(AtomicI64::new(2_000_000));
+    let clock: ReplicationClock = {
+        let time = Arc::clone(&time);
+        Arc::new(move || Timestamp(time.load(Ordering::SeqCst)))
+    };
+    let config = ReplicationConfig {
+        external_source: true,
+        assertion_interval: Duration::from_secs(60),
+        flush_timeout: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let Fixture { driver, handle, source, replica, .. } = fixture_with_clock(config, 1 << 27, Some(clock)).await;
+    let observer = handle.clone();
+    let mut observation = tokio::spawn(async move {
+        let mut status = observer.watch_status();
+        status.wait_for(|status| status.role == Role::Leading(Term(1))).await.unwrap();
+        let claim = replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
+        assert_eq!(claim.metadata.offset, LogOffset(0));
+        assert_eq!(claim.metadata.timestamp, Timestamp(2_000_000));
+        let claim = ReplicaEnvelope::decode(&claim.payload).unwrap().unwrap();
+        assert_eq!(claim.term, Term(1));
+        assert_eq!(claim.term_sequence, Some(TermSequence(0)));
+        assert!(matches!(claim.message, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })));
+
+        time.store(3_000_000, Ordering::SeqCst);
+        let result = observer.term().unwrap()
+            .resolve_external(Box::new(CommitExternal), None, Some(b"clock".to_vec())).await.unwrap();
+        assert!(result.committed());
+        assert_eq!(result.tx_key().system_time, Timestamp(3_000_000));
+        let progress = observer.progress().current();
+        assert_eq!(progress.tx_key, Some(result.tx_key()));
+        assert_eq!(progress.external_token.as_deref(), Some(b"clock".as_slice()));
+        let transaction = replica.read_range(LogOffset(1), LogOffset(2)).await.unwrap().pop().unwrap();
+        assert_eq!(transaction.metadata.timestamp, Timestamp(3_000_000));
+        let transaction = ReplicaEnvelope::decode(&transaction.payload).unwrap().unwrap();
+        let ReplicaBody::ResolvedTx(transaction) = transaction.message else { panic!("Expected the resolved external transaction"); };
+        assert_eq!(transaction.tx_id, Some(result.tx_key().tx_id.0));
+        assert_eq!(transaction.system_time_micros, Some(3_000_000));
+
+        time.store(4_000_000, Ordering::SeqCst);
+        let flush = observer.flush().await.unwrap();
+        assert_eq!(flush, SourcePosition(0));
+        let flush = source.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
+        assert_eq!(flush.metadata.timestamp, Timestamp(4_000_000));
+        assert!(matches!(SourceMessage::decode(&flush.payload).unwrap(),
+            Some(SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(-1) })))));
+    });
+    let stop = async {
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut observation).await;
+        if result.is_err() {
+            observation.abort();
+            let _ = observation.await;
+        }
+        handle.shutdown();
+        result
+    };
+    let (run, observation) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(driver.run(), stop)
+    }).await.unwrap();
+    run.unwrap();
+    observation.unwrap().unwrap();
 }
 
 async fn queue_external_write(fixture: &mut Fixture, token: &[u8]) -> (ExternalReceipt, TransactionKey) {

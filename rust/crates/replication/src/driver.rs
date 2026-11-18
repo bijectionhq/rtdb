@@ -29,6 +29,10 @@ pub trait DatabaseEffects: Send + Sync {
     fn secondary_databases(&self) -> Result<BTreeMap<String, DatabaseConfig>>;
 }
 
+/// Supplies UTC timestamps in Unix microseconds for replication.
+/// The driver, term appender and cloned handles can sample it concurrently.
+pub type ReplicationClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+
 #[derive(Clone, Debug)]
 pub struct ReplicationConfig {
     pub enabled: bool,
@@ -64,7 +68,7 @@ pub struct DriverStatus {
 #[derive(Clone)]
 pub struct ReplicationHandle {
     logs: Arc<PartitionLogs>, progress: Arc<ProgressMonitor>, status: watch::Receiver<DriverStatus>,
-    commands: mpsc::Sender<Command>, cancellation: CancellationToken,
+    commands: mpsc::Sender<Command>, cancellation: CancellationToken, clock: ReplicationClock,
 }
 impl ReplicationHandle {
     pub fn progress(&self) -> &Arc<ProgressMonitor> { &self.progress }
@@ -86,12 +90,12 @@ impl ReplicationHandle {
     pub async fn await_source(&self, position: SourcePosition, cancellation: &CancellationToken) -> Result<()> { self.progress.await_source(position, cancellation).await }
     pub async fn flush(&self) -> Result<SourcePosition> {
         let expected = self.status.borrow().adopted_block.as_ref().map_or(-1, |block| block.block_index().0);
-        self.submit_source(&SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(expected) })), now()).await
+        self.submit_source(&SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(expected) })), (self.clock)()).await
     }
     /// Cancels the owned driver; the node must join `ReplicationDriver::run` before releasing its dependencies.
     pub fn shutdown(&self) { self.cancellation.cancel(); }
     pub async fn publish_compaction(&self, message: proto::TriesAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
-        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::TriesAdded(message)), now()).await?;
+        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::TriesAdded(message)), (self.clock)()).await?;
         self.await_source(position, cancellation).await?;
         Ok(position)
     }
@@ -250,7 +254,7 @@ impl LeaderState {
 pub struct ReplicationDriver {
     config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, partition: Arc<PartitionState>, progress: Arc<ProgressMonitor>,
     restart: Option<Arc<DriverRestart>>,
-    resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken,
+    resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
@@ -258,6 +262,18 @@ pub struct ReplicationDriver {
 }
 impl ReplicationDriver {
     pub fn new(config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, recovered: RecoveredPartition, progress: Arc<ProgressMonitor>, resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken) -> Result<(ReplicationHandle, Self)> {
+        Self::new_with_clock(config, logs, blocks, recovered, progress, resolve, effects, cancellation, Arc::new(now))
+    }
+
+    /// Uses the supplied clock for replica writes, default external transaction time candidates, maintenance writes and flush deadlines.
+    /// The clock is sampled during construction and when recording block upload time.
+    /// Source submissions accept caller timestamps, and log providers determine the timestamps in records.
+    /// Returns a handle and an idle driver after checking configuration, recovered progress, log boundaries and memory admission.
+    pub fn new_with_clock(
+        config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, recovered: RecoveredPartition,
+        progress: Arc<ProgressMonitor>, resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>,
+        cancellation: CancellationToken, clock: ReplicationClock,
+    ) -> Result<(ReplicationHandle, Self)> {
         if config.assertion_interval.is_zero() || config.pending_block_records == 0 || config.pending_block_bytes == 0 { return Err(invalid("Replication intervals and pending-block limits must be positive")); }
         let applied = progress.current();
         if applied.tx_key != recovered.progress.tx_key || applied.source_position != recovered.progress.source_position || applied.external_token != recovered.progress.external_token {
@@ -271,14 +287,14 @@ impl ReplicationDriver {
             open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
         let (status, receiver) = watch::channel(initial);
         let (sender, commands) = mpsc::channel(128);
-        let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone() };
+        let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone(), clock: Arc::clone(&clock) };
         let persisted_tx = recovered.block.as_ref().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        let flush_timer = FlushTimer::new(now(), persisted_tx, config.flush_timeout)?;
+        let flush_timer = FlushTimer::new(clock(), persisted_tx, config.flush_timeout)?;
         let recovered_confirmation = if config.enabled && config.may_lead {
             recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
         } else { None };
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, recovered_confirmation, fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -401,9 +417,10 @@ impl ReplicationDriver {
         let term = self.fence.claim_term()?;
         let envelope = ReplicaEnvelope { term, term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
         let logs = Arc::clone(&self.logs);
+        let clock = Arc::clone(&self.clock);
         let block = self.partition.value().live().block_index();
         self.claiming = Some(Claim { term, observed: None, future: Box::pin(async move {
-            logs.enqueue_replica(&envelope, block, now()).await?.durable().await
+            logs.enqueue_replica(&envelope, block, clock()).await?.durable().await
         }) });
         Ok(())
     }
@@ -435,10 +452,11 @@ impl ReplicationDriver {
         let term = self.fence.highest_term();
         let progress = self.progress.current();
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        self.flush_timer = FlushTimer::new(now(), persisted, self.config.flush_timeout)?;
+        self.flush_timer = FlushTimer::new((self.clock)(), persisted, self.config.flush_timeout)?;
         let cancellation = self.cancellation.child_token();
         let source_tail = self.logs.source_tail(progress.source_position).await?;
-        let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory), term, self.config.assertion_interval, cancellation.clone());
+        let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
+            term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
         let cycle = if self.pending_block.is_some() { BlockCycle::Cut } else { BlockCycle::Filling { rows: self.partition.value().live().block_row_count() } };
         let recovery_write = self.recovered_confirmation.as_ref().map(|checkpoint| {
             PendingWrite::clone_message(&checkpoint.body, self.partition.value().live().block_index(), &self.resolve.memory)
@@ -480,7 +498,10 @@ impl ReplicationDriver {
         self.status.send_replace(DriverStatus { role, highest_term: self.fence.highest_term(), replica_position: self.read_position,
             open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds });
     }
-    fn record_block_upload(&self) { self.status.send_modify(|status| status.last_block_upload_epoch_seconds = now().0.div_euclid(1_000_000)); }
+    fn record_block_upload(&self) {
+        let upload_time = (self.clock)().0.div_euclid(1_000_000);
+        self.status.send_modify(|status| status.last_block_upload_epoch_seconds = upload_time);
+    }
     async fn consume(&mut self, raw: LogRecord) -> Result<()> {
         self.consume_record(raw, None).await
     }
@@ -584,7 +605,7 @@ impl ReplicationDriver {
                     self.logs.append_source(&SourceMessage::Protobuf(SourceBody::TriesAdded(proto::TriesAdded {
                         storage_version: Some(self.logs.storage_version.0), storage_epoch: Some(self.logs.storage_epoch.0),
                         tries: message.tries.clone(), source_msg_id: None,
-                    })), now()).await?;
+                    })), (self.clock)()).await?;
                 }
                 self.publish_status(self.role());
                 if let Some(leader) = &mut self.leader {
@@ -735,7 +756,8 @@ impl ReplicationDriver {
         match result {
             ProductionResult::Written(result) => {
                 let produced = result?;
-                self.status.send_modify(|status| status.last_block_upload_epoch_seconds = now().0.div_euclid(1_000_000));
+                let upload_time = (self.clock)().0.div_euclid(1_000_000);
+                self.status.send_modify(|status| status.last_block_upload_epoch_seconds = upload_time);
                 let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Produced block has no retained boundary"))?;
                 let ReplicaBody::BlockBoundary(boundary) = &pending.boundary.envelope.message else { return Err(invalid("Pending boundary changed type")); };
                 let message = ReplicaBody::BlockUploaded(proto::BlockUploaded {
@@ -865,7 +887,7 @@ impl ReplicationDriver {
     }
     async fn flush_if_due(&mut self) -> Result<()> {
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        if self.leader.as_ref().is_some_and(LeaderState::accepting) && self.flush_timer.should_flush(now(), persisted) { self.cut().await?; }
+        if self.leader.as_ref().is_some_and(LeaderState::accepting) && self.flush_timer.should_flush((self.clock)(), persisted) { self.cut().await?; }
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {
@@ -900,8 +922,9 @@ impl ReplicationDriver {
                 let durable = self.partition.value().snapshot();
                 let mut resolver = leader.resolver.take().ok_or_else(|| invalid("External resolution has no idle resolver"))?;
                 let context = Arc::clone(&self.resolve);
+                let clock = Arc::clone(&self.clock);
                 leader.resolution = Some(Resolution { completion: Completion(Some(completion)), future: Box::pin(async move {
-                    let result = resolver.resolve_external(durable, now(), system_time, token, writer.as_mut(), &context).await;
+                    let result = resolver.resolve_external(durable, clock(), system_time, token, writer.as_mut(), &context).await;
                     (resolver, result)
                 }) });
                 Ok(())
