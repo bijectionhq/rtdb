@@ -268,6 +268,19 @@ rd_kafka_topic_get_error(rd_kafka_topic_t *rkt) {
         return err;
 }
 
+/**
+ * @brief Apply metadata to a retained local topic.
+ * @param ts_age Metadata timestamp in rd_clock() units.
+ * @returns The update count, or -1 when the client is terminating.
+ * @locks_required The client lock must be held through the call.
+ * @locks_acquired Topic and partition locks.
+ */
+int rd_kafka_topic_metadata_update(
+    rd_kafka_topic_t *rkt,
+    const struct rd_kafka_metadata_topic *mdt,
+    const rd_kafka_metadata_topic_internal_t *mdit,
+    rd_ts_t ts_age);
+
 int rd_kafka_topic_metadata_update2(
     rd_kafka_broker_t *rkb,
     const struct rd_kafka_metadata_topic *mdt,

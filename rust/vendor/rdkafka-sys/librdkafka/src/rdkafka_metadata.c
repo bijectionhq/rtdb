@@ -2105,10 +2105,11 @@ rd_kafka_metadata_new_topic_with_partition_replicas_mock(int replication_factor,
  * @brief Handle update of metadata received in the produce or fetch tags.
  *
  * @param rk Client instance.
- * @param rko Metadata update operation.
+ * @param mdi Metadata carried by the update operation.
  *
  * @locality main thread
  * @locks none
+ * @locks_acquired rd_kafka_wrlock()
  *
  * @return always RD_KAFKA_OP_RES_HANDLED
  */
@@ -2126,12 +2127,14 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
 
         for (i = 0; i < md->topic_cnt; i++) {
                 struct rd_kafka_metadata_cache_entry *rkmce;
+                rd_kafka_topic_t *rkt = NULL;
                 int32_t partition_cache_changes = 0;
                 rd_bool_t by_id =
                     !RD_KAFKA_UUID_IS_ZERO(mdi->topics[i].topic_id);
                 rd_kafka_Uuid_t topic_id = RD_KAFKA_UUID_ZERO;
                 char *topic              = NULL;
 
+                rd_kafka_wrlock(rk);
                 if (by_id) {
                         rkmce = rd_kafka_metadata_cache_find_by_id(
                             rk, mdi->topics[i].topic_id, 1);
@@ -2143,6 +2146,7 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
                 }
 
                 if (!rkmce) {
+                        rd_kafka_wrunlock(rk);
                         if (by_id) {
                                 rd_kafka_log(
                                     rk, LOG_WARNING, "METADATAUPDATE",
@@ -2212,14 +2216,10 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
                         }
                         partition_cache_changes++;
 
-                        /* Need to acquire the write lock to avoid dirty reads
-                         * from other threads acquiring read locks. */
-                        rd_kafka_wrlock(rk);
                         rkmce->rkmce_metadata_internal_topic.partitions[part]
                             .leader_epoch = mdpi->leader_epoch;
                         rkmce->rkmce_mtopic.partitions[part].leader =
                             mdp->leader;
-                        rd_kafka_wrunlock(rk);
                         rd_kafka_broker_destroy(rkb);
 
                         rd_kafka_dbg(rk, METADATA, "METADATAUPDATE",
@@ -2233,10 +2233,16 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
 
                 if (partition_cache_changes > 0) {
                         cache_updated = rd_true;
-                        rd_kafka_topic_metadata_update2(
-                            rk->rk_internal_rkb, &rkmce->rkmce_mtopic,
-                            &rkmce->rkmce_metadata_internal_topic);
+                        rkt = rd_kafka_topic_find(rk, topic, RD_DONT_LOCK);
+                        if (rkt)
+                                rd_kafka_topic_metadata_update(
+                                    rkt, &rkmce->rkmce_mtopic,
+                                    &rkmce->rkmce_metadata_internal_topic,
+                                    rd_clock());
                 }
+                rd_kafka_wrunlock(rk);
+                if (rkt)
+                        rd_kafka_topic_destroy0(rkt);
         }
 
         if (!cache_updated) {
@@ -2247,11 +2253,14 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
 
         rd_kafka_dbg(rk, METADATA, "METADATAUPDATE",
                      "Metadata cache updated, propagating changes");
+        rd_kafka_wrlock(rk);
         rd_kafka_metadata_cache_propagate_changes(rk);
         rd_kafka_metadata_cache_expiry_start(rk);
+        rd_kafka_wrunlock(rk);
 
         return RD_KAFKA_OP_RES_HANDLED;
 }
 
 #include "rdkafka_metadata_account_test.h"
 #include "rdkafka_metadata_cache_parser_test.h"
+#include "rdkafka_metadata_tag_update_lock_test.h"

@@ -191,9 +191,13 @@ The source fixtures have not been compiled or executed.
 
 Cache entry arenas still have no automatic byte admission.
 Retained payloads and source padding/slack must be admitted together, including old/new replacement overlap, in a later source slice.
-The tag-update and consumer-group hint borrowing repairs remain separate lock changes.
+The consumer-group hint borrowing repair remains a separate lock change.
 
 The lightweight topic conversion acquires the client write lock before looking up or creating a proper topic.
-The constructor holds it through local topic publication, cache lookup and copying the cached metadata into the local topic.
+The constructor holds it through local topic publication, cache lookup and initialization from the cached entry.
 A source fixture observes that lock through the immediate constructor diagnostic on the native main actor and checks that the new topic inherits cached metadata after the parsed response has been freed.
 Native request/cache scratch, topic-info/assignor/admin clones, allocator overhead and all runtime/Phase2 qualification remain separate obligations.
+
+The Fetch and Produce leader tag handler holds the client write lock from cache lookup through leader and local topic updates.
+When a tag changes cached leader metadata, the handler reacquires the client write lock after processing the topics to notify cache observers and schedule expiry.
+A source fixture on the actual native main actor checks the lock on a missing-broker diagnostic, the accepted UUID update and observer wakeup, and the stale name-addressed update.

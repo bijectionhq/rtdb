@@ -51,13 +51,6 @@ const char *rd_kafka_topic_state_names[] = {"unknown", "exists", "notexists",
                                             "error"};
 
 
-static int
-rd_kafka_topic_metadata_update(rd_kafka_topic_t *rkt,
-                               const struct rd_kafka_metadata_topic *mdt,
-                               const rd_kafka_metadata_topic_internal_t *mdit,
-                               rd_ts_t ts_age);
-
-
 /**
  * @brief Increases the app's topic reference count.
  *
@@ -1347,23 +1340,11 @@ rd_bool_t rd_kafka_topic_set_error(rd_kafka_topic_t *rkt,
 
 
 
-/**
- * @brief Update a topic from metadata.
- *
- * @param mdt Topic metadata.
- * @param mdit Topic internal metadata.
- * @param ts_age absolute age (timestamp) of metadata.
- * @returns 1 if the number of partitions changed, 0 if not, and -1 if the
- *          topic is unknown.
-
- *
- * @locks_required rd_kafka_*lock() MUST be held.
- */
-static int
-rd_kafka_topic_metadata_update(rd_kafka_topic_t *rkt,
-                               const struct rd_kafka_metadata_topic *mdt,
-                               const rd_kafka_metadata_topic_internal_t *mdit,
-                               rd_ts_t ts_age) {
+int rd_kafka_topic_metadata_update(
+    rd_kafka_topic_t *rkt,
+    const struct rd_kafka_metadata_topic *mdt,
+    const rd_kafka_metadata_topic_internal_t *mdit,
+    rd_ts_t ts_age) {
         rd_kafka_t *rk = rkt->rkt_rk;
         int upd        = 0;
         int j;

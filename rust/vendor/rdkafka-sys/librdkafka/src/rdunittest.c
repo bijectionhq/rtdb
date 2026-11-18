@@ -420,6 +420,7 @@ extern int unittest_metadata_account(void);
 extern int unittest_connection_observation(void);
 extern int unittest_metadata_cache_ownership(void);
 extern int unittest_metadata_cache_topic_borrow(void);
+extern int unittest_metadata_tag_update_lock(void);
 extern int unittest_cgrp(void);
 extern int unittest_mock_cluster(void);
 #if WITH_SASL_SCRAM
@@ -465,6 +466,7 @@ int rd_unittest(void) {
                 {"connection_observation", unittest_connection_observation},
                 {"metadata_cache_ownership", unittest_metadata_cache_ownership},
                 {"metadata_cache_topic_borrow", unittest_metadata_cache_topic_borrow},
+                {"metadata_tag_update_lock", unittest_metadata_tag_update_lock},
                 {"request", unittest_request},
 #if WITH_SASL_OAUTHBEARER
                 {"sasl_oauthbearer", unittest_sasl_oauthbearer},
