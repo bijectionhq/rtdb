@@ -225,3 +225,12 @@ fn msgpack_allocation_admission_preserves_the_encoders_depth_boundary() {
     assert_eq!(msgpack_allocation_bound(&value).unwrap_err().message.as_deref(), Some("Transit nesting limit exceeded"));
     assert_eq!(encode_msgpack(&value).unwrap_err().message.as_deref(), Some("Transit nesting limit exceeded"));
 }
+
+#[test]
+fn malformed_transit_json_is_a_json_parse_error_with_the_reference_close_marker_wording() {
+    let error = rtdb_format::transit::decode_json_sequence(b"},,,,").unwrap_err();
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.error/json-parse", Some("Unexpected close marker '}'")));
+    let error = rtdb_format::transit::decode_json_sequence(b"[\"~:a\"]\n ]").unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Unexpected close marker ']'"));
+    assert_eq!(rtdb_format::transit::decode_json_sequence(br#"["unfinished"#).unwrap_err().code, "xtdb.error/json-parse");
+}

@@ -153,7 +153,18 @@ pub fn decode_with<B: TransitReadBuilder>(bytes: &[u8], builder: &mut B) -> Resu
 /// Reads consecutive top-level values, resetting Transit cache indices for each value.
 pub fn decode_json_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
     serde_json::Deserializer::from_slice(bytes).into_iter::<JsonPacked>()
-        .map(|packed| unpack_value(packed.map_err(invalid)?.0, false, &mut ReadCache::new(), 0, &mut WireValues)).collect()
+        .map(|packed| unpack_value(packed.map_err(|error| json_parse(bytes, error))?.0, false, &mut ReadCache::new(), 0, &mut WireValues)).collect()
+}
+
+/// Malformed JSON is the reference's `xtdb.error/json-parse`; a stray close marker carries Jackson's wording.
+fn json_parse(bytes: &[u8], error: serde_json::Error) -> Anomaly {
+    if !matches!(error.classify(), serde_json::error::Category::Syntax | serde_json::error::Category::Eof) { return invalid(error); }
+    let offending = bytes.split(|byte| *byte == b'\n').nth(error.line().saturating_sub(1)).and_then(|line| line.get(error.column().saturating_sub(1))).copied();
+    let message = match offending {
+        Some(marker @ (b'}' | b']')) => format!("Unexpected close marker '{}'", marker as char),
+        _ => error.to_string(),
+    };
+    Anomaly::incorrect("xtdb.error/json-parse", message)
 }
 
 /// Reads consecutive top-level values; a truncated trailing value is an error.
