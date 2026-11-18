@@ -2,12 +2,91 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{bloom::BloomFilter, transit::{TransitValue, encode_msgpack}};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, NamedExpr, Schema};
-use rtdb_types::{Iid, Result, Value};
+use rtdb_types::{Iid, LogicalType, Result, ScalarType, Value};
 use crate::{context::Execution, invalid};
+
+type IidEntries = BTreeMap<Iid, Arc<MemoryReservation>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntityIdDomain { Integer, String, Keyword, Uuid }
+
+impl EntityIdDomain {
+    fn of_type(data_type: &LogicalType) -> Option<Self> {
+        match data_type {
+            LogicalType::Maybe(inner) => Self::of_type(inner),
+            LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64) => Some(Self::Integer),
+            LogicalType::Scalar(ScalarType::Utf8) => Some(Self::String),
+            LogicalType::Scalar(ScalarType::Keyword) => Some(Self::Keyword),
+            LogicalType::Scalar(ScalarType::Uuid) => Some(Self::Uuid),
+            _ => None,
+        }
+    }
+
+    fn contains(self, value: &Value) -> bool {
+        matches!((self, value),
+            (Self::Integer, Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_))
+            | (Self::String, Value::Utf8(_))
+            | (Self::Keyword, Value::Keyword(_))
+            | (Self::Uuid, Value::Uuid(_)))
+    }
+}
+
+enum IidCandidates {
+    Raw(IidEntries),
+    Entity(EntityIdDomain, IidEntries),
+    UnresolvedEntity,
+}
+
+impl IidCandidates {
+    fn for_probe(field: &Field) -> Option<Self> {
+        match field.name.as_str() {
+            "_iid" => Some(Self::Raw(BTreeMap::new())),
+            "_id" => Some(EntityIdDomain::of_type(&field.data_type)
+                .map_or(Self::UnresolvedEntity, |domain| Self::Entity(domain, BTreeMap::new()))),
+            _ => None,
+        }
+    }
+
+    fn entries_for(&self, field: &Field) -> Option<&IidEntries> {
+        match self {
+            Self::Raw(entries) if field.name == "_iid" => Some(entries),
+            Self::Entity(domain, entries) if field.name == "_id"
+                && EntityIdDomain::of_type(&field.data_type) == Some(*domain) => Some(entries),
+            _ => None,
+        }
+    }
+
+    fn count_for(&self, field: &Field) -> Option<usize> {
+        if matches!(self, Self::UnresolvedEntity) && field.name == "_id" {
+            Some(0)
+        } else {
+            self.entries_for(field).map(BTreeMap::len)
+        }
+    }
+
+    fn insert(&mut self, value: &Value, scope: &rtdb_expr::EvaluationScope, memory: &Arc<MemoryBudget>) -> Result<bool> {
+        let (iid, entries) = match self {
+            Self::Raw(entries) => {
+                let Value::FixedSizeBinary(bytes) = value else { return Ok(false); };
+                let Ok(bytes) = bytes.as_slice().try_into() else { return Ok(false); };
+                (Iid(bytes), entries)
+            }
+            Self::Entity(domain, entries) if domain.contains(value) => {
+                scope.reserve(value.retained_bytes()?.checked_mul(3).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?)?;
+                (value.entity_id()?.iid(), entries)
+            }
+            _ => return Ok(false),
+        };
+        if !entries.contains_key(&iid) {
+            entries.insert(iid, memory.reserve(256)?);
+        }
+        Ok(true)
+    }
+}
 
 struct ColumnFilter {
     bloom: Option<BloomFilter>,
-    iids: Option<BTreeMap<Iid, Arc<MemoryReservation>>>,
+    iids: Option<IidCandidates>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -47,10 +126,10 @@ impl Pushdowns {
     pub fn path_matches(&self, schema: &[Field], lower: Iid, upper: Iid) -> bool {
         self.iid_filter(schema).is_none_or(|iids| iids.is_empty() || iids.range(lower..=upper).next().is_some())
     }
-    fn iid_filter(&self, schema: &[Field]) -> Option<&BTreeMap<Iid, Arc<MemoryReservation>>> {
+    fn iid_filter(&self, schema: &[Field]) -> Option<&IidEntries> {
         ["_iid", "_id"].into_iter().find_map(|name| {
             let field = schema.iter().find(|field| field.name == name)?;
-            self.columns.iter().find(|(id, _)| *id == field.id)?.1.iids.as_ref()
+            self.columns.iter().find(|(id, _)| *id == field.id)?.1.iids.as_ref()?.entries_for(field)
         })
     }
     pub fn page_matches(&self, schema: &[Field], columns: &[Value], memory: &Arc<MemoryBudget>) -> Result<bool> {
@@ -76,14 +155,14 @@ impl Pushdowns {
             let Some((_, filter)) = self.columns.iter().find(|(id, _)| *id == field.id) else { continue; };
             let mut entries = vec![(keyword("column"), TransitValue::String(field.name.clone()))];
             if let Some(bloom) = &filter.bloom { entries.push((keyword("bloom-filter"), TransitValue::Map(vec![(keyword("cardinality"), TransitValue::Integer(bloom.cardinality() as i64))]))); }
-            if let Some(iids) = &filter.iids { entries.push((keyword("iids"), TransitValue::Map(vec![(keyword("count"), TransitValue::Integer(iids.len() as i64))]))); }
+            if let Some(count) = filter.iids.as_ref().and_then(|iids| iids.count_for(field)) { entries.push((keyword("iids"), TransitValue::Map(vec![(keyword("count"), TransitValue::Integer(count as i64))]))); }
             columns.push(TransitValue::Map(entries));
         }
         if columns.is_empty() { Ok(Value::Null) } else { encode_msgpack(&TransitValue::Array(columns)).map(Value::Transit) }
     }
 }
 
-struct Key { expression: Expr, probe: ColumnId, raw_iid: bool, filter: ColumnFilter }
+struct Key { expression: Expr, probe: ColumnId, filter: ColumnFilter }
 pub(crate) struct PushdownBuilder { keys: Vec<Key>, _reservation: Arc<MemoryReservation> }
 impl PushdownBuilder {
     pub fn new(condition: Option<&Expr>, build: &Schema, probe: &Schema, rows: i64, blooms: bool, execution: &Execution) -> Result<Self> {
@@ -101,19 +180,10 @@ impl PushdownBuilder {
             let Some(bloom) = &mut key.filter.bloom else { continue; };
             let value = execution.evaluate(&scope, &key.expression, schema, row).await?;
             bloom.insert_value(&value)?;
-            if !matches!(value, Value::Null | Value::Undefined) {
-                if let Some(iids) = &mut key.filter.iids {
-                    let iid = if key.raw_iid {
-                        let Value::FixedSizeBinary(bytes) = &value else { return Err(invalid("join-iid", "An _iid join key must contain 16 bytes")); };
-                        Iid(bytes.as_slice().try_into().map_err(|_| invalid("join-iid", "An _iid join key must contain 16 bytes"))?)
-                    } else {
-                        scope.reserve(value.retained_bytes()?.checked_mul(3).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?)?;
-                        value.entity_id()?.iid()
-                    };
-                    if !iids.contains_key(&iid) {
-                        let reservation = execution.context.memory.reserve(256)?;
-                        iids.insert(iid, reservation);
-                    }
+            if matches!(value, Value::Null | Value::Undefined) { continue; }
+            if let Some(iids) = &mut key.filter.iids {
+                if !iids.insert(&value, &scope, &execution.context.memory)? {
+                    key.filter.iids = None;
                 }
             }
         }
@@ -138,13 +208,12 @@ fn collect_keys(expr: &Expr, build: &Schema, probe: &Schema, bitmap_bound: usize
             for (expression, candidate) in [(left.as_ref(), right.as_ref()), (right.as_ref(), left.as_ref())] {
                 let Expr::Column { id, .. } = candidate else { continue; };
                 let Some(field) = probe.fields().iter().find(|field| field.id == *id) else { continue; };
-                let iid = matches!(field.name.as_str(), "_id" | "_iid");
-                if !blooms && !iid { continue; }
+                let iids = IidCandidates::for_probe(field);
+                if !blooms && iids.is_none() { continue; }
                 let columns = expression.referenced_columns();
                 if columns.is_empty() || columns.iter().any(|id| !build.fields().iter().any(|field| field.id == *id)) { continue; }
                 let reservation = execution.context.memory.reserve(if blooms { bitmap_bound } else { 256 })?;
-                let raw_iid = matches!(expression, Expr::Column { id, .. } if build.fields().iter().any(|field| field.id == *id && field.name == "_iid"));
-                keys.push(Key { expression: expression.clone(), probe: *id, raw_iid, filter: ColumnFilter { bloom: blooms.then(BloomFilter::default), iids: iid.then(BTreeMap::new), _reservation: reservation } });
+                keys.push(Key { expression: expression.clone(), probe: *id, filter: ColumnFilter { bloom: blooms.then(BloomFilter::default), iids, _reservation: reservation } });
                 break;
             }
         }

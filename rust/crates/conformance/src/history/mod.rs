@@ -266,3 +266,209 @@ pub async fn execute(fixture: &Path, output: &Path) -> Result<Json, Error> {
     write_new(&output.join("execution.json"), &result)?;
     Ok(result)
 }
+
+#[cfg(test)]
+mod join_iid_tests {
+    use super::{AutonomousTxOptions, BTreeMap, Documents, Duration, Error, FixtureClock, Identity, Node,
+        PreparedQuery, Reads, RunningNode, TableRef, Timestamp, TxOp, Value, combine, flush, read_value};
+    use rtdb_format::transit::{TransitValue, decode_msgpack};
+    use rtdb_types::{Keyword, TransactionKey};
+    use std::sync::{Arc, atomic::AtomicI64};
+
+    const TABLES: [&str; 3] = ["mixed_ids", "keyword_ids", "raw_ids"];
+    const RAW_KEY: [u8; 16] = *b"abcdefghijklmnop";
+    const MIXED_JOIN: &str = "SELECT l.build_key, r._id, r.label
+        FROM (VALUES ('byte-key')) AS l(build_key) JOIN mixed_ids r ON l.build_key = r._id";
+    const RAW_JOIN: &str = "SELECT l._iid AS build_key, r._iid AS probe_key
+        FROM raw_ids l JOIN raw_ids r ON l._iid = r._iid";
+
+    fn document(id: Value, label: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([("_id".into(), id), ("label".into(), Value::Utf8(label.into()))])
+    }
+
+    fn keyword(value: &str) -> Value { Value::Keyword(Keyword::from_name(value)) }
+    fn text(value: &str) -> Value { Value::Utf8(value.into()) }
+
+    async fn put_join_rows(node: &Node, system_time: Timestamp) -> Result<TransactionKey, Error> {
+        let ops = [
+            ("mixed_ids", vec![
+                document(text("byte-key"), "string"),
+                document(keyword("byte-key"), "keyword"),
+                document(text("abcdefghijklmnop"), "long-string"),
+                document(Value::Uuid(RAW_KEY), "uuid"),
+                document(text("absent"), "unmatched"),
+            ]),
+            ("keyword_ids", vec![
+                document(keyword("exact-first"), "first"),
+                document(keyword("byte-key"), "second"),
+            ]),
+            ("raw_ids", vec![document(Value::Uuid(RAW_KEY), "raw")]),
+        ].into_iter().map(|(table, docs)| {
+            Ok(TxOp::PutDocs {
+                table: TableRef::new("public", table),
+                documents: Documents::new(docs, node.memory())?,
+                valid_from: Some(Timestamp(0)),
+                valid_to: None,
+            })
+        }).collect::<Result<Vec<_>, Error>>()?;
+        let mut session = node.session("xtdb", Arc::new(Identity))?;
+        let result = session.state_mut().execute_tx(ops, AutonomousTxOptions {
+            system_time: Some(system_time),
+            ..Default::default()
+        }).await?;
+        if !result.committed() || result.tx_key().system_time != system_time {
+            return Err(format!("Join fixture did not commit at its requested system time: {result:?}").into());
+        }
+        Ok(result.tx_key())
+    }
+
+    async fn check_layout(node: &Node, prefix: TransactionKey, level: Option<i64>) -> Result<(), Error> {
+        let mut session = node.session("xtdb", Arc::new(Identity))?;
+        let context = session.query_context().await?;
+        let snapshot = &context.catalog.database("xtdb")?.partitions[0];
+        if snapshot.tx_basis() != Some(prefix) {
+            return Err("The join fixture layout advanced its transaction prefix".into());
+        }
+        for name in TABLES {
+            let table = TableRef::new("public", name);
+            let tries = snapshot.trie_entries(&table);
+            let live = !snapshot.segments(&table).is_empty();
+            let expected = match level {
+                None => live && tries.is_empty(),
+                Some(0) => !live && !tries.is_empty() && tries.iter().all(|trie| trie.key.level() == 0),
+                Some(_) => !live && !tries.is_empty() && tries.iter().all(|trie| trie.key.level() > 0),
+            };
+            if !expected { return Err(format!("Unexpected join fixture layout for {name} at {level:?}").into()); }
+        }
+        Ok(())
+    }
+
+    async fn join_rows(node: &Node, sql: &str, build_rows: i64) -> Result<Vec<Vec<Value>>, Error> {
+        let mut session = node.session("xtdb", Arc::new(Identity))?;
+        let mut context = session.query_context().await?;
+        Arc::get_mut(&mut context).ok_or("Join fixture context is shared")?.options.join_build_rows = build_rows;
+        let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &Default::default(), &context.memory)?;
+        let prepared = PreparedQuery::from_prepared(prepared, &context.memory)?;
+        let mut cursor = prepared.execute(Arc::clone(&context), vec![]).await?;
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor.next_batch().await? {
+            for row in 0..batch.batch().num_rows() {
+                rows.push(batch.batch().schema().fields().iter().zip(batch.batch().columns())
+                    .map(|(field, array)| read_value(field, array.as_ref(), row))
+                    .collect::<rtdb_types::Result<_>>()?);
+            }
+        }
+        drop(cursor);
+        if (context.spill_peak_bytes() > 0) != (build_rows == 0) || context.spill_bytes() != 0 {
+            return Err(format!("Unexpected join spill state for {sql} with build threshold {build_rows}").into());
+        }
+        Ok(rows)
+    }
+
+    async fn check_join_results(node: &Node) -> Result<(), Error> {
+        let raw = Value::FixedSizeBinary(RAW_KEY.to_vec());
+        let cases = [
+            (
+                MIXED_JOIN,
+                vec![
+                    vec![text("byte-key"), text("byte-key"), text("string")],
+                    vec![text("byte-key"), keyword("byte-key"), text("keyword")],
+                ],
+            ),
+            (
+                "SELECT l.build_key, r._id, r.label
+                 FROM (VALUES (KEYWORD 'exact-first'), ('byte-key')) AS l(build_key)
+                 JOIN keyword_ids r ON l.build_key = r._id",
+                vec![
+                    vec![keyword("exact-first"), keyword("exact-first"), text("first")],
+                    vec![text("byte-key"), keyword("byte-key"), text("second")],
+                ],
+            ),
+            (
+                "SELECT l.build_key, r._id, r.label
+                 FROM (VALUES (X'627974652d6b6579')) AS l(build_key) JOIN keyword_ids r ON l.build_key = r._id",
+                vec![vec![Value::Binary(b"byte-key".to_vec()), keyword("byte-key"), text("second")]],
+            ),
+            (
+                "SELECT l._iid AS build_key, r._iid AS probe_key, r.label
+                 FROM raw_ids l JOIN (SELECT _id AS _iid, label FROM mixed_ids) r ON l._iid = r._iid",
+                vec![
+                    vec![raw.clone(), text("abcdefghijklmnop"), text("long-string")],
+                    vec![raw.clone(), Value::Uuid(RAW_KEY), text("uuid")],
+                ],
+            ),
+            (
+                RAW_JOIN,
+                vec![vec![raw.clone(), raw]],
+            ),
+        ];
+        for (sql, expected) in cases {
+            for build_rows in [i64::MAX, 0] {
+                let rows = join_rows(node, sql, build_rows).await?;
+                if rows.len() != expected.len() || !expected.iter().all(|row| rows.contains(row)) {
+                    return Err(format!("Unexpected join rows for {sql} with build threshold {build_rows}: {rows:?}").into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_compacted_probe_filters(node: &Node) -> Result<(), Error> {
+        for (sql, source, count) in [(MIXED_JOIN, "public.mixed_ids", None), (RAW_JOIN, "public.raw_ids", Some(1))] {
+            let rows = join_rows(node, &format!("EXPLAIN ANALYZE {sql}"), i64::MAX).await?;
+            let source = text(source);
+            let (attributes, pushdowns) = rows.iter().find_map(|row| match row.as_slice() {
+                [_, op, attributes, _, _, _, _, _, Value::Transit(bytes), _]
+                    if *op == keyword("scan") && attributes.field("scan_source") == Some(&source) => Some((attributes, bytes)),
+                _ => None,
+            }).ok_or("Compacted probe scan metrics are missing")?;
+            if !matches!(attributes.field("scan_pages_used"), Some(Value::I64(pages)) if *pages > 0) {
+                return Err("Compacted probe did not load any persisted pages".into());
+            }
+            let TransitValue::Array(filters) = decode_msgpack(pushdowns)? else { return Err("Expected probe filters".into()); };
+            let [TransitValue::Map(entries)] = filters.as_slice() else { return Err("Expected one probe filter".into()); };
+            let entry = |key: &str| entries.iter().find_map(|(name, value)| {
+                matches!(name, TransitValue::Keyword(name) if name.as_str() == key).then_some(value)
+            });
+            if !matches!(entry("bloom-filter"), Some(TransitValue::Map(_))) {
+                return Err("Compacted probe scan did not receive a Bloom filter".into());
+            }
+            match (count, entry("iids")) {
+                (None, None) => {}
+                (Some(count), Some(TransitValue::Map(iids)))
+                    if matches!(iids.as_slice(),
+                        [(TransitValue::Keyword(key), TransitValue::Integer(actual))]
+                            if key.as_str() == "count" && *actual == count) => {}
+                _ => return Err("Unexpected IID proof for compacted probe".into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joins_keep_equal_byte_keys_through_live_flush_and_compaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let system_time = Timestamp(1_000_000);
+        let clock = Arc::new(FixtureClock(AtomicI64::new(system_time.0)));
+        let running = RunningNode::open(directory.path(), clock, Arc::new(Reads::default())).await.unwrap();
+        let work = async {
+            let node = &running.node;
+            let database = node.catalog().database("xtdb")?;
+            let compactor = database.compaction().ok_or("Join fixture compactor is missing")?;
+            tokio::time::timeout(Duration::from_secs(60), compactor.compact_all()).await??;
+            let prefix = put_join_rows(node, system_time).await?;
+            check_layout(node, prefix, None).await?;
+            check_join_results(node).await?;
+
+            flush(node).await?;
+            check_layout(node, prefix, Some(0)).await?;
+            check_join_results(node).await?;
+
+            tokio::time::timeout(Duration::from_secs(60), compactor.compact_all()).await??;
+            check_layout(node, prefix, Some(1)).await?;
+            check_join_results(node).await?;
+            check_compacted_probe_filters(node).await
+        }.await;
+        combine(work, running.close().await).unwrap();
+    }
+}
