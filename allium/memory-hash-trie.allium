@@ -6,10 +6,9 @@
 -- Excludes: Arrow serialization, disk persistence, ArrowHashTrie
 --
 -- Purpose:
---   MemoryHashTrie organizes row indices (integers pointing into Arrow vectors)
---   into a tree structure based on IID (Internal Identifier, a 16-byte hash of
---   entity primary keys). Used as the in-memory index for LiveTable before
---   transactions are written to block storage.
+--   MemoryHashTrie groups row indices by the stored IID, a 16-byte internal identifier.
+--   It indexes the IID supplied by each row, whether derived from a logical ID or supplied explicitly.
+--   It serves as the in-memory index for LiveTable before transactions are written to block storage.
 --
 -- Concurrency model:
 --   - Single-writer: all mutations create new immutable trie instances
@@ -31,7 +30,7 @@
 -- External Entities
 ------------------------------------------------------------
 
-external entity IID   -- 16-byte fixed-size binary (entity identifier hash)
+external entity IID   -- Stored 16-byte entity identifier.
 
 external entity VectorReader   -- Arrow vector for reading IID values by index
 

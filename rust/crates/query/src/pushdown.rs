@@ -47,20 +47,21 @@ impl IidCandidates {
         }
     }
 
-    fn entries_for(&self, field: &Field) -> Option<&IidEntries> {
+    fn entries_for(&self, field: &Field, canonical_entity_iids: bool) -> Option<&IidEntries> {
         match self {
             Self::Raw(entries) if field.name == "_iid" => Some(entries),
             Self::Entity(domain, entries) if field.name == "_id"
+                && (canonical_entity_iids || entries.is_empty())
                 && EntityIdDomain::of_type(&field.data_type) == Some(*domain) => Some(entries),
             _ => None,
         }
     }
 
-    fn count_for(&self, field: &Field) -> Option<usize> {
+    fn count_for(&self, field: &Field, canonical_entity_iids: bool) -> Option<usize> {
         if matches!(self, Self::UnresolvedEntity) && field.name == "_id" {
             Some(0)
         } else {
-            self.entries_for(field).map(BTreeMap::len)
+            self.entries_for(field, canonical_entity_iids).map(BTreeMap::len)
         }
     }
 
@@ -120,16 +121,24 @@ impl Pushdowns {
         }
         Ok(Arc::new(Self { columns, _reservation: reservation }))
     }
-    pub fn iid_matches(&self, schema: &[Field], iid: Iid) -> bool {
-        self.iid_filter(schema).is_none_or(|iids| iids.is_empty() || iids.contains_key(&iid))
+    pub fn needs_entity_iid_proof(&self, schema: &[Field]) -> bool {
+        if self.iid_filter(schema, false).is_some() { return false; }
+        let Some(field) = schema.iter().find(|field| field.name == "_id") else { return false; };
+        self.columns.iter().find(|(id, _)| *id == field.id)
+            .and_then(|(_, filter)| filter.iids.as_ref())
+            .and_then(|iids| iids.entries_for(field, true))
+            .is_some_and(|entries| !entries.is_empty())
     }
-    pub fn path_matches(&self, schema: &[Field], lower: Iid, upper: Iid) -> bool {
-        self.iid_filter(schema).is_none_or(|iids| iids.is_empty() || iids.range(lower..=upper).next().is_some())
+    pub fn iid_matches(&self, schema: &[Field], iid: Iid, canonical_entity_iids: bool) -> bool {
+        self.iid_filter(schema, canonical_entity_iids).is_none_or(|iids| iids.is_empty() || iids.contains_key(&iid))
     }
-    fn iid_filter(&self, schema: &[Field]) -> Option<&IidEntries> {
+    pub fn path_matches(&self, schema: &[Field], lower: Iid, upper: Iid, canonical_entity_iids: bool) -> bool {
+        self.iid_filter(schema, canonical_entity_iids).is_none_or(|iids| iids.is_empty() || iids.range(lower..=upper).next().is_some())
+    }
+    fn iid_filter(&self, schema: &[Field], canonical_entity_iids: bool) -> Option<&IidEntries> {
         ["_iid", "_id"].into_iter().find_map(|name| {
             let field = schema.iter().find(|field| field.name == name)?;
-            self.columns.iter().find(|(id, _)| *id == field.id)?.1.iids.as_ref()?.entries_for(field)
+            self.columns.iter().find(|(id, _)| *id == field.id)?.1.iids.as_ref()?.entries_for(field, canonical_entity_iids)
         })
     }
     pub fn page_matches(&self, schema: &[Field], columns: &[Value], memory: &Arc<MemoryBudget>) -> Result<bool> {
@@ -149,13 +158,13 @@ impl Pushdowns {
             bytes.checked_add(field.name.len().checked_mul(8).and_then(|n| n.checked_add(4096)).ok_or_else(size_error)?).ok_or_else(size_error)
         })
     }
-    pub fn describe(&self, schema: &[Field]) -> Result<Value> {
+    pub fn describe(&self, schema: &[Field], canonical_entity_iids: bool) -> Result<Value> {
         let mut columns = Vec::new();
         for field in schema {
             let Some((_, filter)) = self.columns.iter().find(|(id, _)| *id == field.id) else { continue; };
             let mut entries = vec![(keyword("column"), TransitValue::String(field.name.clone()))];
             if let Some(bloom) = &filter.bloom { entries.push((keyword("bloom-filter"), TransitValue::Map(vec![(keyword("cardinality"), TransitValue::Integer(bloom.cardinality() as i64))]))); }
-            if let Some(count) = filter.iids.as_ref().and_then(|iids| iids.count_for(field)) { entries.push((keyword("iids"), TransitValue::Map(vec![(keyword("count"), TransitValue::Integer(count as i64))]))); }
+            if let Some(count) = filter.iids.as_ref().and_then(|iids| iids.count_for(field, canonical_entity_iids)) { entries.push((keyword("iids"), TransitValue::Map(vec![(keyword("count"), TransitValue::Integer(count as i64))]))); }
             columns.push(TransitValue::Map(entries));
         }
         if columns.is_empty() { Ok(Value::Null) } else { encode_msgpack(&TransitValue::Array(columns)).map(Value::Transit) }

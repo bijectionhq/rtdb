@@ -56,6 +56,7 @@ struct PartitionScan {
     output_reservation: Option<Arc<MemoryReservation>>,
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
+    canonical_entity_iids: bool,
 }
 
 use crate::analysis::ScanCounts;
@@ -64,18 +65,21 @@ impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
+        let database = execution.context.catalog.database(&scan.table.name.database)?;
+        let canonical_entity_iids = scan.iids.is_none()
+            && pushdowns.as_ref().is_some_and(|filters| filters.needs_entity_iid_proof(&scan.columns))
+            && database.partitions.iter().all(|snapshot| snapshot.has_canonical_entity_iids(&scan.table.name.table));
         if let (Some(analysis), Some(pushdowns)) = (&execution.analysis, &pushdowns) {
-            analysis.set_pushdowns(pushdowns, &scan.columns, &execution.context.memory)?;
+            analysis.set_pushdowns(pushdowns, &scan.columns, canonical_entity_iids, &execution.context.memory)?;
         }
         let name = scan.table.name.database.clone();
         let source = format!("{}.{}", scan.table.name.table.schema, scan.table.name.table.table);
-        let database = execution.context.catalog.database(&scan.table.name.database)?;
         let mut partitions = VecDeque::new();
         for snapshot in &database.partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(&database.storage), scan: scan.clone(), execution: execution.clone(), bounds,
                 initialized: false, files: Vec::new(), pages: Vec::new(), tasks: None, loaded: BTreeMap::new(),
-                output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone() });
+                output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
         }
         Ok(Self { partitions, completed: ScanCounts::default(), database: name, source, _reservation: reservation })
     }
@@ -112,7 +116,7 @@ impl PartitionScan {
     fn path_matches(&self, lower: Iid, upper: Iid) -> bool {
         match &self.scan.iids {
             Some(iids) => iids.range(lower..=upper).next().is_some(),
-            None => self.pushdowns.as_ref().is_none_or(|filters| filters.path_matches(&self.scan.columns, lower, upper)),
+            None => self.pushdowns.as_ref().is_none_or(|filters| filters.path_matches(&self.scan.columns, lower, upper, self.canonical_entity_iids)),
         }
     }
     async fn initialize(&mut self) -> Result<()> {
@@ -275,7 +279,7 @@ impl PartitionScan {
                 if header.iid <= task.range.upper { heads.push(Head { header,ordinal,..head }); }
             }
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
-            if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid)) { continue; }
+            if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
             for row in resolver.resolve(&head.header,source)? {
                 let bound = self.scan.columns.iter().try_fold(256usize,|bound,field|bound.checked_add(project_bound(&row,&field.name)?).ok_or_else(||invalid("scan-row-size","Scan row allocation exceeds addressable memory")))?;
                 let reservation = self.execution.context.memory.reserve(bound)?;

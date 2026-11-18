@@ -43,9 +43,9 @@ impl AnalysisNode {
         Ok(Arc::new(Self { op: operator(relation), attributes, counts: Mutex::new(Counts::default()), children, _reservation: Arc::clone(reservation) }))
     }
     pub fn child(&self, index: usize) -> Option<Arc<Self>> { self.children.get(index).cloned() }
-    pub fn set_pushdowns(&self, pushdowns: &crate::pushdown::Pushdowns, fields: &[rtdb_plan::Field], memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
+    pub fn set_pushdowns(&self, pushdowns: &crate::pushdown::Pushdowns, fields: &[rtdb_plan::Field], canonical_entity_iids: bool, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
         let reservation = memory.reserve(pushdowns.description_bound(fields)?)?;
-        let value = pushdowns.describe(fields)?;
+        let value = pushdowns.describe(fields, canonical_entity_iids)?;
         self.counts.lock().map_err(|_| invalid("analysis-state", "Analysis counters were poisoned"))?.pushdowns = Some(MeasuredPushdowns { value, _reservation: reservation });
         Ok(())
     }

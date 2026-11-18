@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, estimate_builder_bytes_refs, from_field, struct_field_cell};
+use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_execution_value, struct_field_cell};
 use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation, build_event_batch, copy_event_batch};
 use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
-use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
 
 use crate::{Snapshot, TableMeta, merge_column_types};
 
@@ -86,6 +86,18 @@ impl IndexBatch {
         };
         Self::from_owned(OwnedBatch::with_reservation(batch, reservation)?)
     }
+    fn put_id_matches(&self, row: usize, iid: Iid) -> Option<bool> {
+        let operations = self.arrow().column_by_name("op")?.as_any().downcast_ref::<UnionArray>()?;
+        let put = operations.child(operations.type_id(row)).as_any().downcast_ref::<StructArray>()?;
+        let (index, field) = put.fields().iter().enumerate().find(|(_, field)| field.name() == "_id")?;
+        let column = put.column(index);
+        let offset = operations.value_offset(row);
+        let bound = estimate_read_value_bytes(field, column.as_ref(), offset).ok()?
+            .checked_mul(3)?.checked_add(1024)?;
+        let _scratch = self.owned.reservation().budget().reserve(bound).ok()?;
+        let value = read_execution_value(field, column.as_ref(), offset).ok()?;
+        Some(value.entity_id().ok()?.iid() == iid)
+    }
     pub fn view(&self) -> &EventBatch { &self.events }
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
     pub fn len(&self) -> usize { self.events.len() }
@@ -109,17 +121,19 @@ pub struct LiveTable {
     column_types: BTreeMap<String, LogicalType>,
     trie: MemoryHashTrie,
     last_system_time: Option<Timestamp>,
+    canonical_entity_iids: bool,
 }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: BTreeMap::new(), trie: MemoryHashTrie::new(config), last_system_time: None }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: BTreeMap::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn row_count(&self) -> u32 { self.row_count }
     pub fn column_types(&self) -> &BTreeMap<String, LogicalType> { &self.column_types }
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
+    pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
     pub fn row(&self, row: u32) -> Result<RowSource> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
@@ -133,7 +147,11 @@ impl LiveTable {
         next.column_types = merge_column_types(&next.column_types, &write.column_types);
         if let Some(batch) = &write.batch {
             for row in 0..batch.len() {
-                if batch.view().header(row)?.system_from != system_time { return Err(invalid("Imported event system time differs from its transaction")); }
+                let header = batch.view().header(row)?;
+                if header.system_from != system_time { return Err(invalid("Imported event system time differs from its transaction")); }
+                if next.canonical_entity_iids && header.op == EventOp::Put {
+                    next.canonical_entity_iids = batch.put_id_matches(row, header.iid).unwrap_or(false);
+                }
             }
             let count = u32::try_from(batch.len()).map_err(invalid)?;
             let start = next.row_count;
@@ -301,3 +319,35 @@ impl TransactionBuffer {
 }
 
 fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.index/invalid-live-index", message.to_string()) }
+
+#[cfg(test)]
+#[test]
+fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation() {
+    let memory = MemoryBudget::new(1 << 20);
+    let table = TableRef::new("public", "docs");
+    let write = |id, system_from| {
+        let event = StoredEvent {
+            iid: EntityId::Uuid(id).iid(),
+            system_from,
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::Uuid(id))])),
+            recency: None,
+        };
+        TableWrite::new(BTreeMap::new(), Some(IndexBatch::from_events(&[event], &BTreeMap::new(), &memory).unwrap()))
+    };
+    let first_time = Timestamp(1);
+    let second_time = Timestamp(2);
+    let first = write([1; 16], first_time);
+    let second = write([2; 16], second_time);
+    let empty = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+    let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
+    let unproved = empty.append(&first, first_time).unwrap();
+    assert_eq!(unproved.row(0).unwrap().header().unwrap().iid, Iid([1; 16]));
+    assert!(!unproved.has_canonical_entity_iids());
+    drop(blocker);
+
+    let extended = unproved.append(&second, second_time).unwrap();
+    assert_eq!(extended.row_count(), 2);
+    assert!(!extended.has_canonical_entity_iids());
+    assert!(empty.append(&first, first_time).unwrap().has_canonical_entity_iids());
+}

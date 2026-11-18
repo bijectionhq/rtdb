@@ -75,13 +75,21 @@ impl Snapshot {
         names
     }
 
+    fn iter_segments<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a Arc<LiveTable>> {
+        let overlays = self.layered.get(table).into_iter().flat_map(|layers| layers.iter().rev());
+        let applied = self.durable.tables().get(table)
+            .filter(|segment| segment.block_index() > self.trie_catalog.l0_max_block_index(table));
+        overlays.chain(applied)
+    }
+
     /// Newer delta segments precede older ones, preserving operation order at equal system times.
-    pub fn segments(&self, table: &TableRef) -> Vec<Arc<LiveTable>> {
-        let mut segments: Vec<_> = self.layered.get(table).into_iter().flat_map(|layers| layers.iter().rev()).cloned().collect();
-        if let Some(durable) = self.durable.tables().get(table) {
-            if durable.block_index() > self.trie_catalog.l0_max_block_index(table) { segments.push(Arc::clone(durable)); }
-        }
-        segments
+    pub fn segments(&self, table: &TableRef) -> Vec<Arc<LiveTable>> { self.iter_segments(table).cloned().collect() }
+
+    /// Confirms that every put in this table's captured scan inputs uses the IID derived from its document ID.
+    /// A serving trie, a mismatched ID, or an unverified live segment leaves the relationship unproved.
+    pub fn has_canonical_entity_iids(&self, table: &TableRef) -> bool {
+        !self.trie_catalog.has_current_tries(table)
+            && self.iter_segments(table).all(|segment| segment.has_canonical_entity_iids())
     }
 
     pub fn column_types(&self, table: &TableRef) -> BTreeMap<String, LogicalType> { self.column_types_for(table, self.column_names(table)) }

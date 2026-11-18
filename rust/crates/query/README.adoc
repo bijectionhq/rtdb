@@ -335,10 +335,12 @@ Only equality operands with nonempty column references contained in opposite inp
 Identity projections and renames map filter keys to scan columns.
 Row bounds and window evaluation stop inherited filters, preserving the selected prefix and window inputs.
 Persisted page Bloom filters participate in superseder-preserving page selection.
-Join keys restrict IID paths and events when every reached non-null build value identifies a raw IID or an entity in the probe's confirmed ID domain.
-The scan checks the key domain against the physical column after identity remapping.
-Entity ID narrowing relies on the stored IID being derived from the document ID.
-An unproved build key leaves Bloom filtering available.
+Join keys on the physical `_iid` column can restrict IID paths and events using the reached raw IIDs.
+After identity remapping, a logical `_id` key can restrict the same paths and events when the key matches the probe's ID domain and every put in the captured table inputs has its derived IID.
+A live segment checks each incoming put while its IID agreement remains established.
+The first failed check or refused verification reservation marks the segment unproved.
+The scan requires exclusively verified live inputs for the table across its captured partitions.
+Bloom filtering remains available on the logical key.
 The ordinary join predicate still determines matches.
 Empty IID sets remain descriptive and do not eliminate the probe scan.
 Normal outer and anti joins carry empty IID descriptors for probe `_id`/`_iid` keys without populating Bloom filters or IID restrictions.

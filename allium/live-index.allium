@@ -82,7 +82,8 @@ external entity TableRef {
     tableName: String
 }
 
-external entity IID {}   -- 16-byte entity identifier
+external entity IID {}   -- Stored 16-byte entity identifier.
+    -- Writers may derive the IID from the document's logical ID or supply it explicitly.
 
 external entity Document {}   -- the actual row data for puts
 
@@ -332,6 +333,9 @@ entity TableSnapshot {
     -- Within a transaction it is the transaction's own view where it has written to this table, else the newest staged transaction's, else the applied rows.
     -- Absent when the table has no rows at snapshot time.
     segment: MemorySegment?
+
+    -- A native table snapshot can attest IID agreement when its inputs consist entirely of verified live segments.
+    -- The attestation covers every put in those segments and compares its stored IID to the IID derived from its document ID.
 }
 
 ------------------------------------------------------------

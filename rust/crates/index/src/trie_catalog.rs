@@ -181,6 +181,9 @@ impl TrieCatalog {
     pub fn current_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         self.all_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).collect()
     }
+    pub(crate) fn has_current_tries(&self, table: &TableRef) -> bool {
+        self.iter_tries(table).any(|trie| trie.state == TrieState::Live)
+    }
     pub fn live_and_nascent_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         self.all_tries(table).into_iter().filter(|trie| !matches!(trie.state, TrieState::Garbage { .. })).collect()
     }
