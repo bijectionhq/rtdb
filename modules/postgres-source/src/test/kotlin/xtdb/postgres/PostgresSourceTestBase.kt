@@ -1,5 +1,9 @@
 package xtdb.postgres
 
+import org.postgresql.PGConnection
+import org.postgresql.PGProperty
+import org.postgresql.util.PSQLException
+import org.postgresql.util.PSQLState
 import org.testcontainers.postgresql.PostgreSQLContainer
 import xtdb.XtdbInternal
 import xtdb.api.Xtdb
@@ -10,6 +14,7 @@ import java.nio.file.Path
 import java.sql.Connection
 import java.sql.DriverManager
 import java.sql.PreparedStatement
+import java.util.Properties
 import java.util.UUID
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
@@ -48,8 +53,27 @@ abstract class PostgresSourceTestBase {
             c.createStatement().use { it.execute("COMMIT") }
         }
 
-    protected fun dropSlot(slot: String) =
-        pgExecute("SELECT pg_drop_replication_slot('$slot') FROM pg_replication_slots WHERE slot_name = '$slot'")
+    protected fun dropSlot(slot: String) {
+        val properties = Properties().also {
+            PGProperty.USER.set(it, postgres.username)
+            PGProperty.PASSWORD.set(it, postgres.password)
+            PGProperty.ASSUME_MIN_SERVER_VERSION.set(it, "15")
+            PGProperty.REPLICATION.set(it, "database")
+            PGProperty.PREFER_QUERY_MODE.set(it, "simple")
+        }
+        DriverManager.getConnection(postgres.jdbcUrl, properties).use { connection ->
+            val name = connection.unwrap(PGConnection::class.java).escapeIdentifier(slot)
+            connection.createStatement().use { statement ->
+                statement.queryTimeout = 10
+                try {
+                    // The server can still own the slot after the streaming connection closes locally.
+                    statement.execute("DROP_REPLICATION_SLOT $name WAIT")
+                } catch (error: PSQLException) {
+                    if (error.sqlState != PSQLState.UNDEFINED_OBJECT.state) throw error
+                }
+            }
+        }
+    }
 
     // --- node ---
 
