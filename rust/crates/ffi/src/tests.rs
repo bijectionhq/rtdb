@@ -12,6 +12,15 @@ fn ok(status: i32, error: u64) {
     }
     assert_eq!(error, 0);
 }
+
+fn incorrect(status: i32, error: u64, code: &str) {
+    assert_eq!(status, 1);
+    let Handle::Error(diagnostic) = handles::get(error).unwrap() else { panic!("expected diagnostic") };
+    handles::release(error).unwrap();
+    assert_eq!(diagnostic.error.category, AnomalyCategory::Incorrect);
+    assert_eq!(diagnostic.error.code, code);
+}
+
 struct Native { database: u64, session: u64, retained: Vec<u64> }
 
 #[test]
@@ -60,7 +69,9 @@ fn database_properties_reject_unknown_and_oversized_inputs_before_node_configura
 
 impl Native {
     fn open() -> Self {
-        let yaml = b"server: null\nflightSql: null\nnodeId: ffi-test\n";
+        Self::open_yaml(b"server: null\nflightSql: null\nnodeId: ffi-test\n")
+    }
+    fn open_yaml(yaml: &[u8]) -> Self {
         let mut database = 0; let mut session = 0; let mut error = 0;
         ok(unsafe { rtdb_v1_database_open(yaml.as_ptr(), yaml.len(), 512 * 1024 * 1024, &mut database, &mut error) }, error);
         ok(unsafe { rtdb_v1_session_open(database, b"xtdb".as_ptr(), 4, 0, std::ptr::null(), 0, std::ptr::null(), 0, &mut session, &mut error) }, error);
@@ -74,9 +85,32 @@ impl Native {
         let mut out = 0; let mut error = 0;
         ok(unsafe { rtdb_v1_statement_new(self.session, sql.as_ptr(), sql.len(), 0, &mut out, &mut error) }, error); self.retained.push(out); out
     }
+    fn set_sql(&self, statement: u64, sql: &str) {
+        let mut error = 0;
+        ok(unsafe { rtdb_v1_statement_set_sql(statement, sql.as_ptr(), sql.len(), &mut error) }, error);
+    }
+    fn memory_used(&self) -> usize {
+        let mut used = 0;
+        let mut error = 0;
+        ok(unsafe { rtdb_v1_memory_used(self.database, &mut used, &mut error) }, error);
+        used
+    }
     fn query(&mut self, statement: u64, operation: u64) -> u64 {
         let mut out = 0; let mut error = 0;
         ok(unsafe { rtdb_v1_statement_query(statement, operation, &mut out, &mut error) }, error); self.retained.push(out); out
+    }
+    fn query_value(&mut self, statement: u64, operation: u64) -> rtdb_types::Value {
+        let cursor = self.query(statement, operation);
+        let mut array = FFI_ArrowArray::empty();
+        let mut schema = FFI_ArrowSchema::empty();
+        let mut present = 0;
+        let mut error = 0;
+        ok(unsafe { rtdb_v1_cursor_next(cursor, &mut array, &mut schema, &mut present, &mut error) }, error);
+        assert_eq!(present, 1);
+        let rows = StructArray::from(unsafe { from_ffi(array, &schema) }.unwrap());
+        assert_eq!(rows.len(), 1);
+        let field = Field::try_from(schema.child(0)).unwrap();
+        rtdb_columnar::read_value(&field, rows.column(0).as_ref(), 0).unwrap()
     }
 }
 impl Drop for Native {
@@ -407,6 +441,156 @@ fn adbc_set_query_rejection_has_no_side_effect_and_show_schema_requires_prepare(
     show.prepare(&token).unwrap();
     assert_eq!(show.schema(false, &token).unwrap().schema.fields()[0].name(), "application_name");
     assert!(matches!(show.update(&token), Err(error) if error.code == "xtdb.adbc/not-an-update"));
+}
+
+#[test]
+fn adbc_rejected_replacement_keeps_preparation_and_bind_until_valid_sql_is_installed() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let statement = native.statement("SELECT ? AS value");
+    let mut error = 0;
+    ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![17]))],
+    ).unwrap();
+    let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+    let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
+    ok(unsafe { rtdb_v1_statement_bind(statement, &mut array, &mut schema, &mut error) }, error);
+
+    for (sql, code) in [
+        ("SELECT 1; SELECT 'unterminated", "xtdb/sql-error"),
+        ("SHOW TIME ZONE; SELECT 1", "xtdb/sql-error"),
+        ("DISCARD ALL", "xtdb/not-a-query"),
+    ] {
+        let status = unsafe { rtdb_v1_statement_set_sql(statement, sql.as_ptr(), sql.len(), &mut error) };
+        incorrect(status, error, code);
+    }
+    for sql in ["BEGIN", "START TRANSACTION", "BEGIN READ ONLY", "COMMIT", "COMMIT SYNC", "ROLLBACK"] {
+        let mut rejected = u64::MAX;
+        let status = unsafe { rtdb_v1_statement_new(native.session, sql.as_ptr(), sql.len(), 0, &mut rejected, &mut error) };
+        assert_eq!(rejected, 0);
+        incorrect(status, error, "xtdb.adbc/tx-control-as-sql");
+        let status = unsafe { rtdb_v1_statement_set_sql(statement, sql.as_ptr(), sql.len(), &mut error) };
+        incorrect(status, error, "xtdb.adbc/tx-control-as-sql");
+    }
+
+    let mut parameters = FFI_ArrowSchema::empty();
+    ok(unsafe { rtdb_v1_statement_schema(statement, operation, 1, &mut parameters, &mut error) }, error);
+    assert_eq!(Schema::try_from(&parameters).unwrap().fields().len(), 1);
+    assert_eq!(native.query_value(statement, operation), rtdb_types::Value::I64(17));
+
+    native.set_sql(statement, "SELEC 1");
+    let status = unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) };
+    incorrect(status, error, "xtdb/sql-error");
+
+    native.set_sql(statement, "SELECT CAST(42 AS BIGINT) AS value");
+    let mut schema = FFI_ArrowSchema::empty();
+    let status = unsafe { rtdb_v1_statement_schema(statement, operation, 0, &mut schema, &mut error) };
+    incorrect(status, error, "xtdb.adbc/not-prepared");
+    for _ in 0..2 {
+        ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+        assert_eq!(native.query_value(statement, operation), rtdb_types::Value::I64(42));
+    }
+}
+
+#[test]
+fn adbc_set_and_show_round_trip_after_the_caller_releases_the_sql() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let statement = native.statement("");
+    let mut error = 0;
+
+    let sql = String::from("SET datestyle = 'ISO'");
+    native.set_sql(statement, &sql);
+    drop(sql);
+    let mut schema = FFI_ArrowSchema::empty();
+    ok(unsafe { rtdb_v1_statement_schema(statement, operation, 0, &mut schema, &mut error) }, error);
+    assert!(Schema::try_from(&schema).unwrap().fields().is_empty());
+    drop(schema);
+    let mut affected = 0;
+    ok(unsafe { rtdb_v1_statement_update(statement, operation, &mut affected, &mut error) }, error);
+    assert_eq!(affected, -1);
+
+    let sql = String::from("SHOW datestyle");
+    native.set_sql(statement, &sql);
+    drop(sql);
+    let mut schema = FFI_ArrowSchema::empty();
+    let status = unsafe { rtdb_v1_statement_schema(statement, operation, 0, &mut schema, &mut error) };
+    incorrect(status, error, "xtdb.adbc/not-prepared");
+    ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+    ok(unsafe { rtdb_v1_statement_schema(statement, operation, 0, &mut schema, &mut error) }, error);
+    let schema = Schema::try_from(&schema).unwrap();
+    assert_eq!(schema.fields().len(), 1);
+    assert_eq!(schema.field(0).name(), "datestyle");
+    assert_eq!(native.query_value(statement, operation), rtdb_types::Value::Utf8("ISO".into()));
+}
+
+#[test]
+fn adbc_statement_replacement_keeps_the_previous_lease_during_admission() {
+    let mut native = Native::open_yaml(
+        b"server: null\nflightSql: null\nnodeId: ffi-source-budget\nindexer: {enabled: false}\ncompactor: {threads: 0}\ngarbageCollector: {enabled: false}\n",
+    );
+    let operation = native.operation();
+    let current_sql = "SHOW application_name";
+    let replacement_sql = "SELECT 1";
+    let statement = native.statement(current_sql);
+    let memory = Arc::clone(handles::database(native.database).unwrap().0.memory());
+
+    let calibration = MemoryBudget::new(1 << 20);
+    assert!(rtdb_sql::parse_admitted_control_in(replacement_sql, &Default::default(), &calibration).unwrap().is_none());
+    let lexical_peak = calibration.peak_bytes();
+    assert_eq!(calibration.used_bytes(), 0);
+    let control = rtdb_sql::parse_admitted_control_in(current_sql, &Default::default(), &calibration).unwrap().unwrap();
+    let control_bytes = calibration.used_bytes();
+    drop(control);
+    assert_eq!(calibration.used_bytes(), 0);
+    let sql_bytes = replacement_sql.len() + 256;
+    assert!(lexical_peak > sql_bytes);
+    assert!(control_bytes > lexical_peak);
+
+    let with_control = native.memory_used();
+    let headroom = memory.limit_bytes() - with_control;
+    assert!(headroom >= lexical_peak);
+    let pressure = memory.reserve(headroom - lexical_peak + 1).unwrap();
+    let under_pressure = native.memory_used();
+    assert_eq!(memory.limit_bytes() - under_pressure, lexical_peak - 1);
+    let mut error = 0;
+    let status = unsafe { rtdb_v1_statement_set_sql(statement, replacement_sql.as_ptr(), replacement_sql.len(), &mut error) };
+    incorrect(status, error, "rtdb/memory-budget-exceeded");
+    assert_eq!(native.memory_used(), under_pressure);
+    drop(pressure);
+    assert_eq!(native.memory_used(), with_control);
+
+    ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+    let mut schema = FFI_ArrowSchema::empty();
+    ok(unsafe { rtdb_v1_statement_schema(statement, operation, 0, &mut schema, &mut error) }, error);
+    assert_eq!(Schema::try_from(&schema).unwrap().field(0).name(), "application_name");
+    drop(schema);
+    assert_eq!(native.memory_used(), with_control);
+
+    let pressure = memory.reserve(headroom - lexical_peak).unwrap();
+    assert_eq!(memory.limit_bytes() - native.memory_used(), lexical_peak);
+    native.set_sql(statement, replacement_sql);
+    assert_eq!(native.memory_used(), memory.limit_bytes() - lexical_peak - control_bytes + sql_bytes);
+    drop(pressure);
+    assert_eq!(native.memory_used(), with_control - control_bytes + sql_bytes);
+    ok(unsafe { rtdb_v1_close(statement, &mut error) }, error);
+    assert_eq!(native.memory_used(), with_control - control_bytes);
+
+    let bulk_baseline = native.memory_used();
+    let ignored_prefix = format!("SELECT '{}.public.items", "x".repeat(16_384));
+    let mut bulk_bytes = None;
+    for target in ["items", "public.items", ignored_prefix.as_str()] {
+        let mut bulk = 0;
+        ok(unsafe { rtdb_v1_statement_new(native.session, target.as_ptr(), target.len(), 1, &mut bulk, &mut error) }, error);
+        let retained = native.memory_used() - bulk_baseline;
+        assert_eq!(*bulk_bytes.get_or_insert(retained), retained);
+        ok(unsafe { rtdb_v1_close(bulk, &mut error) }, error);
+        assert_eq!(retained - (native.memory_used() - bulk_baseline), "public".len() + "items".len() + 256);
+        ok(unsafe { rtdb_v1_release(bulk, &mut error) }, error);
+        assert_eq!(native.memory_used(), bulk_baseline);
+    }
 }
 
 #[test]

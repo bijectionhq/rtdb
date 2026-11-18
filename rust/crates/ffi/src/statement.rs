@@ -5,6 +5,7 @@ use rtdb_columnar::{DeclaredBatch, MemoryReservation, OwnedBatch, conform_batch}
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
 use rtdb_plan::ControlStatement;
 use rtdb_query::QueryCursor;
+use rtdb_sql::{AdmittedControl, parse_admitted_control_in};
 use rtdb_tx::{Documents, SqlArguments, TxOp};
 use rtdb_types::{Anomaly, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
@@ -27,13 +28,15 @@ impl SessionHandle {
 }
 impl Drop for SessionHandle { fn drop(&mut self) { self.close(); } }
 
+const SOURCE_ALLOCATION_OVERHEAD: usize = 256;
+
 enum Source {
-    Sql { text: String, prepared: Option<PreparedSql> },
-    Set(ControlStatement),
-    Show { statement: ControlStatement, prepared: bool },
-    Bulk(TableRef),
+    Sql { text: String, prepared: Option<PreparedSql>, _text_reservation: Arc<MemoryReservation> },
+    Set(AdmittedControl),
+    Show { statement: AdmittedControl, prepared: bool },
+    Bulk { table: TableRef, _name_reservation: Arc<MemoryReservation> },
 }
-struct StatementState { source: Source, bound: Option<ImportedRows>, _reservation: Arc<MemoryReservation> }
+struct StatementState { source: Source, bound: Option<ImportedRows> }
 pub(crate) struct StatementHandle {
     pub session: Arc<SessionHandle>,
     creation_database: String,
@@ -59,25 +62,31 @@ impl StatementHandle {
         Ok(())
     }
     fn source_state(session: &Arc<SessionHandle>, text: &str, bulk: bool) -> Result<StatementState> {
-        let reservation = session.region.memory().reserve(super::add(super::mul(text.len(), 1024)?, 8192)?)?;
+        let memory = session.region.memory();
         let source = if bulk {
             let mut parts = text.rsplit('.');
             let table = parts.next().unwrap_or("");
             let schema = parts.next().unwrap_or("public");
             if table.is_empty() || schema.is_empty() { return Err(super::invalid("Bulk ingest requires a table name")); }
-            Source::Bulk(TableRef { schema: schema.into(), table: table.into() })
-        } else if let Some(control) = rtdb_sql::parse_control_in(text, &Default::default(), session.region.memory())? {
-            if matches!(&control, ControlStatement::Begin(_) | ControlStatement::Commit(_) | ControlStatement::Rollback) {
+            let bytes = super::add(super::add(schema.len(), table.len())?, SOURCE_ALLOCATION_OVERHEAD)?;
+            let reservation = memory.reserve(bytes)?;
+            Source::Bulk { table: TableRef { schema: schema.into(), table: table.into() }, _name_reservation: reservation }
+        } else if let Some(control) = parse_admitted_control_in(text, &Default::default(), memory)? {
+            let statement = control.statement();
+            if matches!(statement, ControlStatement::Begin(_) | ControlStatement::Commit(_) | ControlStatement::Rollback) {
                 return Err(Anomaly::incorrect("xtdb.adbc/tx-control-as-sql", "Use the transaction API to begin, commit, or roll back transactions"));
             }
-            if !matches!(&control, ControlStatement::Show { .. } | ControlStatement::SetTransaction(_) | ControlStatement::SetSessionCharacteristics(_) | ControlStatement::SetTimeZone(_) | ControlStatement::SetAwaitToken(_) | ControlStatement::SetParameter { .. } | ControlStatement::SetRole) {
+            if !matches!(statement, ControlStatement::Show { .. } | ControlStatement::SetTransaction(_) | ControlStatement::SetSessionCharacteristics(_) | ControlStatement::SetTimeZone(_) | ControlStatement::SetAwaitToken(_) | ControlStatement::SetParameter { .. } | ControlStatement::SetRole) {
                 return Err(Anomaly::incorrect("xtdb/not-a-query", "This statement is not supported through ADBC"));
             }
-            if matches!(&control, ControlStatement::Show { .. }) {
+            if matches!(statement, ControlStatement::Show { .. }) {
                 Source::Show { statement: control, prepared: false }
             } else { Source::Set(control) }
-        } else { Source::Sql { text: text.into(), prepared: None } };
-        Ok(StatementState { source, bound: None, _reservation: reservation })
+        } else {
+            let reservation = memory.reserve(super::add(text.len(), SOURCE_ALLOCATION_OVERHEAD)?)?;
+            Source::Sql { text: text.into(), prepared: None, _text_reservation: reservation }
+        };
+        Ok(StatementState { source, bound: None })
     }
     pub fn close(&self) { self.state.lock().take(); }
     pub fn bind(&self, values: ImportedRows) -> Result<()> {
@@ -91,14 +100,14 @@ impl StatementHandle {
         self.session.region.run(async {
             let mut session = self.session.state.lock();
             match &mut state.source {
-                Source::Sql { text, prepared } => {
+                Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
                     let context = session.prepare_context_for(&self.creation_database, token).await?;
                     *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                 }
                 Source::Show { prepared, .. } => { session.state().revalidate().await?; *prepared = true; }
                 Source::Set(_) => { session.state().revalidate().await?; }
-                Source::Bulk(_) => return Err(Anomaly::incorrect("xtdb.adbc/bulk-ingest-no-prepare", "Bulk ingest does not support prepare")),
+                Source::Bulk { .. } => return Err(Anomaly::incorrect("xtdb.adbc/bulk-ingest-no-prepare", "Bulk ingest does not support prepare")),
             }
             Ok(())
         })
@@ -121,11 +130,11 @@ impl StatementHandle {
                 Source::Show { statement: control, prepared } => {
                     if !*prepared { return Err(not_prepared()); }
                     if parameters { crate::arrow::OwnedSchema::empty(self.session.region.memory()) } else {
-                        crate::arrow::OwnedSchema::logical(&control_schema(control)?.unwrap_or_default(), self.session.region.memory())
+                        crate::arrow::OwnedSchema::logical(&control_schema(control.statement())?.unwrap_or_default(), self.session.region.memory())
                     }
                 }
                 Source::Set(_) => crate::arrow::OwnedSchema::empty(self.session.region.memory()),
-                Source::Bulk(_) => Err(Anomaly::incorrect("xtdb.adbc/bulk-ingest-no-query", "Bulk ingest does not have a query schema")),
+                Source::Bulk { .. } => Err(Anomaly::incorrect("xtdb.adbc/bulk-ingest-no-query", "Bulk ingest does not have a query schema")),
             }
         })
     }
@@ -139,7 +148,7 @@ impl StatementHandle {
             let mut session = self.session.state.lock();
             let args = state.bound.as_ref().map(|bound| &bound.arguments);
             match &mut state.source {
-                Source::Sql { text, prepared } => {
+                Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
                     if prepared.is_none() {
                         if args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
@@ -153,13 +162,13 @@ impl StatementHandle {
                 Source::Show { statement: control, prepared } => {
                     if !*prepared && args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
                     *prepared = true;
-                    match session.execute_control_with(control, &[], token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
+                    match session.execute_control_with(control.statement(), &[], token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
                         ControlResult::Rows(cursor) => Ok(cursor),
                         _ => Err(Anomaly::incorrect("xtdb/not-a-query", "Statement does not produce rows")),
                     }
                 }
                 Source::Set(_) => Err(Anomaly::incorrect("xtdb/not-a-query", "Statement does not produce rows")),
-                Source::Bulk(_) => Err(Anomaly::incorrect("xtdb.adbc/bulk-ingest-no-query", "Bulk ingest does not support queries")),
+                Source::Bulk { .. } => Err(Anomaly::incorrect("xtdb.adbc/bulk-ingest-no-query", "Bulk ingest does not support queries")),
             }
         })?;
         CursorHandle::new(Arc::clone(&self.session.region), cursor, result_token)
@@ -171,7 +180,7 @@ impl StatementHandle {
             let mut session = self.session.state.lock();
             session.state().revalidate().await?;
             match &mut state.source {
-                Source::Sql { text, prepared } => {
+                Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
                     if prepared.is_none() {
                         let context = session.prepare_context_for(&self.creation_database, token).await?;
@@ -183,12 +192,12 @@ impl StatementHandle {
                 }
                 Source::Set(control) => {
                     let values = argument_row(state.bound.as_ref().map(|bound| &bound.arguments), self.session.region.memory())?;
-                    match session.execute_control_with(control, &values.0, token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
+                    match session.execute_control_with(control.statement(), &values.0, token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
                         ControlResult::Command { .. } => Ok(-1), _ => Err(Anomaly::incorrect("xtdb.adbc/not-an-update", "Statement is not an update")),
                     }
                 }
                 Source::Show { .. } => Err(Anomaly::incorrect("xtdb.adbc/not-an-update", "Statement is not an update")),
-                Source::Bulk(table) => {
+                Source::Bulk { table, .. } => {
                     let Some(bound) = state.bound.take() else { return Ok(0); };
                     let count = i64::try_from(bound.arguments.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
                     let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;

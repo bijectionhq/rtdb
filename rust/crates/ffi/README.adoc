@@ -44,6 +44,11 @@ Each result owns a child cancellation token, so releasing a result preserves its
 Releasing the last operation handle cancels its scope.
 Statements retain the default database captured at creation for preparation, schema inspection and queries.
 Changing the connection's current catalog affects subsequent statements and DML submission.
+Statement creation and source replacement classify SQL under the node's memory budget.
+The statement retains an admitted control command through schema inspection and execution.
+Ordinary SQL retains its source text for preparation, and bulk ingest retains its schema and table names.
+A rejected source replacement preserves the current source, preparation and bound arguments.
+A successful replacement clears the prior preparation and bound arguments.
 Session-variable SHOW remains available in failed ADBC transactions; query-classified SHOW and PostgreSQL's failed-command guard retain their access checks.
 
 Arrow exports implement the Arrow C Data Interface.
