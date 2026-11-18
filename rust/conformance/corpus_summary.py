@@ -2,7 +2,8 @@
 
 Errors raised because a test reaches a JVM-only API (a cast to xtdb.api.Xtdb, NodeBase or the database catalog)
 are reported as jvm-api-boundary: the binding documents those types as a migration boundary, so such Vars
-cannot run natively without changing the original test.
+cannot run natively without changing the original test. Vars that need cloud CLIs or real cloud endpoints report
+environment-unavailable.
 """
 
 import argparse
@@ -13,13 +14,19 @@ import re
 
 BOUNDARY = re.compile(
     r"cannot be cast to class xtdb\.api\.Xtdb\b|xtdb\.NodeBase|xtdb\.database\.Database\$Catalog|"
-    r"cannot be cast to class xtdb\.api\.Xtdb\$Connection|No implementation of method: :\S+ of protocol: #'xtdb\.(db|node)")
+    r"cannot be cast to class xtdb\.api\.Xtdb\$Connection|No implementation of method: :\S+ of protocol: #'xtdb\.(db|node)|"
+    r"NativeDatabase cannot be cast to class clojure\.lang\.(Associative|ILookup|IPersistentMap)|"
+    r"Unsupported native start-node options|No serializer found for class")
+ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 
 
 def outcome(row):
-    if row["result"] in ("error", "fail") and BOUNDARY.search(row.get("detail") or ""):
+    detail = row.get("detail") or ""
+    if row["result"] in ("error", "fail") and BOUNDARY.search(detail):
         return "jvm-api-boundary"
+    if row["result"] in ("error", "fail") and ENVIRONMENT.search(detail):
+        return "environment-unavailable"
     return row["result"]
 
 
