@@ -64,11 +64,11 @@ pub(crate) fn resolve<'a>(
         let values = providers[alias].get(path, &keys, reserve)?;
         lookups.insert((alias, path), values);
     }
+    let replacement = |variable: &Variable<'a>| {
+        lookups.get(&(variable.provider, variable.path))?.get(variable.key).map(String::as_str)
+    };
     let mut output = BTreeMap::new();
     for (name, value) in original {
-        let replacement = |variable: &Variable<'_>| {
-            lookups.get(&(variable.provider, variable.path))?.get(variable.key).map(String::as_str)
-        };
         let length = Variables::new(value).try_fold(value.len(), |length, variable| {
             match replacement(&variable) {
                 Some(text) => add(length.checked_sub(variable.end - variable.start).ok_or_else(allocation)?, text.len()),

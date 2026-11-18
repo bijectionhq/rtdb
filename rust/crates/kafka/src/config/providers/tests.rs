@@ -24,10 +24,12 @@ fn file_and_directory_values_resolve_once_and_keep_original_missing_placeholders
         "${{file:{}:name}}/${{file:{}:quoted}}/${{file:{}:next}}/${{dir:{}:secret}}/${{dir:{}:nested}}/${{unused:x}}",
         file.display(), file.display(), file.display(), root.path().display(), root.path().display(),
     ));
+    original.insert("shared".into(), format!("${{file:{}:name}}", file.display()));
     let memory = MemoryBudget::new(1 << 25);
     let scope = AllocationScope::new(&memory).unwrap();
     let resolved = resolve(&original, &mut |bytes| scope.reserve(bytes)).unwrap();
     assert_eq!(resolved["setting"], format!("café/firstcontinued/${{file:after}}/opaque\r\n/${{dir:{}:nested}}/${{unused:x}}", root.path().display()));
+    assert_eq!(resolved["shared"], "café");
     assert!(memory.used_bytes() > 4096);
     drop(resolved);
     drop(scope);
