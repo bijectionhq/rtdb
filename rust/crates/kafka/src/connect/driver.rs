@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use super::{ConnectConfig, ConversionContext, Converter, DateEnvironment, PluginRegistry, RecordIndexer, ResumeToken, SinkRecord, SourceConfig, SourceTransactions, error};
 use crate::KafkaClusterConfig;
+mod native_account;
 
 struct ConsumerConfiguration {
     client: rdkafka::ClientConfig,
@@ -154,7 +155,8 @@ impl SourceDriver {
             }).and_then(|bytes| bytes.checked_mul(8)).ok_or_else(overflow)?;
             scope.reserve(bound)?;
         }
-        let client = crate::client::prepare(properties, &self.memory)?;
+        let mut client = crate::client::prepare(properties, &self.memory)?;
+        native_account::install(&mut client, &self.memory)?;
         Ok(ConsumerConfiguration { client, _providers: captured.allocation })
     }
     async fn ingest(&mut self, term: &TermHandle, after: Option<ResumeToken>, converters: &mut Converters, plugin_charge: &Arc<MemoryReservation>) -> Result<()> {

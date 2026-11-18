@@ -495,7 +495,7 @@ impl<C: ClientContext> Client<C> {
 
     /// Returns the metadata information for the specified topic, or for all topics in the cluster
     /// if no topic is specified.
-    /// An accounted producer reports the native critical system resource error if parsed-arena admission or allocation fails.
+    /// An accounted client reports the native critical system resource error if parsed-arena admission or allocation fails.
     pub fn fetch_metadata<T: Into<Timeout>>(
         &self,
         topic: Option<&str>,

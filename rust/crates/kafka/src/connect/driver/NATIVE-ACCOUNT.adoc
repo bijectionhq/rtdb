@@ -1,0 +1,45 @@
+= Connect stock consumer native account
+
+SourceDriver installs the explicit consumer-capable native account at the tail of consumer_configuration, after provider resolution and TLS preparation and before returning the configuration.
+Its actual MemoryBudget admits the entire declared native capacity before the native consumer is constructed in ingest.
+ClientConfig, NativeClientConfig, the native consumer, queues/events and independent Metadata results share that capacity reservation through the reviewed SDK ownership chain.
+Captured property/provider/file scope remains in the returned ConsumerConfiguration unchanged.
+
+The stock path copies only fetch.max.bytes, message.max.bytes, queued.max.messages.kbytes and receive.message.max.bytes into a private scalar configuration for native integer normalization.
+It does not replay unrelated native setters, TLS configuration or plugin callbacks.
+That temporary configuration is destroyed before native capacity construction and starts no client or network thread.
+Native configuration/probe bookkeeping remains in the separate configuration-coverage domain, outside the selected native byte ceiling.
+
+Absent explicit fetch.max.bytes, the effective target follows the pinned native consumer rule: the default target is clamped to the queued byte allowance, then raised to message.max.bytes when necessary.
+The queued kilobyte product, native signed integer storage, framing additions and capacity sum are checked.
+Explicit fetch and receive values are normalized by native scalar setters and retain their numeric demands.
+Fetch must be at least message.max.bytes.
+An absent receive limit becomes the effective fetch target plus 1MiB; an explicit receive limit must be at least fetch plus 512 bytes.
+The capacity policy is two receive allowances plus 8MiB.
+With the default 8MiB source queue, this gives an 8MiB fetch target, 9MiB receive limit and 26MiB native ceiling.
+A larger explicit fetch or receive setting raises the required reservation rather than being silently clamped to the source batch size.
+
+Kafka may return its first large batch beyond the requested fetch target.
+That exception does not make the request target a hard wire bound.
+A response above the finite native receive limit follows the existing oversized-frame error path.
+Overlapping admitted owners can separately exhaust the account and follow the existing CRIT_SYS_RESOURCE broker error/reconnect route.
+Neither outcome creates a new fatal latch or rollback guarantee.
+The 8MiB control allowance is a ceiling policy, not a proof that every metadata response or every broker concurrency level fits it.
+
+Arithmetic and incompatible-limit failures return the existing typed Connect errors.
+Capacity denial preserves the original MemoryBudget error and releases the private configuration work without starting a native consumer.
+Provider transformations and source option changes that preceded this admission keep their existing order; this helper does not roll them back.
+After successful admission, the unpublished configuration receives its finite limits and account together before being returned.
+Failed native consumer construction finishes its existing native cleanup before its retained configuration capacity can be released.
+
+Presence of plugin.library.paths retains the existing unaccounted Connect caller branch, including the setting's original value and native callback demand at real client creation.
+A full temporary probe would load plugins and replay configuration callbacks, and plugin callbacks can consume the byte-limit settings themselves.
+The stock scalar account policy does not claim to cover that path.
+A separate one-native-configuration admission/consume boundary remains required for native plugins.
+No new unsupported-setting rejection is introduced.
+
+The unexecuted source fixtures cover native default normalization and message-size floor, isolated scalar probing, explicit larger demands, incompatible limits, integer/product/sum overflow, exact and one-byte-short capacity, actual SourceDriver configuration denial, consumer/configuration lifetime, failed native construction, independent Metadata retention and provider-scope retention.
+All existing client_tests.rs assertions remain exact.
+Decompression/shadow buffers, individual fetch/error ops, native requests/lists, construction/thread/queue storage, allocator overhead and other allocation classes remain separate admission obligations.
+Log-client activation, the native plugin path, whole-native coverage and runtime/Phase 2 verification remain open.
+link:native-account-sources.json[The source record] and link:native-account-COPYRIGHT[its complete retained notices] pin this caller policy.

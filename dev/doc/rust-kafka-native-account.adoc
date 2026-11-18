@@ -30,5 +30,14 @@ An application activating this profile must provide compatible fetch, receive-fr
 SDK attachment alone supplies no sizing formula for those independent limits.
 Connect and log call-site activation is separate from this public SDK profile.
 
+The stock Connect SourceDriver now reserves its native consumer ceiling from the assignment MemoryBudget before consumer construction.
+Its scalar native configuration probe computes the native queued-byte/default-message floor, honors explicit fetch and receive demands, and selects a finite receive limit when none was supplied.
+The policy reserves two receive limits plus 8MiB; default source settings produce a 9MiB receive limit and 26MiB reservation.
+The captured provider/file scope remains retained beside configuration.
+The scalar probe omits unrelated setters and callbacks.
+Configurations containing plugin.library.paths retain their original unaccounted path until a separate one-native-configuration boundary is implemented.
+link:../../rust/crates/kafka/src/connect/driver/NATIVE-ACCOUNT.adoc[The Connect caller contract] describes limit compatibility, first-large-batch errors, ownership and uncovered allocation classes.
+Log-client activation and native codec storage remain separate work.
+
 The new public regression sources are unexecuted in Phase 1.
 Compilation, native runtime checks, complete allocation coverage and Phase 2 gates remain open.

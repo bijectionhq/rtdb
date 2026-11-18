@@ -1,0 +1,41 @@
+{
+  "native_upstream_commit": "d5203d7b0c097d912d076681fd9e0922725b7575",
+  "reviewed_consumer_api_predecessor": "94fd15dbd",
+  "reviewed_property_capture_predecessor": "d3b52615f",
+  "baseline13_manifest_sha256": "fb24f4b2e47ba672d972f24705cbcdbb2f5dc772f9b39b4d6811e1912addfdb8",
+  "role_plan_sha256": "23e7fae84663d9b44562be1ab6dff0311a4ae5c5d455e6779bb58427a4c825f2",
+  "source_inputs": {
+    "rust/crates/kafka/src/connect/driver.rs": "5091b4ad36af1bf9739e3b0595325bd6304d5d4621ed4b87415abdec63b382b4",
+    "rust/vendor/rdkafka/src/client.rs": "aae082325bc3634c3a6a97c671fd1ab80f1783917a2962fc237272343790caa1",
+    "dev/doc/rust-kafka-native-account.adoc": "f020710a1c4a2389cc2f7a26202a78c63850bb05cd936b0fc5a2ec95ca97bc1e",
+    "rust/crates/kafka/src/connect/driver/client_tests.rs": "3301175575629aa0598184c0c24987467d09a4431d01984778ba44aeb3e2cd63",
+    "rust/crates/types/src/memory.rs": "dac531797c9086a1400e0d08d362f7d9881bd34caab61438993baa6e2d87316f",
+    "rust/crates/kafka/src/client.rs": "09686ad957caa41c19471f19118117c53bea74d4c9465f91f45504a4cd0d5746",
+    "rust/vendor/rdkafka/src/config.rs": "9ce9e3622cd9c6f99f7d4efc4427805a6bb934f6acdfcdfaf6e54c0ec32429e8",
+    "rust/vendor/rdkafka/src/native_byte_account.rs": "4d8c828467c65da44b1e217201f231e275674a6ce0e6836bd6924787f43f5902",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_conf.c": "59d9b852e4490e2ce441558eb603a02e085efb6044b8e3d03698c2f7d999e060",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_conf.h": "21db80ac03a4f8e88cce9a2f1b42e11a8738259fcfd427002299728f15f11387",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_broker.c": "6345e03d3ad2a744960c58f2bd9b4dcd36d86b9f72bcfc8eaca0d3351a310982",
+    "rust/vendor/rdkafka-sys/librdkafka/LICENSE": "c545fe812d514aa0151449062eecfc181b8c9d49b6c0b540593110bf79749eaa",
+    "rust/vendor/rdkafka/LICENSE": "170c12ecdda861b90f057a788f70b5d270a9f7292fd06263ec1d6bffc404f933",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_plugin.c": "8e8ac3380dc8c99e083ae9c279f6046c645f5fc05a28696a3f797940640ee12e",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_plugin.h": "20446f9cacfcacd31baf66cdbe2b452183b4c268cc88954a63b9355085cadbe1",
+    "rust/vendor/rdkafka/src/consumer/base_consumer.rs": "b3fc043b050d6d9f1b31beec7d8680cdda6a00cccefa107e550a900390a84278",
+    "rust/vendor/rdkafka/src/metadata.rs": "43ce8f0626a641ada6174b40cb4ab5dcd28c29f7d69ea700c73a9dfbcf049b78",
+    "rust/vendor/rdkafka/src/util.rs": "dea7ffad817880e05dccbb71f1fdd21c9713f1d47cef95bb606534d24fd7e141",
+    "rust/crates/kafka/src/client/material.rs": "87dfcf4e6500277d688de2e19814260a46cc5828646426617b8d567e0a73e25a",
+    "rust/crates/kafka/src/tls.rs": "b8bb078999e3d1306756a2a54e12b8a71f00ec529a901957380fcd3647038975",
+    "rust/crates/kafka/src/tls/identities.rs": "b762bad2136343b44b0191c1fdd46d4331a619f6aa03034b5f9e8abf0e160c36",
+    "rust/crates/tls/src/lib.rs": "96b24fc92421fcd087d154fd48ba627ece2f4e9db7d0dd953914b24c1b2a4fb3",
+    "rust/crates/tls/tests/fixtures/empty.jks": "021785913c905b64e597d46b150c4927ea223feba243e31f45a5b3bf4128dcc3",
+    "rust/crates/kafka/src/config.rs": "4ed2c2c0ab668fed51ee46decb5eec954b7e5033217445eddf1b8e6dedf214f3"
+  },
+  "leading_notice_sha256": {
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_conf.c": "365b08a26678009675de6be0b0585f051ab3aacfa28c40d276f9f1b40b0c6a98",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_conf.h": "21f40108f3fc25e7c28aa44c098c9f3d024f1e76ebfa28737b995d9eebcf3514",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_broker.c": "365b08a26678009675de6be0b0585f051ab3aacfa28c40d276f9f1b40b0c6a98",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_plugin.c": "b327df8c5cfae5b9c9c82875c36c6bb57c06eed0efac594c2501b3246bc72e8c",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_plugin.h": "b327df8c5cfae5b9c9c82875c36c6bb57c06eed0efac594c2501b3246bc72e8c"
+  },
+  "qualification": "Source-only actual stock Connect consumer activation on its assignment MemoryBudget, preserving captured.allocation. A temporary scalar-only native configuration normalizes four byte limits without replaying unrelated TLS/plugin setters. The pinned absent-fetch queued/message rule, checked native integer products, finite receive compatibility and two-receive-plus-8MiB reservation policy are applied before native consumer creation. Explicit larger demands remain demands; first-large-batch responses can follow the existing oversized-frame error and overlapping admitted storage can independently deny the account. Presence of plugin.library.paths retains its original unaccounted caller branch, not a new unsupported-setting rejection; a one-native-config admission/consume boundary remains open. Native configuration/probe bookkeeping, decompression/shadow storage, individual fetch/error ops, other native allocation classes, log activation, whole-native/Java/runtime and Phase 2 closure remain separate obligations."
+}
