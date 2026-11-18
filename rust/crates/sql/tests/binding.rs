@@ -35,6 +35,36 @@ fn insert_values_without_a_projection_reports_both_planning_diagnostics() {
 }
 
 #[test]
+fn table_projection_failures_report_dependent_columns_in_order() {
+    let sql = "INSERT INTO foo (_id) SELECT _id FROM UNNEST([1,2,3]) x (_id, foo)";
+    let error = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_err();
+    assert_eq!(error.code, "xtdb/sql-error");
+    assert_eq!(error.message.as_deref(), Some(
+        "Errors planning SQL statement:\n  - Table projection mismatch for x (_id,foo)\n  - Column not found: _id",
+    ));
+    assert_eq!(error.context["errors"], serde_json::json!([
+        {"table-alias": "x", "projections": ["_id", "foo"]},
+        {"chain": ["_id"]},
+    ]));
+
+    let qualified = prepare("SELECT x._id FROM UNNEST([1,2,3]) x (_id, foo)", &Fixture, &PrepareOptions::default()).unwrap_err();
+    assert_eq!(qualified.context["errors"][1]["chain"], serde_json::json!(["_id", "x"]));
+
+    let sql = "INSERT INTO foo (_id) FROM generate_series (1,4) xs (x, foo)";
+    let error = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_err();
+    assert_eq!(error.message.as_deref(), Some(concat!(
+        "Errors planning SQL statement:\n  - Table projection mismatch for xs (x,foo)",
+        "\n  - Column count mismatch: expected 1, given 0",
+        "\n  - INSERT does not contain mandatory _id column",
+    )));
+    assert_eq!(error.context["errors"], serde_json::json!([
+        {"table-alias": "xs", "projections": ["x", "foo"]},
+        {"expected": 1, "given": 0},
+        {},
+    ]));
+}
+
+#[test]
 fn invalid_interval_default_reports_its_source_occurrence_once() {
     let error = prepare("SETTING DEFAULT VALID_TIME AS OF INTERVAL 'bad' SELECT * FROM foo",&Fixture,&PrepareOptions::default()).unwrap_err();
     assert_eq!(error.message.as_deref(),Some("Errors planning SQL statement:\n  - Cannot parse interval: bad - failed with message null"));

@@ -127,7 +127,7 @@ async fn expression_derived_tables_keep_a_single_value_and_capture_visible_sourc
         [vec![V::I64(5), V::I64(5)]]);
     assert_eq!(query("SELECT * FROM ((SELECT 5) AS q)", false).await.unwrap(), [vec![V::I64(5)]]);
     for (source, expected) in [
-        ("SELECT * FROM ABS(1) AS t(a,b)", "Table projection mismatch for t (a,b)"),
+        ("SELECT * FROM ABS(1) AS t(a,b)", "Errors planning SQL statement:\n  - Table projection mismatch for t (a,b)"),
         ("SELECT * FROM SUM(42) AS t(x)", "Aggregates are not allowed in this context"),
         ("SELECT * FROM (SELECT 5)", "Subqueries are not allowed in this context"),
     ] {

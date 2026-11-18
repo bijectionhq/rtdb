@@ -758,6 +758,7 @@ rule LeaderProcessesTx {
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
+        -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }

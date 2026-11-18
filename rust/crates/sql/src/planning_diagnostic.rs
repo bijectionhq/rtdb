@@ -13,6 +13,18 @@ impl PlanningDiagnostic {
         Self { message: message.into(), details: Map::new() }
     }
 
+    pub fn column_count(expected: usize, given: usize) -> Self {
+        Self::new(format!("Column count mismatch: expected {expected}, given {given}"))
+            .with_detail("expected", serde_json::json!(expected))
+            .with_detail("given", serde_json::json!(given))
+    }
+
+    pub fn table_projection(alias: String, projections: Vec<String>) -> Self {
+        Self::new(format!("Table projection mismatch for {alias} ({})", projections.join(",")))
+            .with_detail("table-alias", alias)
+            .with_detail("projections", serde_json::json!(projections))
+    }
+
     pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.details.insert(key.into(), value.into());
         self

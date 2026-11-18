@@ -58,7 +58,7 @@ impl Context<'_> {
                         Err(missing) if missing.code == "xtdb/column-not-found" && name.normalized() == "user" => {
                             call("current_user".into(), Vec::new())?
                         }
-                        resolved => resolved?,
+                        resolved => self.recover_column(resolved, std::slice::from_ref(&name))?,
                     }
                 }
             }
@@ -66,7 +66,10 @@ impl Context<'_> {
                 let names: Vec<_> = names.iter().map(identifier).collect();
                 if let Some(function) = names.last().and_then(|name| bare_scalar_name(name, names.len())) {
                     call(function, Vec::new())?
-                } else { input.scope().resolve(self, &names)? }
+                } else {
+                    let resolved = input.scope().resolve(self, &names);
+                    self.recover_column(resolved, &names)?
+                }
             }
             ast::Expr::Value(value) => match &value.value {
                 ast::Value::Placeholder(parameter) => {

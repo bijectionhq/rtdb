@@ -7,6 +7,7 @@ use sqlparser::ast as ast;
 
 use crate::parse::{ParsedStatement, Syntax, TemporalClause, TemporalExtent};
 use crate::PrepareOptions;
+use crate::planning_diagnostic::PlanningDiagnostic;
 use crate::expression::{ReplacementKey, Replacements};
 use crate::subquery::{DeferredExpressionInput, ExpressionAttachment, ExpressionInput};
 
@@ -54,6 +55,7 @@ pub(crate) struct Context<'a> {
     pub(crate) next_parameter: usize,
     period_columns: BTreeSet<String>,
     notices: Vec<SqlNotice>,
+    diagnostics: Vec<PlanningDiagnostic>,
     default_valid: Option<TemporalExtent>,
     default_system: Option<TemporalExtent>,
 }
@@ -81,7 +83,7 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     context.admit_expression_literals(expression)?;
     let expression = context.expr(expression, &Schema::default(), &BTreeMap::new())?;
     context.literals.check()?;
@@ -95,12 +97,14 @@ pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: 
     let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
-    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
     context.admit_statement_literals(&statement)?;
-    let statement = context.statement(&statement)?;
+    let statement = context.statement(&statement);
+    context.check_diagnostics(statement.as_ref().err())?;
+    let statement = statement?;
     context.literals.check()?;
     Ok(PreparedStatement { statement, parameter_types: context.binder.parameter_types().clone(), source: prepared_source.to_owned(), notices: context.notices, settings })
 }
@@ -122,6 +126,44 @@ impl Catalog for TransactionCatalog<'_> {
 }
 
 impl Context<'_> {
+    fn check_diagnostics(&mut self, terminal: Option<&Anomaly>) -> Result<()> {
+        if terminal.is_some_and(|error| !error.is_caller_error() || error.code.starts_with("rtdb/")) {
+            return Ok(());
+        }
+        let mut errors = std::mem::take(&mut self.diagnostics).into_iter();
+        if let Some(first) = errors.next() {
+            let terminal = terminal.map(|error| {
+                let mut diagnostic = PlanningDiagnostic::new(error.message.as_deref().unwrap_or(&error.code));
+                for (key, value) in &error.context {
+                    diagnostic = diagnostic.with_detail(key.clone(), value.clone());
+                }
+                diagnostic
+            });
+            return Err(first.into_anomaly(errors.chain(terminal)));
+        }
+        Ok(())
+    }
+
+    fn planning_failure(&mut self, cause: PlanningDiagnostic) -> Anomaly {
+        let mut prior = std::mem::take(&mut self.diagnostics).into_iter();
+        match prior.next() {
+            Some(first) => first.into_anomaly(prior.chain([cause])),
+            None => cause.into_anomaly([]),
+        }
+    }
+
+    pub(crate) fn recover_column(&mut self, resolved: Result<Expr>, names: &[Identifier]) -> Result<Expr> {
+        match resolved {
+            Err(error) if error.code == "xtdb/column-not-found" && !self.diagnostics.is_empty() => {
+                let chain = names.iter().rev().map(Identifier::normalized).collect::<Vec<_>>();
+                self.diagnostics.push(PlanningDiagnostic::new(error.message.unwrap_or(error.code))
+                    .with_detail("chain", serde_json::json!(chain)));
+                Ok(Expr::Literal(Value::Null))
+            }
+            resolved => resolved,
+        }
+    }
+
     pub(crate) fn record_column_demand(&mut self, id: ColumnId) {
         for scope in &mut self.inferred_group_scopes {
             if scope.source.contains(&id) {
@@ -196,18 +238,27 @@ impl Context<'_> {
                 let ast::TableObject::TableName(name) = &insert.table else { return Err(unsupported("Dynamic INSERT target")); };
                 let target = self.target(name)?;
                 let source = insert.source.as_ref().ok_or_else(|| unsupported("INSERT DEFAULT VALUES"))?;
-                let missing_id = || crate::planning_diagnostic::PlanningDiagnostic::new("INSERT does not contain mandatory _id column");
+                let missing_id = || PlanningDiagnostic::new("INSERT does not contain mandatory _id column");
                 if insert.columns.is_empty() && matches!(source.body.as_ref(), ast::SetExpr::Values(_)) {
-                    return Err(crate::planning_diagnostic::PlanningDiagnostic::new("INSERT with VALUES needs column name list").into_anomaly([missing_id()]));
+                    return Err(PlanningDiagnostic::new("INSERT with VALUES needs column name list").into_anomaly([missing_id()]));
                 }
                 let mut input = self.query(source)?;
                 if !insert.columns.is_empty() {
-                    if insert.columns.len() != input.schema().len() { return Err(error("INSERT column count differs from source")); }
+                    if insert.columns.len() != input.schema().len() {
+                        let mismatch = PlanningDiagnostic::column_count(insert.columns.len(), input.schema().len());
+                        let declares_id = matches!(source.body.as_ref(), ast::SetExpr::Values(_))
+                            && insert.columns.iter().any(|name| {
+                                matches!(name.0.as_slice(), [part] if part.as_ident().is_some_and(|name| identifier(name).normalized() == "_id"))
+                            });
+                        if declares_id { return Err(self.planning_failure(mismatch)); }
+                        self.diagnostics.push(mismatch);
+                        return Err(self.planning_failure(missing_id()));
+                    }
                     let names = insert.columns.iter().map(|name| { let names = identifiers(name)?; if names.len() != 1 { return Err(error("INSERT columns must be unqualified")); } Ok(names[0].normalized()) }).collect::<Result<Vec<_>>>()?;
                     if names.iter().collect::<BTreeSet<_>>().len() != names.len() { return Err(error("INSERT repeats a column")); }
                     input = self.rename(input, None, Some(names))?;
                 }
-                if !input.schema().fields().iter().any(|field| field.name == "_id") { return Err(missing_id().into_anomaly([])); }
+                if !input.schema().fields().iter().any(|field| field.name == "_id") { return Err(self.planning_failure(missing_id())); }
                 if input.schema().fields().iter().any(|field| field.name.starts_with('_') && !["_id", "_fn", "_valid_from", "_valid_to"].contains(&field.name.as_str())) { return Err(error("INSERT cannot write internal identity or system-time columns")); }
                 Statement::Dml(Dml::Insert { table: target, input })
             }
@@ -871,7 +922,8 @@ impl Context<'_> {
         let width = usize::from(with_ordinality) + 1;
         if !columns.is_empty() && columns.len() != width {
             let names = columns.iter().map(|column| identifier(&column.name).normalized()).collect::<Vec<_>>();
-            return Err(error(format!("Table projection mismatch for {name} ({})", names.join(","))));
+            self.diagnostics.push(PlanningDiagnostic::table_projection(name, names));
+            return Ok(Arc::new(Relation::empty(Schema::default())));
         }
         if columns.iter().any(|column| column.data_type.is_some()) {
             return Err(error("Table projections specify column names"));
@@ -896,6 +948,12 @@ impl Context<'_> {
 
     fn list_table(&mut self, expr: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool, kind: ListTableKind) -> Result<Arc<Relation>> {
         let alias = alias.ok_or_else(|| error("List tables require an alias"))?;
+        if !alias.columns.is_empty() && alias.columns.len() != 1 + usize::from(with_ordinality) {
+            let name = identifier(&alias.name).normalized();
+            let columns = alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect();
+            self.diagnostics.push(PlanningDiagnostic::table_projection(name, columns));
+            return Ok(Arc::new(Relation::empty(Schema::default())));
+        }
         let elements = expr.data_type().legs().into_iter().map(|ty| match ty.unencoded() {
             LogicalType::Nothing | LogicalType::Null => Ok(LogicalType::Null),
             LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => Ok(*element),
@@ -992,7 +1050,11 @@ impl Context<'_> {
             _ => input,
         };
         let visible = input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id)).count();
-        if columns.as_ref().is_some_and(|columns| columns.len() != visible) { return Err(error("Alias column count differs from relation")); }
+        if let Some(columns) = &columns
+            && columns.len() != visible {
+            self.diagnostics.push(PlanningDiagnostic::column_count(columns.len(), visible));
+            return Ok(Arc::new(Relation::empty(Schema::default())));
+        }
         let mut index = 0;
         let mut expressions = Vec::new();
         for field in input.schema().fields() {

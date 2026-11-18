@@ -89,6 +89,8 @@
 
 (deftest-original-api original-sql/test-generated-column-names)
 
+(deftest-original-api original-sql/mismatched-columns-in-table-projection-stops-ingestion-4069)
+
 (deftest-original-api original-sql/test-empty-array-3818)
 
 (deftest-original-api original-sql/test-function-as-from-source)
