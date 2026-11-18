@@ -18,7 +18,7 @@ class SelectedArtifacts(unittest.TestCase):
 
     def test_client_packages_must_equal_the_selected_successful_dependencies(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             native = "linux-amd64/rust/local/package"
             jvm = "linux-amd64/jvm/standalone/package"
             lane = {"runner": "clients", "platform": "linux/amd64", "selection": {"variant": "local", "jvm_variant": "standalone"}, "dependencies": [native, jvm]}
@@ -52,7 +52,7 @@ class SelectedArtifacts(unittest.TestCase):
 
     def test_native_input_is_the_retained_production_conformance_target(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             binary = root / "rtdb-conformance"
             binary.write_bytes(b"selected production")
             identity = "linux-amd64/rust/s3/production"
@@ -69,7 +69,7 @@ class SelectedArtifacts(unittest.TestCase):
 
     def test_packaged_recovery_binds_both_packages_and_exact_production_helper(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             producers = {}
             paths = {}
             for engine, variant in (("rust", "gcs"), ("jvm", "google-cloud")):

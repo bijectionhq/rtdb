@@ -146,6 +146,7 @@ def sql_logic_fixture(root):
     write_record(root / "inputs.json", revisions)
     directory = root / "production"
     directory.mkdir()
+    write_record(directory / "artifact-bindings.json", [])
     native = directory / "rtdb-conformance"
     native.write_bytes(b"selected production executable bytes")
     compiler_artifact = {"reason": "compiler-artifact", "target": {"name": "rtdb-conformance"}, "profile": {"test": False}}
