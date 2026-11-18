@@ -1,14 +1,14 @@
 use std::{alloc::Layout,sync::Arc};
 use rtdb_types::Result;
 use crate::{admission::Admission,numeric::overflow};
-use super::{Map,Object,Path,T,Throwable,Time,legacy_date_text,render};
+use super::{Map,Object,T,Throwable,legacy_date_text,render,wire_text_object};
 
 pub(crate) enum FormatArgument { Semantic(String),Wire(T) }
 
 pub(crate) fn format_argument(value: T,admission: Admission<'_>) -> Result<FormatArgument> {
-    if let T::Tagged { tag, representation } = &value && tag == "xtdb/path" {
-        let path = Object::Path(Path::read_wire(representation)?);
-        return render::string(&path, admission).map(FormatArgument::Semantic);
+    if let T::Tagged { tag, representation } = &value && let Some(object) = wire_text_object(tag, representation)? {
+        if matches!(object, Object::Null) { return Ok(FormatArgument::Wire(T::Null)); }
+        return render::string(&object, admission).map(FormatArgument::Semantic);
     }
     if legacy_date_text::HOST_CAPTURE
         && let T::Tagged { tag, representation } = &value
@@ -16,13 +16,6 @@ pub(crate) fn format_argument(value: T,admission: Admission<'_>) -> Result<Forma
     {
         let millis = legacy_date_text::wire_millis(tag, representation)?;
         return legacy_date_text::plain(millis, admission).map(FormatArgument::Semantic);
-    }
-    if let T::Tagged { tag,representation } = &value
-        && matches!(tag.as_str(),"time/date" | "time/time" | "time/duration" | "time/day-of-week" | "time/month")
-        && let T::String(source) = representation.as_ref()
-        && let Some(time) = Time::read_text(tag,source)?
-    {
-        return render::string(&Object::Time(time),admission).map(FormatArgument::Semantic);
     }
     let Some(message_bytes) = message_bytes(&value) else { return Ok(FormatArgument::Wire(value)); };
     let retained = Layout::new::<Throwable>().size().checked_add(32).and_then(|bytes|bytes.checked_add(message_bytes)).ok_or_else(overflow)?;

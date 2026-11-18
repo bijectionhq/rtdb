@@ -133,6 +133,33 @@ fn legacy_date_cast_str_and_format_use_their_source_text_policies() {
 }
 
 #[test]
+fn registered_temporal_strings_use_object_text_and_readable_tags() {
+    let context = EvalContext::default();
+    for (tag_name, source, scalar, readable) in [
+        ("time/period", "P12M", "P12M", "period"),
+        ("time/instant", "2024-01-02T03:04+02", "2024-01-02T01:04:00Z", "instant"),
+        ("time/date-time", "2024-01-02T03:04:00.120000", "2024-01-02T03:04:00.120", "ldt"),
+        ("time/offset-time", "08:09:00+02:00", "08:09+02:00", "offset-time"),
+        ("time/offset-date-time", "2024-01-02T03:04:00+02", "2024-01-02T03:04+02:00", "odt"),
+        ("time/zoned-date-time", "2024-01-02T03:04:00+01[Europe/Paris]", "2024-01-02T03:04+01:00[Europe/Paris]", "zdt"),
+        ("time/year", "2024", "2024", "year"),
+        ("time/year-month", "2024-02", "2024-02", "year-month"),
+        ("time/month-day", "--02-29", "--02-29", "month-day"),
+        ("xtdb/interval", "P1Y1M2DT3S", "P1Y1M2DT3S", "interval"),
+    ] {
+        let value = stored(&tag(tag_name, T::String(source.into())));
+        assert_eq!(scalar_call("str", std::slice::from_ref(&value), &context).unwrap(), text(&format!("#xt/{readable} \"{scalar}\"")));
+        assert_eq!(scalar_call("format", &[text("%s"), value], &context).unwrap(), text(scalar));
+    }
+    let wire_null = stored(&T::Null);
+    let absent_interval = stored(&tag("xtdb/interval", T::String("unrecognized".into())));
+    for value in [wire_null, absent_interval] {
+        assert_eq!(scalar_call("str", std::slice::from_ref(&value), &context).unwrap(), text("nil"));
+        assert_eq!(scalar_call("format", &[text("%s/%L"), value.clone(), value], &context).unwrap(), text("/NULL"));
+    }
+}
+
+#[test]
 fn public_format_denies_constructor_charge_after_the_existing_transit_prefix() {
     let args = [text("%s"),stored(&info(T::String("message".into()),T::Map(vec![])))];
     let retained = args.iter().map(|value|value.retained_bytes().unwrap()).sum::<usize>();

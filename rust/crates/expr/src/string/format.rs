@@ -117,6 +117,7 @@ fn resolve(value: &Value, context: &EvalContext<'_>) -> Result<Option<String>> {
             let decoded = rtdb_format::transit::decode_msgpack(bytes)?;
             match format_argument(decoded,Admission::for_context(context.allocation))? {
                 FormatArgument::Semantic(value) => value,
+                FormatArgument::Wire(rtdb_format::transit::TransitValue::Null) => return Ok(None),
                 FormatArgument::Wire(rtdb_format::transit::TransitValue::String(value)) => value,
                 FormatArgument::Wire(value) => super::render::transit(&value, 0)?,
             }

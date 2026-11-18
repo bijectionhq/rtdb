@@ -93,27 +93,30 @@ pub(super) fn transit(value: &TransitValue, depth: usize) -> Result<String> {
         TransitValue::Bytes(value) => tagged("bytes", &hex(value)),
         TransitValue::Array(values) => format!("[{}]", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
         TransitValue::Map(entries) => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", transit(key, depth + 1)?, transit(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
-        TransitValue::Tagged { tag, representation } => match (tag.as_str(), representation.as_ref()) {
-            ("i8" | "i16" | "i32" | "i64", TransitValue::Integer(value)) => value.to_string(),
-            ("f32", TransitValue::Float(value)) => printed_float(*value, Some(*value as f32)),
-            ("f64", TransitValue::Float(value)) => printed_float(*value, None),
-            (tag @ ("m" | "t"), representation) if legacy_date_text::HOST_CAPTURE => {
-                let millis = legacy_date_text::wire_millis(tag, representation)?;
-                legacy_date_text::readable(millis, Admission::Standalone)?
+        TransitValue::Tagged { tag, representation } => {
+            if let Some(printed) = crate::transit_object::print_registered_scalar(tag, representation, Admission::Standalone)? {
+                return Ok(printed);
             }
-            ("m", TransitValue::String(value)) => instant(value.parse().map_err(|_| Anomaly::incorrect("xtdb.expression/invalid-transit-date", "Invalid millisecond date representation"))?)?,
-            ("n", TransitValue::String(value)) => format!("{value}N"), ("f", TransitValue::String(value)) => format!("{value}M"),
-            ("u", TransitValue::String(value)) => tagged("uuid", value), ("r", TransitValue::String(value)) => tagged("xt/uri", &rtdb_types::UriParts::parse(value)?.to_ascii_string()),
-            ("r", _) => return Err(Anomaly::incorrect("xtdb.expression/invalid-transit-uri", "URI Transit representation must be text")),
-            ("set", TransitValue::Array(values)) => format!("#{{{}}}", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-            ("list", TransitValue::Array(values)) => format!("({})", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-            ("xtdb/interval", _) => format!("#xt/interval {}", transit(representation, depth + 1)?),
-            ("xtdb/period-duration", _) => format!("#xt/period-duration {}", transit(representation, depth + 1)?),
-            ("xtdb/tstz-range", _) => format!("#xt/tstz-range {}", transit(representation, depth + 1)?),
-            ("xtdb/path", representation) => crate::transit_object::print_path(representation, Admission::Standalone)?,
-            ("xtdb/tx-key", _) => format!("#xt/tx-key {}", transit(representation, depth + 1)?),
-            _ => format!("#{tag} {}", transit(representation, depth + 1)?),
-        },
+            match (tag.as_str(), representation.as_ref()) {
+                ("i8" | "i16" | "i32" | "i64", TransitValue::Integer(value)) => value.to_string(),
+                ("f32", TransitValue::Float(value)) => printed_float(*value, Some(*value as f32)),
+                ("f64", TransitValue::Float(value)) => printed_float(*value, None),
+                (tag @ ("m" | "t"), representation) if legacy_date_text::HOST_CAPTURE => {
+                    let millis = legacy_date_text::wire_millis(tag, representation)?;
+                    legacy_date_text::readable(millis, Admission::Standalone)?
+                }
+                ("m", TransitValue::String(value)) => instant(value.parse().map_err(|_| Anomaly::incorrect("xtdb.expression/invalid-transit-date", "Invalid millisecond date representation"))?)?,
+                ("n", TransitValue::String(value)) => format!("{value}N"), ("f", TransitValue::String(value)) => format!("{value}M"),
+                ("u", TransitValue::String(value)) => tagged("uuid", value), ("r", TransitValue::String(value)) => tagged("xt/uri", &rtdb_types::UriParts::parse(value)?.to_ascii_string()),
+                ("r", _) => return Err(Anomaly::incorrect("xtdb.expression/invalid-transit-uri", "URI Transit representation must be text")),
+                ("set", TransitValue::Array(values)) => format!("#{{{}}}", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
+                ("list", TransitValue::Array(values)) => format!("({})", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
+                ("xtdb/period-duration", _) => format!("#xt/period-duration {}", transit(representation, depth + 1)?),
+                ("xtdb/tstz-range", _) => format!("#xt/tstz-range {}", transit(representation, depth + 1)?),
+                ("xtdb/tx-key", _) => format!("#xt/tx-key {}", transit(representation, depth + 1)?),
+                _ => format!("#{tag} {}", transit(representation, depth + 1)?),
+            }
+        }
     })
 }
 

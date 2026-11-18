@@ -42,8 +42,19 @@ pub(crate) enum Object {
 fn invalid() -> Anomaly { Anomaly::incorrect("xtdb.expression/invalid-transit-object", "Invalid stored Transit object representation") }
 fn tagged(tag: &str,representation: T) -> T { T::Tagged { tag: tag.into(),representation: Box::new(representation) } }
 
-pub(crate) fn print_path(representation: &T, admission: Admission<'_>) -> Result<String> {
-    render::printed(&Object::Path(Path::read_wire(representation)?), admission)
+fn wire_text_object(tag: &str, representation: &T) -> Result<Option<Object>> {
+    if tag == "xtdb/path" {
+        return Ok(Some(Object::Path(Path::read_wire(representation)?)));
+    }
+    if Time::recognizes(tag) && !matches!(tag, "m" | "t" | "xtdb/tstz-range") {
+        let T::String(source) = representation else { return Err(invalid()); };
+        return Ok(Some(Time::read_text(tag, source)?.map_or(Object::Null, Object::Time)));
+    }
+    Ok(None)
+}
+
+pub(crate) fn print_registered_scalar(tag: &str, representation: &T, admission: Admission<'_>) -> Result<Option<String>> {
+    wire_text_object(tag, representation)?.map(|value| render::printed(&value, admission)).transpose()
 }
 
 pub(crate) struct Decoded<'a> { value: Object,allocation: &'a EvaluationScope }
