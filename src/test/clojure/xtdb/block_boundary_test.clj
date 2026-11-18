@@ -357,6 +357,20 @@
              :flush   (tu/flush-block! node)))
          (xt/q node "FROM docs WHERE _id = 1"))))))
 
+(defn- await-doc-block-count [node expected]
+  (let [table-catalog (.getTableCatalog (db/primary-db node))
+        target (dec (long expected))
+        started (System/nanoTime)]
+    (loop []
+      (let [latest (.getBlockIdx (.snap table-catalog))]
+        (if (and (some? latest) (>= (long latest) target))
+          (count (tu/read-files-from-bp-path node "tables/public$docs/meta/"))
+          (do
+            (when (>= (- (System/nanoTime) started) 60000000000)
+              (throw (ex-info "Timed out awaiting durable block adoption" {:target target :latest latest})))
+            (Thread/sleep 10)
+            (recur)))))))
+
 (t/deftest ^:property local-log-restart-block-boundary
   (tu/run-property-test
    {:num-tests 10}
@@ -373,10 +387,7 @@
                              (xt/submit-tx node [(into [:put-docs :docs] record-batch)]))
                            (xt-log/sync-node node #xt/duration "PT1M")
                            
-                           ;; Wait for blocks to be written by the live index
-                           (Thread/sleep 1000)
-                           
-                           {:initial-block-count (count (tu/read-files-from-bp-path node "tables/public$docs/meta/"))
+                           {:initial-block-count (await-doc-block-count node expected-block-count)
                             :initial-doc-count (count (xt/q node "SELECT * FROM docs FOR VALID_TIME ALL FOR SYSTEM_TIME ALL"))
                             :initial-tx-count (count (xt/q node "SELECT * FROM xt.txs"))})]
                  
@@ -385,8 +396,7 @@
                                                        :storage [:local {:path (.resolve node-dir "objects")}]
                                                        :indexer {:rows-per-block rows-per-block}
                                                        :compactor {:threads 0}})]
-                       ;; Wait a bit to ensure no reindexing happens
-                       (Thread/sleep 1000) 
+                       (xt-log/sync-node node #xt/duration "PT1M")
 
                        (and (t/testing "should be expected amount of blocks written initially"
                               (= expected-block-count initial-block-count))
