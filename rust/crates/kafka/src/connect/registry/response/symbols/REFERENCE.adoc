@@ -1,0 +1,105 @@
+= Persistent Registry Reader symbols
+
+`ReaderSymbols` implements the field-name table used by the pinned Jackson `ReaderBasedJsonParser` profiles.
+It is a registered, inactive capability under the Registry response decoder's existing test gate.
+The installed HTTP/JSON route and all existing observation-driven entry points remain unchanged.
+The table decides its own lookup, insertion, collision and overflow outcomes from completed UTF16 names.
+It does not accept an observation that merely declares a field name successful.
+
+== Factory profile and authority
+
+`FactoryProfile` contains the selected Jackson216 or Jackson221 source profile and the actual factory identity-hash seed observed by `CharsToNameCanonicalizer.createRoot`.
+The caller supplies that profile and seed for one actual mapper-factory domain and shares its root across the corresponding parsers.
+A zero supplied seed remains zero; no native identity, clock or random value substitutes for the observed factory value.
+The declared dependency profiles do not establish an effective runtime classloader winner.
+The pinned Registry mapper changes the non-numeric-number read feature and keeps the factory's default canonicalization, field-name interning and collision-overflow failure features.
+The two pinned character canonicalizer implementations have equivalent behavior; the selected profile remains attached to every child.
+link:profiles.json[The profile comparison] records their source normalization and the distinct intern-cache policies.
+
+`InternAuthority` is the separately supplied, never-retained interning capability demanded on a canonicalized miss.
+It receives an admitted candidate `Arc<SymbolName>` and returns the admitted original or an existing admitted symbol owner.
+Returning an existing owner retains that same original reservation in the current conversion context.
+The returned UTF16 content must equal the completed name; a changed value is an unsupported authority failure.
+Authority errors propagate unchanged and do not become name-length or collision failures.
+The fixture interning authorities are programmatic source-case inputs and are not installed on live HTTP.
+
+Jackson216's global `InternCache` uses a180-entry threshold and synchronized clearing.
+Jackson221 uses a280-entry threshold and a try-lock clear, so its threshold is not a strict concurrent bound.
+Those global cache owners, JVM intern identity and their actual memory/error behavior are not supplied by this table port.
+They remain explicit integration work before the default mapper can use the capability without an interning authority.
+Sharing native JavaString storage confers no Java object identity.
+
+== Owners and admission
+
+`ReaderSymbols` is a passive factory identity with fixed profile/seed and one immutable table snapshot protected by a synchronous publication lock.
+It owns no worker, callback or condition wait.
+`ChildSymbols` is a passive, parser-local single-writer transient with Shared/Private table state or a poisoned state.
+Its lookup and release calls use the same ConversionContext that created the child.
+The future parser entry point must supply that call region consistently; moving a child between contexts is outside this private contract.
+
+`SymbolName` is an immutable exact JavaString and its original full reservation.
+That reservation includes text backing and native shared-name owner storage and survives through the final returned JavaString clone.
+`Bucket` is an immutable name/tail/length value retaining its admitted node owner.
+`Table` is one primary-array/bucket-head-array/count/threshold/longest-chain value with its admitted backing and publication-owner storage.
+`OverflowBits` is parser-local admitted bit storage, not part of the root snapshot.
+Every backing field drops before its associated trailing reservation.
+
+Root creation, arrays, text/shared-name owners, bucket nodes and overflow bitmap storage are admitted through the existing context before allocation.
+No budget is exposed or duplicated by a second lease pool.
+Child creation retains every inherited root/table/name/bucket reservation before cloning its immutable snapshot.
+It does not reserve those already tracked bytes again.
+New allocations retain their own original reservations in the same call context.
+Release also attaches any current root snapshot that another child published since creation before comparing it with the completed child.
+Old and replacement arrays, shared bucket tails, candidate/interner result owners and previous/replacement snapshots remain charged through their actual overlap.
+Table storage admission includes the eventual shared publication owner before that owner is allocated.
+
+Native admission/allocation or incompatible-authority failure poisons the unpublished child and prevents partial publication.
+Source name-length, collision and rehash-count failures preserve their completed source mutation prefix for explicit release.
+The context keeps accepted reservations through its region even after individual transient storage has dropped.
+Factory/table/name owners retain their original reservations after that context ends.
+Native allocator overhead and the complete parser/global-intern domain still require later qualification.
+
+== Lookup and lifecycle
+
+Empty names return the factory's admitted empty value before name-length, intern or table-mutation demand.
+Lookup uses the parser's raw wrapping33-fold hash over UTF16 units, then the source's index mixing.
+A primary match returns immediately; its half-size collision bucket is searched only when that primary slot is occupied.
+The default50000-unit name constraint is checked after a miss and on canonicalization bypass, preserving the source cached-hit stage.
+
+The first shared miss copies both arrays without rehashing, even if the inherited count has reached the75-percent threshold.
+A later private miss rehashes at the threshold.
+Rehash visits primary slots first, then bucket heads and their tails in source order.
+Its String hash helper normalizes a zero hash to one; the Reader parser's initial lookup does not.
+The port retains that observable asymmetry.
+
+The first collision chain exceeding150 entries marks its overflow bucket, replaces the selected primary with the new symbol and clears that bucket.
+The source count is reduced by the new chain length and longest-chain metadata becomes minus one.
+A second overflow of that bucket throws after incrementing the count and before clearing the existing chain.
+That source failure prefix can publish on close and later expose the source rehash count mismatch.
+It is distinct from a poisoned native failure.
+
+Growth beyond65536 slots resets local arrays to64 and disables canonicalization.
+The in-progress addition still creates/interns/inserts its one symbol; later names use new uninterned text after their length check.
+Disabled children do not publish to the root.
+
+Release ignores unchanged children and same-count root/child snapshots.
+A child with a different count proposes replacement, rather than union-merging names.
+A count above12000 proposes an initial empty root instead.
+Publication compares the actual root snapshot read for that merge and loses if another publication changed it before the compare step.
+Children keep their own immutable snapshot or private arrays independent of later root publications.
+
+== Evidence and continuation
+
+link:sources.json[Source identities] pin both Jackson core archives and selected canonicalizer/parser/factory/intern/constraint source bytes, plus the actual Registry mapper source.
+link:COPYRIGHT[Notices] retain complete pre-package prefixes, including an explicit zero-byte prefix record when a source begins with its package declaration.
+link:LICENSES[License material] retains complete selected archive license/notice entries and the Registry Apache license.
+
+Sixteen new unexecuted source fixture functions cover ordinary persistent hits, exact unmatched UTF16, empty/length demands, COW/growth, equal-count/stale/failed compare publication, raw-zero rehash behavior, both collision spills and retained mismatch, source-failure release, reuse/max-size limits, native poisoning, incompatible interning and reservation survival/reattachment.
+All115 existing rule, bean, cursor and input-window fixture bodies remain unchanged.
+No compiler, formatter, test/runtime, Cargo/Gradle or project script was executed.
+
+The next bounded slice will compose this Reader authority at the observed cursor's actual name demand before immutable text publication.
+UTF8 ByteQuads, remaining lexical branches, physical read/recycler authority, the effective mapper/intern profile, nullable DTO/reference/rule activation and version/cache timing remain open.
+Native HTTP frames do not supply Java refill tapes or accepted-name observations.
+Avro's exact JavaText schema input remains coordinated with its owner.
+This prerequisite does not close Phase2, whole-native memory or source completeness gates.

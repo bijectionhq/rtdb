@@ -1,0 +1,49 @@
+{
+  "source_only": true,
+  "compared": "CharsToNameCanonicalizer.java",
+  "normalizations": [
+    "Remove source comments and whitespace",
+    "Normalize AtomicReference diamond syntax",
+    "Remove redundant int casts from char operands"
+  ],
+  "normalized_sources": [
+    {
+      "profile": "2.16.0",
+      "normalized_sha256": "9693ce9097ad2aa1f2719cf1665361c5ba0ee0e1de20d8742fc56611e779ec79"
+    },
+    {
+      "profile": "2.21.7",
+      "normalized_sha256": "9693ce9097ad2aa1f2719cf1665361c5ba0ee0e1de20d8742fc56611e779ec79"
+    }
+  ],
+  "intern_cache_profiles": {
+    "2.16.0": {
+      "threshold": 180,
+      "clear": "synchronized after size check"
+    },
+    "2.21.7": {
+      "threshold": 280,
+      "clear": "tryLock after size check; threshold not a strict concurrent cap"
+    }
+  },
+  "effective_profile_selected": false,
+  "observed_factory_seed_required": true,
+  "actual_http_read_tape_generated": false,
+  "raw_zero_hash_case": {
+    "factory_seed": 7,
+    "utf16_units": [
+      1,
+      26,
+      8,
+      3,
+      24,
+      11,
+      16
+    ],
+    "parser_raw_hash": 0,
+    "rehash_normalized_hash": 1,
+    "parser_index_at_128": 0,
+    "rehash_index_at_128": 17,
+    "derivation": "Base33 representation of (-7 * 33^7) mod 2^32; escaped Reader-name units are valid UTF16 field content."
+  }
+}

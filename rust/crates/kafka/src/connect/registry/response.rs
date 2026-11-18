@@ -9,6 +9,7 @@ mod scalars;
 mod collections;
 mod decode;
 mod window;
+pub(super) mod symbols;
 
 pub(super) use beans::{Metadata, Properties, Rule, RuleKind, RuleMode, RuleSet};
 pub(super) use window::{LexicalObservations, NameObservation, ObservedDecode, WindowInput, schema_from_window, schema_string_from_window};
