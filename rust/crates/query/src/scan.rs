@@ -65,6 +65,35 @@ impl PageDescriptors {
     }
 }
 
+const MAX_IID_DEPTH: usize = 64;
+
+#[derive(Clone, Copy)]
+struct MetadataVisit { node: usize, path: [u8; MAX_IID_DEPTH], depth: usize, recency: Timestamp }
+
+#[derive(Default)]
+struct MetadataStack {
+    entries: Vec<MetadataVisit>,
+    capacity: usize,
+    _reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl MetadataStack {
+    fn push(&mut self, visit: MetadataVisit, memory: &Arc<MemoryBudget>) -> Result<()> {
+        if self.entries.len() == self.capacity {
+            let size_error = || invalid("scan-metadata-size", "Scan metadata traversal capacity exceeds addressable memory");
+            let capacity = self.capacity.checked_mul(2).ok_or_else(size_error)?.max(1);
+            let bytes = capacity.checked_mul(std::mem::size_of::<MetadataVisit>())
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+            let reservation = memory.reserve(bytes)?;
+            self.entries.try_reserve_exact(capacity - self.entries.len()).map_err(|error| invalid("scan-metadata-size", error))?;
+            self.capacity = capacity;
+            self._reservation = Some(reservation);
+        }
+        self.entries.push(visit);
+        Ok(())
+    }
+}
+
 enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File(Arc<IndexBatch>) }
 struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation> }
 impl ActiveRows {
@@ -228,22 +257,33 @@ impl PartitionScan {
             let file = files.entries.len();
             files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, state: DataState::Unopened });
             let trie_recency = recency(trie.key.recency())?;
-            let mut pending = metadata.root_index().map(|root| vec![(root, Vec::new(), trie_recency)]).unwrap_or_default();
-            while let Some((node, path, recency)) = pending.pop() {
+            let memory = &self.execution.context.memory;
+            let mut pending = MetadataStack::default();
+            if let Some(node) = metadata.root_index() {
+                pending.push(MetadataVisit { node, path: [0; MAX_IID_DEPTH], depth: 0, recency: trie_recency }, memory)?;
+            }
+            while let Some(visit) = pending.entries.pop() {
                 self.execution.context.check_cancelled()?;
-                let (lower, upper) = path_range(&path)?;
+                let path = visit.path.get(..visit.depth).ok_or_else(invalid_iid_path)?;
+                let (lower, upper) = path_range(path)?;
                 if !self.path_matches(lower, upper) { continue; }
-                match &metadata.nodes()[node] {
+                match &metadata.nodes()[visit.node] {
                     MetadataNode::Nil => {}
                     MetadataNode::IidBranch(children) => for (bucket, child) in children.iter().enumerate().rev() {
-                        if let Some(child) = child { let mut path = path.clone(); path.push(bucket as u8); pending.push((*child, path, recency)); }
+                        if let Some(node) = child {
+                            let mut next = MetadataVisit { node: *node, depth: visit.depth + 1, ..visit };
+                            if let Some(slot) = next.path.get_mut(visit.depth) { *slot = bucket as u8; }
+                            pending.push(next, memory)?;
+                        }
                     },
-                    MetadataNode::RecencyBranch(children) => for (upper, child) in children.iter().rev() { pending.push((*child, path.clone(), recency.min(*upper))); },
+                    MetadataNode::RecencyBranch(children) => for (upper, node) in children.iter().rev() {
+                        pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
+                    },
                     MetadataNode::Leaf { data_page_index, columns } => pages.push(Page { lower, upper, priority: live.len() + index,
                         content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
                             && may_satisfy_not_null(&self.scan, columns),
                         source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
-                            recency: Some(recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?,
+                            recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?,
                 }
             }
         }
@@ -407,8 +447,9 @@ fn project(row: &ResolvedRow<RowSource>, name: &str) -> Result<Value> {
     let Some(index) = fields.iter().position(|field| field.name() == name) else { return Ok(Value::Null); };
     rtdb_columnar::read_execution_value(&fields[index], put.column(index).as_ref(), op.value_offset(row.source.row)).map(|value| if matches!(value, Value::Undefined) { Value::Null } else { value })
 }
+fn invalid_iid_path() -> Anomaly { invalid("iid-path", "Trie path exceeds 64 base-four buckets") }
 fn path_range(path: &[u8]) -> Result<(Iid, Iid)> {
-    if path.len() > 64 || path.iter().any(|bucket| *bucket > 3) { return Err(invalid("iid-path", "Trie path exceeds 64 base-four buckets")); }
+    if path.len() > MAX_IID_DEPTH || path.iter().any(|bucket| *bucket > 3) { return Err(invalid_iid_path()); }
     let mut lower = [0u8; 16];
     let mut upper = [u8::MAX; 16];
     for (depth, bucket) in path.iter().enumerate() {
@@ -532,6 +573,7 @@ mod tests {
         let cursor_open = memory.used_bytes();
         let candidate_extent = if files_used == 0 { 0 } else { std::mem::size_of::<&CatalogTrie>() + 256 };
         let file_extent = if files_used == 0 { 0 } else { std::mem::size_of::<DataFile>() + 256 };
+        let stack_extent = if files_used == 0 { 0 } else { 4 * std::mem::size_of::<MetadataVisit>() + 256 };
         if files_used != 0 {
             let pressure = memory.reserve(memory.limit_bytes() - cursor_open - (candidate_extent - 1)).unwrap();
             let retained = cursor_open + pressure.bytes();
@@ -569,12 +611,32 @@ mod tests {
             assert_eq!(memory.used_bytes(), before_cursor);
             cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
             assert_eq!(memory.used_bytes(), cursor_open);
+
+            let previous_stack = 2 * std::mem::size_of::<MetadataVisit>() + 256;
+            let headroom = candidate_extent + metadata_charge + file_extent + previous_stack + stack_extent - 1;
+            let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
+            let retained = cursor_open + pressure.bytes() + candidate_extent + metadata_charge + file_extent + previous_stack;
+            let error = cursor.next_page().await.err().unwrap();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            let expected = format!("Cannot reserve {stack_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
+            assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+            let partition = cursor.partitions.front().unwrap();
+            assert!(!partition.initialized);
+            assert!(partition.files.entries.is_empty());
+            assert!(partition.pages.entries.is_empty());
+            assert!(partition.tasks.is_none());
+            assert!(partition.loaded.is_empty());
+            assert!(partition.output.is_empty());
+            assert_eq!(storage.retained_bytes(), metadata_size);
+            assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
+            drop(pressure);
+            assert_eq!(memory.used_bytes(), cursor_open);
         }
         let old_extent = 2 * std::mem::size_of::<Page>() + 256;
         let replacement_extent = 4 * std::mem::size_of::<Page>() + 256;
-        let headroom = candidate_extent + metadata_charge + file_extent + old_extent + replacement_extent - 1;
+        let headroom = candidate_extent + metadata_charge + file_extent + stack_extent + old_extent + replacement_extent - 1;
         let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
-        let retained_at_growth = cursor_open + pressure.bytes() + candidate_extent + metadata_charge + file_extent + old_extent;
+        let retained_at_growth = cursor_open + pressure.bytes() + candidate_extent + metadata_charge + file_extent + stack_extent + old_extent;
         let error = cursor.next_page().await.err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let expected = format!("Cannot reserve {replacement_extent} bytes from budget {} with {retained_at_growth} retained", memory.limit_bytes());
@@ -595,6 +657,10 @@ mod tests {
             let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
             let partition = cursor.partitions.front_mut().unwrap();
             partition.initialize().await.unwrap();
+            let plan_memory = MemoryBudget::new(memory.limit_bytes());
+            let plan = ScanTaskPlan::new(partition.pages.entries.iter().map(|page| PageRange { lower: page.lower, upper: page.upper }), &plan_memory).unwrap();
+            assert_eq!(memory.used_bytes(), cursor_open + file_extent + replacement_extent + plan_memory.used_bytes());
+            drop(plan);
             drop(partition.tasks.take().unwrap());
             assert_eq!(memory.used_bytes(), cursor_open + file_extent + replacement_extent);
             drop(cursor);

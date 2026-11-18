@@ -209,6 +209,8 @@ The scan accepts uncompressed, LZ4 and Zstandard Arrow trie data and metadata.
 The scan reserves query memory for the persisted candidate list before allocating space for references to trie catalog entries in the `Live` state.
 It releases the reservation before planning scan tasks.
 It reserves inspected dictionary, row-descriptor and decoded-buffer bounds before opening the corresponding data.
+Persisted metadata traversal reserves stack capacity before growth and stores each IID path inline.
+The stack reservation is released after traversing each metadata file.
 Live and persisted scan page descriptors reserve capacity from the query budget before growth, and the reservation stays with the scan partition.
 The scan reserves capacity for selected persisted data-file descriptors from the query budget before allocating the descriptor vector, and releases the reservation when the descriptors are dropped.
 The scan keeps the current entity's temporal ceiling charged within the scan task and reads each event's polygon through borrowed ranges.
