@@ -4,7 +4,9 @@ use arrow_schema::Schema;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
+use rtdb_plan::ControlStatement;
 use rtdb_tx::SqlArguments;
+use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
 use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::Ticket, wire};
 
@@ -36,42 +38,54 @@ impl Service {
     }
     async fn execute_update_in(&self, native: &mut NativeSession, source: &str, arguments: Option<SqlArguments>) -> Result<(), Status> {
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
-        let options = options(&native);
+        let options = options(native);
         if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)? {
             if control_schema(&control).map_err(status)?.is_some() { return Err(invalid("executeUpdate does not support queries")); }
-            let params = arguments.as_ref().and_then(|arguments| arguments.rows().next()).unwrap_or(&[]);
-            match native.execute_control_with(&control, params, &token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
-                ControlResult::Command { .. } => return Ok(()), _ => return Err(invalid("Statement is not supported by Flight SQL executeUpdate")),
-            }
+            return execute_control_update(native, &control, arguments.as_ref(), &token).await;
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
-        let operation = prepared.dml_operation(arguments).map_err(status)?;
-        if let Some(result) = native.state_mut().execute_operation(operation).await.map_err(status)? { if let Some(error) = result.error() { return Err(status(error.clone())); } }
-        Ok(())
+        execute_prepared_update(native, &prepared, arguments).await
     }
+
+    fn empty_update_info(&self) -> Result<(wire::OwnedSchema, Bytes), Status> {
+        Ok((wire::OwnedSchema::empty(self.memory())?, query_ticket(Ticket::Empty {}.encode(self.memory())?, self.memory())?))
+    }
+
     pub async fn query_info(&self, connection: Arc<ConnectionResource>, source: &str, params: Option<Bytes>) -> Result<(wire::OwnedSchema, Bytes), Status> {
         let mut native = connection.borrow().await?;
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
-        let control = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)?;
-        let query = if let Some(control) = &control { control_schema(control).map_err(status)?.is_some() } else {
-            let context = native.prepare_context(&token).await.map_err(status)?;
-            !PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic).map_err(status)?.is_dml()
-        };
-        if !query {
-            let arguments = params.as_ref().map(|params| wire::parameter_batch(params, self.memory()).and_then(|batch| wire::arguments(batch.batch(), self.memory()))).transpose()?;
-            self.execute_update_in(&mut native, source, arguments).await?;
-            return Ok((wire::OwnedSchema::empty(self.memory())?, query_ticket(Ticket::Empty {}.encode(self.memory())?, self.memory())?));
-        }
-        let basis = if control.is_some() { native.state_mut().unchecked_read_basis().await } else { native.state_mut().read_basis().await }.map_err(status)?;
-        let schema = if let Some(control) = control {
-            wire::plan_schema(&control_schema(&control).map_err(status)?.ok_or_else(|| invalid("Query has no result schema"))?, self.memory())?
+        let decode_arguments = || params.as_ref().map(|params| {
+            let batch = wire::parameter_batch(params, self.memory())?;
+            wire::arguments(batch.batch(), self.memory())
+        }).transpose();
+        let (basis, schema) = if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)? {
+            let Some(schema) = control_schema(&control).map_err(status)? else {
+                let arguments = decode_arguments()?;
+                execute_control_update(&mut native, &control, arguments.as_ref(), &token).await?;
+                return self.empty_update_info();
+            };
+            let basis = native.state_mut().unchecked_read_basis().await.map_err(status)?;
+            (basis, wire::plan_schema(&schema, self.memory())?)
         } else {
+            let prepared = {
+                let context = native.prepare_context(&token).await.map_err(status)?;
+                PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic).map_err(status)?
+            };
+            if prepared.is_dml() {
+                let arguments = decode_arguments()?;
+                native.prepare_context(&token).await.map_err(status)?;
+                execute_prepared_update(&mut native, &prepared, arguments).await?;
+                return self.empty_update_info();
+            }
+            drop(prepared);
+            let basis = native.state_mut().read_basis().await.map_err(status)?;
             let context = native.query_context_at(&basis, &token).await.map_err(status)?;
             let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
             let types = match &params { Some(params) => { let batch = wire::parameter_batch(params, self.memory())?; batch.batch().schema().fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? }, None => prepared.parameter_types().to_vec() };
-            wire::plan_schema(prepared.result_schema(&context, &types).map_err(status)?.schema(), self.memory())?
+            let schema = wire::plan_schema(prepared.result_schema(&context, &types).map_err(status)?.schema(), self.memory())?;
+            (basis, schema)
         };
         let basis_bytes = basis.snapshot.databases.iter().try_fold(8192usize, |size, (database, times)| wire::add(size, wire::add(wire::mul(database.len(), 8)?, wire::mul(times.len(), 128)?)?))?;
         let _ticket = self.memory().reserve(wire::add(basis_bytes, wire::mul(wire::add(source.len(), params.as_ref().map_or(0, Bytes::len))?, 8)?)?).map_err(status)?;
@@ -124,4 +138,20 @@ impl Service {
         let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)
     }
 }
+async fn execute_control_update(native: &mut NativeSession, control: &ControlStatement, arguments: Option<&SqlArguments>, token: &CancellationToken) -> Result<(), Status> {
+    let params = arguments.and_then(|arguments| arguments.rows().next()).unwrap_or(&[]);
+    match native.execute_control_with(control, params, token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
+        ControlResult::Command { .. } => Ok(()),
+        _ => Err(invalid("Statement is not supported by Flight SQL executeUpdate")),
+    }
+}
+
+async fn execute_prepared_update(native: &mut NativeSession, prepared: &PreparedSql, arguments: Option<SqlArguments>) -> Result<(), Status> {
+    let operation = prepared.dml_operation(arguments).map_err(status)?;
+    if let Some(result) = native.state_mut().execute_operation(operation).await.map_err(status)? {
+        if let Some(error) = result.error() { return Err(status(error.clone())); }
+    }
+    Ok(())
+}
+
 pub(crate) fn options(native: &NativeSession) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: native.state().parameter("search_path").unwrap_or("public").split(',').map(|name| name.trim().trim_matches('"').to_owned()).collect(), ..Default::default() } }

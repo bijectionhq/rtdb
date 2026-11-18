@@ -65,7 +65,8 @@ DoGet revalidates the redeeming session, waits its visibility barrier, then open
 A ticket remains usable by a different authorized caller.
 Query streams retain their cursor, connection, session lease, cancellation scope, and Arrow allocation owners through completion or cancellation.
 
-DML and SET executed through GetFlightInfo run once when the ticket is issued.
+GetFlightInfo issues DML and SET once.
+An open write transaction buffers DML for commit.
 Their empty ticket sends an empty Arrow schema when redeemed and performs no further effect.
 SQL BEGIN, COMMIT, and ROLLBACK use the shared Flight SQL control rejection; transaction actions own those operations.
 Prepared handles are re-prepared against the current execution context on each use.

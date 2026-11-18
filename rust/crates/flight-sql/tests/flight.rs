@@ -132,6 +132,26 @@ async fn ticket_basis_is_immutable_and_update_ticket_redemption_is_effect_free()
 }
 
 #[tokio::test]
+async fn prepared_update_info_buffers_the_bound_operation_once() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO docs (_id,n) VALUES (1,10)", None).await;
+    let transaction = client.begin().await;
+    let prepared = client.prepare("UPDATE docs SET n = n + ? WHERE _id = 1", Some(transaction.clone())).await;
+    let command = CommandPreparedStatementQuery { prepared_statement_handle: prepared.prepared_statement_handle };
+    client.upload(command.clone(), vec![arguments(vec![2])]).await;
+    let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+    let request = client.request(descriptor);
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+    assert!(info.clone().try_decode_schema().unwrap().fields().is_empty());
+    assert!(client.redeem(&info).await.is_empty());
+    assert!(client.redeem(&info).await.is_empty());
+    client.end(transaction, true).await.unwrap();
+    assert_eq!(integer(&client.query("SELECT n FROM docs").await[0], 0, 0), 12);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn query_info_pins_read_only_and_announced_schema_matches_redeemed_rows() {
     let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
     client.update("INSERT INTO docs (_id,n) VALUES (1,10)", None).await;
