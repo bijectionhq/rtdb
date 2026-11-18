@@ -1596,7 +1596,7 @@ Next steps:
 .. mega-join;
 .. a memory-budget property;
 .. Hikari URLs.
-. Resolve final-design-closure with build/finalize_phase1.py, set implementation_revision and phase_2_authorized_by_completeness_gate, then close the qualification findings.
+. Resolve final-design-closure with `python3 rust/conformance/phase1_closure.py .` once its conclusions still hold, set implementation_revision and phase_2_authorized_by_completeness_gate, then close the qualification findings.
 
 Environment: Docker runs through colima, so set DOCKER_HOST=unix://$HOME/.colima/default/docker.sock and TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock.
 JAVA_HOME is Temurin 25.0.5, and the shared CARGO_TARGET_DIR is ~/code/rtdb-target, built with CARGO_INCREMENTAL=0.
