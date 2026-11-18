@@ -2576,8 +2576,10 @@ static int rd_kafka_cgrp_metadata_refresh(rd_kafka_cgrp_t *rkcg,
                 /* Hint cache that something is interested in
                  * these topics so that they will be included in
                  * a future all known_topics query. */
+                rd_kafka_wrlock(rk);
                 rd_kafka_metadata_cache_hint(rk, &topics, NULL,
                                              RD_KAFKA_RESP_ERR__NOENT);
+                rd_kafka_wrunlock(rk);
                 rd_kafka_dbg(rk, CGRP | RD_KAFKA_DBG_METADATA, "CGRPMETADATA",
                              "%s: need to refresh metadata (%dms old) "
                              "but no usable brokers available: %s",
@@ -7549,6 +7551,8 @@ int unittest_member_metadata_serdes(void) {
 }
 
 
+#include "rdkafka_cgrp_metadata_hint_lock_test.h"
+
 /**
  * @brief Consumer group unit tests
  */
@@ -7561,6 +7565,7 @@ int unittest_cgrp(void) {
         fails += unittest_map_to_list();
         fails += unittest_list_to_map();
         fails += unittest_member_metadata_serdes();
+        fails += unittest_cgrp_metadata_hint_lock();
 
         return fails;
 }
