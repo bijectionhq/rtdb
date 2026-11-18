@@ -172,9 +172,7 @@ impl PreparedSql {
         options.default_timezone = context.timezone.clone();
         if execution { for ty in options.parameter_types.values_mut() { *ty = rtdb_columnar::execution_type(ty); } }
         for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
-        let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
-        let prepared = rtdb_sql::prepare_in(&self.0.source, &context.catalog, &options, &context.memory)?;
-        PreparedQuery::from_prepared(prepared, &context.memory)
+        prepare_query(&self.0.source, context, &options)
     }
 
     fn check_signature(&self, actual: &Schema) -> Result<()> {
@@ -195,6 +193,12 @@ fn admit_source(source: &str, context: &QueryContext, options: &mut PrepareOptio
     options.default_timezone = context.timezone.clone();
     options.generate_series_end_exclusive = context.options.generate_series_end_exclusive;
     context.memory.reserve(source.len().checked_add(256).ok_or_else(size_error)?)
+}
+
+pub(crate) fn prepare_query(source: &str, context: &QueryContext, options: &PrepareOptions) -> Result<PreparedQuery> {
+    let _syntax = admit_sql_syntax(source, &context.memory)?;
+    let prepared = rtdb_sql::prepare_in(source, &context.catalog, options, &context.memory)?;
+    PreparedQuery::from_prepared(prepared, &context.memory)
 }
 
 fn admit_sql_syntax(source: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {

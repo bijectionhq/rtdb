@@ -4,11 +4,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryReservation, estimate_read_value_bytes, read_value};
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogRuntime, CatalogUser, CatalogUsers};
-use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
+use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 use rtdb_types::{Anomaly, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::Node;
+use crate::{Node, statement::prepare_query};
 
 pub(crate) struct RuntimeProviders {
     pub users: Arc<dyn CatalogUsers>,
@@ -40,8 +40,8 @@ impl CatalogRuntime for NodeCatalogRuntime {
         if !snapshot.contains_table(&TableRef::new("xt", "role_membership")) { return empty(); }
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]), false)?;
         let context = QueryContext::with_owner(catalog, Arc::clone(self.node.memory()), self.node.now(), "UTC", QueryOptions::default(), &self.cancellation, self.node.cancellation())?;
-        let prepared = rtdb_sql::prepare_in("SELECT \"user\", \"role\" FROM xt.role_membership", &context.catalog, &Default::default(), &context.memory)?;
-        let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, Vec::new()).await?;
+        let mut cursor = prepare_query("SELECT \"user\", \"role\" FROM xt.role_membership", &context, &Default::default())?
+            .execute(context, Vec::new()).await?;
         let mut rows = Vec::new();
         let mut reservations = Vec::<Arc<MemoryReservation>>::new();
         while let Some(batch) = cursor.next_batch().await? {

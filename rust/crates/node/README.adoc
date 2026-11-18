@@ -105,6 +105,7 @@ HTTP serving and metrics export are separate operational adapters still requirin
 `PreparedSql::prepare` and query rebinding reserve an estimate for temporary lexer, grammar and binding work before parsing.
 The temporary reservation stays live while the prepared source and metadata or the rebound query plan are admitted.
 It releases when preparation or rebinding returns.
+Native session SQL queries, stored transaction-result reads, and role membership reads reserve the same estimate from their query context and release it before execution.
 
 The session tests preserve state observations from `InProcessAdbcTest`, `ConnectionTest`, and `tx.allium`.
 Native node tests cover data-dependent SQL writes, historical reads, asynchronous await tokens, local recovery, retained batches, skipped membership, and detach ordering around running or failed drivers.

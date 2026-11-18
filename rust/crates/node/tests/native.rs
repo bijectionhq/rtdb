@@ -94,6 +94,69 @@ async fn read_transaction_pinned_before_ingestion_retains_a_null_partition_time(
 }
 
 #[tokio::test]
+async fn native_query_admits_syntax_after_the_reached_read_basis() {
+    let mut config = options();
+    config.replication.enabled = false;
+    let (node, driver) = Node::open(config, services()).await.unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let memory = node.memory();
+    let baseline = memory.used_bytes();
+    let context = session.query_context().await.unwrap();
+    let context_bytes = memory.used_bytes() - baseline;
+    assert!(context_bytes > 0);
+    drop(context);
+    assert_eq!(memory.used_bytes(), baseline);
+
+    let source = format!("SELECT '{}'; SELECT @", "é".repeat(64));
+    let syntax_bytes = rtdb_sql::statement_syntax_estimate(source.len()).unwrap();
+    let expected = rtdb_sql::parse_in(&source, memory).unwrap_err();
+    assert_eq!(expected.code, "xtdb/sql-error");
+
+    let pressure = memory.reserve(memory.limit_bytes() - baseline - context_bytes - syntax_bytes + 1).unwrap();
+    let Err(error) = session.query_sql(&source, Vec::new()).await else { panic!("syntax reservation must be refused"); };
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    let retained_at_parse = baseline + pressure.bytes() + context_bytes;
+    let message = format!("Cannot reserve {syntax_bytes} bytes from budget {} with {retained_at_parse} retained", memory.limit_bytes());
+    assert_eq!(error.message.as_deref(), Some(message.as_str()));
+    assert_eq!(memory.used_bytes(), baseline + pressure.bytes());
+    drop(pressure);
+
+    let pressure = memory.reserve(memory.limit_bytes() - baseline - context_bytes - syntax_bytes).unwrap();
+    let Err(error) = session.query_sql(&source, Vec::new()).await else { panic!("malformed source must be rejected"); };
+    assert_eq!(error, expected);
+    assert_eq!(memory.used_bytes(), baseline + pressure.bytes());
+
+    session.state().cancellation().cancel();
+    let Err(error) = session.query_sql(&source, Vec::new()).await else { panic!("cancelled session must be rejected"); };
+    assert_eq!(error.code, "xtdb/connection-cancelled");
+    assert_eq!(memory.used_bytes(), baseline + pressure.bytes());
+    drop(pressure);
+    drop(session);
+    driver.close_without_run().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_internal_reads_return_stored_transaction_result_and_role_membership() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let grant = TxOp::Sql { sql: "GRANT reader TO alice".into(), args: None };
+        let first = session.state_mut().execute_tx(vec![grant], AutonomousTxOptions::default()).await.unwrap();
+        assert!(first.committed());
+        let second = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap();
+        assert!(second.committed());
+        assert!(second.tx_key().tx_id > first.tx_key().tx_id);
+        assert_eq!(node.latest_completed_transactions().unwrap()["xtdb"], vec![Some(second.tx_key())]);
+        let stored = node.await_transaction("xtdb", first.tx_key().tx_id, &Authority, &CancellationToken::new()).await.unwrap();
+        assert_eq!(stored, first);
+
+        let memberships = session.query_sql("SELECT admin_option FROM pg_catalog.pg_auth_members", Vec::new()).await.unwrap();
+        assert_eq!(rows(memberships).await, [vec![Value::Bool(false)]]);
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn native_sql_and_xtql_admit_unsigned_external_parameters_before_binding() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
