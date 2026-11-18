@@ -79,7 +79,10 @@ fn character_length_units_preserve_syntax_and_later_binding_errors() {
             assert!(rtdb_sql::parse(&sql).is_ok(), "{sql}");
             let error = prepare(&sql, &context.catalog, &options).unwrap_err();
             assert!(error.message.as_deref().is_some_and(|message| message.contains("Unknown function:")), "{sql}: {error}");
-            assert!(rtdb_sql::parse(&format!("SELECT {name}('x' USING OCTETS)")).is_err());
+            for units in ["CHARACTERS", "OCTETS"] {
+                let sql = format!("SELECT {name}('x' USING {units})");
+                assert_eq!(rtdb_sql::parse(&sql).unwrap_err().code, "xtdb/sql-error", "{sql}");
+            }
         }
         for argument in ["DISTINCT 'x'", "'x', 'y'", "'x' AS alias", "*"] {
             let sql = format!("SELECT {spelling}({argument} USING OCTETS)");

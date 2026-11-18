@@ -2256,6 +2256,14 @@ impl<'a> Parser<'a> {
             let Some(AccessExpr::Dot(Expr::Function(mut func))) = access_chain.pop() else {
                 return parser_err!("expected function expression", root.span().start);
             };
+            if matches!(&func.args, FunctionArguments::List(args) if args.clauses.iter()
+                .any(|clause| matches!(clause, FunctionArgumentClause::UsingCharacterLengthUnits(_))))
+            {
+                return parser_err!(
+                    "Character-length units require an unqualified function name",
+                    root.span().start
+                );
+            }
 
             let compound_func_name = [root]
                 .into_iter()
