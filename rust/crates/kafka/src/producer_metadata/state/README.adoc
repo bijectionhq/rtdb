@@ -151,6 +151,13 @@ A bootstrap fatal is retained across observations and takes priority without cle
 The topic error path clears both recoverable sets after an ordinary fatal or a topic-specific lookup.
 The monitor must notify waiters after publishing a fatal cause.
 
+`MetadataMonitor` holds the producer state and the broadcast under one admitted owner.
+Successful response publication, fatal publication and close wake every waiter.
+A terminal native admission failure also wakes waiters so they can observe the ended capability.
+Empty responses and server rebootstrap outcomes leave notification to the subsequent source action.
+The Tokio 1.54.1 notifier captures broadcasts before the condition check, with the lock released before parking or waking callers.
+The caller owns its wait future, source clock and runtime timer.
+
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.
