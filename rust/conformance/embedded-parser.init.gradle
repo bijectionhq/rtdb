@@ -1,0 +1,36 @@
+import org.gradle.api.tasks.JavaExec
+import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.api.tasks.testing.Test
+import org.gradle.process.CommandLineArgumentProvider
+
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    def side = root.providers.gradleProperty("rtdb.embeddedSide").get()
+    def target
+    switch (side) {
+        case "reference": target = root; break
+        case "native": target = root.project(":bindings:xtdb-rust-bindings"); break
+        default: throw new GradleException("Unknown embedded parser observation side: " + side)
+    }
+    def baseline = target.tasks.named("test", Test)
+    target.tasks.register("rtdbConformanceEmbeddedParser", JavaExec) { task ->
+        def test = baseline.get()
+        javaLauncher.set(test.javaLauncher)
+        jvmArgs(test.jvmArgs)
+        systemProperties(test.systemProperties)
+        minHeapSize = test.minHeapSize
+        maxHeapSize = test.maxHeapSize
+        defaultCharacterEncoding = test.defaultCharacterEncoding
+        enableAssertions = test.enableAssertions
+        systemProperty("user.timezone", "UTC")
+        dependsOn target.tasks.named("testClasses")
+        classpath = target.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath +
+            target.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
+        mainClass = "clojure.main"
+        argumentProviders.add({
+            ["-m", "rtdb.conformance.embedded-parser-" + side,
+             root.providers.gradleProperty("rtdb.fixture").get(), root.providers.gradleProperty("rtdb.output").get()]
+        } as CommandLineArgumentProvider)
+        outputs.upToDateWhen { false }
+    }
+}

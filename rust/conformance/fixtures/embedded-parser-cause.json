@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "sql": {
+    "statement_mismatch": "SELEC 1",
+    "unwanted_token": "extra SELECT 1",
+    "follow_up": "SELECT 42 AS answer"
+  },
+  "native": {
+    "yaml": "server: null\nflightSql: null\nnodeId: embedded-parser-observer\n",
+    "memory_bytes": 536870912,
+    "legacy_merge_sort": false
+  }
+}

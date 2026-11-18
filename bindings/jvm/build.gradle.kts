@@ -21,6 +21,7 @@ dependencies {
     testRuntimeOnly(libs.junit.jupiter.engine)
     testRuntimeOnly(libs.junit.platform.launcher)
     testRuntimeOnly(libs.jovial)
+    testRuntimeOnly(libs.jsonista)
 }
 
 tasks.withType<Test>().configureEach {

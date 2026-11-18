@@ -35,7 +35,37 @@ The report omits the count when zero.
 The group stays in the strict agreement denominator and leaves `complete_parity` false.
 The `compare` CLI exit status still measures complete parity.
 Equality controls require `passing_both` and reject selections that include a declared migration.
-The embedded source fixtures need paired observation adapters and explicit discovery bindings to supply this evidence.
+The embedded migration observer selects the authored Kotlin and Java assertions in `configurations/embedded-parser-migration.json`.
+The selected source assertions were authored after the pinned reference revision.
+The selection records their identity separately from the clean reference artifact revision.
+The external Gradle init script loads the observer from the implementation checkout through the pinned root test runtime.
+It loads the native observer through the binding test runtime on the selected package's host platform.
+The tasks use the corresponding test task's Java launcher and copy its explicit JVM arguments, system properties, heap settings, encoding and assertion setting.
+The native task receives the absolute path to the retained packaged FFI library.
+Both execution tasks read the same input-only `fixtures/embedded-parser-cause.json`.
+
+The reference observer calls the public `SqlParser.parseStatementAst` and observes the caught exception's live recognizer and decision array.
+The native observer calls `NativeStatement.prepare` and reads the ADBC diagnostic's immediate cause.
+The supplemental observations retain the reference unwanted-token exception, native Clojure anomaly and the follow-up on the same native connection.
+Only the statement mismatch contributes a paired migration observation.
+The runner retains the process, observed runtime artifact identities, shared fixture and packaged library evidence before invoking the comparator.
+
+Run the scoped observer after the Phase 2 gate opens.
+Select an official package for the clean implementation revision and a production comparator.
+
+[source,shell]
+----
+python3 rust/conformance/run_embedded_migration.py --phase-two \
+  --reference /absolute/path/to/clean-reference \
+  --native-package /absolute/path/to/native-package/package.json \
+  --comparator /absolute/path/to/rtdb-conformance \
+  --output /absolute/path/to/new-evidence-directory
+----
+
+The output directory must be outside both checkouts.
+`result.json` records `selected_migration_observed` after the comparator reports one matched declaration and the supplemental observations agree with their authored assertions.
+The report retains the two incomplete inventory and reconciliation diagnostics and a false `complete_parity`.
+The existing global ledger, original-source discovery and equality controls have independent selections.
 
 `assertion-ledger.json` maps the two mandatory comparison controls and the four compound assertions in `xtdb.operator.table-test/test-single-col`.
 `fixtures/table-column.json` retains that test's inputs and exact typed rows; its native counterpart exercises the column-table operator.

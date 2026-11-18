@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "authored_revision": "891454fe1ea3406d3a4cfa33a31477436408eb23",
+  "authored_sources": {
+    "core/src/test/kotlin/xtdb/query/SqlParserCauseTest.kt": "7c82b6d4aee31bc645835f42ef375fe623145082a08f90a22b42ad826b06af00",
+    "bindings/jvm/src/test/java/xtdb/rust/NativeAdbcTest.java": "ffb95ff3bdc77923e30eb4f440d46b236a02d7931a0ea3a4bf0ebd4c979f76cb"
+  },
+  "fixture_sha256": "52a7c25e80e824a2e705f3cfc7fd3dbe59e85e229cd8a32863cb930846d06b58",
+  "context": {
+    "applied_basis": null,
+    "valid_time": null,
+    "system_time": null,
+    "clock": "not-observed",
+    "timezone": "UTC",
+    "storage_version": 0,
+    "features": ["embedded-sql-parser-cause"]
+  },
+  "ledger": {
+    "schema_version": 1,
+    "inventory_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+    "inventory_complete": false,
+    "runtime_reconciled": false,
+    "cases": [
+      {
+        "identity": {
+          "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+          "source": "core/src/test/kotlin/xtdb/query/SqlParserCauseTest.kt",
+          "qualified_name": "xtdb.query.SqlParserCauseTest.statement mismatch exposes its live recognizer and shared decision states",
+          "parameter_fixture": "rust/conformance/fixtures/embedded-parser-cause.json",
+          "configuration": "embedded-sql-parser-cause"
+        },
+        "source_assertion_lines": [23, 26, 27, 33, 36, 37, 38],
+        "counterparts": ["xtdb.rust.NativeAdbcTest.embeddedSqlErrorsExposeDiagnosticsAndKeepTheConnectionUsable"],
+        "observations": [
+          {
+            "id": "statement_mismatch",
+            "comparison": "exact",
+            "expected": {
+              "kind": "declared_migration",
+              "migration": "embedded_sql_parser_cause",
+              "reference": {
+                "stage": "parse_statement_ast",
+                "category": "incorrect",
+                "code": "xtdb/sql-error",
+                "signature": {
+                  "cause": {
+                    "class": "org.antlr.v4.runtime.InputMismatchException",
+                    "recognizer_class": "xtdb.antlr.Sql",
+                    "offending_state": 574,
+                    "shared_decision_array": true
+                  }
+                }
+              },
+              "native": {
+                "stage": "statement_prepare",
+                "category": "incorrect",
+                "code": "xtdb/sql-error",
+                "signature": {"cause": null}
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
