@@ -320,7 +320,8 @@ impl ScalarWriter {
     pub(crate) fn source_reader(&self) -> Result<Option<SourceScalarReader<'_>>> {
         let Some(metadata) = self.scalar.descriptor.source_metadata() else { return Ok(None); };
         let MutableScalarData::Fixed { data, .. } = &self.scalar.data else { return Err(layout()); };
-        Ok(Some(SourceScalarReader::fixed(metadata.declaration(), data.bytes())))
+        let validity = self.scalar.validity.as_ref().map(MutableBits::bytes);
+        Ok(Some(SourceScalarReader::fixed(metadata.declaration(), data.bytes(), validity)))
     }
     pub(crate) fn source_int_pointer(&self, row: i32) -> Result<Option<SourceBytePointer<'_>>> {
         if self.scalar.descriptor.count_class() != Some(CountScalarClass::IntArrow19Default) { return Ok(None); }

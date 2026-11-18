@@ -6,6 +6,7 @@ mod tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SourceScalarReadFailure {
     Unsupported { declaration: SourceScalarDeclaration, method: &'static str },
+    ValidityByteBounds { offset: i32, capacity: usize },
     NegativeViewLength(i64),
     UuidFirstLongUnderflow,
     UuidSecondLongUnderflow,
@@ -15,18 +16,25 @@ pub(crate) enum SourceScalarReadFailure {
 pub(crate) enum SourceScalarReadError { Reference(SourceScalarReadFailure), Native(Anomaly) }
 pub(crate) type SourceScalarReadResult<T> = std::result::Result<T, SourceScalarReadError>;
 
-pub(crate) struct SourceScalarReader<'a> { declaration: SourceScalarDeclaration, backing: &'a [u8] }
+pub(crate) struct SourceScalarReader<'a> {
+    declaration: SourceScalarDeclaration,
+    backing: &'a [u8],
+    validity: Option<&'a [u8]>,
+}
 impl<'a> SourceScalarReader<'a> {
     pub(crate) fn new(vector: &'a ExecutionVector) -> Result<Option<Self>> {
         let (ReaderView::Direct(node), Address::Identity { .. }) = (&vector.view, &vector.address) else { return Ok(None); };
         let Some(declaration) = node.descriptor.scalar().and_then(|scalar| scalar.source_declaration()) else { return Ok(None); };
         let NodeLayout::Scalar(storage) = &node.storage else { return Ok(None); };
         let native_scalar::NativeScalarData::Fixed(bytes) = &storage.data else { return Err(layout()); };
-        Ok(Some(Self::fixed(declaration, bytes.bytes.as_slice())))
+        let validity = storage.validity.as_ref().map(|bits| bits.bytes.as_slice());
+        Ok(Some(Self::fixed(declaration, bytes.bytes.as_slice(), validity)))
     }
-    pub(super) fn fixed(declaration: SourceScalarDeclaration, backing: &'a [u8]) -> Self { Self { declaration, backing } }
+    pub(super) fn fixed(declaration: SourceScalarDeclaration, backing: &'a [u8], validity: Option<&'a [u8]>) -> Self {
+        Self { declaration, backing, validity }
+    }
     pub(crate) fn slice(&self, start: i32, length: i32) -> SourceScalarSlice<'a> {
-        SourceScalarSlice { inner: Self::fixed(self.declaration, self.backing), start, length }
+        SourceScalarSlice { inner: Self::fixed(self.declaration, self.backing, self.validity), start, length }
     }
     pub(crate) fn get_pointer(&self, row: i32) -> SourceBytePointer<'a> {
         let width = self.declaration.fixed_width();
@@ -41,30 +49,45 @@ impl<'a> SourceScalarReader<'a> {
         Ok(SourceByteView { backing: pointer.backing, offset: pointer.offset, length })
     }
     pub(crate) fn binary_object0(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> Option<SourceScalarReadResult<OwnedValue>> {
-        if !self.declaration.bytes_method() { return None; }
-        Some((|| {
-            let view = self.get_bytes(row)?;
-            let source = view.demand_native()?;
-            let bound = source.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096))
-                .ok_or_else(|| SourceScalarReadError::Native(allocation()))?;
-            let copy_reservation = memory.reserve(bound).map_err(SourceScalarReadError::Native)?;
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(source.len()).map_err(|cause| SourceScalarReadError::Native(Anomaly::incorrect("rtdb/allocation-failed", cause.to_string())))?;
-            bytes.extend_from_slice(source);
-            if matches!(self.declaration, SourceScalarDeclaration::FixedBinary(_)) {
-                return Ok(OwnedValue { value: Value::FixedSizeBinary(bytes), _reservation: copy_reservation });
+        self.declaration.bytes_method().then(|| self.read_binary_object(row, memory))
+    }
+
+    pub(crate) fn binary_object(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> Option<SourceScalarReadResult<Option<OwnedValue>>> {
+        self.declaration.bytes_method().then(|| {
+            if let Some(validity) = self.validity {
+                let offset = row >> 3;
+                let byte = usize::try_from(offset).ok().and_then(|index| validity.get(index))
+                    .ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::ValidityByteBounds {
+                        offset, capacity: validity.len(),
+                    }))?;
+                if byte & (1 << (row & 7)) == 0 { return Ok(None); }
             }
-            let high = bytes.get(..8).ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::UuidFirstLongUnderflow))?;
-            let low = bytes.get(8..16).ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::UuidSecondLongUnderflow))?;
-            let mut uuid = [0; 16];
-            uuid[..8].copy_from_slice(high);
-            uuid[8..].copy_from_slice(low);
-            let reservation = memory.reserve(4096).map_err(SourceScalarReadError::Native)?;
-            let result = OwnedValue { value: Value::Uuid(uuid), _reservation: reservation };
-            drop(bytes);
-            drop(copy_reservation);
-            Ok(result)
-        })())
+            self.read_binary_object(row, memory).map(Some)
+        })
+    }
+
+    fn read_binary_object(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> SourceScalarReadResult<OwnedValue> {
+        let view = self.get_bytes(row)?;
+        let source = view.demand_native()?;
+        let bound = source.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| SourceScalarReadError::Native(allocation()))?;
+        let copy_reservation = memory.reserve(bound).map_err(SourceScalarReadError::Native)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(source.len()).map_err(|cause| SourceScalarReadError::Native(Anomaly::incorrect("rtdb/allocation-failed", cause.to_string())))?;
+        bytes.extend_from_slice(source);
+        if matches!(self.declaration, SourceScalarDeclaration::FixedBinary(_)) {
+            return Ok(OwnedValue { value: Value::FixedSizeBinary(bytes), _reservation: copy_reservation });
+        }
+        let high = bytes.get(..8).ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::UuidFirstLongUnderflow))?;
+        let low = bytes.get(8..16).ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::UuidSecondLongUnderflow))?;
+        let mut uuid = [0; 16];
+        uuid[..8].copy_from_slice(high);
+        uuid[8..].copy_from_slice(low);
+        let reservation = memory.reserve(4096).map_err(SourceScalarReadError::Native)?;
+        let result = OwnedValue { value: Value::Uuid(uuid), _reservation: reservation };
+        drop(bytes);
+        drop(copy_reservation);
+        Ok(result)
     }
 }
 
@@ -80,6 +103,9 @@ impl<'a> SourceScalarSlice<'a> {
     }
     pub(crate) fn get_bytes(&self, row: i32) -> SourceScalarReadResult<SourceByteView<'a>> {
         self.inner.get_bytes(self.start.wrapping_add(row))
+    }
+    pub(crate) fn binary_object(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> Option<SourceScalarReadResult<Option<OwnedValue>>> {
+        self.inner.binary_object(self.start.wrapping_add(row), memory)
     }
 }
 

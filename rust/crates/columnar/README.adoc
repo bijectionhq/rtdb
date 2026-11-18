@@ -294,7 +294,7 @@ Snapshots keep the descriptor and payload reservations independently of their or
 
 `SourceScalarReader` admits only native source scalar fixed storage under a direct reader with identity addressing.
 SDK-backed readers, checked ranges/selections, containers, named union legs and run-end wrappers return factory absence rather than a source method failure.
-The mutable reader bridge borrows sealed metadata and fixed backing from its existing scalar owner without exposing mutable storage or another publication gate.
+The mutable reader bridge borrows sealed metadata, fixed backing and optional validity from its existing scalar owner without exposing mutable storage or another publication gate.
 It remains available for prefix inspection after `NativeAborted`, as does the existing checked reader, and does not change the gate.
 Pointer facts retain signed wrapped offsets and lengths without checking the row, validity or retained span.
 Byte-view construction rejects a negative length at the source `MemorySegment.reinterpret` producer and otherwise retains nonnegative view facts without payload admission.
@@ -313,7 +313,7 @@ They retain the inner declaration's actual width, unsupported methods and negati
 Raw forwarding is independent of logical row count and validity.
 Slice construction and raw forwarding allocate no payload storage or reservations.
 Slices and returned facts borrow the real writer/vector owner and may outlive intermediate reader or Slice variables within that borrow.
-Repeated selection, mutable array aliases, guarded object reads, copying, close and pointer reuse remain required indirect-reader operations.
+Repeated selection, mutable array aliases, copying, close and pointer reuse remain required indirect-reader operations.
 
 `SourceScalarReader::binary_object0` materializes a FixedBinary or UUID object from its signed byte address.
 The same raw demand applies to null rows and wrapped row offsets.
@@ -330,6 +330,15 @@ The inline UUID result reservation overlaps the temporary copied-byte reservatio
 The temporary owner drops before return.
 The returned object owns its bytes and destination charge independently of the original vector, snapshots and intermediate readers.
 Copy denial, underflow and result denial release their admitted temporary owners without changing source prefixes or an existing writer abort gate.
+
+`binary_object` checks the retained validity bitmap before calling the raw FixedBinary or UUID materialization.
+A first signed Slice translates the row before that same check.
+The Arrow 19 enabled-bounds profile reads the signed byte index `row >> 3` before selecting bit `row & 7`.
+If that byte lies outside the retained bitmap, the reader returns its typed validity-byte bounds failure.
+A zero bit returns null without payload demand or destination admission.
+With no bitmap, the reader enters raw materialization directly.
+Bitmap reads and payload demands are independent of the stored logical count and the signed Slice length.
+Time still reports binary-object capability absence.
 
 `cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, first signed Slice forwarding, binary object underflow and surplus bytes, overlapping object reservations, abort inspection and retained snapshot ownership.
 These tests are unexecuted source under the Phase 1 gate.

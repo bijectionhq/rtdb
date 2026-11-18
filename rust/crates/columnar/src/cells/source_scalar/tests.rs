@@ -1501,3 +1501,96 @@ fn signed_slice_demands_retained_payload_when_aborted_count_is_zero() {
     drop(blocker);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn guarded_fixed_binary_reads_validity_before_signed_width_or_destination_admission() {
+    let source = memory();
+    let destination = MemoryBudget::new(0);
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(-1), true, &source);
+    let empty = output.source_reader().unwrap().unwrap();
+    read_reference(empty.binary_object(0, &destination).unwrap(),
+        SourceScalarReadFailure::ValidityByteBounds { offset: 0, capacity: 0 });
+
+    output.ensure_capacity(1).unwrap();
+    let reader = output.source_reader().unwrap().unwrap();
+    assert!(reader.binary_object(0, &destination).unwrap().unwrap().is_none());
+    assert!(reader.binary_object(7, &destination).unwrap().unwrap().is_none());
+    read_reference(reader.binary_object0(0, &destination).unwrap(), SourceScalarReadFailure::NegativeViewLength(-1));
+
+    let captured = output.finish().unwrap();
+    let capacity = storage(&captured).validity.as_ref().unwrap().bytes.as_slice().len();
+    assert_eq!(captured.value_count(), 1);
+    let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+    read_reference(reader.binary_object(-1, &destination).unwrap(),
+        SourceScalarReadFailure::ValidityByteBounds { offset: -1, capacity });
+    let after_bitmap = i32::try_from(capacity).unwrap() * 8;
+    read_reference(reader.binary_object(after_bitmap, &destination).unwrap(),
+        SourceScalarReadFailure::ValidityByteBounds { offset: after_bitmap >> 3, capacity });
+    let slice = reader.slice(i32::MAX, 0);
+    read_reference(slice.binary_object(1, &destination).unwrap(),
+        SourceScalarReadFailure::ValidityByteBounds { offset: i32::MIN >> 3, capacity });
+    assert_eq!(destination.peak_bytes(), 0);
+    drop(captured);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn guarded_uuid_null_does_not_copy_the_payload_consumed_by_unguarded_underflow() {
+    let source = memory();
+    let destination = memory();
+    let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: 7 }, true, &source);
+    output.write_null().unwrap();
+    let reader = output.source_reader().unwrap().unwrap();
+    assert!(reader.binary_object(0, &destination).unwrap().unwrap().is_none());
+    assert_eq!(destination.peak_bytes(), 0);
+    read_reference(reader.binary_object0(0, &destination).unwrap(), SourceScalarReadFailure::UuidFirstLongUnderflow);
+    assert_eq!(destination.peak_bytes(), 4096 + 4 * 7);
+    assert_eq!(destination.used_bytes(), 0);
+    drop(output);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn guarded_slice_uses_the_translated_validity_bit_and_retains_only_the_owned_result() {
+    let source = memory();
+    let destination = MemoryBudget::new(4096 + 4 * 4);
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(4), true, &source);
+    for _ in 0..9 { output.write_null().unwrap(); }
+    output.write_bytes(&[3, 1, 4, 1]).unwrap();
+    let captured = output.finish().unwrap();
+    let object = {
+        let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+        let slice = reader.slice(10, -1);
+        assert!(slice.binary_object(-2, &destination).unwrap().unwrap().is_none());
+        slice.binary_object(-1, &destination).unwrap().unwrap().unwrap()
+    };
+    drop(captured);
+    assert_eq!(object.value(), &Value::FixedSizeBinary(vec![3, 1, 4, 1]));
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(destination.used_bytes(), destination.limit_bytes());
+    drop(object);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
+fn missing_validity_preserves_signed_payload_addresses_and_time_capability_absence() {
+    let source = memory();
+    let destination = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(4), false, &source);
+    output.write_bytes(&[1, 2, 3, 4]).unwrap();
+    let reader = output.source_reader().unwrap().unwrap();
+    let object = reader.slice(i32::MAX, 0).binary_object(1, &destination).unwrap().unwrap().unwrap();
+    assert_eq!(object.value(), &Value::FixedSizeBinary(vec![1, 2, 3, 4]));
+    read_native(reader.binary_object(-1, &destination).unwrap());
+
+    for declaration in [SourceScalarDeclaration::Time32(TimeUnit::Second), SourceScalarDeclaration::Time64(TimeUnit::Nanosecond)] {
+        let output = writer(declaration, true, &source);
+        let reader = output.source_reader().unwrap().unwrap();
+        assert!(reader.binary_object(-1, &destination).is_none());
+        assert!(reader.slice(i32::MAX, 0).binary_object(1, &destination).is_none());
+    }
+    assert_eq!(destination.used_bytes(), 4096 + 4 * 4);
+    drop((object, output));
+    assert_eq!(destination.used_bytes(), 0);
+    assert_eq!(source.used_bytes(), 0);
+}
