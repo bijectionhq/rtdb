@@ -7,3 +7,7 @@ RTDB's dialect enables the FROM-first query specification from the XTDB grammar.
 The parser records each WHERE and SELECT tail in source order, including GROUP BY and HAVING before the SELECT they belong to.
 The syntax tree retains the usual expression nodes and their spans, and the existing set-operation parser consumes each FROM-first specification as one operand.
 The flag defaults to false, preserving the upstream dialects' FROM-first syntax.
+
+RTDB's admitted SQL batch parser and statement splitter use the tokenizer's boundary mode to emit line-comment tokens with empty prefix and body strings.
+Each comment still occupies one token with its original location and participates in the same buffer growth.
+Full SQL tokenization and tokens expanded from optimizer hints retain their original comment text.

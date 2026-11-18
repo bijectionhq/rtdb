@@ -235,22 +235,33 @@ impl VisitMut for TemporalExtent {
 }
 
 pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
+    let dialect = SqlDialect::default();
     let mut tokens = Vec::new();
-    tokenize_into(source, &mut tokens, |tokens, token| {
+    tokenize_into(source, Tokenizer::new(&dialect, source), &mut tokens, |tokens, token| {
         tokens.push(token);
         Ok(())
     })?;
     Ok(tokens)
 }
 
-pub(super) fn tokenize_into(
+pub(super) fn tokenize_boundaries_into(
     source: &str,
+    tokens: &mut Vec<TokenWithSpan>,
+    append: impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<()>,
+) -> Result<()> {
+    let dialect = SqlDialect::default();
+    let tokenizer = Tokenizer::new(&dialect, source).without_line_comment_text();
+    tokenize_into(source, tokenizer, tokens, append)
+}
+
+fn tokenize_into(
+    source: &str,
+    mut tokenizer: Tokenizer<'_>,
     tokens: &mut Vec<TokenWithSpan>,
     mut append: impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<()>,
 ) -> Result<()> {
-    let dialect = SqlDialect::default();
     let mut invalid_token = None;
-    let result = Tokenizer::new(&dialect, source).try_tokenize_with_location_into_buf(tokens, |tokens, mut token| {
+    let result = tokenizer.try_tokenize_with_location_into_buf(tokens, |tokens, mut token| {
         if invalid_token.is_none() {
             let invalid = match &token.token {
                 Token::Word(word) if word.quote_style.is_some() && word.value.contains('/') => Some(("Quoted SQL identifiers cannot contain a slash", token.span)),

@@ -882,6 +882,7 @@ pub struct Tokenizer<'a> {
     /// If true (the default), the tokenizer will un-escape literal
     /// SQL strings See [`Tokenizer::with_unescape`] for more details.
     unescape: bool,
+    retain_line_comment_text: bool,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -906,6 +907,7 @@ impl<'a> Tokenizer<'a> {
             dialect,
             query,
             unescape: true,
+            retain_line_comment_text: true,
         }
     }
 
@@ -941,6 +943,14 @@ impl<'a> Tokenizer<'a> {
     /// ```
     pub fn with_unescape(mut self, unescape: bool) -> Self {
         self.unescape = unescape;
+        self
+    }
+
+    /// Keep located line-comment tokens with empty prefix and body strings when finding statement boundaries.
+    /// Expanded hint tokens retain their comment text.
+    #[doc(hidden)]
+    pub fn without_line_comment_text(mut self) -> Self {
+        self.retain_line_comment_text = false;
         self
     }
 
@@ -1512,13 +1522,7 @@ impl<'a> Tokenizer<'a> {
 
                             if is_comment {
                                 chars.next(); // consume second '-'
-                                let comment = self.tokenize_single_line_comment(chars);
-                                return Ok(Some(Token::Whitespace(
-                                    Whitespace::SingleLineComment {
-                                        prefix: "--".to_owned(),
-                                        comment,
-                                    },
-                                )));
+                                return Ok(Some(self.tokenize_single_line_comment(chars, "--")));
                             }
 
                             self.start_binop(chars, "-", Token::Minus)
@@ -1543,11 +1547,7 @@ impl<'a> Tokenizer<'a> {
                         }
                         Some('/') if dialect_of!(self is SnowflakeDialect) => {
                             chars.next(); // consume the second '/', starting a snowflake single-line comment
-                            let comment = self.tokenize_single_line_comment(chars);
-                            Ok(Some(Token::Whitespace(Whitespace::SingleLineComment {
-                                prefix: "//".to_owned(),
-                                comment,
-                            })))
+                            Ok(Some(self.tokenize_single_line_comment(chars, "//")))
                         }
                         Some('/') if dialect_of!(self is DuckDbDialect | GenericDialect) => {
                             self.consume_and_return(chars, Token::DuckIntDiv)
@@ -1753,11 +1753,7 @@ impl<'a> Tokenizer<'a> {
                 '#' if dialect_of!(self is SnowflakeDialect | BigQueryDialect | MySqlDialect | HiveDialect) =>
                 {
                     chars.next(); // consume the '#', starting a snowflake single-line comment
-                    let comment = self.tokenize_single_line_comment(chars);
-                    Ok(Some(Token::Whitespace(Whitespace::SingleLineComment {
-                        prefix: "#".to_owned(),
-                        comment,
-                    })))
+                    Ok(Some(self.tokenize_single_line_comment(chars, "#")))
                 }
                 '~' => {
                     chars.next(); // consume
@@ -2086,13 +2082,25 @@ impl<'a> Tokenizer<'a> {
         Ok(s)
     }
 
-    // Consume characters until newline
-    fn tokenize_single_line_comment(&self, chars: &mut State) -> String {
-        peeking_take_while(chars, |ch| match ch {
-            '\n' => false,                                           // Always stop at \n
-            '\r' if dialect_of!(self is PostgreSqlDialect) => false, // Stop at \r for Postgres
-            _ => true, // Keep consuming for other characters
-        })
+    fn tokenize_single_line_comment(&self, chars: &mut State<'_>, prefix: &str) -> Token {
+        let mut comment = String::new();
+        while let Some(&ch) = chars.peek() {
+            match ch {
+                '\n' => break,
+                '\r' if dialect_of!(self is PostgreSqlDialect) => break,
+                _ => (),
+            }
+            chars.next();
+            if self.retain_line_comment_text {
+                comment.push(ch);
+            }
+        }
+        let prefix = if self.retain_line_comment_text {
+            prefix.to_owned()
+        } else {
+            String::new()
+        };
+        Token::Whitespace(Whitespace::SingleLineComment { prefix, comment })
     }
 
     /// Tokenize an identifier or keyword, after the first char is already consumed.
@@ -4668,5 +4676,101 @@ mod tests {
                 Token::make_word("b", None),
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod boundary_line_comment_tests {
+    use super::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
+    use crate::{
+        ast::comments::Comment,
+        dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SnowflakeDialect},
+        parser::Parser,
+    };
+
+    #[test]
+    fn boundary_line_comments_preserve_dialect_dispatch_and_locations() {
+        let cases: [(&dyn Dialect, &str, &[(&str, &str)]); 4] = [
+            (&GenericDialect {}, "--α\rβ\nx//y # z", &[("--", "α\rβ")]),
+            (&PostgreSqlDialect {}, "--α\rb\nx", &[("--", "α")]),
+            (&SnowflakeDialect {}, "//α\n#β\r\n--γ", &[("//", "α"), ("#", "β\r"), ("--", "γ")]),
+            (&MySqlDialect {}, "--x\n-- α", &[("--", " α")]),
+        ];
+        for (dialect, source, expected_comments) in cases {
+            let full = Tokenizer::new(dialect, source).tokenize_with_location().unwrap();
+            let boundary = Tokenizer::new(dialect, source)
+                .without_line_comment_text()
+                .tokenize_with_location()
+                .unwrap();
+            assert_eq!(boundary.len(), full.len());
+            let mut comments = expected_comments.iter().copied();
+            for (boundary, full) in boundary.iter().zip(&full) {
+                assert_eq!(boundary.span, full.span);
+                match (&boundary.token, &full.token) {
+                    (
+                        Token::Whitespace(Whitespace::SingleLineComment { prefix, comment }),
+                        Token::Whitespace(Whitespace::SingleLineComment { prefix: full_prefix, comment: full_comment }),
+                    ) => {
+                        assert_eq!((prefix.capacity(), comment.capacity()), (0, 0));
+                        assert_eq!(comments.next(), Some((full_prefix.as_str(), full_comment.as_str())));
+                    }
+                    (boundary, full) => assert_eq!(boundary, full),
+                }
+            }
+            assert!(comments.next().is_none());
+            if dialect.is::<GenericDialect>() {
+                assert!(boundary.iter().any(|token| token.token == Token::DuckIntDiv));
+                assert!(boundary.iter().any(|token| token.token == Token::Sharp));
+            }
+            if dialect.is::<PostgreSqlDialect>() {
+                assert_eq!(boundary[0].span, Span::new(Location::new(1, 1), Location::new(1, 4)));
+                assert_eq!(boundary[1], Token::Whitespace(Whitespace::Newline));
+                assert_eq!(boundary[1].span, Span::new(Location::new(1, 4), Location::new(1, 5)));
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_mode_retains_hint_comments_and_default_ast_comments() {
+        let dialect = GenericDialect {};
+        let source = "/*!0 --α\n SELECT 1 */ SELECT 2";
+        let full = Tokenizer::new(&dialect, source).tokenize_with_location().unwrap();
+        let boundary = Tokenizer::new(&dialect, source)
+            .without_line_comment_text()
+            .tokenize_with_location()
+            .unwrap();
+        assert_eq!(boundary, full);
+        assert!(boundary.iter().any(|token| matches!(&token.token,
+            Token::Whitespace(Whitespace::SingleLineComment { prefix, comment })
+                if prefix == "--" && comment == "α")));
+
+        let (ast, comments) = Parser::parse_sql_with_comments(&dialect, "SELECT 1 -- α\n").unwrap();
+        assert_eq!(ast.len(), 1);
+        let mut comments = comments.find(..);
+        let comment = comments.next().unwrap();
+        assert_eq!(comment.span, Span::new(Location::new(1, 10), Location::new(1, 14)));
+        assert!(matches!(&comment.comment, Comment::SingleLine { content, prefix }
+            if content == " α" && prefix == "--"));
+        assert!(comments.next().is_none());
+    }
+
+    #[test]
+    fn boundary_mode_uses_the_supplied_previous_token_from_the_buffer() {
+        let dialect = GenericDialect {};
+        let prefix = TokenWithSpan::wrap(Token::make_word("table", None));
+        let mut tokens = vec![prefix.clone()];
+        Tokenizer::new(&dialect, "._column--α")
+            .without_line_comment_text()
+            .try_tokenize_with_location_into_buf(&mut tokens, |tokens, token| {
+                tokens.push(token);
+                Ok::<(), core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens[0], prefix);
+        assert_eq!(tokens[1], Token::Period);
+        assert_eq!(tokens[2], Token::make_word("_column", None));
+        assert!(matches!(&tokens[3].token, Token::Whitespace(Whitespace::SingleLineComment { prefix, comment })
+            if prefix.capacity() == 0 && comment.capacity() == 0));
     }
 }

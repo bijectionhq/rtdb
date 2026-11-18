@@ -56,7 +56,7 @@ impl SplitTokens {
     pub(super) fn tokenize_in(source: &str, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut tokens = Self { values: Vec::new(), reservation: None };
         let reservation = &mut tokens.reservation;
-        crate::parse::tokenize_into(source, &mut tokens.values, |values, token| {
+        crate::parse::tokenize_boundaries_into(source, &mut tokens.values, |values, token| {
             if values.len() == values.capacity() {
                 let capacity = values.capacity().checked_mul(2).ok_or_else(token_array_size)?.max(4);
                 let layout = Layout::array::<TokenWithSpan>(capacity).map_err(|_| token_array_size())?;
@@ -78,8 +78,11 @@ impl SplitTokens {
 fn token_array_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/token-array-size", "SQL token array exceeds addressable memory") }
 
 /// Admits located-token array growth during lexical validation, then admits the returned byte ranges.
-/// The token array is released before return. Tokenizer payloads and scratch need separate admission.
-/// Empty statement groups acquire no span charge. Size, allocation and budget errors propagate as native errors.
+/// Source line comments occupy located slots with empty text fields.
+/// The token array is released before return.
+/// Other tokenizer payloads and scratch need separate admission.
+/// Empty statement groups acquire no span charge.
+/// Size, allocation and budget errors propagate as native errors.
 pub fn split_statements_in(source: &str, memory: &Arc<MemoryBudget>) -> Result<SplitStatements> {
     let mut tokens = SplitTokens::tokenize_in(source, memory)?;
     collect_split_ranges(source, &mut tokens.values, memory)
@@ -303,5 +306,132 @@ mod tests {
             assert_eq!(error, super::split_statements(source).unwrap_err());
             assert_eq!(memory.used_bytes(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod boundary_line_comment_tests {
+    use std::alloc::Layout;
+
+    use rtdb_plan::SourceSpan;
+    use rtdb_types::MemoryBudget;
+    use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Whitespace};
+
+    use super::{SplitTokens, split_statements, split_statements_in};
+    use crate::{ExecutableSyntax, parse_statement_batch};
+
+    fn array_charge(capacity: usize) -> usize {
+        Layout::array::<TokenWithSpan>(capacity).unwrap().size() + 256
+    }
+
+    #[test]
+    fn admitted_token_array_keeps_long_comment_locations_without_allocated_payloads() {
+        const REPEATS: usize = 32768;
+        let body = format!("{}\rβ\r", "é😀;".repeat(REPEATS));
+        let source = format!("x;--{body}\nz");
+        let first = array_charge(4);
+        let next = array_charge(8);
+        let memory = MemoryBudget::new(first + next);
+        let boundary = SplitTokens::tokenize_in(&source, &memory).unwrap();
+        assert_eq!(boundary.values.len(), 5);
+        assert_eq!(memory.used_bytes(), next);
+        assert_eq!(memory.peak_bytes(), first + next);
+
+        let end = Location::new(1, (3 * REPEATS + 8) as u64);
+        let token = &boundary.values[2];
+        assert_eq!(token.span, Span::new(Location::new(1, 3), end));
+        assert_eq!(crate::parse::source_span(&source, token.span), SourceSpan { start: 2, end: 7 * REPEATS + 8 });
+        assert!(matches!(&token.token, Token::Whitespace(Whitespace::SingleLineComment { prefix, comment })
+            if prefix.capacity() == 0 && comment.capacity() == 0));
+        assert_eq!(boundary.values[3], Token::Whitespace(Whitespace::Newline));
+        assert_eq!(boundary.values[3].span, Span::new(end, Location::new(2, 1)));
+        assert_eq!(boundary.values[4].span, Span::new(Location::new(2, 1), Location::new(2, 2)));
+
+        let full = crate::parse::tokenize(&source).unwrap();
+        assert_eq!((&boundary.values[..2], &boundary.values[3..]), (&full[..2], &full[3..]));
+        assert_eq!(token.span, full[2].span);
+        assert!(matches!(&full[2].token, Token::Whitespace(Whitespace::SingleLineComment { prefix, comment })
+            if prefix == "--" && comment == &body));
+        drop(boundary);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn admitted_ranges_keep_original_bytes_across_comment_endings_and_quoted_semicolons() {
+        let first = "SELECT 'é' -- 😀; inside\rignored\r\n, $$a;b$$";
+        let source = format!("{first}; /* outer /* ; */ end */ SELECT 2; -- EOF é");
+        let memory = MemoryBudget::new(1 << 20);
+        let ranges = split_statements_in(&source, &memory).unwrap();
+        let full = split_statements(&source).unwrap();
+        assert_eq!(ranges.as_slice(), full.as_slice());
+        assert_eq!(ranges.as_slice().iter().map(|span| &source[span.start..span.end]).collect::<Vec<_>>(),
+            [first, "SELECT 2"]);
+        drop(ranges);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn line_comment_slots_preserve_admission_and_lexical_error_order() {
+        let first = array_charge(4);
+        for (source, expected_span) in [
+            ("x;--😀\r\n@", serde_json::json!({"start": 10, "end": 11})),
+            ("x;--😀\r\n._x", serde_json::json!({"start": 10, "end": 10})),
+        ] {
+            let memory = MemoryBudget::new(first);
+            let error = split_statements_in(source, &memory).err().expect("reached lexical error");
+            assert_eq!(error, split_statements(source).unwrap_err());
+            assert_eq!(error.code, "xtdb/sql-error");
+            assert_eq!(error.context["position"], serde_json::json!(11));
+            assert_eq!(error.context["span"], expected_span);
+            assert_eq!(memory.peak_bytes(), first);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+        let memory = MemoryBudget::new(first);
+        let source = "x;--😀\r\ny 'unterminated";
+        let error = split_statements_in(source, &memory).err().expect("fifth token must reserve more space");
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(split_statements(source).unwrap_err().code, "xtdb/sql-error");
+        assert_eq!(memory.peak_bytes(), first);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn admitted_sql_batch_keeps_comments_in_original_command_and_prepare_ranges() {
+        let first = "SELECT 'é' -- 😀; still comment\rignored\r\n, 2";
+        let command = "SELECT 3 -- é; inside\n, 4";
+        let inner = format!("PREPARE inner_q AS\n {command}");
+        let outer = format!("PREPARE outer_q AS {inner}");
+        let source = format!("{first}; {outer};");
+        let memory = MemoryBudget::new(1 << 20);
+        let mut batch = parse_statement_batch(&source, &memory).unwrap();
+        let first_statement = batch.next().unwrap();
+        assert!(matches!(&first_statement.command, ExecutableSyntax::Sql(_)));
+        assert!(first_statement.preparations.is_empty());
+        assert_eq!(first_statement.command.source(), first);
+        let wrapped = batch.next().unwrap();
+        assert!(matches!(&wrapped.command, ExecutableSyntax::Sql(_)));
+        assert_eq!(wrapped.command.source(), command);
+        assert_eq!(wrapped.preparations.len(), 2);
+        assert_eq!((wrapped.preparations[0].name.as_str(), wrapped.preparations[0].source),
+            ("outer_q", outer.as_str()));
+        assert_eq!((wrapped.preparations[1].name.as_str(), wrapped.preparations[1].source),
+            ("inner_q", inner.as_str()));
+        assert!(batch.next().is_none());
+        drop(first_statement);
+        drop(wrapped);
+        drop(batch);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn later_sql_batch_grammar_error_after_unicode_comments_keeps_original_byte_span() {
+        let source = "SELECT 1 -- 😀; ignored\r\n; SELECT 2;; SELECT 3";
+        let memory = MemoryBudget::new(1 << 20);
+        let error = parse_statement_batch(source, &memory).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert_eq!(error.message.as_deref(), Some("Expected an SQL statement between semicolons"));
+        assert_eq!(error.context["position"], serde_json::json!(39));
+        assert_eq!(error.context["span"], serde_json::json!({"start": 38, "end": 39}));
+        assert_eq!(memory.used_bytes(), 0);
     }
 }
