@@ -8,6 +8,7 @@
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.operator.distinct-test :as original-distinct]
             [xtdb.operator.join-test :as original-join]
+            [xtdb.operator.let-test :as original-let]
             [xtdb.operator.order-by-test :as original-order-by]
             [xtdb.operator.project-test :as original-project]
             [xtdb.operator.rename-test :as original-rename]
@@ -287,6 +288,8 @@
 (deftest-original-api original-apply/test-forwarding-nullable-type-information-494)
 
 (deftest-original-api original-apply/test-missing-column-in-independent-rel)
+
+(deftest-original-api original-let/test-let)
 
 (deftest-original-api original-join/can-join-on-lists-491)
 

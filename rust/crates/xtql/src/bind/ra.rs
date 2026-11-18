@@ -1,6 +1,6 @@
 use super::*;
 use crate::{Edn, EdnKind};
-use rtdb_plan::{PercentileFraction, PercentileKind};
+use rtdb_plan::{MaterializedBinding, PercentileFraction, PercentileKind};
 
 /// Imports a Clojure logical relation into the native plan using exact column symbols.
 /// Named parameter bindings describe the caller's typed argument positions.
@@ -21,7 +21,8 @@ pub fn compile_ra_in(source: &str, catalog: &dyn Catalog, options: &CompileOptio
         next_parameter = next_parameter.max(index.checked_add(1).ok_or_else(|| invalid("Parameter index exceeds addressable range"))?);
     }
     let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter, timezone: &options.default_timezone, forms: FormAllocation::Tracked(memory), symbols };
-    let importer = Importer { compiler: &mut compiler, parameters: &parameters, memory };
+    let relations = BTreeMap::new();
+    let importer = Importer { compiler: &mut compiler, parameters: &parameters, relations: &relations, memory };
     let relation = importer.relation(&form)?;
     Ok(PreparedStatement { statement: Statement::Query(relation), parameter_types: binder.parameter_types().clone(), source: source.into(), notices: Vec::new(), settings: Default::default() })
 }
@@ -29,6 +30,7 @@ pub fn compile_ra_in(source: &str, catalog: &dyn Catalog, options: &CompileOptio
 struct Importer<'a, 'b, 'c> {
     compiler: &'a mut Compiler<'b, 'c>,
     parameters: &'a Parameters,
+    relations: &'a BTreeMap<String, Arc<MaterializedBinding>>,
     memory: &'b Arc<MemoryBudget>,
 }
 
@@ -49,6 +51,8 @@ impl Importer<'_, '_, '_> {
         let result = match (op, children) {
             ("table", []) => self.table(options)?,
             ("scan", []) => self.scan(options)?,
+            ("let", [bound, body]) => self.let_relation(options, bound, body)?,
+            ("relation", []) => self.reference(options)?,
             ("literal-pages", []) => self.literal_pages(options)?,
             ("select" | "σ" | "sigma", [input]) => {
                 let input = self.lower(input)?;
@@ -555,7 +559,7 @@ impl Importer<'_, '_, '_> {
             parameters.insert(name, PExpr::Parameter { index, data_type: field.data_type.clone() });
             arguments.push((index, field.expression()));
         }
-        let mut child = Importer { compiler: self.compiler, parameters: &parameters, memory: self.memory };
+        let mut child = Importer { compiler: self.compiler, parameters: &parameters, relations: self.relations, memory: self.memory };
         let mut dependent = child.lower(dependent)?;
         let kind = match required(options, "mode")?.keyword() {
             Some("cross-join") => ApplyKind::Inner,
@@ -578,6 +582,29 @@ impl Importer<'_, '_, '_> {
         } else { None };
         let schema = kind.result_schema(input.schema(), dependent.schema(), output.as_ref())?;
         Relation::new(schema, RelationNode::Apply { input, dependent, arguments, kind, output })
+    }
+
+    fn let_relation(&mut self, options: &Edn, bound: &Edn, body: &Edn) -> Result<Relation> {
+        let name = required(options, "binding-sym")?.symbol().ok_or_else(|| invalid("Let requires a binding symbol"))?;
+        let binding = Arc::new(MaterializedBinding { name: name.to_owned(), relation: self.lower(bound)? });
+        let mut relations = self.relations.clone();
+        relations.insert(name.to_owned(), Arc::clone(&binding));
+        let mut child = Importer { compiler: self.compiler, parameters: self.parameters, relations: &relations, memory: self.memory };
+        let body = child.lower(body)?;
+        Relation::new(body.schema().clone(), RelationNode::Let { binding, body })
+    }
+
+    fn reference(&mut self, options: &Edn) -> Result<Relation> {
+        let name = required(options, "cte-id")?.symbol().ok_or_else(|| invalid("Relation reference requires a binding symbol"))?;
+        let binding = self.relations.get(name).cloned().ok_or_else(|| {
+            rtdb_types::Anomaly::fault("xtdb.operator.let/missing-relation", format!("Can't find relation '{name}'"))
+                .with_context("cte-id", name.into())
+        })?;
+        let relation = Arc::new(Relation::new(binding.relation.schema().clone(), RelationNode::Reference { binding })?);
+        let expressions = relation.schema().fields().iter().map(|field| {
+            Ok(NamedExpr { field: self.compiler.binder.field(&field.name, None, field.data_type.clone())?, expr: field.expression() })
+        }).collect::<Result<Vec<_>>>()?;
+        relation.project(expressions)
     }
 
     fn set(&mut self, operator: SetOperator, left: &Edn, right: &Edn) -> Result<Relation> {
