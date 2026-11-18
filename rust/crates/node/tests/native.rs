@@ -182,6 +182,36 @@ async fn native_logical_queries_execute_bound_relations_with_named_arguments() {
 }
 
 #[tokio::test]
+async fn native_logical_query_checks_named_argument_admission_before_binding() {
+    let mut config = options();
+    config.replication.enabled = false;
+    let (node, driver) = Node::open(config, services()).await.unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let operation = session.state().cancellation().child_token();
+    let memory = node.memory();
+    let baseline = memory.used_bytes();
+    let context = session.query_context_for("xtdb", &operation).await.unwrap();
+    let context_bytes = memory.used_bytes() - baseline;
+    drop(context);
+    assert_eq!(memory.used_bytes(), baseline);
+
+    let arguments = || BTreeMap::from([("param".into(), Value::Utf8("x".repeat(64 << 10)))]);
+    let pressure = memory.reserve(memory.limit_bytes() - baseline - context_bytes - (256 << 10)).unwrap();
+    let Err(error) = session.query_ra("@", arguments(), &operation).await else {
+        panic!("expected a failed parameter reservation");
+    };
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(memory.used_bytes(), baseline + pressure.bytes());
+    drop(pressure);
+
+    let source = "[:table {:rows [{:value 1}]}]";
+    let cursor = session.query_ra(source, arguments(), &operation).await.unwrap();
+    assert_eq!(rows(cursor).await, [vec![Value::I64(1)]]);
+    drop(session);
+    driver.close_without_run().await.unwrap();
+}
+
+#[tokio::test]
 async fn native_logical_queries_preserve_explicit_page_boundaries() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();

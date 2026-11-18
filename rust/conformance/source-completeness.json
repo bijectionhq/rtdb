@@ -6,9 +6,13 @@
   "areas": {
     "types_columnar_durable_formats": {
       "status": "pending",
-      "conclusion": "A captured direct FixedBinary vector supplies retained buffers and signed layout to a UUID reader. The final source review must reconcile type, Arrow, durable-codec and registered-object coverage with the reviewed design.",
+      "conclusion": "A captured direct FixedBinary vector supplies retained buffers and signed layout to a UUID reader. Legacy Transit dates share the pinned hybrid calendar and format resources, and the default Windows Path provider has a native parser and object semantics. The final source review must reconcile type, Arrow, durable-codec and remaining registered-object coverage with the reviewed design.",
       "implementation_paths": [
         "rust/crates/types/src/lib.rs",
+        "rust/crates/types/src/java_date.rs",
+        "rust/crates/java-date/src/date_display.rs",
+        "rust/crates/expr/src/transit_object/legacy_date_text.rs",
+        "rust/crates/expr/src/transit_object/path/windows.rs",
         "rust/crates/columnar/src/lib.rs",
         "rust/crates/columnar/src/cells.rs",
         "rust/crates/columnar/src/cells/source_scalar.rs",
@@ -35,7 +39,7 @@
     },
     "sql_xtql_execution": {
       "status": "pending",
-      "conclusion": "The private direct-control entry returns owned control statements and scalar recognition facts. Reported diagnostics retain their listener reservation. Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and frontend allocation still require source completion.",
+      "conclusion": "The private direct-control entry returns owned control statements and scalar recognition facts. Reported diagnostics retain their listener reservation. Direct logical queries admit retained named parameter metadata before binding and transfer owned argument values into the native page cursor. Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and additional frontend allocations still require source completion.",
       "implementation_paths": [
         "rust/crates/sql/src/lib.rs",
         "rust/crates/sql/src/lexer.rs",
@@ -59,7 +63,7 @@
     },
     "compaction_gc_adapters": {
       "status": "pending",
-      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction. Native Metadata rack scratch and queue and event lifetimes have admitted owners. Paired Avro constructs built-in logical types and accepts scalar-representable JavaText. The Registry Reader symbol table is implemented within its private parser profile. Actual typed HTTP and Avro activation, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
+      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction with Java lookup ordering. Native Metadata rack scratch and queue and event lifetimes have admitted owners. The SDK exposes consumer account attachment. Paired Avro constructs built-in logical types and accepts scalar-representable JavaText. The Registry Reader drives persistent symbol tables during its private UTF16 and UTF32 bean parse. Actual typed HTTP and Avro activation, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
       "implementation_paths": [
         "rust/crates/maintenance/src/driver.rs",
         "rust/crates/maintenance/src/gc.rs",
@@ -261,7 +265,7 @@
     },
     "database_shutdown": {
       "status": "reviewed",
-      "conclusion": "The recorded source review covers public server signals, unstarted and failed startup, embedded closure, listeners, database and term tasks, log owners, and retained I/O drain. Embedded direct logical relations enter the same call admission and session cancellation tree as SQL, and their native cursor reads use the same close fence.",
+      "conclusion": "The recorded source review covers public server signals, unstarted and failed startup, embedded closure, listeners, database and term tasks, log owners, and retained I/O drain. Embedded direct logical relations enter the same call admission and session cancellation tree as SQL, and their native page cursor reads use the same close fence and owner cancellation.",
       "implementation_paths": [
         "rust/crates/server/src/main.rs",
         "rust/crates/server/src/runtime.rs",
@@ -272,19 +276,21 @@
         "rust/crates/storage/src/io_region.rs",
         "rust/crates/ffi/src/region.rs",
         "rust/crates/ffi/src/handles.rs",
-        "rust/crates/ffi/src/statement.rs"
+        "rust/crates/ffi/src/statement.rs",
+        "rust/crates/query/src/cursor.rs"
       ],
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
-        "rust/crates/ffi/src/lib.rs": "297959eca4306d004a509791ac80d52525359582be94cfd236961366d89c7c7c",
-        "rust/crates/node/src/node.rs": "2a1a0fa99702b83f2f33ded57f540161395e6565e52ef1c6019ac42680abe89d",
+        "rust/crates/ffi/src/lib.rs": "3d6c03b3ab50f0c40a8e944074e9f193c5b3c4d7cd0348ac0842283f54eb9766",
+        "rust/crates/node/src/node.rs": "9bea359694d95b4afdecdb3730f618c0adb74edb219181297c3dc9b75491cadc",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
         "rust/crates/ffi/src/region.rs": "328562e748473a73e1dfe1ad205d9d45842041b25d40a36b692ba061c6f820b0",
         "rust/crates/ffi/src/handles.rs": "5209dafbfc70ba3a68b6c4da6052b9db5f1ed521a17657fea16a485aa5c1ba01",
-        "rust/crates/ffi/src/statement.rs": "51c6cc270571dd64abc2ae8d844666ac6c28b74b9a8edf4c8ef2b29cdbd427d8"
+        "rust/crates/ffi/src/statement.rs": "51c6cc270571dd64abc2ae8d844666ac6c28b74b9a8edf4c8ef2b29cdbd427d8",
+        "rust/crates/query/src/cursor.rs": "d6195262d3026ac6dcce88e79f19076b6f56d54717e27a03fa699ef138521ce4"
       }
     }
   },

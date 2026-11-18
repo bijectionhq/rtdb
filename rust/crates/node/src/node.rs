@@ -411,12 +411,27 @@ impl NativeSession {
     pub async fn query_ra(&mut self, source: &str, arguments: BTreeMap<String, Value>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let database = self.state.database().to_owned();
         let context = self.query_context_for(&database, cancellation).await?;
+        let overflow = || Anomaly::incorrect("rtdb.query/parameter-size", "Logical relation parameter metadata exceeds addressable memory");
+        let per_name = std::mem::size_of::<(String, (usize, LogicalType))>() * 16 + 256;
+        let metadata_bytes = arguments.iter().try_fold(4096usize, |total, (name, value)| {
+            let names = name.len().checked_mul(4).ok_or_else(overflow)?;
+            let types = value.retained_bytes()?.checked_mul(16).ok_or_else(overflow)?;
+            total.checked_add(per_name).and_then(|bytes| bytes.checked_add(names))
+                .and_then(|bytes| bytes.checked_add(types)).ok_or_else(overflow)
+        })?;
+        let metadata = context.memory.reserve(metadata_bytes)?;
         let named_parameters = arguments.iter().enumerate().map(|(index, (name, value))| {
             (name.clone(), (index, rtdb_columnar::execution_type(&value.logical_type())))
         }).collect();
         let options = rtdb_xtql::CompileOptions { named_parameters, default_timezone: context.timezone.clone(), ..Default::default() };
         let prepared = rtdb_xtql::compile_ra_in(source, &context.catalog, &options, &context.memory)?;
-        PreparedQuery::from_prepared(prepared, &context.memory)?.execute_pages(context, arguments.into_values().collect()).await
+        let query = PreparedQuery::from_prepared(prepared, &context.memory)?;
+        drop(options);
+        drop(metadata);
+        let container_bytes = arguments.len().checked_mul(std::mem::size_of::<Value>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
+        let _container = context.memory.reserve(container_bytes)?;
+        query.execute_pages(context, arguments.into_values().collect()).await
     }
 }
 

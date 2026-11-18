@@ -559,7 +559,11 @@ ExceptionInfo identity and the corresponding JSON/MessagePack regression sources
 === Default Sort scheduling and numeric object follow-ups
 
 Shared native Java URI descriptors, UTF8 decoding, calendars and zone rules have bounded source review.
-The calendar source includes extreme supported dates, temporal text and retained zone data; process-default Date rendering remains separate required work.
+The calendar source includes extreme supported dates, temporal text and retained zone data.
+Legacy Transit Date STR and casts use the process FORMAT locale and UTC for Clojure readability on Linux and macOS.
+FORMAT uses Date.toString fields in the captured default timezone with US-English names.
+The shared native Date crate uses the archived CLDR resource data for these routes and the existing Connect formatters.
+Other host capture adapters and runtime qualification remain open.
 Run-end layout replacement preserves its child layouts and has a same-increment regression source.
 
 Sort has independent source reviews for indexed memory/spill backing, the default OpenJDK25 TimSort algorithm and complete callback/run/merge scheduling.

@@ -270,8 +270,10 @@ pub unsafe extern "C" fn rtdb_v1_session_query_ra(session: u64, operation: u64, 
         let out = output(out)?; *out = 0;
         let session = handles::session(session)?;
         let _admitted = session.region.enter()?;
-        let token = handles::cancellation(operation, &session)?.child_token();
+        let operation = handles::cancellation(operation, &session)?;
         let memory = session.region.memory();
+        let _token_storage = memory.reserve(4096)?;
+        let token = operation.child_token();
         let source = text(plan, plan_length)?;
         let (arguments, _arguments) = rtdb_pg_codec::decode_transit_msgpack(bytes(arguments, arguments_length)?, memory)?.into_parts();
         let rtdb_types::Value::Struct(arguments) = arguments else { return Err(invalid("Logical relation arguments require a Transit map")); };
