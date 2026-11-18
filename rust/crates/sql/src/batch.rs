@@ -64,7 +64,6 @@ pub fn parse_statement_batch<'input>(source: &'input str, memory: &'input Arc<Me
         return Err(sql_error("Expected an SQL statement", source, tokens.values.last().map_or_else(Span::empty, |token| token.span)));
     }
     let tokens = &tokens.values[..end];
-    validate_common_syntax(tokens, source)?;
     let ranges = tokens.split(|token| token.token == Token::SemiColon);
     let count = ranges.clone().count();
     let bytes = Layout::array::<BatchStatement<'_>>(count).map_err(|_| batch_size())?.size();
@@ -79,6 +78,7 @@ pub fn parse_statement_batch<'input>(source: &'input str, memory: &'input Arc<Me
             let span = tokens.get(next).or_else(|| tokens.last()).map_or_else(Span::empty, |token| token.span);
             return Err(sql_error("Expected an SQL statement between semicolons", source, span));
         };
+        validate_common_syntax(range, source)?;
         let start = starts.offset(first.span.start);
         let end = ends.offset(last.span.end);
         let bytes = (end - start).checked_mul(128).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(batch_size)?;

@@ -69,6 +69,8 @@ external entity SqlParser {
     -- Validates every transaction option occurrence and retains the last occurrence of each option for resolution.
     -- ASYNC accepts a literal or DEFAULT.
     -- Ordinary SQL in a Simple Query message has its full grammar checked before a statement can affect the session.
+    -- Native pgwire reports lexical errors in that message before grammar errors.
+    -- Grammar validation reports the first invalid statement in source order.
     -- Each parsed statement resolves its operands when the connection reaches it.
     -- pgwire acts on the tx-control statements it classifies; the other frontends reject them.
     -- See: core/src/main/kotlin/xtdb/query/SqlParser.kt

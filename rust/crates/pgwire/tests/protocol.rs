@@ -809,3 +809,26 @@ async fn single_range_grammar_error_keeps_an_extended_transaction_open_until_syn
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn simple_batch_reports_the_first_statement_grammar_error_after_lexing() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for (source, message, start, end) in [
+        ("SELEC 7; SELECT 1 LIMIT ALL", "SELEC", 0, 5),
+        ("SELECT 1 LIMIT ALL; SELEC 7", "LIMIT requires an unsigned integer or parameter", 15, 18),
+        ("SELEC 7; SELECT @", "Invalid character in SQL source", 16, 17),
+    ] {
+        let frames = client.query(source).await;
+        assert_eq!(tags(&frames), b"EZ");
+        assert_eq!(frames[1].1, b"I");
+        let detail = frames[0].1.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap();
+        let anomaly: serde_json::Value = serde_json::from_slice(detail).unwrap();
+        assert_eq!(anomaly["code"], "xtdb/sql-error");
+        assert!(anomaly["message"].as_str().unwrap().contains(message));
+        assert_eq!(anomaly["data"]["position"], serde_json::json!(start + 1));
+        assert_eq!(anomaly["data"]["span"], serde_json::json!({"start": start, "end": end}));
+    }
+    drop(client);
+    running.stop().await;
+}
