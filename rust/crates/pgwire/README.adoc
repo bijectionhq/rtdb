@@ -72,10 +72,15 @@ Inside an explicit transaction, all batches remain buffered until the user's com
 Keyword document keys use the source normalization, including `:xt/id` to `_id`; the literal string `xt/id` remains a different key.
 
 Frame, parameter, environment, prepared-registration, portal-descriptor, decoded-row, and encoded-value owners retain memory reservations.
-Simple Query admits located-token array growth as the tokenizer emits each token.
+Simple Query recognizes empty, line-comment-only and leading-semicolon markers on the whole message before tokenization.
+The marker check left-trims Java whitespace and removes one semicolon at the end or before the final line terminator, allowing ASCII regex whitespace after the semicolon.
+A leading semicolon that survives that check returns NoData and a zero-row command tag.
+The empty marker returns EmptyQueryResponse.
+On success the markers preserve an existing explicit transaction's status and settle an implicit transaction through the normal Simple Query path.
+Ordinary Simple Query admits located-token array growth as the tokenizer emits each token.
 The prior array retains its charge until replacement storage has been admitted and the tokens have moved.
 A denied append ends tokenization, and a lexical error already observed by the validator keeps precedence.
-The whole source passes lexical validation before Simple Query admits the nonempty statement ranges and executes the first statement.
+The ordinary source passes lexical validation before Simple Query admits the nonempty statement ranges and executes the first statement.
 The token array keeps its charge during range construction and releases it before execution.
 The range buffer keeps its reservation through batch execution and releases it on completion, error, or cancellation.
 The input frame retains the source bytes.

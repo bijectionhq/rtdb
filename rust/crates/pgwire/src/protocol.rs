@@ -264,6 +264,21 @@ impl ProtocolSession {
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
+        if let Some(marker) = simple_query_marker(source) {
+            self.begin_implicit(None)?;
+            let result: Result<()> = async {
+                match marker {
+                    SimpleQueryMarker::Empty => writer.empty(b'I').await,
+                    SimpleQueryMarker::Semicolon => {
+                        writer.empty(b'n').await?;
+                        writer.string(b'C', " 0").await
+                    }
+                }
+            }.await;
+            self.simple_statement_result(result, writer).await?;
+            return self.settle_simple_transaction().await;
+        }
+
         let spans = rtdb_sql::split_statements_in(source, self.node.memory())?;
         if spans.is_empty() { writer.empty(b'I').await?; return Ok(()); }
         for span in spans.as_slice() {
@@ -277,11 +292,81 @@ impl ProtocolSession {
                 if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
                 self.execute(&mut portal, 0, writer).await
             }.await;
-            if let Err(error) = result { if self.implicit { self.rollback()?; } else { self.session.state_mut().fail_transaction(error.clone()); } writer.error(&error, self.environment()?.fallback(), false).await?; }
+            self.simple_statement_result(result, writer).await?;
         }
-        if self.implicit { if self.session.state().status() == TransactionStatus::Failed { self.rollback()?; } else { self.commit().await?; } }
+        self.settle_simple_transaction().await
+    }
+
+    async fn simple_statement_result<W: AsyncWrite + Unpin>(&mut self, result: Result<()>, writer: &mut Writer<W>) -> Result<()> {
+        if let Err(error) = result {
+            if self.implicit {
+                self.rollback()?;
+            } else {
+                self.session.state_mut().fail_transaction(error.clone());
+            }
+            writer.error(&error, self.environment()?.fallback(), false).await?;
+        }
         Ok(())
     }
+
+    async fn settle_simple_transaction(&mut self) -> Result<()> {
+        if self.implicit {
+            if self.session.state().status() == TransactionStatus::Failed {
+                self.rollback()?;
+            } else {
+                self.commit().await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SimpleQueryMarker {
+    Empty,
+    Semicolon,
+}
+
+fn simple_query_marker(source: &str) -> Option<SimpleQueryMarker> {
+    let (body, suffix) = simple_marker_text(source);
+    if body.starts_with(';') {
+        return Some(SimpleQueryMarker::Semicolon);
+    }
+    let mut chars = body.chars().chain(suffix.chars());
+    while let Some(character) = chars.next() {
+        if java_whitespace(character) {
+            continue;
+        }
+        if character != '-' || chars.next() != Some('-') {
+            return None;
+        }
+        let _ = chars.by_ref().find(|&character| matches!(character, '\r' | '\n'));
+    }
+    Some(SimpleQueryMarker::Empty)
+}
+
+fn simple_marker_text(source: &str) -> (&str, &str) {
+    let source = source.trim_start_matches(java_whitespace);
+    if let Some(body) = source.trim_end_matches(java_regex_whitespace).strip_suffix(';') {
+        return (body, "");
+    }
+    if let Some(last @ ('\u{85}' | '\u{2028}' | '\u{2029}')) = source.chars().next_back() {
+        let (head, suffix) = source.split_at(source.len() - last.len_utf8());
+        if let Some(body) = head.trim_end_matches(java_regex_whitespace).strip_suffix(';') {
+            return (body, suffix);
+        }
+    }
+    (source, "")
+}
+
+fn java_whitespace(character: char) -> bool {
+    matches!(character, '\u{9}'..='\u{d}' | '\u{1c}'..=' '
+        | '\u{1680}' | '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200a}'
+        | '\u{2028}' | '\u{2029}' | '\u{205f}' | '\u{3000}')
+}
+
+fn java_regex_whitespace(character: char) -> bool {
+    matches!(character, '\u{9}'..='\u{d}' | ' ')
 }
 
 fn invalid_argument(error: Anomaly, index: usize, format: Format) -> Anomaly {
@@ -297,6 +382,26 @@ fn replace_query(source: &str) -> &str { if source == "SELECT n.oid,n.*,d.descri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_simple_markers_use_java_blankness_comments_and_regex_end_anchors() {
+        for source in [
+            "", ";", ";\r\n", ";\u{b}\u{2028}", ";\u{2029}", "-- end;\u{85}",
+            "\u{2003}-- first\r -- second\r\n\t-- last", "\u{1c}\u{3000}",
+        ] {
+            assert_eq!(simple_query_marker(source), Some(SimpleQueryMarker::Empty), "{source:?}");
+        }
+        for source in [
+            ";;", ";\u{2028}\n", "\u{1c}\t\u{2003};; ", ";\u{a0}", ";-- comment", ";;\u{85}",
+        ] {
+            assert_eq!(simple_query_marker(source), Some(SimpleQueryMarker::Semicolon), "{source:?}");
+        }
+        for source in [
+            ";\u{85}", "\u{85};@", "\u{a0};@", "/* only a block comment */", "-- a\n/* block */", "SELECT 1;",
+        ] {
+            assert_eq!(simple_query_marker(source), None, "{source:?}");
+        }
+    }
 
     #[test]
     fn argument_reclassification_preserves_nullable_messages_and_parameter_location() {

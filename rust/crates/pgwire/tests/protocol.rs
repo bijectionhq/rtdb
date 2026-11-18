@@ -497,10 +497,42 @@ async fn simple_empty_groups_and_canned_keyword_result_keep_protocol_shapes() {
     assert_eq!(tags(&empty), b"IZ");
     assert!(empty[0].1.is_empty());
     assert_eq!(empty[1].1, b"I");
-    let canned = client.query("; SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords(); ;").await;
+    let semicolon = client.query("; SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords(); ;").await;
+    assert_eq!(semicolon, vec![(b'n', vec![]), (b'C', b" 0\0".to_vec()), (b'Z', b"I".to_vec())]);
+    let canned = client.query("SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()").await;
     assert_eq!(tags(&canned), b"TDCZ");
     assert_eq!(rows(&canned), vec![vec![Some(b"xtdb".to_vec())]]);
     assert_eq!(canned[2].1, b"SELECT 1\0");
     assert_eq!(canned[3].1, b"I");
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn whole_simple_markers_bypass_tokenization_and_preserve_transaction_status() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("SET application_name = 'before'").await), b"SCZ");
+
+    let empty = client.query("\u{1c}\u{2003}-- idle\r -- end").await;
+    assert_eq!(empty, vec![(b'I', vec![]), (b'Z', b"I".to_vec())]);
+    let semicolon = client.query("\u{1c} ; SET application_name = 'changed'; SELECT @").await;
+    assert_eq!(semicolon, vec![(b'n', vec![]), (b'C', b" 0\0".to_vec()), (b'Z', b"I".to_vec())]);
+    assert_eq!(rows(&client.query("SHOW application_name").await), vec![vec![Some(b"before".to_vec())]]);
+
+    let begun = client.query("BEGIN").await;
+    assert_eq!(tags(&begun), b"CZ");
+    assert_eq!(begun[1].1, b"T");
+    let semicolon = client.query(";;").await;
+    assert_eq!(semicolon, vec![(b'n', vec![]), (b'C', b" 0\0".to_vec()), (b'Z', b"T".to_vec())]);
+    let failed = client.query("BEGIN").await;
+    assert_eq!(tags(&failed), b"EZ");
+    assert_eq!(failed[1].1, b"E");
+    let semicolon = client.query("; SELECT @").await;
+    assert_eq!(semicolon, vec![(b'n', vec![]), (b'C', b" 0\0".to_vec()), (b'Z', b"E".to_vec())]);
+    let empty = client.query(";\u{b}\u{2028}").await;
+    assert_eq!(empty, vec![(b'I', vec![]), (b'Z', b"E".to_vec())]);
+    let rolled_back = client.query("ROLLBACK").await;
+    assert_eq!(tags(&rolled_back), b"CZ");
+    assert_eq!(rolled_back[1].1, b"I");
     drop(client); running.stop().await;
 }
