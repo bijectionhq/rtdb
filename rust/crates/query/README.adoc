@@ -208,6 +208,7 @@ A single large output row, aggregate array, or set of overlapping active pages c
 The scan accepts uncompressed, LZ4 and Zstandard Arrow trie data and metadata.
 The scan reserves query memory for the persisted candidate list before allocating space for references to trie catalog entries in the `Live` state.
 It releases the reservation before planning scan tasks.
+The scan reserves the candidate summary vector before allocation and retains its charge through file selection.
 It reserves inspected dictionary, row-descriptor and decoded-buffer bounds before opening the corresponding data.
 Persisted metadata traversal reserves stack capacity before growth and stores each IID path inline.
 The stack reservation is released after traversing each metadata file.

@@ -94,6 +94,11 @@ impl MetadataStack {
     }
 }
 
+fn summary_bytes(count: usize) -> Result<usize> {
+    count.checked_mul(std::mem::size_of::<PageSummary>()).and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| invalid("scan-summary-size", "Scan summary capacity exceeds addressable memory"))
+}
+
 enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File(Arc<IndexBatch>) }
 struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation> }
 impl ActiveRows {
@@ -210,14 +215,18 @@ impl PartitionScan {
         tries.try_reserve_exact(trie_count).map_err(|error| invalid("scan-candidate-size", error))?;
         tries.extend(current_tries());
         tries.sort_unstable_by(|left, right| right.key.block_index().cmp(&left.key.block_index()).then_with(|| left.key.cmp(&right.key)));
-        let summaries: Vec<_> = tries.iter().enumerate().map(|(index, trie)| {
+        let memory = &self.execution.context.memory;
+        let mut summary_reservation = if tries.is_empty() { None } else { Some(memory.reserve(summary_bytes(tries.len())?)?) };
+        let mut combined = Vec::new();
+        combined.try_reserve_exact(tries.len()).map_err(|error| invalid("scan-summary-size", error))?;
+        for (index, trie) in tries.iter().enumerate() {
             let temporal = trie.metadata.as_ref().and_then(|metadata| metadata.temporal_metadata.as_ref()).map(|metadata| TemporalSummary {
                 min_valid_from: Timestamp(metadata.min_valid_from.unwrap_or(i64::MIN)), max_valid_to: Timestamp(metadata.max_valid_to.unwrap_or(i64::MAX)),
                 min_system_from: Timestamp(metadata.min_system_from.unwrap_or(i64::MIN)), max_system_from: Timestamp(metadata.max_system_from.unwrap_or(i64::MAX)),
             });
-            Ok(PageSummary { page_index: u32::try_from(index).map_err(|error| invalid("file-count", error))?, temporal,
-                recency: Some(recency(trie.key.recency())?), iid_range: Some(path_range(trie.key.part())?) })
-        }).collect::<Result<_>>()?;
+            combined.push(PageSummary { page_index: u32::try_from(index).map_err(|error| invalid("file-count", error))?, temporal,
+                recency: Some(recency(trie.key.recency())?), iid_range: Some(path_range(trie.key.part())?) });
+        }
         let slug = self.snapshot.table_entry(table).map(|entry| entry.slug.clone());
         let mut pages = PageDescriptors::default();
         let live = self.snapshot.segments(table);
@@ -231,13 +240,21 @@ impl PartitionScan {
                     summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?;
             }
         }
-        let mut combined = summaries;
+        let live_count = pages.entries.len();
+        if live_count != 0 {
+            let count = tries.len().checked_add(live_count).ok_or_else(|| invalid("page-count", "Candidate count overflow"))?;
+            let reservation = memory.reserve(summary_bytes(count)?)?;
+            combined.try_reserve_exact(live_count).map_err(|error| invalid("scan-summary-size", error))?;
+            summary_reservation = Some(reservation);
+        }
         for (index, page) in pages.entries.iter().enumerate() {
             let mut summary = page.summary.clone();
             summary.page_index = u32::try_from(tries.len().checked_add(index).ok_or_else(|| invalid("page-count", "Candidate count overflow"))?).map_err(|error| invalid("page-count", error))?;
             combined.push(summary);
         }
         let selected: Vec<_> = select_pages(&combined, self.pruning(), |_| true).iter().filter(|summary| summary.iid_range.is_none_or(|(lower, upper)| self.path_matches(lower, upper))).map(|summary| summary.page_index as usize).filter(|index| *index < tries.len()).collect();
+        drop(combined);
+        drop(summary_reservation);
         let file_count = selected.len();
         self.counts.files_pruned = (tries.len() - file_count) as u64;
         self.counts.files_used = file_count as u64;
@@ -550,11 +567,8 @@ mod tests {
         (state, table, events)
     }
 
-    async fn assert_descriptor_lifetime(snapshot: Snapshot, table: TableRef, store: MemoryStore, persisted: Option<(usize, usize)>) {
-        let (metadata_size, metadata_charge) = persisted.unwrap_or_default();
-        let files_used = usize::from(persisted.is_some());
-        let storage = Arc::new(BufferPool::new(Arc::new(store), 1 << 20));
-        let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&storage) };
+    fn descriptor_scan(snapshot: Snapshot, table: TableRef, storage: Arc<BufferPool>) -> (Scan, Execution, Arc<MemoryBudget>) {
+        let database = DatabaseSnapshot { partitions: vec![snapshot], storage };
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
         let binding = catalog.table(&QualifiedTable { database: "xtdb".into(), table }).unwrap().unwrap();
         let field = Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: binding.columns["v"].clone() };
@@ -568,6 +582,14 @@ mod tests {
             parameters: Arc::new(BoundParameters::infer(Vec::new(), &memory).unwrap()),
             outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
         };
+        (scan, execution, memory)
+    }
+
+    async fn assert_descriptor_lifetime(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>, persisted: Option<(usize, usize)>) {
+        let (metadata_size, metadata_charge) = persisted.unwrap_or_default();
+        let files_used = usize::from(persisted.is_some());
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(snapshot, table, Arc::clone(&storage));
         let before_cursor = memory.used_bytes();
         let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
         let cursor_open = memory.used_bytes();
@@ -592,6 +614,22 @@ mod tests {
             assert_eq!(memory.used_bytes(), retained);
             drop(pressure);
             assert_eq!(memory.used_bytes(), cursor_open);
+
+            let summary_extent = std::mem::size_of::<PageSummary>() + 256;
+            let pressure = memory.reserve(memory.limit_bytes() - cursor_open - candidate_extent - summary_extent + 1).unwrap();
+            let retained = cursor_open + pressure.bytes() + candidate_extent;
+            let error = cursor.next_page().await.err().unwrap();
+            let expected = format!("Cannot reserve {summary_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+            let partition = cursor.partitions.front().unwrap();
+            assert!(!partition.initialized);
+            assert!(partition.files.entries.is_empty());
+            assert!(partition.pages.entries.is_empty());
+            assert!(partition.tasks.is_none());
+            assert_eq!(storage.retained_bytes(), 0);
+            assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
+            drop(pressure);
 
             let headroom = candidate_extent + metadata_charge + file_extent - 1;
             let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
@@ -699,7 +737,7 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].trie().leaves().len(), 3);
         assert!(snapshot.trie_entries(&table).is_empty());
-        assert_descriptor_lifetime(snapshot, table, MemoryStore::default(), None).await;
+        assert_descriptor_lifetime(snapshot, table, Arc::new(MemoryStore::default()), None).await;
     }
 
     #[tokio::test]
@@ -728,7 +766,7 @@ mod tests {
         assert!(probe.peak_bytes() <= metadata_charge);
         assert_eq!(probe.used_bytes(), 0);
 
-        let store = MemoryStore::default();
+        let store = Arc::new(MemoryStore::default());
         let addition = CatalogTrie::notification(trie.clone(), data.len() as i64, Some(statistics)).unwrap();
         let nascent = CatalogTrie::notification("l01-r20200101-b00".parse().unwrap(), 0, None).unwrap();
         store.put(&ObjectKey::new(table_entry.slug.metadata_key(&trie)).unwrap(), meta.into()).await.unwrap();
@@ -738,7 +776,56 @@ mod tests {
         assert_eq!(snapshot.trie_catalog().iter_tries(&table).count(), 2);
         assert_eq!(snapshot.trie_entries(&table).len(), 1);
         assert!(snapshot.segments(&table).is_empty());
-        assert_descriptor_lifetime(snapshot, table, store, Some((metadata_size, metadata_charge))).await;
+        assert_descriptor_lifetime(snapshot.clone(), table.clone(), Arc::clone(&store), Some((metadata_size, metadata_charge))).await;
+        assert_combined_summary_replacement(snapshot, table, store).await;
+    }
+
+    async fn assert_combined_summary_replacement(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>) {
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(110) };
+        let mut write = TransactionBuffer::new(snapshot, key, MemoryBudget::new(1 << 20)).unwrap();
+        write.append(table.clone(), StoredEvent {
+            iid: Iid([0xc0; 16]),
+            system_from: key.system_time,
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(4)), ("v".into(), Value::I64(4))])),
+            recency: None,
+        }).unwrap();
+        let mixed = write.snapshot().unwrap();
+        assert_eq!(mixed.trie_entries(&table).len(), 1);
+        assert_eq!(mixed.segments(&table).len(), 1);
+        assert_eq!(mixed.segments(&table)[0].trie().leaves().len(), 1);
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(mixed, table, Arc::clone(&storage));
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let baseline = memory.used_bytes();
+        let candidate = std::mem::size_of::<&CatalogTrie>() + 256;
+        let old_summary = std::mem::size_of::<PageSummary>() + 256;
+        let new_summary = 2 * std::mem::size_of::<PageSummary>() + 256;
+        let live_page = std::mem::size_of::<Page>() + 256;
+        let headroom = candidate + old_summary + live_page + new_summary - 1;
+        let pressure = memory.reserve(memory.limit_bytes() - baseline - headroom).unwrap();
+        let retained = baseline + pressure.bytes() + candidate + old_summary + live_page;
+        let error = cursor.next_page().await.err().unwrap();
+        let expected = format!("Cannot reserve {new_summary} bytes from budget {} with {retained} retained", memory.limit_bytes());
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+        let partition = cursor.partitions.front().unwrap();
+        assert!(!partition.initialized);
+        assert!(partition.pages.entries.is_empty());
+        assert!(partition.tasks.is_none());
+        assert_eq!(storage.retained_bytes(), 0);
+        assert_eq!(memory.used_bytes(), baseline + pressure.bytes());
+        drop(pressure);
+        assert_eq!(memory.used_bytes(), baseline);
+
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_page().await.unwrap() {
+            rows.extend(page.rows().iter().map(|row| row.values[0].clone()));
+        }
+        assert_eq!(rows, [Value::I64(1), Value::I64(2), Value::I64(3), Value::I64(4)]);
+        assert_eq!(cursor.scan_counts().unwrap().files_used, 1);
+        drop(cursor);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[tokio::test]
