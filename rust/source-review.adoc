@@ -1184,3 +1184,23 @@ The paired embedded observation adapters and exact source-to-native diagnostic c
 
 The implementation revision remains unset and the source-completeness gate remains false.
 Compilation, runtime discovery and regression execution remain pending.
+
+== Direct statement and embedded observation checkpoint
+
+The private generated statement action drives both parser profiles through the ROLLBACK branch, optional semicolon and final EOF.
+For the malformed statement fixtures, the first pass shares the original decision failure across the child and root catches.
+On retry, the child catch owns the `SELEC 1` mismatch and the required block reports `extra SELECT 1` with a null cause.
+The suffix fixtures exercise the root's required sync and EOF match with their own expected sets.
+The root's stop uses the matched EOF even when terminal allocation fails.
+The private DATE path declines a current ARRAY keyword at the recursive loop entry before its next prediction.
+
+The embedded runner pairs the live JVM statement mismatch and the packaged Java FFI prepare diagnostic using the selected declaration.
+It records the native Clojure diagnostic and subsequent successful-query observation separately.
+Each receipt binds the selected input bytes, JVM classpath, JDK and native library where applicable.
+The scoped ledger keeps both inventory flags false.
+
+The intervening result-schema change affects the query branch of the prepared statement.
+The reviewed write trace still constructs the same `TxOp::Sql` and resolves it against the same transaction-local state.
+
+The implementation revision remains unset and the source-completeness gate remains false.
+Compilation, runtime discovery and regression execution remain pending.

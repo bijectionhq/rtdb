@@ -118,7 +118,7 @@
       ],
       "evidence": {
         "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
-        "rust/crates/node/src/statement.rs": "56deebeaaa4e91d9e956e0c6b0dce306dac62d8d2512cfc64e5440317c1f4fd8",
+        "rust/crates/node/src/statement.rs": "46a5c03ddea225d0c10843a9b805f03ef912ac2d6b1e9730e8424e4c7862e2e0",
         "rust/crates/tx/src/submission.rs": "cb379ba6639fad3683854be5e5e92c59facd4fc702e5e657dea59ba7f18ba20f",
         "rust/crates/tx/src/resolver.rs": "557628bb3e04dffba304b004cf41e86e210ba24e6fc8d131cc0937c0e508e7e0",
         "rust/crates/replication/src/appender.rs": "fdaaf5ed638cb76098397c0329762b82b7df5814c362c3d24940d5035514a8ef",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete generated rule and tree schedules beyond the two-profile isolation and empty-details window paths and the SLL DATE array and field paths. Extend native sync, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, whole-batch syntax validation before simple-query effects, actual host policy capture and production cache ownership, and admitted parsed ownership across every frontend."
+      "requirement": "Complete generated rule and tree schedules beyond the two-profile direct ROLLBACK, isolation and empty-details window paths and the SLL DATE array and field paths. Extend native sync, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, whole-batch syntax validation before simple-query effects, actual host policy capture and production cache ownership, and admitted parsed ownership across every frontend."
     },
     {
       "id": "source-signed-binary-width",
@@ -277,7 +277,7 @@
         "client_operational_surfaces",
         "client_read"
       ],
-      "requirement": "Complete paired reference and native embedded observation adapters for the documented live-recognizer migration, and qualify their actual receipts through the declared-migration comparator. Enforce private native-cache nonescape separately before production parsing, and qualify diagnostic parity and serialized pgwire and Flight results separately from the embedded migration."
+      "requirement": "Qualify actual receipts from the paired reference and native embedded observers through the declared-migration comparator. Enforce private native-cache nonescape before production parsing. Qualify exact diagnostic parity and serialized pgwire and Flight results independently of the embedded migration."
     },
     {
       "id": "planning-allocation",
