@@ -38,7 +38,9 @@ The restarted writer resumes ordinary source processing after completing the con
 The restored partition generation and applied progress are already in place on the restarted node.
 A replica that already installed the block skips its current-storage upload before buffering for a later pending block.
 A failure starting that later block during promotion preserves the recovered confirmation and returns the later block to the follower.
-The historical replay starts at the oldest eligible catalog and must reach the selected boundary with a matching fence.
+Historical replay first tries to open a tail from the oldest retained historical catalog.
+If opening the tail reports that its first requested position precedes the retained log, the writer tries the next newer catalog when one exists.
+Historical replay must reach the selected boundary with a matching fence.
 A positive-term legacy selected boundary without a sequence cannot establish that fence match.
 Before appending an older confirmation, the writer verifies that its catalog, table blocks and required L0 files are still present in shared storage.
 A failed historical replay discards the older repair candidates.

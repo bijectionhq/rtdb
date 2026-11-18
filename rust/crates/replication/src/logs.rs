@@ -63,7 +63,10 @@ impl PartitionLogs {
         if offset < 0 { Ok(None) } else { Ok(Some(ReplicaPosition::from_epoch_offset(self.replica_epoch, offset)?)) }
     }
     pub async fn source_tail(&self, after: SourcePosition) -> Result<Box<dyn LogTail>> { self.source.tail(LogOffset(after.after_offset(self.source_epoch))).await.map_err(Into::into) }
-    pub async fn replica_tail(&self, after: ReplicaPosition) -> Result<Box<dyn LogTail>> { self.replica.tail(LogOffset(after.after_offset(self.replica_epoch))).await.map_err(Into::into) }
+    pub async fn replica_tail(&self, after: ReplicaPosition) -> Result<Box<dyn LogTail>> { self.open_replica_tail(after).await.map_err(Into::into) }
+    pub(crate) async fn open_replica_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Box<dyn LogTail>> {
+        self.replica.tail(LogOffset(after.after_offset(self.replica_epoch))).await
+    }
     pub async fn source_range(&self, from: SourcePosition, to: SourcePosition) -> Result<Box<dyn rtdb_storage::log::LogRange>> {
         let (from, to) = inspection_offsets(from.0, to.0, self.source_epoch)?;
         self.source.range(from, to).await.map_err(Into::into)

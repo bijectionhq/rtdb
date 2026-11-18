@@ -560,7 +560,8 @@ config {
 -- An admitted upload after a recovered boundary in the configured replica epoch confirms its checkpoint when the block index, storage version and epoch, source watermark, and external token match its recorded identity.
 -- An omitted upload storage epoch means zero.
 -- A writable restart also checks contiguous retained older catalogs whose admitted replica history reaches the selected boundary and agrees with its startup fence.
--- That check observes confirmations while keeping the restored partition and applied progress in place.
+-- If opening the historical tail reports that its first requested position precedes the retained log, the writer tries the next newer retained catalog when one exists.
+-- The check observes confirmations while keeping the restored partition and applied progress in place.
 -- After an elected term observes the retained prefix through its claim, it announces each still-missing confirmation in block order.
 -- Each announcement describes the L0 tries recorded for that block in its table blocks.
 -- The node waits for each admitted read-back before appending the next announcement.

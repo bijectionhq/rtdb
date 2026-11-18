@@ -406,11 +406,20 @@ impl ReplicationDriver {
         let Some(selected) = &self.recovered_confirmation else { return Ok(VecDeque::new()); };
         let selected = &selected.catalog;
         let mut retained = self.blocks.retained_catalogs(selected, self.logs.replica_epoch, &self.cancellation).await?;
-        let Some(oldest) = retained.first() else { return Ok(VecDeque::new()); };
-        let mut tail = self.logs.replica_tail(oldest.boundary).await?;
-        let mut witness = TermFence::from_catalog(&oldest.catalog)?;
-        let mut position = oldest.boundary;
-        let mut next_boundary = 1;
+        if retained.is_empty() { return Ok(VecDeque::new()); }
+        let mut first = 0;
+        let mut tail = loop {
+            match self.logs.open_replica_tail(retained[first].boundary).await {
+                Ok(tail) => break tail,
+                Err(rtdb_storage::Error::UnavailableLogRange { requested, first_retained })
+                    if requested < first_retained && first + 1 < retained.len() => first += 1,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let anchor = &retained[first];
+        let mut witness = TermFence::from_catalog(&anchor.catalog)?;
+        let mut position = anchor.boundary;
+        let mut next_boundary = first + 1;
         let end = selected.boundary_replica_position().ok_or_else(|| invalid("Selected checkpoint has no replica boundary"))?;
         loop {
             let head = tail.replay().ok_or_else(|| invalid("Historical replay requires an admitted replica tail"))?
@@ -444,7 +453,7 @@ impl ReplicationDriver {
             }
             if let Some(record) = record {
                 if let ReplicaBody::BlockUploaded(upload) = &record.envelope.message {
-                    if let Some(candidate) = retained.iter_mut().find(|candidate| {
+                    if let Some(candidate) = retained[first..].iter_mut().find(|candidate| {
                         candidate.boundary < position
                             && matches_confirmation(&candidate.catalog, upload, self.logs.storage_version, self.logs.storage_epoch)
                     }) {
@@ -454,7 +463,7 @@ impl ReplicationDriver {
             }
         }
         let mut confirmations = VecDeque::new();
-        for candidate in retained.into_iter().filter(|candidate| !candidate.confirmed) {
+        for candidate in retained.into_iter().skip(first).filter(|candidate| !candidate.confirmed) {
             let confirmation = self.blocks.historical_confirmation(&candidate.catalog, self.logs.storage_version, self.logs.storage_epoch, &self.cancellation).await?;
             confirmations.push_back(confirmation);
         }

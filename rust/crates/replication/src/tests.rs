@@ -806,6 +806,50 @@ async fn promotion_ignores_a_deleted_historical_catalog_still_present_in_the_dis
 }
 
 #[tokio::test]
+async fn recovery_confirms_a_later_anchor_when_the_oldest_catalog_precedes_the_log_floor() {
+    let fixture = produced_memory_checkpoint(true).await;
+    produce_newer_memory_checkpoint(&fixture).await;
+    let (_, mut last) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+        may_lead: false, ..Default::default()
+    }).await;
+    deliver_checkpoint_record(&fixture, &mut last, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut last, 3, 1, boundary(2, -1)).await.unwrap();
+    let pending = last.pending_block.as_ref().unwrap();
+    let latest = last.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    assert_eq!(latest.catalog.boundary_replica_position(), Some(rtdb_types::ReplicaPosition(5)));
+    fixture.replica.truncate_before(LogOffset(4)).unwrap();
+
+    let (handle, mut writer) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+        assertion_interval: Duration::from_secs(3600), ..Default::default()
+    }).await;
+    let restored = writer.partition.value();
+    let progress = handle.progress().current();
+    writer.historical_confirmations = writer.prove_historical_confirmations().await.unwrap();
+    assert_eq!(writer.historical_confirmations.len(), 1);
+    assert_eq!(writer.historical_confirmations[0].catalog.block_index(), BlockIndex(1));
+    assert!(Arc::ptr_eq(&writer.partition.value(), &restored));
+    assert_eq!(handle.progress().current().source_position, progress.source_position);
+    assert_eq!(handle.progress().current().tx_key, progress.tx_key);
+
+    writer.claim = Some(rtdb_types::ReplicaPosition(6));
+    deliver_checkpoint_record(&fixture, &mut writer, 4, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    let mut tail = fixture.replica.tail(LogOffset(6)).await.unwrap();
+    for (index, sequence) in [(1, 1), (2, 2)] {
+        assert_eq!(writer.role(), Role::Following);
+        let raw = next_local_record(tail.as_mut()).await;
+        let envelope = ReplicaEnvelope::decode(&raw.payload).unwrap().unwrap();
+        assert_eq!(envelope.term, Term(4));
+        assert_eq!(envelope.term_sequence, Some(TermSequence(sequence)));
+        let ReplicaBody::BlockUploaded(upload) = envelope.message else { panic!("expected a recovered block upload"); };
+        assert_eq!(upload.block_index, Some(index));
+        writer.consume(raw).await.unwrap();
+    }
+    assert_eq!(handle.status().role, Role::Leading(Term(4)));
+    assert_eq!(handle.status().adopted_block.unwrap().block_index(), BlockIndex(2));
+    writer.demote().await.unwrap();
+}
+
+#[tokio::test]
 async fn unavailable_older_confirmation_evidence_keeps_latest_checkpoint_reopen_and_writes_live() {
     for missing_catalog in [false, true] {
         let fixture = produced_memory_checkpoint(true).await;
