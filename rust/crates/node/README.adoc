@@ -102,6 +102,9 @@ Frontends revalidate before their protocol commands.
 Its current observations distinguish critical from noncritical database failures, check a five-block lag threshold, and submit explicit block-flush requests.
 HTTP serving and metrics export are separate operational adapters still requiring composition.
 `PreparedSql` retains charged source and prepared metadata, rebinds at execution, and exposes separate PostgreSQL signature checks and dynamic Arrow schemas.
+`PreparedSql::prepare` and query rebinding reserve an estimate for temporary lexer, grammar and binding work before parsing.
+The temporary reservation stays live while the prepared source and metadata or the rebound query plan are admitted.
+It releases when preparation or rebinding returns.
 
 The session tests preserve state observations from `InProcessAdbcTest`, `ConnectionTest`, and `tx.allium`.
 Native node tests cover data-dependent SQL writes, historical reads, asynchronous await tokens, local recovery, retained batches, skipped membership, and detach ordering around running or failed drivers.

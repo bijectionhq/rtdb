@@ -29,6 +29,7 @@ pub struct PreparedSql(Arc<PreparedData>);
 impl PreparedSql {
     pub fn prepare(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
         let source_reservation = admit_source(source, context, &mut options)?;
+        let _syntax = admit_sql_syntax(source, &context.memory)?;
         let parsed = one_statement(source, &context.memory)?;
         Self::prepare_parsed(parsed, context, options, policy, false, false, source_reservation)
     }
@@ -171,6 +172,7 @@ impl PreparedSql {
         options.default_timezone = context.timezone.clone();
         if execution { for ty in options.parameter_types.values_mut() { *ty = rtdb_columnar::execution_type(ty); } }
         for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
+        let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
         let prepared = rtdb_sql::prepare_in(&self.0.source, &context.catalog, &options, &context.memory)?;
         PreparedQuery::from_prepared(prepared, &context.memory)
     }
@@ -193,6 +195,10 @@ fn admit_source(source: &str, context: &QueryContext, options: &mut PrepareOptio
     options.default_timezone = context.timezone.clone();
     options.generate_series_end_exclusive = context.options.generate_series_end_exclusive;
     context.memory.reserve(source.len().checked_add(256).ok_or_else(size_error)?)
+}
+
+fn admit_sql_syntax(source: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {
+    memory.reserve(rtdb_sql::statement_syntax_estimate(source.len()).ok_or_else(size_error)?)
 }
 
 fn one_statement<'input>(source: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<ParsedStatement<'input>> {

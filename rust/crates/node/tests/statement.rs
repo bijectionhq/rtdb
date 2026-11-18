@@ -436,6 +436,98 @@ async fn prepared_series_uses_the_nodes_captured_endpoint_policy() {
 }
 
 #[test]
+fn programmatic_preparation_admits_syntax_after_source_and_cancellation() {
+    let source = format!("SELECT '{}'; SELECT @", "é".repeat(64));
+    let source_bytes = source.len() + 256;
+    let syntax_bytes = rtdb_sql::statement_syntax_estimate(source.len()).unwrap();
+    let prepare = |context: &Arc<QueryContext>| PreparedSql::prepare(&source, context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic);
+    let short = MemoryBudget::new(source_bytes + syntax_bytes - 1);
+    let short_context = context(None, &short);
+    assert_eq!(prepare(&short_context).err().unwrap().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(short.peak_bytes(), source_bytes);
+    assert_eq!(short.used_bytes(), 0);
+
+    short_context.cancellation.cancel();
+    assert_eq!(prepare(&short_context).err().unwrap().code, "xtdb/query-cancelled");
+    assert_eq!(short.used_bytes(), 0);
+
+    let exact = MemoryBudget::new(source_bytes + syntax_bytes);
+    let expected = rtdb_sql::parse_in(&source, &exact).unwrap_err();
+    assert_eq!(expected.code, "xtdb/sql-error");
+    assert_eq!(prepare(&context(None, &exact)).err().unwrap(), expected);
+    assert_eq!(exact.peak_bytes(), source_bytes + syntax_bytes);
+    assert_eq!(exact.used_bytes(), 0);
+}
+
+#[test]
+fn programmatic_preparation_keeps_the_syntax_charge_through_owner_admission() {
+    let source = "DELETE FROM docs";
+    let syntax_bytes = rtdb_sql::statement_syntax_estimate(source.len()).unwrap();
+    let prepare = |memory: &Arc<MemoryBudget>| PreparedSql::prepare(source, &context(None, memory), PrepareOptions::default(), ResultSignaturePolicy::Dynamic);
+    let probe = MemoryBudget::new(1 << 20);
+    let prepared = prepare(&probe).unwrap();
+    assert_eq!(prepared.source(), source);
+    let retained = probe.used_bytes();
+    let temporary = syntax_bytes + source.len() + 256 + 1024;
+    assert_eq!(probe.peak_bytes(), temporary + retained);
+    drop(prepared);
+    assert_eq!(probe.used_bytes(), 0);
+
+    let short = MemoryBudget::new(temporary + retained - 1);
+    let error = prepare(&short).err().unwrap();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(short.peak_bytes(), temporary);
+    assert_eq!(short.used_bytes(), 0);
+}
+
+#[test]
+fn query_rebinding_admits_syntax_in_the_reached_budget_through_plan_admission() {
+    let source = "SELECT 1 AS value";
+    let syntax_bytes = rtdb_sql::statement_syntax_estimate(source.len()).unwrap();
+    let origin = MemoryBudget::new(1 << 20);
+    let initial = context(None, &origin);
+    let options = PrepareOptions::default();
+    let statement = PreparedSql::prepare(source, &initial, options.clone(), ResultSignaturePolicy::Dynamic).unwrap();
+    let dml = PreparedSql::prepare("DELETE FROM docs", &initial, options.clone(), ResultSignaturePolicy::Dynamic).unwrap();
+    let origin_retained = origin.used_bytes();
+
+    let short = MemoryBudget::new(syntax_bytes - 1);
+    let reached = context(None, &short);
+    assert_eq!(dml.result_schema(&reached, &[]).err().unwrap().code, "rtdb.node/statement-kind");
+    assert_eq!(statement.result_schema(&reached, &[LogicalType::Null]).err().unwrap().code, "xtdb/parameter-count-mismatch");
+    assert_eq!(statement.result_schema(&reached, &[]).err().unwrap().code, "rtdb/memory-budget-exceeded");
+    reached.cancellation.cancel();
+    assert_eq!(statement.result_schema(&reached, &[]).err().unwrap().code, "xtdb/query-cancelled");
+    assert_eq!(short.peak_bytes(), 0);
+    assert_eq!(short.used_bytes(), 0);
+
+    let probe = MemoryBudget::new(1 << 20);
+    let reached = context(None, &probe);
+    let raw = rtdb_sql::prepare_in(source, &reached.catalog, &options, &probe).unwrap();
+    let plan = rtdb_query::PreparedQuery::from_prepared(raw, &probe).unwrap();
+    let plan_bytes = probe.used_bytes();
+    let schema = plan.result_schema(&reached).unwrap();
+    let schema_bytes = probe.used_bytes() - plan_bytes;
+    drop((schema, plan));
+    assert_eq!(probe.used_bytes(), 0);
+
+    let plan_short = MemoryBudget::new(syntax_bytes + plan_bytes - 1);
+    let error = statement.result_schema(&context(None, &plan_short), &[]).err().unwrap();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(plan_short.peak_bytes(), syntax_bytes);
+    assert_eq!(plan_short.used_bytes(), 0);
+
+    let schema = statement.result_schema(&reached, &[]).unwrap();
+    assert_eq!(schema.schema().fields()[0].name, "value");
+    assert_eq!(probe.used_bytes(), schema_bytes);
+    assert_eq!(origin.used_bytes(), origin_retained);
+    drop(schema);
+    drop((statement, dml));
+    assert_eq!(probe.used_bytes(), 0);
+    assert_eq!(origin.used_bytes(), 0);
+}
+
+#[test]
 fn programmatic_and_postgres_preparation_keep_their_syntax_and_cancellation_order() {
     let malformed = "SELECT @";
     let memory = MemoryBudget::new(malformed.len() + 255);

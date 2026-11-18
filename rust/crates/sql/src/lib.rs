@@ -51,6 +51,12 @@ impl Default for PrepareOptions {
     fn default() -> Self { Self { search_path: vec!["public".into()], parameter_types: BTreeMap::new(), default_timezone: "UTC".into(), generate_series_end_exclusive: false } }
 }
 
+/// Estimates temporary SQL lexer, grammar and binding storage in bytes.
+/// Returns `None` if the estimate exceeds `usize`.
+pub fn statement_syntax_estimate(source_bytes: usize) -> Option<usize> {
+    source_bytes.checked_mul(128).and_then(|bytes| bytes.checked_add(8192))
+}
+
 /// Prepares programmatic source with explicitly untracked raw metadata compatibility storage.
 pub fn prepare(sql: &str, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
     prepare_with(sql, catalog, options, bind::FormAllocation::Untracked)
