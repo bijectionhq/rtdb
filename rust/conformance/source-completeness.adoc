@@ -28,7 +28,8 @@ python3 rust/conformance/source_gate.py --repository .
 
 `--output` writes the report to a new file and refuses to replace an existing artifact.
 The report preserves `compatibility_claim: none` even after source completion.
-The source inventory and two control ledger mappings remain separate: source candidates are not an executed assertion denominator, and the full ledger remains runtime-reconciled in Phase 2.
+The source inventory records candidate tests and the ledger maps individual assertions.
+Phase 2 links runtime invocations to ledger identities and compares their observations.
 
 To record the phase transition:
 
