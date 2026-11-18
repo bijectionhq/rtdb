@@ -189,8 +189,13 @@ Independent source review covers the null-basis repair and direct, SQL and publi
 Embedded ADBC admits nullable C parameter fields and temporary typed result inputs before metadata construction.
 Pgwire Extended Parse separately admits its initial located token array before scanning.
 Marking a transaction failed carries no diagnostic payload, so pgwire borrows the original diagnostic for serialization.
-Character length binds the original unit spelling after its operand and selects code-point or byte length.
-Standard substring and overlay consume their optional unit keywords while keeping the operator positions and lengths.
+Character length validates the original unit spelling after binding its operand, then selects code-point or byte length.
+Standard substring and overlay consume their optional unit keywords and retain their position and length semantics.
+The non-comma substring form admits a separated start or length beginning with an unsigned decimal integer, placeholder or opening parenthesis.
+Regex host conditional bindings cover one simple symbol, select the body by truthiness and compile the optional else in the outer scope.
+Flight SQL projects selected Direct first-token reports in GetFlightInfo, GetSchema, CreatePreparedStatement and DoPut statement updates.
+Pgwire Simple Query projects selected Multi first-token reports before execution and retains the raw query through one ErrorResponse.
+Exact paired runtime diagnostic observations remain pending.
 Language-catalogue completion, parser/IR allocation and transport peak accounting remain separate implementation work.
 Protocol bytes, schemas, ordering, SQLSTATEs, resource limits and all regression observations remain unexecuted.
 
@@ -906,7 +911,8 @@ Byte and pointer getters forward the stored signed index after the selector look
 LongLong checks the inner receiver class before lookup and reads its eight-byte backing span immediately.
 A UUID reader can adopt the immutable buffers and original append cursors of a direct source FixedBinary capture after admitting its own metadata.
 The retained owners share their buffer leases, and the original remains usable after an admission error.
-Mutable existing-inner aliases, cross-allocator ownership, complete raw object and ByteBuffer behavior, remaining indirect-reader operations and production transport remain required.
+An exclusive mutable UUID view borrows the source FixedBinary writer and forwards writes through the same publication state.
+Independent mutable handles, cross-allocator ownership, complete raw object and ByteBuffer behavior, remaining indirect-reader operations and production transport remain required.
 
 Supported embedded SQL preparation can expose a parser through an Incorrect exception's RecognitionException cause.
 That recognizer reaches shared mutable DFA configurations, so listener restrictions alone do not establish that cached keys never change after publication.
@@ -1544,8 +1550,11 @@ A native allocation refusal from the typed decoder ends the request.
 The demand-driven body reader is available in test builds before live parser adoption.
 Wider typed Registry parsing still requires source read and symbol observations, nullable UTF16 consumers and format-specific lookup timing.
 The admitted Avro datum API retains the validated canonical/native pair through Connect planning, resolution, decoding and migration.
-The Registry Avro entry still uses legacy parsing.
-Canonical graph, default, logical type and exact string integration remain source commitments.
+Stock Registry Avro conversion passes the accepted UTF8 schema and ordered references to the native String Reader before constructing a datum plan.
+The converter retains its parser environment and shares admitted intern and token recycler owners with other converters from its plugin registry.
+Direct nullable UTF16 transport and remaining canonical graph, default and logical type consumers remain source commitments.
+Accounted Snappy and gzip Fetch output and shadow metadata are retained by events, and gzip also charges the inflater allocator.
+Other codec and consumer allocations need separate admission.
 
 The implementation revision remains unset.
 The new regression sources and the Phase 2 release matrix await execution after source closure.

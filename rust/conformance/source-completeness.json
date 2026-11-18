@@ -6,7 +6,7 @@
   "areas": {
     "types_columnar_durable_formats": {
       "status": "pending",
-      "conclusion": "A captured direct FixedBinary vector supplies retained buffers and signed layout to a UUID reader. Legacy Transit dates share the pinned hybrid calendar and format resources, and the default Windows Path provider has a native parser and object semantics. The final source review must reconcile type, Arrow, durable-codec and remaining registered-object coverage with the reviewed design.",
+      "conclusion": "A captured direct FixedBinary vector supplies retained buffers and signed layout to a UUID reader. An exclusive mutable UUID view borrows an existing source FixedBinary writer and its publication state. Legacy Transit dates share the pinned hybrid calendar and format resources, and the default Windows Path provider has a native parser and object semantics. The final source review must reconcile type, Arrow, durable-codec and remaining registered-object coverage with the reviewed design.",
       "implementation_paths": [
         "rust/crates/types/src/lib.rs",
         "rust/crates/types/src/java_date.rs",
@@ -18,7 +18,8 @@
         "rust/crates/columnar/src/cells/source_scalar.rs",
         "rust/crates/format/src/lib.rs",
         "rust/crates/temporal/src/lib.rs",
-        "rust/crates/trie/src/lib.rs"
+        "rust/crates/trie/src/lib.rs",
+        "rust/crates/columnar/src/cells/write/owner.rs"
       ]
     },
     "storage_indexing_historical_visibility": {
@@ -39,7 +40,7 @@
     },
     "sql_xtql_execution": {
       "status": "pending",
-      "conclusion": "The private direct-control entry returns owned control statements and scalar recognition facts. Reported diagnostics retain their listener reservation. Direct logical queries admit retained named parameter metadata before binding and transfer owned argument values into the native page cursor. Explicit character-length units select code-point or byte length. Standard substring and overlay accept units and use the existing position and length semantics. Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and additional frontend allocations still require source completion.",
+      "conclusion": "The private direct-control entry returns owned control statements and scalar recognition facts. Reported diagnostics retain their listener reservation. Direct logical queries admit retained named parameter metadata before binding and transfer owned argument values into the native page cursor. Explicit character-length units select code-point or byte length. Standard substring and overlay accept units and use the existing position and length semantics. Substring also admits selected separate operands with omitted FROM or FOR. Each supported regex host if-let or when-let uses one local slot for its simple-symbol binding. Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and additional frontend allocations still require source completion.",
       "implementation_paths": [
         "rust/crates/sql/src/lib.rs",
         "rust/crates/sql/src/lexer.rs",
@@ -50,7 +51,8 @@
         "rust/crates/plan/src/lib.rs",
         "rust/crates/expr/src/evaluate.rs",
         "rust/crates/expr/src/transit_object.rs",
-        "rust/crates/query/src/lib.rs"
+        "rust/crates/query/src/lib.rs",
+        "rust/crates/expr/src/evaluate/invocation/host.rs"
       ]
     },
     "writes_replication_recovery": {
@@ -65,7 +67,7 @@
     },
     "compaction_gc_adapters": {
       "status": "pending",
-      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction with Java lookup and regular-file Reader ordering. Native Metadata rack scratch and queue and event lifetimes have admitted owners. Stock Connect attaches a receive account before constructing the native consumer. The scoped Avro String Reader pairs its original trees after all source parses and closes. The Registry Reader drives persistent character symbols during its private UTF16 and UTF32 bean parse, and the UTF8 byte table is implemented. Prior pinned Gradle workers establish the default Jackson 2.21.7 artifact selection. The live Avro schema-ID lookup decodes common UTF8 responses as typed beans after HTTP completion. Other envelopes use generic decoding on the same body. Wider typed HTTP and live Avro parser activation, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
+      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction with Java lookup and regular-file Reader ordering. Native Metadata rack scratch and queue and event lifetimes have admitted owners. Stock Connect attaches a receive account before constructing the native consumer. Stock Registry Avro conversion builds datum plans through the String Reader from scalar UTF8 schema and reference text. Accounted Snappy and gzip Fetch output survives through its last event, and gzip admits inflater allocations. The Registry Reader drives persistent character symbols during its private UTF16 and UTF32 bean parse, and the UTF8 byte table is implemented. Prior pinned Gradle workers establish the default Jackson 2.21.7 artifact selection. The live Avro schema-ID lookup decodes common UTF8 responses as typed beans after HTTP completion. Other envelopes use generic decoding on the same body. Wider typed HTTP, nullable UTF16 transport and remaining Avro consumer behavior, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
       "implementation_paths": [
         "rust/crates/maintenance/src/driver.rs",
         "rust/crates/maintenance/src/gc.rs",
@@ -87,12 +89,15 @@
         "rust/crates/s3/src/lib.rs",
         "rust/crates/azure/src/lib.rs",
         "rust/crates/gcs/src/lib.rs",
-        "rust/crates/pg-source/src/driver.rs"
+        "rust/crates/pg-source/src/driver.rs",
+        "rust/crates/kafka/src/connect/registry/factory.rs",
+        "rust/crates/kafka/src/connect/avro/runtime.rs",
+        "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msgset_reader.c"
       ]
     },
     "client_operational_surfaces": {
       "status": "pending",
-      "conclusion": "Client, configuration, telemetry, TLS, embedded and package sources are present. Flight SQL charges conversion of Arrow parameter fields before result binding or argument construction. Embedded ADBC charges C parameter schema and temporary result parameter types before constructing them. Pgwire Extended Parse admits its located token array before the first scan. The final public-entry and configuration review is pending.",
+      "conclusion": "Client, configuration, telemetry, TLS, embedded and package sources are present. Flight SQL charges conversion of Arrow parameter fields before result binding or argument construction. Embedded ADBC charges C parameter schema and temporary result parameter types before constructing them. Pgwire Extended Parse admits its located token array before the first scan. Selected initial syntax errors use native Direct reports on Flight SQL query info, schema, prepared creation and uploaded updates. Pgwire Simple Query uses the native Multi report and retains the received SQL through one error serialization. The final public-entry and configuration review is pending.",
       "implementation_paths": [
         "rust/crates/node/src/runtime.rs",
         "rust/crates/pgwire/src/lib.rs",
@@ -106,7 +111,9 @@
         "rust/crates/server/src/main.rs",
         "rust/crates/config/src/main.rs",
         "rust/crates/metrics/src/lib.rs",
-        "rust/crates/tls/src/lib.rs"
+        "rust/crates/tls/src/lib.rs",
+        "rust/crates/flight-sql/src/error.rs",
+        "rust/crates/pgwire/src/protocol.rs"
       ]
     },
     "conformance_machinery": {
@@ -355,7 +362,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete mutable FixedSizeBinary existing-inner aliases and cross-allocator transfers, pointer use beyond the reviewed borrowed retargeting, ordering and default equality paths, general ByteBuffer operations, remaining indirect-reader operations, transport and production consumers. Preserve signed construction and write-copy behavior, immutable captured FixedBinary adoption into UUID readers, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand, signed explicit selection lookup and receiver-class order, FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
+      "requirement": "Extend mutable FixedSizeBinary existing-inner aliases beyond the exclusive UUID borrow, and complete cross-allocator transfers, pointer use beyond the reviewed borrowed retargeting, ordering and default equality paths, general ByteBuffer operations, remaining indirect-reader operations, transport and production consumers. Preserve signed construction and write-copy behavior, immutable captured FixedBinary adoption into UUID readers, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand, signed explicit selection lookup and receiver-class order, FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
     },
     {
       "id": "embedded-parser-error-capability",
@@ -407,7 +414,7 @@
         "compaction_gc_adapters",
         "client_operational_surfaces"
       ],
-      "requirement": "Activate the same-input Avro pairing with exact JavaString schema input and source LogicalType construction, admitted graph/default and union materialization, MapEntry, qualified identity witnesses, and writer/SMT/cache owners. Preserve and reconcile the explicit null-default assertion conflict and qualify traversal beyond the native depth limit. Drive the observed Registry parser from the bounded live HTTP input with persistent symbol state, admitted nullable UTF16 schema, reference and rule consumers, and branch-specific version, cache and failure timing. Bind the existing connection timing, preferred DNS address, admitted logical flights and source jitter to qualified live DNS, socket, clock, Selector and request lifecycle events, including Math results and throttle deadlines. Drive the updater, exact native exchange, fatal broadcasts and topic wait from the live sender and use the resulting fixed partition, queue budget and timestamp in actual DLQ enqueue. Audit remaining cache borrowers and extend native admission to live copies, rack scratch, admin output, construction, security and outbound/compression owners."
+      "requirement": "Extend the live same-input Avro pairing from scalar UTF8 to nullable JavaString transport, and finish source LogicalType construction, admitted graph/default and union materialization, MapEntry, qualified identity witnesses, and writer/SMT/cache owners. Preserve and reconcile the explicit null-default assertion conflict and qualify traversal beyond the native depth limit. Drive the observed Registry parser from the bounded live HTTP input with persistent symbol state, admitted nullable UTF16 schema, reference and rule consumers, and branch-specific version, cache and failure timing. Bind the existing connection timing, preferred DNS address, admitted logical flights and source jitter to qualified live DNS, socket, clock, Selector and request lifecycle events, including Math results and throttle deadlines. Drive the updater, exact native exchange, fatal broadcasts and topic wait from the live sender and use the resulting fixed partition, queue budget and timestamp in actual DLQ enqueue. Audit remaining cache borrowers and extend native admission to live copies, rack scratch, admin output, construction, security and outbound/compression owners."
     },
     {
       "id": "recovered-block-confirmation",
