@@ -1,5 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc};
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::transit::{TransitValue as T, encode_json};
 use rtdb_node::AutonomousTxOptions;
 use rtdb_tx::{Documents, EntityIds, SqlArguments, TxOp, UserMetadata};
@@ -25,9 +25,25 @@ fn output(value: &Value, typed_structs: bool) -> Result<T> {
     })
 }
 
-pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToken, request: Value) -> Result<Value> {
+pub(crate) struct TransactionInput {
+    value: Value,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl TransactionInput {
+    pub(crate) fn decode(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mut reservation = memory.reserve(crate::add(crate::mul(bytes.len(), 4096)?, 8192)?)?;
+        let value = rtdb_pg_codec::from_transit(rtdb_format::transit::decode_msgpack(bytes)?)?;
+        let retained = crate::add(value.retained_bytes()?, 8192)?;
+        Arc::get_mut(&mut reservation).expect("input decoding owns its reservation").shrink_to(retained)?;
+        Ok(Self { value, reservation })
+    }
+}
+
+pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToken, input: TransactionInput) -> Result<Value> {
     let memory = session.region.memory();
-    let mut request = fields(request)?;
+    let TransactionInput { value, reservation: _reservation } = input;
+    let mut request = fields(value)?;
     let asynchronous = match request.remove("asynchronous").unwrap_or(Value::Bool(false)) { Value::Bool(value) => value, _ => return Err(crate::invalid("asynchronous must be boolean")) };
     let mut options = fields(request.remove("options").unwrap_or_else(|| Value::Struct(BTreeMap::new())))?;
     let timezone = optional_string(options.remove("default_timezone"))?;
@@ -93,4 +109,17 @@ fn string(value: Value) -> Result<String> { match value { Value::Utf8(value) => 
 fn optional_string(value: Option<Value>) -> Result<Option<String>> { value.filter(|value| !matches!(value, Value::Null)).map(string).transpose() }
 fn optional_time(value: Option<Value>, timezone: &str) -> Result<Option<Timestamp>> {
     value.filter(|value| !matches!(value, Value::Null)).map(|value| rtdb_expr::timestamp_micros(&value, timezone).map(|value| Timestamp(value.0))).transpose()
+}
+
+#[test]
+fn transaction_input_releases_transit_scratch_before_submission() {
+    let message = T::Map(vec![(T::String("operations".into()), T::Array(vec![T::String("SELECT 1".into())]))]);
+    let payload = rtdb_format::transit::encode_msgpack(&message).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    let input = TransactionInput::decode(&payload, &memory).unwrap();
+    assert_eq!(memory.used_bytes(), input.value.retained_bytes().unwrap() + 8192);
+    assert!(memory.used_bytes() < memory.peak_bytes());
+    assert_eq!(input.value, Value::Struct(BTreeMap::from([("operations".into(), Value::List(vec![Value::Utf8("SELECT 1".into())]))])));
+    drop(input);
+    assert_eq!(memory.used_bytes(), 0);
 }

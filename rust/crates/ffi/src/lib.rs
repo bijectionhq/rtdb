@@ -356,9 +356,8 @@ pub unsafe extern "C" fn rtdb_v1_session_transact(session: u64, operation: u64, 
         let session = handles::session(session)?; let _admitted = session.region.enter()?;
         let token = handles::cancellation(operation, &session)?;
         let memory = session.region.memory();
-        let _request = memory.reserve(add(mul(length, 4096)?, 8192)?)?;
-        let value = rtdb_pg_codec::from_transit(rtdb_format::transit::decode_msgpack(bytes(request, length)?)?)?;
-        let value = transit::transaction(&session, &token, value)?;
+        let request = transit::TransactionInput::decode(bytes(request, length)?, memory)?;
+        let value = transit::transaction(&session, &token, request)?;
         let reservation = memory.reserve(add(mul(value.retained_bytes()?, 32)?, 8192)?)?;
         let value = rtdb_tx::RetainedBytes::with_reservation(transit::encode(&value)?, reservation)?;
         *out = handles::insert(Handle::Bytes(Arc::new(handles::NativeBytes { value, memory: Arc::clone(memory) })))?; Ok(())
