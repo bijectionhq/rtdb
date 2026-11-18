@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_plan::{Catalog, Expr, QualifiedTable, RelationNode, Statement, TableBinding};
 use rtdb_types::{LogicalType, MemoryBudget, Result, ScalarType, Value};
-use rtdb_xtql::{CompileOptions, compile_ra_in};
+use rtdb_xtql::{CompileOptions, compile, compile_ra_in};
 
 struct EmptyCatalog;
 
@@ -40,4 +40,33 @@ fn logical_table_keeps_zero_column_cardinality() {
     let RelationNode::Values { rows } = output.node() else { panic!("Expected table") };
     assert!(output.schema().is_empty());
     assert_eq!(rows, &[vec![], vec![], vec![]]);
+}
+
+#[test]
+fn an_unbound_logical_symbol_is_an_unknown_symbol() {
+    let memory = MemoryBudget::new(1 << 20);
+    let error = compile_ra_in("[:select {:predicate (== ?x13 x4)} [:table {:rows []}]]", &EmptyCatalog, &CompileOptions::default(), &memory).unwrap_err();
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.expression/unknown-symbol", Some("Unknown symbol: '?x13'")));
+}
+
+#[test]
+fn mega_join_joins_every_relation_under_all_its_conditions() {
+    let memory = MemoryBudget::new(1 << 20);
+    let plan = "[:mega-join {:conditions [{x1 x2} (> (+ x1 10) x3)]} [[:table {:rows [{x1 1}]}] [:table {:rows [{x2 1}]}] [:table {:rows [{x3 3}]}]]]";
+    let Statement::Query(output) = compile_ra_in(plan, &EmptyCatalog, &CompileOptions::default(), &memory).unwrap().statement else { panic!("Expected query") };
+    let mut names = output.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["x1", "x2", "x3"]);
+    assert!(matches!(output.node(), RelationNode::Filter { .. }));
+    assert!(compile_ra_in("[:mega-join {:conditions []} []]", &EmptyCatalog, &CompileOptions::default(), &memory).is_err());
+}
+
+#[test]
+fn aggregate_outputs_may_only_reference_grouping_variables_outside_aggregates() {
+    let compiled = |source: &str| compile(source, &EmptyCatalog, &CompileOptions::default());
+    let error = compiled("(-> (rel [{:c 1 :v 2}] [c v]) (aggregate c {:s (* v (sum v))}))").unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Variables outside of aggregate expressions must be grouping columns"));
+    let error = compiled("(-> (rel [{:v 2}] [v]) (aggregate y))").unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Not all variables in expression are in scope"));
+    assert!(compiled("(-> (rel [{:c 1 :v 2}] [c v]) (aggregate c {:s (+ c (sum v))}))").is_ok());
 }

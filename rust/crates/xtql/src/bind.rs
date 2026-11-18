@@ -1,6 +1,6 @@
 use crate::{Binding, Clause, Expr, FormAllocation, From, Query, RelationInput, SubqueryKind, Tail, TemporalFilter, error, read};
 use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, Binder, Catalog, Expr as PExpr, Field, Identifier, JoinKind, NamedExpr, PreparedStatement, QualifiedTable, Relation, RelationNode, Scan, Schema, SetOperator, SortExpr, Statement, TableBinding, TemporalFilter as PTemporal, UnaryOp};
-use rtdb_types::{ListKind, LogicalType, MemoryBudget, Result, ScalarType, TimeUnit, Value};
+use rtdb_types::{Anomaly, ListKind, LogicalType, MemoryBudget, Result, ScalarType, TimeUnit, Value};
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 mod ra;
@@ -96,6 +96,13 @@ type Parameters = BTreeMap<String, PExpr>;
 enum Symbols { Xtql, Relational }
 
 impl Symbols {
+    fn out_of_scope(self, name: &str) -> Anomaly {
+        match self {
+            Self::Xtql => error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")),
+            Self::Relational => error("xtdb.expression/unknown-symbol", format!("Unknown symbol: '{name}'")).with_context("symbol", name.into()),
+        }
+    }
+
     fn parameter(self, name: &str) -> String {
         match self {
             Self::Xtql => normal(name),
@@ -471,10 +478,10 @@ impl Compiler<'_, '_> {
                 let parameter = matches!(self.symbols, Symbols::Xtql) || name.starts_with('?');
                 parameter.then(|| parameters.get(&self.symbols.parameter(name))).flatten().cloned()
                     .or_else(|| bound.variables.get(self.symbols.column(name).as_ref()).map(Field::expression))
-                    .ok_or_else(|| error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")))?
+                    .ok_or_else(|| self.symbols.out_of_scope(name))?
             }
             Expr::LogicVariable(name) => bound.variables.get(self.symbols.column(name).as_ref()).map(Field::expression)
-                .ok_or_else(|| error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")))?,
+                .ok_or_else(|| self.symbols.out_of_scope(name))?,
             Expr::Get { object, field } => {
                 let object = self.expr(object, bound, parameters)?;
                 let name = field.clone();
@@ -517,14 +524,20 @@ impl Compiler<'_, '_> {
         let mut groups = BTreeMap::new();
         for binding in bindings {
             if let Some(name) = binding_variable(&binding.expression, parameters) {
-                let field = bound.variables.get(&normal(name)).cloned().ok_or_else(|| error("xtql/invalid-expression", "Grouping variable is outside input scope"))?;
+                let field = bound.variables.get(&normal(name)).cloned().ok_or_else(|| error("xtql/invalid-expression", "Not all variables in expression are in scope"))?;
                 groups.insert(normal(name), NamedExpr { expr: field.expression(), field });
             }
         }
         let mut aggregates = Vec::new();
         let mut outputs = Vec::new();
         for binding in bindings {
-            outputs.push(Binding { name: binding.name.clone(), expression: self.rewrite_aggregates(&binding.expression, &mut bound, parameters, &mut aggregates)? });
+            let expression = self.rewrite_aggregates(&binding.expression, &mut bound, parameters, &mut aggregates)?;
+            let mut required = BTreeSet::new();
+            required_expr(&expression, parameters, &mut required);
+            if required.iter().any(|name| !name.starts_with("xt$aggregate$") && !groups.contains_key(name)) {
+                return Err(error("xtql/invalid-expression", "Variables outside of aggregate expressions must be grouping columns"));
+            }
+            outputs.push(Binding { name: binding.name.clone(), expression });
         }
         if !groups.is_empty() {
             for aggregate in &mut aggregates {

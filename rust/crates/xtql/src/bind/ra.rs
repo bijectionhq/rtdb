@@ -85,6 +85,7 @@ impl Importer<'_, '_, '_> {
             ("semi-join" | "⋉", [left, right]) => self.join(JoinKind::Semi, options, left, right)?,
             ("anti-join" | "▷", [left, right]) => self.join(JoinKind::Anti, options, left, right)?,
             ("single-join", [left, right]) => self.join(JoinKind::Single, options, left, right)?,
+            ("mega-join", [relations]) => self.mega_join(options, relations)?,
             ("mark-join", [left, right]) => self.mark(options, left, right)?,
             ("apply", [input, dependent]) => self.apply(options, input, dependent)?,
             ("unnest" | "ω", [input]) => self.unnest(options, input)?,
@@ -589,6 +590,31 @@ impl Importer<'_, '_, '_> {
     fn join(&mut self, kind: JoinKind, options: &Edn, left: &Edn, right: &Edn) -> Result<Relation> {
         let left = self.lower(left)?;
         let right = self.lower(right)?;
+        self.join_lowered(kind, options, left, right)
+    }
+
+    /// Joins every relation and applies every condition once all are in scope, which yields the same rows as the reference's join-order search.
+    fn mega_join(&mut self, options: &Edn, relations: &Edn) -> Result<Relation> {
+        let relations = relations.vector().ok_or_else(|| invalid("Mega-join relations must be a vector"))?;
+        let Some((first, rest)) = relations.split_first() else { return Err(invalid("Mega-join requires at least one relation")); };
+        let mut joined = self.lower(first)?;
+        for relation in rest {
+            let right = self.lower(relation)?;
+            joined = Arc::new(self.join_lowered(JoinKind::Cross, options, joined, right)?);
+        }
+        let mut input = bind_input(&joined);
+        let conditions = required(options, "conditions")?.vector().ok_or_else(|| invalid("Join conditions must be a vector"))?;
+        let predicates = conditions.iter().map(|condition| match condition.map() {
+            Some([(left, right)]) => Ok(PExpr::binary(BinaryOp::Eq, self.join_key(left, &mut input)?, self.join_key(right, &mut input)?)),
+            _ => self.scalar(condition, &mut input),
+        }).collect::<Result<Vec<_>>>()?;
+        match and(predicates) {
+            Some(predicate) => joined.filter(predicate),
+            None => Ok(Arc::unwrap_or_clone(joined)),
+        }
+    }
+
+    fn join_lowered(&mut self, kind: JoinKind, options: &Edn, left: Arc<Relation>, right: Arc<Relation>) -> Result<Relation> {
         let mut left_input = bind_input(&left);
         let mut right_input = bind_input(&right);
         let condition = if kind == JoinKind::Cross { None }
