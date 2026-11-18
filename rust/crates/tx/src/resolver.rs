@@ -424,14 +424,15 @@ impl<'a> OpenTransaction<'a> {
         let _reservation = self.context.memory.reserve(bound)?;
         let table = TableRef::new("xt", "txs");
         let error_column = "error".to_owned();
+        let metadata_column = "user_metadata".to_owned();
         let document = BTreeMap::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
             ("committed".into(), Value::Bool(result.committed())),
-            ("user_metadata".into(), metadata.map(|metadata| metadata.value().clone()).unwrap_or(Value::Null)),
+            (metadata_column.clone(), metadata.map(|metadata| metadata.value().clone()).unwrap_or(Value::Null)),
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
-        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe())])
+        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &LogicalType::Struct(BTreeMap::new()).maybe())])
     }
 }
 

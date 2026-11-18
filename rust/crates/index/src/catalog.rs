@@ -16,6 +16,17 @@ pub fn merge_column_types(left: &BTreeMap<String, LogicalType>, right: &BTreeMap
     }).collect()
 }
 
+/// Joins declared column types into row-derived types; a declaration is not a row, so it adds no absence.
+pub fn declare_column_types(rows: &BTreeMap<String, LogicalType>, declared: &BTreeMap<String, LogicalType>) -> BTreeMap<String, LogicalType> {
+    let absent = absent_type(rows);
+    let mut types = rows.clone();
+    for (name, ty) in declared {
+        let joined = types.get(name).unwrap_or(&absent).join(ty);
+        types.insert(name.clone(), joined);
+    }
+    types
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableMeta {
     pub column_types: BTreeMap<String, LogicalType>,

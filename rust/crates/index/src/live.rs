@@ -7,7 +7,7 @@ use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation, owned_event_ba
 use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
 
-use crate::{Snapshot, TableMeta, merge_column_types};
+use crate::{Snapshot, TableMeta, declare_column_types, merge_column_types};
 
 #[derive(Debug)]
 pub struct IndexBatch {
@@ -62,17 +62,18 @@ impl IndexBatch {
             }
         }
         let _schema_scratch = budget.reserve(schema_bytes.checked_mul(4).ok_or_else(|| invalid("Put schema allocation size overflow"))?)?;
-        let mut fields = declared.clone();
+        let mut rows: Option<BTreeMap<String, LogicalType>> = None;
         let mut has_put = matches!(mode, EventBuild::CopyCaptured) || !declared.is_empty();
         for event in events {
             if let StoredOperation::Put(document) = &event.operation {
                 if !matches!(mode, EventBuild::CopyCaptured) {
-                    let next = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
-                    if fields != next { fields = merge_column_types(&fields, &next); }
+                    let next: BTreeMap<_, _> = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
+                    rows = Some(match rows { Some(fields) if fields != next => merge_column_types(&fields, &next), Some(fields) => fields, None => next });
                 }
                 has_put = true;
             }
         }
+        let fields = match rows { Some(rows) => declare_column_types(&rows, declared), None => declared.clone() };
         let copy = !matches!(mode, EventBuild::Write);
         Self::from_owned(owned_event_batch(events, has_put.then_some(fields), copy, budget)?)
     }
@@ -244,7 +245,7 @@ impl BlockPages<'_> {
 pub struct TableWrite { column_types: BTreeMap<String, LogicalType>, batch: Option<Arc<IndexBatch>> }
 impl TableWrite {
     pub fn new(column_types: BTreeMap<String, LogicalType>, batch: Option<Arc<IndexBatch>>) -> Self {
-        let column_types = match &batch { Some(batch) => merge_column_types(&column_types, batch.put_types()), None => column_types };
+        let column_types = match &batch { Some(batch) => declare_column_types(batch.put_types(), &column_types), None => column_types };
         Self { column_types, batch }
     }
     pub fn column_types(&self) -> &BTreeMap<String, LogicalType> { &self.column_types }

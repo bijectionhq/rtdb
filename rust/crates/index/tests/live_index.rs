@@ -220,6 +220,19 @@ fn put_omitting_a_declared_column_preserves_its_null_field() {
 }
 
 #[test]
+fn declared_document_types_do_not_make_written_columns_nullable() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
+    tx.put(table(), BTreeMap::from([("_id".into(), Value::I64(1)), ("error".into(), Value::Null)]), Interval::ALL).unwrap();
+    let error = "error".to_owned();
+    tx.declare_document_types(&table(), [(&error, &LogicalType::Scalar(ScalarType::Transit).maybe())]).unwrap();
+    state.apply(&tx.stage().unwrap()).unwrap();
+    let types = state.open_snapshot(Some(key(0).system_time)).segments(&table())[0].column_types().clone();
+    assert_eq!(types, BTreeMap::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("error".into(), LogicalType::Scalar(ScalarType::Transit).maybe())]));
+}
+
+#[test]
 fn table_membership_includes_seeded_empty_catalogs_and_keeps_its_captured_generation() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let before = state.open_snapshot(None);
