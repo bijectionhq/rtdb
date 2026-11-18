@@ -115,3 +115,6 @@ The retained link:../NOTICE-JACKSON[], link:../../../names/LICENSE-APACHE[], lin
 Twenty-two new source regression functions cover creation/snapshot order, buffered versus unread tails, semantic/close failure order, exact units, actual persistent symbols, retained tree storage, native normalization, recursive pairing, complete source-group precedence over transport and datum/decode use after construction-owner drop.
 All previously published fixture bodies and assertions remain unchanged.
 No compiler, formatter, runtime, test or project helper was executed for this Phase1 slice.
+
+The subsequent first-token probe on both Jackson 2.16.0 and 2.21.7 returned a Boolean token for `true$` and an integer token for `1\rX`.
+The same Reader probe rejected `trueA`, `false0`, `null` followed by U+0301, `false` followed by U+20AC, and `1X` before admitting a first token.

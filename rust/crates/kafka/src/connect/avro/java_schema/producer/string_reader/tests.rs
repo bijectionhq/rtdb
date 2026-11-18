@@ -172,16 +172,26 @@ fn json_number_classes_and_duplicate_members_keep_source_values() {
 
 #[test]
 fn literal_identifier_boundaries_and_root_number_whitespace_match_the_pinned_reader() {
-    let mut context = support::context();
-    let factory = SchemaStringFactory::new_default(profile(Profile::Jackson216), &mut context).unwrap();
-    let mut buffers = TokenRecycler::empty(Profile::Jackson216);
-    let mut intern = Intern::new(&mut context);
-    for input in ["trueA", "false0", "true$", "null\u{301}", "false\u{20ac}", "1X"] {
-        assert!(factory.with_tree(JavaText::from_utf8(input), &mut buffers, &mut intern, &mut context, |_, _| -> Result<()> { panic!("invalid token precedes schema assembly") }).is_err());
+    for selected in [Profile::Jackson216, Profile::Jackson221] {
+        let mut context = support::context();
+        let factory = SchemaStringFactory::new_default(profile(selected), &mut context).unwrap();
+        let mut buffers = TokenRecycler::empty(selected);
+        let mut intern = Intern::new(&mut context);
+        for input in ["trueA", "false0", "null\u{301}", "false\u{20ac}", "1X"] {
+            assert!(factory.with_tree(JavaText::from_utf8(input), &mut buffers, &mut intern, &mut context, |_, _| -> Result<()> {
+                panic!("invalid token {input:?} reaches schema assembly")
+            }).is_err());
+        }
+        let failure = factory.with_tree(JavaText::from_utf8("true$"), &mut buffers, &mut intern, &mut context, |tree, _| {
+            assert!(matches!(tree.unwrap().value(), JsonValue::Bool(true)));
+            Ok(())
+        }).unwrap_err();
+        assert!(failure.code.ends_with("avro-schema-dangling"));
+        let failure = factory.with_tree(JavaText::from_utf8("1\rX"), &mut buffers, &mut intern, &mut context, |_, _| {
+            Err::<(), _>(error("semantic", "Schema assembly"))
+        }).unwrap_err();
+        assert!(failure.code.ends_with("semantic"));
     }
-    let mut called = false;
-    assert!(factory.with_tree(JavaText::from_utf8("1\rX"), &mut buffers, &mut intern, &mut context, |_, _| { called=true; Err::<(), _>(error("semantic", "Schema assembly")) }).err().unwrap().code.ends_with("semantic"));
-    assert!(called);
     assert!(identifier::part(48));
     assert!(identifier::part(65));
     assert!(identifier::part(0x0301));
