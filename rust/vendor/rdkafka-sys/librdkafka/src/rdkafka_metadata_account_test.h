@@ -45,6 +45,39 @@ static int ut_metadata_arena_admission(void) {
         RD_UT_PASS();
 }
 
+static int ut_metadata_segments_admit_exact_storage(void) {
+        const size_t root = RD_ROUNDUP(sizeof(rd_kafka_metadata_internal_t), 8);
+        const size_t header = RD_ROUNDUP(sizeof(struct rd_kafka_metadata_segment), 8);
+        const char name[] = "metadata";
+        rd_kafka_byte_account_t *account =
+            rd_kafka_byte_account_new(root + header + sizeof(name));
+        rd_kafka_metadata_internal_t *metadata;
+        rd_tmpabuf_t arena = RD_ZERO_INIT;
+        char *payload;
+
+        RD_UT_ASSERT(account, "create an exact decoded metadata budget");
+        metadata = rd_kafka_metadata_arena_new(&arena, account, root, malloc);
+        RD_UT_ASSERT(metadata, "admit root before decoded data");
+        RD_UT_ASSERT(!rd_kafka_metadata_alloc(&arena, metadata, sizeof(name) + 1) &&
+                         !metadata->segments &&
+                         rd_kafka_byte_account_used(account) == root,
+                     "denied segment leaves the existing owner intact");
+        payload = rd_kafka_metadata_alloc(&arena, metadata, sizeof(name));
+        RD_UT_ASSERT(payload && rd_kafka_byte_account_used(account) ==
+                                    root + header + sizeof(name),
+                     "segment charges its header and decoded bytes exactly");
+        memcpy(payload, name, sizeof(name));
+        metadata->metadata.orig_broker_name = payload;
+        RD_UT_ASSERT(!strcmp(metadata->metadata.orig_broker_name, name) &&
+                         !rd_kafka_metadata_alloc(&arena, metadata, 1),
+                     "subsequent admission failure preserves present data");
+        rd_kafka_metadata_destroy(&metadata->metadata);
+        RD_UT_ASSERT(!rd_kafka_byte_account_used(account),
+                     "the final root releases its segment charge as well");
+        rd_kafka_byte_account_destroy(account);
+        RD_UT_PASS();
+}
+
 static int ut_metadata_arena_clone_overlap(void) {
         size_t size;
         rd_tmpabuf_t first_buf = RD_ZERO_INIT, second_buf = RD_ZERO_INIT;
@@ -168,7 +201,8 @@ static int ut_metadata_parser_rollback(void) {
 extern int unittest_metadata_admin_account(void);
 
 int unittest_metadata_account(void) {
-        return ut_metadata_arena_admission() + ut_metadata_arena_clone_overlap() +
+        return ut_metadata_arena_admission() + ut_metadata_segments_admit_exact_storage() +
+               ut_metadata_arena_clone_overlap() +
                ut_metadata_arena_op_ownership() + ut_metadata_parser_rollback() +
                unittest_metadata_admin_account();
 }

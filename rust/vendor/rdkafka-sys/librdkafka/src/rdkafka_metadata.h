@@ -96,6 +96,7 @@ typedef struct rd_kafka_metadata_internal_s {
                                                 * supported by broker */
         rd_kafka_byte_account_t *byte_account;
         size_t byte_charge;
+        struct rd_kafka_metadata_segment *segments;
 } rd_kafka_metadata_internal_t;
 
 /**

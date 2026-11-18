@@ -205,7 +205,10 @@ Replacement, explicit deletion, expiry, hint purge and client teardown all free 
 Cache purge and final destruction precede the client's account detach.
 The account guard's final drain covers these retained arenas.
 
-The shared ordinary/admin parser maps cache denial to CRIT_SYS_RESOURCE and returns no parsed Metadata owner.
+The shared ordinary/admin parser admits additional decoded storage when the initial arena fills.
+Array counts must fit the response before they can request decoded storage.
+The parsed metadata owner keeps its admitted segments alive through final destruction.
+An admission denial returns CRIT_SYS_RESOURCE and no parsed Metadata owner.
 Broker inventory changes and earlier topic/cache updates have already happened.
 The denied topic's live-topic update precedes its failed cache construction, so that topic may have new live state beside its previous valid cache entry.
 Live topics copy timestamps, errors, states, UUIDs and leader/epoch integers, allocate their own partition owners and retain broker references explicitly.

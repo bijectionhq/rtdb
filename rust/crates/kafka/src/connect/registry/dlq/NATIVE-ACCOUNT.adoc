@@ -19,7 +19,8 @@ Admission denial leaves an existing array intact and ends the current connection
 Initial and downgraded ApiVersions requests admit their contiguous frame and buffer owner before entering the broker's outbound queue.
 Their charge persists to final buffer release, including overlap with an earlier request during a downgrade.
 It does not establish a complete producer allocation bound.
-Ordinary Metadata responses admit the contiguous parsed arena and keep its charge through the last native or Rust result owner.
+Ordinary Metadata responses admit a root arena and any additional storage segments as the parser reaches them.
+The final native or Rust result owner retains all of these allocations.
 Retained ordinary Metadata cache arenas admit their complete root, copied payloads, padding and reliable-merge slack on that same account before allocation.
 Replacement admits the new arena while the old one remains charged, and common final destruction frees each arena before releasing its charge.
 A denied cache replacement preserves its old entry and propagates the native resource error after any broker and live-topic updates already completed.

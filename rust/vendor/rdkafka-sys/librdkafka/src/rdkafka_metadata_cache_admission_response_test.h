@@ -12,7 +12,9 @@ static int ut_cache_admission_ordinary_handler(rd_bool_t late) {
         rd_list_t topics, hint;
         size_t hint_size = ut_cache_admission_empty_size("hint");
         rd_bool_t error_preserved, retained;
-        account = rd_kafka_byte_account_new(ut_cache_admission_parser_size() + hint_size +
+        size_t parser_size = ut_cache_admission_parser_size();
+        RD_UT_ASSERT(parser_size > 0, "decode the response and measure its independent storage charge");
+        account = rd_kafka_byte_account_new(parser_size + hint_size +
                     (late ? ut_cache_admission_empty_size("first") : 0));
         RD_UT_ASSERT(account, "create ordinary parser account with exact cache failure boundary");
         ut_cache_admission_client_init(&fixture, account);
@@ -52,8 +54,9 @@ static int ut_cache_admission_ordinary_handler(rd_bool_t late) {
         rd_kafka_buf_destroy(response);
         rd_list_destroy(&topics);
         ut_cache_admission_client_destroy(&fixture);
-        RD_UT_ASSERT(error_preserved && retained && rd_kafka_byte_account_used(account) == 0,
-                     "ordinary handler returns original resource error, purges requested hints and retains only earlier cache effects");
+        RD_UT_ASSERT(error_preserved, "ordinary response must return its original resource error");
+        RD_UT_ASSERT(retained, "ordinary response must purge hints and retain only earlier cache updates");
+        RD_UT_ASSERT(rd_kafka_byte_account_used(account) == 0, "ordinary response must release its account");
         rd_kafka_byte_account_destroy(account);
         RD_UT_PASS();
 }

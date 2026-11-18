@@ -23,6 +23,7 @@ static RD_UNUSED void ut_cache_admission_client_init(
         rk->rk_conf.socket_timeout_ms = 60000;
         rk->rk_ts_metadata = 123;
         rk->rk_ts_full_metadata = 456;
+        rk->rk_controllerid = -1;
 #if defined(_TTHREAD_WIN32_)
         {
                 int duplicated = DuplicateHandle(
@@ -75,9 +76,34 @@ static const unsigned char ut_cache_admission_response[] = {
 };
 
 static RD_UNUSED size_t ut_cache_admission_parser_size(void) {
-        return RD_ROUNDUP(sizeof(rd_kafka_metadata_internal_t), 8) +
-               RD_ROUNDUP(2, 8) +
-               RD_ROUNDUP(4 * sizeof(ut_cache_admission_response), 8);
+        struct ut_cache_admission_client fixture;
+        rd_kafka_byte_account_t *account = rd_kafka_byte_account_new(4096);
+        rd_kafka_metadata_internal_t *metadata = NULL;
+        rd_kafka_buf_t *response;
+        rd_kafka_resp_err_t error;
+        size_t admitted, retained, unbalanced;
+        rd_bool_t decoded;
+        if (!account)
+                return 0;
+        ut_cache_admission_client_init(&fixture, account);
+        response = rd_kafka_buf_new_shadow(ut_cache_admission_response,
+                                           sizeof(ut_cache_admission_response), NULL);
+        response->rkbuf_reqhdr.ApiVersion = 0;
+        error = rd_kafka_parse_Metadata_admin(&fixture.broker, response, NULL, &metadata);
+        admitted = rd_kafka_byte_account_used(account);
+        decoded = error == RD_KAFKA_RESP_ERR_NO_ERROR && metadata &&
+                  metadata->metadata.topic_cnt == 2 &&
+                  !strcmp(metadata->metadata.topics[0].topic, "first") &&
+                  !strcmp(metadata->metadata.topics[1].topic, "second");
+        rd_kafka_metadata_destroy(metadata ? &metadata->metadata : NULL);
+        retained = rd_kafka_byte_account_used(account);
+        rd_kafka_buf_destroy(response);
+        ut_cache_admission_client_destroy(&fixture);
+        unbalanced = rd_kafka_byte_account_used(account);
+        rd_kafka_byte_account_destroy(account);
+        if (!decoded || unbalanced || retained >= admitted)
+                return 0;
+        return admitted - retained;
 }
 
 static RD_UNUSED rd_bool_t ut_cache_admission_after_parse(
