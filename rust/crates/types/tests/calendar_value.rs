@@ -34,3 +34,17 @@ fn calendar_millisecond_admission_wraps_at_both_boundaries() {
         assert_eq!(value.expression_value().unwrap(), expected);
     }
 }
+
+#[test]
+fn calendar_objects_and_admitted_dates_report_the_same_invalid_identifier_type() {
+    let date = CivilDate::from_ymd(2020, 1, 6).unwrap();
+    for unit in [DateUnit::Day, DateUnit::Millisecond] {
+        let object = CalendarDate::new(date, unit);
+        for value in [Value::Date(object), object.object_value(), object.expression_value().unwrap()] {
+            let error = value.entity_id().unwrap_err();
+            assert_eq!(error.code, "xtdb/invalid-id");
+            assert_eq!(error.message.as_deref(), Some("Invalid ID type: java.time.LocalDate"));
+            assert_eq!(error.context["type"], "java.time.LocalDate");
+        }
+    }
+}
