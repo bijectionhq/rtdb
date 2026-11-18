@@ -110,7 +110,7 @@ pub(super) fn transit(value: &TransitValue, depth: usize) -> Result<String> {
             ("xtdb/interval", _) => format!("#xt/interval {}", transit(representation, depth + 1)?),
             ("xtdb/period-duration", _) => format!("#xt/period-duration {}", transit(representation, depth + 1)?),
             ("xtdb/tstz-range", _) => format!("#xt/tstz-range {}", transit(representation, depth + 1)?),
-            ("xtdb/path", _) => format!("#xt/path {}", transit(representation, depth + 1)?),
+            ("xtdb/path", representation) => crate::transit_object::print_path(representation, Admission::Standalone)?,
             ("xtdb/tx-key", _) => format!("#xt/tx-key {}", transit(representation, depth + 1)?),
             _ => format!("#{tag} {}", transit(representation, depth + 1)?),
         },

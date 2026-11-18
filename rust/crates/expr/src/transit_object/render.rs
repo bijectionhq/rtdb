@@ -2,8 +2,6 @@ use rtdb_types::{Anomaly,Result};
 use super::{Map,Object,Throwable,Time,hash,invalid,keyword_value,number};
 use super::allocation::{Text,path_capacity};
 use crate::admission::Admission;
-#[cfg(test)]
-use crate::EvaluationScope;
 use crate::semantic_text::{self,Atom,Mode,SequenceKind,atom,quoted};
 
 pub(super) fn string(value: &Object,allocation: Admission<'_>) -> Result<String> {
@@ -52,8 +50,7 @@ fn write_string(text: &mut Text<'_>,value: &Object) -> Result<()> {
 
 fn java_string(text: &mut Text<'_>,value: &Object) -> Result<()> { if matches!(value,Object::Null) { text.push("null") } else { write_string(text,value) } }
 
-#[cfg(test)]
-pub(super) fn printed(value: &Object,allocation: &EvaluationScope) -> Result<String> {
+pub(super) fn printed<'a>(value: &Object,allocation: impl Into<Admission<'a>>) -> Result<String> {
     let mut text = Text::new(allocation);write_printed(&mut text,value)?;Ok(text.finish())
 }
 

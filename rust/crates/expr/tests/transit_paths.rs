@@ -51,3 +51,31 @@ fn windows_transit_paths_select_native_text_and_replace_case_equivalent_keys() {
         assert_eq!(selected(value, json).unwrap(), T::Map(vec![(path(r"C:\a"), T::Integer(2))]));
     }
 }
+
+#[test]
+fn path_text_calls_use_the_registered_provider_and_print_policy() {
+    use rtdb_expr::{cast, scalar_call};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let memory = rtdb_columnar::MemoryBudget::new(8 << 20);
+    {
+        let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope), ..Default::default() };
+        let (input, display, printed) = if cfg!(windows) {
+            ("file:///C:/group%20dir/a//", r"C:\group dir\a", r#"#xt/path "C:\\group dir\\a""#)
+        } else {
+            ("file:/group%20dir/a//", "/group dir/a", r#"#xt/path "/group dir/a""#)
+        };
+        let value = V::Transit(encode_msgpack(&path(input)).unwrap());
+        let utf8 = LogicalType::Scalar(ScalarType::Utf8);
+        assert_eq!(cast(&value, &utf8, "UTC").unwrap(), V::Utf8(printed.into()));
+        assert_eq!(scalar_call("str", std::slice::from_ref(&value), &context).unwrap(), V::Utf8(printed.into()));
+        assert_eq!(scalar_call("format", &[V::Utf8("%s".into()), value], &context).unwrap(), V::Utf8(display.into()));
+
+        let nested = V::Transit(encode_msgpack(&T::Array(vec![path(input), path("jrt:/java.base")])).unwrap());
+        assert_eq!(cast(&nested, &utf8, "UTC").unwrap(), V::Utf8(format!("[{printed} #xt/path \"/modules/java.base\"]")));
+        let invalid = V::Transit(encode_msgpack(&path("file:/%00")).unwrap());
+        assert_eq!(cast(&invalid, &utf8, "UTC").unwrap_err().code, "xtdb.expression/invalid-transit-object");
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}

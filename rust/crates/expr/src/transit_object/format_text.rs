@@ -1,11 +1,15 @@
 use std::{alloc::Layout,sync::Arc};
 use rtdb_types::Result;
 use crate::{admission::Admission,numeric::overflow};
-use super::{Map,Object,T,Throwable,Time,legacy_date_text,render};
+use super::{Map,Object,Path,T,Throwable,Time,legacy_date_text,render};
 
 pub(crate) enum FormatArgument { Semantic(String),Wire(T) }
 
 pub(crate) fn format_argument(value: T,admission: Admission<'_>) -> Result<FormatArgument> {
+    if let T::Tagged { tag, representation } = &value && tag == "xtdb/path" {
+        let path = Object::Path(Path::read_wire(representation)?);
+        return render::string(&path, admission).map(FormatArgument::Semantic);
+    }
     if legacy_date_text::HOST_CAPTURE
         && let T::Tagged { tag, representation } = &value
         && matches!(tag.as_str(), "m" | "t")

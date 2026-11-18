@@ -42,6 +42,10 @@ pub(crate) enum Object {
 fn invalid() -> Anomaly { Anomaly::incorrect("xtdb.expression/invalid-transit-object", "Invalid stored Transit object representation") }
 fn tagged(tag: &str,representation: T) -> T { T::Tagged { tag: tag.into(),representation: Box::new(representation) } }
 
+pub(crate) fn print_path(representation: &T, admission: Admission<'_>) -> Result<String> {
+    render::printed(&Object::Path(Path::read_wire(representation)?), admission)
+}
+
 pub(crate) struct Decoded<'a> { value: Object,allocation: &'a EvaluationScope }
 
 pub(crate) fn scope(allocation: Option<&EvaluationScope>) -> Result<&EvaluationScope> {

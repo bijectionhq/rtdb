@@ -11,6 +11,9 @@ pub(crate) enum Path { Unix(Vec<u8>), Windows(WindowsPath), Jrt(String) }
 enum FileProvider { Unix, Windows }
 
 impl Path {
+    pub(super) fn read_wire(representation: &T) -> Result<Self> {
+        match representation { T::String(text) => Self::read(text), _ => Err(invalid()) }
+    }
     pub(super) fn read(text: &str) -> Result<Self> {
         Self::read_with_provider(text, if cfg!(windows) { FileProvider::Windows } else { FileProvider::Unix })
     }

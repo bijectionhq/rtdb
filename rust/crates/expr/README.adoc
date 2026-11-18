@@ -521,6 +521,8 @@ Stored Transit Path values retain each provider's object identity.
 URI validation precedes path construction; Unix slash normalization preserves dot segments, and the exact `file:///` spelling selects raw escaped octets.
 Other file URI spellings decode text before constructing a path, while `jrt` paths use their registered module prefix and provider constraints.
 Canonical Path writing uses Java UTF-8 replacement for Unix bytes, so distinct objects can write the same text.
+STR and text casts print the provider's normalized text inside `#xt/path`, including nested paths.
+FORMAT uses the normalized Path string for a root Path argument.
 Windows builds construct normalized Windows file paths, including drive roots and UNC shares.
 The Windows provider compares and hashes simple uppercase UTF-16 code units and retains the original normalized casing in written text.
 Other default-platform encodings and externally installed filesystem providers require separate environment support.
