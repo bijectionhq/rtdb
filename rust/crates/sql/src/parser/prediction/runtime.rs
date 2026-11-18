@@ -155,6 +155,7 @@ pub(super) enum ContextClass {
     QuerySpecification,
     DiscardAll, DiscardPlans, DiscardTemp, DiscardSequences,
     IntegerLiteral0, FloatLiteral, BooleanLiteral, NullLiteral, CharacterStringLiteral, SqlStandardString, CEscapesString, DollarString,
+    TimeLiteral, DurationLiteral, UuidLiteral, UriLiteral, KeywordLiteral,
     CommonValueExpr0, LiteralExpr, NumericFactorExpr, NumericTermExpr,
 }
 impl ContextClass {
@@ -164,7 +165,8 @@ impl ContextClass {
             Self::QuerySpecification => 126,
             Self::DiscardAll | Self::DiscardPlans | Self::DiscardTemp | Self::DiscardSequences => 3,
             Self::DateType | Self::ArrayType => 26,
-            Self::IntegerLiteral0 | Self::FloatLiteral | Self::BooleanLiteral | Self::NullLiteral | Self::CharacterStringLiteral => 14,
+            Self::IntegerLiteral0 | Self::FloatLiteral | Self::BooleanLiteral | Self::NullLiteral | Self::CharacterStringLiteral
+            | Self::TimeLiteral | Self::DurationLiteral | Self::UuidLiteral | Self::UriLiteral | Self::KeywordLiteral => 14,
             Self::SqlStandardString | Self::CEscapesString | Self::DollarString => 16,
             Self::CommonValueExpr0 => 33,
             Self::LiteralExpr | Self::NumericFactorExpr | Self::NumericTermExpr => 34,

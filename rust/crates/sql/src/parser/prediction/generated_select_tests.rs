@@ -598,3 +598,60 @@ fn dollar_string_semicolons_are_indexed_text_before_the_real_statement_delimiter
     });
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn prefixed_string_projections_use_the_same_literal_trees_in_direct_and_multi_roots() {
+    let ((), memory) = environment(|environment, work, _| {
+        let direct = "SELECT TIME '23:59:59' AS t, DURATION E'P2D' AS d, UUID '00000000-0000-0000-0000-000000000000' AS u, URI $q$a;b$q$ AS uri_col, KEYWORD 'a''b' AS kw;";
+        let multiple = format!("{direct} ROLLBACK;");
+        for (source, multi, statement_call, eof) in [(direct, false, 352, 28), (multiple.as_str(), true, 358, 30)] {
+            both_profiles(environment, source, work, multi, |session, root| {
+                let (_, _, list) = projection(session, root, 0, statement_call, 0, false);
+                assert_eq!(list.children().len(), 9);
+                for (item, prefix, start, stop, class, call, string_class, raw, name) in [
+                    (0, "TIME", 1, 2, ContextClass::TimeLiteral, 697, ContextClass::SqlStandardString, "'23:59:59'", "t"),
+                    (2, "DURATION", 6, 7, ContextClass::DurationLiteral, 700, ContextClass::CEscapesString, "E'P2D'", "d"),
+                    (4, "UUID", 11, 12, ContextClass::UuidLiteral, 702, ContextClass::SqlStandardString, "'00000000-0000-0000-0000-000000000000'", "u"),
+                    (6, "URI", 16, 19, ContextClass::UriLiteral, 704, ContextClass::DollarString, "$q$", "uri_col"),
+                    (8, "KEYWORD", 23, 24, ContextClass::KeywordLiteral, 706, ContextClass::SqlStandardString, "'a''b'", "kw"),
+                ] {
+                    let column = derived(session, list.key(), item, item == 0);
+                    let expr = child(session, column.key(), 0, 33, 2405);
+                    bounds(expr, start, stop);
+                    let value = child(session, expr.key(), 0, 34, 1000);
+                    let literal = child(session, value.key(), 0, 14, 1140);
+                    assert_eq!((literal.class(), literal.children().len()), (Some(class), 2));
+                    bounds(literal, start, stop);
+                    terminal(literal.children()[0], start, prefix);
+                    let string = child(session, literal.key(), 1, 16, call);
+                    assert_eq!(string.class(), Some(string_class));
+                    bounds(string, start + 1, stop);
+                    terminal(string.children()[0], start + 1, raw);
+                    if string_class == ContextClass::DollarString {
+                        assert_eq!(string.children().len(), 3);
+                        let content = child(session, string.key(), 1, 15, 719);
+                        terminal(content.children()[0], 18, "a;b");
+                        terminal(string.children()[2], stop, "$q$");
+                    } else {
+                        assert_eq!(string.children().len(), 1);
+                    }
+                    let alias = child(session, column.key(), 1, AS_CLAUSE, 2406);
+                    terminal(alias.children()[0], stop + 1, "AS");
+                    let label = child(session, alias.key(), 1, COLUMN_LABEL, 2410);
+                    let identifier = child(session, label.key(), 0, 22, 852);
+                    terminal(identifier.children()[0], stop + 2, name);
+                }
+                let tree = session.invocation_view();
+                let root_view = tree.context(root).unwrap();
+                terminal(root_view.children()[1], 27, ";");
+                if multi {
+                    let rollback = child(session, root, 2, STATEMENT, 360);
+                    assert_eq!(rollback.class(), Some(ContextClass::RollbackStatement));
+                    terminal(root_view.children()[3], 29, ";");
+                }
+                complete_root(session, root, if multi { 1 } else { 0 }, eof);
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}

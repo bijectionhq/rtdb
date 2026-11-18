@@ -390,6 +390,15 @@
     "cleanup": "The denied rule 15 attachment leaves a failed child whose exited dollar string parent links the current literal residue to call 693.",
     "qualification": "Static source and ATN inspection. Execution remains pending."
   },
+  "prefixed_character_string_literals": {
+    "predecessor": "9e4621f077b6cdf97c49faca42c32491c7016c71",
+    "source_plan_sha256": "92757edb6dca21c50f55b1399d5f524c772e302d6e97d79deacf49e80d517de2",
+    "source_geometry_sha256": "babd4eb1abe341c7e827846c5c9195abc055b8ea3e8911beddd2c4793dbf1f46",
+    "generated": "Rule 14 decision 55 alternatives 6, 8, 9, 10 and 11 retain TIME, DURATION, UUID, URI and KEYWORD prefix atoms and their precise calls to the existing rule 16 string tree.",
+    "cleanup": "The literal's characterString call state identifies the failed rule 16 child or the exited rule 16 parent of a failed rule 15 child.",
+    "scope": "Private raw prefixed string trees through the expression, direct statement and multi-statement roots in both profiles.",
+    "qualification": "Static source and ATN inspection. Execution remains pending."
+  },
   "private_runtime_full_domain": {
     "ownership": "One transferred PredictionStorage retained across exclusive sessions; real TokenStream, primary invocation records and witnessed signed precedence stack belong to one parse transient. No production classloader/cache/concurrency mapping is selected.",
     "recursion": "Five actual entries and all42 saved-parent constructors: immutable entry outer links, admitted primary records, active capabilities only after real LT1, source push/unroll prefixes, actual one top pop before LT(-1), no Recognizer-state restore.",

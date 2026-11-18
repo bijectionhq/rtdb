@@ -78,6 +78,33 @@ const FACTOR_PREDICATE: PredicateAction = PredicateAction { state: 1639, rule: C
 const TERM_PREDICATE: PredicateAction = PredicateAction { state: 1642, rule: COMMON_VALUE, target: 1643, minimum: 60 };
 
 #[derive(Clone, Copy)]
+struct PrefixedStringLiteral {
+    alternative: usize,
+    class: ContextClass,
+    prefix: TerminalAction,
+    string: CallAction,
+}
+
+const fn prefixed_string(
+    alternative: usize, class: ContextClass, prefix_state: u32, token: i32, call_state: u32,
+) -> PrefixedStringLiteral {
+    PrefixedStringLiteral {
+        alternative,
+        class,
+        prefix: TerminalAction { state: prefix_state, rule: LITERAL, target: call_state, tokens: TokenAction::Atom(token) },
+        string: CallAction { state: call_state, rule: LITERAL, called: CHARACTER_STRING, start: 32, follow: 710, precedence: 0 },
+    }
+}
+
+const PREFIXED_STRINGS: [PrefixedStringLiteral; 5] = [
+    prefixed_string(6, ContextClass::TimeLiteral, 696, 315, 697),
+    prefixed_string(8, ContextClass::DurationLiteral, 699, 123, 700),
+    prefixed_string(9, ContextClass::UuidLiteral, 701, 344, 702),
+    prefixed_string(10, ContextClass::UriLiteral, 703, 334, 704),
+    prefixed_string(11, ContextClass::KeywordLiteral, 705, 180, 706),
+];
+
+#[derive(Clone, Copy)]
 struct NumericTail {
     class: ContextClass,
     predicate: PredicateAction,
@@ -153,16 +180,26 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
 
     fn scalar_literal(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         self.generated_ordinary(LITERAL, |session, local| {
-            let class = match session.predict_numeric(LITERAL_BASE, mode)?.number() {
-                1 => ContextClass::FloatLiteral,
-                2 => ContextClass::IntegerLiteral0,
-                3 => ContextClass::CharacterStringLiteral,
-                12 => ContextClass::BooleanLiteral,
-                13 => ContextClass::NullLiteral,
-                _ => return session.decline_numeric_site(),
+            let (class, prefixed) = match session.predict_numeric(LITERAL_BASE, mode)?.number() {
+                1 => (ContextClass::FloatLiteral, None),
+                2 => (ContextClass::IntegerLiteral0, None),
+                3 => (ContextClass::CharacterStringLiteral, None),
+                12 => (ContextClass::BooleanLiteral, None),
+                13 => (ContextClass::NullLiteral, None),
+                alternative => {
+                    let Some(literal) = PREFIXED_STRINGS.into_iter().find(|literal| literal.alternative == alternative) else {
+                        return session.decline_numeric_site();
+                    };
+                    (literal.class, Some(literal))
+                }
             };
             *local = session.labelled_context(*local, class)?;
             session.enter_outer_alt(*local)?;
+            if let Some(literal) = prefixed {
+                session.match_tree_action(*local, literal.prefix)?;
+                session.generated_call(literal.string)?;
+                return session.character_string().map(|_| ());
+            }
             match class {
                 ContextClass::FloatLiteral => session.signed_numeric_terminal(*local, FLOAT_SIGN, MATCH_FLOAT_SIGN, MATCH_FLOAT),
                 ContextClass::IntegerLiteral0 => {
@@ -316,6 +353,12 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             (None, InvocationRole::OrdinaryTreeAttachmentFailed, ParserState::State(28)) => return Ok(true),
             (Some(ContextClass::IntegerLiteral0), InvocationRole::Ordinary, ParserState::State(692)) => LITERAL_INTEGER,
             (Some(ContextClass::CharacterStringLiteral), InvocationRole::Ordinary, ParserState::State(693)) => LITERAL_CHARACTER_STRING,
+            (Some(class), InvocationRole::Ordinary, ParserState::State(state)) => {
+                let Some(literal) = PREFIXED_STRINGS.into_iter().find(|literal| literal.class == class && literal.string.state == state) else {
+                    return Ok(false);
+                };
+                literal.string
+            }
             _ => return Ok(false),
         };
         let Some(child) = self.records.last() else { return Ok(false); };
@@ -325,7 +368,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         if child.rule == call.called && child.parent == Some(current) && child.invoking == ParserState::State(call.state) {
             return Ok(true);
         }
-        if call.state != LITERAL_CHARACTER_STRING.state || child.rule != DOLLAR_STRING_TEXT
+        if call.called != CHARACTER_STRING || child.rule != DOLLAR_STRING_TEXT
             || child.invoking != ParserState::State(DOLLAR_TEXT.state) || child.stop.is_none()
         {
             return Ok(false);
