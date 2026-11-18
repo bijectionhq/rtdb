@@ -398,6 +398,20 @@ pub unsafe extern "C" fn rtdb_v1_database_pgwire_port(database: u64, out: *mut i
         Ok(())
     }) }
 }
+/// Writes the host a client reaches the pgwire listener on, as UTF-8 into `out`, and its length into `length`.
+/// A wildcard bind is reachable on loopback, so it reports `localhost`; no listener reports a length of 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_pgwire_client_host(database: u64, out: *mut u8, capacity: usize, length: *mut usize, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let host = handles::database(database)?.0.server.addresses().pgwire
+            .map(|address| if address.ip().is_unspecified() { "localhost".to_owned() } else { address.ip().to_string() })
+            .unwrap_or_default();
+        if host.len() > capacity { return Err(rtdb_types::Anomaly::incorrect("rtdb.ffi/buffer-too-small", "Host buffer is too small")); }
+        if !host.is_empty() { std::ptr::copy_nonoverlapping(host.as_ptr(), out, host.len()); }
+        *output(length)? = host.len();
+        Ok(())
+    }) }
+}
 /// Writes the bound Flight SQL port, or -1 when the configuration starts no Flight SQL listener.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_database_flight_sql_port(database: u64, out: *mut i32, error: *mut u64) -> i32 {

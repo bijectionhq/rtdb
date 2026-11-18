@@ -165,6 +165,15 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
     public int getServerPort() throws AdbcException {
         try (Arena arena = Arena.ofConfined()) { MemorySegment out = arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT); abi.call("database_pgwire_port", handle(), out); return out.get(java.lang.foreign.ValueLayout.JAVA_INT, 0); }
     }
+    /** The host a client reaches the pgwire listener on: the bound address, or localhost for a wildcard bind. */
+    private String getServerClientHost() throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(256);
+            MemorySegment length = arena.allocate(java.lang.foreign.ValueLayout.JAVA_LONG);
+            abi.call("database_pgwire_client_host", handle(), out, 256L, length);
+            return new String(out.asSlice(0, length.get(java.lang.foreign.ValueLayout.JAVA_LONG, 0)).toArray(java.lang.foreign.ValueLayout.JAVA_BYTE), java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
     /** The bound Flight SQL port, or -1 when the configuration starts no Flight SQL listener. */
     public int getFlightSqlPort() throws AdbcException {
         try (Arena arena = Arena.ofConfined()) { MemorySegment out = arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT); abi.call("database_flight_sql_port", handle(), out); return out.get(java.lang.foreign.ValueLayout.JAVA_INT, 0); }
@@ -175,7 +184,9 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
         int port;
         try { port = getServerPort(); } catch (AdbcException error) { throw new IllegalStateException(error); }
         if (port < 0) throw new IllegalStateException("This native node was opened without a pgwire server");
-        return new xtdb.api.DataSource.ConnectionBuilder("localhost", port);
+        String host;
+        try { host = getServerClientHost(); } catch (AdbcException error) { throw new IllegalStateException(error); }
+        return new xtdb.api.DataSource.ConnectionBuilder(host, port);
     }
     @Override public <T> T unwrap(Class<T> type) throws java.sql.SQLException {
         if (type.isInstance(this)) return type.cast(this);

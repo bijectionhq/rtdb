@@ -64,6 +64,18 @@ fn pgwire_port_reports_the_bound_listener_or_its_absence() {
 }
 
 #[test]
+fn pgwire_client_host_is_the_bound_address_or_localhost_for_a_wildcard() {
+    let host = |native: &Native| {
+        let (mut buffer, mut length, mut error) = ([0u8; 64], 0usize, 0);
+        ok(unsafe { rtdb_v1_database_pgwire_client_host(native.database, buffer.as_mut_ptr(), buffer.len(), &mut length, &mut error) }, error);
+        String::from_utf8(buffer[..length].to_vec()).unwrap()
+    };
+    assert_eq!(host(&Native::open()), "");
+    assert_eq!(host(&Native::open_yaml(b"server:\n  port: 0\n  host: 127.0.0.1\nflightSql: null\nnodeId: ffi-host-test\n")), "127.0.0.1");
+    assert_eq!(host(&Native::open_yaml(b"server:\n  port: 0\n  host: '*'\nflightSql: null\nnodeId: ffi-wildcard-host-test\n")), "localhost");
+}
+
+#[test]
 fn flight_sql_port_reports_the_bound_listener_or_its_absence() {
     let port = |native: &Native| { let mut port = 0; let mut error = 0; ok(unsafe { rtdb_v1_database_flight_sql_port(native.database, &mut port, &mut error) }, error); port };
     assert_eq!(port(&Native::open()), -1);
