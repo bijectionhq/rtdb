@@ -1204,3 +1204,28 @@ The reviewed write trace still constructs the same `TxOp::Sql` and resolves it a
 
 The implementation revision remains unset and the source-completeness gate remains false.
 Compilation, runtime discovery and regression execution remain pending.
+
+== Kafka observed Registry and producer request checkpoint
+
+The Registry's typed SchemaString decoder can consume actual UTF8, UTF16 and UTF32 parser windows through its cursor.
+It qualifies the Reader number guard according to the fast or slow path reached by the observed window boundaries.
+The transferred owner closes after decoding and retains a suppressed close failure alongside the primary failure.
+The live Registry HTTP path still needs observed input capture, persistent symbol state and the admitted nullable UTF16 consumers.
+
+The producer now owns its retained ordinary and bootstrap fatal errors, source Timer, synchronized waiter notification and bounded topic wait.
+A completed wait retains the generation whose partitions satisfied the caller, and RoundRobin fixes the native record's partition using that generation and the producer's persistent counter.
+The returned native QueueFull record keeps the chosen partition.
+The scoped OpenJDK ThreadLocalRandom generator supplies two-draw bounded jitter for a qualified thread history.
+Its source clock and thread history, Java Math results, queue deadline and append timestamp remain production inputs.
+
+The native broker actor can publish copied connection observations without keeping the original broker alive after completion.
+An observed submission checks the originating client, immutable broker serial, address/connect epochs and socket generation, and its fenced request has no cross-connection retry.
+The Rust metadata request can use that observed socket without reconstructing the captured name list or update scope.
+Native observations still need qualified Java selector, in-flight, throttle, readiness and reconnect histories.
+Production startup, updater and DLQ enqueue must carry those values across their actual call paths.
+
+Native admission covers the observation result and queued operation in addition to the previously selected receive, request and response owners.
+Other native allocations, including ordinary cache entries, rack scratch, diagnostics, construction, security and outbound/compression owners, remain open.
+
+The implementation revision remains unset and the source-completeness gate remains false.
+Compilation, runtime discovery and regression execution remain pending.
