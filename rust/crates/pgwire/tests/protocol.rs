@@ -872,3 +872,63 @@ async fn locale_dependent_keyword_responses_bypass_only_matching_range_grammar()
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn extended_client_probes_keep_emulation_and_sql_prepare_children_use_ordinary_sql() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let keywords = "SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()";
+    let namespace = "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
+    let cases = [
+        (keywords, b"1TZ".as_slice(), ["col1"].as_slice(), "xtdb/sql-unsupported", "Table function"),
+        (namespace, b"1tTZ".as_slice(), ["oid", "nspname", "nspowner", "nspacl", "description"].as_slice(), "xtdb/sql-error", "Duplicate column projection: oid"),
+    ];
+    let assert_prepare_error = |frames: &[(u8, Vec<u8>)], expected_tags: &[u8], code: &str, message: &str| {
+        assert_eq!(tags(frames), expected_tags);
+        assert_eq!(frames.last().unwrap().1, b"I");
+        let body = &frames[frames.len() - 2].1;
+        let detail = body.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap();
+        let anomaly: serde_json::Value = serde_json::from_slice(detail).unwrap();
+        assert_eq!(anomaly["code"], code);
+        assert_eq!(anomaly["message"], message);
+    };
+
+    for (index, (probe, description_tags, columns, code, message)) in cases.into_iter().enumerate() {
+        let direct = format!("probe_{index}");
+        client.parse(&direct, probe, &[]).await;
+        let mut describe = vec![b'S'];
+        describe.extend_from_slice(&cstring(&direct));
+        client.send(b'D', &describe).await;
+        client.send(b'S', &[]).await;
+        let description = client.through(b'Z').await;
+        assert_eq!(tags(&description), description_tags);
+        assert_eq!(description.last().unwrap().1, b"I");
+        let (count, mut fields) = description[description.len() - 2].1.split_at(2);
+        assert_eq!(count, &u16::try_from(columns.len()).unwrap().to_be_bytes());
+        for name in columns {
+            let end = fields.iter().position(|&byte| byte == 0).unwrap();
+            assert_eq!(&fields[..end], name.as_bytes());
+            fields = &fields[end + 19..];
+        }
+        assert!(fields.is_empty());
+
+        let statement = format!("prepare_{index}");
+        let portal = format!("direct_portal_{index}");
+        client.parse(&statement, &format!("PREPARE child_{index} AS {probe}"), &[]).await;
+        client.bind(&portal, &statement).await;
+        client.execute(&portal, 0).await;
+        client.send(b'S', &[]).await;
+        assert_prepare_error(&client.through(b'Z').await, b"12EZ", code, message);
+
+        let outer = format!("outer_{index}");
+        let portal = format!("nested_portal_{index}");
+        let prepared = client.query(&format!("PREPARE {outer} AS PREPARE inner_{index} AS {probe}")).await;
+        assert_eq!(prepared, vec![(b'C', b"PREPARE\0".to_vec()), (b'Z', b"I".to_vec())]);
+        client.bind(&portal, &outer).await;
+        client.execute(&portal, 0).await;
+        client.send(b'S', &[]).await;
+        assert_prepare_error(&client.through(b'Z').await, b"2EZ", code, message);
+    }
+    drop(client);
+    running.stop().await;
+}

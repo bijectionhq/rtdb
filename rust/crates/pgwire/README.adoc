@@ -56,6 +56,7 @@ Statement close releases its associated portals, and transaction completion rele
 
 The frontend preserves the reference's JDBC type-lookup exception inside a write transaction and its DBeaver projection rewrite from issue 4528.
 It also preserves the canned keyword response.
+SQL `PREPARE` bodies use ordinary SQL preparation for both queries.
 The server read-only flag applies to DML; COPY independently enforces the connection's read-only transaction state.
 `SET ROLE` follows the pinned no-response visitor.
 CancelRequest uses the connection identifier and ignores the supplied secret; BackendKeyData sends zero as the secret.

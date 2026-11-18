@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(ControlStatement), Keywords }
+enum PrepareOrigin { ClientParse, SqlPrepareChild }
 struct PreparedShape {
     kind: PreparedKind,
     columns: Option<Vec<Column>>,
@@ -71,7 +72,7 @@ impl ProtocolSession {
                 self.extended = true;
                 let name = input.string()?.to_owned(); let sql = input.string()?;
                 let count = usize::from(input.short()?); let oids = (0..count).map(|_| input.integer()).collect::<Result<Vec<_>>>()?; input.end()?;
-                let prepared = self.prepare(sql, oids).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
+                let prepared = self.prepare(sql, oids, PrepareOrigin::ClientParse).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
                 Self::planning_warnings(&prepared, writer).await?;
                 self.register_statement(name, prepared)?; writer.empty(b'1').await?;
             }
@@ -127,16 +128,17 @@ impl ProtocolSession {
         Ok(())
     }
 
-    async fn prepare(&mut self, original: &str, oids: Vec<i32>) -> Result<Arc<Prepared>> {
+    async fn prepare(&mut self, original: &str, oids: Vec<i32>, origin: PrepareOrigin) -> Result<Arc<Prepared>> {
         let _scratch = self.node.memory().reserve(original.len().checked_mul(128).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("SQL is too large"))?)?;
         let spans = rtdb_sql::split_statements(original)?;
         if spans.len() > 1 { return Err(protocol("A prepared statement must contain exactly one statement")); }
         let source = spans.first().map_or("", |span| &original[span.start..span.end]);
-        let source = replace_namespace_query(source, (source, ""));
+        let client_parse = matches!(origin, PrepareOrigin::ClientParse);
+        let source = if client_parse { replace_namespace_query(source, (source, "")) } else { source };
         let options = self.options();
         let shape = if source.is_empty() {
             PreparedShape { kind: PreparedKind::Empty, columns: None, parameter_count: 0 }
-        } else if legacy_keyword_probe(source) {
+        } else if client_parse && legacy_keyword_probe(source) {
             keyword_shape()
         } else if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.node.memory())? {
             control_shape(control, oids.len())?
@@ -255,7 +257,7 @@ impl ProtocolSession {
                         writer.string(b'C', &tag).await
                     }
                     ControlResult::Prepare { name, source, allocation: _allocation } => {
-                        let prepared = self.prepare(&source, Vec::new()).await?;
+                        let prepared = self.prepare(&source, Vec::new(), PrepareOrigin::SqlPrepareChild).await?;
                         self.install_sql_prepare(name, prepared, writer).await
                     },
                     ControlResult::CopyIn { table, format, allocation: _allocation } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
