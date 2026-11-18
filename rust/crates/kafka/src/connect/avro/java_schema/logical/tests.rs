@@ -102,12 +102,13 @@ fn decimal_object_access_distinguishes_unmatched_numeric_fallthrough_from_null_s
 #[test]
 fn fixed_decimal_precision_uses_source_wrapping_int_arithmetic_without_a_payload_allocation() {
     let mut context = support::context();
-    for (size, precision, valid) in [(1, 2, true), (1, 3, false), (2, 4, true), (2, 5, false), (16, 38, true), (16, 39, false), (0, 1, false), (268435456, 1, false)] {
+    for (size, precision, valid) in [(1, 2, true), (1, 3, false), (2, 4, true), (2, 5, false), (16, 38, true), (16, 39, false), (0, 1, false), (268435456, 1, true), (536870912, 1, false)] {
         let text = format!(r#"{{"type":"fixed","name":"F","size":{size},"logicalType":"decimal","precision":{precision}}}"#);
-        assert_eq!(logical(&text, &mut context).is_some(), valid);
+        assert_eq!(logical(&text, &mut context).is_some(), valid, "size {size}, precision {precision}");
     }
     assert_eq!(fixed_precision_bounds(0), (-1, -1));
-    assert_eq!(fixed_precision_bounds(268435456), (-1, -1));
+    assert_eq!(fixed_precision_bounds(268435456), (646456992, 646456992));
+    assert_eq!(fixed_precision_bounds(536870912), (-1, -1));
     assert_eq!(fixed_precision_bounds(16), (38, 38));
 }
 

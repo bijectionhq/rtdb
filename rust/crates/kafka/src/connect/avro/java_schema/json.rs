@@ -227,7 +227,7 @@ impl Members {
     pub(super) fn get(&self, key: &Text) -> Option<&JsonNode> {
         self.get_text(key.view())
     }
-    fn get_text(&self, key: JavaText<'_>) -> Option<&JsonNode> {
+    pub(super) fn get_text(&self, key: JavaText<'_>) -> Option<&JsonNode> {
         self.lookup.binary_search_by(|index| self.fields[*index].0.view().units().cmp(key.units())).ok()
             .map(|index| &self.fields[self.lookup[index]].1)
     }
