@@ -53,6 +53,8 @@ impl Context<'_> {
                 let name = identifier(name);
                 if let Some(function) = bare_scalar_name(&name, 1) {
                     call(function, Vec::new())?
+                } else if let Some(constant) = catalog_constant(std::slice::from_ref(&name), None)? {
+                    constant
                 } else {
                     match input.scope().resolve(self, std::slice::from_ref(&name)) {
                         Err(missing) if missing.code == "xtdb/column-not-found" && name.normalized() == "user" => {
@@ -66,6 +68,8 @@ impl Context<'_> {
                 let names: Vec<_> = names.iter().map(identifier).collect();
                 if let Some(function) = names.last().and_then(|name| bare_scalar_name(name, names.len())) {
                     call(function, Vec::new())?
+                } else if let Some(constant) = catalog_constant(&names, None)? {
+                    constant
                 } else {
                     let resolved = input.scope().resolve(self, &names);
                     self.recover_column(resolved, &names)?
@@ -191,6 +195,11 @@ impl Context<'_> {
                 if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(unsupported("Window function or scalar function modifiers")); }
                 if let Some((query, value)) = function_query(function) {
                     return self.query_value(query, input, value);
+                }
+                if let ast::FunctionArguments::List(arguments) = &function.args
+                    && arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty()
+                    && let Some(constant) = catalog_constant(&identifiers(&function.name)?, Some(&arguments.args))? {
+                    return Ok(constant);
                 }
                 let units = match &function.args {
                     ast::FunctionArguments::List(arguments) => scalar_argument_units(arguments)?,
@@ -447,6 +456,30 @@ pub(crate) fn bare_scalar_name(name: &rtdb_plan::Identifier, parts: usize) -> Op
         | "local_date" | "snapshot_token" if parts == 1 => Some(function),
         _ => None,
     }
+}
+
+/// pg_catalog introspection stubs: constants whose arguments are never bound, so they need not resolve.
+fn catalog_constant(names: &[rtdb_plan::Identifier], args: Option<&[ast::FunctionArg]>) -> Result<Option<Expr>> {
+    let [.., last] = names else { return Ok(None); };
+    if names.len() > 2 || last.quoted { return Ok(None); }
+    let name = last.normalized();
+    let expressions = args.map(|args| args.iter().map(|arg| match arg {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Some(expr),
+        _ => None,
+    }).collect::<Option<Vec<_>>>());
+    let count = match &expressions { None => None, Some(Some(expressions)) => Some(expressions.len()), Some(None) => return Err(error(format!("Invalid arguments to {name}"))) };
+    let column = || matches!(expressions.as_ref().and_then(Option::as_deref), Some([ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)]));
+    let (value, valid) = match name.as_str() {
+        "has_table_privilege" | "has_schema_privilege" | "has_any_column_privilege" if count.is_some() => (Value::Bool(true), matches!(count, Some(2 | 3))),
+        "pg_table_is_visible" if count.is_some() => (Value::Bool(true), column()),
+        "pg_get_userbyid" if count.is_some() => (Value::Utf8("xtdb".into()), column()),
+        "pg_get_indexdef" if count.is_some() => (Value::Null, matches!(count, Some(1 | 3))),
+        "pg_get_expr" => (Value::Null, matches!(count, None | Some(2 | 3))),
+        "_pg_expandarray" => (Value::Null, matches!(count, None | Some(1))),
+        _ => return Ok(None),
+    };
+    if !valid { return Err(error(format!("Invalid arguments to {name}"))); }
+    Ok(Some(Expr::Literal(value)))
 }
 
 pub(crate) fn scalar_argument_units(arguments: &ast::FunctionArgumentList) -> Result<Option<&ast::CharacterLengthUnits>> {
