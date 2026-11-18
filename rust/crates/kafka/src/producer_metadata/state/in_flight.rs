@@ -82,7 +82,7 @@ impl<T> InFlightQueue<T> {
         }
     }
 
-    fn reserve_slot(&self) -> Result<Option<Storage<T>>> {
+    fn reserve_slot(&mut self) -> Result<Option<Storage<T>>> {
         if self.count() == i32::MAX {
             return Err(Anomaly::unsupported("rtdb/kafka-in-flight-size", "Java request queues require a signed int length"));
         }
