@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -22,16 +22,56 @@ impl RetainedBytes {
 impl AsRef<[u8]> for RetainedBytes { fn as_ref(&self) -> &[u8] { self.as_slice() } }
 
 #[derive(Clone, Debug)]
-pub struct Documents { rows: Arc<Vec<BTreeMap<String, Value>>>, _reservation: Arc<MemoryReservation> }
+pub struct Documents(Arc<DocumentBatch>);
+
+#[derive(Debug)]
+struct DocumentBatch {
+    rows: Vec<BTreeMap<String, Value>>,
+    columns: Vec<String>,
+    _reservation: Arc<MemoryReservation>,
+}
+
 impl Documents {
-    pub fn new(mut rows: Vec<BTreeMap<String, Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        for row in &mut rows { row.values_mut().for_each(Value::admit_object_dates); }
-        let bytes = rows.iter().try_fold(rows.capacity().checked_mul(std::mem::size_of::<BTreeMap<String, Value>>()).ok_or_else(overflow)?, |bytes, row| {
+    pub fn new(rows: Vec<BTreeMap<String, Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mut reservations = Vec::new();
+        let mut names = BTreeSet::new();
+        for name in rows.iter().flat_map(|row| row.keys()) {
+            if !names.contains(name) {
+                reservations.push(memory.reserve(name.len().checked_add(128).ok_or_else(overflow)?)?);
+                names.insert(name);
+            }
+        }
+        let columns = names.into_iter().cloned().collect();
+        Self::with_column_order(rows, columns, memory)
+    }
+
+    /// Adopts row values and their declared column order, including all-null or empty columns.
+    pub fn with_column_order(
+        mut rows: Vec<BTreeMap<String, Value>>,
+        columns: Vec<String>,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let row_bytes = rows.iter().try_fold(rows.capacity().checked_mul(std::mem::size_of::<BTreeMap<String, Value>>()).ok_or_else(overflow)?, |bytes, row| {
             bytes.checked_add(Value::document_retained_bytes(row)?).ok_or_else(overflow)
         })?;
-        Ok(Self { rows: Arc::new(rows), _reservation: memory.reserve(bytes.checked_add(128).ok_or_else(overflow)?)? })
+        let column_bytes = columns.iter().try_fold(columns.capacity().checked_mul(std::mem::size_of::<String>()).ok_or_else(overflow)?, |bytes, name| {
+            bytes.checked_add(name.capacity()).ok_or_else(overflow)
+        })?;
+        let bytes = row_bytes.checked_add(column_bytes).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)?;
+        let reservation = memory.reserve(bytes)?;
+        let _scratch = memory.reserve(columns.len().checked_mul(64).ok_or_else(overflow)?)?;
+        let names: BTreeSet<&str> = columns.iter().map(String::as_str).collect();
+        if names.len() != columns.len() || rows.iter().any(|row| row.keys().any(|name| !names.contains(name.as_str()))) {
+            return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document columns must be unique and cover every field in every row"));
+        }
+        for row in &mut rows { row.values_mut().for_each(Value::admit_object_dates); }
+        Ok(Self(Arc::new(DocumentBatch { rows, columns, _reservation: reservation })))
     }
-    pub fn rows(&self) -> &[BTreeMap<String, Value>] { &self.rows }
+
+    pub fn rows(&self) -> &[BTreeMap<String, Value>] { &self.0.rows }
+
+    /// Returns the source column order for this document batch.
+    pub fn columns(&self) -> &[String] { &self.0.columns }
 }
 
 #[derive(Clone, Debug)]

@@ -14,6 +14,8 @@ It preserves raw SQL for data-dependent statements and distinguishes absent argu
 INSERT, UPDATE, and DELETE RETURNING clauses are syntax-checked and ignored by shared SQL preparation, including during static INSERT expansion.
 `tests/returning.rs` maps `ignore-returning-keys-3668` through staged mutation, parameter binding, committed reads, and static source encoding; its assertions have not run.
 Source replay decodes its recorded operations without repeating submit-time expansion.
+Document batches own their ordered columns along with their row values.
+The source encoder carries document columns in first encounter order in each table and mutation leg, and the decoder recovers that order from the Arrow field layout.
 Each SQL statement and each argument row binds against durable rows, resolved predecessors, and the current transaction's preceding writes.
 Resolution reserves temporary SQL syntax before lowering each mutation.
 For a mutation that opens a query, the syntax reservation stays live through plan admission and releases before execution.

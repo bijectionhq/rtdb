@@ -357,6 +357,7 @@ entity SourceMessage {
 
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
+    -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
     default_tz: ZoneId               -- always present
     user: String?
