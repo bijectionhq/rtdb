@@ -758,7 +758,8 @@ rule BufferDml {
     -- An explicit transaction is open: buffer the DML into it, even when auto_commit is
     -- on. Rejected if the open tx is read-only (see DmlInReadOnlyRejected) or failed
     -- (see FailedTransactionRejectsStatements).
-    -- The buffer accepts the supplied SQL argument width; submission and transaction resolution validate it when the transaction commits.
+    -- The buffer retains the argument width supplied by the frontend.
+    -- At commit, the database applies the submission and resolution rules for those SQL arguments.
     when: ExecuteStatement(frontend, connection, kind, statement)
     requires: kind = dml
     requires: connection.tx != null

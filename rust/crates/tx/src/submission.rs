@@ -51,15 +51,15 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     fn needs_resolver(input: &Relation) -> bool { input.expressions().iter().any(|expr| resolve_only(expr)) || input.children().iter().any(|input| needs_resolver(input)) }
     if needs_resolver(&plan.input) || plan.valid_time.expressions().iter().any(|expr| resolve_only(expr)) { return Ok(None); }
     if args.is_some_and(|args| args.row_count() == 0) { return Ok(None); }
-    let count = plan.input.parameter_count().max(plan.valid_time.expressions().iter().map(|expr| {
+    let parameter_count = plan.input.parameter_count().max(plan.valid_time.expressions().iter().map(|expr| {
         let mut count = 0; expr.visit(&mut |expr| { if let rtdb_plan::Expr::Parameter { index, .. } = expr { count = count.max(index + 1); } }); count
     }).max().unwrap_or(0));
-    if args.is_none() && count > 0 { return Err(Anomaly::incorrect("xtdb/missing-arg", "Static SQL requires arguments")); }
-    if args.is_some_and(|args| args.types().len() != count) { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", "Static SQL argument count differs")); }
+    if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
     let parameter_rows: Box<dyn Iterator<Item = &[Value]> + '_> = match args { Some(args) => Box::new(args.rows()), None => Box::new(std::iter::once(&[][..])) };
     let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<BTreeMap<String, Value>>)> = Vec::new();
     let mut reservations = Vec::new();
     for parameters in parameter_rows {
+        let parameters = &parameters[..parameter_count];
         let parameter_bytes = parameters.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
         let mut expression_count = 0usize;
         fn count(input: &Relation, total: &mut usize) { for expr in input.expressions() { expr.visit(&mut |_| *total += 1); } for child in input.children() { count(child, total); } }
@@ -200,6 +200,28 @@ mod tests {
         assert_eq!(error.code, "");
         assert_eq!(error.message.as_deref(), Some("Unsupported precision: 77"));
         assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+    use crate::source::Operation;
+
+    #[test]
+    fn static_expansion_requires_referenced_positions_and_ignores_unused_arguments() {
+        let memory = MemoryBudget::new(1 << 25);
+        let sql = "INSERT INTO docs (_id, v) VALUES (?, ?)";
+        let batch = |row: Vec<Value>| SqlArguments::new(row.iter().map(Value::logical_type).collect(), vec![row], &memory).unwrap();
+        let submit = |args| prepare_submission(vec![TxOp::Sql { sql: sql.into(), args }], SubmitOptions::default(), "xtdb", &memory).unwrap();
+
+        for args in [None, Some(batch(vec![Value::I64(3)]))] {
+            let source = submit(args);
+            assert!(matches!(&source.operations[..], [Operation::Public(TxOp::Sql { .. })]));
+        }
+        let source = submit(Some(batch(vec![Value::I64(3), Value::I64(4), Value::I64(5)])));
+        let [Operation::Public(TxOp::PutDocs { documents, .. })] = &source.operations[..] else { panic!("expanded documents") };
+        assert_eq!(documents.rows(), &[BTreeMap::from([("_id".into(), Value::I64(3)), ("v".into(), Value::I64(4))])]);
     }
 }
 

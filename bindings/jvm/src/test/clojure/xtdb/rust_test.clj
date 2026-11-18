@@ -178,6 +178,27 @@
 (deftest-original-api original-sql/ignore-returning-keys-3668)
 (deftest-original-api original-sql/read-write-promotion-conflict-in-live-rel-3709)
 
+(deftest-original-api original-sql/test-tx-ops-sql-params)
+
+(deftest sql-argument-validation-preserves-transaction-outcomes
+  (tu/with-allocator
+   #(tu/with-mock-clock
+     (fn []
+       (with-native-node
+         (fn []
+           (let [sql "INSERT INTO docs (_id, v) VALUES (?, ?)"
+                 errors (mapv (fn [op]
+                                (try (xt/execute-tx tu/*node* [op])
+                                     (catch xtdb.api.error.Incorrect error (ex-data error))))
+                              [[:sql sql] [:sql sql [2]]])]
+             (is (= [:xtdb.indexer/missing-sql-args :xtdb.indexer/incorrect-sql-arg-count]
+                    (mapv :xtdb.error/code errors)))
+             (is (= [0 1] (mapv (fn [error] (get-in error [:tx-key :tx-id])) errors)))
+             (is (= 2 (:tx-id (xt/execute-tx tu/*node* [[:sql sql [3 4 5]]]))))
+             (is (= [{:xt/id 0, :committed false} {:xt/id 1, :committed false} {:xt/id 2, :committed true}]
+                    (xt/q tu/*node* "SELECT _id, committed FROM xt.txs ORDER BY _id")))
+             (is (= [{:xt/id 3, :v 4}] (xt/q tu/*node* "SELECT * FROM docs"))))))))))
+
 (deftest-original-api original-sql/test-current-catalog)
 (deftest-original-api original-sql/test-c-style-escapes-3415)
 (deftest-original-api original-sql/test-delete-with-unqualified-col-3017)

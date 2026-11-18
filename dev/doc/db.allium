@@ -704,6 +704,8 @@ rule TransitionToFollower {
 
 rule ClientSubmitsTransaction {
     -- A client submits a transaction: it is appended to the SOURCE log, which every node shares, so this succeeds whether or not this node happens to be the leader.
+    -- Static expansion reads the referenced argument positions and can expand an operation that supplies additional arguments.
+    -- An operation missing a referenced argument proceeds to transaction resolution as SQL, where the argument failure aborts the transaction.
     when: ClientSubmitsTx(client, database, tx_ops, opts)
 
     requires: database.external_source = null
