@@ -383,3 +383,43 @@ async fn custom_commit_sends_result_with_await_token_and_durable_transaction_ide
     let results = client.action("xtdb.CommitTransaction", tx).await.unwrap(); assert_eq!(results.len(), 1);
     let value: serde_json::Value = serde_json::from_slice(&results[0].body).unwrap(); assert_eq!(value["committed"], true); assert!(value["txId"].is_i64()); assert!(value["systemTime"].is_string()); assert!(value["awaitToken"].is_string()); assert!(value["error"].is_null()); running.stop().await;
 }
+
+#[tokio::test]
+async fn uuid_and_fixed_size_binary_results_keep_their_arrow_storage_and_extension() {
+    use arrow_array::{Array, FixedSizeBinaryArray};
+    use std::collections::HashMap;
+    let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
+    let uuid_metadata = HashMap::from([("ARROW:extension:name".to_owned(), "uuid".to_owned()), ("ARROW:extension:metadata".to_owned(), String::new())]);
+    let uuids: [Option<[u8; 16]>; 2] = [Some(std::array::from_fn(|index| 0xf0 | index as u8)), None];
+    let fixed: [Option<[u8; 4]>; 2] = [None, Some([0xde, 0xad, 0xbe, 0xef])];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_id", DataType::Int64, false),
+        Field::new("u", DataType::FixedSizeBinary(16), true).with_metadata(uuid_metadata.clone()),
+        Field::new("b", DataType::FixedSizeBinary(4), true),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![
+        Arc::new(Int64Array::from(vec![1, 2])),
+        Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(uuids.iter().map(|value| value.as_ref().map(|bytes| bytes.as_slice())), 16).unwrap()),
+        Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(fixed.iter().map(|value| value.as_ref().map(|bytes| bytes.as_slice())), 4).unwrap()),
+    ]).unwrap();
+    client.upload(CommandStatementIngest { table: "docs".into(), ..Default::default() }, vec![batch]).await;
+    let info = client.info("SELECT u, b, UUID 'f0f1f2f3-f4f5-f6f7-f8f9-fafbfcfdfeff' AS literal FROM docs ORDER BY _id", None).await;
+    let announced = info.clone().try_decode_schema().unwrap();
+    let rows = client.redeem(&info).await;
+    assert_eq!(rows[0].schema().as_ref(), &announced);
+    let field = |name: &str| announced.field_with_name(name).unwrap().clone();
+    for name in ["u", "literal"] {
+        assert_eq!(field(name).data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(field(name).metadata(), &uuid_metadata);
+    }
+    assert_eq!(field("b").data_type(), &DataType::FixedSizeBinary(4));
+    assert!(field("b").metadata().get("ARROW:extension:name").is_none());
+    let column = |name: &str| rows.iter().flat_map(|page| {
+        let array = page.column_by_name(name).unwrap().as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap().clone();
+        (0..array.len()).map(move |row| array.is_valid(row).then(|| array.value(row).to_vec()))
+    }).collect::<Vec<_>>();
+    assert_eq!(column("u"), uuids.iter().map(|value| value.map(|bytes| bytes.to_vec())).collect::<Vec<_>>());
+    assert_eq!(column("b"), fixed.iter().map(|value| value.map(|bytes| bytes.to_vec())).collect::<Vec<_>>());
+    assert_eq!(column("literal"), vec![uuids[0].map(|bytes| bytes.to_vec()); 2]);
+    running.stop().await;
+}
