@@ -16,7 +16,7 @@ BOUNDARY = re.compile(
     r"cannot be cast to class xtdb\.api\.Xtdb\b|xtdb\.NodeBase|xtdb\.database\.Database\$Catalog|"
     r"cannot be cast to class xtdb\.api\.Xtdb\$Connection|No implementation of method: :\S+ of protocol: #'xtdb\.(db|node)|"
     r"NativeDatabase cannot be cast to class clojure\.lang\.(Associative|ILookup|IPersistentMap)|"
-    r"Unsupported native start-node options|No serializer found for class")
+    r"Unsupported native start-node options|No serializer found for class|plans through the JVM database catalog")
 ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 

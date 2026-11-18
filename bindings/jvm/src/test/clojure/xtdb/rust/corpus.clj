@@ -173,7 +173,8 @@
   {'xtdb.pgwire-test/with-server-and-port (port-fixture 'xtdb.pgwire-test/*port* 'xtdb.pgwire-test/*server*)
    'xtdb.pgwire.pg2-test/with-server-and-port (port-fixture 'xtdb.pgwire.pg2-test/*port* 'xtdb.pgwire.pg2-test/*server*)
    'xtdb.pgwire-protocol-test/with-port (port-fixture 'xtdb.pgwire-protocol-test/*port* nil)
-   'xtdb.pgwire.authn-test/with-port (port-fixture 'xtdb.pgwire.authn-test/*port* nil)})
+   'xtdb.pgwire.authn-test/with-port (port-fixture 'xtdb.pgwire.authn-test/*port* nil)
+   'xtdb.sql.logic-test.runner/with-xtdb (fn [_] (throw (ex-info "The SQL logic XTDB engine plans through the JVM database catalog" {})))})
 
 (defn- native-fixtures [fixtures]
   (let [overrides (into {} (keep (fn [[sym fixture]] (when-let [v (resolve sym)] [@v fixture]))) fixture-overrides)]
