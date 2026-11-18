@@ -47,7 +47,7 @@ pub use clojure_index::{CheckedIndex,ClojureKeyIndex,DuplicateKey,KeySemantics};
 pub use murmur3::murmur3_32;
 
 mod decimal_text;
-pub use decimal_text::{DecimalSpelling, decimal_digit, decimal_spelling, decimal_text_scale};
+pub use decimal_text::{DecimalSpelling, decimal_digit, decimal_spelling, decimal_text_scale, hexadecimal_digit};
 mod sql_time;
 pub use sql_time::{parse_sql_timestamp_literal, parse_sql_timestamp_cast, parse_sql_timestamp_instant, parse_sql_local_datetime, parse_sql_zoned_datetime, parse_sql_date_literal, parse_query_clock, validate_sql_time_literal};
 mod duration_text;

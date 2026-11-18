@@ -363,6 +363,9 @@ Stored Transit field access constructs semantic objects through the wire decoder
 Repeated cached byte-array and NaN keys retain object identity during record construction, including NaN returned unchanged by ratio division.
 The cache and constructed objects remain owned by one evaluation; `tests/transit_objects.rs` records the MessagePack and JSON cases as unexecuted regression source.
 Equality between two stored Transit values constructs each registered object graph before comparing it.
+Casting text to VARBINARY decodes pairs of hexadecimal digits.
+The inverse cast uses lowercase hexadecimal with a `\x` prefix.
+
 SQL equality compares the emitted byte buffers of UTF8, keyword, UUID, variable binary and fixed binary values by content.
 These values retain their logical types in the query result.
 Scalar ordering predicates compare unsigned bytes within one byte-buffer type and signed bytes across different byte-buffer types.

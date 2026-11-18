@@ -210,7 +210,7 @@ fn decode_long(text: &str) -> Result<i64> {
     let limit = if negative { i64::MIN } else { -i64::MAX };
     let mut value = 0i64;
     for digit in digits.chars() {
-        let digit = rtdb_types::decimal_digit(digit).map(u32::from).or_else(||match digit { 'a'..='f' => Some(digit as u32 - 'a' as u32 + 10),'A'..='F' => Some(digit as u32 - 'A' as u32 + 10),'ａ'..='ｆ' => Some(digit as u32 - 'ａ' as u32 + 10),'Ａ'..='Ｆ' => Some(digit as u32 - 'Ａ' as u32 + 10),_ => None }).filter(|digit|*digit < radix).ok_or_else(invalid)?;
+        let digit = rtdb_types::hexadecimal_digit(digit).map(u32::from).filter(|digit|*digit < radix).ok_or_else(invalid)?;
         value = value.checked_mul(i64::from(radix)).and_then(|value|value.checked_sub(i64::from(digit))).filter(|value|*value >= limit).ok_or_else(invalid)?;
     }
     Ok(if negative { value } else { -value })

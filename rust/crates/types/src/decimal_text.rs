@@ -35,6 +35,17 @@ pub fn decimal_digit(character: char) -> Option<u8> {
     (digit < 10).then_some(digit as u8)
 }
 
+/// Returns the Java hexadecimal digit value for a BMP character.
+pub fn hexadecimal_digit(character: char) -> Option<u8> {
+    match character {
+        'a'..='f' => Some(character as u8 - b'a' + 10),
+        'A'..='F' => Some(character as u8 - b'A' + 10),
+        'ａ'..='ｆ' => Some((u32::from(character) - u32::from('ａ')) as u8 + 10),
+        'Ａ'..='Ｆ' => Some((u32::from(character) - u32::from('Ａ')) as u8 + 10),
+        _ => decimal_digit(character),
+    }
+}
+
 /// Normalizes Java decimal digits and validates the coefficient, exponent, and final scale.
 /// - ASCII input allocates nothing; other input allocates at most `text.len()` bytes before validation.
 ///   The caller must include that scratch/retained allocation in its input reservation.

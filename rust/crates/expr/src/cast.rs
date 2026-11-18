@@ -218,11 +218,30 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
                 if let S::FixedSizeBinary(width) = target { if bytes.len() != *width as usize { return Err(inapplicable("fixed-size binary", &[value])); } }
                 Ok(if *target == S::Binary { Value::Binary(bytes.clone()) } else { Value::FixedSizeBinary(bytes.clone()) })
             }
-            Value::Utf8(text) if *target == S::Binary => Ok(Value::Binary(text.as_bytes().to_vec())),
+            Value::Utf8(text) if *target == S::Binary => binary_from_hex(text).map(Value::Binary),
             _ => Err(inapplicable("binary", &[value])),
         },
         _ => Err(inapplicable("cast", &[value])),
     }
+}
+
+fn binary_from_hex(text: &str) -> Result<Vec<u8>> {
+    let length = text.encode_utf16().count();
+    if !length.is_multiple_of(2) {
+        return Err(Anomaly::fault("xtdb.error/unknown", format!("Odd number of characters {length}.")));
+    }
+    let digit = |unit: u16, index| {
+        char::from_u32(u32::from(unit)).and_then(rtdb_types::hexadecimal_digit).ok_or_else(|| {
+            Anomaly::fault("xtdb.error/unknown", format!("Illegal hexadecimal character 0x{:02X} at index {index}.", unit as u8))
+        })
+    };
+    let mut bytes = Vec::with_capacity(length / 2);
+    let mut units = text.encode_utf16().enumerate();
+    while let Some((index, high)) = units.next() {
+        let (next_index, low) = units.next().expect("validated the even UTF-16 length");
+        bytes.push((digit(high, index)? << 4) | digit(low, next_index)?);
+    }
+    Ok(bytes)
 }
 
 /// Applies expression cast semantics, including source-preserving decimal defaults and recursive lists.

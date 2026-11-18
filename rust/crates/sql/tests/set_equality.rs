@@ -62,6 +62,24 @@ async fn byte_buffer_predicates_and_vector_ordering_follow_their_respective_type
 }
 
 #[tokio::test]
+async fn text_to_varbinary_uses_hexadecimal_digits_and_reports_utf16_offsets() {
+    assert_eq!(query("SELECT CAST('616263' AS VARBINARY) = KEYWORD 'abc', CAST('0AfF' AS BYTEA), CAST('' AS VARBINARY), CAST('０１' AS VARBINARY), CAST('١٠' AS VARBINARY), CAST('Ａｆ' AS VARBINARY)", vec![]).await.unwrap(),
+        [vec![V::Bool(true), V::Binary(vec![0x0a, 0xff]), V::Binary(vec![]), V::Binary(vec![1]), V::Binary(vec![16]), V::Binary(vec![0xaf])]]);
+    assert_eq!(query("SELECT CAST(CAST('616263' AS VARBINARY) AS TEXT)", vec![]).await.unwrap(),
+        [vec![V::Utf8("\\x616263".into())]]);
+    for (input, expected) in [
+        ("0", "Odd number of characters 1."),
+        ("0g", "Illegal hexadecimal character 0x67 at index 1."),
+        ("é0", "Illegal hexadecimal character 0xE9 at index 0."),
+        ("😀", "Illegal hexadecimal character 0x3D at index 0."),
+    ] {
+        let error = query("SELECT CAST($1 AS VARBINARY)", vec![V::Utf8(input.into())]).await.unwrap_err();
+        assert_eq!(error.code, "xtdb.error/unknown");
+        assert_eq!(error.message.as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
 async fn sql_equality_rejects_runtime_set_parameters_and_empty_declared_set_lists() {
     for source in ["SELECT $1 = $2","SELECT $1 <> $2","SELECT $1 IS DISTINCT FROM $2","SELECT 1 WHERE $1 = $2","SELECT CASE WHEN FALSE THEN $1 = $2 ELSE TRUE END"] {
         assert_eq!(query(source,vec![V::Set(vec![]),V::Set(vec![])]).await.unwrap_err().code,"xtdb.expression/set-equality","{source}");

@@ -237,15 +237,14 @@ fn uuid(value: &Object) -> Result<[i64;2]> {
         let (Number::Long(left),Number::Long(right)) = (left.as_ref(),right.as_ref()) else { return Err(invalid()); };Ok([*left,*right])
     }
 }
-fn hex_digit(value: char) -> Option<u8> { rtdb_types::decimal_digit(value).or_else(||match value { 'a'..='f' => Some(value as u8 - b'a' + 10),'A'..='F' => Some(value as u8 - b'A' + 10),'\u{ff41}'..='\u{ff46}' => Some((value as u32 - 0xff41 + 10) as u8),'\u{ff21}'..='\u{ff26}' => Some((value as u32 - 0xff21 + 10) as u8),_ => None }) }
 fn java_hex(text: &str) -> Result<i64> {
     let digits = text.strip_prefix('+').unwrap_or(text);if digits.is_empty() { return Err(invalid()); }
-    digits.chars().try_fold(0i64,|value,digit|value.checked_mul(16).and_then(|value|value.checked_add(i64::from(hex_digit(digit)?))).ok_or_else(invalid))
+    digits.chars().try_fold(0i64,|value,digit|value.checked_mul(16).and_then(|value|value.checked_add(i64::from(rtdb_types::hexadecimal_digit(digit)?))).ok_or_else(invalid))
 }
 fn byte_buffer(text: &str) -> Result<Vec<u8>> {
     let units = text.encode_utf16().collect::<Vec<_>>();if units.len() < 2 || units.len() % 2 != 0 { return Err(invalid()); }
     units[2..].chunks_exact(2).map(|pair| {
-        let digit = |value|char::from_u32(u32::from(value)).and_then(hex_digit).ok_or_else(invalid);
+        let digit = |value|char::from_u32(u32::from(value)).and_then(rtdb_types::hexadecimal_digit).ok_or_else(invalid);
         Ok(digit(pair[0])? * 16 + digit(pair[1])?)
     }).collect()
 }
