@@ -188,8 +188,8 @@
         "rust/crates/storage/src/log/local.rs": "6120a36e774aec5598e0da629c27045bc843f559943c360ccdeb125ec4da2d5c",
         "rust/crates/storage/src/log/memory.rs": "3a431b06592f32559c31768da6bc8b5f9fa6a98e6fe11a386d647f6d31892aca",
         "rust/crates/storage/src/log/read_only.rs": "ec0a94c3d47f5cc447c27f051748da9f18800d559d10d52bc288a49129b1a22a",
-        "rust/crates/kafka/src/lib.rs": "17748ca1378e9a2027785bb69c8cd2c45b5f1f87ecbc583c0fa4e9662202b21e",
-        "rust/crates/kafka/src/log_configuration.rs": "1afd0cdd8d2a65898ad952560f122f6306293e84edc324b267399f769c78b9cf",
+        "rust/crates/kafka/src/lib.rs": "1bf39692c791e06c9fd9633fa3964afa1da4344a22a0fb3a34a1ee3a418b54f0",
+        "rust/crates/kafka/src/log_configuration.rs": "4f76c1c95041775abb5551536964783c9385a6643569d9337fd4e70129e8a24c",
         "rust/crates/kafka/src/tail.rs": "7065a2c34ca223af11cef4bf031a7ce2b0fc7ed82de2483830f7f218d62091ed",
         "rust/vendor/rdkafka/src/message.rs": "8992730b18b16a1b500c237a48f4814f8288e4cbf37d60575965a8487d5103ec"
       }

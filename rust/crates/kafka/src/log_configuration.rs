@@ -1,9 +1,9 @@
-use std::{collections::BTreeMap, ops::Deref, sync::Arc};
+use std::{ops::Deref, sync::Arc};
 
 use rdkafka::{ClientConfig, error::KafkaError};
-use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, MemoryReservation, Result};
+use rtdb_types::{AllocationScope, MemoryBudget, Result};
 
-use crate::{client, config::providers};
+use crate::{KafkaClusterConfig, client, config::{ClientProperties, properties_bound, property_allocation, providers}};
 
 pub(crate) enum LogConfiguration {
     Common(ClientConfig),
@@ -11,9 +11,8 @@ pub(crate) enum LogConfiguration {
 }
 
 pub(crate) struct ProviderConfiguration {
-    original: BTreeMap<String, String>,
+    original: ClientProperties,
     memory: Arc<MemoryBudget>,
-    _charge: Arc<MemoryReservation>,
 }
 
 #[derive(Clone, Copy)]
@@ -57,10 +56,13 @@ impl PreparedLogClient {
 }
 
 impl LogConfiguration {
-    pub(crate) fn from_cluster(original: BTreeMap<String, String>, memory: Arc<MemoryBudget>) -> Result<Self> {
-        if !providers::configured(&original) { return client::prepare(&original, &memory).map(Self::Common); }
-        let charge = memory.reserve(property_bound(&original)?)?;
-        Ok(Self::Providers(ProviderConfiguration { original, memory, _charge: charge }))
+    pub(crate) fn from_cluster(cluster: &KafkaClusterConfig, memory: Arc<MemoryBudget>) -> Result<Self> {
+        let mut original = cluster.capture_client_properties(&memory)?;
+        if !providers::configured(&original.values) {
+            original.values.retain(|name, _| !providers::control_property(name));
+            return client::prepare(&original.values, &memory).map(Self::Common);
+        }
+        Ok(Self::Providers(ProviderConfiguration { original, memory }))
     }
 
     pub(crate) fn prepare(&self, role: Role) -> Result<PreparedLogClient> {
@@ -69,8 +71,8 @@ impl LogConfiguration {
             Self::Providers(provider) => provider,
         };
         let allocation = AllocationScope::new(&provider.memory)?;
-        allocation.reserve(property_bound(&provider.original)?)?;
-        let mut properties = provider.original.clone();
+        allocation.reserve(properties_bound(&provider.original.values)?)?;
+        let mut properties = provider.original.values.clone();
         for name in role.overrides() {
             properties.remove(*name);
         }
@@ -78,30 +80,21 @@ impl LogConfiguration {
             properties = resolved;
         }
         properties.retain(|name, _| !providers::control_property(name));
-        allocation.reserve(property_bound(&properties)?.checked_mul(8).ok_or_else(overflow)?)?;
+        allocation.reserve(properties_bound(&properties)?.checked_mul(8).ok_or_else(property_allocation)?)?;
         let configuration = client::prepare(&properties, &provider.memory)?;
         Ok(PreparedLogClient { configuration, allocation: Some(allocation) })
     }
 
     pub(crate) fn overridden_acks(&self) -> Option<&str> {
         let Self::Providers(provider) = self else { return None; };
-        provider.original.get("acks").map(String::as_str).filter(|value| *value != "all" && *value != "-1")
+        provider.original.values.get("acks").map(String::as_str).filter(|value| *value != "all" && *value != "-1")
     }
-}
-
-fn property_bound(properties: &BTreeMap<String, String>) -> Result<usize> {
-    properties.iter().try_fold(4096usize, |sum, (name, value)| {
-        sum.checked_add(512)?.checked_add(name.capacity())?.checked_add(value.capacity())
-    }).ok_or_else(overflow)
-}
-
-fn overflow() -> Anomaly {
-    Anomaly::incorrect("xtdb.kafka/config-allocation", "Kafka configuration exceeds addressable memory")
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn log_client_roles_remove_source_overrides_before_provider_demand() {
@@ -116,10 +109,12 @@ mod tests {
         for (role, overridden) in [(Role::Consumer, &["key.deserializer"][..]), (Role::Producer, &["key.serializer", "acks"][..])] {
             let mut properties = original.clone();
             for &name in overridden { properties.insert(name.into(), value.clone()); }
-            let log = LogConfiguration::from_cluster(properties, Arc::clone(&memory)).unwrap();
+            let cluster = KafkaClusterConfig { properties_map: properties, ..KafkaClusterConfig::new("mock:9092") };
+            let log = LogConfiguration::from_cluster(&cluster, Arc::clone(&memory)).unwrap();
             let retained = memory.used_bytes();
             let config = log.prepare(role).unwrap();
-            assert!(config.configuration.config_map().is_empty());
+            assert_eq!(config.configuration.config_map().len(), 1);
+            assert_eq!(config.configuration.get("bootstrap.servers"), Some("mock:9092"));
             assert!(log.prepare(Role::Admin).is_err());
             drop(config);
             assert_eq!(memory.used_bytes(), retained);

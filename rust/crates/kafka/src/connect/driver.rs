@@ -125,15 +125,14 @@ impl SourceDriver {
     fn consumer_configuration(&mut self) -> Result<ConsumerConfiguration> {
         use crate::config::{providers, signed_integer};
 
-        let mut properties = self.cluster.properties()?;
+        let mut captured = self.cluster.capture_client_properties(&self.memory)?;
+        let properties = &mut captured.values;
         for key in ["key.deserializer", "value.deserializer", "enable.auto.commit"] { properties.remove(key); }
-        let scope = if providers::configured(&properties) {
-            let scope = AllocationScope::new(&self.memory)?;
-            if let std::borrow::Cow::Owned(resolved) = providers::resolve(&properties, &self.memory, &mut |bytes| scope.reserve(bytes))? {
-                properties = resolved;
+        if let Some(scope) = captured.allocation.as_ref() {
+            if let std::borrow::Cow::Owned(resolved) = providers::resolve(properties, &self.memory, &mut |bytes| scope.reserve(bytes))? {
+                *properties = resolved;
             }
-            Some(scope)
-        } else { None };
+        }
         if let Some(maximum) = properties.remove("max.poll.records") {
             let maximum = signed_integer(&maximum).and_then(|value| i32::try_from(value).ok()).filter(|value| *value > 0)
                 .ok_or_else(|| error("invalid-config", "max.poll.records must be a positive signed integer"))?;
@@ -149,14 +148,14 @@ impl SourceDriver {
         properties.entry("group.id".into()).or_insert_with(|| "rtdb-kafka-connect-explicit-assignment".into());
         properties.insert("queued.max.messages.kbytes".into(), self.options.maximum_batch_bytes.div_ceil(1024).to_string());
         properties.insert("fetch.message.max.bytes".into(), self.options.maximum_record_bytes.to_string());
-        if let Some(scope) = scope.as_ref() {
+        if let Some(scope) = captured.allocation.as_ref() {
             let bound = properties.iter().try_fold(4096usize, |bytes, (name, value)| {
                 bytes.checked_add(name.len())?.checked_add(value.len())?.checked_add(256)
             }).and_then(|bytes| bytes.checked_mul(8)).ok_or_else(overflow)?;
             scope.reserve(bound)?;
         }
-        let client = crate::client::prepare(&properties, &self.memory)?;
-        Ok(ConsumerConfiguration { client, _providers: scope })
+        let client = crate::client::prepare(properties, &self.memory)?;
+        Ok(ConsumerConfiguration { client, _providers: captured.allocation })
     }
     async fn ingest(&mut self, term: &TermHandle, after: Option<ResumeToken>, converters: &mut Converters, plugin_charge: &Arc<MemoryReservation>) -> Result<()> {
         let registration = self.metrics.as_ref().map(|(identity, observer)| observer.register(identity, self.subscribe())).transpose()?;

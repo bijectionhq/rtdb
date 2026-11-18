@@ -61,6 +61,19 @@ async fn log_tls_admission_fails_before_broker_setup_and_releases_failed_materia
     assert_eq!(memory.used_bytes(), 0);
 }
 
+#[tokio::test]
+async fn log_property_file_requires_admission_before_client_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("cluster.properties");
+    std::fs::write(&file, "client.id=one\n".repeat(4096)).unwrap();
+    let mut configuration = KafkaClusterConfig::new("unused.invalid:9092");
+    configuration.properties_file = Some(file);
+    let memory = MemoryBudget::new(16 * 1024);
+    let result = KafkaLog::open(&configuration, KafkaLogOptions::new("log"), Arc::new(Warnings::default()), Arc::clone(&memory)).await;
+    assert_eq!(result.err().unwrap().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(memory.used_bytes(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_driver() {
     let cluster = MockCluster::new(1).unwrap();

@@ -52,7 +52,7 @@ impl KafkaLog {
     /// TLS material is admitted against `memory` and remains charged until the last derived native client is destroyed.
     pub async fn open(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>) -> Result<OpenedKafkaLog> {
         options.validate()?;
-        let configuration = LogConfiguration::from_cluster(cluster.properties()?, memory)?;
+        let configuration = LogConfiguration::from_cluster(cluster, memory)?;
         let admin_config = configuration.prepare(Role::Admin)?;
         if admin_config.configuration.get("transactional.id").is_some() { return Err(Anomaly::incorrect("xtdb.kafka/invalid-config", "XTDB logs do not open Kafka producer transactions")); }
         ensure_topic(admin_config, &options, observer.as_ref()).await?;

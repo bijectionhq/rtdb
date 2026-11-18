@@ -1,8 +1,6 @@
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{collections::BTreeMap, fs::File, io::Read, path::PathBuf, sync::Arc, time::Duration};
 use rtdb_format::generated::xtdb::kafka::proto as pb;
-use rtdb_types::{Anomaly, Result, jvm_number::Number};
+use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, Result, jvm_number::Number};
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod providers;
@@ -37,14 +35,78 @@ impl std::fmt::Debug for KafkaClusterConfig {
 impl KafkaClusterConfig {
     pub fn new(bootstrap_servers: impl Into<String>) -> Self { Self { bootstrap_servers: bootstrap_servers.into(), properties_map: BTreeMap::new(), properties_file: None, schema_registry_url: None } }
     pub fn properties(&self) -> Result<BTreeMap<String, String>> {
-        let mut properties = BTreeMap::from([("bootstrap.servers".into(), self.bootstrap_servers.clone())]);
-        properties.extend(self.properties_map.clone());
+        let mut properties = self.inline_properties();
         if let Some(path) = &self.properties_file {
             properties.extend(parse_properties(&std::fs::read(path).map_err(|error| Anomaly::incorrect("xtdb.kafka/properties-file", error.to_string()))?)?);
         }
         Ok(properties)
     }
+
+    pub(crate) fn capture_client_properties(&self, memory: &Arc<MemoryBudget>) -> Result<ClientProperties> {
+        if self.properties_file.is_none() && !providers::configured(&self.properties_map) {
+            return Ok(ClientProperties { values: self.inline_properties(), allocation: None });
+        }
+        let staging = AllocationScope::new(memory)?;
+        staging.reserve(properties_bound(&self.properties_map)?.checked_add(self.bootstrap_servers.capacity())
+            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(property_allocation)?)?;
+        let mut values = self.inline_properties();
+        if let Some(path) = &self.properties_file {
+            let input = File::open(path).map_err(property_io)?;
+            let bytes = read_allocated(input, &mut |bytes| staging.reserve(bytes), property_io, property_allocation)?;
+            let parse = bytes.len().checked_mul(96).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(property_allocation)?;
+            staging.reserve(parse)?;
+            values.extend(parse_properties(&bytes)?);
+        }
+        let allocation = AllocationScope::new(memory)?;
+        allocation.reserve(properties_bound(&values)?)?;
+        Ok(ClientProperties { values, allocation: Some(allocation) })
+    }
+
+    fn inline_properties(&self) -> BTreeMap<String, String> {
+        let mut properties = BTreeMap::from([("bootstrap.servers".into(), self.bootstrap_servers.clone())]);
+        properties.extend(self.properties_map.clone());
+        properties
+    }
 }
+
+pub(crate) struct ClientProperties {
+    pub(crate) values: BTreeMap<String, String>,
+    pub(crate) allocation: Option<AllocationScope>,
+}
+
+pub(crate) fn properties_bound(properties: &BTreeMap<String, String>) -> Result<usize> {
+    properties.iter().try_fold(4096usize, |sum, (name, value)| {
+        sum.checked_add(512)?.checked_add(name.capacity())?.checked_add(value.capacity())
+    }).ok_or_else(property_allocation)
+}
+
+fn read_allocated(
+    mut input: File,
+    reserve: &mut impl FnMut(usize) -> Result<()>,
+    io_error: impl Fn(std::io::Error) -> Anomaly,
+    allocation_error: fn() -> Anomaly,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut block = [0; 8192];
+    loop {
+        let length = match input.read(&mut block) {
+            Ok(0) => return Ok(bytes),
+            Ok(length) => length,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(io_error(error)),
+        };
+        let needed = bytes.len().checked_add(length).ok_or_else(allocation_error)?;
+        if needed > bytes.capacity() {
+            let capacity = bytes.capacity().checked_mul(2).ok_or_else(allocation_error)?.max(needed);
+            reserve(capacity)?;
+            bytes.try_reserve_exact(capacity - bytes.len()).map_err(|_| allocation_error())?;
+        }
+        bytes.extend_from_slice(&block[..length]);
+    }
+}
+
+fn property_io(error: std::io::Error) -> Anomaly { Anomaly::incorrect("xtdb.kafka/properties-file", error.to_string()) }
+pub(crate) fn property_allocation() -> Anomaly { Anomaly::incorrect("xtdb.kafka/config-allocation", "Kafka configuration exceeds addressable memory") }
 
 pub fn producer_properties(properties: &BTreeMap<String, String>, pipelined: bool) -> BTreeMap<String, String> {
     let mut result = BTreeMap::from([("enable.idempotence".into(), "true".into()), ("compression.type".into(), "snappy".into())]);

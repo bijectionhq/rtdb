@@ -2,7 +2,6 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -199,24 +198,8 @@ impl Provider {
 }
 
 fn read_text(path: &Path, reserve: &mut impl FnMut(usize) -> Result<()>) -> Result<String> {
-    let mut file = File::open(path).map_err(|_| invalid("Kafka ConfigProvider file could not be opened"))?;
-    let mut bytes = Vec::new();
-    let mut block = [0; 8192];
-    loop {
-        let length = match file.read(&mut block) {
-            Ok(0) => break,
-            Ok(length) => length,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(invalid("Kafka ConfigProvider file could not be read")),
-        };
-        let needed = add(bytes.len(), length)?;
-        if needed > bytes.capacity() {
-            let capacity = product(bytes.capacity(), 2)?.max(needed);
-            reserve(capacity)?;
-            bytes.try_reserve_exact(capacity - bytes.len()).map_err(|_| allocation())?;
-        }
-        bytes.extend_from_slice(&block[..length]);
-    }
+    let file = File::open(path).map_err(|_| invalid("Kafka ConfigProvider file could not be opened"))?;
+    let bytes = super::read_allocated(file, reserve, |_| invalid("Kafka ConfigProvider file could not be read"), allocation)?;
     String::from_utf8(bytes).map_err(|_| invalid("Kafka ConfigProvider file is not valid UTF-8"))
 }
 
