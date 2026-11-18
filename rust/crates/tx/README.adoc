@@ -15,6 +15,9 @@ INSERT, UPDATE, and DELETE RETURNING clauses are syntax-checked and ignored by s
 `tests/returning.rs` maps `ignore-returning-keys-3668` through staged mutation, parameter binding, committed reads, and static source encoding; its assertions have not run.
 Source replay decodes its recorded operations without repeating submit-time expansion.
 Each SQL statement and each argument row binds against durable rows, resolved predecessors, and the current transaction's preceding writes.
+Resolution reserves temporary SQL syntax before lowering each mutation.
+For a mutation that opens a query, the syntax reservation stays live through plan admission and releases before execution.
+The cursor retains the plan charge.
 SQL argument payloads retain their physical Arrow fields and raw values through source encoding and replay.
 Binding uses their signed execution field view, and parameter evaluation admits unsigned cells at the same signed width.
 Static SQL expansion applies that admission before producing logical documents.

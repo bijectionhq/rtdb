@@ -276,19 +276,21 @@ impl<'a> OpenTransaction<'a> {
             None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
         };
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let mutation = rtdb_sql::prepare_tx_in(sql, &context.catalog, &options, &context.memory)
-            .map_err(|error| error.with_context("sql", sql.into()))?;
-        self.execute_mutation(mutation, context, arguments).await.map_err(|error| error.with_context("sql", sql.into()))
+        let with_sql = |error: Anomaly| error.with_context("sql", sql.into());
+        let syntax = rtdb_sql::statement_syntax_estimate(sql.len()).ok_or_else(overflow)
+            .and_then(|bytes| context.memory.reserve(bytes)).map_err(with_sql)?;
+        let mutation = rtdb_sql::prepare_tx_in(sql, &context.catalog, &options, &context.memory).map_err(with_sql)?;
+        self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
     }
 
-    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<&[Value]>) -> Result<()> {
+    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
         use rtdb_sql::Mutation;
         let (table, input, kind) = match mutation {
             Mutation::Put { table, input } => (Some(table), input, 0),
             Mutation::Delete { table, input } => (Some(table), input, 1),
             Mutation::Erase { table, input } => (Some(table), input, 2),
             Mutation::Assert { input, message } => {
-                let mut cursor = execute(input, context, arguments).await?;
+                let mut cursor = execute(input, context, arguments, syntax).await?;
                 if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, "xtdb/assert-failed", message.unwrap_or_else(|| "Assert failed".into()))); }
                 return Ok(());
             }
@@ -311,7 +313,7 @@ impl<'a> OpenTransaction<'a> {
         let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
         if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "Mutation cannot write to another database")); }
         check_table(&table.table)?;
-        let mut cursor = execute(input, context, arguments).await?;
+        let mut cursor = execute(input, context, arguments, syntax).await?;
         while let Some(batch) = cursor.next_batch().await? {
             let schema = batch.batch().schema();
             let index = |name| schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()));
@@ -391,7 +393,7 @@ impl<'a> OpenTransaction<'a> {
         let input = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?);
         let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
-        self.execute_mutation(mutation, context, None).await
+        self.execute_mutation(mutation, context, None, None).await
     }
     fn put_documents(&mut self, table: &TableRef, documents: &[BTreeMap<String, Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         check_table(table)?;
@@ -428,12 +430,14 @@ fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {
     encoded.checked_mul(4).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)
 }
 
-async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>) -> Result<QueryCursor> {
+async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
     let count = input.parameter_count();
     if arguments.is_none() && count != 0 { return Err(Anomaly::incorrect("xtdb.indexer/missing-sql-args", "Arguments list was expected but not provided").with_context("param-count", count.into())); }
     let arguments = arguments.unwrap_or_default();
     if arguments.len() != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {} provided, {count} expected", arguments.len())).with_context("param-count", count.into()).with_context("arg-count", arguments.len().into())); }
-    PreparedQuery::new(input)?.execute(context, arguments.to_vec()).await
+    let query = PreparedQuery::new_in(input, &context.memory)?;
+    drop(syntax);
+    query.execute(context, arguments.to_vec()).await
 }
 fn check_table(table: &TableRef) -> Result<()> {
     if is_reserved_write_schema(&table.schema) {
@@ -467,6 +471,75 @@ fn overflow() -> Anomaly { Anomaly::fault("rtdb.tx/overflow", "Transaction posit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoRoleChecks;
+    impl TransactionAuthorization for NoRoleChecks {
+        fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { panic!("unexpected role check") }
+    }
+
+    #[tokio::test]
+    async fn mutation_syntax_is_charged_until_the_plan_takes_ownership() {
+        let memory = MemoryBudget::new(1 << 24);
+        let resolve = ResolveContext {
+            database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions { batch_rows: 1, ..Default::default() },
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let state = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+        let options = SubmitOptions::default();
+        let mut tx = OpenTransaction::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) }, &options, &resolve).unwrap();
+        let baseline = memory.used_bytes();
+
+        let malformed = "DELETE FROM docs WHERE @";
+        let syntax_bytes = rtdb_sql::statement_syntax_estimate(malformed.len()).unwrap();
+        let lexical_error = rtdb_sql::parse_in(malformed, &memory).unwrap_err().with_context("sql", malformed.into());
+        assert_eq!(lexical_error.code, "xtdb/sql-error");
+        for (headroom, code) in [(syntax_bytes - 1, "rtdb/memory-budget-exceeded"), (syntax_bytes, "xtdb/sql-error")] {
+            let held = memory.reserve(memory.limit_bytes() - baseline - headroom).unwrap();
+            let error = tx.execute_sql(malformed, None).await.unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.context["sql"], malformed);
+            if headroom == syntax_bytes { assert_eq!(error, lexical_error); }
+            assert_eq!(memory.used_bytes(), baseline + held.bytes());
+        }
+
+        let source = format!("ASSERT TRUE /*{}*/", "x".repeat(4096));
+        let syntax_bytes = rtdb_sql::statement_syntax_estimate(source.len()).unwrap();
+        let probe = MemoryBudget::new(1 << 20);
+        let context = resolve.query_context(tx.snapshot().unwrap(), tx.tx_key().system_time, "UTC", None).unwrap();
+        let raw = rtdb_sql::prepare_tx_in(&source, &context.catalog, &Default::default(), &probe).unwrap();
+        let rtdb_sql::Mutation::Assert { input, .. } = raw else { panic!("expected ASSERT relation"); };
+        assert_eq!(probe.used_bytes(), 0);
+        let query = PreparedQuery::new_in(input, &probe).unwrap();
+        let plan_bytes = probe.used_bytes();
+        assert!(plan_bytes > 0);
+        drop((query, context));
+        assert_eq!(probe.used_bytes(), 0);
+        assert_eq!(memory.used_bytes(), baseline);
+
+        let headroom = syntax_bytes + plan_bytes;
+        let short = memory.reserve(memory.limit_bytes() - baseline - headroom + 1).unwrap();
+        let error = tx.execute_sql(&source, None).await.unwrap_err();
+        let retained = baseline + short.bytes() + syntax_bytes;
+        let expected = format!("Cannot reserve {plan_bytes} bytes from budget {} with {retained} retained", memory.limit_bytes());
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+        assert_eq!(error.context["sql"], source.as_str());
+        assert_eq!(memory.used_bytes(), baseline + short.bytes());
+        drop(short);
+
+        let exact = memory.reserve(memory.limit_bytes() - baseline - headroom).unwrap();
+        tx.execute_sql(&source, None).await.unwrap();
+        assert_eq!(memory.used_bytes(), baseline + exact.bytes());
+        drop(exact);
+        let missing = tx.execute_sql("INSERT INTO docs (_id) VALUES (?)", None).await.unwrap_err();
+        assert_eq!(missing.code, "xtdb.indexer/missing-sql-args");
+        assert_eq!(memory.used_bytes(), baseline);
+        drop(tx);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
     #[test]
     fn reserved_tables_in_resolution_retain_the_table_reference() {
         let table = TableRef::new("information_schema", "columns");

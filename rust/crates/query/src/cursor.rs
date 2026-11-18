@@ -63,6 +63,15 @@ pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::Que
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
 impl PreparedQuery {
     pub fn new(relation: Arc<Relation>) -> Result<Self> { Self::with_settings(relation, rtdb_plan::QuerySettings::default()) }
+    /// Retains a validated relation with its existing operator shape.
+    /// The supplied budget holds the plan charge until the last prepared query or cursor drops.
+    /// Invalid relations, plan size overflow and budget exhaustion return an error.
+    pub fn new_in(relation: Arc<Relation>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mut query = Self::new(relation)?;
+        query._plan_reservation = Some(reserve_plan(&query.relation, &query.settings, memory)?);
+        Ok(query)
+    }
+
     pub fn with_settings(relation: Arc<Relation>, settings: rtdb_plan::QuerySettings) -> Result<Self> {
         relation.validate()?;
         let required_parameter_count = relation.parameter_count().max(settings.parameter_count());
@@ -76,8 +85,7 @@ impl PreparedQuery {
             rtdb_plan::Statement::Explain { relation, mode } => (relation, Some(mode)),
             _ => return Err(invalid("not-a-query", "Statement does not produce a query result")),
         };
-        let settings_bytes = prepared.settings.retained_bytes()?;
-        let plan_reservation = memory.reserve(crate::runtime_schema::allocation_bound(&relation)?.checked_mul(8).and_then(|bytes| bytes.checked_add(settings_bytes)).ok_or_else(|| invalid("plan-size", "Prepared plan allocation overflow"))?)?;
+        let plan_reservation = reserve_plan(&relation, &prepared.settings, memory)?;
         let relation = crate::optimize::prepare(relation)?;
         let output = match mode {
             None => QueryOutput::Rows,
@@ -157,6 +165,13 @@ impl PreparedQuery {
         let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
         Ok(QueryCursor { schema, runtime_schema: runtime_schema.output(), input: Some(input), context, sample, trace, query_span, plan_reservation: self._plan_reservation.clone() })
     }
+}
+
+fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {
+    let settings_bytes = settings.retained_bytes()?;
+    let bytes = crate::runtime_schema::allocation_bound(relation)?.checked_mul(8).and_then(|bytes| bytes.checked_add(settings_bytes))
+        .ok_or_else(|| invalid("plan-size", "Prepared plan allocation overflow"))?;
+    memory.reserve(bytes)
 }
 
 pub struct QueryCursor { schema: Arc<RuntimeSchema>, runtime_schema: Arc<RuntimeSchema>, input: Option<BoxCursor>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
