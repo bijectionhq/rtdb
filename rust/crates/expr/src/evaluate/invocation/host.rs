@@ -202,9 +202,56 @@ impl<'a> Compiler<'a,'_,'_> {
                 let branches = if operation.is_some_and(|name|name.ends_with("when-not")) { [test,Expression::Nil,body] } else { [test,body,Expression::Nil] };
                 Expression::If(Box::new(branches))
             }
+            Some("if-let" | "clojure.core/if-let") => self.conditional_binding(args, depth, true)?,
+            Some("when-let" | "clojure.core/when-let") => self.conditional_binding(args, depth, false)?,
             Some("and" | "clojure.core/and" | "or" | "clojure.core/or") => Expression::Logical { conjunction: operation.is_some_and(|name|name.ends_with("and")),values: self.expressions(args,depth)? },
             _ => Expression::Call { function: Box::new(self.expression(head,depth)?),arguments: self.expressions(args,depth)? },
         })
+    }
+    fn conditional_binding(&mut self, args: Forms<'a>, depth: usize, if_let: bool) -> Result<Expression<'a>> {
+        arity(args.len(), if if_let { 2 } else { 1 }, usize::MAX)?;
+        let FormKind::Vector(bindings) = args.at(0).kind() else {
+            return Err(error("Host conditional binding requires a binding vector"));
+        };
+        if if_let { arity(args.len(), 2, 3)?; }
+        if bindings.len() != 2 {
+            return Err(error("Host conditional binding requires one binding pair"));
+        }
+        let FormKind::Symbol(name) = bindings.at(0).kind() else {
+            return Err(unsupported("Host binding destructuring is not implemented"));
+        };
+        if name != "/" && name.contains('/') {
+            return Err(error("Host let cannot bind a qualified symbol"));
+        }
+        let branch_depth = depth + 1;
+        let synthetic_nodes = 2 + usize::from(!if_let) + usize::from(!if_let || args.len() == 2);
+        self.nodes += synthetic_nodes;
+        if branch_depth > 128 || self.nodes > 65_536 { return Err(limit()); }
+        self.context.reserve(synthetic_nodes * 256 + std::mem::size_of::<Expression<'_>>() + 256)?;
+        let initializer = self.expression(bindings.at(1), depth)?;
+        let emission = initializer.emission();
+        let first = self.active;
+        let previous = self.symbols.insert(name, (first, emission));
+        self.active += 1;
+        self.slots = self.slots.max(self.active);
+        let then = if if_let {
+            self.expression(args.at(1), branch_depth)
+        } else {
+            self.body(args.slice(1..args.len()), branch_depth + 1)
+        };
+        match previous {
+            Some(binding) => { self.symbols.insert(name, binding); }
+            None => { self.symbols.remove(name); }
+        }
+        self.active = first;
+        let then = then?;
+        let otherwise = match args.get(2).filter(|_| if_let) {
+            Some(form) => self.expression(form, branch_depth)?,
+            None => Expression::Nil,
+        };
+        let test = Expression::Local { index: first, emission };
+        let body = Expression::If(Box::new([test, then, otherwise]));
+        Ok(Expression::Let { first, bindings: vec![initializer], body: Box::new(body) })
     }
     fn arithmetic(&mut self,operation: Arithmetic,args: Forms<'a>,depth: usize) -> Result<Expression<'a>> {
         if matches!(operation,Arithmetic::Increment(_) | Arithmetic::Decrement(_)) { arity(args.len(),1,1)?; }
@@ -759,6 +806,40 @@ mod tests {
     fn raw_map() -> Form { raw_build(|builder| { builder.begin_map()?; builder.end() }) }
     fn raw_set() -> Form { raw_build(|builder| { builder.begin_set()?; builder.end() }) }
     fn raw_anonymous(value: Form) -> Form { raw_build(|builder| { builder.begin_anonymous()?; builder.append_view(value.view())?; builder.end() }) }
+
+    #[test]
+    fn conditional_binding_uses_one_slot_and_evaluates_one_initializer() {
+        let initializer = raw_build(|builder| {
+            builder.begin_list()?;
+            builder.symbol("str")?;
+            builder.literal(&Value::Utf8("a".into()))?;
+            builder.end()
+        });
+        let bound = raw_build(|builder| {
+            builder.begin_list()?;
+            builder.symbol("if-let")?;
+            builder.begin_vector()?;
+            builder.symbol("p")?;
+            builder.append_view(initializer.view())?;
+            builder.end()?;
+            builder.symbol("p")?;
+            builder.end()
+        });
+        let compile_context = EvalContext::default();
+        let direct = Program::compile(&initializer, &compile_context).unwrap();
+        let conditional = Program::compile(&bound, &compile_context).unwrap();
+        assert_eq!(direct.locals, 0);
+        assert_eq!(conditional.locals, 1);
+        let peak = |program: &Program<'_>| {
+            let memory = MemoryBudget::new(1 << 20);
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope), ..Default::default() };
+            let pattern = program.pattern(&context).unwrap();
+            assert_eq!(pattern.view().units().collect::<Vec<_>>(), [u16::from(b'a')]);
+            memory.peak_bytes()
+        };
+        assert_eq!(peak(&conditional), peak(&direct) + std::mem::size_of::<HostValue<'_>>());
+    }
 
     fn number(value: HostValue<'_>) -> Arc<Number> { match value { HostValue::Number(value) => value,_ => panic!("number expected") } }
 

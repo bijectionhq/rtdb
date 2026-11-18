@@ -442,7 +442,17 @@ Patterns compile in emitted call order: a replacement call precedes its source b
 A statically non-null COALESCE input omits the remaining metadata bindings.
 The raw carrier preserves host pattern lists, symbols and other forms independently of scalar XTDB arguments.
 Native host compilation admits all emitted pattern programs before any pattern binding executes.
-Its initial lexical and string forms include simple-symbol `let`/`let*`, `if`, `do`, `quote`, `when`, `when-not`, `and`, `or`, vector evaluation, and `str`, `identity`, `name`, `namespace`, `subs`, `not` and `boolean` calls.
+Its initial lexical and string forms include simple-symbol `let`/`let*`, `if`, `do`, `quote`, `when`, `when-not`, `if-let`, `when-let`, `and`, `or`, vector evaluation, and `str`, `identity`, `name`, `namespace`, `subs`, `not` and `boolean` calls.
+
+* Host `if-let` and `when-let` accept one simple-symbol binding.
+** Unqualified calls respect same-name local bindings, and `clojure.core/` selects the core forms.
+** The initializer compiles in the outer scope and evaluates once.
+** The truthy branch sees the new binding.
+** `if-let` evaluates its optional else in the outer scope when the initializer is falsey.
+*** An omitted else yields nil.
+** `when-let` evaluates the selected body forms in order and yields nil for an empty body or a falsey initializer.
+** The expansion uses one local slot and counts toward the host instruction, allocation and depth limits.
+
 Lexical function values preserve strict argument evaluation, and substring indexes count UTF16 units.
 Ordinary host calls admit the evaluated function value to the JVM IFn boundary before reserving or evaluating arguments.
 Numbers, Booleans, strings, characters and raw lists fail that admission; nil, vectors, maps, sets, keywords and symbols retain argument evaluation before invocation.
@@ -479,7 +489,7 @@ Substring indexes require Number objects before boxed integer conversion; Charac
 Programs retain no runtime context or global namespace; their lexical values and computed strings use the invocation preparation scope.
 The host admission limits are 128 nested forms or generated instruction levels and 65536 instructions, with a 16MiB limit per computed text temporary or numeric scratch reservation.
 Numeric scratch admission includes decimal scale alignment before powers or expanded coefficients are allocated.
-Remaining host numeric functions and dynamic arithmetic bindings, interop and effects, namespace state, destructuring/functions/macros, shared host-literal interpretation, collection/object rendering, tagged objects, emitted-local multiplicity and isolated-surrogate text remain required work.
+Remaining host numeric functions and dynamic arithmetic bindings, interop and effects, namespace state, destructuring, general functions and macro expansion, shared host-literal interpretation, collection/object rendering, tagged objects, emitted-local multiplicity and isolated-surrogate text remain required work.
 Forms outside the implemented host subset report `rtdb.expr/regex-host-form` explicitly.
 `tests/regex_host.rs` records lexical, phase, empty-input and ownership regressions as unexecuted source.
 `tests/regex_replace_metadata.rs` contains unexecuted source regressions for phase, full vector types, empty batches, per-row scope release and cancellation.

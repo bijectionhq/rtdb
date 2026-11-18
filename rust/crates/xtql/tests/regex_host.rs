@@ -50,6 +50,71 @@ async fn host_patterns_use_lexical_controls_and_strict_string_functions() {
 }
 
 #[tokio::test]
+async fn conditional_host_bindings_scope_only_the_selected_body() {
+    for (source, pattern) in [
+        ("a", r#"(let [p "a"] (if-let [p (str p "b")] (subs p 0 1) "b"))"#),
+        ("a", r#"(let [p "a"] (if-let [p false] (subs "x" -1) (let [inner p] inner)))"#),
+        ("a", r#"(let [p "b"] (when-let [p "a"] (identity "ignored") p))"#),
+        ("a", r#"(or (if-let [p nil] (subs "x" -1)) "a")"#),
+        ("a", r#"(or (when-let [p false] (subs "x" -1) p) "a")"#),
+        ("a", r#"(or (clojure.core/when-let [p true]) "a")"#),
+        ("a", r#"(if-let [p ""] (str p "a") "b")"#),
+        ("1", r#"(if-let [n 0] (str (inc n)) "b")"#),
+        ("126", r#"(if-let [n 126.9] (str (byte n)) "b")"#),
+        ("a", r#"(let [if-let str] (if-let "a"))"#),
+        ("a", r#"(let [if-let str] (clojure.core/if-let [p "a"] p "b"))"#),
+        ("a", r#"(if-let [when-let str] (when-let "a") "b")"#),
+    ] {
+        let expression = format!(r#"(regexp-replace "{source}" {pattern} "x")"#);
+        assert_eq!(project(&expression).await.unwrap(), Value::Utf8("x".into()), "{pattern}");
+    }
+    for pattern in [
+        r#"(if-let [p (subs "x" -1)] p "a")"#,
+        r#"(when-let [p "a"] (subs "x" -1) p)"#,
+    ] {
+        let expression = format!(r#"(regexp-replace "a" {pattern} "x")"#);
+        assert_eq!(project(&expression).await.unwrap_err().message.as_deref(), Some("Host substring indexes are out of range"));
+    }
+    for pattern in [
+        r#"(if-let [n 127.9] (str (byte n)) "a")"#,
+        r#"(when-let [n 127.9] (str (byte n)))"#,
+    ] {
+        let expression = format!(r#"(regexp-replace "a" {pattern} "x")"#);
+        assert_eq!(project(&expression).await.unwrap_err().message.as_deref(), Some("Host numeric cast is out of range"));
+    }
+}
+
+#[tokio::test]
+async fn conditional_host_bindings_compile_vector_shape_and_both_branch_scopes() {
+    for (pattern, message) in [
+        (r#"(if true "a" (if-let [p "a"]))"#, "Host form has the wrong number of arguments"),
+        (r#"(if-let [p "a"] p "b" "c")"#, "Host form has the wrong number of arguments"),
+        (r#"(when-let)"#, "Host form has the wrong number of arguments"),
+        (r#"(if-let (p "a") "a")"#, "Host conditional binding requires a binding vector"),
+        (r#"(when-let [p "a" q "b"] p)"#, "Host conditional binding requires one binding pair"),
+        (r#"(when-let [ns/p "a"] "a")"#, "Host let cannot bind a qualified symbol"),
+        (r#"(if-let [p "a"] p p)"#, "Host symbol or namespace is not implemented"),
+        (r#"(if-let [p p] "a" "b")"#, "Host symbol or namespace is not implemented"),
+    ] {
+        let expression = format!(r#"(regexp-replace "a" {pattern} "x")"#);
+        assert_eq!(project(&expression).await.unwrap_err().message.as_deref(), Some(message), "{pattern}");
+    }
+    let error = project(r#"(regexp-replace "a" (when-let [[p] ["a"]] p) "x")"#).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.expr/regex-host-form");
+}
+
+#[tokio::test]
+async fn conditional_host_expansion_counts_toward_the_instruction_depth_limit() {
+    let nested = |depth| {
+        let mut pattern = r#""a""#.to_owned();
+        for _ in 0..depth { pattern = format!("(if-let [p true] {pattern})"); }
+        format!(r#"(regexp-replace "a" {pattern} "x")"#)
+    };
+    assert_eq!(project(&nested(63)).await.unwrap(), Value::Utf8("x".into()));
+    assert_eq!(project(&nested(64)).await.unwrap_err().code, "rtdb.expr/regex-host-limit");
+}
+
+#[tokio::test]
 async fn host_compilation_visits_dead_branches_before_any_pattern_binding_executes() {
     for expression in [
         r#"(regexp-replace "a" (if true "a" (if)) "x")"#,

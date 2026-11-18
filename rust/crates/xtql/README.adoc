@@ -201,6 +201,11 @@ The owned carrier preserves nonliteral host pattern syntax through the native ho
 `tests/regex_replace_metadata.rs` records missing/extra fields, raw flags, dead COALESCE tails and host-form preservation as unexecuted source regressions.
 Native REGEXP_REPLACE host patterns retain their own lexical compilation and invocation phases.
 Simple lexical bindings and pure string/control forms compile independently of XTQL row variables, while raw replacement and flag fields retain their metadata contracts.
+Host `if-let` and `when-let` support one simple-symbol binding.
+Each evaluates its initializer once and exposes its value in the selected truthy branch.
+Unqualified macro calls respect same-name local bindings.
+The `clojure.core/` spellings select the core forms.
+The link:../expr/README.adoc[expression reference] describes branch scope and return values.
 Ordinary host calls reject known non-IFn function values before argument evaluation, while nil, vectors, maps, sets, keywords and symbols admit their arguments before invocation.
 Quoted anonymous-function forms remain raw lists; successful collection invocation, null invocation diagnostics and exact JVM throwable payloads remain required work.
 Host BigInt and BigDecimal literals preserve exact numeric text, and checked primitive conversions retain the difference between direct inline calls and calls through lexical function values.
