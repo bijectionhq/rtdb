@@ -18,12 +18,13 @@
     },
     "storage_indexing_historical_visibility": {
       "status": "pending",
-      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. The scan admits borrowed catalog references, summaries, file selection and retained index worklists, file and page descriptors, metadata traversal, temporal ceiling growth and per-event history results. Ordinary IID narrowing, broader metadata predicates and shared live-index allocations remain open.",
+      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. The scan admits borrowed catalog references, summaries, file selection and retained index worklists, file and page descriptors, metadata traversal, temporal ceiling growth and per-event history results. Scan setup borrows the captured live layers and walks their trie leaves in depth-first order. Ordinary IID narrowing, broader metadata predicates and shared live-index allocations remain open.",
       "implementation_paths": [
         "rust/crates/storage/src/lib.rs",
         "rust/crates/storage/src/cache.rs",
         "rust/crates/index/src/live.rs",
         "rust/crates/index/src/snapshot.rs",
+        "rust/crates/trie/src/memory.rs",
         "rust/crates/query/src/scan.rs",
         "rust/crates/query/src/scan_tasks.rs",
         "rust/crates/temporal/src/lib.rs",
@@ -84,7 +85,7 @@
     },
     "conformance_machinery": {
       "status": "pending",
-      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. Reference recorder sources exist for the refused-claim processor simulation and mixed IID case. The native mixed IID comparison has source for the exact internal query and PATCH observations. Native pgwire and Flight SQL observations, refused-claim simulation replay, additional paired adapters and full assertion bindings need source completion.",
+      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. The refused-claim simulation has source for the original JVM recorder, archive checks and a native trial of its boot and authored inputs. The mixed IID comparison has source for internal SQL, PATCH, pgwire and Flight SQL observations. Full simulation scheduling and assertions, portable mixed IID checkpoint transfer, additional paired adapters and full assertion bindings need source completion.",
       "implementation_paths": [
         "rust/crates/conformance/src/main.rs",
         "rust/conformance/source_inventory.py",
@@ -97,10 +98,13 @@
         "rust/conformance/archive_sql_logic.py",
         "rust/conformance/emit_sql_logic_case.py",
         "rust/conformance/run_log_processor_sim.py",
+        "rust/conformance/replay_log_processor_sim.py",
         "rust/conformance/simulation/LogProcessorTrace.kt",
+        "rust/crates/conformance/src/simulation/mod.rs",
         "rust/conformance/run_mixed_iid_reference.py",
         "rust/conformance/run_mixed_iid_native.py",
         "rust/crates/conformance/src/history/mixed_iid.rs",
+        "rust/crates/conformance/src/history/mixed_iid/wire.rs",
         "rust/conformance/jvm/rtdb/conformance/mixed_iid_reference.clj",
         "rust/crates/conformance/src/faults.rs"
       ]
@@ -171,7 +175,7 @@
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
         "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56",
-        "rust/crates/replication/src/blocks.rs": "4b1560f5f6e7696a4c6c4bd5d26db9390ba6193bc94d76ebc6f20d701975692f",
+        "rust/crates/replication/src/blocks.rs": "6bdcfa17d80c7dd0aa37f248cdff83b09b6c71edb2aedbccfbce7226cc0da522",
         "rust/crates/server/src/resources.rs": "8bb66510352c189bd5e5c65d24c18848bf04ff1285f421d1c9ee00b6d127bf24",
         "rust/crates/node/src/backends.rs": "04c98d6847f658ab1f90c6e230b4d2f462b482da0dc0fe58fb18b95eae6679ac",
         "rust/crates/node/src/resources.rs": "06fcbfe224b8713f7099dae88bae863436c3342126ddd9f3f1784372929ce05b",

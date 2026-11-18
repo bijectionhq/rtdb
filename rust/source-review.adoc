@@ -1404,7 +1404,10 @@ Cross-engine execution remains pending.
 A caller can supply one replication timestamp source for the driver, its handle and its term appender.
 The clock is available to a simulation that controls delivered time.
 One original refused-claim JVM invocation has a recorder for authored actions, dispatcher choices, simulated log delivery and assertion completion.
-The native action and delivery replay, internal timing observations and paired artifact results remain pending.
+The archived worker receipt and tape bind the recorded actions to the selected JUnit invocation and its actual runtime files.
+The native trial opens three writable processors over a shared source log, replica log and object store.
+It reproduces the recorded boot refusal, claim durability, append receipt and offset-zero claim deliveries, and submits the original source flushes and external actions in order.
+Full dispatcher timing, intermediate role and apply events, block and snapshot comparisons, and paired assertions remain pending.
 
 On own-term leader read-back, Rust follows `LeaderAppliesOwnTx` in `dev/doc/db.allium` by validating the staged head and applying its writes before applying the committed database attach or detach effect.
 The pinned JVM applies the catalog effect before taking the staged head.
@@ -1431,7 +1434,11 @@ The regression sources check refusal before the first object fetch and while gro
 The scan charges its combined summaries before selection and holds both reservations while growing the vector to include live page summaries.
 It charges selection worklists and copied file indexes before allocation.
 The worklists end before metadata reads, and the selected indexes remain charged through traversal.
+Scan setup traverses borrowed live segments and their leaves in the existing order.
+A live segment whose IID paths all miss still contributes to the priority offset of persisted pages.
 The shared live-index allocations, including sorted live-leaf storage, still require admission work.
+Block production can copy selected leaf rows directly when every live batch matches the captured Arrow layout.
+The fallback rebuilds the page from the captured table schema.
 Ordinary IID narrowing and broader metadata predicates remain open.
 
 Each reference control receipt binds the exact JVM runtime manifest, the verified runtime files and the artifact verifier source.
@@ -1444,7 +1451,10 @@ The mixed-IID JVM recorder selects its original Jovial invocation and keeps each
 The native fixture runs the same two ingest ranges and rewrites the IID column after closing its first mixed store.
 The comparison source checks serving plain and run-end files plus ordered SQL history, direct IID join and intersection, and PATCH read-back.
 After reopening, the fixture synchronizes both manually configured nodes before their next explicit compaction request.
-Portable transfer of the first closed layout, native pgwire and Flight SQL observations, and paired execution remain pending.
+The native pgwire fixture captures the ordered IID rows before either PATCH.
+The Flight SQL fixture captures signed IID bytes and its declared and per-batch fields after both PATCH operations.
+The runner compares those observations with the original JVM case after both native node owners have joined and binds the verdict to the validated receipt bytes.
+Portable transfer of the first closed layout and paired execution remain pending.
 The SQL-logic release lane checks the selected native executable, the pinned script roster, and the archived process and observation files.
 Offline verification recomputes the paired and repeated-reference comparisons from the retained streams.
 The external inventory validator checks normalized SQL-logic records against retained original SQL source bytes.
