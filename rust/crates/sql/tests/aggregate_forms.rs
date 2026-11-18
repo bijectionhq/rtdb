@@ -162,12 +162,16 @@ async fn supported_sql_aggregate_aliases_and_integer_percentile_literals_retain_
     let forms = aggregate_forms(&sql(&context, "EXPLAIN SELECT BOOL_AND(v), EVERY(v), BOOL_OR(v) FROM (VALUES (TRUE),(FALSE)) t(v)").await.unwrap());
     for prefix in ["(bool_and ", "(every ", "(bool_or "] { assert!(forms.iter().any(|form| form.starts_with(prefix)), "{forms:?}"); }
     assert_eq!(sql(&context, "SELECT BOOL_AND(v), EVERY(v), BOOL_OR(v) FROM (VALUES (TRUE),(FALSE)) t(v)").await.unwrap(), [vec![Value::Bool(false), Value::Bool(false), Value::Bool(true)]]);
-    for (fraction, spelling, expected) in [("1", "1", 20), ("1.0", "1.0", 20), ("-1", "-1", 10)] {
+    for (fraction, spelling, expected) in [("1", "1", 20), ("1.0", "1.0", 20)] {
         let query = format!("SELECT PERCENTILE_DISC({fraction}) WITHIN GROUP (ORDER BY v) FROM (VALUES (10),(20)) t(v)");
         let forms = aggregate_forms(&sql(&context, &format!("EXPLAIN {query}")).await.unwrap());
         assert!(forms[0].starts_with(&format!("(percentile_disc {spelling} [")), "{forms:?}");
         assert_eq!(sql(&context, &query).await.unwrap(), [vec![Value::I64(expected)]]);
     }
+    let query = "SELECT PERCENTILE_DISC(-1) WITHIN GROUP (ORDER BY v) FROM (VALUES (10),(20)) t(v)";
+    assert!(aggregate_forms(&sql(&context, &format!("EXPLAIN {query}")).await.unwrap())[0].starts_with("(percentile_disc -1 ["));
+    let error = sql(&context, query).await.unwrap_err();
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.operator.group-by/percentile-fraction-out-of-range", Some("percentile fraction must be between 0 and 1, got: -1.0")));
     assert_eq!(context.memory.used_bytes(), 0);
 }
 

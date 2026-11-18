@@ -88,6 +88,10 @@ impl AggregateCursor {
                     let resolved = number(value).ok_or_else(|| rtdb_types::Anomaly::incorrect("xtdb/expected-number", "Percentile fraction parameter must be a number").with_context("param", serde_json::json!(format!("?_{}", index))))?;
                     *fraction = PercentileFraction::Literal(resolved);
                 }
+                if let PercentileFraction::Literal(value) = *fraction && !(0.0..=1.0).contains(&value) {
+                    return Err(rtdb_types::Anomaly::incorrect("xtdb.operator.group-by/percentile-fraction-out-of-range",
+                        format!("percentile fraction must be between 0 and 1, got: {}", rtdb_types::java_f64_text(value))).with_context("fraction", serde_json::json!(value)));
+                }
             }
         }
         Ok(Self { input: Some(input), schema, groups, aggregates, runtime, execution })

@@ -139,13 +139,18 @@ async fn nonnumeric_fraction_parameters_fail_before_empty_input_and_filtered_val
 }
 
 #[tokio::test]
-async fn discrete_clamps_fraction_but_continuous_preserves_reference_rank_failures() {
-    assert_eq!(query("SELECT PERCENTILE_DISC(-1) WITHIN GROUP (ORDER BY n), PERCENTILE_DISC(2) WITHIN GROUP (ORDER BY n) AS test_output_2 FROM (VALUES (10),(20)) t(n)", vec![]).await.unwrap().1, [vec![Value::I64(10), Value::I64(20)]]);
-    for fraction in [-0.1, 1.1, f64::INFINITY, f64::NEG_INFINITY] {
-        assert_eq!(query("SELECT PERCENTILE_CONT($1) WITHIN GROUP (ORDER BY n) FROM (VALUES (10),(20)) t(n)", vec![Value::F64(fraction)]).await.err().unwrap().code, "rtdb.query/percentile-rank");
-        assert_eq!(query("SELECT PERCENTILE_CONT($1) WITHIN GROUP (ORDER BY n) FROM (VALUES (10)) t(n)", vec![Value::F64(fraction)]).await.unwrap().1, [vec![Value::F64(10.0)]]);
+async fn fractions_outside_the_unit_interval_are_rejected_before_any_row_is_read() {
+    for function in ["PERCENTILE_CONT", "PERCENTILE_DISC"] {
+        for fraction in [-0.1, 1.1, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            for rows in ["(10),(20)", "(10)"] {
+                let error = query(&format!("SELECT {function}($1) WITHIN GROUP (ORDER BY n) FROM (VALUES {rows}) t(n)"), vec![Value::F64(fraction)]).await.unwrap_err();
+                assert_eq!(error.code, "xtdb.operator.group-by/percentile-fraction-out-of-range", "{function} {fraction} {rows}");
+            }
+        }
     }
-    assert_eq!(query("SELECT PERCENTILE_CONT($1) WITHIN GROUP (ORDER BY n), PERCENTILE_DISC($1) WITHIN GROUP (ORDER BY n) FROM (VALUES (10),(20)) t(n)", vec![Value::F64(f64::NAN)]).await.unwrap().1, [vec![Value::F64(10.0), Value::I64(10)]]);
+    let error = query("SELECT PERCENTILE_DISC(2) WITHIN GROUP (ORDER BY n) FROM (VALUES (10),(20)) t(n)", vec![]).await.unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("percentile fraction must be between 0 and 1, got: 2.0"));
+    assert_eq!(query("SELECT PERCENTILE_CONT(0) WITHIN GROUP (ORDER BY n), PERCENTILE_DISC(1) WITHIN GROUP (ORDER BY n) FROM (VALUES (10),(20)) t(n)", vec![]).await.unwrap().1, [vec![Value::F64(10.0), Value::I64(20)]]);
 }
 
 #[test]
