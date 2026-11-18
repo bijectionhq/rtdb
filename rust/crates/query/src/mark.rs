@@ -232,7 +232,7 @@ impl PageCursor for Mark {
                     while let Some(row) = page.next() {
                         let row = Arc::new(row);
                         let execution = plan.execution.bind_arguments(&arguments,&plan.input_schema,Arc::clone(&row)).await?;
-                        let dependent = build_pages(Arc::clone(&runtime),execution.clone()).await?;
+                        let dependent = build_pages(Arc::clone(&runtime),execution.child(1)).await?;
                         let result = correlated_mark(&row,dependent,&plan.comparison,&plan.comparison_schema,&execution).await?;
                         output.push(OwnedRow::copy_parts(&[&row.values,&[result]],0,0,&plan.execution.context.memory)?)?;
                     }

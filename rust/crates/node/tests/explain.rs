@@ -47,6 +47,29 @@ async fn explain_description_and_open_check_aggregate_factory_types() {
     assert!(cursor.next_batch().await.unwrap().is_some());
 }
 
+async fn operators(sql: &str, context: &Arc<QueryContext>) -> Vec<(Value, Value)> {
+    let prepared = PreparedSql::prepare(sql, context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = prepared.open_query(Arc::clone(context), vec![]).await.unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = cursor.next_batch().await.unwrap() {
+        let schema = batch.batch().schema();
+        for row in 0..batch.batch().num_rows() {
+            let value = |index: usize| read_value(schema.field(index), batch.batch().column(index).as_ref(), row).unwrap();
+            rows.push((value(0), value(1)));
+        }
+    }
+    rows
+}
+
+#[tokio::test]
+async fn xtdb_api_test_explain_analyze_covers_the_whole_plan_including_apply_dependents() {
+    let context = context();
+    let query = "SELECT a.x FROM (VALUES (1), (2)) AS a(x) WHERE NOT EXISTS (SELECT 1 FROM (VALUES (1)) AS b(y) WHERE b.y = a.x)";
+    let explained = operators(&format!("EXPLAIN {query}"), &context).await;
+    assert!(explained.iter().any(|(_, op)| matches!(op, Value::Keyword(op) if op.as_str().contains("apply-"))), "{explained:?}");
+    assert_eq!(explained, operators(&format!("EXPLAIN ANALYZE {query}"), &context).await);
+}
+
 #[tokio::test]
 async fn plain_explain_emits_types_without_opening_a_values_table() {
     let context = context();

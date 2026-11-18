@@ -541,7 +541,7 @@ impl PageCursor for Apply {
             self.execution.context.check_cancelled()?;
             let row = Arc::new(row);
             let execution = self.execution.bind_arguments(&self.arguments,&self.schema,Arc::clone(&row)).await?;
-            let mut cursor = build(Arc::clone(&self.dependent),execution).await?;
+            let mut cursor = build(Arc::clone(&self.dependent),execution.child(1)).await?;
             if matches!(self.kind, ApplyKind::Inner | ApplyKind::Left) {
                 let mut matched = false;
                 while let Some(dependent) = cursor.next().await? {

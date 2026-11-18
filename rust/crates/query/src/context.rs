@@ -208,7 +208,7 @@ impl Execution {
             parameters[*index] = self.evaluate(&scope, expression, schema, &row.values).await?;
         }
         let outer = self.outer.prepend(schema, row, &self.context.memory)?;
-        Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(crate::parameters::BoundParameters::new(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: None })
+        Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(crate::parameters::BoundParameters::new(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
     }
     pub fn child(&self, index: usize) -> Self {
         let mut execution = self.clone(); execution.analysis = self.analysis.as_ref().and_then(|node| node.child(index)); execution

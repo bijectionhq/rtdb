@@ -36,10 +36,7 @@ impl AnalysisNode {
             RelationNode::Scan(scan) if !crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none() => Attributes::Scan { database: scan.table.name.database.clone(), source: format!("{}.{}", scan.table.name.table.schema, scan.table.name.table.table) },
             _ => Attributes::None,
         };
-        let children = match relation.node() {
-            RelationNode::Apply { input, .. } => vec![Self::build(input, reservation)?],
-            _ => relation.children().iter().map(|child| Self::build(child, reservation)).collect::<Result<_>>()?,
-        };
+        let children = relation.children().iter().map(|child| Self::build(child, reservation)).collect::<Result<_>>()?;
         Ok(Arc::new(Self { op: operator(relation), attributes, counts: Mutex::new(Counts::default()), children, _reservation: Arc::clone(reservation) }))
     }
     pub fn child(&self, index: usize) -> Option<Arc<Self>> { self.children.get(index).cloned() }
