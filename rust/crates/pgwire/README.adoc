@@ -42,6 +42,8 @@ Simple Query supports multiple statements, implicit transaction completion, expl
 Shared control parsing and execution live in `rtdb-sql` and `rtdb-node`.
 Parse/Bind/Describe/Execute/Close/Flush/Sync retain named prepared statements and portals across protocol messages.
 Extended Parse validates the grammar of every SQL `PREPARE` body before sending ParseComplete.
+During extended Parse, the node's memory budget covers the temporary tokens used to identify a control statement.
+A directly prepared control retains its estimated parsing and binding allowance while a statement registration or bound portal holds it.
 A bound portal retains the body selected at Bind when a later Parse replaces the statement name.
 Executing the wrapper prepares its immediate child in the current session context.
 Planning warnings use severity `WARNING` and SQLSTATE `01000` and are sent in occurrence order before ParseComplete, simple-query results, or SQL `PREPARE` completion.

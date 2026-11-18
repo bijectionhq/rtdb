@@ -940,6 +940,50 @@ fn prepare_error_detail(frame: &(u8, Vec<u8>)) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn extended_control_errors_preserve_coordinates_and_the_registered_statement() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("zone", "SET TIME ZONE 'Europe/Paris'", &[]).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"1Z");
+
+    let bounded = "SET TIME ZONE /* café */ 'UTC' TRAILING";
+    let control_error = format!("-- début\r\n; ; {bounded}; ;");
+    let lexical_error = "-- début\r\n; SET TIME ZONE 'UTC'; SELECT @; ;";
+    for (source, message, start, end) in [
+        (control_error.as_str(), "Unexpected input after control statement", bounded.find("TRAILING").unwrap(), bounded.len()),
+        (lexical_error, "Invalid character in SQL source", lexical_error.find('@').unwrap(), lexical_error.find('@').unwrap() + 1),
+    ] {
+        client.parse("zone", source, &[]).await;
+        client.bind("", "zone").await;
+        client.send(b'S', &[]).await;
+        let rejected = client.through(b'Z').await;
+        assert_eq!(tags(&rejected), b"EZ");
+        assert_eq!(rejected[1].1, b"I");
+        let detail = prepare_error_detail(&rejected[0]);
+        assert_eq!(detail["code"], "xtdb/sql-error");
+        assert_eq!(detail["message"], message);
+        assert_eq!(detail["data"]["position"], serde_json::json!(start + 1));
+        assert_eq!(detail["data"]["span"], serde_json::json!({"start": start, "end": end}));
+    }
+
+    client.bind("", "zone").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"2SCZ");
+    assert_eq!(rows(&client.query("SHOW TIME ZONE").await), [vec![Some(b"Europe/Paris".to_vec())]]);
+
+    client.parse("zone", "SET TIME ZONE 'UTC'", &[]).await;
+    client.bind("", "zone").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"12SCZ");
+    assert_eq!(rows(&client.query("SHOW TIME ZONE").await), [vec![Some(b"UTC".to_vec())]]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn extended_prepare_rejects_nested_grammar_before_acknowledgment_and_keeps_the_registration() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
