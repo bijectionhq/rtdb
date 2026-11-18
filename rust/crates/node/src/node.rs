@@ -185,6 +185,20 @@ impl Node {
         tokio::time::timeout(timeout, try_join_all(waits)).await.map_err(|_| timeout_error())??;
         Ok(())
     }
+    /// Submits a flush request to each open writable database and waits for its source position.
+    pub async fn flush_all(&self, timeout: Duration) -> Result<()> {
+        self.ensure_open()?;
+        let databases = self.catalog.open_database_snapshot(self.memory())?;
+        let work = async {
+            for database in databases.rows().iter().filter(|database| !database.read_only()) {
+                let position = database.flush().await?;
+                database.progress().await_source(position, &self.cancellation).await?;
+            }
+            Ok(())
+        };
+        tokio::time::timeout(timeout, self.cancellation.run_until_cancelled(work))
+            .await.map_err(|_| timeout_error())?.ok_or_else(closed)?
+    }
     pub async fn sync_all(&self, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         self.ensure_open()?;
         let work = async {

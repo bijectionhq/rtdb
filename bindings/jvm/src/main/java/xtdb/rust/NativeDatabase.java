@@ -7,6 +7,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.InstantSource;
 import java.util.concurrent.atomic.AtomicLong;
@@ -116,6 +117,19 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
         } finally {
             if (clockArena != null && clockArena.scope().isAlive()) clockArena.close();
         }
+    }
+
+    /** Requests a block flush in each open writable database and awaits progress through those requests. */
+    public void flushAll(Duration timeout) throws AdbcException {
+        if (timeout == null || timeout.isZero() || timeout.isNegative())
+            throw AdbcException.invalidArgument("Flush timeout must be positive");
+        long nanos;
+        try {
+            nanos = timeout.toNanos();
+        } catch (ArithmeticException tooLarge) {
+            throw AdbcException.invalidArgument("Flush timeout exceeds the signed nanosecond range").withCause(tooLarge);
+        }
+        abi.call("database_flush_all", handle(), nanos);
     }
 
     @Override public NativeConnection connect() throws AdbcException { return connect("xtdb"); }

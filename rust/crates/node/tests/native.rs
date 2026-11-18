@@ -261,6 +261,22 @@ async fn log_tables_test_source_log_msgs_basic_and_tx_ops_decoded() {
 }
 
 #[tokio::test]
+async fn flush_all_observes_successive_durable_blocks_before_returning() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    for (id, expected) in [(1, "00"), (2, "01")] {
+        session.state_mut().execute_operation(put(&node, id, id * 10)).await.unwrap();
+        node.flush_all(Duration::from_secs(10)).await.unwrap();
+        let blocks = rows(session.query_sql(
+            "SELECT block_idx FROM xt.table_block_files WHERE table_name = 'public/docs' AND block_idx = ?",
+            vec![Value::Utf8(expected.into())],
+        ).await.unwrap()).await;
+        assert_eq!(blocks, vec![vec![Value::Utf8(expected.into())]]);
+    }
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn block_tables_test_block_files_with_params_and_table_block_tries() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let (node, driver) = running(options(), services()).await;

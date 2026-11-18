@@ -143,7 +143,8 @@
                           (not-any? #{tu/with-allocator} fixtures) (into [tu/with-allocator]))]
     (when (some nil? native-fixtures)
       (throw (ex-info "Unsupported original API fixture" {:test (str original)})))
-    (binding [tu/*query-ra-executor* run-native-logical-query]
+    (binding [tu/*query-ra-executor* run-native-logical-query
+              tu/*flush-block-executor* (fn [^NativeDatabase node timeout] (.flushAll node timeout))]
       ((t/join-fixtures native-fixtures) (:test (meta original))))))
 
 (defmacro ^:private deftest-original-api [original & [local-name]]
@@ -805,6 +806,10 @@
 (deftest-original-api original-scan/dont-use-fast-path-on-non-literals-2768)
 
 (deftest-original-api original-scan/test-past-point-point-queries-with-valid-time)
+
+(deftest-original-api original-scan/test-aligns-temporal-columns-correctly-363)
+
+(deftest-original-api original-scan/test-scan-col-types)
 
 (deftest-original-api original-as-of/test-as-of-tx)
 

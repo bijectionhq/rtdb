@@ -74,6 +74,11 @@ The callback must be safe to call concurrently across logs and finish without re
 If the source throws or supplies an instant outside the microsecond range, the append fails before it publishes a record.
 The database releases the callback when close finishes.
 
+`NativeDatabase.flushAll(timeout)` submits an explicit block flush in each open writable database and waits for indexed progress through those requests.
+Each request targets the database's adopted block index at submission.
+If another boundary has already advanced that index when the request is processed, the request advances source progress without cutting another block.
+The timeout covers submission and waiting across all targeted databases.
+
 The new module does not invoke Cargo from Gradle and does not build or load a native library during source preparation.
 The binding tests load a separately built native library from `xtdb.native.library`.
 The Clojure suite invokes the original query-tail, duration literal, null-or-missing UNNEST, and declared-column extrema test bodies with a fresh `NativeDatabase`.

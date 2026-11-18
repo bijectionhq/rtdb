@@ -159,14 +159,19 @@
 (defn ->tstz-range ^xtdb.types.ZonedDateTimeRange [from to]
   (ZonedDateTimeRange. (time/->zdt from) (some-> to time/->zdt)))
 
+(def ^:dynamic *flush-block-executor* nil)
+
 (defn flush-block!
   ([node] (flush-block! node #xt/duration "PT5S"))
   ([node timeout]
-   (let [db-cat (db/<-node node)]
-     (doseq [db-name (.getDatabaseNames db-cat)]
-       (xt-log/send-flush-block-msg! (.databaseOrNull db-cat db-name))))
+   (if *flush-block-executor*
+     (*flush-block-executor* node timeout)
+     (do
+       (let [db-cat (db/<-node node)]
+         (doseq [db-name (.getDatabaseNames db-cat)]
+           (xt-log/send-flush-block-msg! (.databaseOrNull db-cat db-name))))
 
-   (xt-log/sync-node node timeout)))
+       (xt-log/sync-node node timeout)))))
 
 (defn open-vec
   (^xtdb.arrow.Vector [^Field field]

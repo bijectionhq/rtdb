@@ -24,6 +24,19 @@ fn incorrect(status: i32, error: u64, code: &str) {
 struct Native { database: u64, session: u64, retained: Vec<u64> }
 
 #[test]
+fn flush_all_validates_timeout_and_refuses_closed_handles() {
+    let native = Native::open();
+    let mut error = 0;
+    for timeout in [0, -1] {
+        let status = unsafe { rtdb_v1_database_flush_all(native.database, timeout, &mut error) };
+        incorrect(status, error, "rtdb.ffi/invalid-argument");
+    }
+    ok(unsafe { rtdb_v1_close(native.database, &mut error) }, error);
+    let status = unsafe { rtdb_v1_database_flush_all(native.database, 1_000_000, &mut error) };
+    incorrect(status, error, "rtdb.ffi/closed");
+}
+
+#[test]
 fn diagnostic_slices_distinguish_absent_empty_and_present_messages_through_retain() {
     for message in [None, Some(String::new()), Some("échec".into())] {
         let original = handles::diagnostic(Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message.clone()));

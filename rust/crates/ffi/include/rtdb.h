@@ -72,6 +72,10 @@ typedef int32_t (*RtdbInstantSource)(uintptr_t context, int64_t *seconds, uint32
 int32_t rtdb_v1_database_open_with_in_memory_log_clock(const uint8_t *yaml, size_t yaml_length, size_t memory_bytes,
                                                     const uint8_t *properties, size_t properties_length,
                                                     RtdbInstantSource clock, uintptr_t context, RtdbHandle *out, RtdbHandle *error);
+/* Requests a block flush in each open writable database and waits for indexed progress
+ * through each request. timeout_nanos is a positive overall deadline.
+ */
+int32_t rtdb_v1_database_flush_all(RtdbHandle handle, int64_t timeout_nanos, RtdbHandle *error);
 int32_t rtdb_v1_retain(RtdbHandle handle, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_release(RtdbHandle handle, RtdbHandle *error);
 

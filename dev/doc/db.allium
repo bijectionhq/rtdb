@@ -377,6 +377,8 @@ variant LegacyTxMessage : SourceMessage {
 
 variant FlushBlockMessage : SourceMessage {
     -- The leader sends this to itself to trigger a block flush on timeout, so that the cut goes through resolution in log order like any other boundary trigger.
+    -- A manual request reads its expected index from the database's adopted table catalog.
+    -- The embedded node can request a flush from each open writable database and await each request's applied source position.
     -- Wire observations preserve the message and the presence of its expected index for replay verification.
     expected_block_idx: Integer?
 }

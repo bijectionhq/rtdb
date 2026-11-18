@@ -69,6 +69,7 @@ pub struct DriverStatus {
 pub struct ReplicationHandle {
     logs: Arc<PartitionLogs>, progress: Arc<ProgressMonitor>, status: watch::Receiver<DriverStatus>,
     commands: mpsc::Sender<Command>, cancellation: CancellationToken, clock: ReplicationClock,
+    partition: Arc<PartitionState>,
 }
 impl ReplicationHandle {
     pub fn progress(&self) -> &Arc<ProgressMonitor> { &self.progress }
@@ -89,7 +90,7 @@ impl ReplicationHandle {
     pub async fn await_tx(&self, id: TxId, cancellation: &CancellationToken) -> Result<Option<Arc<TransactionResult>>> { self.progress.await_tx(id, cancellation).await }
     pub async fn await_source(&self, position: SourcePosition, cancellation: &CancellationToken) -> Result<()> { self.progress.await_source(position, cancellation).await }
     pub async fn flush(&self) -> Result<SourcePosition> {
-        let expected = self.status.borrow().adopted_block.as_ref().map_or(-1, |block| block.block_index().0);
+        let expected = self.partition.value().table_catalog().block_index().map_or(-1, |block| block.0);
         self.submit_source(&SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(expected) })), (self.clock)()).await
     }
     /// Cancels the owned driver; the node must join `ReplicationDriver::run` before releasing its dependencies.
@@ -288,7 +289,7 @@ impl ReplicationDriver {
             open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
         let (status, receiver) = watch::channel(initial);
         let (sender, commands) = mpsc::channel(128);
-        let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone(), clock: Arc::clone(&clock) };
+        let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone(), clock: Arc::clone(&clock), partition: Arc::clone(&recovered.partition) };
         let persisted_tx = recovered.block.as_ref().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
         let flush_timer = FlushTimer::new(clock(), persisted_tx, config.flush_timeout)?;
         let recovered_confirmation = if config.enabled && config.may_lead {
