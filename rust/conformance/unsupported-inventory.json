@@ -85,7 +85,7 @@
    "code": "rtdb.format/metadata-flavour",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/format/src/statistics.rs:154"
+    "rust/crates/format/src/statistics.rs:155"
    ],
    "category": "internal-guard",
    "rationale": "Statistics are only grouped for numeric, temporal and duration columns once presence and byte-backed columns have returned; any other Arrow type here is an internal invariant breach.",
@@ -145,8 +145,8 @@
    "code": "rtdb.query/boolean-setter",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/query/src/aggregate.rs:407",
-    "rust/crates/query/src/aggregate.rs:527"
+    "rust/crates/query/src/aggregate.rs:411",
+    "rust/crates/query/src/aggregate.rs:531"
    ],
    "category": "reference-failure",
    "rationale": "BOOL_AND/BOOL_OR/EVERY over non-boolean emitted types: the reference reducing aggregate has no vector setter for them and throws.",
@@ -156,7 +156,7 @@
    "code": "rtdb.query/min-max-setter",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/query/src/aggregate.rs:514"
+    "rust/crates/query/src/aggregate.rs:518"
    ],
    "category": "reference-failure",
    "rationale": "MIN/MAX into decimal, small or unsigned integer, half-float or time vectors: the reference reducing aggregate's output vector has no matching setter and throws.",
@@ -166,7 +166,7 @@
    "code": "rtdb.query/small-integer-sum",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/query/src/aggregate.rs:588"
+    "rust/crates/query/src/aggregate.rs:592"
    ],
    "category": "reference-failure",
    "rationale": "SUM into a byte or short accumulator: the reference Sum vector has no sumInto implementation for those widths.",
@@ -176,7 +176,7 @@
    "code": "rtdb.query/variance-input",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/query/src/aggregate.rs:625"
+    "rust/crates/query/src/aggregate.rs:629"
    ],
    "category": "reference-failure",
    "rationale": "VAR_*/STDDEV_* over inputs other than int, long or double: the reference squareInto is only implemented on those vectors.",
@@ -215,20 +215,10 @@
    "reference": "core/src/main/kotlin/xtdb/arrow/MergeFields.kt:72-96 unsupported(\"LargeList\"/\"Utf8View\"/...) throws UnsupportedOperationException."
   },
   {
-   "code": "rtdb/avro-custom-logical-type",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/connect/avro/java_schema/logical.rs:159"
-   ],
-   "category": "jvm-host-dependent",
-   "rationale": "A custom Avro logical type is a Java class registered with LogicalTypes.register on the JVM classpath; a native node cannot load it.",
-   "reference": "org.apache.avro.LogicalTypes custom factories."
-  },
-  {
    "code": "rtdb/avro-java-text-reader-required",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/kafka/src/connect/avro/java_schema/producer/java_text.rs:45"
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/java_text.rs:46"
    ],
    "category": "internal-guard",
    "rationale": "Schema text reaches the reader from UTF-8 Registry responses, which cannot hold unmatched UTF-16 units.",
@@ -238,7 +228,7 @@
    "code": "rtdb/avro-logical-math-profile-required",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/kafka/src/connect/avro/java_schema/logical.rs:44"
+    "rust/crates/kafka/src/connect/avro/java_schema/logical.rs:41"
    ],
    "category": "jvm-host-dependent",
    "rationale": "Consulted only when the two adjacent doubles around log10(2) floor fixed-decimal precision differently, which depends on the JVM's Math.log10 last-ulp result; realistic fixed sizes never reach it.",
@@ -399,7 +389,7 @@
    "code": "xtdb.expression/multi-dimensional-array-literal",
    "classification": "reference-parity",
    "sites": [
-    "rust/crates/expr/src/cast.rs:291"
+    "rust/crates/expr/src/cast.rs:323"
    ]
   },
   {
@@ -426,7 +416,7 @@
    "code": "xtdb.expression/non-literal-scale",
    "classification": "reference-parity",
    "sites": [
-    "rust/crates/plan/src/expr.rs:516"
+    "rust/crates/plan/src/expr.rs:515"
    ]
   },
   {
@@ -498,7 +488,7 @@
    "code": "xtdb.expression/unsupported-round-type",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/plan/src/expr.rs:521"
+    "rust/crates/plan/src/expr.rs:520"
    ],
    "category": "reference-failure",
    "rationale": "ROUND(smallint/tinyint, scale): the reference case only maps :i32 and :i64 to a decimal precision and throws IllegalArgumentException otherwise.",
@@ -515,27 +505,17 @@
    "code": "xtdb.kafka-connect-source/registry-symbol-intern",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/kafka/src/connect/registry/response/symbols.rs:128"
+    "rust/crates/kafka/src/connect/registry/response/symbols.rs:129"
    ],
    "category": "internal-guard",
    "rationale": "Consistency check on the native symbol intern table; Registry input cannot alter interned content.",
    "reference": "No reference equivalent."
   },
   {
-   "code": "xtdb.kafka-connect-source/unsupported-avro-input-profile",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/connect/avro/java_schema/producer/input.rs:9"
-   ],
-   "category": "deferred-parity",
-   "rationale": "Avro schema documents above 256 KiB or with text above 50,000 units are rejected; the reference accepts them up to Jackson's limits. Listed in the kafka-avro-registry-and-producer resolution.",
-   "reference": "Jackson StreamReadConstraints defaults"
-  },
-  {
    "code": "xtdb.kafka-connect-source/unsupported-avro-native-profile",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/kafka/src/connect/avro/java_schema/producer/pair.rs:73"
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/pair.rs:78"
    ],
    "category": "deferred-parity",
    "rationale": "A schema the Java parser accepts but the native Avro backend cannot represent; observed cases are tracked by differential-equivalence.",
@@ -550,6 +530,16 @@
    "category": "jvm-host-dependent",
    "rationale": "specific.avro.reader and schema.reflection with named schemas load generated Java classes through SpecificData and ReflectData.",
    "reference": "io.confluent.connect.avro.AvroData"
+  },
+  {
+   "code": "xtdb.kafka-connect-source/unsupported-avro-reference",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro.rs:87"
+   ],
+   "category": "deferred-parity",
+   "rationale": "A schema reference whose union inlines a named declaration is rejected; the reference's Confluent Avro deserializer resolves it. Phase 2 differential qualification of the Registry path covers it.",
+   "reference": "io.confluent.kafka.schemaregistry.avro.AvroSchema resolves referenced schemas, including unions with inline named types."
   },
   {
    "code": "xtdb.kafka-connect-source/unsupported-source-profile",
@@ -581,6 +571,16 @@
    "category": "resource-or-format-guard",
    "rationale": "Environment names or values that are not valid process-encoded text.",
    "reference": "No reference equivalent."
+  },
+  {
+   "code": "xtdb.kafka/config-provider-utf16",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/config/providers/file_text.rs:39"
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "A ConfigProvider file value with unpaired UTF-16 surrogates has a Java String but no Rust String; native settings are UTF-8, so the value is refused rather than altered.",
+   "reference": "org.apache.kafka.common.config.provider.FileConfigProvider returns java.lang.String values, which admit unpaired surrogates."
   },
   {
    "code": "xtdb.kafka/jaas-login-module",
@@ -623,7 +623,7 @@
    "code": "xtdb.pgwire/unsupported-execute",
    "classification": "reference-parity",
    "sites": [
-    "rust/crates/pgwire/src/protocol.rs:267"
+    "rust/crates/pgwire/src/protocol.rs:268"
    ]
   },
   {
@@ -707,21 +707,21 @@
    "code": "xtdb.sql/lead-lag-default-expr",
    "classification": "reference-parity",
    "sites": [
-    "rust/crates/sql/src/window.rs:54"
+    "rust/crates/sql/src/window.rs:57"
    ]
   },
   {
    "code": "xtdb.sql/lead-lag-expr",
    "classification": "reference-parity",
    "sites": [
-    "rust/crates/sql/src/window.rs:57"
+    "rust/crates/sql/src/window.rs:60"
    ]
   },
   {
    "code": "xtdb.sql/lead-lag-ignore-nulls",
    "classification": "reference-parity",
    "sites": [
-    "rust/crates/sql/src/window.rs:55"
+    "rust/crates/sql/src/window.rs:58"
    ]
   },
   {
@@ -742,7 +742,7 @@
    "code": "xtdb.sql/recursive-ctes",
    "classification": "reference-parity",
    "sites": [
-    "rust/crates/sql/src/bind.rs:471"
+    "rust/crates/sql/src/bind.rs:522"
    ]
   },
   {
@@ -783,7 +783,7 @@
    "code": "xtdb/sql-unsupported",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/sql/src/bind.rs:1260"
+    "rust/crates/sql/src/bind.rs:1313"
    ],
    "category": "reference-failure",
    "rationale": "All 66 binder sites are sqlparser-rs dialect constructs that Sql.g4 has no rule for, grammar alternatives that sql.clj has no visitor for or explicitly throws on (window names and frames, ranking windows, a second window function, CTE column aliases, schema-qualified wildcards, DISTINCT on non-distinct aggregates), or branches that RTDB pre-processing makes unreachable (RETURNING, LIKE ANY, session control). The reference reports most of these as an incorrect xtdb/sql-error parse failure, where RTDB reports unsupported.",
@@ -803,14 +803,14 @@
    "code": "xtdb/unsupported-cast",
    "classification": "reference-parity",
    "sites": [
-    "rust/crates/expr/src/cast.rs:88"
+    "rust/crates/expr/src/cast.rs:117"
    ]
   },
   {
    "code": "xtdb/unsupported-run-end-type",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/types/src/logical.rs:131"
+    "rust/crates/types/src/logical.rs:152"
    ],
    "category": "resource-or-format-guard",
    "rationale": "Null and bottom have no run-end encoding.",
@@ -820,7 +820,7 @@
    "code": "xtdb/unsupported-type-rendering",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/types/src/type_edn.rs:119"
+    "rust/crates/types/src/type_edn.rs:142"
    ],
    "category": "reference-failure",
    "rationale": "Unsigned integers and half floats have no JVM type EDN rendering; the reference vector types never contain them.",

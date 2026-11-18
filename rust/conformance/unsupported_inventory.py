@@ -14,6 +14,8 @@ import sys
 
 SITE = re.compile(r'(?:Anomaly::unsupported|\bunsupported)\(\s*"(?P<code>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"')
 TEST_PATH = re.compile(r"(^|/)(tests?|benches|examples)(/|\.rs$)|_tests?\.rs$")
+# A test module, or a test-only item on the line before (or the line of) a site; other `#[cfg(test)]` items do not end production code.
+TEST_MODULE = re.compile(r"^#\[cfg\(test\)\]\s*(pub(\([a-z]+\))?\s+)?mod\s", re.MULTILINE)
 
 
 def production_sites(crates: pathlib.Path):
@@ -22,11 +24,15 @@ def production_sites(crates: pathlib.Path):
         if TEST_PATH.search(relative):
             continue
         text = path.read_text(encoding="utf-8")
-        test_module = text.find("#[cfg(test)]")
+        module = TEST_MODULE.search(text)
+        test_module = module.start() if module else -1
+        lines = text.splitlines()
         for match in SITE.finditer(text):
             if 0 <= test_module < match.start():
                 continue
             line = text.count("\n", 0, match.start()) + 1
+            if any(lines[index].strip().startswith("#[cfg(test)]") for index in (line - 1, line - 2) if index >= 0):
+                continue
             yield match["code"], f"{relative}:{line}"
 
 

@@ -1,6 +1,8 @@
+import pathlib
+import tempfile
 import unittest
 
-from unsupported_inventory import classify
+from unsupported_inventory import classify, production_sites
 
 
 def entry(code, classification="native-gap"):
@@ -24,6 +26,27 @@ class ClassificationTests(unittest.TestCase):
         for classification in [{"a/removed": reason()}, {"xtdb/parity": reason()}, {"a/gap": reason("unknown")}]:
             with self.subTest(classification=classification), self.assertRaises(ValueError):
                 classify(codes, classification)
+
+
+class SiteTests(unittest.TestCase):
+    def test_a_test_only_item_hides_only_itself_and_a_test_module_hides_the_rest(self):
+        source = "\n".join([
+            '#[cfg(test)]',
+            'fn helper() -> Anomaly { Anomaly::unsupported("a/test-helper", "") }',
+            'fn production() -> Anomaly { Anomaly::unsupported("a/production", "") }',
+            'match outcome {',
+            '    #[cfg(test)]',
+            '    Outcome::Test => return Err(Anomaly::unsupported(',
+            '        "a/test-arm", "")),',
+            '}',
+            '#[cfg(test)]',
+            'mod tests { fn t() { Anomaly::unsupported("a/in-tests", ""); } }',
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            crates = pathlib.Path(root) / "rust" / "crates"
+            (crates / "x" / "src").mkdir(parents=True)
+            (crates / "x" / "src" / "lib.rs").write_text(source, encoding="utf-8")
+            self.assertEqual(list(production_sites(crates)), [("a/production", "rust/crates/x/src/lib.rs:3")])
 
 
 if __name__ == "__main__":

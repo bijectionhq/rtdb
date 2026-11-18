@@ -104,11 +104,6 @@
   "rationale": "Arrow types with no XTDB vector mapping (LargeUtf8, views, large lists, ...) in stored files or client batches.",
   "reference": "core/src/main/kotlin/xtdb/arrow/MergeFields.kt:72-96 unsupported(\"LargeList\"/\"Utf8View\"/...) throws UnsupportedOperationException."
  },
- "rtdb/avro-custom-logical-type": {
-  "category": "jvm-host-dependent",
-  "rationale": "A custom Avro logical type is a Java class registered with LogicalTypes.register on the JVM classpath; a native node cannot load it.",
-  "reference": "org.apache.avro.LogicalTypes custom factories."
- },
  "rtdb/avro-java-text-reader-required": {
   "category": "internal-guard",
   "rationale": "Schema text reaches the reader from UTF-8 Registry responses, which cannot hold unmatched UTF-16 units.",
@@ -214,11 +209,6 @@
   "rationale": "Consistency check on the native symbol intern table; Registry input cannot alter interned content.",
   "reference": "No reference equivalent."
  },
- "xtdb.kafka-connect-source/unsupported-avro-input-profile": {
-  "category": "deferred-parity",
-  "rationale": "Avro schema documents above 256 KiB or with text above 50,000 units are rejected; the reference accepts them up to Jackson's limits. Listed in the kafka-avro-registry-and-producer resolution.",
-  "reference": "Jackson StreamReadConstraints defaults"
- },
  "xtdb.kafka-connect-source/unsupported-avro-native-profile": {
   "category": "deferred-parity",
   "rationale": "A schema the Java parser accepts but the native Avro backend cannot represent; observed cases are tracked by differential-equivalence.",
@@ -228,6 +218,11 @@
   "category": "jvm-host-dependent",
   "rationale": "specific.avro.reader and schema.reflection with named schemas load generated Java classes through SpecificData and ReflectData.",
   "reference": "io.confluent.connect.avro.AvroData"
+ },
+ "xtdb.kafka-connect-source/unsupported-avro-reference": {
+  "category": "deferred-parity",
+  "rationale": "A schema reference whose union inlines a named declaration is rejected; the reference's Confluent Avro deserializer resolves it. Phase 2 differential qualification of the Registry path covers it.",
+  "reference": "io.confluent.kafka.schemaregistry.avro.AvroSchema resolves referenced schemas, including unions with inline named types."
  },
  "xtdb.kafka-connect-source/unsupported-source-profile": {
   "category": "resource-or-format-guard",
@@ -243,6 +238,11 @@
   "category": "resource-or-format-guard",
   "rationale": "Environment names or values that are not valid process-encoded text.",
   "reference": "No reference equivalent."
+ },
+ "xtdb.kafka/config-provider-utf16": {
+  "category": "jvm-host-dependent",
+  "rationale": "A ConfigProvider file value with unpaired UTF-16 surrogates has a Java String but no Rust String; native settings are UTF-8, so the value is refused rather than altered.",
+  "reference": "org.apache.kafka.common.config.provider.FileConfigProvider returns java.lang.String values, which admit unpaired surrogates."
  },
  "xtdb.kafka/jaas-login-module": {
   "category": "deferred-parity",
