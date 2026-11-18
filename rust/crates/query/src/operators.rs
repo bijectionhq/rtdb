@@ -83,6 +83,11 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
+        RelationNode::LiteralPages { .. } => {
+            let pages = Box::new(LiteralPageCursor { relation, next: 0, execution });
+            let pages = crate::pages::retain_page_state(pages, state_reservation);
+            return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
+        }
         RelationNode::Scan(scan) => {
             let mut constraints = constraints;for predicate in &scan.predicates { constraints.add(predicate); }
             let pages: BoxPageCursor = if crate::inspection::is_inspection(&scan.table.name.table) {
@@ -251,6 +256,22 @@ async fn materialize_rows(rows: &[Vec<Expr>], execution: &Execution) -> Result<O
         page.push(OwnedRow::new(values, &execution.context.memory)?)?;
     }
     Ok(Some(page.finish()))
+}
+struct LiteralPageCursor { relation: Arc<Relation>, next: usize, execution: Execution }
+
+#[async_trait]
+impl PageCursor for LiteralPageCursor {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        self.execution.context.check_cancelled()?;
+        let RelationNode::LiteralPages { pages } = self.relation.node() else { return Err(invalid("page-source", "Expected literal pages")); };
+        let Some(rows) = pages.get(self.next) else { return Ok(None); };
+        let page = match materialize_rows(rows, &self.execution).await? {
+            Some(page) => page,
+            None => PageBuilder::new(0, &self.execution.context.memory)?.finish(),
+        };
+        self.next += 1;
+        Ok(Some(page))
+    }
 }
 struct PageProject { input: BoxPageCursor, schema: Schema, expressions: Vec<NamedExpr>, execution: Execution }
 #[async_trait]

@@ -45,7 +45,7 @@ impl ResolvedTables {
 
 fn collect(source: &Relation, catalog: &dyn Catalog, bindings: &mut Vec<TableBinding>) -> Result<()> {
     match source.node() {
-        RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => {}
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => {}
         RelationNode::Scan(scan) => bindings.push(catalog.table(&scan.table.name)?
             .ok_or_else(|| gap("Prepared table disappeared from its own snapshot"))?),
         RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. }
@@ -90,6 +90,7 @@ impl Rebuilder<'_> {
         let mut node = source.node().clone();
         match &mut node {
             RelationNode::Values { rows } => self.expressions(rows.iter_mut().flatten())?,
+            RelationNode::LiteralPages { pages } => self.expressions(pages.iter_mut().flatten().flatten())?,
             RelationNode::List { expr, .. } | RelationNode::ColumnTable { expr, .. } => self.expression(expr)?,
             RelationNode::Scan(scan) => {
                 scan.table = self.next_table()?;
@@ -321,6 +322,7 @@ mod tests {
         patch_output[3].data_type = patch_output[3].data_type.clone().maybe();
         vec![
             ("Values", values(Expr::Literal(V::I64(7)), 0)),
+            ("LiteralPages", relation(Schema::new(vec![output.clone()]).unwrap(), RelationNode::LiteralPages { pages: vec![vec![vec![Expr::Literal(V::I64(7))]], vec![]] })),
             ("Scan", Arc::clone(&input)),
             ("Project", relation(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Project { input: Arc::clone(&input), expressions: vec![named.clone()] })),
             ("Extend", Arc::new(Arc::clone(&input).extend(vec![named.clone()]).unwrap())),
@@ -349,7 +351,7 @@ mod tests {
     #[test]
     fn all_relation_variants_keep_their_typed_projection() {
         let cases = variants();
-        assert_eq!(cases.len(), 23);
+        assert_eq!(cases.len(), 24);
         let mut names = BTreeSet::new();
         for (name, source) in cases {
             assert!(names.insert(name));
@@ -360,6 +362,7 @@ mod tests {
             assert_eq!(serde_json::to_value(&*restored).unwrap()["node"].as_object().unwrap().keys().next().map(String::as_str), Some(name));
             match restored.node() {
                 RelationNode::Values { rows } => assert_eq!(rows, &[vec![Expr::Literal(V::I64(7))]]),
+                RelationNode::LiteralPages { pages } => assert_eq!(pages, &[vec![vec![Expr::Literal(V::I64(7))]], vec![]]),
                 RelationNode::List { expr, element } | RelationNode::ColumnTable { expr, element } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); }
                 RelationNode::PageOrdinality { field, .. } => { assert_eq!(field.id, ColumnId(3)); assert_eq!(field.data_type, L::Scalar(S::I64)); }
                 RelationNode::Scan(scan) => { assert_eq!(scan.table, table("a")); assert_eq!(scan.columns[0].id, ColumnId(0)); }

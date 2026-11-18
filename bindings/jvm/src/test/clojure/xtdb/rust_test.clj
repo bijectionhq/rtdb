@@ -4,6 +4,7 @@
             [xtdb.information-schema-test :as original-info-schema]
             [xtdb.issue-test :as original-issue]
             [xtdb.operator.group-by-test :as original-group-by]
+            [xtdb.operator.project-test :as original-project]
             [xtdb.operator.select-test :as original-select]
             [xtdb.operator.table-test :as original-table]
             [xtdb.sql.expr-test :as original-expr]
@@ -99,6 +100,21 @@
       (binding [tu/*node* node]
         (f)))))
 
+(defn- import-logical-inputs [query]
+  (let [[operator options & operands] query]
+    (if (= operator ::tu/pages)
+      (if (empty? operands)
+        [:literal-pages {:pages options}]
+        (throw (ex-info "Declared fixture page types require a native schema representation" {:query query})))
+      (into [operator options] (map import-logical-inputs) operands))))
+
+(defn- run-native-logical-query [query {:keys [node] :as options}]
+  (let [query (import-logical-inputs query)]
+    (if node
+      (rust/query-ra node query options)
+      (with-open [node (open-node tu/*allocator*)]
+        (rust/query-ra node query options)))))
+
 (defn- run-original-api-case [original]
   (let [fixtures (-> original meta :ns meta ::t/each-fixtures)
         native-fixtures (mapv {tu/with-node with-native-node
@@ -109,11 +125,7 @@
                           (not-any? #{tu/with-allocator} fixtures) (into [tu/with-allocator]))]
     (when (some nil? native-fixtures)
       (throw (ex-info "Unsupported original API fixture" {:test (str original)})))
-    (binding [tu/*query-ra-executor* (fn [query {:keys [node] :as options}]
-                                      (if node
-                                        (rust/query-ra node query options)
-                                        (with-open [node (open-node tu/*allocator*)]
-                                          (rust/query-ra node query options))))]
+    (binding [tu/*query-ra-executor* run-native-logical-query]
       ((t/join-fixtures native-fixtures) (:test (meta original))))))
 
 (defmacro ^:private deftest-original-api [original & [local-name]]
@@ -125,6 +137,10 @@
 (deftest-original-api original-sql/multiple-query-tails)
 
 (deftest-original-api original-select/test-no-column-relation)
+
+(deftest-original-api original-select/test-select)
+
+(deftest-original-api original-project/test-project)
 
 (deftest-original-api original-table/test-table-handles-exprs)
 

@@ -102,4 +102,5 @@ Native requests preserve the JVM numeric widths of Byte, Short, Integer and Floa
 The embedded native connection accepts logical relation EDN with named Transit arguments on its normal read basis.
 The logical relation cursor exposes its declared result types through the Arrow schema, independently of row availability.
 Logical scans bind to the awaited database snapshot and accept stored column symbols, scan predicates, and valid-time and system-time filters.
+Logical relation output preserves operator page boundaries, and a literal page source supplies its pages in the specified order, including empty pages.
 Native logical relation tests run with the original Clojure assertions and the native relation cursor.

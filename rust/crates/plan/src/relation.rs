@@ -223,6 +223,8 @@ pub struct WindowExpr { pub field: Field, pub function: WindowFunction }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RelationNode {
     Values { rows: Vec<Vec<Expr>> },
+    /// Rows from an explicit sequence of input pages, including empty pages.
+    LiteralPages { pages: Vec<Vec<Vec<Expr>>> },
     List { expr: Expr, element: Field },
     /// Materializes the selected list during opening and publishes one page, including an empty page.
     /// Statically non-list scalar payloads are not demanded; null and non-list results produce an empty page.
@@ -297,7 +299,7 @@ impl Relation {
 
     pub fn children(&self) -> Vec<&Arc<Self>> {
         match &self.node {
-            RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
+            RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
             RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
             | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. } | RelationNode::SortLimit { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
@@ -311,6 +313,7 @@ impl Relation {
     pub fn expressions(&self) -> Vec<&Expr> {
         match &self.node {
             RelationNode::Values { rows } => rows.iter().flatten().collect(),
+            RelationNode::LiteralPages { pages } => pages.iter().flatten().flatten().collect(),
             RelationNode::Scan(scan) => scan.valid_time.expressions().into_iter().chain(scan.system_time.expressions()).chain(scan.predicates.iter()).collect(),
             RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } | RelationNode::Rename { expressions, .. } => expressions.iter().map(|expr| &expr.expr).collect(),
             RelationNode::Filter { predicate, .. } => vec![predicate],
@@ -380,6 +383,9 @@ impl Relation {
         match &self.node {
             RelationNode::Values { rows } => {
                 if rows.iter().any(|row| row.len() != self.schema.len()) { return invalid("VALUES row width differs from schema"); }
+            }
+            RelationNode::LiteralPages { pages } => {
+                if pages.iter().flatten().any(|row| row.len() != self.schema.len()) { return invalid("Literal page row width differs from schema"); }
             }
             RelationNode::Scan(scan) => {
                 if self.schema.fields() != scan.columns { return invalid("Scan columns differ from output schema"); }

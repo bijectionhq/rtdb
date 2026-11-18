@@ -516,7 +516,7 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
         }
         RelationNode::Apply { arguments: values, .. } => map(work, [("columns", text(arguments(values, &input_columns, work)?)?)])?,
         RelationNode::Set { operator, .. } => { op = match operator { rtdb_plan::SetOperator::Union => "union-all", rtdb_plan::SetOperator::Intersect => "intersect", rtdb_plan::SetOperator::Except => "difference" }; work.null() }
-        RelationNode::Values { .. } | RelationNode::Sort { .. } | RelationNode::Limit { .. } | RelationNode::Distinct { .. }
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::Sort { .. } | RelationNode::Limit { .. } | RelationNode::Distinct { .. }
         | RelationNode::Let { .. } | RelationNode::Reference { .. } => work.null(),
     };
     let mut columns = Columns::new(work);

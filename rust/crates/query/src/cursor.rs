@@ -117,7 +117,15 @@ impl PreparedQuery {
     pub async fn execute(&self, context: Arc<QueryContext>, parameters: Vec<Value>) -> Result<QueryCursor> {
         self.execute_with_text(context, parameters, None).await
     }
-    pub async fn execute_with_text(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>) -> Result<QueryCursor> {
+    pub async fn execute_with_text(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>) -> Result<QueryCursor> {
+        self.open(context, parameters, text, false).await
+    }
+    /// Opens the query with one output batch for each page delivered by its root operator.
+    pub async fn execute_pages(&self, context: Arc<QueryContext>, parameters: Vec<Value>) -> Result<QueryCursor> {
+        self.open(context, parameters, None, true).await
+    }
+
+    async fn open(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, preserve_pages: bool) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
         for dependency in self.relation.dependencies() {
             let current = context.catalog.table(&dependency.name)?.ok_or_else(|| invalid("stale-plan", "Prepared table is no longer present"))?;
@@ -149,9 +157,17 @@ impl PreparedQuery {
         let execution = Execution { context: Arc::clone(&context), parameters, outer: crate::context::OuterRows::empty(&context.memory)?, bindings: None, analysis: analysis.clone() };
         let cancellation = context.cancellation.clone();
         let owner = context.owner_cancellation.clone();
-        let mut input = owner.run_until_cancelled(cancellation.run_until_cancelled(crate::operators::build(Arc::clone(&runtime_schema), execution))).await.flatten().ok_or_else(cancelled)??;
+        let operators = Arc::clone(&runtime_schema);
+        let input = owner.run_until_cancelled(cancellation.run_until_cancelled(async {
+            if preserve_pages && analysis.is_none() {
+                crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages)
+            } else {
+                crate::operators::build(operators, execution).await.map(QueryInput::Rows)
+            }
+        })).await.flatten().ok_or_else(cancelled)??;
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
         if let (QueryOutput::Analyze(schema), Some(analysis)) = (&self.output, analysis) {
+            let QueryInput::Rows(mut input) = input else { return Err(invalid("analysis-input", "Query analysis requires a row cursor")); };
             while let Some(row) = owner.run_until_cancelled(cancellation.run_until_cancelled(input.next())).await.flatten().ok_or_else(cancelled)?? { context.check_cancelled()?; drop(row); }
             drop(input);
             let peak = context.memory.peak_bytes();
@@ -174,7 +190,9 @@ fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory
     memory.reserve(bytes)
 }
 
-pub struct QueryCursor { schema: Arc<RuntimeSchema>, runtime_schema: Arc<RuntimeSchema>, input: Option<BoxCursor>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
+enum QueryInput { Rows(BoxCursor), Pages(crate::pages::BoxPageCursor) }
+
+pub struct QueryCursor { schema: Arc<RuntimeSchema>, runtime_schema: Arc<RuntimeSchema>, input: Option<QueryInput>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
 impl QueryCursor {
     /// The caller reserves before allocating rows; the reservation must cover their complete retained capacities.
     /// The returned cursor owns the rows and a child cancellation scope; its parent context stays usable after cancellation.
@@ -189,7 +207,7 @@ impl QueryCursor {
         if retained > reservation.bytes() { return Err(invalid("row-reservation", "Owned rows exceed their memory reservation")); }
         let runtime_schema = RuntimeSchema::fixed(&schema, &context.memory)?;
         let sample = sample.or_else(|| Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query)));
-        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(Box::new(OwnedRows { rows: rows.into_iter(), reservation })), context: context.execution_child(), sample, trace: None, query_span: None, plan_reservation: None })
+        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows(Box::new(OwnedRows { rows: rows.into_iter(), reservation }))), context: context.execution_child(), sample, trace: None, query_span: None, plan_reservation: None })
     }
     pub fn schema(&self) -> &Schema { self.schema.schema() }
     /// Batch fields derived from this execution's pinned catalog, before any rows are read.
@@ -219,14 +237,26 @@ impl QueryCursor {
     }
     async fn pull_batch(&mut self) -> Result<Option<OwnedBatch>> {
         let Some(input) = &mut self.input else { return Ok(None); };
-        let _row_container = self.context.memory.reserve(self.context.options.batch_rows.checked_mul(std::mem::size_of::<OwnedRow>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| invalid("batch-size", "Output row container allocation overflow"))?)?;
-        let mut rows = Vec::with_capacity(self.context.options.batch_rows);
-        while rows.len() < self.context.options.batch_rows {
-            let Some(row) = input.next().await? else { break; };
-            if row.values.len() != self.schema.schema().len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
-            rows.push(row);
+        let page = match input {
+            QueryInput::Pages(input) => {
+                let Some(page) = input.next_page().await? else { return Ok(None); };
+                page
+            }
+            QueryInput::Rows(input) => {
+                let mut rows = crate::pages::PageBuilder::new(self.context.options.batch_rows, &self.context.memory)?;
+                while rows.len() < self.context.options.batch_rows {
+                    let Some(row) = input.next().await? else { break; };
+                    if row.values.len() != self.schema.schema().len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
+                    rows.push(row)?;
+                }
+                if rows.len() == 0 { return Ok(None); }
+                rows.finish()
+            }
+        };
+        let rows = page.rows();
+        if rows.iter().any(|row| row.values.len() != self.schema.schema().len()) {
+            return Err(invalid("row-width", "Operator output differs from its declared schema"));
         }
-        if rows.is_empty() { return Ok(None); }
         let schema = self.runtime_schema.schema();
         let mut bound = 4096usize;
         for (column, field) in schema.fields().iter().enumerate() {

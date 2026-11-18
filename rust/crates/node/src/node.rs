@@ -416,7 +416,7 @@ impl NativeSession {
         }).collect();
         let options = rtdb_xtql::CompileOptions { named_parameters, default_timezone: context.timezone.clone(), ..Default::default() };
         let prepared = rtdb_xtql::compile_ra_in(source, &context.catalog, &options, &context.memory)?;
-        PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, arguments.into_values().collect()).await
+        PreparedQuery::from_prepared(prepared, &context.memory)?.execute_pages(context, arguments.into_values().collect()).await
     }
 }
 

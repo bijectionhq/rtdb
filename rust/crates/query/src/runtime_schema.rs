@@ -153,6 +153,11 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
     let mut expression = |expr: &Expr| { bytes = add(bytes, expression_bound(expr)?)?; Ok::<_, rtdb_types::Anomaly>(()) };
     match relation.node() {
         RelationNode::Values { rows } => for row in rows { for expr in row { expression(expr)?; } },
+        RelationNode::LiteralPages { pages } => {
+            for expr in pages.iter().flatten().flatten() { expression(expr)?; }
+            bytes = add(bytes, multiply(pages.capacity(), std::mem::size_of::<Vec<Vec<Expr>>>())?)?;
+            for page in pages { bytes = add(bytes, multiply(page.capacity(), std::mem::size_of::<Vec<Expr>>())?)?; }
+        }
         RelationNode::Scan(scan) => {
             for filter in [&scan.valid_time, &scan.system_time] {
                 match filter {
@@ -217,10 +222,15 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
         Ok::<_, rtdb_types::Anomaly>(schema)
     };
     let schema = match relation.node() {
-        RelationNode::Values { rows } => {
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } => {
+            let pages = match relation.node() {
+                RelationNode::Values { rows } => std::slice::from_ref(rows),
+                RelationNode::LiteralPages { pages } => pages.as_slice(),
+                _ => unreachable!(),
+            };
             Schema::new(relation.schema().fields().iter().enumerate().map(|(index, field)| {
-                let types = rows.iter().map(|row| type_of(&row[index], &Schema::default())).collect::<Result<Vec<_>>>()?;
-                Ok(if rows.iter().map(|row| row[index].data_type()).eq(types.iter().cloned()) { field.clone() } else { field_type(field, L::join_all(&types)) })
+                let types = pages.iter().flatten().map(|row| type_of(&row[index], &Schema::default())).collect::<Result<Vec<_>>>()?;
+                Ok(if pages.iter().flatten().map(|row| row[index].data_type()).eq(types.iter().cloned()) { field.clone() } else { field_type(field, L::join_all(&types)) })
             }).collect::<Result<_>>()?)?
         }
         RelationNode::Scan(scan) => {
@@ -359,7 +369,7 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
         }
     };
     let node = match (relation.node(), children.as_slice()) {
-        (RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => EmittedNode::Leaf,
+        (RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => EmittedNode::Leaf,
         (RelationNode::Aggregate { .. }, [input]) => EmittedNode::Aggregate { input: Arc::clone(input), types: aggregates },
         (RelationNode::Join { .. } | RelationNode::Set { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Let { .. }, [left, right]) => EmittedNode::Binary(Arc::clone(left), Arc::clone(right)),
         (RelationNode::Project { .. } | RelationNode::Extend { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::Sort { .. } | RelationNode::SortLimit { .. } | RelationNode::Limit { .. }

@@ -34,7 +34,7 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             Ok(Arc::new(Relation::scan(scan)?))
         }
         // An opened VALUES table evaluates every cell, including fields discarded by a parent projection.
-        RelationNode::Values { .. } => Ok(relation),
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } => Ok(relation),
         RelationNode::Limit { input, offset, fetch } => {
             let child = prune(Arc::clone(input), required)?;
             bounds(child, offset.clone(), fetch.clone())

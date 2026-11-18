@@ -48,6 +48,7 @@ impl Importer<'_, '_, '_> {
         let result = match (op, children) {
             ("table", []) => self.table(options)?,
             ("scan", []) => self.scan(options)?,
+            ("literal-pages", []) => self.literal_pages(options)?,
             ("select" | "σ" | "sigma", [input]) => {
                 let input = self.lower(input)?;
                 let predicate = self.scalar(required(options, "predicate")?, &mut bind_input(&input))?;
@@ -164,12 +165,36 @@ impl Importer<'_, '_, '_> {
                 .transpose().map(|value| value.unwrap_or(PExpr::Literal(Value::Null))),
             TableRow::Argument(parameter) => Ok(get_field(parameter, column)),
         }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+        let schema = self.row_schema(columns, std::slice::from_ref(&rows))?;
+        Relation::new(schema, RelationNode::Values { rows })
+    }
+
+    fn literal_pages(&mut self, options: &Edn) -> Result<Relation> {
+        let mut inferred = BTreeSet::new();
+        let pages = sequence(required(options, "pages")?)?.iter().map(|page| {
+            sequence(page)?.iter().map(|row| {
+                let fields = row.map().ok_or_else(|| invalid("Literal page rows must be maps"))?;
+                let row = fields.iter().map(|(name, value)| Ok((field_name(name)?.to_owned(), page_value(value)?)))
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                inferred.extend(row.keys().cloned());
+                Ok(row)
+            }).collect::<Result<Vec<_>>>()
+        }).collect::<Result<Vec<_>>>()?;
+        let columns = output_names(options, inferred)?;
+        let pages = pages.into_iter().map(|page| page.into_iter().map(|mut row| {
+            columns.iter().map(|column| PExpr::Literal(row.remove(column).unwrap_or(Value::Null))).collect()
+        }).collect()).collect::<Vec<_>>();
+        let schema = self.row_schema(columns, &pages)?;
+        Relation::new(schema, RelationNode::LiteralPages { pages })
+    }
+
+    fn row_schema(&mut self, columns: Vec<String>, pages: &[Vec<Vec<PExpr>>]) -> Result<Schema> {
         let fields = columns.into_iter().enumerate().map(|(position, name)| {
-            let types = rows.iter().map(|row| row[position].data_type()).collect::<Vec<_>>();
+            let types = pages.iter().flatten().map(|row| row[position].data_type()).collect::<Vec<_>>();
             let data_type = if types.is_empty() { LogicalType::Null } else { LogicalType::join_all(&types) };
             self.compiler.binder.field(name, None, data_type)
         }).collect::<Result<Vec<_>>>()?;
-        Relation::new(Schema::new(fields)?, RelationNode::Values { rows })
+        Schema::new(fields)
     }
 
     fn column_table(&mut self, options: &Edn, column: &Edn) -> Result<Relation> {
@@ -324,5 +349,21 @@ fn sequence(form: &Edn) -> Result<&[Edn]> {
 }
 
 fn column_name(form: &Edn) -> Result<&str> { form.symbol().ok_or_else(|| invalid("Expected a logical column symbol")) }
+
+fn field_name(form: &Edn) -> Result<&str> {
+    match &form.kind {
+        EdnKind::Symbol(name) | EdnKind::Keyword(name) | EdnKind::String(name) => Ok(name),
+        _ => Err(invalid("Expected a literal field name")),
+    }
+}
+
+fn page_value(form: &Edn) -> Result<Value> {
+    Ok(match &form.kind {
+        EdnKind::List(forms) | EdnKind::Vector(forms) => Value::List(forms.iter().map(page_value).collect::<Result<_>>()?),
+        EdnKind::Set(forms) => Value::Set(forms.iter().map(page_value).collect::<Result<_>>()?),
+        EdnKind::Map(fields) => Value::Struct(fields.iter().map(|(name, value)| Ok((normal(field_name(name)?), page_value(value)?))).collect::<Result<_>>()?),
+        _ => crate::literal::value(form)?,
+    })
+}
 
 fn invalid(message: impl Into<String>) -> rtdb_types::Anomaly { error("rtdb.ra/invalid-relation", message) }

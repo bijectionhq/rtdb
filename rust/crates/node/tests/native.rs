@@ -182,6 +182,21 @@ async fn native_logical_queries_execute_bound_relations_with_named_arguments() {
 }
 
 #[tokio::test]
+async fn native_logical_queries_preserve_explicit_page_boundaries() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let plan = "[:literal-pages {:pages [[{:a 1}] [] [{:a 2} {:a 3}]]}]";
+    let mut cursor = session.query_ra(plan, BTreeMap::new(), &token).await.unwrap();
+    for expected in [1, 0, 2] {
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.batch().num_rows(), expected);
+    }
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn disabled_indexing_and_read_only_nodes_do_not_resolve_external_source_factories() {
     for read_only in [false, true] {
         let mut config = options();
