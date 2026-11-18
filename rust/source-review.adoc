@@ -526,6 +526,8 @@ Registered Path and the shared Java UTF8 decoder have bounded root source review
 Evaluation and registered-object construction share the borrowed admission policy used by name rendering and invalid VectorType diagnostics.
 Stored MessagePack ExceptionInfo with a string or null message and null or empty-map data reaches the scalar FORMAT renderer under the default print bindings.
 The selected constructor reserves its message copy before allocation.
+FORMAT resolves root MessagePack LocalDate and LocalTime strings through the registered ISO constructors and the shared scalar renderer.
+The renderer admits temporary formatting text before it admits output growth.
 Generic text rendering still needs the source Date locale and time-zone policies and ExceptionInfo construction state.
 Other platform/provider environments and remaining registered objects are still required work.
 
@@ -628,7 +630,7 @@ COPY and ATTACH character strings preserve their control-visitor bodies.
 COPY forwards an unknown first format to its frontend diagnostic and validates later options without decoding their ignored bodies.
 Quoted identifiers preserve doubled interior delimiters through query and control binding.
 The generic lexer still differs in E-string admission, numeric/binary and operator token boundaries and exact parser-demand scheduling.
-Pinned simple-query parsing validates the complete grammar before any statement dispatch; native lexical splitting currently permits earlier effects before a later syntax failure.
+Pinned Simple Query validates the complete grammar before dispatching statements.
 Native scanner and token-stream production integration, raw UTF16 literal intermediates, grammar prediction, diagnostic demand and admitted parsed ownership remain required implementation work.
 No compiler or test command has executed; the completeness gate remains false and no implementation-completeness revision is recorded.
 
@@ -1249,6 +1251,8 @@ Dollar strings retain their opening and closing tokens and the indexed text in a
 The LL path distinguishes a missing closing tag after text from a mismatch immediately after the opener.
 TIME, DURATION, UUID, URI and KEYWORD retain their prefix terminal and characterString child in both profiles.
 Their raw trees reach both SELECT roots, and cleanup identifies the failed attachment by the originating call state.
+DATE and TIMESTAMP preserve the `dateTimeLiteral` and raw `characterString` trees.
+TIMESTAMP also retains its optional `withOrWithoutTimeZone` child.
 Adaptive decision scratch drops when the decision finishes, while the token stream and invocation records stay live through the parse.
 The SELECT list and explicit alias fixtures preserve the reached sync and error sites, including lexical failure during LL recovery.
 Production parsing still requires the remaining grammar and the host cache and diagnostic boundaries.
@@ -1257,17 +1261,20 @@ Simple Query recognizes empty and leading-semicolon markers on the complete norm
 The markers preserve an open or failed explicit transaction and participate in ordinary implicit settlement.
 The DBeaver rewrite recognizes the complete normalized namespace query before lexical splitting and replaces `n.oid,n.*` with the explicit namespace fields `n.oid,n.nspname,n.nspowner,n.nspacl`.
 Simple Query takes the whole-message response for fixed keyword spellings with a locale-independent match.
-Locale-dependent spellings retain the existing range behavior pending host locale capture.
+Locale-dependent spellings require host locale capture.
 The ordinary Simple Query tokenizer reserves replacement token-array storage while the old array still owns its charge.
-Lexical validation precedes range construction, with both arrays charged while the nonempty ranges are filled.
-The token array drops before execution, the ranges retain their reservation across the batch, and the input frame holds the source text.
-Token payloads and tokenizer scratch still need admission.
-Simple Query reuses its first lowered control when preparation receives the same source bytes.
-The SQL parser validates the surrounding syntax and explicit inline XTQL argument envelope before reading the embedded EDN and assigning slots.
-The raw read uses the metadata budget carried with the syntax tree.
-Whole-batch syntax validation before execution still requires admitted syntax owners and nested PREPARE classification.
-PostgreSQL preparation consumes the classified AST with its original source and budget after parameter handling.
-The durable DML operation retains that source, and query execution still binds against its own snapshot.
+The admitted lexer keeps source line-comment slots with their original locations and empty prefix and body strings.
+The batch parser validates the full lexical input before checking ordinary statement grammar in source order, including nested PREPARE bodies.
+The located token array, batch slots and per-statement grammar reservations overlap while the batch is built.
+Execution releases each grammar reservation after consuming its syntax during preparation.
+Token payloads, parser scratch and retained tree growth still need allocation coverage beyond these reservations.
+Operands resolve against the reached context, including inline XTQL text, argument slots and control expressions.
+Standalone PostgreSQL preparation checks the originating budget on the full syntax input.
+Simple Query uses the complete normalized or rewritten batch for diagnostics and passes the bounded statement text into native preparation and durable DML.
+Query execution still binds against its own snapshot.
+The explicit and mixed Extended/Simple wire fixtures record transaction status through grammar, reached operand failure and Sync.
+Extended Execute can reach a PREPARE command with a raw child, including a command registered through nested Simple Query PREPARE.
+That route prepares the child when the command executes.
 
 The direct source scalar reader materializes raw FixedBinary and UUID objects through its signed byte view.
 UUID demand copies the complete admitted inner span before the first or second relative read can fail.
@@ -1278,6 +1285,7 @@ The direct and first Slice guarded object paths read the signed validity byte be
 The LongLong methods on those readers use signed lane arithmetic and demand all eight bytes within the retained Arrow 19 bounds.
 The direct reader and first Slice can retarget an existing borrowed pointer slot while previously demanded bytes keep their original backing.
 Pointer comparison validates both spans in Arrow 19 operand order before comparing unsigned bytes.
+Default backed pointer equality checks object identity first and validates both spans for distinct pointers.
 Existing-inner and selected-reader ownership still require source work.
 
 == Kafka connection state and paired Avro source checkpoint
@@ -1297,7 +1305,8 @@ The native Metadata cache now owns the rack values and selected replica and ISR 
 Full entries preserve the parsed rack pointer presence.
 A reliable merge preserves the existing optional-rack rule and the selected replica and ISR pointer presence.
 Rack-aware topic-info comparison reads a zero count for partitions without racks.
-The cache still needs per-entry admission and broader caller-lock validation.
+Lightweight topic conversion holds the client write lock through topic publication and initialization from the cached entry.
+The cache still needs per-entry admission and lock repair for other borrowers.
 Observation fixtures use the ordinary and admin parser paths with separate lifetimes for parsed results and retained cache entries.
 
 The implementation revision remains unset and the source-completeness gate remains false.
