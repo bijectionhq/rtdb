@@ -159,7 +159,13 @@ impl NativeSession {
                 self.state.set_await_token(string(value, "AWAIT_TOKEN")?)?; Ok(command("SET AWAIT_TOKEN", allocation))
             }
             ControlStatement::SetParameter { name, value } => {
-                let value = self.control_value(value, arguments, &allocation, catalog).await?;
+                let value = match value {
+                    Expr::DurationLiteral(value) => {
+                        allocation.reserve(rtdb_types::DurationLiteral::MAX_TEXT_LEN)?;
+                        Value::Utf8(value.to_iso_string())
+                    }
+                    value => self.control_value(value, arguments, &allocation, catalog).await?,
+                };
                 allocation.reserve(rtdb_expr::text_allocation_bound(&value)?)?;
                 allocation.reserve(name.len().checked_mul(4).ok_or_else(|| invalid("SET name allocation overflow"))?)?;
                 let value = if matches!(value, Value::Null | Value::Undefined) { None } else {

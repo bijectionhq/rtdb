@@ -335,6 +335,9 @@ TIME, TIMESTAMP and DURATION casts preserve their requested fractional precision
 SQL qualifiers support every single interval field and the YEAR TO MONTH, DAY TO HOUR/MINUTE/SECOND, HOUR TO MINUTE/SECOND and MINUTE TO SECOND ranges.
 SECOND precision determines nanosecond versus micro-interval metadata for multi-field, duration and interval inputs; single-field text and integer inputs keep the reference's micro-interval result metadata.
 TIME WITH TIME ZONE follows the pinned planner's timestamp-with-zone cast lowering.
+DURATION literals read ISO duration text during SQL binding and keep the signed-second range for formatting.
+Query evaluation converts a demanded duration literal to microseconds through the checked nanosecond range.
+KEYWORD literals remove one leading colon from the string before constructing a keyword.
 `PrepareOptions.default_timezone` supplies the zone label for prepared query and DML result types.
 The default is UTC; callers using another execution zone must supply it during preparation.
 Retained control expressions resolve that zone from `EvalContext` when executed.

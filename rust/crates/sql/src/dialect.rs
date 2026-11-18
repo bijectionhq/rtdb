@@ -38,6 +38,24 @@ impl std::fmt::Write for TokenWork<'_> {
 }
 fn position_limit() -> ParserError { ParserError::ParserError("POSITION cumulative parsing work limit exceeded".into()) }
 
+pub(crate) enum CustomStringLiteral { Duration, Uri, Keyword }
+
+impl CustomStringLiteral {
+    fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("DURATION") { Some(Self::Duration) }
+        else if name.eq_ignore_ascii_case("URI") { Some(Self::Uri) }
+        else if name.eq_ignore_ascii_case("KEYWORD") { Some(Self::Keyword) }
+        else { None }
+    }
+
+    pub(crate) fn from_type(data_type: &ast::DataType) -> Option<Self> {
+        let ast::DataType::Custom(name, modifiers) = data_type else { return None; };
+        let [ast::ObjectNamePart::Identifier(name)] = &name.0[..] else { return None; };
+        if !modifiers.is_empty() || name.quote_style.is_some() { return None; }
+        Self::from_name(&name.value)
+    }
+}
+
 macro_rules! generic_flags {
     ($($name:ident),* $(,)?) => { $(fn $name(&self) -> bool { GenericDialect {}.$name() })* };
 }
@@ -138,7 +156,7 @@ impl Dialect for SqlDialect {
             parser.next_token();
             return Some(parser.parse_function(name));
         }
-        if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("URI")
+        if word.quote_style.is_none() && CustomStringLiteral::from_name(&word.value).is_some()
             && matches!(parser.peek_nth_token(1).token, Token::SingleQuotedString(_) | Token::EscapedStringLiteral(_) | Token::DollarQuotedString(_)) {
             let name = ast::ObjectName::from(vec![word.to_ident(token.span)]);
             parser.next_token();

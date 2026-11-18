@@ -544,6 +544,10 @@ fn form<'work>(expr: &Expr, columns: &Columns<'work>, work: &'work ExplainWork) 
     let child = |expr: &Expr| form(expr, columns, work);
     match expr {
         Expr::Literal(value) => literal(RegexLiteralView::new(value), work),
+        Expr::DurationLiteral(value) => {
+            work.admit(rtdb_types::DurationLiteral::MAX_TEXT_LEN)?;
+            work.pieces(&[RenderPiece::Text("#time/duration "), RenderPiece::JsonText(&value.to_iso_string())])
+        }
         Expr::Column { id, .. } | Expr::Correlated { id, .. } => column(*id, columns, work),
         Expr::Parameter { index, .. } => work.pieces(&[RenderPiece::Text("?_"), RenderPiece::U64(u64::try_from(*index).map_err(|_| size_error())?)]),
         Expr::Unary { op, expr } => call_array(work, match op { UnaryOp::Negate => "-", UnaryOp::Not => "not", UnaryOp::BitNot => "bit-not", UnaryOp::IsNull | UnaryOp::IsUnknown => "nil?", UnaryOp::IsNotNull => "some?", UnaryOp::IsTrue => "true?", UnaryOp::IsFalse => "false?" }, [child(expr)?]),

@@ -152,11 +152,16 @@ mod owner_tests {
         assert_eq!(error.code, "xtdb/sql-error");
         assert!(error.message.unwrap().starts_with("Cannot parse timestamp: bad"));
 
+        let source = "SET application_name = DURATION '1 second'";
+        let parsed = parse_control_syntax_in(source, &budget).unwrap().unwrap();
+        let error = parsed.bind(&PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert_eq!(error.message.as_deref(), Some("Cannot parse duration: 1 second - failed with message Text cannot be parsed to a Duration"));
         assert_eq!(budget.used_bytes(), 0);
     }
 
     #[test]
-    fn control_literal_syntax_accepts_typed_datetime_uuid_and_uri_strings() {
+    fn control_literal_syntax_accepts_xtdb_typed_strings() {
         let budget = MemoryBudget::new(0);
         for literal in [
             "DATE '2020-01-01'",
@@ -164,8 +169,10 @@ mod owner_tests {
             "TIMESTAMP '2020-01-01T00:00:00'",
             "TIMESTAMP WITH TIME ZONE '2020-01-01T00:00:00Z'",
             "TIMESTAMP WITHOUT TIME ZONE '2020-01-01T00:00:00'",
+            "DURATION 'PT1S'",
             "UUID '01234567-89ab-cdef-0123-456789abcdef'",
             "URI 'https://example.com'",
+            "KEYWORD 'example'",
         ] {
             let source = format!("SET application_name = {literal}");
             assert!(parse_control_syntax_in(&source, &budget).unwrap_or_else(|error| panic!("{source}: {error:?}")).is_some());

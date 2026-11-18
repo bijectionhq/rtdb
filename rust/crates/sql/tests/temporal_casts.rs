@@ -36,6 +36,26 @@ async fn temporal_precision_survives_sql_binding_and_arrow_execution() {
 }
 
 #[tokio::test]
+async fn duration_literals_execute_at_microsecond_precision() {
+    for (source, micros) in [
+        ("SELECT DURATION 'P1D' as duration", 86_400_000_000),
+        ("SELECT DURATION 'PT1H' as duration", 3_600_000_000),
+        ("SELECT DURATION 'P1DT2H' as duration", 93_600_000_000),
+        ("SELECT DURATION 'P-1DT2H' as duration", -79_200_000_000),
+        ("SELECT DURATION 'PT-0.123456789S'", -123_456),
+    ] {
+        let value = V::Duration { value: micros, unit: U::Microsecond };
+        assert_eq!(query(source, "UTC").await.unwrap(), (value.logical_type(), value), "{source}");
+    }
+}
+
+#[tokio::test]
+async fn keyword_literals_accept_one_optional_leading_colon() {
+    let (ty, value) = query("SELECT KEYWORD ':example' = KEYWORD 'example'", "UTC").await.unwrap();
+    assert_eq!((ty, value), (LogicalType::Scalar(ScalarType::Bool), V::Bool(true)));
+}
+
+#[tokio::test]
 async fn interval_sql_qualifiers_keep_source_dependent_output_types() {
     for (source, expected) in [
         ("SELECT CAST('1-10' AS INTERVAL YEAR TO MONTH)",V::IntervalYearMonth(22)),

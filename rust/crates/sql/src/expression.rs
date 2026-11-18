@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, Expr, Field, PercentileFraction, PercentileKind, Schema, SqlNotice, UnaryOp};
-use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast::{self as ast, Spanned};
 
 use crate::bind::{Context, error, identifier, identifiers, unsupported};
@@ -70,6 +70,7 @@ impl Context<'_> {
                 value => Expr::Literal(crate::types::literal(value)?),
             },
             ast::Expr::TypedString(value) => {
+                use crate::dialect::CustomStringLiteral;
                 let literal = crate::types::literal(&value.value.value)?;
                 match (&value.data_type, &literal) {
                     (ast::DataType::Date, Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_date_literal(text).map_err(|failure| error(format!("Cannot parse date: {text} - failed with message {}", failure.message.as_deref().unwrap_or("null"))))?),
@@ -78,14 +79,18 @@ impl Context<'_> {
                         rtdb_types::validate_sql_time_literal(text).map_err(|failure| error(format!("Cannot parse time: {text} - failed with message {}", failure.message.as_deref().unwrap_or("null"))))?;
                         Expr::Cast { expr: Box::new(Expr::Literal(literal)), target: self.cast_target(&value.data_type)? }
                     }
-                    _ => {
-                        let target = self.cast_target(&value.data_type)?;
-                        if target.result_type(&literal.logical_type()) == LogicalType::Scalar(ScalarType::Uri) {
-                            let Value::Utf8(text) = literal else { return Err(error("URI literal requires a string")); };
-                            rtdb_types::UriParts::parse(&text).map_err(|failure| error(format!("Cannot parse uri: {}", failure.message.as_deref().unwrap_or("null"))))?;
-                            Expr::Literal(Value::Uri(text))
-                        } else { Expr::Cast { expr: Box::new(Expr::Literal(literal)), target } }
-                    },
+                    (_, Value::Utf8(text)) if let Some(kind) = CustomStringLiteral::from_type(&value.data_type) => {
+                        match kind {
+                            CustomStringLiteral::Uri => {
+                                rtdb_types::UriParts::parse(text).map_err(|failure| error(format!("Cannot parse uri: {}", failure.message.as_deref().unwrap_or("null"))))?;
+                                Expr::Literal(Value::Uri(text.clone()))
+                            }
+                            CustomStringLiteral::Keyword => Expr::Literal(Value::Keyword(rtdb_types::Keyword::from_name(text.strip_prefix(':').unwrap_or(text)))),
+                            CustomStringLiteral::Duration => Expr::DurationLiteral(rtdb_types::DurationLiteral::parse(text)
+                                .map_err(|message| error(format!("Cannot parse duration: {text} - failed with message {message}")))?),
+                        }
+                    }
+                    _ => Expr::Cast { expr: Box::new(Expr::Literal(literal)), target: self.cast_target(&value.data_type)? },
                 }
             },
             ast::Expr::Interval(interval) => self.interval_literal(interval)?,

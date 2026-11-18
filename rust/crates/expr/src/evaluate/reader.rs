@@ -64,6 +64,7 @@ fn expression_type_bound(expr: &Expr) -> Result<usize> {
     let mut add = |value: usize| -> Result<()> { bytes = bytes.checked_add(value).ok_or_else(overflow)?;Ok(()) };
     match expr {
         Expr::Literal(value) => add(value_type_bound(value)?)?,
+        Expr::DurationLiteral(_) => {},
         Expr::Column { data_type,.. } | Expr::Parameter { data_type,.. } | Expr::Correlated { data_type,.. } => add(data_type.retained_bytes()?)?,
         Expr::Field { data_type,expr,.. } => { add(data_type.retained_bytes()?)?;add(expression_type_bound(expr)?)?; }
         Expr::Subscript { data_type,expr,index } => { add(data_type.retained_bytes()?)?;add(expression_type_bound(expr)?)?;add(expression_type_bound(index)?)?; }

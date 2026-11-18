@@ -288,9 +288,7 @@ fn typed_literal(value: &ast::TypedString) -> bool {
     match &value.data_type {
         D::Date | D::Uuid | D::Time(None, Z::None)
         | D::Timestamp(None, Z::None | Z::WithTimeZone | Z::WithoutTimeZone) => true,
-        D::Custom(name, modifiers) => matches!(name.0.as_slice(), [ast::ObjectNamePart::Identifier(name)]
-            if modifiers.is_empty() && name.quote_style.is_none() && name.value.eq_ignore_ascii_case("URI")),
-        _ => false,
+        other => crate::dialect::CustomStringLiteral::from_type(other).is_some(),
     }
 }
 

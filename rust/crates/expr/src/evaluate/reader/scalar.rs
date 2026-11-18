@@ -42,6 +42,7 @@ pub(super) fn emitted_type(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<Lo
     let child = |expr: &Expr| emitted_type(expr,frame);
     Ok(match expr {
         Expr::Literal(value) => { frame.context.reserve(value_type_bound(value)?.checked_mul(8).ok_or_else(overflow)?)?;value.logical_type() }
+        Expr::DurationLiteral(_) => expr.data_type(),
         Expr::RegexReplace { source,recipe,.. } => recipe.output_type(&child(source)?)?,
         Expr::Column { id,.. } => retained_type(&frame.schema.get(*id).ok_or_else(||Anomaly::fault("rtdb.expr/missing-column","Expression input column is unavailable"))?.data_type,frame)?,
         Expr::Parameter { index,data_type } => {
@@ -268,7 +269,7 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                     pattern.search(scalar_ref(&input)?,*negated,frame.context).map(scalar)
                 },frame)
             }
-            Expr::Literal(_) | Expr::In {..} => deferred(ty,async move { evaluate(expr,frame)?.await },frame),
+            Expr::Literal(_) | Expr::DurationLiteral(_) | Expr::In {..} => deferred(ty,async move { evaluate(expr,frame)?.await },frame),
         }
     },frame)
 }

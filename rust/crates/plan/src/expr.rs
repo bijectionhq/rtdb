@@ -233,6 +233,8 @@ pub enum Expr {
     RowCopy(Vec<crate::Field>),
     In { expr: Box<Expr>, values: Vec<Expr>, negated: bool },
     Like { expr: Box<Expr>, pattern: Box<Expr>, escape: Option<char>, case_insensitive: bool, negated: bool },
+    /// Keeps the source duration's signed-second range until a consumer demands an Arrow value.
+    DurationLiteral(rtdb_types::DurationLiteral),
 }
 
 impl Expr {
@@ -274,6 +276,7 @@ impl Expr {
         use UnaryOp as U;
         match self {
             Self::Literal(value) => value.logical_type(),
+            Self::DurationLiteral(_) => LogicalType::Scalar(ScalarType::Duration(rtdb_types::TimeUnit::Microsecond)),
             Self::Column { data_type, .. } | Self::Parameter { data_type, .. }
             | Self::Correlated { data_type, .. }
             | Self::Field { data_type, .. } => data_type.clone(),
@@ -347,7 +350,7 @@ impl Expr {
             Self::Struct(fields) => fields.iter().map(|(_, value)| value).collect(),
             Self::In { expr, values, .. } => std::iter::once(expr.as_ref()).chain(values).collect(),
             Self::Like { expr, pattern, .. } => vec![expr, pattern],
-            Self::Literal(_) | Self::Column { .. } | Self::Parameter { .. } | Self::Correlated { .. } | Self::RowCopy(_) => vec![],
+            Self::Literal(_) | Self::DurationLiteral(_) | Self::Column { .. } | Self::Parameter { .. } | Self::Correlated { .. } | Self::RowCopy(_) => vec![],
         }
     }
 
@@ -414,7 +417,7 @@ impl Expr {
                 expr.rewrite(rewrite);
                 pattern.rewrite(rewrite);
             }
-            Self::Literal(_) | Self::Column { .. } | Self::Parameter { .. } | Self::Correlated { .. } | Self::RowCopy(_) => {}
+            Self::Literal(_) | Self::DurationLiteral(_) | Self::Column { .. } | Self::Parameter { .. } | Self::Correlated { .. } | Self::RowCopy(_) => {}
         }
         rewrite(self);
     }

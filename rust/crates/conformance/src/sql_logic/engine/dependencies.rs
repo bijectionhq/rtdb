@@ -161,7 +161,7 @@ impl Rebuilder<'_> {
     }
     fn expression(&mut self, expression: &mut Expr) -> Result<()> {
         match expression {
-            Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter { .. } | Expr::Correlated { .. } | Expr::RowCopy(_) => (),
+            Expr::Literal(_) | Expr::DurationLiteral(_) | Expr::Column { .. } | Expr::Parameter { .. } | Expr::Correlated { .. } | Expr::RowCopy(_) => (),
             Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Field { expr, .. } => self.expression(expr)?,
             Expr::Binary { left, right, .. } => { self.expression(left)?; self.expression(right)?; }
             Expr::Call { args, .. } | Expr::Coalesce(args) | Expr::List(args) => self.expressions(args)?,

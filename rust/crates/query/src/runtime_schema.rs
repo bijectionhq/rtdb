@@ -118,6 +118,7 @@ pub(crate) fn expression_bound(expr: &Expr) -> Result<usize> {
     let mut bytes = 2048;
     match expr {
         Expr::Literal(value) => bytes = add(bytes, multiply(value.retained_bytes()?, 32)?)?,
+        Expr::DurationLiteral(_) => {},
         Expr::Column { data_type, .. } | Expr::Parameter { data_type, .. } | Expr::Correlated { data_type, .. } => bytes = add(bytes, multiply(data_type.retained_bytes()?, 32)?)?,
         Expr::Unary { expr, .. } => bytes = add(bytes, expression_bound(expr)?)?,
         Expr::Cast { expr, target } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, cast_bound(target)?)?; }
@@ -383,6 +384,7 @@ fn expression_type(expr: &Expr, input: &Schema, emitter: &Emitter<'_>) -> Result
     let child = |expr: &Expr| expression_type(expr, input, emitter);
     Ok(match expr {
         Expr::Literal(value) => value.logical_type(),
+        Expr::DurationLiteral(_) => expr.data_type(),
         Expr::RegexReplace { source,recipe,.. } => recipe.output_type(&child(source)?)?,
         Expr::Column { id, .. } => input.get(*id).ok_or_else(|| invalid("runtime-column", "Runtime input column is absent"))?.data_type.clone(),
         Expr::Parameter { index, data_type } => emitter.parameters.get(index).cloned().unwrap_or_else(|| if *data_type == L::Nothing { L::Null } else { emitter.mode.field_type(data_type) }),

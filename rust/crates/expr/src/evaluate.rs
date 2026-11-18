@@ -218,6 +218,12 @@ macro_rules! expression_body {
     let (expr, schema, row, context) = ($expression, $input_schema, $input_row, $inputs);
     match expr {
         Expr::Literal(value) => retained_clone(value, context),
+        Expr::DurationLiteral(value) => {
+            let nanos = i64::try_from(value.nanoseconds()).map_err(|_| Anomaly::incorrect(
+                "xtdb.expression/overflow-error", "data exception - overflow error",
+            ))?;
+            Ok(Value::Duration { value: nanos / 1000, unit: rtdb_types::TimeUnit::Microsecond })
+        }
         Expr::Column { id, .. } => retained_clone(schema.position(*id).and_then(|index| row.get(index))
             .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", id.0)))?, context),
         Expr::Parameter { index, .. } => retained_clone(context.parameters.get(*index)

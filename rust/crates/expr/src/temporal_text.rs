@@ -9,25 +9,7 @@ fn invalid_duration(text: &str) -> Anomaly {
 fn regex(pattern: &str) -> Result<Regex> { Regex::new(pattern).map_err(|error| Anomaly::fault("rtdb.expr/temporal-pattern", error.to_string())) }
 
 pub(crate) fn iso_duration(text: &str) -> Result<i128> {
-    let pattern = regex(r"(?i-u)^([+-]?)P(?:([+-]?[0-9]+)D)?(?:T(?:([+-]?[0-9]+)H)?(?:([+-]?[0-9]+)M)?(?:([+-]?[0-9]+)(?:[.,]([0-9]{0,9}))?S)?)?$")?;
-    let captures = pattern.captures(text).ok_or_else(|| invalid_duration(text))?;
-    if (2..=5).all(|index| captures.get(index).is_none()) || (text.contains('T') && (3..=5).all(|index| captures.get(index).is_none())) { return Err(invalid_duration(text)); }
-    let mut components = [0i64; 4];
-    for (index, factor) in [(2, 86_400i64), (3, 3600), (4, 60), (5, 1)] {
-        if let Some(value) = captures.get(index) {
-            components[index - 2] = value.as_str().parse::<i64>().ok().and_then(|value| value.checked_mul(factor)).ok_or_else(|| invalid_duration(text))?;
-        }
-    }
-    let seconds = components.into_iter().rev().try_fold(0i64, |total, value| total.checked_add(value).ok_or_else(|| invalid_duration(text)))?;
-    let mut nanos = i128::from(seconds) * 1_000_000_000;
-    if let Some(fraction) = captures.get(6).filter(|fraction| !fraction.is_empty()) {
-        let value = fraction.as_str().parse::<i128>().map_err(|_| invalid_duration(text))? * 10i128.pow((9 - fraction.len()) as u32);
-        nanos += if captures.get(5).is_some_and(|seconds| seconds.as_str().starts_with('-')) { -value } else { value };
-    }
-    i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| invalid_duration(text))?;
-    if captures.get(1).is_some_and(|sign| sign.as_str() == "-") { nanos = -nanos; }
-    i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| invalid_duration(text))?;
-    Ok(nanos)
+    rtdb_types::DurationLiteral::parse(text).map(rtdb_types::DurationLiteral::nanoseconds).map_err(|_| invalid_duration(text))
 }
 
 pub(crate) fn duration(text: &str) -> Result<i64> {
@@ -76,23 +58,7 @@ pub(crate) fn interval(text: &str) -> Result<IntervalParts> {
 }
 
 pub(crate) fn duration_text(nanos: i128) -> String {
-    if nanos == 0 { return "PT0S".into(); }
-    let seconds = nanos / 1_000_000_000;
-    let remainder = nanos % 1_000_000_000;
-    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
-    let mut output = String::from("PT");
-    if hours != 0 { output.push_str(&format!("{hours}H")); }
-    if minutes != 0 { output.push_str(&format!("{minutes}M")); }
-    if seconds != 0 || remainder != 0 || (hours == 0 && minutes == 0) {
-        if seconds == 0 && remainder < 0 { output.push('-'); }
-        output.push_str(&seconds.to_string());
-        if remainder != 0 {
-            let fraction = format!("{:09}", remainder.abs());
-            output.push('.'); output.push_str(fraction.trim_end_matches('0'));
-        }
-        output.push('S');
-    }
-    output
+    rtdb_types::format_iso_duration(nanos)
 }
 pub(crate) fn interval_text(parts: IntervalParts) -> String {
     let mut output = String::from("P");

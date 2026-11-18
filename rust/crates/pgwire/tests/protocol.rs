@@ -83,6 +83,30 @@ fn rows(frames: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<Vec<u8>>>> {
 }
 
 #[tokio::test]
+async fn duration_literal_overflow_occurs_only_when_query_output_demands_value() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+
+    let frames = client.query("SELECT DURATION 'PT9223372037S'").await;
+    assert_eq!(tags(&frames), b"TEZ");
+    let error: serde_json::Value = serde_json::from_slice(
+        frames[1].1.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap(),
+    ).unwrap();
+    assert_eq!(error["code"], "xtdb.expression/overflow-error");
+
+    let frames = client.query("SELECT DURATION 'PT9223372037S' WHERE FALSE").await;
+    assert_eq!(tags(&frames), b"TCZ");
+    assert!(rows(&frames).is_empty());
+
+    let frames = client.query("SET application_name = DURATION 'PT9223372037S'").await;
+    assert_eq!(tags(&frames), b"SCZ");
+    let frames = client.query("SHOW application_name").await;
+    assert_eq!(tags(&frames), b"TDCZ");
+    assert_eq!(rows(&frames), [vec![Some(b"PT2562047H47M17S".to_vec())]]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn sql_parse_failures_return_anomaly_details_and_an_idle_connection() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
