@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod columns;
 pub mod config;
 pub mod data;
+pub mod diagnostics;
 pub mod envelope;
 pub mod hll;
 pub mod ipc;

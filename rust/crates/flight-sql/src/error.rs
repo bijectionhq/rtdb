@@ -1,20 +1,6 @@
+use rtdb_format::diagnostics::JsonAnomaly;
 use rtdb_types::{Anomaly, AnomalyCategory};
 use tonic::{Code, Status};
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct AnomalyWire<'a> {
-    category: AnomalyCategory,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    code: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<&'a std::collections::BTreeMap<String, serde_json::Value>>,
-}
-impl<'a> From<&'a Anomaly> for AnomalyWire<'a> {
-    fn from(error: &'a Anomaly) -> Self { Self { category: error.category, code: (!error.code.is_empty()).then_some(error.code.as_str()), message: error.message.as_deref(), data: (!error.context.is_empty()).then_some(&error.context) } }
-}
 struct MetadataBytes(Vec<u8>);
 impl std::io::Write for MetadataBytes {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -38,11 +24,11 @@ pub(crate) fn status(error: Anomaly) -> Status {
     };
     let mut result = Status::new(code, description(&error));
     let mut bytes = MetadataBytes(Vec::with_capacity(4096));
-    if serde_json::to_writer(&mut bytes, &AnomalyWire::from(&error)).is_ok() { result.metadata_mut().insert_bin("xtdb-anomaly-bin", tonic::metadata::MetadataValue::from_bytes(&bytes.0)); }
+    if serde_json::to_writer(&mut bytes, &JsonAnomaly::from(&error)).is_ok() { result.metadata_mut().insert_bin("xtdb-anomaly-bin", tonic::metadata::MetadataValue::from_bytes(&bytes.0)); }
     result
 }
-pub(crate) fn anomaly_json(error: &Anomaly) -> serde_json::Value {
-    serde_json::to_value(AnomalyWire::from(error)).expect("anomaly JSON")
+pub(crate) fn anomaly_json(error: &Anomaly) -> Result<serde_json::Value, Status> {
+    serde_json::to_value(JsonAnomaly::from(error)).map_err(|error| Status::internal(error.to_string()))
 }
 pub(crate) fn allocation_bound(error: &Anomaly) -> Result<usize, Status> {
     let mut bytes = crate::wire::add(4096, crate::wire::mul(crate::wire::add(error.code.len(), description(error).len())?, 16)?)?;
@@ -93,7 +79,7 @@ mod tests {
     fn absent_messages_use_category_class_names_and_are_omitted_from_metadata() {
         for (category, class) in [(AnomalyCategory::Incorrect, "Incorrect"), (AnomalyCategory::Unsupported, "Unsupported"), (AnomalyCategory::NotFound, "NotFound"), (AnomalyCategory::Forbidden, "Forbidden"), (AnomalyCategory::Conflict, "Conflict"), (AnomalyCategory::Busy, "Busy"), (AnomalyCategory::Unavailable, "Unavailable"), (AnomalyCategory::Interrupted, "Interrupted"), (AnomalyCategory::Fault, "Fault")] {
             let error = Anomaly::new_nullable(category, "test/error", None);
-            let json = anomaly_json(&error);
+            let json = anomaly_json(&error).unwrap();
             assert!(json.get("message").is_none());
             let bound = allocation_bound(&error).unwrap();
             let status = status(error);
@@ -103,7 +89,7 @@ mod tests {
             assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(), json);
         }
         let error = Anomaly::fault("test/error", "");
-        assert_eq!(anomaly_json(&error)["message"], "");
+        assert_eq!(anomaly_json(&error).unwrap()["message"], "");
         assert_eq!(status(error).message(), "");
     }
 
@@ -111,7 +97,7 @@ mod tests {
     fn optional_message_metadata_obeys_exact_size_boundary() {
         for message in [None, Some(String::new())] {
             let mut error = Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message).with_context("padding", "".into());
-            let overhead = serde_json::to_vec(&AnomalyWire::from(&error)).unwrap().len();
+            let overhead = serde_json::to_vec(&JsonAnomaly::from(&error)).unwrap().len();
             error.context.insert("padding".into(), "x".repeat(4096 - overhead).into());
             let result = status(error.clone());
             assert_eq!(result.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap().len(), 4096);

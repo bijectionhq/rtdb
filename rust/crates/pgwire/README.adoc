@@ -90,6 +90,9 @@ Interop with PostgreSQL clients, successful TLS handshakes, external authenticat
 Planning warnings are not yet exposed as protocol notices by the shared preparation API.
 
 An absent anomaly message becomes an empty primary `M` field; structured detail retains its JSON, JSON-LD or Transit presence rules.
+Incomparable MIN/MAX inputs include the input vector type in structured detail.
+Plain JSON renders it as EDN text, JSON-LD carries `xt:type`, and Transit carries the native type tag.
+An unsupported MIN/MAX input reports its column type form.
 Bind argument reclassification preserves the native decoder message, including absence.
 The pinned raw-Throwable fallback for a message-less decoding failure requires the original throwable class and display; the passive anomaly does not retain that origin.
 Production routing of raw host failures through this boundary still requires that conversion.

@@ -205,11 +205,10 @@ fn to_transit(value: &Value, depth: usize) -> Result<TransitValue> {
 fn tag(tag: &str, representation: TransitValue) -> TransitValue { TransitValue::Tagged { tag: tag.into(), representation: Box::new(representation) } }
 
 pub fn encode_error(error: &Anomaly, format: PgType) -> Result<Vec<u8>> {
-    let category = format!("{:?}", error.category).to_ascii_lowercase().replace("notfound", "not-found");
-    let value = if format == PgType::JsonLd {
-        let mut data = error.context.clone(); if !error.code.is_empty() { data.insert("xtdb.error/code".into(), error.code.clone().into()); }
-        serde_json::json!({"@type":format!("xt:{category}"),"@value":{"xtdb.error/message":error.message,"xtdb.error/data":data}})
-    } else if format == PgType::Transit { return rtdb_format::transit::encode_json(&rtdb_format::transit::decode_msgpack(&rtdb_format::transit::encode_anomaly(error)?)?); }
-    else { let mut object = serde_json::Map::new(); object.insert("category".into(), category.into()); if !error.code.is_empty() { object.insert("code".into(), error.code.clone().into()); } if let Some(message) = &error.message { object.insert("message".into(), message.clone().into()); } if !error.context.is_empty() { object.insert("data".into(), serde_json::to_value(&error.context).map_err(invalid)?); } serde_json::Value::Object(object) };
-    serde_json::to_vec(&value).map_err(invalid)
+    use rtdb_format::{diagnostics, transit};
+    match format {
+        PgType::JsonLd => serde_json::to_vec(&diagnostics::json_ld(error).map_err(invalid)?).map_err(invalid),
+        PgType::Transit => transit::encode_json(&transit::decode_msgpack(&transit::encode_anomaly(error)?)?),
+        _ => serde_json::to_vec(&diagnostics::JsonAnomaly::from(error)).map_err(invalid),
+    }
 }

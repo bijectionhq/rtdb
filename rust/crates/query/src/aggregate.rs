@@ -48,13 +48,22 @@ impl AggregateTypes {
             A::Alias(_) | A::Named(_) => unreachable!(),
             A::Min | A::Max => match T::least_upper_bound(std::slice::from_ref(&declared_input)) {
                 None => {
-                    let from_type = format!("#xt/type {}", declared_input.to_edn()?);
-                    return Err(rtdb_types::Anomaly::incorrect("xtdb.group-by/incomparable-min-max-types", format!("Incomparable types in min/max aggregate: {from_type}"))
-                        .with_context("from-type", from_type.into()));
+                    let form = declared_input.type_form()?;
+                    let data = rtdb_format::diagnostics::vector_type_data(&form)?;
+                    return Err(rtdb_types::Anomaly::incorrect("xtdb.group-by/incomparable-min-max-types", format!("Incomparable types in min/max aggregate: #xt/type {form}"))
+                        .with_context("from-type", data));
                 }
                 Some(ty @ (T::Nothing | T::Null | T::Scalar(S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 | S::F16 | S::F32 | S::F64 | S::Decimal { .. }
                     | S::Duration(_) | S::DateDay | S::DateMilli | S::Timestamp { .. } | S::Time { .. } | S::Utf8 | S::Binary | S::Keyword | S::Uri))) => ty.maybe(),
-                _ => return Err(rtdb_types::Anomaly::unsupported("xtdb.group-by/unsupported-min-max-type", format!("Unsupported type in min/max aggregate: {input:?}"))),
+                Some(ty) => {
+                    let code = "xtdb.group-by/unsupported-min-max-type";
+                    let Ok(form) = ty.type_form() else {
+                        return Err(rtdb_types::Anomaly::unsupported(code, format!("Unsupported type in min/max aggregate: {ty:?}")));
+                    };
+                    let data = rtdb_format::diagnostics::column_type_data(&form)?;
+                    return Err(rtdb_types::Anomaly::unsupported(code, format!("Unsupported type in min/max aggregate: {form}"))
+                        .with_context("unsupported-type", data));
+                }
             },
         };
         Ok(Self { input, output: mode.field_type(&output), declared_output: output })

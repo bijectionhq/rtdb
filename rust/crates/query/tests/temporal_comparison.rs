@@ -51,7 +51,8 @@ async fn spilled_sort_uses_session_order_and_extrema_reject_mixed_timestamp_vect
     assert_eq!(error.code, "xtdb.group-by/incomparable-min-max-types");
     let from_type = format!("#xt/type {}", input_type.to_edn().unwrap());
     assert_eq!(error.message.as_deref(), Some(format!("Incomparable types in min/max aggregate: {from_type}").as_str()));
-    assert_eq!(error.context.get("from-type"), Some(&serde_json::Value::String(from_type)));
+    let json = serde_json::to_value(rtdb_format::diagnostics::JsonAnomaly::from(&error)).unwrap();
+    assert_eq!(json["data"]["from-type"], from_type);
 }
 
 #[tokio::test]

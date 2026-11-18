@@ -54,6 +54,15 @@ async fn minmax_type_errors_are_emitted_without_reading_input_rows() {
         let description_error = statement.result_schema(&context, &[]).err().unwrap();
         assert_eq!(description_error.category, category);
         assert_eq!(description_error.code, code);
+        let json = serde_json::to_value(rtdb_format::diagnostics::JsonAnomaly::from(&description_error)).unwrap();
+        if values == "(true)" {
+            assert_eq!(json["message"], "Unsupported type in min/max aggregate: :bool");
+            assert_eq!(json["data"]["unsupported-type"], "bool");
+        }
+        if values == "(ARRAY[12])" {
+            assert_eq!(json["message"], "Unsupported type in min/max aggregate: [:list :i64]");
+            assert_eq!(json["data"]["unsupported-type"], serde_json::json!(["list", "i64"]));
+        }
         let opening_error = statement.open_query(Arc::clone(&context), vec![]).await.err().unwrap();
         assert_eq!(description_error, opening_error);
     }

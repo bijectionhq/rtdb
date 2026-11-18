@@ -43,7 +43,7 @@ impl Service {
                         let _scratch = self.memory().reserve(bound).map_err(status)?;
                         let (tx_id, time, committed, error) = match last {
                             LastSubmittedTx::Submitted(tx) => (tx.tx_id.0, None, None, None),
-                            LastSubmittedTx::Executed(tx) => (tx.tx_key().tx_id.0, Some(ticket::timestamp(tx.tx_key().system_time)?), Some(tx.committed()), tx.error().map(crate::error::anomaly_json)),
+                            LastSubmittedTx::Executed(tx) => (tx.tx_key().tx_id.0, Some(ticket::timestamp(tx.tx_key().system_time)?), Some(tx.committed()), tx.error().map(crate::error::anomaly_json).transpose()?),
                         };
                         let value = serde_json::json!({ "txId": tx_id, "systemTime": time, "committed": committed, "error": error, "awaitToken": native.state().effective_await_token() });
                         let bytes = serde_json::to_vec(&value).map_err(arrow)?;

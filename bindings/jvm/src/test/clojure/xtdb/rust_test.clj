@@ -122,3 +122,13 @@
     (is (= [{}]
            (xt/q node "SELECT MIN(v) AS mn, MAX(v) AS mx
                             FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) t")))))
+
+(deftest incompatible-extrema-retain-the-vector-type-in-transit
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (let [error (try
+                  (xt/q node "SELECT MAX(v) AS m FROM (VALUES (12), ('twelve')) AS t(v)")
+                  (catch xtdb.api.error.Incorrect error error))]
+      (is (instance? xtdb.api.error.Incorrect error))
+      (is (= :xtdb.group-by/incomparable-min-max-types (:xtdb.error/code (ex-data error))))
+      (is (instance? xtdb.arrow.VectorType (:from-type (ex-data error)))))))

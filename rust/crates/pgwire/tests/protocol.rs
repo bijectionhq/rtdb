@@ -138,6 +138,37 @@ async fn min_max_incomparable_default_json_pgwire() {
 }
 
 #[tokio::test]
+async fn min_max_incomparable_json_ld_pgwire() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id, v) VALUES (1, 12)").await), b"CZ");
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id, v) VALUES (2, TIMESTAMP '2022-08-01T13:34:00+01:00[Europe/London]')").await), b"CZ");
+    let setting = client.query("SET fallback_output_format = 'json-ld'").await;
+    assert_eq!(tags(&setting), b"SCZ");
+    assert_eq!(setting[0].1, b"fallback_output_format\0json-ld\0");
+
+    let frames = client.query("SELECT MAX(v) AS m FROM docs").await;
+    assert_eq!(tags(&frames), b"EZ");
+    let fields = frames[0].1.split(|&byte| byte == 0).filter_map(|field| field.split_first()).collect::<std::collections::BTreeMap<_, _>>();
+    let message = std::str::from_utf8(fields[&b'M']).unwrap();
+    assert!(message.contains("Incomparable types in min/max aggregate"));
+    let detail: serde_json::Value = serde_json::from_slice(fields[&b'D']).unwrap();
+    assert_eq!(detail["@type"], "xt:incorrect");
+    assert_eq!(detail["@value"]["xtdb.error/message"], message);
+    let data = &detail["@value"]["xtdb.error/data"];
+    assert_eq!(data["xtdb.error/code"], serde_json::json!({"@type":"xt:keyword","@value":"xtdb.group-by/incomparable-min-max-types"}));
+    let from_type = &data["from-type"];
+    assert_eq!(from_type["@type"], "xt:type");
+    assert_eq!(from_type["@value"]["@type"], "xt:set");
+    let legs = from_type["@value"]["@value"].as_array().unwrap();
+    assert!(legs.contains(&serde_json::json!({"@type":"xt:keyword","@value":"i64"})));
+    assert!(legs.iter().any(|leg| leg[0] == serde_json::json!({"@type":"xt:keyword","@value":"timestamp-tz"}) && leg[2] == "Europe/London"));
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn percentile_planning_warning_precedes_simple_and_extended_results_without_repeating_at_bind() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
