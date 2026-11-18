@@ -309,3 +309,40 @@ fn jvm_transit_preserves_nested_lists_and_uuid_words() {
         assert!(from_transit(decode_json(data).unwrap()).is_err());
     }
 }
+
+#[test]
+fn uuid_columns_use_the_pg_uuid_type_with_hyphenated_lowercase_text_and_raw_binary() {
+    use rtdb_types::{LogicalType, ScalarType};
+    let bytes = [0x9f, 0x8e, 0x7d, 0x6c, 0x5b, 0x4a, 0x39, 0x28, 0x17, 0x06, 0xf5, 0xe4, 0xd3, 0xc2, 0xb1, 0xa0];
+    let ty = PgType::from_logical(&LogicalType::Scalar(ScalarType::Uuid)).unwrap();
+    assert_eq!(ty, PgType::Uuid);
+    assert_eq!((ty.descriptor().oid, ty.descriptor().length), (2950, 16));
+    assert_eq!(PgType::from_logical(&LogicalType::Scalar(ScalarType::Uuid).maybe()).unwrap(), PgType::Uuid);
+    let value = Value::Uuid(bytes);
+    assert_eq!(output(ty, Format::Text, &value), b"9f8e7d6c-5b4a-3928-1706-f5e4d3c2b1a0");
+    assert_eq!(output(ty, Format::Binary, &value), bytes);
+    let memory = MemoryBudget::new(1 << 20);
+    assert_eq!(decode(ty, Format::Text, b"9F8E7D6C-5B4A-3928-1706-F5E4D3C2B1A0", &memory).unwrap().value(), &value);
+    assert_eq!(decode(ty, Format::Binary, &bytes, &memory).unwrap().value(), &value);
+    assert!(decode(ty, Format::Binary, &bytes[..15], &memory).is_err());
+    for format in [Format::Text, Format::Binary] {
+        assert!(encode(ty, format, &Value::Null, &SessionEnvironment::default(), &memory).unwrap().is_none());
+    }
+}
+
+#[test]
+fn fixed_size_binary_columns_are_bytea_with_lowercase_hex_text_and_raw_binary() {
+    use rtdb_types::{LogicalType, ScalarType};
+    let ty = PgType::from_logical(&LogicalType::Scalar(ScalarType::FixedSizeBinary(4))).unwrap();
+    assert_eq!(ty, PgType::Bytes);
+    assert_eq!(ty.descriptor().oid, 17);
+    for (bytes, text) in [(vec![0xde, 0xad, 0xbe, 0xef], &b"\\xdeadbeef"[..]), (vec![0, 1, 0x0a, 0xff], b"\\x00010aff")] {
+        let value = Value::FixedSizeBinary(bytes.clone());
+        assert_eq!(output(ty, Format::Text, &value), text);
+        assert_eq!(output(ty, Format::Binary, &value), bytes);
+        let memory = MemoryBudget::new(1 << 20);
+        assert_eq!(decode(ty, Format::Text, text, &memory).unwrap().value(), &Value::Binary(bytes.clone()));
+        assert_eq!(decode(ty, Format::Binary, &bytes, &memory).unwrap().value(), &Value::Binary(bytes));
+    }
+    assert_eq!(output(ty, Format::Text, &Value::FixedSizeBinary(vec![])), b"\\x");
+}
