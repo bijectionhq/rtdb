@@ -18,7 +18,7 @@
     },
     "storage_indexing_historical_visibility": {
       "status": "pending",
-      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. Scan page and persisted file descriptor capacity, temporal ceiling growth and per-event history results have admission at their reached owners. Ordinary IID narrowing, broader metadata predicates, candidate and traversal scratch, and shared live-index allocations need source completion.",
+      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. The scan admits borrowed catalog references, file and page descriptors, metadata traversal, temporal ceiling growth and per-event history results. Ordinary IID narrowing, broader metadata predicates, summary and selection scratch, and shared live-index allocations remain open.",
       "implementation_paths": [
         "rust/crates/storage/src/lib.rs",
         "rust/crates/storage/src/cache.rs",
@@ -84,7 +84,7 @@
     },
     "conformance_machinery": {
       "status": "pending",
-      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. Other paired adapters and full assertion bindings need source completion.",
+      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. Reference recorder sources exist for the refused-claim processor simulation and mixed IID case. Their native runs, additional paired adapters and full assertion bindings need source completion.",
       "implementation_paths": [
         "rust/crates/conformance/src/main.rs",
         "rust/conformance/source_inventory.py",
@@ -96,6 +96,10 @@
         "rust/conformance/external_inventory.py",
         "rust/conformance/archive_sql_logic.py",
         "rust/conformance/emit_sql_logic_case.py",
+        "rust/conformance/run_log_processor_sim.py",
+        "rust/conformance/simulation/LogProcessorTrace.kt",
+        "rust/conformance/run_mixed_iid_reference.py",
+        "rust/conformance/jvm/rtdb/conformance/mixed_iid_reference.clj",
         "rust/crates/conformance/src/faults.rs"
       ]
     }
@@ -131,12 +135,12 @@
         "rust/crates/tx/src/resolver.rs": "27d628d04527d54645eb9d88b8a7276fa8dd11777557c96c62272c0752446e69",
         "rust/crates/replication/src/appender.rs": "c62347b8038046ac8920a6b5491ce50654fb5970b15b8a12055c9fbcfad95296",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
-        "rust/crates/replication/src/driver.rs": "9ec30959c7321eae5c6757acd752eed8b36fc7c8262aee4b1c77c64f070d139a"
+        "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56"
       }
     },
     "replica_recovery": {
       "status": "reviewed",
-      "conclusion": "The recorded source review covers public startup, catalog restoration before opening logs, native local and Kafka replay admission, adoption, readable restored state, and failure restart. An elected writer confirms the selected checkpoint for its current replica epoch before source processing. A surviving follower waiting for an older missing upload already superseded on disk remains an open source case.",
+      "conclusion": "The recorded source review covers public startup, catalog restoration before opening logs, native local and Kafka replay admission, adoption, readable restored state, and failure restart. An elected writer confirms the selected checkpoint and verified older missing uploads before source processing. Historical proof uses retained catalogs, authoritative object metadata and a fence witness at the actual selected boundary. The historical tail can start at a newer retained catalog, and an admitted legacy boundary can establish unsequenced proof without changing ordinary startup replay.",
       "implementation_paths": [
         "rust/crates/server/src/main.rs",
         "rust/crates/server/src/runtime.rs",
@@ -148,6 +152,9 @@
         "rust/crates/node/src/backends.rs",
         "rust/crates/node/src/resources.rs",
         "rust/crates/storage/src/io_region.rs",
+        "rust/crates/replication/src/logs.rs",
+        "rust/crates/storage/src/disk_cache.rs",
+        "rust/crates/storage/src/object_store.rs",
         "rust/crates/storage/src/log/mod.rs",
         "rust/crates/storage/src/log/local.rs",
         "rust/crates/storage/src/log/memory.rs",
@@ -161,12 +168,15 @@
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
-        "rust/crates/replication/src/driver.rs": "9ec30959c7321eae5c6757acd752eed8b36fc7c8262aee4b1c77c64f070d139a",
-        "rust/crates/replication/src/blocks.rs": "97f681cfea4fa47b9e9e542988913de991a7c52cc2aa7d6512806acc4ce3058f",
+        "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56",
+        "rust/crates/replication/src/blocks.rs": "b13d71dd5f7a3abad1745dfb38736373356dacdea7e0cdf5ae28c21364c3ea7d",
         "rust/crates/server/src/resources.rs": "8bb66510352c189bd5e5c65d24c18848bf04ff1285f421d1c9ee00b6d127bf24",
         "rust/crates/node/src/backends.rs": "04c98d6847f658ab1f90c6e230b4d2f462b482da0dc0fe58fb18b95eae6679ac",
         "rust/crates/node/src/resources.rs": "06fcbfe224b8713f7099dae88bae863436c3342126ddd9f3f1784372929ce05b",
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
+        "rust/crates/replication/src/logs.rs": "a14c3a3581d82f09b5b3d0c34ae0916bc0dcfd4efedff1fb3bb82f4b07a72a21",
+        "rust/crates/storage/src/disk_cache.rs": "fa4a7a2ef8afb1b07cc9bdcc0e7eff34fb703ad96a3cf1d214b845505f5ae109",
+        "rust/crates/storage/src/object_store.rs": "d442c6aea6958927c48bde1ecdb850e0cd115b1d1c5ce6a497e066f06777cd45",
         "rust/crates/storage/src/log/mod.rs": "ee8807f00b83b67bd99267a9a9aab98ddc0599dfbefab7c13879857ddb808d56",
         "rust/crates/storage/src/log/local.rs": "6120a36e774aec5598e0da629c27045bc843f559943c360ccdeb125ec4da2d5c",
         "rust/crates/storage/src/log/memory.rs": "3a431b06592f32559c31768da6bc8b5f9fa6a98e6fe11a386d647f6d31892aca",
@@ -194,7 +204,7 @@
         "rust/crates/maintenance/src/job.rs": "34e3d43ca7baef270ca9b6c4d4ee7b1eedeab56156bc6a85de0e741f34244274",
         "rust/crates/maintenance/src/merge.rs": "7068ecddc375ab352667f6b97fba2a93efd311aaa3ac6e2ea6d805142ce5ed01",
         "rust/crates/maintenance/src/publication.rs": "d9214c092e3a873df597dfad81f3ac2dc8b7b178c9b8f4b933ef090116a27740",
-        "rust/crates/replication/src/driver.rs": "9ec30959c7321eae5c6757acd752eed8b36fc7c8262aee4b1c77c64f070d139a",
+        "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56",
         "rust/crates/index/src/trie_catalog.rs": "517d3a6fd0478555db85153f92e97cdf0597aa0dcfa7be912677a3609c0bc8c8"
       }
     },
@@ -217,7 +227,7 @@
         "rust/crates/pg-source/src/stream.rs": "24f3c47d194ae231bdede32105bece10c303867cd7ba5a6672b1195fe4468261",
         "rust/crates/pg-source/src/indexer.rs": "8eda7ab84068564f692bdb98eb02f88d5e7acd1e745379e8ad6b1d465269f590",
         "rust/crates/pg-source/src/token.rs": "b7dbcb8f4b601ae64231b1e8c4d30d65373d5d0afc160c0f530fa56da188f0c0",
-        "rust/crates/replication/src/driver.rs": "9ec30959c7321eae5c6757acd752eed8b36fc7c8262aee4b1c77c64f070d139a"
+        "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56"
       }
     },
     "database_shutdown": {
@@ -236,7 +246,7 @@
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
-        "rust/crates/ffi/src/lib.rs": "de48f64941ee1e58e76fb73b08ecad8562defc797318c7ea0b995e55597614c7",
+        "rust/crates/ffi/src/lib.rs": "9afa907a822864ec50fcd82cb455dfac4622dedc217b374ea248c14dd6516025",
         "rust/crates/node/src/node.rs": "3e185cb1bc9942912fa9bbc49a4333ff12c312e7173f85e82fea0d963cfab133",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
@@ -353,12 +363,13 @@
     {
       "id": "recovered-block-confirmation",
       "kind": "implementation",
-      "status": "open",
+      "status": "resolved",
       "targets": [
         "writes_replication_recovery",
         "replica_recovery"
       ],
-      "requirement": "Complete recovery for a surviving follower waiting for an older missing block upload after a newer catalog already superseded that block on disk. Preserve retained replica replay, the boundary fence and the original L0 notification identity where the required history remains available. The selected recovered checkpoint is confirmed through the elected term and covered by a native local crash-window regression source."
+      "requirement": "Complete recovery for a surviving follower waiting for an older missing block upload after a newer catalog already superseded that block on disk. Preserve retained replica replay, the boundary fence and the original L0 notification identity where the required history remains available. The selected recovered checkpoint is confirmed through the elected term and covered by a native local crash-window regression source.",
+      "resolution": "The writer uses the oldest usable retained catalog and an admitted replica witness through the selected boundary. It checks original files at the provider and reannounces missing uploads in block order through the elected term. A missing or failed proof preserves selected-checkpoint startup. The local crash, retained range, legacy and stale-cache regressions await execution. Real backend and cross-engine qualification remain open."
     },
     {
       "id": "final-design-closure",

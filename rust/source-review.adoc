@@ -139,7 +139,8 @@ The sequence domain and exhaustion behavior need an explicit compatibility decis
 |Data-dependent write |Public pgwire, Flight SQL and embedded submission paths are traced through native source durability, transaction-local staged reads, ordered replica append, term admission, atomic apply and caller completion; independent whole-path source review is clear, and runtime qualification remains pending.
 |Replica recovery |Public startup, catalog restore, native replay, term admission and follower adoption are traced.
 A restarted writer confirms its selected checkpoint in the configured replica epoch when its upload is absent.
-Recovery of an older absent upload after the checkpoint has been superseded on disk remains open.
+The retained replica suffix can identify older absent uploads before the writer reannounces them in block order.
+Real backend and cross-engine execution remain pending.
 |Compaction retry |Public database and standalone compactor assembly, deterministic merge, data-before-metadata publication, source/replica read-back, catalog visibility and replacement-owner retry are traced; cross-engine bytes and failure execution remain pending.
 |CDC restart |Public remote/source configuration, leader-term assignment, snapshot/resume, ordered import, replica read-back, adopted-block confirmation and cancellation are traced through native implementations; upstream assumptions and runtime qualification remain pending.
 |Database shutdown |Public server signals, startup failure, unstarted closure and embedded closure are traced through listener, node, database, term and log completion into child and ancestor I/O drains; no source gap remains in this bounded trace; execution qualification remains pending.
@@ -382,7 +383,7 @@ Independent source review covered the recovery repairs, staged resource assembly
 The existing watcher-failure, integer-exhaustion, oversized-fetch-order and retry-timestamp compatibility qualifications remain explicit.
 Startup health tracks consumed replica positions; query basis waits remain the visibility barrier.
 Local writable-tail batches, catalog allocation estimates and broker durability still require memory, provider and runtime qualification.
-The <<replica-upload-confirmation,upload-confirmation crash window>> is covered for the selected recovered checkpoint in source.
+The <<replica-upload-confirmation,upload-confirmation crash window>> is covered in source for the selected checkpoint and verified older checkpoints.
 No build, test, formatter, server or fault execution was used for this trace.
 
 == Source checks performed
@@ -1389,12 +1390,19 @@ If the upload is absent, the newly elected term reannounces the original block's
 The writer waits for admitted read-back before producing a later pending block or resuming ordinary source and external-source processing.
 A surviving follower can adopt the reannounced block and drain held records, while an already-installed replica skips that upload before buffering for a later block.
 The native local restart regression checks committed progress on both replicas and the surviving follower's follow-on row.
-The selected checkpoint cannot identify an older missing confirmation that an earlier run already superseded on disk.
-That older case and cross-engine execution remain pending.
+The writer folds a retained replica suffix through the actual selected boundary without changing restored state.
+If opening the suffix reports that it starts below the retained log floor, the writer can advance to a newer catalog anchor.
+An admitted legacy boundary without a sequence can verify an unsequenced historical term while normal replay keeps the original startup fence.
+The historical path checks the backing provider for each needed catalog, table block and L0 file before appending its upload.
+A provider failure, lost prefix during traversal or unavailable file leaves the writer to recover from its selected checkpoint.
+A follower held at an unavailable older boundary may need to reopen from the latest persisted checkpoint and retained suffix.
+The added local, retained-prefix, legacy and warm-cache regressions await execution.
+Cross-engine execution remains pending.
 
 A caller can supply one replication timestamp source for the driver, its handle and its term appender.
 The clock is available to a simulation that controls delivered time.
-The original processor simulation still needs a recorded schedule and comparative replay.
+One original refused-claim JVM invocation has a recorder for authored actions, dispatcher choices, simulated log delivery and assertion completion.
+The native action and delivery replay, internal timing observations and paired artifact results remain pending.
 
 On own-term leader read-back, Rust follows `LeaderAppliesOwnTx` in `dev/doc/db.allium` by validating the staged head and applying its writes before applying the committed database attach or detach effect.
 The pinned JVM applies the catalog effect before taking the staged head.
@@ -1415,7 +1423,10 @@ A persisted-file regression checks refusal after metadata admission and before a
 The scan charges each event's history result vector before it grows and keeps the reservation through projection of the event's fragments.
 Query and compaction reserve replacement temporal ceiling capacity before allocation and borrow the current polygon ranges.
 Native database buffer pools charge keys and fetch coordination to the node budget and release an empty entry after its final failed or cancelled fetch.
-The trie candidate and metadata traversal containers and shared live-index allocations, including sorted live-leaf storage, still require admission work.
+A persisted scan reserves its reference vector before borrowing serving catalog entries and releases it before task planning.
+It holds an admitted per-file traversal stack with inline IID paths while it visits metadata nodes.
+The regression sources check refusal before the first object fetch and while growing metadata traversal, and retain the independent file and page refusal checks.
+The summary and selection containers and shared live-index allocations, including sorted live-leaf storage, still require admission work.
 Ordinary IID narrowing and broader metadata predicates remain open.
 
 Each reference control receipt binds the exact JVM runtime manifest, the verified runtime files and the artifact verifier source.
@@ -1424,6 +1435,8 @@ Native control receipts identify the same production executable as the compariso
 The optional historical erase mapping preserves the two original SQL statements and checks each engine's live and later adopted L0 layout at its applied erase transaction.
 Its paired and comparator inputs are present in source.
 The original Gradle invocation, the paired execution and the mismatch result are pending.
+The mixed-IID JVM recorder selects its original Jovial invocation and keeps each of its 14 assertion observations and corroborating physical file evidence.
+Portable transfer of its first closed layout, the matching native lane and wire comparisons remain pending.
 The SQL-logic release lane checks the selected native executable, the pinned script roster, and the archived process and observation files.
 Offline verification recomputes the paired and repeated-reference comparisons from the retained streams.
 The external inventory validator checks normalized SQL-logic records against retained original SQL source bytes.
