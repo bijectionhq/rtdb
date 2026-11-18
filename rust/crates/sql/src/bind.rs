@@ -1128,7 +1128,7 @@ impl Context<'_> {
         } else { None };
         let element_schema = Schema::new(vec![element.clone()])?;
         let node = match kind {
-            ListTableKind::Series => RelationNode::List { expr, element },
+            ListTableKind::Series => RelationNode::List { expr, element, page_rows: None },
             ListTableKind::Unnest => RelationNode::ColumnTable { expr, element },
         };
         let input = Arc::new(Relation::new(element_schema, node)?);

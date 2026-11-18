@@ -341,7 +341,7 @@ mod tests {
             ("Limit", relation(input.schema().clone(), RelationNode::Limit { input: Arc::clone(&input), offset: Some(Expr::Literal(V::I64(0))), fetch: Some(Expr::Literal(V::I64(2))) })),
             ("Distinct", relation(input.schema().clone(), RelationNode::Distinct { input: Arc::clone(&input) })),
             ("Set", relation(input.schema().clone(), RelationNode::Set { left: Arc::clone(&input), right, operator: SetOperator::Except, all: false })),
-            ("List", relation(Schema::new(vec![element.clone()]).unwrap(), RelationNode::List { expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element: element.clone() })),
+            ("List", relation(Schema::new(vec![element.clone()]).unwrap(), RelationNode::List { expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element: element.clone(), page_rows: std::num::NonZeroUsize::new(3) })),
             ("ColumnTable", relation(Schema::new(vec![element.clone()]).unwrap(), RelationNode::ColumnTable { expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element: element.clone() })),
             ("Ordinality", Arc::new(Arc::clone(&input).with_ordinality(ordinal.clone(), rtdb_plan::OrdinalityScope::Relation).unwrap())),
             ("Unnest", relation(input.schema().concat(&Schema::new(vec![element.clone(), ordinal.clone()]).unwrap()).unwrap(), RelationNode::Unnest { input, expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element, ordinality: Some(ordinal), outer: true })),
@@ -364,7 +364,8 @@ mod tests {
             match restored.node() {
                 RelationNode::Values { rows } => assert_eq!(rows, &[vec![Expr::Literal(V::I64(7))]]),
                 RelationNode::LiteralPages { pages } => assert_eq!(pages, &[vec![vec![Expr::Literal(V::I64(7))]], vec![]]),
-                RelationNode::List { expr, element } | RelationNode::ColumnTable { expr, element } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); }
+                RelationNode::List { expr, element, page_rows } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); assert_eq!(*page_rows, std::num::NonZeroUsize::new(3)); }
+                RelationNode::ColumnTable { expr, element } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); }
                 RelationNode::Ordinality { field, scope, .. } => { assert_eq!(field.id, ColumnId(3)); assert_eq!(field.data_type, L::Scalar(S::I64)); assert_eq!(*scope, rtdb_plan::OrdinalityScope::Relation); }
                 RelationNode::Scan(scan) => { assert_eq!(scan.table, table("a")); assert_eq!(scan.columns[0].id, ColumnId(0)); }
                 RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } => { assert_eq!(expressions[0].field.id, ColumnId(2)); assert_eq!(expressions[0].expr, Expr::column(ColumnId(0), L::Scalar(S::I64))); }

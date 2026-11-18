@@ -15,7 +15,7 @@ fn execution(batch_rows: usize) -> Execution {
 fn list(expr: Expr) -> Arc<Relation> {
     let types = expr.data_type().legs().into_iter().map(|ty| match ty { LogicalType::List { element, .. } => *element, _ => LogicalType::Null }).collect::<Vec<_>>();
     let element = Field { id: ColumnId(0), name: "a".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::join_all(&types) };
-    Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(), RelationNode::List { expr, element }).unwrap())
+    Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(), RelationNode::List { expr, element, page_rows: None }).unwrap())
 }
 fn series(start: i64, end: i64, step: i64, inclusive: bool) -> Expr {
     let args = vec![Expr::Literal(Value::I64(start)), Expr::Literal(Value::I64(end)), Expr::Literal(Value::I64(step)), Expr::Literal(Value::Bool(inclusive))];

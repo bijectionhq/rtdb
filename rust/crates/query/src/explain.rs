@@ -475,7 +475,7 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             }
             map(work, [("partition-by", partition), ("order-by", text(order)?), ("window-functions", work.list(windows)?)])?
         }
-        RelationNode::List { expr, element } => {
+        RelationNode::List { expr, element, .. } => {
             let expression = expression(expr)?;
             let element = field_symbol(element, work)?;
             map(work, [("columns", text(work.pieces(&[RenderPiece::Text("{"), RenderPiece::Text(element.as_str()), RenderPiece::Text(" "), RenderPiece::Text(expression.as_str()), RenderPiece::Text("}")])?)?)])?

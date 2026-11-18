@@ -315,7 +315,7 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
             for expr in expressions { fields.push(field_type(&expr.field, expr.function.result_type(&input)?)); }
             Schema::new(fields)?
         }
-        RelationNode::List { expr, element } | RelationNode::ColumnTable { expr, element } => {
+        RelationNode::List { expr, element, .. } | RelationNode::ColumnTable { expr, element } => {
             let types = type_of(expr, &Schema::default())?.legs().into_iter().map(|ty| match ty.unencoded() {
                 L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element,
                 _ => L::Null,
@@ -328,8 +328,7 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
         }
         RelationNode::Unnest { input, expr, element, ordinality, outer: nullable } => {
             let input = child(input)?;
-            let types = type_of(expr, &input)?.legs().into_iter().map(|ty| match ty { L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element, _ => L::Null }).collect::<Vec<_>>();
-            let ty = if types.is_empty() { L::Null } else { L::join_all(&types) };
+            let ty = rtdb_plan::unnest_element_type(&type_of(expr, &input)?);
             let mut fields = input.fields().to_vec();
             fields.push(field_type(element, if *nullable { ty.maybe() } else { ty }));
             fields.extend(ordinality.iter().cloned());

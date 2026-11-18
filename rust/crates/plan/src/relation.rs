@@ -34,6 +34,14 @@ pub struct Scan {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NamedExpr { pub field: Field, pub expr: Expr }
 
+pub fn unnest_element_type(ty: &LogicalType) -> LogicalType {
+    let types = ty.legs().into_iter().filter_map(|ty| match ty {
+        LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => Some(*element),
+        _ => None,
+    }).collect::<Vec<_>>();
+    if types.is_empty() { LogicalType::Null } else { LogicalType::join_all(&types) }
+}
+
 /// An immutable lexical binding; references retain this definition and are opened within its `Let` scope.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MaterializedBinding { pub name: String, pub relation: Arc<Relation> }
@@ -277,7 +285,7 @@ pub enum RelationNode {
     Values { rows: Vec<Vec<Expr>> },
     /// Rows from an explicit sequence of input pages, including empty pages.
     LiteralPages { pages: Vec<Vec<Vec<Expr>>> },
-    List { expr: Expr, element: Field },
+    List { expr: Expr, element: Field, #[serde(default)] page_rows: Option<std::num::NonZeroUsize> },
     /// Materializes the selected list during opening and publishes one page, including an empty page.
     /// Statically non-list scalar payloads are not demanded; null and non-list results produce an empty page.
     ColumnTable { expr: Expr, element: Field },

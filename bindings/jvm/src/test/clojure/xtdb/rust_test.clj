@@ -9,6 +9,8 @@
             [xtdb.operator.distinct-test :as original-distinct]
             [xtdb.operator.join-test :as original-join]
             [xtdb.operator.let-test :as original-let]
+            [xtdb.operator.list :as list-operator]
+            [xtdb.operator.list-test :as original-list]
             [xtdb.operator.order-by-test :as original-order-by]
             [xtdb.operator.project-test :as original-project]
             [xtdb.operator.rename-test :as original-rename]
@@ -113,11 +115,15 @@
 
 (defn- import-logical-inputs [query]
   (let [[operator options & operands] query]
-    (if (= operator ::tu/pages)
+    (case operator
+      ::tu/pages
       (case (count operands)
         0 [:literal-pages {:pages options}]
         1 [:literal-pages {:pages (first operands) :types (update-vals options st/render-type)}]
         (throw (ex-info "Invalid fixture page source" {:query query})))
+
+      :list [:list (update options :batch-size #(or % list-operator/*batch-size*))]
+
       (into [operator options] (map import-logical-inputs) operands))))
 
 (defn- run-native-logical-query [query {:keys [node] :as options}]
@@ -769,6 +775,18 @@
                           {:args {:fraction 0.5}})))))
 
 (deftest-original-api original-unnest/test-vector-not-found-4343)
+
+(deftest-original-api original-unnest/test-simple-unnest)
+
+(deftest-original-api original-unnest/test-unnest-operator)
+
+(deftest-original-api original-unnest/fix-ordinality-field-naming)
+
+(deftest-original-api original-unnest/unnest-issue-4441)
+
+(deftest-original-api original-list/test-generate-series)
+
+(deftest-original-api original-list/test-batch-boundaries)
 
 (deftest-original-api original-unnest/unnest-ordinality-join-issue-4131)
 

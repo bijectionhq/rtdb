@@ -240,7 +240,7 @@ impl Execution {
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
             invocation.evaluate_projection_async(row,&context))).await.flatten().ok_or_else(cancelled)?
     }
-    pub async fn open_list(&self, expression: rtdb_plan::Expr) -> Result<crate::list::ListCursor> {
+    pub async fn open_list(&self, expression: rtdb_plan::Expr, page_rows: Option<std::num::NonZeroUsize>) -> Result<crate::list::ListCursor> {
         let execution = self.clone();
         let context = Arc::clone(&self.context);
         let stream = async_stream::try_stream! {
@@ -251,7 +251,8 @@ impl Execution {
             let eval = rtdb_expr::EvalContext { parameters: execution.parameters.values(), parameter_types: Some(execution.parameters.types()), current_time: execution.context.current_time,
                 timezone: &execution.context.timezone, outer_rows: &outer_rows, snapshot_token: execution.context.snapshot_token(), allocation: Some(&scope), catalog: Some(&execution.context.catalog) };
             let invocation = rtdb_expr::ExpressionInvocation::prepare(&expression, &schema, &eval)?;
-            let list = invocation.open_list(&[], &eval, execution.context.options.list_batch_rows).await?;
+            let page_rows = page_rows.map_or(execution.context.options.list_batch_rows,std::num::NonZeroUsize::get);
+            let list = invocation.open_list(&[], &eval, page_rows).await?;
             match list.into_indexed() {
                 Ok(batches) => yield crate::list::ListEvent::Opened(Some(batches)),
                 Err(mut list) => {

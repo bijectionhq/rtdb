@@ -4,7 +4,7 @@ use rtdb_types::Result;
 use std::sync::Arc;
 
 pub(crate) async fn open(execution: &Execution, expression: Expr) -> Result<BoxPageCursor> {
-    let mut input = execution.open_list(expression).await?;
+    let mut input = execution.open_list(expression,None).await?;
     let mut output = PageBuilder::new(0, &execution.context.memory)?;
     while let Some(mut page) = input.next_page().await? {
         execution.context.check_cancelled()?;

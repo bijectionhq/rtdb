@@ -50,6 +50,7 @@ impl Importer<'_, '_, '_> {
         if options.map().is_none() { return Err(invalid("Logical relation options must be a map")); }
         let result = match (op, children) {
             ("table", []) => self.table(options)?,
+            ("list", []) => self.list(options)?,
             ("scan", []) => self.scan(options)?,
             ("let", [bound, body]) => self.let_relation(options, bound, body)?,
             ("relation", []) => self.reference(options)?,
@@ -76,6 +77,7 @@ impl Importer<'_, '_, '_> {
             ("single-join", [left, right]) => self.join(JoinKind::Single, options, left, right)?,
             ("mark-join", [left, right]) => self.mark(options, left, right)?,
             ("apply", [input, dependent]) => self.apply(options, input, dependent)?,
+            ("unnest" | "ω", [input]) => self.unnest(options, input)?,
             ("distinct" | "δ", [input]) => {
                 let input = self.lower(input)?;
                 Relation::new(input.schema().clone(), RelationNode::Distinct { input })?
@@ -102,6 +104,42 @@ impl Importer<'_, '_, '_> {
             (None, None, Some(parameter)) => self.argument_table(options, parameter),
             _ => Err(invalid("Logical table requires exactly one of :rows, :column, and :param")),
         }
+    }
+
+    fn list(&mut self, options: &Edn) -> Result<Relation> {
+        let Some([(name, form)]) = required(options, "columns")?.map() else { return Err(invalid("List requires one output column")); };
+        let name = column_name(name)?;
+        let expr = self.scalar(form, &mut Bound::unit())?;
+        let element = self.compiler.binder.field(name, None, list_element(&expr.data_type()))?;
+        let page_rows = options.option("batch-size").map(|form| {
+            let EdnKind::Integer(rows) = form.kind else { return Err(invalid("List batch size must be a positive integer")); };
+            usize::try_from(rows).ok().and_then(std::num::NonZeroUsize::new)
+                .ok_or_else(|| invalid("List batch size must be a positive integer"))
+        }).transpose()?;
+        let relation = Relation::new(Schema::new(vec![element.clone()])?, RelationNode::List { expr, element: element.clone(), page_rows })?;
+        let Some(columns) = options.option("col-names") else { return Ok(relation); };
+        let expressions = sequence(columns)?.iter().map(|column| {
+            let name = column_name(column)?;
+            if name == element.name { return Ok(NamedExpr { field: element.clone(), expr: element.expression() }); }
+            let field = self.compiler.binder.field(name, None, LogicalType::Null)?;
+            Ok(NamedExpr { field, expr: PExpr::Literal(Value::Null) })
+        }).collect::<Result<Vec<_>>>()?;
+        Arc::new(relation).project(expressions)
+    }
+
+    fn unnest(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
+        let input = self.lower(input)?;
+        let Some([(name, source)]) = required(options, "columns")?.map() else { return Err(invalid("Unnest requires one source and destination column")); };
+        let name = column_name(name)?;
+        let source = column_name(source)?;
+        let expr = input.schema().fields().iter().find(|field| field.name == source)
+            .ok_or_else(|| invalid(format!("Unknown unnest column: {source}")))?.expression();
+        let element = self.compiler.binder.field(name, None, rtdb_plan::unnest_element_type(&expr.data_type()))?;
+        let ordinality = options.option("ordinality-column").map(|column| {
+            self.compiler.binder.field(column_name(column)?, None, LogicalType::Scalar(ScalarType::I32))
+        }).transpose()?;
+        let schema = Schema::new(input.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinality.iter().cloned()).collect())?;
+        Relation::new(schema, RelationNode::Unnest { input, expr, element, ordinality, outer: false })
     }
 
     fn scan(&mut self, options: &Edn) -> Result<Relation> {
