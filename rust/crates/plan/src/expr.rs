@@ -89,7 +89,6 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         }
         return Ok(LogicalType::Null);
     }
-    let numeric = || LogicalType::least_upper_bound(arguments).unwrap_or_else(|| LogicalType::join_all(arguments));
     let (ty, arity, nullable) = match name.as_str() {
         "lower" | "upper" => {
             let mut outputs = Vec::new();
@@ -108,7 +107,7 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         }
         "format_type" => (LogicalType::Scalar(S::Utf8), 2..=2, false),
         "length" | "cardinality" => (LogicalType::Scalar(S::I32), 1..=1, true),
-        "abs" => (numeric(), 1..=1, true),
+        "abs" => (LogicalType::join_all(arguments), 1..=1, true),
         "floor" | "ceil" | "ceiling" => (LogicalType::Scalar(S::F64), 1..=1, true),
         "round" => (round_type(arguments.first().unwrap_or(&LogicalType::Nothing), None, arguments.len() == 2)?, 1..=2, true),
         "greatest" | "least" => (if arguments.is_empty() { LogicalType::Null } else { LogicalType::join_all(arguments) }, 0..=usize::MAX, true),

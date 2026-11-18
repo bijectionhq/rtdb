@@ -35,3 +35,14 @@ fn hyperbolic_calls_preserve_signed_zero_nan_and_infinite_limits() {
     assert_eq!(call("sinh", &[V::F64(f64::NEG_INFINITY)]).unwrap(), V::F64(f64::NEG_INFINITY));
     assert_eq!(call("cosh", &[V::F64(f64::NEG_INFINITY)]).unwrap(), V::F64(f64::INFINITY));
 }
+
+#[test]
+fn abs_keeps_each_numeric_leg_of_a_union_argument() {
+    let union = L::join_all(&[L::Scalar(S::I64), L::Scalar(S::F64), L::Null]);
+    let result = function_type("abs", std::slice::from_ref(&union)).unwrap();
+    for (input, expected) in [(V::I64(-2), V::I64(2)), (V::F64(-3.4), V::F64(3.4)), (V::Null, V::Null)] {
+        let output = call("abs", &[input]).unwrap();
+        assert!(result.legs().contains(&output.logical_type()), "{output:?} in {result:?}");
+        assert_eq!(output, expected);
+    }
+}
