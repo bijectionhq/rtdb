@@ -1,0 +1,84 @@
+= Borrowed Registry rules and metadata
+
+The typed rule consumer borrows the ordered Registry response beans directly.
+The capability is registered under the same test gate as the response decoder.
+The installed `RegistrySchema` JSON route uses `ReadRules`.
+All text views borrow Java UTF16 units, including unmatched surrogate units.
+
+== Owners
+
+`RuleSchema` is a passive borrowed projection of one parsed schema's optional rule set and metadata.
+An absent schema differs from a present schema with no rule set.
+`RuleSetView`, `MetadataView` and `RuleView` are passive borrowed views.
+`RuleWalk` is a passive single-writer execution cursor over an existing rule list.
+The cursor contains a borrowed slice, position, direction and target metadata view.
+The response beans and their original admitted backing must outlive every view and cursor.
+
+`next` consumes a cursor and returns either completion or the demanded rule plus the remaining cursor.
+An error consumes the failing execution state.
+Internal selection, property lookup and action slicing allocate no storage.
+Callbacks and subsequent executor/context/action owners remain responsible for their own admission and source behavior.
+
+== Demand order
+
+`RuleSetView::has_rules` follows `RuleSet.hasRules` for all six rule modes.
+It scans the selected list forward and stops at the first match, including disabled rules.
+A later null entry is not inspected after a match.
+A demanded null entry fails, while a null rule mode compares unequal.
+Constructor defaults are not re-applied to fields that a later reflected assignment set to null.
+An explicitly null list fails only when its membership stream is demanded.
+
+`RuleWalk::start` returns an empty execution for a Java-null message or absent target before selecting any rule list.
+The Java-null flag refers to the source object identity; a non-null Jackson `NullNode` must not be supplied as Java null.
+Upgrade uses the target migration list in encounter order.
+Downgrade requires a source schema and uses its migration list in reverse order.
+Read uses the target domain list in reverse order.
+Missing rule sets select an empty list; a post-creator null selected list preserves the source copy/size failure stage.
+The borrowed cursor preserves the logical list order without an additional native list copy.
+Reference JVM allocation failures during its list copies still require runtime qualification.
+
+For each reached slot, null entry rejection occurs at the source disabled-cache key demand.
+The caller's `RuleDecisions` supplies the existing cached disabled decision.
+Only enabled rules demand the caller's last DLQ-rule header outcome.
+An absent header does not inspect the rule name.
+A present header with a null byte value fails at Java string construction before rule-name comparison.
+A decoded header name then requires a non-null rule-name receiver and compares exact UTF16 units.
+A matching name skips that rule before mode and executor demand.
+Mode selection follows the disabled/header stage.
+An explicitly null mode skips execution without reading type or kind.
+Native callback failures propagate unchanged through a separate typed failure branch.
+
+An applicable `RuleView` preserves null type until `executor_type` is demanded.
+The caller must perform the actual source `RuleContext` construction and admission before that lookup stage.
+A null type then fails before selecting an executor.
+`kind_after_transform` belongs after a found executor successfully returns; a missing executor or a thrown `RuleException` does not demand kind.
+A post-creator null kind remains an unchecked failure at that switch stage.
+
+Success/failure action getters preserve their exact nullable values.
+The actual cached action/configuration decision remains the caller's responsibility.
+`action_name` applies paired actions only for `WRITEREAD` and `UPDOWN` when the demanded text contains a comma.
+It follows Java `String.split(",")` trailing-empty removal, using the first component for upgrade and the second for read/downgrade.
+Missing selected components remain unchecked index failures, while an internal empty component remains present empty text.
+A null action is returned to the caller for the source default-action stage.
+
+`parameter` checks rule parameters first, then the target metadata properties only when the first lookup is absent or null.
+Its parameter name is non-null borrowed text; the pinned DLQ caller supplies the `dlq.topic` constant.
+An empty string suppresses metadata fallback.
+Downgrade still uses target metadata even though its rules come from the source schema.
+Absent or post-creator null parameter/property maps remain distinguishable in the beans and are safely skipped by this getter.
+
+== Scope and source identity
+
+The execution ordering is pinned to Confluent Schema Registry 7.8.0 `AbstractKafkaSchemaSerDe`, `RuleSet`, `Rule`, `RuleContext` and `DlqAction`.
+The split and null-cache-key branches are pinned to Temurin 25.0.1+8 `String` and `ConcurrentHashMap`.
+link:sources.json[Source identities] record the complete archives, selected source bytes and retained legal copies.
+link:COPYRIGHT[Copyright notices] preserve every complete pre-package source prefix.
+link:LICENSES[License texts] retain the Apache and JDK legal material.
+The existing link:../../response/REFERENCE.adoc[ordered bean decoder reference] owns Jackson 2.16.0/2.21.7 construction, collection and lexical qualifications.
+
+The new paired fixture sources decode actual ordered bean JSON under both pinned Jackson profiles before consuming its typed views.
+They cover short-circuit nullable membership, post-creator null mode/kind/type and lists, directional source/target selection, nullable-slot demand, disabled/header/mode order, native callback failure, exact text/parameter precedence, action-pair boundaries and exhausted additional admission.
+
+The actual disabled/action `ConcurrentHashMap` owners, Rule-key hashing/collision behavior, configuration/cache policy, header-byte conversion and executor/context/action allocation ordering remain integration obligations.
+Metadata tag wildcard matching and custom field executors are outside this borrowed property consumer.
+Live typed HTTP routing requires nullable schema carriers through Avro and JSON consumers and source version and cache timing.

@@ -4,6 +4,9 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use super::super::error;
 
+#[cfg(test)]
+mod typed;
+
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 enum RuleMode { Upgrade, Downgrade, Updown, Write, Read, #[default] Writeread }

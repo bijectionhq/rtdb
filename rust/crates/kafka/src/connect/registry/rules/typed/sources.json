@@ -1,0 +1,126 @@
+{
+  "source_only": true,
+  "runtime_execution": false,
+  "archives": [
+    {
+      "profile": "confluent-client-7.8.0",
+      "url_or_origin": "https://packages.confluent.io/maven/io/confluent/kafka-schema-registry-client/7.8.0/kafka-schema-registry-client-7.8.0-sources.jar",
+      "sha256": "0bede2ed51df1c97cc1a86c49e5dc1bdebca570d791e81183b39cd3b5004feaf"
+    },
+    {
+      "profile": "confluent-serializer-7.8.0",
+      "url_or_origin": "https://packages.confluent.io/maven/io/confluent/kafka-schema-serializer/7.8.0/kafka-schema-serializer-7.8.0-sources.jar",
+      "sha256": "3ed555f5937698de16892906cc1bb0dfba8ca32d2c9220c7feeb4fe6740a5ac6"
+    },
+    {
+      "profile": "temurin-25.0.1+8",
+      "url_or_origin": "Temurin 25.0.1+8 JDK src.zip, retained archive shared with connect/avro/names",
+      "sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482"
+    }
+  ],
+  "sources": [
+    {
+      "profile": "confluent-serializer-7.8.0",
+      "entry": "io/confluent/kafka/serializers/AbstractKafkaSchemaSerDe.java",
+      "sha256": "fbd1abb4d9fa39bf05e2a81f42900a0f7b924343a989fb6c88ff007443b12e89",
+      "prefix_bytes": 595,
+      "prefix_sha256": "1a213df5f633cee7547228673a81db1aa052a73bd9bd16c13f76472ccbc7c053"
+    },
+    {
+      "profile": "confluent-client-7.8.0",
+      "entry": "io/confluent/kafka/schemaregistry/client/rest/entities/RuleSet.java",
+      "sha256": "01a7ac1d54d672c4002dca88ce6933c337809a8390a5001b3d50071a0bcf7638",
+      "prefix_bytes": 595,
+      "prefix_sha256": "2885fd991d2fa9b6ef4c26f1465ad2f961016b7b017d22d4da2b67d9934f44ec"
+    },
+    {
+      "profile": "confluent-client-7.8.0",
+      "entry": "io/confluent/kafka/schemaregistry/client/rest/entities/Rule.java",
+      "sha256": "5e18fb0a23fb7a772cb852c1f49f61f975a381b834dd62cea848706af9d7e6b0",
+      "prefix_bytes": 595,
+      "prefix_sha256": "2885fd991d2fa9b6ef4c26f1465ad2f961016b7b017d22d4da2b67d9934f44ec"
+    },
+    {
+      "profile": "confluent-client-7.8.0",
+      "entry": "io/confluent/kafka/schemaregistry/client/rest/entities/Metadata.java",
+      "sha256": "1fe54499dfcc775ac3aafa751c1fcf8c8901c0e764676323860ad0e51fba14ee",
+      "prefix_bytes": 595,
+      "prefix_sha256": "2885fd991d2fa9b6ef4c26f1465ad2f961016b7b017d22d4da2b67d9934f44ec"
+    },
+    {
+      "profile": "confluent-client-7.8.0",
+      "entry": "io/confluent/kafka/schemaregistry/client/rest/entities/RuleMode.java",
+      "sha256": "1377e1dab79b2baecfbd762dc8938427237802c3414e11ba5d49feafe0c13f99",
+      "prefix_bytes": 595,
+      "prefix_sha256": "2885fd991d2fa9b6ef4c26f1465ad2f961016b7b017d22d4da2b67d9934f44ec"
+    },
+    {
+      "profile": "confluent-client-7.8.0",
+      "entry": "io/confluent/kafka/schemaregistry/client/rest/entities/RuleKind.java",
+      "sha256": "a0eb516ece1a7e1bcd37fe6cec48d11f36f7a6f8b9e261e7f1591a970dce06d9",
+      "prefix_bytes": 595,
+      "prefix_sha256": "2885fd991d2fa9b6ef4c26f1465ad2f961016b7b017d22d4da2b67d9934f44ec"
+    },
+    {
+      "profile": "confluent-client-7.8.0",
+      "entry": "io/confluent/kafka/schemaregistry/rules/RuleContext.java",
+      "sha256": "5c73d8de0d32823fd32b6158ca3b2547ae617b9ea359b62411783a45e9de96af",
+      "prefix_bytes": 595,
+      "prefix_sha256": "2885fd991d2fa9b6ef4c26f1465ad2f961016b7b017d22d4da2b67d9934f44ec"
+    },
+    {
+      "profile": "confluent-client-7.8.0",
+      "entry": "io/confluent/kafka/schemaregistry/rules/DlqAction.java",
+      "sha256": "f8c1d26964073d6fe65b1116ea4477ffbdc6f46fbd2144ab8b10d3e1f493ff0f",
+      "prefix_bytes": 595,
+      "prefix_sha256": "2885fd991d2fa9b6ef4c26f1465ad2f961016b7b017d22d4da2b67d9934f44ec"
+    },
+    {
+      "profile": "temurin-25.0.1+8",
+      "entry": "java.base/java/lang/String.java",
+      "sha256": "15cc88d0676a2193b72f56e6f1bb7efcebff9bf97ce5d1fdc01732636a23e38a",
+      "prefix_bytes": 1214,
+      "prefix_sha256": "a4cb0557ff2358b3b7b5ac0cc8720d65e776e923df2ddee0aa54c9ee3ab4bd24"
+    },
+    {
+      "profile": "temurin-25.0.1+8",
+      "entry": "java.base/java/util/concurrent/ConcurrentHashMap.java",
+      "sha256": "cf47348e18d1bdfcd32f2fe2c9ea1efa2764c7e5d1297f9c63206cc06a536c08",
+      "prefix_bytes": 1559,
+      "prefix_sha256": "288eadb6c115199325622c59af077f2d93d35df2cdda3691e4bc0899b32879f3"
+    }
+  ],
+  "license_copies": [
+    {
+      "label": "confluent-7.8.0/LICENSE-APACHE",
+      "retained_published_source": "rust/crates/kafka/src/connect/registry/references/LICENSE-APACHE",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "label": "temurin-25.0.1+8/LICENSE",
+      "retained_published_source": "rust/crates/kafka/src/connect/avro/names/LICENSE",
+      "bytes": 19274,
+      "sha256": "4b9abebc4338048a7c2dc184e9f800deb349366bdf28eb23c2677a77b4c87726"
+    },
+    {
+      "label": "temurin-25.0.1+8/ADDITIONAL_LICENSE_INFO",
+      "retained_published_source": "rust/crates/kafka/src/connect/avro/names/ADDITIONAL_LICENSE_INFO",
+      "bytes": 2114,
+      "sha256": "a69bce275ba7a3570af6579cb0f55682cd75fedfcd49e0e8e9022270c447c916"
+    },
+    {
+      "label": "temurin-25.0.1+8/ASSEMBLY_EXCEPTION",
+      "retained_published_source": "rust/crates/kafka/src/connect/avro/names/ASSEMBLY_EXCEPTION",
+      "bytes": 1514,
+      "sha256": "75292f03bf23d3db7c985aecc191029b93883200721ed23ed34a2e601463df33"
+    }
+  ],
+  "decoder_provenance": "../../response/sources.sha256 and ../../response/artifacts.json",
+  "scope": {
+    "borrowed_rules": "RuleSet.hasRules and executeRules list/guard/stage selection",
+    "borrowed_metadata": "RuleContext.getParameter rule/target precedence",
+    "actions": "getRuleActionName and String.split comma fast path",
+    "cache": "only ConcurrentHashMap.computeIfAbsent null key guard; complete Rule-key caches remain unimplemented"
+  }
+}
