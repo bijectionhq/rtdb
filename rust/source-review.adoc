@@ -138,7 +138,8 @@ The sequence domain and exhaustion behavior need an explicit compatibility decis
 |Client read |Pgwire, Flight SQL and embedded bindings are traced through session bases, one captured catalog/row generation per database, native preparation, temporal scans and owned output; null-token compatibility is source-reviewed; remaining language and allocation surfaces stay open.
 |Data-dependent write |Public pgwire, Flight SQL and embedded submission paths are traced through native source durability, transaction-local staged reads, ordered replica append, term admission, atomic apply and caller completion; independent whole-path source review is clear, and runtime qualification remains pending.
 |Replica recovery |Public startup, catalog restore, native replay, term admission and follower adoption are traced.
-Recovery when the writer crashes before upload confirmation remains open.
+A restarted writer confirms its selected checkpoint in the configured replica epoch when its upload is absent.
+Recovery of an older absent upload after the checkpoint has been superseded on disk remains open.
 |Compaction retry |Public database and standalone compactor assembly, deterministic merge, data-before-metadata publication, source/replica read-back, catalog visibility and replacement-owner retry are traced; cross-engine bytes and failure execution remain pending.
 |CDC restart |Public remote/source configuration, leader-term assignment, snapshot/resume, ordered import, replica read-back, adopted-block confirmation and cancellation are traced through native implementations; upstream assumptions and runtime qualification remain pending.
 |Database shutdown |Public server signals, startup failure, unstarted closure and embedded closure are traced through listener, node, database, term and log completion into child and ancestor I/O drains; no source gap remains in this bounded trace; execution qualification remains pending.
@@ -381,7 +382,7 @@ Independent source review covered the recovery repairs, staged resource assembly
 The existing watcher-failure, integer-exhaustion, oversized-fetch-order and retry-timestamp compatibility qualifications remain explicit.
 Startup health tracks consumed replica positions; query basis waits remain the visibility barrier.
 Local writable-tail batches, catalog allocation estimates and broker durability still require memory, provider and runtime qualification.
-The <<replica-upload-confirmation,upload-confirmation crash window>> requires a source repair.
+The <<replica-upload-confirmation,upload-confirmation crash window>> is covered for the selected recovered checkpoint in source.
 No build, test, formatter, server or fault execution was used for this trace.
 
 == Source checks performed
@@ -1372,6 +1373,7 @@ Submission admits the temporary SQL syntax estimate before lexing and holds it u
 The resolver attaches the original SQL to preparation and execution failures.
 The resolving transaction also admits an estimate before lowering each SQL mutation against its own snapshot.
 For a query-backed mutation, the plan receives its own charge before the temporary allowance releases for query execution.
+A transaction writer's own SQL query reserves temporary preparation against the same transaction-local snapshot and releases it after plan admission.
 Invalid valid-time intervals retain typed instant bounds in the durable transaction error.
 Local and zoned timestamp casts from strings retain syntax diagnostics for a rejected field or parse position.
 Transaction resolution reports the typed table reference when it rejects a SQL mutation targeting a reserved table.
@@ -1382,7 +1384,13 @@ Catalog recovery precedes opening logs, and embedded close joins native work bef
 [[replica-upload-confirmation]]
 Both Rust and the pinned JVM publish the final block catalog before appending its `BlockUploaded` record.
 A restart can therefore resume at a published catalog's boundary with no pending block while a surviving follower still waits for the upload.
-Closing that durable-publication gap and checking follower progress across the crash remain open.
+The restarted Rust writer checks the admitted suffix for confirmation of its selected checkpoint when its boundary belongs to the configured replica epoch.
+If the upload is absent, the newly elected term reannounces the original block's source position, external token and L0 notifications.
+The writer waits for admitted read-back before producing a later pending block or resuming ordinary source and external-source processing.
+A surviving follower can adopt the reannounced block and drain held records, while an already-installed replica skips that upload before buffering for a later block.
+The native local restart regression checks committed progress on both replicas and the surviving follower's follow-on row.
+The selected checkpoint cannot identify an older missing confirmation that an earlier run already superseded on disk.
+That older case and cross-engine execution remain pending.
 
 On own-term leader read-back, Rust follows `LeaderAppliesOwnTx` in `dev/doc/db.allium` by validating the staged head and applying its writes before applying the committed database attach or detach effect.
 The pinned JVM applies the catalog effect before taking the staged head.
@@ -1397,8 +1405,10 @@ Logical-key Bloom filtering remains available for persisted pages.
 Physical IID joins still use the stored bytes.
 A real source log fixture covers an explicit noncanonical IID, a later put under that same physical IID and both current and historical results before flush, after flush and after restart.
 Live and persisted scan page descriptors reserve capacity before allocation and retain that lease until the partition closes.
-The regression source checks refusal at replacement capacity before a data page is read, then closes a successful scan with the descriptor allowance released.
-Retained trie candidates and file descriptors, sorted live-leaf storage, temporal resolver scratch, and buffer-pool entry metadata still require admission work.
+The regression source checks refusal at replacement capacity before a data page is read and release when a successful scan exhausts the partition.
+The scan charges each event's history result vector before it grows and keeps the reservation through projection of the event's fragments.
+Native database buffer pools charge keys and fetch coordination to the node budget and release an empty entry after its final failed or cancelled fetch.
+Retained trie candidates and file descriptors, sorted live-leaf storage, temporal ceiling growth and polygon scratch still require admission work.
 Ordinary IID narrowing and broader metadata predicates remain open.
 
 Each reference control receipt binds the exact JVM runtime manifest, the verified runtime files and the artifact verifier source.
