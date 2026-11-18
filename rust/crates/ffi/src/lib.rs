@@ -378,6 +378,15 @@ pub unsafe extern "C" fn rtdb_v1_metadata(session: u64, operation: u64, request:
 pub unsafe extern "C" fn rtdb_v1_memory_used(database: u64, out: *mut usize, error: *mut u64) -> i32 {
     unsafe { call(error, || { *output(out)? = handles::database(database)?.0.memory().used_bytes(); Ok(()) }) }
 }
+/// Writes the bound PostgreSQL wire port, or -1 when the configuration starts no pgwire listener.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_pgwire_port(database: u64, out: *mut i32, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let port = handles::database(database)?.0.server.addresses().pgwire.map_or(-1, |address| i32::from(address.port()));
+        *output(out)? = port;
+        Ok(())
+    }) }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_transact(session: u64, operation: u64, request: *const u8, length: usize, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || {

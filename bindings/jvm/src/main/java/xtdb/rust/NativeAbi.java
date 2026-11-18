@@ -59,6 +59,7 @@ final class NativeAbi {
         register(library, linker, "bytes", I64, PTR, PTR);
         register(library, linker, "metadata", I64, I64, PTR, I64, PTR, PTR);
         register(library, linker, "memory_used", I64, PTR, PTR);
+        register(library, linker, "database_pgwire_port", I64, PTR, PTR);
         try { if (invoke("abi_version") != 1) throw new IllegalStateException("Unsupported RTDB native ABI version"); }
         catch (AdbcException error) { throw new IllegalStateException(error); }
     }

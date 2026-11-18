@@ -16,7 +16,7 @@ import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.memory.BufferAllocator;
 
 /** A native database region. The supplied Arrow allocator remains caller-owned until all imported batches close. */
-public final class NativeDatabase extends NativeResource implements AdbcDatabase {
+public final class NativeDatabase extends NativeResource implements AdbcDatabase, xtdb.api.DataSource {
     private final BufferAllocator allocator;
     private final java.util.concurrent.atomic.AtomicReference<String> awaitToken = new java.util.concurrent.atomic.AtomicReference<>();
     private final Arena clockArena;
@@ -148,6 +148,23 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
             return new NativeConnection(abi, connection, allocator, database);
         }
     }
+    /** The bound PostgreSQL wire port, or -1 when the configuration starts no pgwire listener. */
+    public int getServerPort() throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) { MemorySegment out = arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT); abi.call("database_pgwire_port", handle(), out); return out.get(java.lang.foreign.ValueLayout.JAVA_INT, 0); }
+    }
+    @Override public void setAwaitToken(String token) { awaitToken.set(token); }
+    /** JDBC connections go through this node's own pgwire listener, as for a JVM node. */
+    @Override public xtdb.api.DataSource.ConnectionBuilder createConnectionBuilder() {
+        int port;
+        try { port = getServerPort(); } catch (AdbcException error) { throw new IllegalStateException(error); }
+        if (port < 0) throw new IllegalStateException("This native node was opened without a pgwire server");
+        return new xtdb.api.DataSource.ConnectionBuilder("localhost", port);
+    }
+    @Override public <T> T unwrap(Class<T> type) throws java.sql.SQLException {
+        if (type.isInstance(this)) return type.cast(this);
+        throw new java.sql.SQLException("Not a wrapper for " + type.getName());
+    }
+    @Override public boolean isWrapperFor(Class<?> type) { return type.isInstance(this); }
     public long nativeMemoryUsed() throws AdbcException {
         try (Arena arena = Arena.ofConfined()) { MemorySegment out = arena.allocate(NativeAbi.I64); abi.call("memory_used", handle(), out); return out.get(NativeAbi.I64, 0); }
     }

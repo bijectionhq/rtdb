@@ -1,5 +1,7 @@
 (ns xtdb.rust-test
   (:require [clojure.test :as t :refer [deftest is]]
+            [next.jdbc :as jdbc]
+            [next.jdbc.result-set :as jdbc-rs]
             [xtdb.api :as xt]
             [xtdb.as-of-test :as original-as-of]
             [xtdb.information-schema-test :as original-info-schema]
@@ -46,7 +48,7 @@
            [org.apache.arrow.memory RootAllocator]
            [xtdb.rust NativeDatabase]))
 
-(def ^:private node-config "server: null\nflightSql: null\nnodeId: clojure-binding-test\n")
+(def ^:private node-config "server:\n  port: 0\nflightSql: null\nnodeId: clojure-binding-test\n")
 
 (defn- open-node ^NativeDatabase
   ([allocator] (NativeDatabase/open allocator node-config (* 512 1024 1024)))
@@ -93,6 +95,13 @@
                (ex-message error)))
         (is (= tx-id (-> error ex-data :tx-key :tx-id)))))
     (is (= [{:xt/id 0 :v "prior"}] (xt/q node "SELECT * FROM docs")))))
+
+(deftest native-node-is-a-jdbc-data-source-over-its-own-pgwire-listener
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (xt/execute-tx node [[:put-docs :docs {:xt/id 1 :v "native"}]])
+    (with-open [conn (jdbc/get-connection node)]
+      (is (= [{:_id 1 :v "native"}] (jdbc/execute! conn ["SELECT _id, v FROM docs"] {:builder-fn jdbc-rs/as-unqualified-maps}))))))
 
 (deftest transit-java-dates-work-as-documents-and-sql-arguments
   (with-open [allocator (RootAllocator.)
