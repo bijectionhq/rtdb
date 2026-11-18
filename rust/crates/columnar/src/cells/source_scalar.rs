@@ -25,6 +25,9 @@ impl<'a> SourceScalarReader<'a> {
         Ok(Some(Self::fixed(declaration, bytes.bytes.as_slice())))
     }
     pub(super) fn fixed(declaration: SourceScalarDeclaration, backing: &'a [u8]) -> Self { Self { declaration, backing } }
+    pub(crate) fn slice(&self, start: i32, length: i32) -> SourceScalarSlice<'a> {
+        SourceScalarSlice { inner: Self::fixed(self.declaration, self.backing), start, length }
+    }
     pub(crate) fn get_pointer(&self, row: i32) -> SourceBytePointer<'a> {
         let width = self.declaration.fixed_width();
         SourceBytePointer { backing: self.backing, offset: i64::from(row.wrapping_mul(width)), length: i64::from(width) }
@@ -62,6 +65,21 @@ impl<'a> SourceScalarReader<'a> {
             drop(copy_reservation);
             Ok(result)
         })())
+    }
+}
+
+pub(crate) struct SourceScalarSlice<'a> {
+    inner: SourceScalarReader<'a>,
+    start: i32,
+    length: i32,
+}
+impl<'a> SourceScalarSlice<'a> {
+    pub(crate) fn value_count(&self) -> i32 { self.length }
+    pub(crate) fn get_pointer(&self, row: i32) -> SourceBytePointer<'a> {
+        self.inner.get_pointer(self.start.wrapping_add(row))
+    }
+    pub(crate) fn get_bytes(&self, row: i32) -> SourceScalarReadResult<SourceByteView<'a>> {
+        self.inner.get_bytes(self.start.wrapping_add(row))
     }
 }
 

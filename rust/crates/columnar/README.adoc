@@ -154,7 +154,8 @@ Those offsets may be negative or outside an empty/inactive child; selecting them
 A range on an already indirect leg reader preserves the mask, matching `IndirectVector.select(start, len)`.
 A first direct range retains Slice topology; another range over an indirect reader reserves and materializes translated selection indices even when its rows are contiguous.
 `Selection::All` invokes the same range behavior over the complete reader.
-The current checked `Selection` surface requires a nonnegative source count; a source-facing signed Slice constructor remains required in the later writer/reader rollout.
+The checked `Selection` surface requires a nonnegative source count.
+The source scalar reader exposes the first signed Slice's raw byte and pointer methods described below.
 `struct_child` also admits a named Struct leg, while `list_elements` and list offsets admit the corresponding plain or named-leg list reader.
 `list_start_index` and `list_count` return signed i32 values.
 Fixed lists compute start with wrapping multiplication and return the declared count without accessing row storage.
@@ -272,7 +273,6 @@ Immutable reader snapshots retain their existing terminal-offset and reader-iden
 
 `cells/write/owner/tree_tests.rs` covers concrete construction and writes, keyed names, wrapper methods, wrapped counts/ordinals, failure prefixes, finite admission, capture cleanup, aliases and depth-bound teardown.
 Full Field/type factory construction, borrowed source getter/hint and LongLong kernels, routed child handles, promotion, recursive copying, relations, host objects/hash, physical transport and production adoption remain required increments.
-The independent source signed-Slice error, allocation and mutable-alias contract also remains open.
 The Phase 1 source gate remains in force; this private foundation has not been compiled or executed.
 
 == Source scalar declarations and borrowed byte facts
@@ -306,6 +306,15 @@ They expose no raw address, mutable alias, relative ByteBuffer cursor, pointer-r
 Existing checked Cell and ScalarReader logical row gates remain separate, using actual native widths at their native byte-admission boundary.
 The checked UUID `Value` adapter requires exactly 16 bytes.
 
+`SourceScalarReader::slice` returns a passive borrowed first Slice with its signed start and length.
+`value_count` returns the supplied length unchanged, including negative values.
+The raw byte and pointer getters translate the requested row with wrapping i32 addition, then delegate to the inner reader's separate wrapping width multiplication.
+They retain the inner declaration's actual width, unsupported methods and negative view lengths.
+Raw forwarding is independent of logical row count and validity.
+Slice construction and raw forwarding allocate no payload storage or reservations.
+Slices and returned facts borrow the real writer/vector owner and may outlive intermediate reader or Slice variables within that borrow.
+Repeated selection, mutable array aliases, guarded object reads, copying, close and pointer reuse remain required indirect-reader operations.
+
 `SourceScalarReader::binary_object0` materializes a FixedBinary or UUID object from its signed byte address.
 The same raw demand applies to null rows and wrapped row offsets.
 For Time declarations it reports capability absence before reading or allocating.
@@ -322,11 +331,11 @@ The temporary owner drops before return.
 The returned object owns its bytes and destination charge independently of the original vector, snapshots and intermediate readers.
 Copy denial, underflow and result denial release their admitted temporary owners without changing source prefixes or an existing writer abort gate.
 
-`cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, binary object underflow and surplus bytes, overlapping object reservations, abort inspection and retained snapshot ownership.
+`cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, first signed Slice forwarding, binary object underflow and surplus bytes, overlapping object reservations, abort inspection and retained snapshot ownership.
 These tests are unexecuted source under the Phase 1 gate.
 Existing-inner wrapper adoption and mutable aliases remain required constructor work.
 Custom Java ZoneRulesProvider/rules support remains a mandatory open environment boundary requiring a typed retained rules representation.
-Full Field factories, source primitive/NPE/object/meta/LongLong/hash and ByteBuffer behavior, independent signed Slice semantics, routed writers and promotions, recursive copying, relations, physical transport and production adoption remain required increments.
+Full Field factories, source primitive/NPE/object/meta/LongLong/hash and ByteBuffer behavior, remaining indirect-reader semantics, routed writers and promotions, recursive copying, relations, physical transport and production adoption remain required increments.
 
 
 == Source Null and Int initial counts

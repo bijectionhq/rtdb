@@ -1194,3 +1194,310 @@ fn uuid_copy_reservation_denial_precedes_both_long_underflow_producers() {
     }
     assert_eq!(source.used_bytes(), 0);
 }
+
+#[test]
+fn signed_slice_bytes_feed_existing_scalar_writers() {
+    let source = memory();
+    let destination = memory();
+    for declaration in [SourceScalarDeclaration::FixedBinary(2), SourceScalarDeclaration::Uuid { inner_width: 2 }] {
+        let mut input = writer(declaration, false, &source);
+        input.write_bytes(&[11, 12]).unwrap();
+        input.write_bytes(&[21, 22]).unwrap();
+        input.write_bytes(&[31, 32]).unwrap();
+        let slice = input.source_reader().unwrap().unwrap().slice(1, 1);
+        let mut output = writer(declaration, false, &destination);
+        output.write_bytes(slice.get_bytes(0).unwrap().demand_native().unwrap()).unwrap();
+        output.write_bytes(slice.get_pointer(1).demand_native().unwrap()).unwrap();
+        assert_eq!(slice.value_count(), 1);
+        assert_eq!(input.value_count(), 3);
+        let captured = output.finish().unwrap();
+        assert_eq!(captured.value_count(), 2);
+        assert_eq!(data(&captured).append, 4);
+        assert_eq!(&data(&captured).bytes.as_slice()[..4], &[21, 22, 31, 32]);
+        assert_eq!(SourceScalarReader::new(&captured).unwrap().unwrap().slice(1, -1).get_bytes(0).unwrap().demand_native().unwrap(), &[31, 32]);
+    }
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_length_is_independent_of_raw_reads_and_logical_count() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(1), false, &memory);
+    output.write_bytes(&[42]).unwrap();
+    for length in [i32::MIN, -1, 0, 1, i32::MAX] {
+        let slice = output.source_reader().unwrap().unwrap().slice(0, length);
+        assert_eq!(slice.value_count(), length);
+        assert_eq!(slice.get_bytes(0).unwrap().demand_native().unwrap(), &[42]);
+        assert_eq!(slice.get_pointer(127).demand_native().unwrap(), &[0]);
+        let view = slice.get_bytes(128).unwrap();
+        assert_eq!(view.offset(), 128);
+        assert_eq!(view.len(), 1);
+        read_native(view.demand_native());
+    }
+    assert_eq!(output.value_count(), 1);
+    assert!(output.reader().get_bytes(1).is_err());
+    drop(output);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_addition_wraps_before_the_inner_width_product() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(16), false, &memory);
+    output.write_bytes(&[42; 16]).unwrap();
+    for (start, row, offset) in [
+        (i32::MAX, 1, 0), (i32::MIN, i32::MIN, 0), (-1, 1, 0),
+        (1, -1, 0), (i32::MIN, 0, 0), (0, i32::MIN, 0),
+        (1, i32::MAX, 0), (i32::MAX, 0, -16), (0, i32::MAX, -16),
+        (i32::MIN, -1, -16), (-1, 2, 16),
+    ] {
+        let slice = output.source_reader().unwrap().unwrap().slice(start, -1);
+        let pointer = slice.get_pointer(row);
+        let view = slice.get_bytes(row).unwrap();
+        assert_eq!(pointer.offset(), offset);
+        assert_eq!(pointer.length(), 16);
+        assert_eq!(view.offset(), offset);
+        assert_eq!(view.len(), 16);
+        match offset {
+            0 => {
+                assert_eq!(pointer.demand_native().unwrap(), &[42; 16]);
+                assert_eq!(view.demand_native().unwrap(), &[42; 16]);
+            }
+            16 => {
+                assert_eq!(pointer.demand_native().unwrap(), &[0; 16]);
+                assert_eq!(view.demand_native().unwrap(), &[0; 16]);
+            }
+            -16 => { read_native(pointer.demand_native()); read_native(view.demand_native()); }
+            _ => panic!(),
+        }
+    }
+    drop(output);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_negative_width_fails_before_payload_demand() {
+    let memory = memory();
+    for width in [i32::MIN, -1] {
+        for declaration in [SourceScalarDeclaration::FixedBinary(width), SourceScalarDeclaration::Uuid { inner_width: width }] {
+            let output = writer(declaration, false, &memory);
+            let blocker = block(&memory, 0);
+            for (start, row) in [(0, 0), (i32::MAX, 1), (i32::MIN, -1), (-1, 0)] {
+                let slice = output.source_reader().unwrap().unwrap().slice(start, i32::MIN);
+                let pointer = slice.get_pointer(row);
+                assert_eq!(pointer.length(), i64::from(width));
+                read_reference(slice.get_bytes(row), SourceScalarReadFailure::NegativeViewLength(i64::from(width)));
+                read_native(pointer.demand_native());
+                assert_eq!(memory.used_bytes(), memory.limit_bytes());
+            }
+            assert_eq!(output.value_count(), 0);
+            drop(blocker);
+        }
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_zero_width_demand_accepts_empty_backing_at_every_signed_index() {
+    let memory = memory();
+    for declaration in [SourceScalarDeclaration::FixedBinary(0), SourceScalarDeclaration::Uuid { inner_width: 0 }] {
+        let output = writer(declaration, false, &memory);
+        let blocker = block(&memory, 0);
+        for start in [i32::MIN, -1, 0, 1, i32::MAX] {
+            for length in [i32::MIN, -1, 0, 1, i32::MAX] {
+                let slice = output.source_reader().unwrap().unwrap().slice(start, length);
+                assert_eq!(slice.value_count(), length);
+                for row in [i32::MIN, -1, 0, 1, i32::MAX] {
+                    let pointer = slice.get_pointer(row);
+                    let view = slice.get_bytes(row).unwrap();
+                    assert_eq!(pointer.offset(), 0);
+                    assert_eq!(pointer.length(), 0);
+                    assert_eq!(pointer.demand_native().unwrap(), &[]);
+                    assert_eq!(view.offset(), 0);
+                    assert!(view.is_empty());
+                    assert_eq!(view.demand_native().unwrap(), &[]);
+                }
+            }
+        }
+        assert_eq!(memory.used_bytes(), memory.limit_bytes());
+        drop(blocker);
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_uses_actual_binary_and_uuid_inner_widths() {
+    let memory = memory();
+    for width in [1, 8, 16, 24, i32::MAX] {
+        for declaration in [SourceScalarDeclaration::FixedBinary(width), SourceScalarDeclaration::Uuid { inner_width: width }] {
+            let mut output = writer(declaration, false, &memory);
+            output.write_bytes(&[63; 24]).unwrap();
+            let captured = output.finish().unwrap();
+            let before = prefix(&captured);
+            let slice = SourceScalarReader::new(&captured).unwrap().unwrap().slice(-1, 0);
+            let pointer = slice.get_pointer(1);
+            let view = slice.get_bytes(1).unwrap();
+            assert_eq!(pointer.offset(), 0);
+            assert_eq!(pointer.length(), i64::from(width));
+            assert_eq!(view.offset(), 0);
+            assert_eq!(view.len(), width as usize);
+            if width == i32::MAX {
+                read_native(pointer.demand_native());
+                read_native(view.demand_native());
+            } else {
+                assert_eq!(pointer.demand_native().unwrap(), &[63; 24][..width as usize]);
+                assert_eq!(view.demand_native().unwrap(), &[63; 24][..width as usize]);
+            }
+            if matches!(declaration, SourceScalarDeclaration::Uuid { .. }) {
+                assert_eq!(captured.descriptor().scalar_field().unwrap().data_type(), &DataType::FixedSizeBinary(16));
+            }
+            assert_eq!(prefix(&captured), before);
+        }
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_time_bytes_remain_unsupported_before_span_admission() {
+    let memory = memory();
+    for unit in [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+        for declaration in [SourceScalarDeclaration::Time32(unit), SourceScalarDeclaration::Time64(unit)] {
+            let mut output = writer(declaration, false, &memory);
+            let expected: &[u8] = match declaration {
+                SourceScalarDeclaration::Time32(_) => { output.write_int(42).unwrap(); &[42, 0, 0, 0] }
+                SourceScalarDeclaration::Time64(_) => { output.write_long(42).unwrap(); &[42, 0, 0, 0, 0, 0, 0, 0] }
+                _ => panic!(),
+            };
+            let blocker = block(&memory, 0);
+            let slice = output.source_reader().unwrap().unwrap().slice(-1, -1);
+            assert_eq!(slice.get_pointer(1).demand_native().unwrap(), expected);
+            assert_eq!(slice.get_pointer(1).length(), expected.len() as i64);
+            read_native(slice.get_pointer(0).demand_native());
+            for row in [i32::MIN, -1, 0, 1, i32::MAX] {
+                read_reference(slice.get_bytes(row), SourceScalarReadFailure::Unsupported { declaration, method: "getBytes" });
+            }
+            assert_eq!(output.value_count(), 1);
+            assert_eq!(memory.used_bytes(), memory.limit_bytes());
+            drop(blocker);
+        }
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_read_failures_preserve_ready_writer_prefix_and_gate() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(1), true, &memory);
+    output.write_bytes(&[42]).unwrap();
+    let slice = output.source_reader().unwrap().unwrap().slice(128, i32::MIN);
+    let view = slice.get_bytes(0).unwrap();
+    assert_eq!(view.offset(), 128);
+    read_native(view.demand_native());
+    read_native(slice.get_pointer(i32::MIN).demand_native());
+    assert_eq!(output.value_count(), 1);
+    assert_eq!(slice.get_bytes(-128).unwrap().demand_native().unwrap(), &[42]);
+    output.write_bytes(&[9]).unwrap();
+    let captured = output.finish().unwrap();
+    assert_eq!(captured.value_count(), 2);
+    assert_eq!(data(&captured).append, 2);
+    assert_eq!(&data(&captured).bytes.as_slice()[..2], &[42, 9]);
+    drop(captured);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_and_byte_facts_borrow_the_owner_after_intermediate_values_drop() {
+    let source = memory();
+    let snapshots = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(1), false, &source);
+    output.write_bytes(&[11]).unwrap();
+    output.write_bytes(&[42]).unwrap();
+    let slice = { let reader = output.source_reader().unwrap().unwrap(); reader.slice(1, i32::MIN) };
+    let view = slice.get_bytes(0).unwrap();
+    let pointer = slice.get_pointer(0);
+    drop(slice);
+    let bytes = view.demand_native().unwrap();
+    drop(view);
+    assert_eq!(bytes, &[42]);
+    assert_eq!(pointer.demand_native().unwrap(), &[42]);
+    drop(pointer);
+    let captured = output.finish().unwrap();
+    let snapshot = captured.snapshot_reader(&snapshots).unwrap();
+    drop(captured);
+    let source_charge = source.used_bytes();
+    let snapshot_charge = snapshots.used_bytes();
+    assert!(source_charge > 0);
+    assert!(snapshot_charge > 0);
+    let pointer = {
+        let reader = SourceScalarReader::new(&snapshot).unwrap().unwrap();
+        let slice = reader.slice(1, -1);
+        slice.get_pointer(0)
+    };
+    assert_eq!(pointer.demand_native().unwrap(), &[42]);
+    assert_eq!(source.used_bytes(), source_charge);
+    assert_eq!(snapshots.used_bytes(), snapshot_charge);
+    drop(pointer);
+    drop(snapshot);
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(snapshots.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_forwarding_needs_no_additional_memory_admission() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(1), false, &memory);
+    output.write_bytes(&[42]).unwrap();
+    let blocker = block(&memory, 0);
+    let before_peak = memory.peak_bytes();
+    for (start, row) in [(0, 0), (-1, 1), (1, -1), (i32::MIN, i32::MIN)] {
+        let slice = output.source_reader().unwrap().unwrap().slice(start, i32::MIN);
+        assert_eq!(slice.value_count(), i32::MIN);
+        assert_eq!(slice.get_bytes(row).unwrap().demand_native().unwrap(), &[42]);
+        assert_eq!(slice.get_pointer(row).demand_native().unwrap(), &[42]);
+        assert_eq!(memory.used_bytes(), memory.limit_bytes());
+        assert_eq!(memory.peak_bytes(), before_peak);
+    }
+    drop(output);
+    assert_eq!(memory.used_bytes(), blocker.bytes());
+    drop(blocker);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_reads_aborted_prefix_without_reopening_publication() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(128), true, &memory);
+    output.write_bytes(&[42; 128]).unwrap();
+    let blocker = block(&memory, 0);
+    assert!(matches!(output.write_undefined(), Err(WriteError::Native(_))));
+    let slice = output.source_reader().unwrap().unwrap().slice(-1, i32::MIN);
+    assert_eq!(slice.value_count(), i32::MIN);
+    assert_eq!(slice.get_bytes(1).unwrap().demand_native().unwrap(), &[42; 128]);
+    read_native(slice.get_bytes(2).unwrap().demand_native());
+    read_native(slice.get_pointer(0).demand_native());
+    assert_eq!(output.value_count(), 1);
+    assert!(matches!(output.write_bytes(&[]), Err(WriteError::Native(error)) if error.code == "rtdb/aborted-vector-writer"));
+    assert!(output.finish().is_err());
+    assert_eq!(memory.used_bytes(), blocker.bytes());
+    drop(blocker);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_demands_retained_payload_when_aborted_count_is_zero() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(1), true, &memory);
+    let blocker = block(&memory, 256);
+    assert!(matches!(output.write_bytes(&[42]), Err(WriteError::Native(_))));
+    assert_eq!(output.value_count(), 0);
+    let slice = output.source_reader().unwrap().unwrap().slice(1, 0);
+    assert_eq!(slice.get_pointer(-1).demand_native().unwrap(), &[42]);
+    assert_eq!(slice.get_bytes(-1).unwrap().demand_native().unwrap(), &[42]);
+    assert!(output.reader().get_bytes(0).is_err());
+    assert!(matches!(output.write_bytes(&[9]), Err(WriteError::Native(error)) if error.code == "rtdb/aborted-vector-writer"));
+    assert!(output.finish().is_err());
+    assert_eq!(memory.used_bytes(), blocker.bytes());
+    drop(blocker);
+    assert_eq!(memory.used_bytes(), 0);
+}
