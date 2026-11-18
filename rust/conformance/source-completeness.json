@@ -39,10 +39,12 @@
     },
     "sql_xtql_execution": {
       "status": "pending",
-      "conclusion": "The private direct-control entry returns owned control statements and scalar recognition facts. Reported diagnostics retain their listener reservation. Direct logical queries admit retained named parameter metadata before binding and transfer owned argument values into the native page cursor. Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and additional frontend allocations still require source completion.",
+      "conclusion": "The private direct-control entry returns owned control statements and scalar recognition facts. Reported diagnostics retain their listener reservation. Direct logical queries admit retained named parameter metadata before binding and transfer owned argument values into the native page cursor. Explicit character-length units select code-point or byte length. Standard substring and overlay accept units and use the existing position and length semantics. Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and additional frontend allocations still require source completion.",
       "implementation_paths": [
         "rust/crates/sql/src/lib.rs",
         "rust/crates/sql/src/lexer.rs",
+        "rust/crates/sql/src/expression.rs",
+        "rust/vendor/sqlparser/src/parser/mod.rs",
         "rust/crates/sql/src/parser/prediction/direct_control.rs",
         "rust/crates/xtql/src/lib.rs",
         "rust/crates/plan/src/lib.rs",
@@ -63,7 +65,7 @@
     },
     "compaction_gc_adapters": {
       "status": "pending",
-      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction with Java lookup and regular-file Reader ordering. Native Metadata rack scratch and queue and event lifetimes have admitted owners. Stock Connect attaches a receive account before constructing the native consumer. The scoped Avro String Reader pairs its original trees after all source parses and closes. The Registry Reader drives persistent character symbols during its private UTF16 and UTF32 bean parse, and the UTF8 byte table is implemented. Prior pinned Gradle workers establish the default Jackson 2.21.7 artifact selection. Actual typed HTTP and Avro activation, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
+      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction with Java lookup and regular-file Reader ordering. Native Metadata rack scratch and queue and event lifetimes have admitted owners. Stock Connect attaches a receive account before constructing the native consumer. The scoped Avro String Reader pairs its original trees after all source parses and closes. The Registry Reader drives persistent character symbols during its private UTF16 and UTF32 bean parse, and the UTF8 byte table is implemented. Prior pinned Gradle workers establish the default Jackson 2.21.7 artifact selection. The live Avro schema-ID lookup decodes common UTF8 responses as typed beans after HTTP completion. Other envelopes use generic decoding on the same body. Wider typed HTTP and live Avro parser activation, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
       "implementation_paths": [
         "rust/crates/maintenance/src/driver.rs",
         "rust/crates/maintenance/src/gc.rs",
@@ -73,6 +75,8 @@
         "rust/crates/kafka/src/config/providers/file_text/reader.rs",
         "rust/crates/kafka/src/connect/driver.rs",
         "rust/crates/kafka/src/connect/driver/native_account.rs",
+        "rust/crates/kafka/src/connect/registry.rs",
+        "rust/crates/kafka/src/connect/registry/schema_id.rs",
         "rust/crates/kafka/src/connect/registry/dlq.rs",
         "rust/crates/kafka/src/connect/registry/response/symbols.rs",
         "rust/crates/kafka/src/connect/registry/response/symbols/bytes.rs",
@@ -88,7 +92,7 @@
     },
     "client_operational_surfaces": {
       "status": "pending",
-      "conclusion": "Client, configuration, telemetry, TLS, embedded and package sources are present. Flight SQL charges conversion of Arrow parameter fields before result binding or argument construction. The final public-entry and configuration review is pending.",
+      "conclusion": "Client, configuration, telemetry, TLS, embedded and package sources are present. Flight SQL charges conversion of Arrow parameter fields before result binding or argument construction. Embedded ADBC charges C parameter schema and temporary result parameter types before constructing them. Pgwire Extended Parse admits its located token array before the first scan. The final public-entry and configuration review is pending.",
       "implementation_paths": [
         "rust/crates/node/src/runtime.rs",
         "rust/crates/pgwire/src/lib.rs",
@@ -97,6 +101,7 @@
         "rust/crates/flight-sql/src/execute.rs",
         "rust/crates/flight-sql/src/wire.rs",
         "rust/crates/ffi/src/lib.rs",
+        "rust/crates/ffi/src/statement.rs",
         "rust/crates/auth/src/lib.rs",
         "rust/crates/server/src/main.rs",
         "rust/crates/config/src/main.rs",
@@ -165,7 +170,7 @@
         "rust/crates/replication/src/driver.rs"
       ],
       "evidence": {
-        "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
+        "rust/crates/node/src/session.rs": "880eddb9f616077f5893976fd7ec73f0e0335df161c71db8338f9831043cf2d9",
         "rust/crates/node/src/statement.rs": "4c53eb61b738383dc5a8aab5bd653f916ca2cd15a6bfdf9622c7d8d32f9bda27",
         "rust/crates/tx/src/submission.rs": "5f7ac36df849a45b7b870c7cf42c13162fc6e386f052ed85873681ab0032af54",
         "rust/crates/tx/src/resolver.rs": "28740e3144487471b765632519c4884baf7f7a2153d075751f6acb70c6bc3267",

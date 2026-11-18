@@ -186,6 +186,11 @@ Missing or null partition times in a snapshot token leave the system-time dimens
 An empty token can expose historical versions, and a transaction pinned before ingestion can observe a later applied generation while retaining its null token entry.
 The corresponding isolation question is recorded in `tx.allium`; the broad snapshot-isolation wording is not treated as proof of the pinned edge behavior.
 Independent source review covers the null-basis repair and direct, SQL and public-node regression expectations.
+Embedded ADBC admits nullable C parameter fields and temporary typed result inputs before metadata construction.
+Pgwire Extended Parse separately admits its initial located token array before scanning.
+Marking a transaction failed carries no diagnostic payload, so pgwire borrows the original diagnostic for serialization.
+Character length binds the original unit spelling after its operand and selects code-point or byte length.
+Standard substring and overlay consume their optional unit keywords while keeping the operator positions and lengths.
 Language-catalogue completion, parser/IR allocation and transport peak accounting remain separate implementation work.
 Protocol bytes, schemas, ordering, SQLSTATEs, resource limits and all regression observations remain unexecuted.
 
@@ -1532,8 +1537,12 @@ An explicit opt-in also attaches the account to consumers, whose receive frames 
 Live-topic allocations, other independent clones and admin output need separate admission.
 
 Live Registry HTTP collection borrows bounded windows from the current native response frame and retains the admitted raw body through its final consumer.
-The production route feeds generic JSON after HTTP EOF.
-Typed Registry parsing still requires source read and symbol observations, nullable UTF16 consumers and format-specific lookup timing.
+The Avro writer schema-ID route decodes the complete common UTF8 response through the typed SchemaString projection.
+The typed decoder uses the default Jackson 2.21.7 profile identified from archived pinned Gradle worker classpaths.
+Out-of-profile bodies retain generic JSON decoding on the same response.
+A native allocation refusal from the typed decoder ends the request.
+The demand-driven body reader is available in test builds before live parser adoption.
+Wider typed Registry parsing still requires source read and symbol observations, nullable UTF16 consumers and format-specific lookup timing.
 The admitted Avro datum API retains the validated canonical/native pair through Connect planning, resolution, decoding and migration.
 The Registry Avro entry still uses legacy parsing.
 Canonical graph, default, logical type and exact string integration remain source commitments.

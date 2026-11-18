@@ -30,5 +30,5 @@
     "database_shutdown": "public_server_signal_unstarted_failure_embedded_close_listener_database_term_log_and_retained_io_drains_traced_to_owned_completion; source_review_complete_with_runtime_qualification_pending"
   },
   "phase_2_authorized_by_completeness_gate": false,
-  "last_source_checkpoint_revision": "591c1f42999da1ced4b0d7b87b960511f6f51626"
+  "last_source_checkpoint_revision": "e19560b52559ed3352284ac95aa5b3a5108d49ac"
 }
