@@ -154,7 +154,8 @@ pub(super) enum ContextClass {
     QueryExpr, CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
     QuerySpecification,
     DiscardAll, DiscardPlans, DiscardTemp, DiscardSequences,
-    IntegerLiteral0, FloatLiteral, CommonValueExpr0, LiteralExpr, NumericFactorExpr, NumericTermExpr,
+    IntegerLiteral0, FloatLiteral, BooleanLiteral, NullLiteral, CharacterStringLiteral, SqlStandardString, CEscapesString,
+    CommonValueExpr0, LiteralExpr, NumericFactorExpr, NumericTermExpr,
 }
 impl ContextClass {
     fn rule(self) -> u16 {
@@ -163,7 +164,8 @@ impl ContextClass {
             Self::QuerySpecification => 126,
             Self::DiscardAll | Self::DiscardPlans | Self::DiscardTemp | Self::DiscardSequences => 3,
             Self::DateType | Self::ArrayType => 26,
-            Self::IntegerLiteral0 | Self::FloatLiteral => 14,
+            Self::IntegerLiteral0 | Self::FloatLiteral | Self::BooleanLiteral | Self::NullLiteral | Self::CharacterStringLiteral => 14,
+            Self::SqlStandardString | Self::CEscapesString => 16,
             Self::CommonValueExpr0 => 33,
             Self::LiteralExpr | Self::NumericFactorExpr | Self::NumericTermExpr => 34,
             Self::RegularIdentifier | Self::DelimitedIdentifier => 22,

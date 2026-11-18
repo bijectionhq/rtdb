@@ -842,9 +842,9 @@ The Bail mismatch uses the existing same-cause cancellation.
 The LL inline path checks deletion before insertion and anchors a mismatch to the selected context.
 The current statement switches select eligible set tokens before entering those bodies.
 
-== Generated numeric expression root
+== Generated scalar expression root
 
-The private numeric action enters generated `expr(0)` using the source `parseExpr` root and the same SLL Bail and LL Default wrapper.
+The private scalar expression action enters generated `expr(0)` using the source `parseExpr` root and the same SLL Bail and LL Default wrapper.
 Its root completes through the source precedence loop and finishes with `LT(-1)`.
 A semicolon may remain current after the completed expression.
 The expression root preserves the recognizer state set by its last generated action and leaves the EOF match flag clear.
@@ -875,8 +875,24 @@ If literal entry fails after making its primary context current, the common-valu
 If integer entry fails after becoming current, the literal's already-entered finally exits the integer.
 The common-value finally then unrolls the remaining literal through its saved expression parent.
 The guard binds that residue to the failed integer entry and its original call.
+A denied characterString entry at 693 follows the same lexical finally order, with a CharacterStringLiteral residue bound to its failed rule 16 child.
 A denial of outer attachment leaves the recursive precedence popped and saved caller restored.
-Both failure paths keep the original admission error category and execute the entered ancestor finally.
+These failure paths keep the admission error category and execute the entered ancestor finally.
+
+== Fixed-token literal alternatives
+
+Decision 55 selects the labelled BooleanLiteral and NullLiteral contexts before the set match at 707 or the NULL atom at 708.
+The Boolean set contains FALSE, OFF, ON and TRUE.
+UNKNOWN belongs to the separate Boolean predicate grammar.
+
+The CharacterStringLiteral alternative invokes the ordinary characterString rule at 693.
+That child synchronizes at 723 and switches on its own current token.
+The standard and C-escaped branches install distinct primary labels and match their atoms at 716 and 717.
+The dollar token reaches the private scope boundary through the same live switch.
+The entered generic string context survives that boundary without a dollar label or terminal.
+
+Standard quote transformations and C escape interpretation belong to the separate string visitor.
+The raw tokens preserve doubled apostrophes, escape spelling and source spans through the scalar expression and SELECT trees.
 
 == Generated SELECT statement shell
 
@@ -891,7 +907,7 @@ The selectClause records the SELECT terminal and its optional ALL or DISTINCT se
 The list predicts its optional first sublist separately from the repeated comma and optional subsequent sublist.
 The nullable list entry and backedge use d250 with current states 2322 and 2324.
 The trailing asterisk decision d251 reaches its own comma match before the unadopted asterisk call.
-The adopted sublist alternative invokes derivedColumn and enters the existing numeric `expr(0)` action at call state 2405.
+The adopted sublist alternative invokes derivedColumn and enters the existing scalar `expr(0)` action at call state 2405.
 Explicit AS, an implicit label, and AS DEFAULT follow the generated switch schedule.
 The column label uses the existing identifier family or the source CURRENT_USER atom, preserving primary records and indexed terminals.
 

@@ -11,6 +11,7 @@ mod tests;
 
 const INTEGER_LITERAL: u16 = 13;
 const LITERAL: u16 = 14;
+const CHARACTER_STRING: u16 = 16;
 const EXPR: u16 = 33;
 const COMMON_VALUE: u16 = 34;
 const SIGN_TOKENS: &[i32] = &[24, 27];
@@ -32,6 +33,7 @@ const VALUE_TAIL: PredictionAction = prediction(COMMON_VALUE, 1659, 152, 7, Sync
 const LITERAL_BASE: PredictionAction = prediction(LITERAL, 709, 55, 13, SyncShape::RequiredBlock);
 const FLOAT_SIGN: SyncAction = SyncAction { state: 689, rule: LITERAL, shape: SyncShape::RequiredBlock };
 const INTEGER_SIGN: SyncAction = SyncAction { state: 684, rule: INTEGER_LITERAL, shape: SyncShape::RequiredBlock };
+const CHARACTER_STRING_BASE: SyncAction = SyncAction { state: 723, rule: CHARACTER_STRING, shape: SyncShape::RequiredBlock };
 
 const EXPR_VALUE: CallAction = CallAction {
     state: 1000, rule: EXPR, called: COMMON_VALUE, start: 68, follow: 1002, precedence: 0,
@@ -41,6 +43,9 @@ const VALUE_LITERAL: CallAction = CallAction {
 };
 const LITERAL_INTEGER: CallAction = CallAction {
     state: 692, rule: LITERAL, called: INTEGER_LITERAL, start: 26, follow: 710, precedence: 0,
+};
+const LITERAL_CHARACTER_STRING: CallAction = CallAction {
+    state: 693, rule: LITERAL, called: CHARACTER_STRING, start: 32, follow: 710, precedence: 0,
 };
 const FACTOR_RHS: CallAction = CallAction {
     state: 1641, rule: COMMON_VALUE, called: COMMON_VALUE, start: 68, follow: 1660, precedence: 62,
@@ -53,6 +58,10 @@ const MATCH_FLOAT_SIGN: TerminalAction = TerminalAction { state: 688, rule: LITE
 const MATCH_FLOAT: TerminalAction = TerminalAction { state: 691, rule: LITERAL, target: 710, tokens: TokenAction::Atom(4) };
 const MATCH_INTEGER_SIGN: TerminalAction = TerminalAction { state: 683, rule: INTEGER_LITERAL, target: 685, tokens: TokenAction::Set(SIGN_TOKENS) };
 const MATCH_INTEGER: TerminalAction = TerminalAction { state: 686, rule: INTEGER_LITERAL, target: 687, tokens: TokenAction::Atom(5) };
+const MATCH_BOOLEAN: TerminalAction = TerminalAction { state: 707, rule: LITERAL, target: 710, tokens: TokenAction::Set(&[139, 227, 230, 326]) };
+const MATCH_NULL: TerminalAction = TerminalAction { state: 708, rule: LITERAL, target: 710, tokens: TokenAction::Atom(220) };
+const MATCH_STANDARD_STRING: TerminalAction = TerminalAction { state: 716, rule: CHARACTER_STRING, target: 724, tokens: TokenAction::Atom(6) };
+const MATCH_C_ESCAPE_STRING: TerminalAction = TerminalAction { state: 717, rule: CHARACTER_STRING, target: 724, tokens: TokenAction::Atom(7) };
 const MATCH_FACTOR: TerminalAction = TerminalAction { state: 1640, rule: COMMON_VALUE, target: 1641, tokens: TokenAction::Set(&[28, 29, 30]) };
 const MATCH_TERM: TerminalAction = TerminalAction { state: 1643, rule: COMMON_VALUE, target: 1644, tokens: TokenAction::Set(SIGN_TOKENS) };
 const FACTOR_PREDICATE: PredicateAction = PredicateAction { state: 1639, rule: COMMON_VALUE, target: 1640, minimum: 61 };
@@ -110,7 +119,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             }
             *local = session.label_recursion_base(entry, ContextClass::LiteralExpr)?;
             session.generated_call(VALUE_LITERAL)?;
-            session.numeric_literal(mode)?;
+            session.scalar_literal(mode)?;
             session.stop_numeric_base(*local)?;
             let mut next = VALUE_LOOP;
             while session.predict_numeric(next, mode)?.number() == 1 {
@@ -124,7 +133,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 *local = replacement.key;
                 session.push_recursion_tree(entry, replacement)?;
                 session.generated_predicate(tail.predicate)?;
-                session.match_numeric_terminal(*local, tail.terminal)?;
+                session.match_tree_action(*local, tail.terminal)?;
                 session.call_common_value(tail.rhs, mode)?;
                 next = VALUE_BACKEDGE;
             }
@@ -132,23 +141,48 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         })
     }
 
-    fn numeric_literal(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+    fn scalar_literal(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         self.generated_ordinary(LITERAL, |session, local| {
             let class = match session.predict_numeric(LITERAL_BASE, mode)?.number() {
                 1 => ContextClass::FloatLiteral,
                 2 => ContextClass::IntegerLiteral0,
+                3 => ContextClass::CharacterStringLiteral,
+                12 => ContextClass::BooleanLiteral,
+                13 => ContextClass::NullLiteral,
                 _ => return session.decline_numeric_site(),
             };
             *local = session.labelled_context(*local, class)?;
             session.enter_outer_alt(*local)?;
-            if class == ContextClass::FloatLiteral {
-                session.signed_numeric_terminal(*local, FLOAT_SIGN, MATCH_FLOAT_SIGN, MATCH_FLOAT)
-            } else {
-                session.generated_call(LITERAL_INTEGER)?;
-                session.generated_ordinary(INTEGER_LITERAL, |session, integer| {
-                    session.signed_numeric_terminal(*integer, INTEGER_SIGN, MATCH_INTEGER_SIGN, MATCH_INTEGER)
-                }).map(|_| ())
+            match class {
+                ContextClass::FloatLiteral => session.signed_numeric_terminal(*local, FLOAT_SIGN, MATCH_FLOAT_SIGN, MATCH_FLOAT),
+                ContextClass::IntegerLiteral0 => {
+                    session.generated_call(LITERAL_INTEGER)?;
+                    session.generated_ordinary(INTEGER_LITERAL, |session, integer| {
+                        session.signed_numeric_terminal(*integer, INTEGER_SIGN, MATCH_INTEGER_SIGN, MATCH_INTEGER)
+                    }).map(|_| ())
+                }
+                ContextClass::CharacterStringLiteral => {
+                    session.generated_call(LITERAL_CHARACTER_STRING)?;
+                    session.character_string().map(|_| ())
+                }
+                ContextClass::BooleanLiteral => session.match_tree_action(*local, MATCH_BOOLEAN),
+                ContextClass::NullLiteral => session.match_tree_action(*local, MATCH_NULL),
+                _ => unreachable!("selected literal class"),
             }
+        })
+    }
+
+    fn character_string(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(CHARACTER_STRING, |session, local| {
+            let (class, terminal) = match session.lookahead_action(CHARACTER_STRING_BASE)?.number() {
+                6 => (ContextClass::SqlStandardString, MATCH_STANDARD_STRING),
+                7 => (ContextClass::CEscapesString, MATCH_C_ESCAPE_STRING),
+                364 => return session.decline_numeric_site(),
+                _ => return session.generated_no_viable().map_err(PassError::from),
+            };
+            *local = session.labelled_context(*local, class)?;
+            session.enter_outer_alt(*local)?;
+            session.match_tree_action(*local, terminal)
         })
     }
 
@@ -158,9 +192,9 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         self.sync_action(sync)?;
         let (_, next) = self.lookahead_token(1)?;
         if SIGN_TOKENS.contains(&next.number()) {
-            self.match_numeric_terminal(local, sign)?;
+            self.match_tree_action(local, sign)?;
         }
-        self.match_numeric_terminal(local, number)
+        self.match_tree_action(local, number)
     }
 
     fn predict_numeric(&mut self, action: PredictionAction, mode: PredictionMode) -> RuntimeResult<'sql, Alternative> {
@@ -170,12 +204,6 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             return self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite)));
         }
         self.adaptive_predict(action.decision, mode)
-    }
-
-    fn match_numeric_terminal(&mut self, local: InvocationKey<'parse>, action: TerminalAction) -> PassResult<'parse, 'sql, ()> {
-        let matched = self.match_terminal_action(action)?;
-        self.append_child(local, ContextChild::Terminal(matched))?;
-        Ok(())
     }
 
     fn stop_numeric_base(&mut self, local: InvocationKey<'parse>) -> RuntimeResult<'sql, ()> {
@@ -254,17 +282,17 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         {
             return Ok(false);
         }
-        match (literal.class, literal.role, self.state) {
-            (None, InvocationRole::OrdinaryTreeAttachmentFailed, ParserState::State(28)) => Ok(true),
-            (Some(ContextClass::IntegerLiteral0), InvocationRole::Ordinary, ParserState::State(692)) => Ok(
-                self.records.last().is_some_and(|integer| {
-                    integer.rule == INTEGER_LITERAL && integer.parent == Some(current)
-                        && integer.invoking == ParserState::State(LITERAL_INTEGER.state)
-                        && integer.start.is_some()
-                        && matches!(integer.role, InvocationRole::OrdinaryTreeAttachmentFailed)
-                })
-            ),
-            _ => Ok(false),
-        }
+        let call = match (literal.class, literal.role, self.state) {
+            (None, InvocationRole::OrdinaryTreeAttachmentFailed, ParserState::State(28)) => return Ok(true),
+            (Some(ContextClass::IntegerLiteral0), InvocationRole::Ordinary, ParserState::State(692)) => LITERAL_INTEGER,
+            (Some(ContextClass::CharacterStringLiteral), InvocationRole::Ordinary, ParserState::State(693)) => LITERAL_CHARACTER_STRING,
+            _ => return Ok(false),
+        };
+        Ok(self.records.last().is_some_and(|child| {
+            child.rule == call.called && child.parent == Some(current)
+                && child.invoking == ParserState::State(call.state)
+                && child.start.is_some()
+                && matches!(child.role, InvocationRole::OrdinaryTreeAttachmentFailed)
+        }))
     }
 }

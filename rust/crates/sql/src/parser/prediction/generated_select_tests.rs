@@ -482,3 +482,84 @@ fn ll_list_capture_keeps_the_live_entry_or_backedge_context_through_outer_report
         assert_eq!(memory.used_bytes(), 0);
     }
 }
+
+#[test]
+fn fixed_scalar_projections_share_the_generated_direct_and_multiple_statement_roots() {
+    let ((), memory) = environment(|environment, work, _| {
+        both_profiles(environment, "SELECT NULL AS x;", work, false, |session, root| {
+            let (_, _, list) = projection(session, root, 0, 352, 0, false);
+            let column = derived(session, list.key(), 0, true);
+            let expr = child(session, column.key(), 0, 33, 2405);
+            let value = child(session, expr.key(), 0, 34, 1000);
+            let literal = child(session, value.key(), 0, 14, 1140);
+            assert_eq!(literal.class(), Some(ContextClass::NullLiteral));
+            terminal(literal.children()[0], 1, "NULL");
+            let alias = child(session, column.key(), 1, AS_CLAUSE, 2406);
+            terminal(alias.children()[0], 2, "AS");
+            let root_view = session.invocation_view().context(root).unwrap();
+            terminal(root_view.children()[1], 4, ";");
+            complete_root(session, root, 0, 5);
+        });
+        let source = r"SELECT NuLl AS absent_value, TrUe, fAlSe, oN, oFf, 'a''b' plain_value, E'\uD800' AS escaped_value; SELECT FALSE;";
+        both_profiles(environment, source, work, true, |session, root| {
+            let (statement, _, list) = projection(session, root, 0, 358, 0, false);
+            bounds(statement, 0, 18);
+            assert_eq!(list.children().len(), 13);
+            for (column_index, (token, raw, literal_class, string_class)) in [
+                (1, "NuLl", ContextClass::NullLiteral, None),
+                (5, "TrUe", ContextClass::BooleanLiteral, None),
+                (7, "fAlSe", ContextClass::BooleanLiteral, None),
+                (9, "oN", ContextClass::BooleanLiteral, None),
+                (11, "oFf", ContextClass::BooleanLiteral, None),
+                (13, "'a''b'", ContextClass::CharacterStringLiteral, Some(ContextClass::SqlStandardString)),
+                (16, r"E'\uD800'", ContextClass::CharacterStringLiteral, Some(ContextClass::CEscapesString)),
+            ].into_iter().enumerate() {
+                let column = derived(session, list.key(), column_index * 2, column_index == 0);
+                let expr = child(session, column.key(), 0, 33, 2405);
+                bounds(expr, token, token);
+                let value = child(session, expr.key(), 0, 34, 1000);
+                let literal = child(session, value.key(), 0, 14, 1140);
+                assert_eq!(literal.class(), Some(literal_class));
+                let leaf = if let Some(string_class) = string_class {
+                    let string = child(session, literal.key(), 0, 16, 693);
+                    assert_eq!(string.class(), Some(string_class));
+                    string
+                } else {
+                    literal
+                };
+                assert_eq!(leaf.children().len(), 1);
+                terminal(leaf.children()[0], token, raw);
+                let (name, name_index, as_index) = match column_index {
+                    0 => ("absent_value", 3, Some(2)),
+                    5 => ("plain_value", 14, None),
+                    6 => ("escaped_value", 18, Some(17)),
+                    _ => {
+                        assert_eq!(column.children().len(), 1);
+                        continue;
+                    }
+                };
+                let alias = child(session, column.key(), 1, AS_CLAUSE, 2406);
+                let label = if let Some(as_index) = as_index {
+                    terminal(alias.children()[0], as_index, "AS");
+                    child(session, alias.key(), 1, COLUMN_LABEL, 2410)
+                } else {
+                    child(session, alias.key(), 0, COLUMN_LABEL, 2414)
+                };
+                let identifier = child(session, label.key(), 0, 22, 852);
+                terminal(identifier.children()[0], name_index, name);
+            }
+            let (_, _, second_list) = projection(session, root, 2, 360, 0, false);
+            let second = derived(session, second_list.key(), 0, true);
+            let expr = child(session, second.key(), 0, 33, 2405);
+            let value = child(session, expr.key(), 0, 34, 1000);
+            let literal = child(session, value.key(), 0, 14, 1140);
+            assert_eq!(literal.class(), Some(ContextClass::BooleanLiteral));
+            terminal(literal.children()[0], 21, "FALSE");
+            let root_view = session.invocation_view().context(root).unwrap();
+            terminal(root_view.children()[1], 19, ";");
+            terminal(root_view.children()[3], 22, ";");
+            complete_root(session, root, 1, 23);
+        });
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}
