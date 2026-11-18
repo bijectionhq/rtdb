@@ -618,6 +618,12 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Supports parametric functions with separate parameter and argument lists.
+    fn supports_parametric_functions(&self) -> bool {
+        let dialect = self.dialect();
+        dialect == TypeId::of::<ClickHouseDialect>() || dialect == TypeId::of::<GenericDialect>()
+    }
+
     /// Supports omitting `FROM` before the start operand in the non-comma `SUBSTRING` form.
     /// See [`Parser::parse_substring`] for the allowed operand starters.
     fn supports_bare_substring_start(&self) -> bool {

@@ -188,6 +188,9 @@ fn substring_bare_length_requires_a_separate_operand_after_explicit_from() {
     }
     let generic = sqlparser::dialect::GenericDialect {};
     assert!(sqlparser::parser::Parser::parse_sql(&generic, "SELECT SUBSTRING('abc' FROM 2 1)").is_err());
+    let parametric = "SELECT HISTOGRAM(0.5, 0.6)(x, y)";
+    assert!(sqlparser::parser::Parser::parse_sql(&generic, parametric).is_ok());
+    assert_eq!(rtdb_sql::parse(parametric).unwrap_err().code, "xtdb/sql-error");
     for sql in [
         "SELECT SUBSTRING('abc' FROM 2 FOR 1)",
         "SELECT SUBSTRING('abc' FROM 2)",
