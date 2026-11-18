@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+  "source": "pre-existing Gradle worker JVM argument files with Kafka output paths in the pinned reference checkout",
+  "observed_worker_classpaths": 35,
+  "observed_worker_classpaths_with_kafka_test_output": 6,
+  "representative_worker_argfile_sha256": "f43082a97a5ef6eacdf136524789fc2b775e0b129fdb997bdc05e629d61c83c6",
+  "representative_worker_jar_paths": 313,
+  "unique_class_owners": {
+    "jackson-core-2.21.7.jar": {
+      "sha256": "8c5623b98f32d5f7e1287ff61ed50e08ab7b11381e991fff89327faabba42261",
+      "class": "com/fasterxml/jackson/core/JsonFactory.class",
+      "class_sha256": "6abc12ba4f29fcd4eb1371b7c894c676d22f63fa005e3554bc59cdd7f0f63336"
+    },
+    "jackson-databind-2.21.7.jar": {
+      "sha256": "1290c2795e93e8a6861a6c4d9ff0d844d32f5ea178362cb2721edf5561e828b1",
+      "class": "com/fasterxml/jackson/databind/ObjectMapper.class",
+      "class_sha256": "3db70cc7d6163bde945c4dbc52a719ffa4410310cbe407b89f08a1727bf8f8e6"
+    },
+    "kafka-schema-registry-client-7.8.0.jar": {
+      "sha256": "ac1fd695cf59de0cfffe138fef3c965fa58dd403af6aa977f1d7685dc1b6b91c",
+      "class": "io/confluent/kafka/schemaregistry/utils/JacksonMapper.class",
+      "class_sha256": "872af7e565d51e0b66d880ef75ba6b57304cf34b0e8f548e7a89db8f88b01e62"
+    },
+    "avro-1.11.4.jar": {
+      "sha256": "eeba11b77070b9aa6337d886fdf778f6695f6c4c3dcfd2a02389925c885079fa",
+      "class": "org/apache/avro/Schema.class",
+      "class_sha256": "124b754351d4c1d5c8b6eab695106809da62d00077df3c716595555d9deb7cf5"
+    }
+  },
+  "jackson_core_and_databind_default_profile": "2.21.7",
+  "qualification": {
+    "packaged_distribution": "pending",
+    "factory_seed": "pending",
+    "global_interner": "pending",
+    "buffer_recycler": "pending",
+    "phase_two_execution": "pending"
+  }
+}

@@ -1,0 +1,16 @@
+= Pinned JVM Registry and Avro classpath
+
+The pinned XTDB reference declares Kafka Connect JSON 4.4.0 and Confluent's Avro converter 7.8.0 on its Kafka runtime classpath.
+Confluent's dependency declarations and the Connect JSON dependency declarations request different Jackson 2 releases.
+Gradle resolves both dependencies in the selected runtime graph.
+
+Thirty-five retained Gradle worker JVM argument files reference the pinned checkout's Kafka output paths, including six with Kafka test classes.
+Each lists Jackson core and databind 2.21.7, Confluent Registry 7.8.0 and Avro 1.11.4.
+Entries for version 2.22 in those argument files belong to Jackson annotations.
+Workers that include Jackson 3.2.2 use its `tools.jackson` namespace in addition to Jackson 2.
+
+The representative Kafka test worker lists 313 jar paths.
+Archive entry inspection found one owner each for the Jackson 2 JsonFactory, ObjectMapper, the Registry JacksonMapper and Avro Schema.
+link:default-profile.json[The record] retains the argument file digest, archive digests and class-byte digests.
+The worker evidence supplies the default parser version for the pinned reference profile.
+Packaged JVM classloader selection, effective recycler and intern ownership, and factory seed observations remain qualification items.

@@ -63,17 +63,22 @@
     },
     "compaction_gc_adapters": {
       "status": "pending",
-      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction with Java lookup ordering. Native Metadata rack scratch and queue and event lifetimes have admitted owners. The SDK exposes consumer account attachment. Paired Avro constructs built-in logical types and accepts scalar-representable JavaText. The Registry Reader drives persistent symbol tables during its private UTF16 and UTF32 bean parse. Actual typed HTTP and Avro activation, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
+      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction with Java lookup and regular-file Reader ordering. Native Metadata rack scratch and queue and event lifetimes have admitted owners. Stock Connect attaches a receive account before constructing the native consumer. The scoped Avro String Reader pairs its original trees after all source parses and closes. The Registry Reader drives persistent character symbols during its private UTF16 and UTF32 bean parse, and the UTF8 byte table is implemented. Prior pinned Gradle workers establish the default Jackson 2.21.7 artifact selection. Actual typed HTTP and Avro activation, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
       "implementation_paths": [
         "rust/crates/maintenance/src/driver.rs",
         "rust/crates/maintenance/src/gc.rs",
         "rust/crates/kafka/src/lib.rs",
         "rust/crates/kafka/src/log_configuration.rs",
         "rust/crates/kafka/src/config/providers.rs",
+        "rust/crates/kafka/src/config/providers/file_text/reader.rs",
         "rust/crates/kafka/src/connect/driver.rs",
+        "rust/crates/kafka/src/connect/driver/native_account.rs",
         "rust/crates/kafka/src/connect/registry/dlq.rs",
         "rust/crates/kafka/src/connect/registry/response/symbols.rs",
+        "rust/crates/kafka/src/connect/registry/response/symbols/bytes.rs",
+        "rust/crates/kafka/src/connect/registry/response/default-profile.json",
         "rust/crates/kafka/src/connect/avro/java_schema/producer/pair.rs",
+        "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader.rs",
         "rust/vendor/rdkafka/src/util.rs",
         "rust/crates/s3/src/lib.rs",
         "rust/crates/azure/src/lib.rs",
@@ -289,7 +294,7 @@
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
         "rust/crates/ffi/src/region.rs": "328562e748473a73e1dfe1ad205d9d45842041b25d40a36b692ba061c6f820b0",
         "rust/crates/ffi/src/handles.rs": "5209dafbfc70ba3a68b6c4da6052b9db5f1ed521a17657fea16a485aa5c1ba01",
-        "rust/crates/ffi/src/statement.rs": "51c6cc270571dd64abc2ae8d844666ac6c28b74b9a8edf4c8ef2b29cdbd427d8",
+        "rust/crates/ffi/src/statement.rs": "6b429d3eca387d844fd3dad13dde2128c487618c7afcaa7a77264f9c9fdc85a7",
         "rust/crates/query/src/cursor.rs": "d6195262d3026ac6dcce88e79f19076b6f56d54717e27a03fa699ef138521ce4"
       }
     }
