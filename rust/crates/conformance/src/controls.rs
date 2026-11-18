@@ -21,6 +21,7 @@ enum Fixture {
     },
     ReplicaTermSequence { envelopes: Vec<Envelope> },
     TableColumnAssertions { cases: Vec<table_column::Input> },
+    AsOfErase(crate::history::as_of_erase::Fixture),
 }
 
 #[derive(Deserialize)]
@@ -79,9 +80,9 @@ fn returned(id: String, typed_value: serde_json::Value) -> ObservationReceipt {
     ObservationReceipt { id, executed: true, outcome: Outcome::Returned { typed_value } }
 }
 
-/// Executes temporal-ceilings, replica-term-sequence and table-column JSON fixtures through production operators and codecs.
-/// Fixture examples are retained in `rust/conformance/fixtures/`; returned observation IDs must be distinct and nonempty.
+/// Executes the control named by the `kind` field of a JSON fixture against production operators, codecs or a local database session.
 /// Expected values and control mutations are ignored.
+/// Returns an error for an invalid fixture, a failed operation or missing, empty or duplicate observation IDs.
 pub async fn observe(bytes: &[u8]) -> Result<Vec<ObservationReceipt>, Error> {
     let fixture: Fixture = serde_json::from_slice(bytes)?;
     let result = match fixture {
@@ -117,6 +118,7 @@ pub async fn observe(bytes: &[u8]) -> Result<Vec<ObservationReceipt>, Error> {
             }).collect::<Result<Vec<_>, Error>>()?
         }
         Fixture::TableColumnAssertions { cases } => table_column::observe(cases).await?,
+        Fixture::AsOfErase(fixture) => crate::history::as_of_erase::observe(&fixture).await?,
     };
     let mut ids = BTreeSet::new();
     if result.is_empty() || result.iter().any(|value| value.id.is_empty() || !ids.insert(&value.id)) {

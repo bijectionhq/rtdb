@@ -86,6 +86,23 @@
           }
         }
       ]
+    },
+    {
+      "identity": {
+        "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+        "source": "src/test/clojure/xtdb/as_of_test.clj",
+        "qualified_name": "xtdb.as-of-test/erased-entity-absent-from-system-time-window-before-erase-6358",
+        "parameter_fixture": "rust/conformance/fixtures/as-of-erase.json",
+        "configuration": "local-log/local-storage/as-of-erase"
+      },
+      "source_assertion_lines": [111, 115],
+      "counterparts": ["rtdb-conformance::history::as_of_erase::historical_window_after_erase"],
+      "observations": [
+        {"id": "as_of_before_erase_with_live_erase", "comparison": "exact", "expected": {"kind": "returned"}},
+        {"id": "system_time_range_before_erase_with_live_erase", "comparison": "exact", "expected": {"kind": "returned"}},
+        {"id": "as_of_before_erase_with_flushed_erase", "comparison": "exact", "expected": {"kind": "returned"}},
+        {"id": "system_time_range_before_erase_with_flushed_erase", "comparison": "exact", "expected": {"kind": "returned"}}
+      ]
     }
   ]
 }

@@ -125,7 +125,8 @@
         observations (case (:kind fixture)
                        "temporal_ceilings" (temporal-observations fixture)
                        "replica_term_sequence" (replica-observations fixture)
-                       "table_column_assertions" (table-column/observe (:cases fixture)))
+                       "table_column_assertions" (table-column/observe (:cases fixture))
+                       "as_of_erase" ((requiring-resolve 'rtdb.conformance.as-of-erase/observe) fixture))
         ids (mapv :id observations)]
     (when (or (empty? ids) (some str/blank? ids) (not= (count ids) (count (distinct ids))))
       (throw (ex-info "Fixture must produce distinct nonempty observations" {})))

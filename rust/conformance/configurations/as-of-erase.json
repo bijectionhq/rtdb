@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "applied_basis": null,
+  "valid_time": "2020-01-03T00:00:00Z",
+  "system_time": null,
+  "clock": "fixture/explicit-transaction-times-fixed-query-time",
+  "timezone": "UTC",
+  "storage_version": 6,
+  "features": ["local-log", "local-storage"]
+}

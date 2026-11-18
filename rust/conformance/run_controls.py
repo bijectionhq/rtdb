@@ -203,7 +203,7 @@ def validate_execution(execution, fixture_digest, mapping):
 
 
 def validate_assertions(execution, fixture):
-    if fixture["kind"] == "temporal_ceilings":
+    if fixture["kind"] in {"temporal_ceilings", "as_of_erase"}:
         expected = fixture["expected_observations"]
     elif fixture["kind"] == "replica_term_sequence":
         expected = {value["name"] + "/decoded": {"term": value["expected_term"],

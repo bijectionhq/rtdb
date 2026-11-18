@@ -250,6 +250,35 @@ os._exit(0)
         with self.assertRaises(ValueError):
             scope_for(mappings).require_agreement(report)
 
+    def test_as_of_erase_is_opt_in_and_requires_four_typed_survivor_sets(self):
+        ledger = (runner.HERE / "assertion-ledger.json").read_bytes()
+        default_selection = (runner.HERE / "configurations/control-selection.json").read_bytes()
+        self.assertEqual(len(runner.ControlSelection(ledger, default_selection).mappings()), 2)
+        selection = (runner.HERE / "configurations/as-of-erase-selection.json").read_bytes()
+        mapping, = runner.ControlSelection(ledger, selection).mappings()
+        self.assertEqual(mapping["source_assertion_lines"], [111, 115])
+        fixture = json.loads((runner.REPOSITORY / mapping["identity"]["parameter_fixture"]).read_bytes())
+        self.assertEqual(fixture["kind"], "as_of_erase")
+        execution = {"observations": [
+            {"id": item["id"], "outcome": {"kind": "returned", "typed_value": [
+                {"kind": "keyword", "namespace": None, "name": "other-doc"}]}}
+            for item in mapping["observations"]]}
+        self.assertEqual(len(execution["observations"]), 4)
+        runner.validate_assertions(execution, fixture)
+        with self.assertRaises(ValueError):
+            runner.validate_assertions({"observations": execution["observations"][:-1]}, fixture)
+        wrong_type = copy.deepcopy(execution)
+        wrong_type["observations"][0]["outcome"]["typed_value"] = ["other-doc"]
+        with self.assertRaises(ValueError):
+            runner.validate_assertions(wrong_type, fixture)
+        control = fixture["negative_control"]
+        changed = copy.deepcopy(execution)
+        target = next(item for item in changed["observations"] if item["id"] == control["observation"])
+        runner.replace_pointer(target["outcome"]["typed_value"], control["path"], control["replacement"])
+        with self.assertRaises(ValueError):
+            runner.validate_assertions(changed, fixture)
+        runner.validate_assertions(execution, fixture)
+
     def test_negative_control_changes_only_the_selected_copy(self):
         source = {"ceilings": [9223372036854775807, 2, 9223372036854775807], "other": [0, 100]}
         mutated = copy.deepcopy(source)

@@ -1,5 +1,6 @@
 mod store;
 mod support;
+pub(crate) mod as_of_erase;
 pub mod recovery;
 
 use rtdb_columnar::read_value;

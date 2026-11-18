@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "kind": "as_of_erase",
+  "timezone": "UTC",
+  "put_system_time": "2020-01-01T00:00:00Z",
+  "put_keyword_ids": ["doc", "other-doc"],
+  "erase_system_time": "2020-01-03T00:00:00Z",
+  "erase_keyword_id": "doc",
+  "query_time": "2020-01-03T00:00:00Z",
+  "queries": [
+    {
+      "sql": "SELECT _id FROM docs FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-01T12:00:00Z'",
+      "live_observation": "as_of_before_erase_with_live_erase",
+      "flushed_observation": "as_of_before_erase_with_flushed_erase"
+    },
+    {
+      "sql": "SELECT _id FROM docs FOR SYSTEM_TIME FROM TIMESTAMP '2020-01-01Z' TO TIMESTAMP '2020-01-01T12:00:00Z'",
+      "live_observation": "system_time_range_before_erase_with_live_erase",
+      "flushed_observation": "system_time_range_before_erase_with_flushed_erase"
+    }
+  ],
+  "expected_observations": {
+    "as_of_before_erase_with_live_erase": [{"kind": "keyword", "namespace": null, "name": "other-doc"}],
+    "system_time_range_before_erase_with_live_erase": [{"kind": "keyword", "namespace": null, "name": "other-doc"}],
+    "as_of_before_erase_with_flushed_erase": [{"kind": "keyword", "namespace": null, "name": "other-doc"}],
+    "system_time_range_before_erase_with_flushed_erase": [{"kind": "keyword", "namespace": null, "name": "other-doc"}]
+  },
+  "negative_control": {
+    "observation": "system_time_range_before_erase_with_flushed_erase",
+    "path": "/0/name",
+    "replacement": "doc"
+  }
+}
