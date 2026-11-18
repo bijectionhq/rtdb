@@ -1311,3 +1311,21 @@ async fn nested_simple_prepare_emits_terminal_planning_warnings_when_the_child_i
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn extended_parse_reports_the_reference_multi_statement_grammar_error() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("broken", "SELEC 7", &[]).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"EZ");
+    let (_, message, detail) = error_fields(&frames[0].1);
+    let expected = initial_statement_mismatch(1, 0);
+    assert_eq!(message, expected);
+    assert_eq!(detail["code"], "xtdb/sql-error");
+    assert_eq!(detail["category"], "incorrect");
+    assert_eq!(detail["data"]["sql"], "SELEC 7");
+    drop(client);
+    running.stop().await;
+}

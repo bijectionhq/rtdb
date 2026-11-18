@@ -199,7 +199,8 @@ impl ProtocolSession {
         } else {
             let context = self.session.prepare_context(&self.token()).await?;
             let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
-            let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)?;
+            let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)
+                .map_err(|error| extended_syntax_error(source, original, error, &context.memory))?;
             sql_shape(PreparedSql::prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?, oids.len())
         };
         self.retain_prepared(source, oids, shape)
@@ -522,6 +523,15 @@ fn sql_shape(prepared: PreparedSql, declared_parameters: usize) -> PreparedShape
         });
         let parameter_count = prepared.parameter_count();
         PreparedShape { kind: PreparedKind::Query(prepared), columns, parameter_count }
+    }
+}
+
+/// Extended Parse reaches the reference's multi-statement grammar, as Simple Query does.
+fn extended_syntax_error(source: &str, original: &str, error: Anomaly, memory: &Arc<MemoryBudget>) -> Anomaly {
+    match rtdb_sql::batch_syntax_diagnostic(source, &error, memory).and_then(|report| report.map(|report| report.with_sql_context(original)).transpose()) {
+        Ok(Some(report)) => report.anomaly().clone(),
+        Ok(None) => error,
+        Err(admission) => admission,
     }
 }
 
