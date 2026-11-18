@@ -1313,10 +1313,10 @@ fn signed_slice_zero_width_demand_accepts_empty_backing_at_every_signed_index() 
                     let view = slice.get_bytes(row).unwrap();
                     assert_eq!(pointer.offset(), 0);
                     assert_eq!(pointer.length(), 0);
-                    assert_eq!(pointer.demand_native().unwrap(), &[]);
+                    assert!(pointer.demand_native().unwrap().is_empty());
                     assert_eq!(view.offset(), 0);
                     assert!(view.is_empty());
-                    assert_eq!(view.demand_native().unwrap(), &[]);
+                    assert!(view.demand_native().unwrap().is_empty());
                 }
             }
         }
