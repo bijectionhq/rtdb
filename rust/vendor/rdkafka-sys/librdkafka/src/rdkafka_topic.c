@@ -273,7 +273,7 @@ rd_kafka_topic_t *rd_kafka_topic_proper(rd_kafka_topic_t *app_rkt) {
 
         /* Create proper topic object */
         return rd_kafka_topic_new0(lrkt->lrkt_rk, lrkt->lrkt_topic, NULL, NULL,
-                                   0);
+                                   RD_DO_LOCK);
 }
 
 
@@ -2158,3 +2158,5 @@ void rd_ut_kafka_topic_set_topic_exists(rd_kafka_topic_t *rkt,
         rd_kafka_wrunlock(rkt->rkt_rk);
         rd_free(partitions);
 }
+
+#include "rdkafka_metadata_cache_topic_borrow_test.h"

@@ -92,5 +92,34 @@
     "rust/vendor/rdkafka-sys/librdkafka/src/rdunittest.c": "3bd8cf58ac97d33515c24ea1e78215cb5b1d70117a721eea70d8a4b954908567",
     "rust/vendor/rdkafka-sys/librdkafka/src/rdunittest.h": "1182511ae370a21442be42d61d6f85cf546d854b32cea6fbdaa2c9f7c8facdc5",
     "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata_account_test.h": "cfd15fd488af830924b62c400e6484e6601d6dec8b20cc0a2864370b9db701b9"
+  },
+  "native_lightweight_topic_lock": {
+    "predecessor": "17d0570846ade082ca4f6c95d62254c911364695",
+    "vendored_upstream": "d5203d7b0c097d912d076681fd9e0922725b7575",
+    "plan_sha256": "48adaed01712cdeb43820b881d6c387a125ad56eb8b3edf480caf4aa9926d22b",
+    "source_inputs": {
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_topic.c": "0ecac7164acaebe7b0c4adab87a549f90f8033dc1ea02fc0f7d3122744c7eff0",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdunittest.c": "ca571451b74cb18ebb4b1044e32843341ac9fe2cb6e9827b9d2e5317e92f9487",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_topic.h": "07eea3f5c116c054adab45bb61ee3fdb9ea125cda972e5e114ada5c08a1d890c",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka.c": "bdf87da6d05e91d61cc4740840589f465f7660e46b4823ccce74a3825b8f5d5b",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka.h": "67ff82a9902d472959510152a77414dd02444b8eed29a098832d465b7b861a2d",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_int.h": "f326dfff1d42eaf43b2257945dd1dd72cbc0949272f76ec9e9ecd9f5402477b6",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_conf.c": "59d9b852e4490e2ce441558eb603a02e085efb6044b8e3d03698c2f7d999e060",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msg.c": "661ee4ddaeb2850ef6f507285310d8efa1b35e65f8d485a63961da93b84f5dc7",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_offset.c": "bb8142a6b268ab4639b18b21484964875169e53f4c0d3b0639a454145e94a2ec",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_partition.c": "40490f79fc1397317ad3cd44547b03e34c3d3e034bb37cca661d13cb2f00ad62",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_op.c": "d8508035803419b0d397f23d328e280df0a6116f1be2921a59c426bdd4ec0a7a",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_broker.c": "6345e03d3ad2a744960c58f2bd9b4dcd36d86b9f72bcfc8eaca0d3351a310982",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata.c": "21519ffe6df4ff0a0fde566f2a10b83aaf581a6c2d4d82b9c8574efc3793f7e8",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata.h": "d5ec14f3d9de9e99e4f3609a51bd34fa7542b6a95d52c1726316f3a682dbcbab",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata_cache.c": "177ed764828ad519231f99b8a6f73f0e13b28e159354dbebd50efb2eb27f1fd8",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata_cache_ownership_test.h": "5e5c657d975f34be0337fa042dc45219d7d4ca6fa0ad4379e56bd57f5c74527f",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata_cache_parser_test.h": "f5763ecf880e2ceb7d4cc98744a208cbfbf478cc4a7023584a1fc7e907e572c1",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata_account_test.h": "cfd15fd488af830924b62c400e6484e6601d6dec8b20cc0a2864370b9db701b9",
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdtypes.h": "cefe170aefa5abd958229c5508f60faeba34a1078480121ea059648e89f765f7",
+      "rust/vendor/rdkafka-sys/librdkafka/src/tinycthread_extra.h": "a11b19dc315ef3dce687d8eeba52b06182768fd91301404edcf9b2973bdf6e7a",
+      "rust/vendor/rdkafka-sys/librdkafka/src/tinycthread_extra.c": "27bc4f2cfeb7407d709dd0d1f23d67d8cd90567f0e10f9b383c4ea1380856db4"
+    },
+    "qualification": "Source-only caller audit and native actor fixture. Execution remains pending."
   }
 }

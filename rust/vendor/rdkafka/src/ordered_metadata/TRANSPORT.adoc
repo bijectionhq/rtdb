@@ -191,6 +191,9 @@ The source fixtures have not been compiled or executed.
 
 Cache entry arenas still have no automatic byte admission.
 Retained payloads and source padding/slack must be admitted together, including old/new replacement overlap, in a later source slice.
-The tag-update/cgrp hint borrowing repairs remain a separate proposed lock change, including the lightweight-topic constructor caller audit.
-The adjacent topic-info clone's NULL-rack count initialization also requires a separate source correction.
+The tag-update and consumer-group hint borrowing repairs remain separate lock changes.
+
+The lightweight topic conversion acquires the client write lock before looking up or creating a proper topic.
+The constructor holds it through local topic publication, cache lookup and copying the cached metadata into the local topic.
+A source fixture observes that lock through the immediate constructor diagnostic on the native main actor and checks that the new topic inherits cached metadata after the parsed response has been freed.
 Native request/cache scratch, topic-info/assignor/admin clones, allocator overhead and all runtime/Phase2 qualification remain separate obligations.
