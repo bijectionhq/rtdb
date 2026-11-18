@@ -135,6 +135,15 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
                 "time/zoned-date-time" => zoned_timestamp(string()?)?, "time/offset-date-time" => timestamp(string()?)?,
                 "time/date-time" => read_text(1114, string()?)?, "time/date" => read_text(1082, string()?)?, "time/time" => read_text(1083, string()?)?, "time/duration" => read_text(11112, string()?)?,
                 "xtdb/interval" => if crate::interval::matches_interval(string()?) { read_text(1186, string()?)? } else { Value::Null },
+                "xt/oid" | "xt/regclass" | "xt/regproc" => {
+                    let T::Integer(oid) = *representation else { return Err(invalid("PostgreSQL reference requires an integer OID")); };
+                    let oid = i32::try_from(oid).map_err(invalid)?;
+                    match tag.as_str() {
+                        "xt/oid" => Value::Oid(oid),
+                        "xt/regclass" => Value::RegClass(oid),
+                        _ => Value::RegProc(oid),
+                    }
+                }
                 "i8" | "i16" | "i32" | "i64" | "f32" | "f64" => {
                     let value = transit(*representation)?;
                     let scalar = match tag.as_str() { "i8" => rtdb_types::ScalarType::I8, "i16" => rtdb_types::ScalarType::I16, "i32" => rtdb_types::ScalarType::I32, "i64" => rtdb_types::ScalarType::I64, "f32" => rtdb_types::ScalarType::F32, _ => rtdb_types::ScalarType::F64 };

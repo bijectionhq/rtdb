@@ -283,3 +283,13 @@ fn malformed_arrays_and_unbounded_interval_exponents_are_rejected() {
 fn equality_scope() -> rtdb_expr::EvaluationScope {
     rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap()
 }
+
+#[test]
+fn transit_preserves_postgres_reference_types_through_nested_values() {
+    use rtdb_format::transit::{TransitValue as T, decode_json, encode_json};
+    let value = Value::List(vec![Value::Oid(-12), Value::RegClass(123), Value::RegProc(i32::MIN)]);
+    let bytes = encode_json(&rtdb_pg_codec::to_transit(&value).unwrap()).unwrap();
+    assert_eq!(rtdb_pg_codec::from_transit(decode_json(&bytes).unwrap()).unwrap(), value);
+    let data = T::Tagged { tag: "xt/regclass".into(), representation: Box::new(T::Integer(i64::MAX)) };
+    assert!(rtdb_pg_codec::from_transit(data).is_err());
+}

@@ -25,7 +25,7 @@
            (xtdb.arrow VectorType)
            xtdb.TaggedValue
            (xtdb.time Interval)
-           (xtdb.types ClojureForm ZonedDateTimeRange)
+           (xtdb.types ClojureForm Oid RegClass RegProc ZonedDateTimeRange)
            xtdb.util.NormalForm))
 
 (defrecord TxKey [tx-id system-time]
@@ -173,6 +173,9 @@
             "xtdb/interval" (transit/read-handler interval-reader)
             "xtdb/type" (transit/read-handler st/->type)
             "xtdb/tstz-range" (transit/read-handler tstz-range-reader)
+            "xt/oid" (transit/read-handler #(Oid. (int %)))
+            "xt/regclass" (transit/read-handler #(RegClass. (int %)))
+            "xt/regproc" (transit/read-handler #(RegProc. (int %)))
             "f64" (transit/read-handler double)
             "f32" (transit/read-handler float)
             "i64" (transit/read-handler long)
@@ -210,6 +213,9 @@
 
           VectorType (transit/write-handler "xtdb/type" st/render-type)
           ZonedDateTimeRange (transit/write-handler "xtdb/tstz-range" render-tstz-range)
+          Oid (transit/write-handler "xt/oid" #(.-oid ^Oid %))
+          RegClass (transit/write-handler "xt/regclass" #(.-oid ^RegClass %))
+          RegProc (transit/write-handler "xt/regproc" #(.-oid ^RegProc %))
           ByteBuffer (transit/write-handler "xtdb/byte-array" #(str "0x" (Hex/encodeHexString (bb->ba %))))
           Path (transit/write-handler "xtdb/path" #(str %))}))
 

@@ -11,6 +11,7 @@
             [xtdb.sql.temporal-test :as original-temporal]
             [xtdb.sql.identifier-test :as original-identifiers]
             [xtdb.sql.with-test :as original-with]
+            [xtdb.expression.pg-test :as original-pg-expression]
             [xtdb.node-test :as original-node]
             [xtdb.update-test :as original-update]
             [xtdb.sql-test :as original-sql]
@@ -140,6 +141,12 @@
               {:xt/id 2, :committed false}]
              (xt/q node "SELECT _id, committed FROM xt.txs ORDER BY _id")))
       (is (= [{:xt/id 1}] (xt/q node "SELECT * FROM docs"))))))
+
+(deftest-original-api original-pg-expression/test-oid)
+
+(deftest-original-api original-pg-expression/test-regproc)
+
+(deftest-original-api original-pg-expression/test-regclass-search-path-precedence)
 
 (deftest-original-api original-node/test-array-element-reference-is-one-based-336)
 
