@@ -82,7 +82,6 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
         TAILQ_ENTRY(rd_kafka_broker_s) rkb_link;
 
         int32_t rkb_nodeid; /**< Broker Node Id, read only. */
-        uint64_t rkb_owner_serial; /* Immutable after publication. */
 #define RD_KAFKA_NODEID_UA -1
 
         rd_sockaddr_list_t *rkb_rsal;
@@ -269,7 +268,6 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
                                                     *   rkb_nodename_epoch at the
                                                     *   last connection attempt.
                                                     */
-        uint64_t rkb_connection_generation;
 
         /* Logging name is a copy of rkb_name, protected by its own mutex */
         char *rkb_logname;
@@ -615,10 +613,6 @@ void rd_kafka_broker_buf_enq_replyq(rd_kafka_broker_t *rkb,
 rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata(
     rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
     rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque);
-rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata_timeout(
-    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
-    rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque,
-    int timeout_ms);
 void rd_kafka_broker_buf_retry(rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf);
 
 
@@ -725,8 +719,5 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
 
 int unittest_broker(void);
 int unittest_byte_account(void);
-int unittest_ordered_metadata(void);
-void rd_kafka_connection_observation_capture(
-    rd_kafka_broker_t *rkb, rd_kafka_connection_observation_t *result);
 
 #endif /* _RDKAFKA_BROKER_H_ */

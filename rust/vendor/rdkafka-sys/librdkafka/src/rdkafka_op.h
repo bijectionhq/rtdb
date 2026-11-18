@@ -189,7 +189,6 @@ typedef enum {
         RD_KAFKA_OP_ELECTLEADERS,         /**< Admin:
                                            *   ElectLeaders
                                            *   u.admin_request */
-        RD_KAFKA_OP_CONNECTION_OBSERVATION,
         RD_KAFKA_OP__END
 } rd_kafka_op_type_t;
 
@@ -325,10 +324,6 @@ struct rd_kafka_op_s {
         rd_kafka_op_cb_t *rko_op_cb;
 
         union {
-                struct {
-                        rd_kafka_connection_observation_t *result;
-                        rd_kafka_broker_t *broker;
-                } connection_observation;
                 struct {
                         rd_kafka_buf_t *rkbuf;
                         rd_kafka_msg_t rkm;

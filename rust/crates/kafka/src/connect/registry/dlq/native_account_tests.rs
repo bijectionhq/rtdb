@@ -1,9 +1,9 @@
 use super::*;
-use rdkafka::{mocking::MockCluster, ordered_metadata::{MetadataTopic, OrderedMetadataError}};
+use rdkafka::mocking::MockCluster;
 use rtdb_columnar::MemoryBudget;
 
 #[test]
-fn the_actual_dlq_producer_attaches_its_native_account_and_a_response_retains_the_capacity_lease() {
+fn the_actual_dlq_producer_attaches_its_native_account_and_metadata_retains_the_capacity_lease() {
     let cluster = MockCluster::new(1).unwrap();
     cluster.create_topic("accounted-dlq", 1, 1).unwrap();
     let options = BTreeMap::from([
@@ -14,28 +14,13 @@ fn the_actual_dlq_producer_attaches_its_native_account_and_a_response_retains_th
     let memory = MemoryBudget::new(1 << 26);
     let mut context = ConversionContext::new(Arc::clone(&memory));
     let producer = DlqProducer::open(&options, &mut context).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let request = loop {
-        producer.producer.poll(Duration::ZERO);
-        match producer.producer.client().start_ordered_metadata(&[MetadataTopic::new("accounted-dlq")], 65536, Duration::from_secs(5)) {
-            Ok(request) => break request,
-            Err(OrderedMetadataError::BrokerNotReady) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            result => panic!("actual DLQ metadata submission: {result:?}"),
-        }
-    };
-    let view = loop {
-        producer.producer.poll(Duration::ZERO);
-        if let Some(result) = request.poll_raw() { break result.unwrap(); }
-        assert!(Instant::now() < deadline, "actual DLQ metadata did not complete");
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert!(view.summary().brokers > 0);
-    let original = view.raw().to_vec();
+    let metadata = producer.producer.client().fetch_metadata(Some("accounted-dlq"), Duration::from_secs(10)).unwrap();
+    assert!(!metadata.brokers().is_empty());
     drop(context);
     drop(producer);
     assert_eq!(memory.used_bytes(), capacity);
-    assert_eq!(request.poll_raw().unwrap().unwrap().raw(), original);
-    drop(request);
+    assert_eq!(metadata.topics()[0].name(), "accounted-dlq");
+    drop(metadata);
     assert_eq!(memory.used_bytes(), 0);
 }
 

@@ -244,7 +244,6 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
         TAILQ_ENTRY(rd_kafka_buf_s) rkbuf_link;
         rd_kafka_byte_account_t *rkbuf_byte_account;
         size_t rkbuf_byte_charge;
-        uint64_t rkbuf_ordered_connection_generation;
 
         int32_t rkbuf_corrid;
 

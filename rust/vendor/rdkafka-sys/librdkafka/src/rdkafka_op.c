@@ -36,7 +36,6 @@
 #include "rdkafka_proto.h"
 #include "rdkafka_offset.h"
 #include "rdkafka_error.h"
-#include "rdkafka_broker.h"
 
 /* Current number of rd_kafka_op_t */
 rd_atomic32_t rd_kafka_op_cnt;
@@ -124,7 +123,6 @@ const char *rd_kafka_op2str(rd_kafka_op_type_t type) {
             [RD_KAFKA_OP_TERMINATE_TELEMETRY] =
                 "REPLY:RD_KAFKA_OP_TERMINATE_TELEMETRY",
             [RD_KAFKA_OP_ELECTLEADERS] = "REPLY:ELECTLEADERS",
-            [RD_KAFKA_OP_CONNECTION_OBSERVATION] = "REPLY:CONNECTION_OBSERVATION",
         };
 
         if (type & RD_KAFKA_OP_REPLY)
@@ -292,7 +290,6 @@ static rd_kafka_op_t *rd_kafka_op_new_accounted0(const char *source,
                 sizeof(rko->rko_u.telemetry_broker),
             [RD_KAFKA_OP_TERMINATE_TELEMETRY] = _RD_KAFKA_OP_EMPTY,
             [RD_KAFKA_OP_ELECTLEADERS] = sizeof(rko->rko_u.admin_request),
-            [RD_KAFKA_OP_CONNECTION_OBSERVATION] = sizeof(rko->rko_u.connection_observation),
         };
         size_t tsize = op2size[type & ~RD_KAFKA_OP_FLAGMASK];
 
@@ -346,14 +343,6 @@ void rd_kafka_op_destroy(rd_kafka_op_t *rko) {
 
 
         switch (rko->rko_type & ~RD_KAFKA_OP_FLAGMASK) {
-        case RD_KAFKA_OP_CONNECTION_OBSERVATION:
-                if (rko->rko_u.connection_observation.result) {
-                        rd_kafka_connection_observation_cancel(rko->rko_u.connection_observation.result);
-                        rd_kafka_connection_observation_destroy(rko->rko_u.connection_observation.result);
-                }
-                if (rko->rko_u.connection_observation.broker)
-                        rd_kafka_broker_destroy(rko->rko_u.connection_observation.broker);
-                break;
         case RD_KAFKA_OP_FETCH:
                 rd_kafka_msg_destroy(NULL, &rko->rko_u.fetch.rkm);
                 /* Decrease refcount on rkbuf to eventually rd_free shared buf*/
@@ -1032,4 +1021,3 @@ void rd_kafka_fetch_op_app_prepare(rd_kafka_t *rk, rd_kafka_op_t *rko) {
         rd_kafka_update_app_pos(rk, rktp, pos, RD_DO_LOCK);
 }
 
-#include "rdkafka_connection_op_test.h"

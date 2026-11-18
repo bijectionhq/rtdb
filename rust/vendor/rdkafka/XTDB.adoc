@@ -119,8 +119,6 @@ The Rust source fixtures include native regression dispatch and real MockCluster
 
 The account measures the listed native allocation requests.
 The client, account monitor, existing queues, ordinary outbound requests, other protocol decoding, TLS and SASL machinery, allocator overhead and application-side result storage have separate ownership and sizing.
-The additive link:src/ordered_metadata/TRANSPORT.adoc[ordered Metadata transport] retains bounded response storage on that account and exposes a validated borrowed visitor.
-The Connect DLQ metadata snapshot and round-robin partitioner still require their own integration.
 Regression sources live in `../../crates/kafka/tests/native_byte_account.rs` and `../rdkafka-sys/librdkafka/src/rdkafka_byte_account_test.h`.
 
 

@@ -697,10 +697,7 @@ static void rd_kafka_metadata_decommission_unavailable_brokers(
         TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
                 rd_bool_t purge_broker;
 
-                if (rkb->rkb_source == RD_KAFKA_LOGICAL ||
-                    (rkb->rkb_source == RD_KAFKA_CONFIGURED &&
-                     rk->rk_type == RD_KAFKA_PRODUCER &&
-                     rk->rk_conf.ordered_metadata_bootstrap))
+                if (rkb->rkb_source == RD_KAFKA_LOGICAL)
                         continue;
 
                 purge_broker = rd_true;

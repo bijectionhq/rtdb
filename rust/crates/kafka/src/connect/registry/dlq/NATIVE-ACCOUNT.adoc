@@ -8,7 +8,7 @@ Native TLS configuration and captured material retain their existing earlier con
 DlqProducer and Settings remain passive values with their existing stored shape.
 The account retains its existing Monitor Object role, with a re-evaluable drain condition over attached clients and charged native allocations.
 Configuration clones and native clients keep that account alive through their existing ownership rules.
-Completed ordered Metadata requests also retain it, including when they outlive both DlqProducer and its originating context.
+Metadata results also retain it, including when they outlive both DlqProducer and its originating context.
 The final account release drains native owners before releasing its Rust capacity guard.
 
 The selected ceiling covers native receive-frame storage and the implemented accounted request, completion and queue-owner classes.

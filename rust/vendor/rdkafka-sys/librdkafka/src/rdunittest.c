@@ -417,7 +417,6 @@ static int unittest_rdclock(void) {
 
 extern int unittest_string(void);
 extern int unittest_metadata_account(void);
-extern int unittest_connection_observation(void);
 extern int unittest_metadata_cache_ownership(void);
 extern int unittest_metadata_cache_admission(void);
 extern int unittest_topic_info_admission(void);
@@ -465,9 +464,7 @@ int rd_unittest(void) {
                 {"conf", unittest_conf},
                 {"broker", unittest_broker},
                 {"byte_account", unittest_byte_account},
-                {"ordered_metadata", unittest_ordered_metadata},
                 {"metadata_account", unittest_metadata_account},
-                {"connection_observation", unittest_connection_observation},
                 {"metadata_cache_ownership", unittest_metadata_cache_ownership},
                 {"metadata_cache_admission", unittest_metadata_cache_admission},
                 {"topic_info_admission", unittest_topic_info_admission},
