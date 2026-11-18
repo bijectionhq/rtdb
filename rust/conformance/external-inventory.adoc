@@ -23,8 +23,10 @@ SQL-logic evidence includes the existing runner's plan, original record streams,
 `native_build` identifies the retained production-artifact manifest, its exact Cargo command/process/messages and copied executable bytes.
 `native_binary` names that retained executable, and native configuration additionally binds the build configuration, feature selection and actual SQL-logic options.
 The validator reparses retained original source bytes and compares every recorded identity, line, expectation and query-limit counter.
+A query passes when both JVM runs and the native run satisfy the source expectation and produce identical formatted result text.
+The inventory retains each assertion's three observations in full, including any native schema and query basis.
 The binding's configuration is the canonical sorted compact JSON object `{adapter: "sql_logic", selection: ..., options: ...}` using the actual recorded selection/options.
-An expected-error assertion only passes when the original statement required an error and each engine retained an actual exception.
+An expected-error assertion only passes when the original statement required an error and each run retained an actual exception.
 Matching unexpected failures, query mismatches, skips, suppression, parse failures and query limits remain unverified.
 They cannot contribute passing coverage.
 

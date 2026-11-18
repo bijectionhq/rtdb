@@ -176,7 +176,7 @@ def sql_cases(evidence, run, revision, implementation):
                 dispositions = [value.get("disposition") for value in actual]
                 passed = not errors and len(set(dispositions)) == 1 and dispositions[0] in PASSING
                 if raw.get("record", {}) and raw["record"]["type"] == "query":
-                    passed = passed and len({canonical(value.get("result")) for value in actual}) == 1
+                    passed = passed and len({value["result"]["text"] for value in actual}) == 1
                 if raw["assertion_ordinal"] is not None:
                     assertions += 1
                     result.append({"runtime_identity": expected_identity, "source": script["source"], "passed": passed,
