@@ -89,7 +89,7 @@ impl ProtocolSession {
         if let Err(error) = result {
             if error.code == "xtdb.pgwire/connection-error" { return Err(error); }
             if self.extended { self.skip_until_sync = true; }
-            self.session.state_mut().fail_transaction(error.clone());
+            self.session.state_mut().fail_transaction();
             writer.error(&error, self.environment()?.fallback(), false).await?;
         }
         Ok(())
@@ -444,7 +444,7 @@ impl ProtocolSession {
             if self.implicit {
                 self.rollback()?;
             } else {
-                self.session.state_mut().fail_transaction(error.clone());
+                self.session.state_mut().fail_transaction();
             }
             writer.error(&error, self.environment()?.fallback(), false).await?;
         }

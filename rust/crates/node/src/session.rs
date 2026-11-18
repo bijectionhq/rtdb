@@ -318,7 +318,7 @@ impl Session {
         } else { self.timezone = timezone; }
         Ok(())
     }
-    pub fn fail_transaction(&mut self, _: Anomaly) { if let Some(tx) = self.transaction_mut() { tx.failed = true; } }
+    pub fn fail_transaction(&mut self) { if let Some(tx) = self.transaction_mut() { tx.failed = true; } }
     pub fn rollback_tx(&mut self) -> Result<()> { self.ensure_open()?; self.lifecycle = Lifecycle::Open(None); Ok(()) }
     pub fn rollback(&mut self) -> Result<()> {
         if self.auto_commit { return Err(Anomaly::incorrect("xtdb.adbc/rollback-in-autocommit", "Cannot rollback when autoCommit is enabled")); }

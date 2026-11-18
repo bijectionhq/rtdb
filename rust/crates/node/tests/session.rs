@@ -278,7 +278,7 @@ async fn commit_override_selects_submission_or_applied_completion() {
 async fn failed_transaction_rejects_work_until_rollback_and_close_discards_buffer() {
     let service = Service::new(); let mut session = service.session();
     session.begin().unwrap(); session.execute_operation(operation()).await.unwrap();
-    session.fail_transaction(Anomaly::incorrect("test/first", "first"));
+    session.fail_transaction();
     assert_eq!(session.read_basis().await.unwrap_err().code, "xtdb/tx-failed");
     assert_eq!(session.execute_operation(operation()).await.unwrap_err().code, "xtdb/tx-failed");
     session.rollback_tx().unwrap(); session.begin().unwrap(); session.execute_operation(operation()).await.unwrap(); session.close();
@@ -323,12 +323,12 @@ fn retained_parameters_reject_over_budget_updates_atomically() {
 }
 
 #[test]
-fn failed_transaction_does_not_retain_an_unbounded_error_payload() {
+fn marking_a_transaction_failed_preserves_its_memory_charge() {
     let service = Service::with_memory(4096);
     let mut session = service.session();
     session.begin().unwrap();
     let before = service.memory.used_bytes();
-    session.fail_transaction(Anomaly::incorrect("example", "x".repeat(16384)));
+    session.fail_transaction();
     assert_eq!(session.status(), TransactionStatus::Failed);
     assert_eq!(service.memory.used_bytes(), before);
     session.rollback_tx().unwrap();

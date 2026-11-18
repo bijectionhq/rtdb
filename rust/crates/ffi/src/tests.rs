@@ -197,7 +197,7 @@ fn adbc_session_show_survives_failed_transaction_while_queries_and_pgwire_show_r
         let mut connection = session.state.lock();
         connection.state_mut().set_parameter("application_name", Some("inspectable".into())).unwrap();
         connection.state_mut().begin().unwrap();
-        connection.state_mut().fail_transaction(invalid("failed"));
+        connection.state_mut().fail_transaction();
     }
     let show = native.statement("SHOW application_name");
     let show = handles::statement(show).unwrap();
