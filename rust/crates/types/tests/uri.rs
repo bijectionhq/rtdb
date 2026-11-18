@@ -36,6 +36,18 @@ fn registry_authorities_clear_all_server_components() {
 }
 
 #[test]
+fn raw_authority_access_distinguishes_registry_authority_and_empty_user() {
+    let uri = UriParts::parse("file://bad_host/share").unwrap();
+    assert_eq!(uri.raw_authority(), Some("bad_host"));
+    assert_eq!(uri.host(), None);
+    assert_eq!(uri.raw_user_info(), None);
+    let uri = UriParts::parse("file://@box/share").unwrap();
+    assert_eq!(uri.raw_authority(), Some("@box"));
+    assert_eq!(uri.raw_user_info(), Some(""));
+    assert_eq!(UriParts::parse("file:///C:/dir").unwrap().raw_authority(), None);
+}
+
+#[test]
 fn uri_ipv6_validation_retains_brackets_and_java_scope_spelling() {
     for host in ["[::]", "[::1]", "[2001:db8:0:1:2:3:4:5]", "[::ffff:000192.168.1.1]", "[fe80::1%eth0]", "[fe80::1%25eth0]", "[fe80::1%scope_1.2]"] {
         let text = format!("http://{host}:123/");

@@ -512,12 +512,15 @@ Count/fill passes admit unit scratch, retained output and encoded bytes separate
 The compiled engine still requires its preparation scope, and ordinary returned values retain the row-scope contract.
 Raw throwable transport, source metadata normalization timing and serialized text admission remain required boundaries.
 
-Stored Transit Path values retain Unix byte identity separately from runtime-image path identity.
+Stored Transit Path values retain each provider's object identity.
 URI validation precedes path construction; Unix slash normalization preserves dot segments, and the exact `file:///` spelling selects raw escaped octets.
 Other file URI spellings decode text before constructing a path, while `jrt` paths use their registered module prefix and provider constraints.
 Canonical Path writing uses Java UTF-8 replacement for Unix bytes, so distinct objects can write the same text.
-The adapter currently represents the default UTF-8 Unix provider and the standard runtime-image provider; other default-platform encodings and externally installed filesystem providers remain explicit environment gaps.
+Windows builds construct normalized Windows file paths, including drive roots and UNC shares.
+The Windows provider compares and hashes simple uppercase UTF-16 code units and retains the original normalized casing in written text.
+Other default-platform encodings and externally installed filesystem providers require separate environment support.
 `tests/transit_paths.rs` records normalization, nested invalid paths and retained key identity as unexecuted regression source.
+link:src/transit_object/path/WINDOWS.adoc[Windows Path source evidence] records the pinned parser and URI behavior.
 
 Decoded Transit anomalies retain their complete normalized exception data and cause while their writer omits the cause.
 Their object equality compares message, Clojure map equivalence and recursive cause equality; their hash follows the Java message/data/cause hash.

@@ -34,6 +34,7 @@ The input SHA-256 is `ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870
 `LICENSE-UNICODE` retains the Unicode License V3 notice from the https://raw.githubusercontent.com/openjdk/jdk/jdk-25-ga/src/java.base/share/legal/unicode.md[OpenJDK 25 Unicode notice].
 `tools/generate_unicode_case.py` verifies that digest and regenerates the immutable tables from a supplied copy of the data file.
 Java-mode backreferences use table lookups without allocating fold classes.
+`java_uppercase_unit` exposes the same simple uppercase table for consumers that apply Java's char-based `Character.toUpperCase`.
 
 `tests/java_matching.rs` covers capture ordering, lookbehind endpoint checks, lookaround atomicity, independent previous-match positions, resource limits, case modes and missing references.
 Phase 2 must run `cargo test --manifest-path rust/vendor/fancy-regex/Cargo.toml --test java_matching` and repeat that target with `--no-default-features --features std`.

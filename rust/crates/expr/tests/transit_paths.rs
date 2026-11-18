@@ -17,6 +17,7 @@ fn selected(value: T,json: bool) -> Result<T> {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn selected_paths_apply_provider_construction_before_canonical_writing() {
     for json in [false,true] {
         for (input,output) in [("a//b/","a/b"),("file:/a%20b","/a b"),("file:///a%2F","/a/"),("file:///%ed%a0%80","/\u{fffd}"),("jrt:/java.base","/modules/java.base")] {
@@ -28,6 +29,7 @@ fn selected_paths_apply_provider_construction_before_canonical_writing() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn path_keys_keep_raw_byte_and_provider_identity_after_text_becomes_equal() {
     for (left,right) in [("file:///%ff","file:/%ff"),("jrt:/java.base","/modules/java.base")] {
         let value = tag("set",T::Array(vec![path(left),path(right)]));
@@ -37,4 +39,15 @@ fn path_keys_keep_raw_byte_and_provider_identity_after_text_becomes_equal() {
     }
     let value = T::Map(vec![(path("file:/a//b/"),T::Integer(1)),(path("/a/b"),T::Integer(2))]);
     assert_eq!(selected(value,false).unwrap(),T::Map(vec![(path("/a/b"),T::Integer(2))]));
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_transit_paths_select_native_text_and_replace_case_equivalent_keys() {
+    for json in [false, true] {
+        assert_eq!(selected(path("file:///C:/Dir/File"), json).unwrap(), path(r"C:\Dir\File"));
+        assert_eq!(selected(path("file://box/share/a/"), json).unwrap(), path(r"\\box\share\a"));
+        let value = T::Map(vec![(path("file:/C:/a"), T::Integer(1)), (path("file:/c:/A"), T::Integer(2))]);
+        assert_eq!(selected(value, json).unwrap(), T::Map(vec![(path(r"C:\a"), T::Integer(2))]));
+    }
 }

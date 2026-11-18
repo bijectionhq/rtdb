@@ -94,6 +94,12 @@ impl<'a> UriParts<'a> {
     }
 
     pub fn scheme(&self) -> Option<&'a str> { self.scheme }
+    /// Borrows the original authority, including a registry authority without a parsed host.
+    pub fn raw_authority(&self) -> Option<&'a str> {
+        match self.body { UriBody::Hierarchical { authority, .. } => authority, UriBody::Opaque(_) => None }
+    }
+    /// Borrows the original user information for a server authority, including an explicitly empty value.
+    pub fn raw_user_info(&self) -> Option<&'a str> { self.user_info }
     /// Host spelling is preserved, including IPv6 brackets and scope identifiers; registry authorities have no host.
     pub fn host(&self) -> Option<&'a str> { self.host }
     pub fn port(&self) -> Option<i32> { self.port }

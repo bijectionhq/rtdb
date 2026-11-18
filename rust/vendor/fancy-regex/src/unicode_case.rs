@@ -11,6 +11,12 @@ fn mapping(table: &[(u32, u32)], value: u32) -> u32 {
     table.binary_search_by_key(&value, |entry| entry.0).map_or(value, |index| table[index].1)
 }
 
+/// Applies the pinned Java simple uppercase mapping to one UTF-16 code unit.
+/// Surrogate code units are returned unchanged.
+pub fn java_uppercase_unit(value: u16) -> u16 {
+    mapping(UPPER, u32::from(value)) as u16
+}
+
 const UPPER: &[(u32, u32)] = &[
     (0x61, 0x41), (0x62, 0x42), (0x63, 0x43), (0x64, 0x44),
     (0x65, 0x45), (0x66, 0x46), (0x67, 0x47), (0x68, 0x48),

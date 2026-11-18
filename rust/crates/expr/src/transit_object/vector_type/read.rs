@@ -81,7 +81,7 @@ fn fields(source: &Object,scope: Admission<'_>) -> Result<Arc<Type>> {
         Object::Vector(values) | Object::List(values) => for value in values { pair(value,scope,&mut add)?; },
         Object::Set(values) => for (value,_) in values.entries() { pair(value,scope,&mut add)?; },
         Object::Null => {},Object::String(value) if value.is_empty() => {},Object::Bytes(value) if value.is_empty() => {},
-        Object::Path(super::super::Path::Unix(value)) if value.as_slice() == b"/" => {},
+        Object::Path(value) if value.is_root_only() => {},
         _ => return Err(invalid()),
     }
     slots(fields.len(),scope)?;let mut ordered = Vec::with_capacity(fields.len());let mut values = BTreeMap::new();

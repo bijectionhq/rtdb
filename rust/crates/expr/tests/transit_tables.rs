@@ -109,7 +109,10 @@ fn table_names_use_registered_objects_custom_string_and_print_methods() {
             (tag("u",text("00000000-0000-0000-0000-000000000001")),"00000000-0000-0000-0000-000000000001","#uuid \"00000000-0000-0000-0000-000000000001\""),
             (tag("time/date-time",text("2020-01-01T00:00:00")),"2020-01-01T00:00","#xt/ldt \"2020-01-01T00:00\""),
             (tag("xtdb/tstz-range",T::Null),"ZonedDateTimeRange(from=null, to=null)","#xt/tstz-range [nil nil]"),
+            #[cfg(not(windows))]
             (tag("xtdb/path",text("a//b/")),"a/b","#xt/path \"a/b\""),
+            #[cfg(windows)]
+            (tag("xtdb/path",text("a//b/")),r"a\b",r#"#xt/path "a\\b""#),
             (tag("xtdb/key-fn",keyword("kebab-case-keyword")),"KEBAB_CASE_KEYWORD","#xt/key-fn :kebab-case-keyword"),
             (tag("xtdb/tx-key",T::Null),"#xt/tx-key {:tx-id nil, :system-time nil}","#xt/tx-key {:tx-id nil, :system-time nil}"),
         ] {

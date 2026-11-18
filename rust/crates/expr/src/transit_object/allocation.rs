@@ -31,7 +31,7 @@ impl<'a> Text<'a> {
 }
 
 pub(super) fn path_capacity(value: &Path) -> Result<usize> {
-    match value { Path::Unix(value) => value.len().checked_mul(8).and_then(|bytes|bytes.checked_add(64)),Path::Jrt(value) => Some(value.len()) }.ok_or_else(overflow)
+    value.text_allocation_bound().ok_or_else(overflow)
 }
 
 pub(super) fn wire_charge(value: &Object,allocation: Admission<'_>) -> Result<()> {

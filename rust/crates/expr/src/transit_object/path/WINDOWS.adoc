@@ -1,0 +1,31 @@
+= Stored Transit Windows Path
+
+The registered Transit reader parses a Java URI before invoking the filesystem provider.
+A value with no URI scheme becomes a default file path.
+A hierarchical file URI decodes its path and maps a server authority into a UNC root.
+IPv6 hosts use the Windows literal spelling, including the zone separator.
+Drive, UNC, directory-relative, drive-relative and relative roots keep their source distinctions.
+The normalized path preserves dot components and collapses repeated separators outside its root.
+An extended path prefix requires the corresponding absolute or UNC root.
+
+The Windows path object keeps normalized text and the root boundary needed for iteration.
+Equality and hashing apply Java's simple uppercase mapping to each UTF-16 unit.
+The original casing remains in the serialized string.
+Supplementary characters retain their individual UTF-16 units during comparison.
+URI parsing, normalized allocation and Transit output remain within the expression caller's allocation scope.
+
+== Source evidence
+
+The pinned XTDB registration is `api/src/main/clojure/xtdb/serde.clj` at `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.
+The OpenJDK paths below are pinned to `jdk-25.0.1+8`.
+The retained notice text is in link:WINDOWS-COPYRIGHT[WINDOWS-COPYRIGHT].
+
+* link:https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/windows/classes/sun/nio/fs/WindowsFileSystemProvider.java[WindowsFileSystemProvider] `bcf64edeaa32f94d466f2ad57a879301092c800f20877cd4ff22e034e9a64491`
+* link:https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/windows/classes/sun/nio/fs/WindowsUriSupport.java[WindowsUriSupport] `72078bbdbd7eba615c1aa3983f19c6c393445aac1206587cd17d5ef1dc3d11c3`
+* link:https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/windows/classes/sun/nio/fs/WindowsPathParser.java[WindowsPathParser] `2b9c293b0756455a5876644a1b9738789228c375614c7710557e0801d95e2e0d`
+* link:https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/windows/classes/sun/nio/fs/WindowsPath.java[WindowsPath] `ac1a0a69521d7e7fa1b3b3e321e5414350e29f5f4356a0d3a9a48ccddc256563`
+
+The simple-uppercase table comes from Unicode 16.0.0 through the vendored Java matcher.
+Unit fixtures select the Windows provider independently of the host.
+The Windows Transit integration fixture checks ordinary decoding, key equality and canonical writing through the evaluator.
+Host runtime and external filesystem-provider qualification remain open.
