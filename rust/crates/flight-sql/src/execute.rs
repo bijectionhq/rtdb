@@ -5,6 +5,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
 use rtdb_plan::ControlStatement;
+use rtdb_query::QueryContext;
 use rtdb_tx::SqlArguments;
 use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
@@ -23,11 +24,22 @@ impl Service {
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
         let schema = if prepared.is_dml() { None } else {
-            let types = match params { Some(params) => { let batch = wire::parameter_batch(params, self.memory())?; batch.batch().schema().fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? }, None => prepared.parameter_types().to_vec() };
-            Some(wire::plan_schema(prepared.result_schema(&context, &types).map_err(status)?.schema(), self.memory())?)
+            Some(self.parameterized_schema(&prepared, &context, params)?)
         };
         Ok(Shape { schema, parameters: prepared.parameter_count() })
     }
+    fn parameterized_schema(
+        &self, prepared: &PreparedSql, context: &Arc<QueryContext>, params: Option<&Bytes>,
+    ) -> Result<wire::OwnedSchema, Status> {
+        let schema = if let Some(params) = params {
+            let types = wire::parameter_types(params, self.memory())?;
+            prepared.result_schema(context, types.as_slice()).map_err(status)?
+        } else {
+            prepared.result_schema(context, prepared.parameter_types()).map_err(status)?
+        };
+        wire::plan_schema(schema.schema(), self.memory())
+    }
+
     pub async fn describe(&self, connection: Arc<ConnectionResource>, source: &str, params: Option<&Bytes>) -> Result<(wire::OwnedSchema, usize), Status> {
         let shape = self.prepare_shape(connection, source, params).await?;
         Ok((shape.schema.ok_or_else(|| invalid("executeSchema only supports queries (DML and SET return no result set)"))?, shape.parameters))
@@ -84,8 +96,7 @@ impl Service {
             let basis = native.state_mut().read_basis().await.map_err(status)?;
             let context = native.query_context_at(&basis, &token).await.map_err(status)?;
             let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
-            let types = match &params { Some(params) => { let batch = wire::parameter_batch(params, self.memory())?; batch.batch().schema().fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? }, None => prepared.parameter_types().to_vec() };
-            let schema = wire::plan_schema(prepared.result_schema(&context, &types).map_err(status)?.schema(), self.memory())?;
+            let schema = self.parameterized_schema(&prepared, &context, params.as_ref())?;
             (basis, schema)
         };
         let basis_bytes = basis.snapshot.databases.iter().try_fold(8192usize, |size, (database, times)| wire::add(size, wire::add(wire::mul(database.len(), 8)?, wire::mul(times.len(), 128)?)?))?;

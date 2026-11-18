@@ -106,6 +106,9 @@ Metadata enumeration reserves borrowed schema bounds before cloning table bindin
 The schema and codec estimates are conservative allowances, not a demonstrated bound for every possible nested Arrow representation.
 During classification of the complete SQL input, Flight SQL charges token array capacity and an estimate for lexer scratch to the node's memory budget.
 A classified control command retains an estimated parsing and binding allowance through schema preparation or execution.
+Flight SQL reserves a schema allowance before converting Arrow parameter fields to logical types and holds it through result-schema binding or construction of retained SQL arguments.
+Typed batches with zero rows still carry their parameter field types.
+Without a bound parameter batch, result-schema binding borrows the prepared parameter types.
 HTTP/2, prost, TLS-free tonic buffers, ordinary SQL parser scratch, and scalar-expression peak allocations still require end-to-end accounting qualification.
 Leases use the shared microsecond clock and have not been compared with the JVM nanosecond clock at submicrosecond timeout boundaries.
 Native server-version metadata uses the Rust package version.
