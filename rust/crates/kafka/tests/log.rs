@@ -272,3 +272,32 @@ async fn partitioned_topics_and_oversized_records_are_rejected_before_receipt() 
     assert!(matches!(opened.log.enqueue(Bytes::from_static(b"large"), Timestamp(0)).await, Err(Error::MessageTooLarge { .. })));
     drop(opened.driver);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_only_log_reads_batches_written_with_every_java_producer_codec() {
+    let cluster = MockCluster::new(1).unwrap();
+    let endpoint = cluster.bootstrap_servers();
+    let configuration = KafkaClusterConfig::new(endpoint.as_str());
+    let payload = b"xtdb-log-record ".repeat(4096);
+    for codec in ["gzip", "snappy", "lz4", "zstd"] {
+        let topic = format!("replay-{codec}");
+        cluster.create_topic(&topic, 1, 1).unwrap();
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", endpoint.as_str())
+            .set("compression.type", codec)
+            .create().unwrap();
+        producer.send(FutureRecord::<(), [u8]>::to(&topic).partition(0).payload(payload.as_slice()), Duration::from_secs(5)).await.unwrap();
+        let mut options = KafkaLogOptions::new(topic.as_str());
+        options.auto_create_topic = false;
+        options.read_only = true;
+        let opened = KafkaLog::open(&configuration, options, Arc::new(Warnings::default()), MemoryBudget::new(64 << 20)).await.unwrap();
+        let mut tail = opened.log.tail(LogOffset(-1)).await.unwrap();
+        let replay = tail.replay().unwrap();
+        let head = replay.poll_head(Duration::from_secs(5)).await.unwrap().unwrap();
+        assert_eq!(head.payload_len, payload.len(), "{codec}");
+        let memory = MemoryBudget::new(head.allocation_bound);
+        let reservation = ReadReservation::new(head.allocation_bound, memory.reserve(head.allocation_bound).unwrap());
+        let record = replay.read_head(head, reservation).await.unwrap();
+        assert_eq!(record.payload.as_ref(), payload.as_slice(), "{codec}");
+    }
+}
