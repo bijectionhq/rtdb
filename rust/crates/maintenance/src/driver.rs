@@ -38,6 +38,7 @@ pub struct CompactionDriver {
     publisher: Arc<dyn CompactionPublisher>,
     observer: Arc<dyn CompactionObserver>,
     parallelism: usize,
+    automatic: bool,
     signals: mpsc::Receiver<()>,
     requests: mpsc::Receiver<Completion>,
 }
@@ -53,7 +54,8 @@ impl CompactionDriver {
         if parallelism == 0 || request_capacity == 0 { return Err(crate::invalid("Maintenance concurrency and request capacity must be positive")); }
         let (signals, signal_receiver) = mpsc::channel(1);
         let (requests, request_receiver) = mpsc::channel(request_capacity);
-        Ok((Self { snapshots, executor, publisher, observer: Arc::new(StderrCompactionObserver), parallelism, signals: signal_receiver, requests: request_receiver },
+        Ok((Self { snapshots, executor, publisher, observer: Arc::new(StderrCompactionObserver), parallelism, automatic: !ignore_signal,
+                signals: signal_receiver, requests: request_receiver },
             CompactionHandle { signals, requests, capacity: Arc::new(Semaphore::new(request_capacity)), ignore_signal }))
     }
 
@@ -74,8 +76,10 @@ impl CompactionDriver {
         let mut pending: Vec<Completion> = Vec::new();
         let outcome = loop {
             if cancellation.is_cancelled() { break Ok(()); }
-            let snapshot = self.snapshots.snapshot();
-            let jobs = match available_jobs(snapshot.trie_catalog()) { Ok(jobs) => jobs, Err(error) => break Err(error) };
+            let jobs = if self.automatic || !pending.is_empty() {
+                let snapshot = self.snapshots.snapshot();
+                match available_jobs(snapshot.trie_catalog()) { Ok(jobs) => jobs, Err(error) => break Err(error) }
+            } else { Vec::new() };
             for job in jobs {
                 if running.len() == self.parallelism { break; }
                 let key = job.key();

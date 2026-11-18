@@ -20,6 +20,7 @@ Publication errors retain the storage anomaly's category, code, message, and con
 `CompactionDriver` and `CycleDriver` are active objects whose `run` methods own their event choices.
 The database owner runs and joins them.
 Compaction belongs to the database lifetime; each garbage-collection driver belongs to one leader term.
+With automatic compaction disabled, a pending `compact_all` request drives scheduling until quiescence.
 Driver queues are bounded, block signals are conflated, and request handles backpressure callers when their queue is full.
 Completion channels are per-request monitors; merge heaps, page builders, file writers, and cycle work lists are single-owner transients.
 The cancellation token is checked between object operations, and started compaction jobs are drained before driver teardown completes.

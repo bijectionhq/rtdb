@@ -78,7 +78,8 @@ external entity ObjectStore {
 }
 
 external entity Compactor {
-    -- Compacts a database's tries. A peer of the log processor rather than a part of it: it is signalled at block boundaries and otherwise runs on its own.
+    -- Compacts a database's tries as a peer of the log processor.
+    -- Block adoption signals the compactor when automatic compaction is enabled.
     -- See: compaction.allium.
 }
 
@@ -503,6 +504,7 @@ config {
     -- The worst-case interval over which an external source's upstream must retain its log, so the value bounds more than block cadence.
     flush_timeout: Duration = 15.minutes
     rows_per_block: Integer = 102400
+    automatic_compaction: Boolean = true
 }
 
 ---- Rules: Role Transitions
@@ -1289,7 +1291,8 @@ rule FollowerHandlesBlockUploaded {
         -- The adopt, over the block at that index read from the object store.
         AdoptBlock(msg)
 
-        CompactorSignalled()
+        if config.automatic_compaction:
+            CompactorSignalled()
 
         -- The block's covered source position, ahead of the drain below: the held records carry later positions, so behind them this one would go backwards (see the watchers' monotonicity obligations).
         watchers.notifyMsg(msg.latest_processed_msg_id)
@@ -1304,7 +1307,8 @@ rule FollowerHandlesBlockUploaded {
 
 ---- Rules: Compaction Orchestration
 
--- The compactor runs asynchronously, signalled after a block is adopted.
+-- The signal-driven wake rule covers automatic compaction.
+-- In native manual mode, compaction schedules jobs only while a compact-all request is pending.
 -- Job selection and the merge algorithm are compaction.allium's.
 -- The compactor writes L1+ tries to the SOURCE log, and the leader forwards them to the replica log.
 
