@@ -10,7 +10,7 @@ use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_plan::Statement;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, Result, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::{SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, decode_arguments, is_reserved_write_schema, table_name}};
@@ -423,13 +423,16 @@ impl<'a> OpenTransaction<'a> {
         let error = result.encoded_error()?;
         let bound = error.as_ref().map_or(0, |error| error.as_slice().len()).checked_add(metadata.map(|value| value.value().retained_bytes()).transpose()?.unwrap_or(0)).and_then(|bytes| bytes.checked_add(16_384)).ok_or_else(overflow)?;
         let _reservation = self.context.memory.reserve(bound)?;
+        let table = TableRef::new("xt", "txs");
+        let error_column = "error".to_owned();
         let document = BTreeMap::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
             ("committed".into(), Value::Bool(result.committed())),
             ("user_metadata".into(), metadata.map(|metadata| metadata.value().clone()).unwrap_or(Value::Null)),
-            ("error".into(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
+            (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
-        self.buffer.put(TableRef::new("xt", "txs"), document, interval(key.system_time, Timestamp::MAX)?)
+        self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
+        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe())])
     }
 }
 

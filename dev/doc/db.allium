@@ -279,6 +279,7 @@ value TransactionKey {
 }
 
 value TransactionResult {
+    -- The transaction result row declares a nullable Transit error column for committed and aborted results.
     -- The outcome of a resolved transaction, carried through the resolver's queue head and reported to the watchers on apply.
     tx_key: TransactionKey
     committed: Boolean
