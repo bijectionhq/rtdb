@@ -134,6 +134,16 @@ fn emitted_integer(value: &Value) -> Option<i128> {
     })
 }
 
+pub(crate) fn emitted_byte_buffer(value: &Value) -> Option<&[u8]> {
+    match value {
+        Value::Utf8(text) => Some(text.as_bytes()),
+        Value::Keyword(keyword) => Some(keyword.as_str().as_bytes()),
+        Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => Some(bytes),
+        Value::Uuid(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
 fn emitted_eq(left: &Value, right: &Value, allocation: Option<&EvaluationScope>) -> Result<bool> {
     if let Value::Transit(left) = left {
         let left = crate::transit_object::Decoded::read(left, crate::transit_object::scope(allocation)?)?;
@@ -141,6 +151,7 @@ fn emitted_eq(left: &Value, right: &Value, allocation: Option<&EvaluationScope>)
             else { left.equivalent_emitted(right) };
     }
     if let Value::Transit(right) = right { return crate::transit_object::Decoded::read(right, crate::transit_object::scope(allocation)?)?.equivalent_emitted(left); }
+    if let (Some(left), Some(right)) = (emitted_byte_buffer(left), emitted_byte_buffer(right)) { return Ok(left == right); }
     if let (Some(left), Some(right)) = (emitted_integer(left), emitted_integer(right)) { return Ok(left == right); }
     if let (Some(left), Some(right)) = (IntervalParts::of(left), IntervalParts::of(right)) {
         return Ok(left.months == right.months && left.days == right.days && left.nanos == right.nanos);
@@ -219,6 +230,15 @@ fn interval_order(left: &Value, right: &Value, a: IntervalParts, b: IntervalPart
     }
     let nanos = |value: IntervalParts| i64::from(value.days).wrapping_mul(86_400_000_000_000).wrapping_add(value.nanos);
     Ok(nanos(a).cmp(&nanos(b)))
+}
+
+pub(crate) fn predicate_order(left: &Value, right: &Value, timezone: &str) -> Result<Ordering> {
+    if std::mem::discriminant(left) != std::mem::discriminant(right) {
+        if let (Some(left), Some(right)) = (emitted_byte_buffer(left), emitted_byte_buffer(right)) {
+            return Ok(left.iter().map(|byte| *byte as i8).cmp(right.iter().map(|byte| *byte as i8)));
+        }
+    }
+    compare_in_timezone(left, right, false, timezone)
 }
 
 /// Null placement is explicit; the ordering of non-null values follows their runtime types.

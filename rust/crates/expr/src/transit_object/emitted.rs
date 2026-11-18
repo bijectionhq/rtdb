@@ -1,5 +1,6 @@
 use num_bigint::BigInt;
 use rtdb_types::{Result, Value};
+use crate::compare::emitted_byte_buffer;
 use super::{Object, number::Number};
 
 impl Object {
@@ -8,10 +9,7 @@ impl Object {
             (Self::Null, Value::Null | Value::Undefined) => true,
             (Self::Bool(left), Value::Bool(right)) => left == right,
             (Self::Number(left), right) => emitted_number(right,allocation)?.is_some_and(|right| left.equivalent(&right)),
-            (Self::ByteBuffer(left), Value::Utf8(right)) => left.as_slice() == right.as_bytes(),
-            (Self::ByteBuffer(left), Value::Keyword(right)) => left.as_slice() == right.as_str().as_bytes(),
-            (Self::ByteBuffer(left), Value::Binary(right) | Value::FixedSizeBinary(right)) => left.as_slice() == right.as_slice(),
-            (Self::ByteBuffer(left), Value::Uuid(right)) => left.as_slice() == right.as_slice(),
+            (Self::ByteBuffer(left), right) => emitted_byte_buffer(right).is_some_and(|right| left.as_slice() == right),
             (Self::Uri(left), Value::Uri(right)) => rtdb_types::UriParts::parse(left)?.equivalent(&rtdb_types::UriParts::parse(right)?),
             (Self::Time(super::Time::Interval { months, days, nanos }), right) => crate::temporal::IntervalParts::of(right).is_some_and(|right| *months == right.months && *days == right.days && *nanos == right.nanos),
             _ => false,

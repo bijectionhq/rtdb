@@ -1,19 +1,14 @@
 use std::cmp::Ordering;
 use rtdb_types::{Anomaly, LogicalType, Result, Value};
+use crate::compare::emitted_byte_buffer;
 
 /// Checks every vector-leg pair, including legs with no populated rows.
 /// Null legs compare with every type; unsupported nonnull pairs fail with function-type-mismatch.
 /// Mixed interval units fail with cannot-compare-different-unit-intervals.
 pub fn validate_order_type(data_type: &LogicalType) -> Result<()> { rtdb_plan::validate_comparison_types(data_type, data_type) }
 
-fn vector_bytes(value: &Value) -> Option<&[u8]> {
-    match value {
-        Value::Utf8(text) => Some(text.as_bytes()), Value::Keyword(keyword) => Some(keyword.as_str().as_bytes()),
-        Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => Some(bytes.as_slice()), Value::Uuid(bytes) => Some(bytes.as_slice()), _ => None,
-    }
-}
 pub(crate) fn scalar_compare(left: &Value,right: &Value,nulls_first: bool,timezone: &str) -> Result<i32> {
-    if let (Some(left),Some(right)) = (vector_bytes(left),vector_bytes(right)) {
+    if let (Some(left),Some(right)) = (emitted_byte_buffer(left),emitted_byte_buffer(right)) {
         let left_len = i32::try_from(left.len()).map_err(|_| crate::numeric::overflow())?;
         let right_len = i32::try_from(right.len()).map_err(|_| crate::numeric::overflow())?;
         let common = left.len().min(right.len());

@@ -1,4 +1,4 @@
-use crate::{arithmetic_in_timezone, compare_in_timezone, functions::scalar_call};
+use crate::{arithmetic_in_timezone, compare::predicate_order, functions::scalar_call};
 use crate::compare::{nullish,sql_eq_scoped,sql_not_eq_scoped};
 use crate::numeric::{inapplicable, integer, integer_value, number, overflow};
 use arrow_array::RecordBatch;
@@ -197,7 +197,7 @@ fn binary_value(op: BinaryOp, left: Value, right: Value, context: &EvalContext<'
         _ if nullish(&left) || nullish(&right) => Ok(Value::Null),
         B::Lt | B::LtEq | B::Gt | B::GtEq => {
             if number(&left).is_some_and(f64::is_nan) || number(&right).is_some_and(f64::is_nan) { return Ok(Value::Bool(false)); }
-            let order = compare_in_timezone(&left, &right, false, context.timezone)?;
+            let order = predicate_order(&left, &right, context.timezone)?;
             Ok(Value::Bool(match op { B::Lt => order == Ordering::Less, B::LtEq => order != Ordering::Greater, B::Gt => order == Ordering::Greater, _ => order != Ordering::Less }))
         }
         B::Concat => {

@@ -60,7 +60,7 @@ pub(super) fn order<'a>(left: EvalValue<'a>,right: EvalValue<'a>,frame: &'a Eval
             (true,true) => return Ok(Ordering::Equal),(true,false) => return Ok(Ordering::Greater),(false,true) => return Ok(Ordering::Less),_ => (),
         }
         match (&left,&right) {
-            (EvalValue::Scalar(a),EvalValue::Scalar(b)) => crate::compare_in_timezone(a,b,false,frame.context.timezone),
+            (EvalValue::Scalar(a),EvalValue::Scalar(b)) => crate::compare::predicate_order(a,b,frame.context.timezone),
             (EvalValue::List(a,_),EvalValue::List(b,_)) if a == b && *a != Kind::Set => {
                 let (a,b) = (len(&left)?,len(&right)?);
                 for index in 0..a.min(b) {

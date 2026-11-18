@@ -142,6 +142,7 @@
 (deftest-original-api original-sql/test-any-correlated-array-with-nulls-4895)
 (deftest-original-api original-sql/test-is-distinct-from)
 (deftest-original-api original-sql/test-in-subquery)
+(deftest-original-api original-sql/datascript-test-aggregates)
 (deftest-original-api original-sql/test-scalar-subquery-with-expressions)
 (deftest-original-api original-sql/test-aggregate-filter)
 (deftest-original-api original-sql/test-lead-lag-window-functions)

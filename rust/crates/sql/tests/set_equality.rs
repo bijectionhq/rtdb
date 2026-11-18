@@ -27,6 +27,41 @@ async fn query(source: &str,arguments: Vec<V>) -> Result<Vec<Vec<V>>> {
     result
 }
 #[tokio::test]
+async fn emitted_byte_buffer_equality_applies_to_operators_and_nested_values() {
+    let keyword = V::Keyword(rtdb_types::Keyword::from_name("ns/medusa"));
+    for value in [V::Utf8("ns/medusa".into()), V::Binary(b"ns/medusa".to_vec()), V::FixedSizeBinary(b"ns/medusa".to_vec())] {
+        assert_eq!(query("SELECT $1 = $2, $2 = $1, $1 <> $2, $1 IS DISTINCT FROM $2, ARRAY[$1] = ARRAY[$2]", vec![keyword.clone(), value]).await.unwrap(),
+            [vec![V::Bool(true), V::Bool(true), V::Bool(false), V::Bool(false), V::Bool(true)]]);
+    }
+    assert_eq!(query("SELECT KEYWORD 'ns/medusa' = 'medusa', KEYWORD 'medusa' = ':medusa', KEYWORD 'medusa' = NULL", vec![]).await.unwrap(),
+        [vec![V::Bool(false), V::Bool(false), V::Null]]);
+    assert_eq!(query("SELECT UUID '61626364-6566-6768-696a-6b6c6d6e6f70' = 'abcdefghijklmnop', UUID '61626364-6566-6768-696a-6b6c6d6e6f70' = KEYWORD 'abcdefghijklmnop'", vec![]).await.unwrap(),
+        [vec![V::Bool(true), V::Bool(true)]]);
+}
+
+#[tokio::test]
+async fn emitted_byte_buffers_keep_their_types_through_hash_join_and_membership() {
+    let keyword = V::Keyword(rtdb_types::Keyword::from_name("abc"));
+    assert_eq!(query("SELECT a.id AS keyword_id, b.id AS string_id FROM (VALUES (KEYWORD 'abc')) a(id) JOIN (VALUES ('abc')) b(id) ON a.id = b.id", vec![]).await.unwrap(),
+        [vec![keyword.clone(), V::Utf8("abc".into())]]);
+    for source in [
+        "SELECT a.id FROM (VALUES (KEYWORD 'abc')) a(id) WHERE a.id IN ('abc')",
+        "SELECT a.id FROM (VALUES (KEYWORD 'abc')) a(id) WHERE a.id IN (VALUES ('abc'))",
+    ] {
+        assert_eq!(query(source, vec![]).await.unwrap(), [vec![keyword.clone()]], "{source}");
+    }
+}
+
+#[tokio::test]
+async fn byte_buffer_predicates_and_vector_ordering_follow_their_respective_type_rules() {
+    assert_eq!(query("SELECT KEYWORD 'é' < 'z', 'é' < KEYWORD 'z', KEYWORD 'é' < KEYWORD 'z', 'é' < 'z'", vec![]).await.unwrap(),
+        [vec![V::Bool(true), V::Bool(true), V::Bool(false), V::Bool(false)]]);
+    assert_eq!(query("SELECT COUNT(DISTINCT id) FROM (VALUES (KEYWORD 'abc'), ('abc')) a(id)", vec![]).await.unwrap(), [vec![V::I64(1)]]);
+    assert_eq!(query("SELECT id FROM (VALUES (KEYWORD 'a'), ('b')) a(id) ORDER BY id", vec![]).await.unwrap_err().code,
+        "xtdb.expression/function-type-mismatch");
+}
+
+#[tokio::test]
 async fn sql_equality_rejects_runtime_set_parameters_and_empty_declared_set_lists() {
     for source in ["SELECT $1 = $2","SELECT $1 <> $2","SELECT $1 IS DISTINCT FROM $2","SELECT 1 WHERE $1 = $2","SELECT CASE WHEN FALSE THEN $1 = $2 ELSE TRUE END"] {
         assert_eq!(query(source,vec![V::Set(vec![]),V::Set(vec![])]).await.unwrap_err().code,"xtdb.expression/set-equality","{source}");
