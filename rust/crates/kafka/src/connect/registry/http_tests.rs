@@ -73,6 +73,51 @@ async fn stock_avro_converter_parses_fetched_schema_strings_with_avros_comment_p
 }
 
 #[tokio::test]
+async fn invalid_avro_schema_precedes_version_lookup_and_preserves_the_cached_plan() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let valid = r#"/* Avro comment */ {"type":"record","name":"Event","namespace":"ns","fields":[]}"#;
+        for (request, response) in [
+            ("GET /schemas/ids/17 HTTP/1.1", serde_json::json!({"schema": valid})),
+            ("POST /subjects/ns.Event?normalize=false&deleted=true HTTP/1.1", serde_json::json!({"id": 17, "version": 3})),
+            ("GET /schemas/ids/18 HTTP/1.1", serde_json::json!({"schema": "\"Absent\""})),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = request_head(&mut socket).await;
+            assert_eq!(head.lines().next(), Some(request));
+            if let Some(length) = head.lines().filter_map(|line| line.split_once(':'))
+                .find(|(key, _)| key.eq_ignore_ascii_case("content-length")).map(|(_, value)| value.trim().parse::<usize>().unwrap()) {
+                assert!(length < 8192);
+                let mut bytes = vec![0; length];
+                socket.read_exact(&mut bytes).await.unwrap();
+            }
+            let body = response.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let spec = PluginSpec { class_name: "io.confluent.connect.avro.AvroConverter".into(), options: BTreeMap::from([
+        ("schema.registry.url".into(), format!("http://{address}")),
+        ("value.subject.name.strategy".into(), "io.confluent.kafka.serializers.subject.RecordNameStrategy".into()),
+        ("max.schemas.per.subject".into(), "1".into()),
+    ]) };
+    let mut converter = RegistryConverter::open(&spec, RegistryFormat::Avro, false).unwrap();
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 27);
+    let mut context = ConversionContext::new(Arc::clone(&memory));
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), converter.schema("events", 17, &mut context)).await.unwrap().unwrap();
+    assert_eq!(first.subject, "ns.Event");
+    assert_eq!(first.version, 3);
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(5), converter.schema("events", 18, &mut context)).await.unwrap().err().unwrap();
+    assert!(failure.code.ends_with("/avro-schema"));
+    assert_eq!(failure.message.as_deref(), Some("Undefined canonical schema reference"));
+    let again = converter.schema("events", 17, &mut context).await.unwrap();
+    assert!(Arc::ptr_eq(&first.avro_plan(&mut context).unwrap(), &again.avro_plan(&mut context).unwrap()));
+    server.await.unwrap();
+    drop((first, again, converter, context));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn writer_schema_id_projects_eligible_envelopes_and_uses_legacy_for_other_fields() {
     for (body, expected_type) in [
         (r#"{"schema":"\"string\"","references":[ ]}"#, None),

@@ -11,7 +11,11 @@ The factory root is initialized on demand with a stable native identity seed.
 The token pool follows the synchronous native calling thread.
 Packaged JVM seed values, SoftReference clearing and foreign classloader state remain runtime qualifications.
 
-The Registry document and plan binding retain the text and resulting schema state through both success and retry.
+The Registry resolves and parses the writer schema before looking up its subject version.
+Record-based subject strategies use the parsed record's full name.
+The writer and selected schema documents retain their parsed plans through reader binding and cache reuse.
+An unsuccessful writer lookup leaves an existing cache entry available.
+The request body projection and the later order of version lookup versus record decoding still follow the current native path.
 The converter currently receives Registry schema strings projected to UTF8 by its HTTP consumers.
 Direct nullable UTF16 transport, typed logical consumers beyond the native datum boundary and Jackson input above the current native traversal limits remain open.
 The link:../avro/runtime/RUNTIME.adoc[Avro runtime reference] records its parser and buffer contracts.

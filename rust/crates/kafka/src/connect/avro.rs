@@ -110,7 +110,7 @@ impl AvroDatumPlan {
         java_schema::ParsedPair::parse_java_text(text, references, options, policy, context)
             .map(java_schema::ParsedPair::into_datum)
     }
-    fn retain_source(&self, context: &mut ConversionContext) -> Result<()> {
+    pub(super) fn retain_source(&self, context: &mut ConversionContext) -> Result<()> {
         if let Some(source) = &self.source { source.retain(context)?; }
         Ok(())
     }
@@ -179,6 +179,13 @@ impl AvroDatumPlan {
         Ok(AvroDatum { value, plan: Arc::clone(self) })
     }
     pub fn root_record(&self) -> bool { matches!(resolve(&self.root, &self.names), Ok(Schema::Record(_))) }
+    pub(super) fn subject_record_name(&self, context: &mut ConversionContext) -> Result<Option<String>> {
+        let Schema::Record(record) = resolve(&self.root, &self.names)? else { return Ok(None); };
+        let name = names::NameParts::parse(&record.name.name, record.name.namespace.as_deref())
+            .map_err(|cause| error("avro-schema", cause))?;
+        context.reserve(name.fullname_bytes()?.checked_add(256).ok_or_else(resolution::overflow)?)?;
+        name.fullname().map(Some)
+    }
     pub fn raw_bytes(&self) -> bool { match &self.root { Schema::Bytes => true, Schema::Decimal(decimal) => matches!(decimal.inner.as_ref(), Schema::Bytes), _ => false } }
     pub fn select_output(&self, reader: &Self, datum: &AvroDatum) -> Result<AvroOutput> {
         if !self.root_record() { return Ok(AvroOutput::Writer); }

@@ -45,9 +45,21 @@ pub(super) struct RegistryConverter {
     binding_order: VecDeque<(String, u32)>,
     dlq: BTreeMap<String, dlq::DlqProducer>,
 }
-struct SchemaDocument { root: RegistrySchema, references: ResolvedReferences, subject: String, version: i32, bytes: usize, charge: Arc<MemoryReservation> }
+struct SchemaDocument {
+    root: RegistrySchema,
+    references: ResolvedReferences,
+    subject: String,
+    version: i32,
+    bytes: usize,
+    plan: DocumentPlan,
+    charge: Arc<MemoryReservation>,
+}
+enum DocumentPlan {
+    Avro { datum: Arc<super::avro::AvroDatumPlan>, charge: Arc<MemoryReservation> },
+    Json,
+}
 struct WriterEntry { document: Arc<SchemaDocument>, key_charge: Arc<MemoryReservation> }
-struct ReaderBinding { writer: Arc<SchemaDocument>, selected: Option<Arc<SchemaDocument>>, plan: ReaderPlan, migrations: Vec<rules::ReadRules>, read_rules: rules::ReadRules, _charges: Vec<Arc<MemoryReservation>> }
+struct ReaderBinding { plan: ReaderPlan, writer: Arc<SchemaDocument>, selected: Option<Arc<SchemaDocument>>, migrations: Vec<rules::ReadRules>, read_rules: rules::ReadRules, _charges: Vec<Arc<MemoryReservation>> }
 enum ReaderPlan {
     Avro { writer: Arc<super::avro::AvroDatumPlan>, selection: AvroSelection, outputs: BTreeMap<super::avro::AvroOutput, super::avro::AvroPlan> },
     Json(JsonOutput),
@@ -62,11 +74,24 @@ enum AvroSelection {
 enum AvroRead { Binary(super::avro::AvroResolution), Migration, RawBytes }
 impl SchemaDocument {
     fn equivalent(&self, other: &Self) -> bool { self.version == other.version && self.subject == other.subject && self.root == other.root && self.references == other.references }
+    fn retain(&self, context: &mut ConversionContext) -> Result<()> {
+        context.retain(Arc::clone(&self.charge))?;
+        if let DocumentPlan::Avro { datum, charge } = &self.plan {
+            context.retain(Arc::clone(charge))?;
+            datum.retain_source(context)?;
+        }
+        Ok(())
+    }
+    fn avro_plan(&self, context: &mut ConversionContext) -> Result<Arc<super::avro::AvroDatumPlan>> {
+        let DocumentPlan::Avro { datum, .. } = &self.plan else { return Err(error("schema-registry", "Avro binding requires a parsed Avro document")); };
+        self.retain(context)?;
+        Ok(Arc::clone(datum))
+    }
 }
 impl ReaderBinding {
     fn retain(&self, context: &mut ConversionContext) -> Result<()> {
-        context.retain(Arc::clone(&self.writer.charge))?;
-        if let Some(selected) = &self.selected { context.retain(Arc::clone(&selected.charge))?; }
+        self.writer.retain(context)?;
+        if let Some(selected) = &self.selected { selected.retain(context)?; }
         for charge in &self._charges { context.retain(Arc::clone(charge))?; }
         Ok(())
     }
@@ -238,21 +263,22 @@ impl RegistryConverter {
         let cache_key = (topic.to_owned(), id);
         if let Some(entry) = self.schemas.get(&cache_key) {
             let schema = Arc::clone(&entry.document);
-            self.order.retain(|cached| cached != &cache_key); self.order.push_back(cache_key);
-            context.retain(Arc::clone(&schema.charge))?;
+            schema.retain(context)?;
             context.retain(Arc::clone(&entry.key_charge))?;
+            self.order.retain(|cached| cached != &cache_key); self.order.push_back(cache_key);
             return Ok(schema);
         }
-        while self.schemas.len() >= self.capacity { if let Some(id) = self.order.pop_front() { self.schemas.remove(&id); } }
         let root = self.fetch_schema_id(id, context).await?;
         self.validate_format(&root)?;
         let resolved = self.resolve_references(root, context).await?;
-        let subject = self.subject(topic, &resolved.root.schema)?;
+        let plan = self.document_plan(&resolved, context)?;
+        let subject = self.subject(topic, &resolved.root.schema, &plan, context)?;
         let lookup = serde_json::to_value(&resolved.root).map_err(|cause| error("schema-registry", cause))?;
         let lookup = self.request_query(&["subjects".into(), subject.clone()], &[("normalize".into(), "false".into()), ("deleted".into(), "true".into())], Some(&lookup), context).await?;
         let version = lookup.get("version").and_then(Json::as_i64).and_then(|version| i32::try_from(version).ok()).ok_or_else(|| error("schema-registry", "Subject lookup has no valid schema version"))?;
         if lookup.get("id").and_then(Json::as_u64) != Some(u64::from(id)) { return Err(error("schema-registry", "Subject lookup returned a different schema ID")); }
-        let schema = self.finish_document(resolved, subject, version, context)?;
+        let schema = self.finish_document(resolved, plan, subject, version, context)?;
+        while self.schemas.len() >= self.capacity { if let Some(id) = self.order.pop_front() { self.schemas.remove(&id); } }
         self.schemas.insert(cache_key.clone(), WriterEntry { document: Arc::clone(&schema), key_charge }); self.order.push_back(cache_key); Ok(schema)
     }
     fn validate_format(&self, root: &RegistrySchema) -> Result<()> {
@@ -263,9 +289,10 @@ impl RegistryConverter {
     async fn document(&mut self, root: RegistrySchema, subject: String, version: i32, context: &mut ConversionContext) -> Result<Arc<SchemaDocument>> {
         self.validate_format(&root)?;
         let resolved = self.resolve_references(root, context).await?;
-        self.finish_document(resolved, subject, version, context)
+        let plan = self.document_plan(&resolved, context)?;
+        self.finish_document(resolved, plan, subject, version, context)
     }
-    fn finish_document(&self, resolved: ResolvedSchema, subject: String, version: i32, context: &mut ConversionContext) -> Result<Arc<SchemaDocument>> {
+    fn finish_document(&self, resolved: ResolvedSchema, plan: DocumentPlan, subject: String, version: i32, context: &mut ConversionContext) -> Result<Arc<SchemaDocument>> {
         let ResolvedSchema { root, references } = resolved;
         let root_bytes = references::serialized_size(&root)?;
         let bytes = references.by_name().iter().try_fold(root_bytes.checked_add(subject.len()).ok_or_else(|| error("allocation-overflow", "Schema subject size overflow"))?, |bytes, (name, text)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(text.len())).ok_or_else(|| error("allocation-overflow", "Schema graph size overflow")))?;
@@ -281,13 +308,14 @@ impl RegistryConverter {
             context.reserve(rule_bytes.checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Schema rules allocation overflow"))?)?;
             rules::validate(rule_set)?;
         }
-        Ok(Arc::new(SchemaDocument { root, references, subject, version, bytes, charge }))
+        Ok(Arc::new(SchemaDocument { root, references, subject, version, bytes, plan, charge }))
     }
     fn plan_charge(&self, document: &SchemaDocument, context: &mut ConversionContext) -> Result<Arc<MemoryReservation>> {
         let rule_bound = rules::ReadRules::allocation_bound(document.root.rule_set.as_ref(), &self.options)?;
         context.reserve(document.bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(rule_bound)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| error("allocation-overflow", "Schema graph allocation overflow"))?)
     }
-    fn avro_plan(&mut self, document: &SchemaDocument, context: &mut ConversionContext) -> Result<Arc<super::avro::AvroDatumPlan>> {
+    fn document_plan(&mut self, document: &ResolvedSchema, context: &mut ConversionContext) -> Result<DocumentPlan> {
+        if self.format == RegistryFormat::Json { return Ok(DocumentPlan::Json); }
         let count = document.references.by_name().len();
         let slots = count.checked_mul(std::mem::size_of::<JavaText<'_>>()).and_then(|bytes| bytes.checked_add(256))
             .ok_or_else(|| error("allocation-overflow", "Avro reference slots exceed addressable memory"))?;
@@ -299,13 +327,17 @@ impl RegistryConverter {
         let runtime = self.avro.as_mut().expect("Avro runtime initialized");
         let policy = super::avro::SourcePolicy { validate_defaults: false, fixed_bytes: super::avro::FixedBytesLimit::DEFAULT };
         let plan = runtime.parse(Some(JavaText::from_utf8(&document.root.schema)), &references, &self.options, policy, context)?;
-        Ok(Arc::new(plan.expect("non-null Avro schema produced a datum plan")))
+        let bytes = std::mem::size_of::<super::avro::AvroDatumPlan>().checked_add(512)
+            .ok_or_else(|| error("allocation-overflow", "Avro plan wrapper exceeds addressable memory"))?;
+        let charge = context.reserve(bytes)?;
+        let datum = Arc::new(plan.expect("non-null Avro schema produced a datum plan"));
+        Ok(DocumentPlan::Avro { datum, charge })
     }
     async fn reader_document(&mut self, writer: &SchemaDocument, id: u32, context: &mut ConversionContext) -> Result<Option<Arc<SchemaDocument>>> {
         context.reserve(self.reader_selection.request_bound(&writer.subject)?)?;
         let Some(key) = self.reader_selection.key(&writer.subject, id) else { return Ok(None); };
         if let Some(document) = self.latest.get(&key, Instant::now()) {
-            context.retain(Arc::clone(&document.charge))?;
+            document.retain(context)?;
             return Ok(Some(document));
         }
         let (path, query) = self.reader_selection.request(&writer.subject).ok_or_else(|| error("schema-registry", "Reader schema selection lost its request"))?;
@@ -330,9 +362,8 @@ impl RegistryConverter {
             let root = serde_json::from_value(value).map_err(|cause| error("schema-registry", cause))?;
             let document = self.document(root, writer.subject.clone(), returned, context).await?;
             self.plan_charge(&document, context)?;
-            match self.format {
-                RegistryFormat::Avro => { self.avro_plan(&document, context)?; }
-                RegistryFormat::Json => { serde_json::from_str::<Json>(&document.root.schema).map_err(|cause| error("json-schema", cause))?; }
+            if let DocumentPlan::Json = document.plan {
+                serde_json::from_str::<Json>(&document.root.schema).map_err(|cause| error("json-schema", cause))?;
             }
             versions.push(document);
         }
@@ -368,9 +399,9 @@ impl RegistryConverter {
             RegistryFormat::Json => ReaderPlan::Json(JsonOutput::Unprepared),
             RegistryFormat::Avro => {
                 charges.push(self.plan_charge(&writer, context)?);
-                let writer = self.avro_plan(&writer, context)?;
+                let writer = writer.avro_plan(context)?;
                 let selection = if let Some(selected) = &selected {
-                    let reader = self.avro_plan(selected, context)?;
+                    let reader = selected.avro_plan(context)?;
                     if migrations.is_empty() { writer.validate_reader(Some(&reader))?; }
                     let decode = if !migrations.is_empty() { AvroRead::Migration }
                         else if writer.raw_bytes() { AvroRead::RawBytes }
@@ -386,14 +417,16 @@ impl RegistryConverter {
         self.bindings.insert(key.clone(), binding); self.binding_order.push_back(key.clone());
         Ok(key)
     }
-    fn subject(&self, topic: &str, schema: &str) -> Result<String> {
+    fn subject(&self, topic: &str, schema: &str, plan: &DocumentPlan, context: &mut ConversionContext) -> Result<String> {
         let key = if self.is_key { "key.subject.name.strategy" } else { "value.subject.name.strategy" };
         let strategy = self.options.get(key).map_or("io.confluent.kafka.serializers.subject.TopicNameStrategy", String::as_str);
         if strategy == "io.confluent.kafka.serializers.subject.TopicNameStrategy" { return Ok(format!("{topic}-{}", if self.is_key { "key" } else { "value" })); }
-        let schema: Json = serde_json::from_str(schema).map_err(|cause| error("schema-registry", cause))?;
-        let name = match self.format {
-            RegistryFormat::Json => schema.get("title").and_then(Json::as_str).map(str::to_owned),
-            RegistryFormat::Avro => schema.get("name").and_then(Json::as_str).map(|name| if name.contains('.') { name.into() } else if let Some(namespace) = schema.get("namespace").and_then(Json::as_str).filter(|name| !name.is_empty()) { format!("{namespace}.{name}") } else { name.into() }),
+        let name = match plan {
+            DocumentPlan::Avro { datum, .. } => datum.subject_record_name(context)?,
+            DocumentPlan::Json => {
+                let schema: Json = serde_json::from_str(schema).map_err(|cause| error("schema-registry", cause))?;
+                schema.get("title").and_then(Json::as_str).map(str::to_owned)
+            }
         }.ok_or_else(|| error("schema-registry", "Record subject naming requires a named schema"))?;
         match strategy {
             "io.confluent.kafka.serializers.subject.RecordNameStrategy" => Ok(name),
@@ -455,12 +488,9 @@ mod configuration_tests {
         RegistryConverter::open(&spec, RegistryFormat::Avro, false)
     }
 
-    fn document(schema: &str, context: &mut ConversionContext) -> Arc<SchemaDocument> {
-        Arc::new(SchemaDocument {
-            root: RegistrySchema { schema: schema.into(), schema_type: Some("AVRO".into()), references: Vec::new(), rule_set: None, metadata: None },
-            references: ResolvedReferences::default(), subject: "events-value".into(), version: 1, bytes: schema.len(),
-            charge: context.reserve(schema.len() * 4 + 1024).unwrap(),
-        })
+    async fn document(converter: &mut RegistryConverter, schema: &str, context: &mut ConversionContext) -> Arc<SchemaDocument> {
+        let root = RegistrySchema { schema: schema.into(), schema_type: Some("AVRO".into()), references: Vec::new(), rule_set: None, metadata: None };
+        converter.document(root, "events-value".into(), 1, context).await.unwrap()
     }
 
     #[tokio::test]
@@ -471,7 +501,7 @@ mod configuration_tests {
             let mut converter = configured(mode, "true").unwrap();
             let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
             assert_eq!(converter.decode("events", None, &mut context).await.unwrap().value, rtdb_types::Value::Null);
-            let writer = document(r#""int""#, &mut context);
+            let writer = document(&mut converter, r#""int""#, &mut context).await;
             let key = converter.bind_reader("events", 1, writer, None, &mut context).await.unwrap();
             let Decoded::Data(value) = converter.bindings.get_mut(&key).unwrap().decode(&[14], &converter.options, &mut converter.next_avro_union, &mut context).unwrap() else { panic!("expected decoded primitive") };
             assert_eq!(value.value, rtdb_types::Value::I32(7));
@@ -484,7 +514,7 @@ mod configuration_tests {
             let mut converter = configured(mode, "true").unwrap();
             let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
             for schema in [r#"{"type":"record","name":"Missing","fields":[]}"#, r#"{"type":"int","custom":"property"}"#] {
-                let writer = document(schema, &mut context);
+                let writer = document(&mut converter, schema, &mut context).await;
                 assert!(converter.bind_reader("events", 1, writer, None, &mut context).await.is_err());
                 assert!(converter.bindings.is_empty());
             }
@@ -495,8 +525,8 @@ mod configuration_tests {
     async fn explicit_specific_reader_binding_bypasses_primitive_class_construction() {
         let mut converter = configured("specific.avro.reader", "true").unwrap();
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
-        let writer = document(r#"{"type":"int","custom":"property"}"#, &mut context);
-        let reader = document(r#""long""#, &mut context);
+        let writer = document(&mut converter, r#"{"type":"int","custom":"property"}"#, &mut context).await;
+        let reader = document(&mut converter, r#""long""#, &mut context).await;
         assert!(converter.bind_reader("events", 1, writer, Some(reader), &mut context).await.is_ok());
     }
 
