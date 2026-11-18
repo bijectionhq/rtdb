@@ -265,6 +265,21 @@ impl TransactionBuffer {
         pending.reservations.push(reservation);
         Ok(())
     }
+    pub fn declare_document_types<'a>(&mut self, table: &TableRef, fields: impl IntoIterator<Item = (&'a String, &'a LogicalType)>) -> Result<()> {
+        let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Put schema requires an open table write"))?;
+        for (name, ty) in fields {
+            let existing = pending.declared.get(name);
+            if existing == Some(ty) { continue; }
+            let bytes = ty.retained_bytes()?.checked_add(existing.map_or(Ok(0), LogicalType::retained_bytes)?)
+                .and_then(|bytes| bytes.checked_add(name.len())).and_then(|bytes| bytes.checked_add(512))
+                .and_then(|bytes| bytes.checked_mul(8)).ok_or_else(|| invalid("Declared schema size overflow"))?;
+            let reservation = self.budget.reserve(bytes)?;
+            let merged = existing.map_or_else(|| ty.clone(), |existing| existing.join(ty));
+            pending.declared.insert(name.clone(), merged);
+            pending.reservations.push(reservation);
+        }
+        Ok(())
+    }
     pub fn put(&mut self, table: TableRef, document: BTreeMap<String, Value>, valid_time: Interval) -> Result<()> {
         let id = document.get("_id").ok_or_else(|| invalid("Put document has no _id"))?.entity_id()?;
         self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Put(document), recency: None })

@@ -10,6 +10,7 @@ use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{Documents, EntityIds, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
+use crate::values::DecodedDocumentLayout;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
@@ -82,6 +83,7 @@ impl SourceTransaction {
             let metadata = optional_cell(first.batch(), "user-metadata", 0)?;
             if !matches!(metadata, Value::Null | Value::Undefined) { options.user_metadata = Some(UserMetadata::new(metadata, memory)?); }
         }
+        let mut reader = SourceOperationReader { memory, parsed_fields, layouts: BTreeMap::new() };
         let mut operations = Vec::new();
         for page in &pages {
             let batch = page.batch();
@@ -91,7 +93,7 @@ impl SourceTransaction {
                 list.value(0)
             } else { Arc::clone(column) };
             let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Transaction operations are not a union"))?;
-            for row in 0..union.len() { operations.push(decode_operation(union, row, memory, parsed_fields)?); }
+            for row in 0..union.len() { operations.push(reader.operation(union, row)?); }
         }
         Self::from_operations(operations, options, memory)
     }
@@ -270,9 +272,13 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
     let mut length = 0usize;
     for list in &lists {
         for name in list.columns() {
+            let declared = list.declared_types().and_then(|columns| columns.get(name));
             if let std::collections::btree_map::Entry::Vacant(field) = fields.entry(name.as_str()) {
-                field.insert((LogicalType::Nothing, 0));
+                field.insert((declared.cloned().unwrap_or(LogicalType::Nothing), 0));
                 order.push(name.as_str());
+            } else if let Some(declared) = declared {
+                let (ty, _) = fields.get_mut(name.as_str()).expect("ordered document column has a type");
+                if ty != declared { *ty = ty.join(declared); }
             }
         }
         for document in list.rows() {
@@ -302,62 +308,77 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
     Ok(Arc::new(ListArray::try_new(field, OffsetBuffer::new(ScalarBuffer::from(offsets)), structs, None).map_err(|error| invalid(error.to_string()))?))
 }
 
-fn decode_operation(union: &UnionArray, row: usize, memory: &Arc<MemoryBudget>, parsed_fields: &mut MemoryReservation) -> Result<Operation> {
-    let (name, array, offset) = union_leg(union, row)?;
-    let base = parsed_fields.bytes().checked_add(name.capacity()).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(overflow)?;
-    if name == "xtql" || name == "call" {
-        parsed_fields.grow_to(base)?;
-        return Ok(Operation::Removed(name));
-    }
-    let body = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Transaction operation leg is not a struct"))?;
-    let value_fields: &[&str] = match name.as_str() {
-        "sql" => &["query", "args"],
-        "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
-        "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
-        "erase-docs" => &["table", "iids"],
-        _ => &[],
-    };
-    let bound = body.fields().iter().zip(body.columns()).filter(|(field, _)| value_fields.contains(&field.name().as_str()))
-        .try_fold(base, |bytes, (field, column)| bytes.checked_add(estimate_read_value_bytes(field, column.as_ref(), offset)?).ok_or_else(overflow))?;
-    parsed_fields.grow_to(bound)?;
-    let value = |name| struct_cell(body, name, offset);
-    let operation = match name.as_str() {
-        "sql" => {
-            let sql = match value("query")? { Value::Utf8(sql) => sql, _ => return Err(invalid("SQL operation has no query")) };
-            let args = match value("args")? { Value::Null | Value::Undefined => None, Value::Binary(bytes) => Some(decode_arguments(&bytes, memory)?), _ => return Err(invalid("SQL arguments are not IPC bytes")) };
-            TxOp::Sql { sql, args }
+struct SourceOperationReader<'a> {
+    memory: &'a Arc<MemoryBudget>,
+    parsed_fields: &'a mut MemoryReservation,
+    layouts: BTreeMap<usize, Arc<DecodedDocumentLayout>>,
+}
+
+impl SourceOperationReader<'_> {
+    fn operation(&mut self, union: &UnionArray, row: usize) -> Result<Operation> {
+        let memory = self.memory;
+        let parsed_fields = &mut *self.parsed_fields;
+        let (name, array, offset) = union_leg(union, row)?;
+        let base = parsed_fields.bytes().checked_add(name.capacity()).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(overflow)?;
+        if name == "xtql" || name == "call" {
+            parsed_fields.grow_to(base)?;
+            return Ok(Operation::Removed(name));
         }
-        "put-docs" | "patch-docs" => {
-            let docs_array = body.column_by_name("documents").ok_or_else(|| invalid("Document operation has no documents"))?;
-            let docs_union = docs_array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
-            let (table, docs_array, docs_offset) = union_leg(docs_union, offset)?;
-            let table = parse_table(&table)?;
-            let lists = docs_array.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Documents are not a list"))?;
-            if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }
-            let rows = lists.value(docs_offset);
-            let structs = rows.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document is not a struct"))?;
-            let documents = Documents::read_arrow(structs, memory)?;
-            let valid_from = optional_timestamp(value("_valid_from")?)?;
-            let valid_to = optional_timestamp(value("_valid_to")?)?;
-            let iids = match value("iids")? { Value::Null | Value::Undefined => None, values => Some(iids(values)?) };
-            if iids.as_ref().is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(invalid("Document and IID counts differ")); }
-            if name == "put-docs" {
-                if let Some(iids) = iids { return Ok(Operation::PutIids { table, documents, iids, valid_from, valid_to }); }
-                TxOp::PutDocs { table, documents, valid_from, valid_to }
-            } else {
-                if let Some(iids) = iids { return Ok(Operation::PatchIids { table, documents, iids, valid_from, valid_to }); }
-                return Err(invalid("Patch operation has no IIDs"));
+        let body = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Transaction operation leg is not a struct"))?;
+        let value_fields: &[&str] = match name.as_str() {
+            "sql" => &["query", "args"],
+            "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
+            "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
+            "erase-docs" => &["table", "iids"],
+            _ => &[],
+        };
+        let bound = body.fields().iter().zip(body.columns()).filter(|(field, _)| value_fields.contains(&field.name().as_str()))
+            .try_fold(base, |bytes, (field, column)| bytes.checked_add(estimate_read_value_bytes(field, column.as_ref(), offset)?).ok_or_else(overflow))?;
+        parsed_fields.grow_to(bound)?;
+        let value = |name| struct_cell(body, name, offset);
+        let operation = match name.as_str() {
+            "sql" => {
+                let sql = match value("query")? { Value::Utf8(sql) => sql, _ => return Err(invalid("SQL operation has no query")) };
+                let args = match value("args")? { Value::Null | Value::Undefined => None, Value::Binary(bytes) => Some(decode_arguments(&bytes, memory)?), _ => return Err(invalid("SQL arguments are not IPC bytes")) };
+                TxOp::Sql { sql, args }
             }
-        }
-        "delete-docs" | "erase-docs" => {
-            let table = match value("table")? { Value::Utf8(table) => parse_table(&table)?, _ => return Err(invalid("Delete/erase has no table")) };
-            let ids = EntityIds::new(iids(value("iids")?)?.into_iter().map(|iid| EntityId::Uuid(iid.0)).collect(), memory)?;
-            if name == "delete-docs" { TxOp::DeleteDocs { table, ids, valid_from: optional_timestamp(value("_valid_from")?)?, valid_to: optional_timestamp(value("_valid_to")?)? } }
-            else { TxOp::EraseDocs { table, ids } }
-        }
-        _ => return Err(invalid(format!("Unknown transaction operation {name}"))),
-    };
-    Ok(Operation::Public(operation))
+            "put-docs" | "patch-docs" => {
+                let docs_array = body.column_by_name("documents").ok_or_else(|| invalid("Document operation has no documents"))?;
+                let docs_union = docs_array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
+                let (table, docs_array, docs_offset) = union_leg(docs_union, offset)?;
+                let table = parse_table(&table)?;
+                let lists = docs_array.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Documents are not a list"))?;
+                if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }
+                let rows = lists.value(docs_offset);
+                let structs = rows.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document is not a struct"))?;
+                let identity = structs.fields().as_ptr() as usize;
+                let layout = match self.layouts.entry(identity) {
+                    std::collections::btree_map::Entry::Occupied(layout) => Arc::clone(layout.get()),
+                    std::collections::btree_map::Entry::Vacant(layout) => Arc::clone(layout.insert(DecodedDocumentLayout::new(structs.fields(), memory)?)),
+                };
+                let documents = Documents::read_arrow(structs, layout, name == "put-docs", memory)?;
+                let valid_from = optional_timestamp(value("_valid_from")?)?;
+                let valid_to = optional_timestamp(value("_valid_to")?)?;
+                let iids = match value("iids")? { Value::Null | Value::Undefined => None, values => Some(iids(values)?) };
+                if iids.as_ref().is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(invalid("Document and IID counts differ")); }
+                if name == "put-docs" {
+                    if let Some(iids) = iids { return Ok(Operation::PutIids { table, documents, iids, valid_from, valid_to }); }
+                    TxOp::PutDocs { table, documents, valid_from, valid_to }
+                } else {
+                    if let Some(iids) = iids { return Ok(Operation::PatchIids { table, documents, iids, valid_from, valid_to }); }
+                    return Err(invalid("Patch operation has no IIDs"));
+                }
+            }
+            "delete-docs" | "erase-docs" => {
+                let table = match value("table")? { Value::Utf8(table) => parse_table(&table)?, _ => return Err(invalid("Delete/erase has no table")) };
+                let ids = EntityIds::new(iids(value("iids")?)?.into_iter().map(|iid| EntityId::Uuid(iid.0)).collect(), memory)?;
+                if name == "delete-docs" { TxOp::DeleteDocs { table, ids, valid_from: optional_timestamp(value("_valid_from")?)?, valid_to: optional_timestamp(value("_valid_to")?)? } }
+                else { TxOp::EraseDocs { table, ids } }
+            }
+            _ => return Err(invalid(format!("Unknown transaction operation {name}"))),
+        };
+        Ok(Operation::Public(operation))
+    }
 }
 
 pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
@@ -503,10 +524,12 @@ mod tests {
             let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("first put"); };
             assert_eq!(documents.columns(), ["z", "_id", "n", "b"]);
             assert_eq!(documents.rows()[0]["z"], Value::Utf8("last".into()));
-            assert_eq!(documents.rows()[0]["n"], Value::Null);
+            assert_eq!(documents.declared_types().unwrap()["n"], LogicalType::Null);
+            assert!(!documents.rows()[0].contains_key("n"));
             let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("second put"); };
             assert_eq!(documents.columns(), ["_id", "e"]);
-            assert_eq!(documents.rows()[0]["e"], Value::Null);
+            assert_eq!(documents.declared_types().unwrap()["e"], LogicalType::Null);
+            assert!(!documents.rows()[0].contains_key("e"));
             let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("third put"); };
             assert_eq!(documents.columns(), ["z", "_id", "n", "b"]);
             assert_eq!(documents.rows()[0]["z"], Value::I64(7));
@@ -537,7 +560,7 @@ mod tests {
 
     #[test]
     fn source_reads_sparse_documents_with_one_row_of_decode_scratch() {
-        let memory = MemoryBudget::new(1 << 28);
+        let memory = MemoryBudget::new(1 << 25);
         let operations = (0..100).map(|id| {
             let mut row = BTreeMap::from([("_id".into(), Value::I64(id))]);
             for index in 0..10 {
@@ -559,7 +582,8 @@ mod tests {
         let Operation::PutIids { documents, .. } = &decoded.operations[99] else { panic!("Expected decoded put"); };
         assert_eq!(documents.columns().len(), 1001);
         assert_eq!(documents.rows()[0]["field_99_9"], Value::Utf8("value_99_9".into()));
-        assert_eq!(documents.rows()[0]["field_0_0"], Value::Null);
+        assert_eq!(documents.declared_types().unwrap()["field_0_0"], LogicalType::Scalar(ScalarType::Utf8).maybe());
+        assert!(!documents.rows()[0].contains_key("field_0_0"));
     }
 
     #[test]

@@ -446,6 +446,21 @@
 
 (deftest-original-api original-node/non-namespaced-keys-for-structs-2418)
 
+(deftest-original-api original-node/large-xt-stars-2484)
+
+(deftest wide-sparse-document-transactions-commit-and-retain-their-declared-columns
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (let [writes (for [id (range 100)]
+                   (let [doc (into {:xt/id id}
+                                   (for [column (range 10)]
+                                     [(keyword (str "field_" id "_" column))
+                                      (str "value_" id "_" column)]))]
+                     [:put-docs :docs (cond-> doc (zero? id) (assoc :all_null nil))]))]
+      (is (= 0 (:tx-id (xt/execute-tx node writes))))
+      (is (= [{:field-99-9 "value_99_9"}]
+             (xt/q node "SELECT field_99_9, field_0_0, all_null FROM docs WHERE _id = 99"))))))
+
 (deftest-original-api original-node/non-existant-column-no-nil-rows-2898)
 
 (deftest-original-api original-node/test-get-field-on-duv-with-struct-2425)

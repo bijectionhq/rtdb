@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, StructArray};
-use arrow_schema::DataType;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes, read_value};
+use arrow_schema::{DataType, Fields, Schema};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes, from_field, read_value};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 #[derive(Clone, Debug)]
@@ -29,8 +29,32 @@ pub struct Documents(Arc<DocumentBatch>);
 #[derive(Debug)]
 struct DocumentBatch {
     rows: Vec<BTreeMap<String, Value>>,
-    columns: Vec<String>,
+    layout: DocumentLayout,
     _reservation: Arc<MemoryReservation>,
+}
+
+#[derive(Debug)]
+enum DocumentLayout { Submitted(Vec<String>), Decoded(Arc<DecodedDocumentLayout>) }
+
+#[derive(Debug)]
+pub(crate) struct DecodedDocumentLayout {
+    physical: Fields,
+    columns: Vec<String>,
+    types: BTreeMap<String, LogicalType>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl DecodedDocumentLayout {
+    pub(crate) fn new(fields: &Fields, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let schema = Schema::new(fields.clone());
+        let reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let columns = fields.iter().map(|field| field.name().clone()).collect();
+        let types = fields.iter().map(|field| Ok((field.name().clone(), from_field(field)?))).collect::<Result<BTreeMap<_, _>>>()?;
+        if types.len() != fields.len() {
+            return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document columns must be unique"));
+        }
+        Ok(Arc::new(Self { physical: fields.clone(), columns, types, _reservation: reservation }))
+    }
 }
 
 impl Documents {
@@ -67,33 +91,36 @@ impl Documents {
             return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document columns must be unique and cover every field in every row"));
         }
         for row in &mut rows { row.values_mut().for_each(Value::admit_object_dates); }
-        Ok(Self(Arc::new(DocumentBatch { rows, columns, _reservation: reservation })))
+        Ok(Self(Arc::new(DocumentBatch { rows, layout: DocumentLayout::Submitted(columns), _reservation: reservation })))
     }
 
     pub fn rows(&self) -> &[BTreeMap<String, Value>] { &self.0.rows }
 
     /// Returns the source column order for this document batch.
-    pub fn columns(&self) -> &[String] { &self.0.columns }
+    pub fn columns(&self) -> &[String] {
+        match &self.0.layout { DocumentLayout::Submitted(columns) => columns, DocumentLayout::Decoded(layout) => &layout.columns }
+    }
 
-    pub(crate) fn read_arrow(array: &StructArray, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let columns = array.fields().iter().try_fold(128usize, |bytes, field| {
-            bytes.checked_add(field.name().len()).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)
-        })?;
-        let mut retained = array.len().checked_mul(std::mem::size_of::<BTreeMap<String, Value>>())
-            .and_then(|bytes| bytes.checked_add(columns)).ok_or_else(overflow)?;
-        let mut reservation = memory.reserve(retained)?;
-        let names: BTreeSet<_> = array.fields().iter().map(|field| field.name()).collect();
-        if names.len() != array.fields().len() {
-            return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document columns must be unique"));
+    pub(crate) fn declared_types(&self) -> Option<&BTreeMap<String, LogicalType>> {
+        match &self.0.layout { DocumentLayout::Submitted(_) => None, DocumentLayout::Decoded(layout) => Some(&layout.types) }
+    }
+
+    pub(crate) fn read_arrow(array: &StructArray, layout: Arc<DecodedDocumentLayout>, omit_nulls: bool, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if array.fields() != &layout.physical {
+            return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document arrays and their column layout differ"));
         }
-        drop(names);
-        let columns = array.fields().iter().map(|field| field.name().clone()).collect();
-        let children = || array.fields().iter().zip(array.columns());
+        let mut retained = array.len().checked_mul(std::mem::size_of::<BTreeMap<String, Value>>())
+            .and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)?;
+        let mut reservation = memory.reserve(retained)?;
         let entry = std::mem::size_of::<(String, Value)>() * 16 + 256;
         let bottom = |field: &arrow_schema::Field| field.data_type() == &DataType::Null && !field.is_nullable();
         let mut rows = Vec::with_capacity(array.len());
         for row in 0..array.len() {
             if array.is_null(row) { return Err(Anomaly::incorrect("rtdb.tx/invalid-ipc", "Document is not a struct")); }
+            let preserve_null = |field: &arrow_schema::Field| !omit_nulls || field.name() == "_id";
+            let children = || array.fields().iter().zip(array.columns()).filter(|(field, column)| {
+                preserve_null(field) || bottom(field) || (field.data_type() != &DataType::Null && column.is_valid(row))
+            });
             let temporary = children().try_fold(4096usize, |bytes, (field, column)| {
                 let value = if bottom(field) { 0 } else { estimate_read_value_bytes(field, column.as_ref(), row)? };
                 bytes.checked_add(value).and_then(|bytes| bytes.checked_add(field.name().len()))
@@ -101,16 +128,19 @@ impl Documents {
             })?;
             let reservation = Arc::get_mut(&mut reservation).expect("document decoding owns its reservation");
             reservation.grow_to(retained.checked_add(temporary).ok_or_else(overflow)?)?;
-            let document = children().map(|(field, column)| {
+            let mut document = BTreeMap::new();
+            for (field, column) in children() {
                 let mut value = if bottom(field) { Value::Undefined } else { read_value(field, column.as_ref(), row)? };
-                value.admit_object_dates();
-                Ok((field.name().clone(), value))
-            }).collect::<Result<BTreeMap<_, _>>>()?;
+                if preserve_null(field) || !matches!(value, Value::Null) {
+                    value.admit_object_dates();
+                    document.insert(field.name().clone(), value);
+                }
+            }
             retained = retained.checked_add(Value::document_retained_bytes(&document)?).ok_or_else(overflow)?;
             reservation.shrink_to(retained)?;
             rows.push(document);
         }
-        Ok(Self(Arc::new(DocumentBatch { rows, columns, _reservation: reservation })))
+        Ok(Self(Arc::new(DocumentBatch { rows, layout: DocumentLayout::Decoded(layout), _reservation: reservation })))
     }
 }
 

@@ -365,8 +365,8 @@ impl<'a> OpenTransaction<'a> {
                 for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types())).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
                 Ok(())
             }
-            Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents.rows(), None, *valid_from, *valid_to),
-            Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents.rows(), Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to),
+            Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to),
             Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
                 check_table(table)?;
                 let interval = interval(valid_from.unwrap_or(self.tx_key().system_time), valid_to.unwrap_or(Timestamp::MAX))?;
@@ -401,16 +401,20 @@ impl<'a> OpenTransaction<'a> {
         let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
         self.execute_mutation(mutation, context, None, None).await
     }
-    fn put_documents(&mut self, table: &TableRef, documents: &[BTreeMap<String, Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
-        if iids.is_some_and(|iids| iids.len() != documents.len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
-        for (index, document) in documents.iter().enumerate() {
+    fn put_documents(&mut self, table: &TableRef, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        if iids.is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
+        let is_content = |name: &str| !matches!(name, "_valid_from" | "_valid_to");
+        for (index, document) in documents.rows().iter().enumerate() {
             let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
             let default_from = from.unwrap_or(self.tx_key().system_time);
             let default_to = to.unwrap_or(Timestamp::MAX);
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
-            let document = document.iter().filter(|(name, _)| name.as_str() != "_valid_from" && name.as_str() != "_valid_to").map(|(name, value)| (name.clone(), value.clone())).collect();
+            let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
             self.buffer.append(table.clone(), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(row_from, row_to)?, operation: StoredOperation::Put(document), recency: None })?;
+        }
+        if let Some(types) = documents.declared_types().filter(|_| !documents.rows().is_empty()) {
+            self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
         }
         Ok(())
     }
