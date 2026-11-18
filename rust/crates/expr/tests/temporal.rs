@@ -1,6 +1,6 @@
 use rtdb_expr::{EvalContext, arithmetic_in_timezone, cast, cast_target, evaluate, scalar_call};
 use rtdb_plan::{BinaryOp as B, CastTarget, Expr, Schema, UnaryOp};
-use rtdb_types::{IntervalUnit as I, LogicalType as T, ScalarType as S, TimeUnit as U, Timestamp, Value as V};
+use rtdb_types::{IntervalUnit as I, LogicalType as T, ScalarType as S, TimeUnit as U, Value as V};
 
 fn date(text: &str) -> V {
     let value = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap();

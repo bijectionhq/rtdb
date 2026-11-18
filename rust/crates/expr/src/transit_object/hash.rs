@@ -4,7 +4,6 @@ use super::{Object,invalid};
 
 pub(super) fn string(text: &str) -> i32 { text.encode_utf16().fold(0i32,|hash,ch|hash.wrapping_mul(31).wrapping_add(i32::from(ch))) }
 pub(super) fn int(value: i32) -> i32 { if value == 0 { 0 } else { rtdb_columnar::murmur3_32(&value.to_le_bytes(),0) as i32 } }
-pub(super) fn long(value: i64) -> i32 { if value == 0 { 0 } else { rtdb_columnar::murmur3_32(&value.to_le_bytes(),0) as i32 } }
 fn combine(seed: i32,hash: i32) -> i32 { seed ^ hash.wrapping_add(0x9e37_79b9u32 as i32).wrapping_add(seed << 6).wrapping_add(seed >> 2) }
 fn symbol(text: &str,equivalent: bool) -> i32 {
     let (namespace,name) = if text == "/" { (None,text) } else { text.split_once('/').map_or((None,text),|(namespace,name)|(Some(namespace),name)) };

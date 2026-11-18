@@ -41,7 +41,7 @@ impl CompileFailure {
 }
 
 impl PatternFailure {
-    pub(super) fn error(&self) -> &Anomaly { self.error.error() }
+    #[cfg(test)] pub(super) fn error(&self) -> &Anomaly { self.error.error() }
 
     fn retain(error: Anomaly, pattern: JavaText<'_>, adapter_point: Option<usize>, syntax: Option<Syntax<'_>>, context: &EvalContext<'_>) -> Result<Self> {
         let error = RetainedAnomaly::retain(error, context)?;
@@ -77,7 +77,7 @@ impl RetainedAnomaly {
         Ok(Self { error, _reservation: reservation })
     }
 
-    pub(super) fn error(&self) -> &Anomaly { &self.error }
+    #[cfg(test)] pub(super) fn error(&self) -> &Anomaly { &self.error }
     pub(super) fn legacy(self) -> Anomaly { self.error }
 }
 
