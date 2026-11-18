@@ -15,12 +15,14 @@ mod properties;
 mod property_order;
 mod evaluation;
 mod context;
+mod producer;
 pub(super) use text::Text;
 pub(super) use names::Name;
 pub(super) use json::{JsonNode, JsonValue, Members};
 pub(super) use properties::Properties;
 pub(super) use evaluation::{Evaluation, RecursionState, Witness};
 pub(super) use context::{CycleContext, CycleReference};
+pub(super) use producer::{ParsedPair, PairSelection, SourcePolicy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SchemaId { region: u64, index: usize }
@@ -351,6 +353,7 @@ impl SchemaHandle {
     }
     /// Native definitions and this arena must be paired by the same validated source producer.
     /// Equal full names in independently produced documents do not establish source object identity.
+    #[cfg(test)]
     pub(super) fn canonical_native_record(&self, source: &apache_avro::Schema, definitions: &BTreeMap<String, apache_avro::Schema>) -> Result<Option<Self>> {
         let apache_avro::Schema::Record(record) = super::resolve(source, definitions)? else { return Ok(None); };
         let parts = super::names::NameParts::parse(&record.name.name, record.name.namespace.as_deref())

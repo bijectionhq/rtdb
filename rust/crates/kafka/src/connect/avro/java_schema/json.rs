@@ -28,6 +28,22 @@ fn double_bits(value: f64) -> u64 { if value.is_nan() { 0x7ff8000000000000 } els
 fn guard(depth: usize) -> Result<()> { guard_depth(depth, "JsonNode traversal exceeds the native traversal depth limit of 128") }
 
 impl JsonNode {
+    pub(super) fn value(&self) -> &JsonValue { &self.data.value }
+    pub(super) fn get(&self, key: &str) -> Option<&JsonNode> {
+        match &self.data.value { JsonValue::Object(values) => values.get_text(JavaText::from_utf8(key)), _ => None }
+    }
+    pub(super) fn integral_long(&self) -> Option<i64> {
+        match &self.data.value {
+            JsonValue::I32(value) => Some(i64::from(*value)),
+            JsonValue::I64(value) => Some(*value),
+            JsonValue::Integer(value) if value.words.len() <= 2 => {
+                let magnitude = u64::from(value.words.first().copied().unwrap_or(0)) | (u64::from(value.words.get(1).copied().unwrap_or(0)) << 32);
+                if value.negative { (magnitude <= 1u64 << 63).then(|| magnitude.wrapping_neg() as i64) }
+                else { i64::try_from(magnitude).ok() }
+            }
+            _ => None,
+        }
+    }
     /// `bound` admits every allocation in `build` not separately retained by its returned child/text owners.
     pub(in crate::connect::avro) fn with(bound: usize, context: &mut ConversionContext, build: impl FnOnce(&mut ConversionContext) -> Result<JsonValue>) -> Result<Self> {
         let charge = context.reserve(add(add(bound, size_of::<JsonData>())?, 4096)?)?;
@@ -165,8 +181,11 @@ impl JsonNode {
 impl Members {
     pub(in crate::connect::avro) fn empty() -> Self { Self { fields: Vec::new(), lookup: Vec::new(), charges: Vec::new() } }
     pub(in crate::connect::avro) fn with(entry_vector_bytes: usize, context: &mut ConversionContext, build: impl FnOnce() -> Result<Vec<(Text, JsonNode)>>) -> Result<Self> {
+        Self::with_context(entry_vector_bytes, context, |_| build())
+    }
+    pub(super) fn with_context(entry_vector_bytes: usize, context: &mut ConversionContext, build: impl FnOnce(&mut ConversionContext) -> Result<Vec<(Text, JsonNode)>>) -> Result<Self> {
         let payload = context.reserve(add(entry_vector_bytes, 4096)?)?;
-        let mut fields = build()?;
+        let mut fields = build(context)?;
         let index = context.reserve(add(mul(mul(fields.len(), size_of::<usize>())?, 16)?, 256)?)?;
         let mut lookup = Vec::new();
         lookup.try_reserve_exact(fields.len()).map_err(allocation)?;
@@ -206,7 +225,10 @@ impl Members {
         self.fields.iter().map(|(key, value)| (key, value))
     }
     pub(super) fn get(&self, key: &Text) -> Option<&JsonNode> {
-        self.lookup.binary_search_by(|index| self.fields[*index].0.cmp(key)).ok()
+        self.get_text(key.view())
+    }
+    fn get_text(&self, key: JavaText<'_>) -> Option<&JsonNode> {
+        self.lookup.binary_search_by(|index| self.fields[*index].0.view().units().cmp(key.units())).ok()
             .map(|index| &self.fields[self.lookup[index]].1)
     }
     pub(super) fn len(&self) -> usize { self.fields.len() }

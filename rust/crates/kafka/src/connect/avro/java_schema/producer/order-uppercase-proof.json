@@ -1,0 +1,1017 @@
+{
+  "profile": "Unicode16 + Temurin25 English String.toUpperCase",
+  "data_only_derivation": true,
+  "execution": "No JVM, Rust or project code executed. Python parsed pinned text tables.",
+  "source_sha256": {
+    "unicode16-UnicodeData.txt": "ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f",
+    "unicode16-SpecialCasing.txt": "8d5de354eef79f2395a54c9c7dcebbaf3d30fc962d0f85611ea97aa973a0c451"
+  },
+  "words": [
+    "ASCENDING",
+    "DESCENDING",
+    "IGNORE"
+  ],
+  "codepoints_considered": 1114112,
+  "single_codepoint_preimages": {
+    "A": [
+      "U+0041",
+      "U+0061"
+    ],
+    "C": [
+      "U+0043",
+      "U+0063"
+    ],
+    "D": [
+      "U+0044",
+      "U+0064"
+    ],
+    "E": [
+      "U+0045",
+      "U+0065"
+    ],
+    "G": [
+      "U+0047",
+      "U+0067"
+    ],
+    "I": [
+      "U+0049",
+      "U+0069",
+      "U+0131"
+    ],
+    "N": [
+      "U+004E",
+      "U+006E"
+    ],
+    "O": [
+      "U+004F",
+      "U+006F"
+    ],
+    "R": [
+      "U+0052",
+      "U+0072"
+    ],
+    "S": [
+      "U+0053",
+      "U+0073",
+      "U+017F"
+    ]
+  },
+  "non_ascii_preimages": [
+    "U+0131",
+    "U+017F"
+  ],
+  "unconditional_multicodepoint_expansions_matching_target_substrings": [],
+  "conditional_special_mappings": [
+    {
+      "source": "U+00DF",
+      "upper": [
+        "U+0053",
+        "U+0053"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+0130",
+      "upper": [
+        "U+0130"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB00",
+      "upper": [
+        "U+0046",
+        "U+0046"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB01",
+      "upper": [
+        "U+0046",
+        "U+0049"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB02",
+      "upper": [
+        "U+0046",
+        "U+004C"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB03",
+      "upper": [
+        "U+0046",
+        "U+0046",
+        "U+0049"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB04",
+      "upper": [
+        "U+0046",
+        "U+0046",
+        "U+004C"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB05",
+      "upper": [
+        "U+0053",
+        "U+0054"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB06",
+      "upper": [
+        "U+0053",
+        "U+0054"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+0587",
+      "upper": [
+        "U+0535",
+        "U+0552"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB13",
+      "upper": [
+        "U+0544",
+        "U+0546"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB14",
+      "upper": [
+        "U+0544",
+        "U+0535"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB15",
+      "upper": [
+        "U+0544",
+        "U+053B"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB16",
+      "upper": [
+        "U+054E",
+        "U+0546"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+FB17",
+      "upper": [
+        "U+0544",
+        "U+053D"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+0149",
+      "upper": [
+        "U+02BC",
+        "U+004E"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+0390",
+      "upper": [
+        "U+0399",
+        "U+0308",
+        "U+0301"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+03B0",
+      "upper": [
+        "U+03A5",
+        "U+0308",
+        "U+0301"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+01F0",
+      "upper": [
+        "U+004A",
+        "U+030C"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1E96",
+      "upper": [
+        "U+0048",
+        "U+0331"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1E97",
+      "upper": [
+        "U+0054",
+        "U+0308"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1E98",
+      "upper": [
+        "U+0057",
+        "U+030A"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1E99",
+      "upper": [
+        "U+0059",
+        "U+030A"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1E9A",
+      "upper": [
+        "U+0041",
+        "U+02BE"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F50",
+      "upper": [
+        "U+03A5",
+        "U+0313"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F52",
+      "upper": [
+        "U+03A5",
+        "U+0313",
+        "U+0300"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F54",
+      "upper": [
+        "U+03A5",
+        "U+0313",
+        "U+0301"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F56",
+      "upper": [
+        "U+03A5",
+        "U+0313",
+        "U+0342"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FB6",
+      "upper": [
+        "U+0391",
+        "U+0342"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FC6",
+      "upper": [
+        "U+0397",
+        "U+0342"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FD2",
+      "upper": [
+        "U+0399",
+        "U+0308",
+        "U+0300"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FD3",
+      "upper": [
+        "U+0399",
+        "U+0308",
+        "U+0301"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FD6",
+      "upper": [
+        "U+0399",
+        "U+0342"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FD7",
+      "upper": [
+        "U+0399",
+        "U+0308",
+        "U+0342"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FE2",
+      "upper": [
+        "U+03A5",
+        "U+0308",
+        "U+0300"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FE3",
+      "upper": [
+        "U+03A5",
+        "U+0308",
+        "U+0301"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FE4",
+      "upper": [
+        "U+03A1",
+        "U+0313"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FE6",
+      "upper": [
+        "U+03A5",
+        "U+0342"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FE7",
+      "upper": [
+        "U+03A5",
+        "U+0308",
+        "U+0342"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FF6",
+      "upper": [
+        "U+03A9",
+        "U+0342"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F80",
+      "upper": [
+        "U+1F08",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F81",
+      "upper": [
+        "U+1F09",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F82",
+      "upper": [
+        "U+1F0A",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F83",
+      "upper": [
+        "U+1F0B",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F84",
+      "upper": [
+        "U+1F0C",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F85",
+      "upper": [
+        "U+1F0D",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F86",
+      "upper": [
+        "U+1F0E",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F87",
+      "upper": [
+        "U+1F0F",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F88",
+      "upper": [
+        "U+1F08",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F89",
+      "upper": [
+        "U+1F09",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F8A",
+      "upper": [
+        "U+1F0A",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F8B",
+      "upper": [
+        "U+1F0B",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F8C",
+      "upper": [
+        "U+1F0C",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F8D",
+      "upper": [
+        "U+1F0D",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F8E",
+      "upper": [
+        "U+1F0E",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F8F",
+      "upper": [
+        "U+1F0F",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F90",
+      "upper": [
+        "U+1F28",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F91",
+      "upper": [
+        "U+1F29",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F92",
+      "upper": [
+        "U+1F2A",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F93",
+      "upper": [
+        "U+1F2B",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F94",
+      "upper": [
+        "U+1F2C",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F95",
+      "upper": [
+        "U+1F2D",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F96",
+      "upper": [
+        "U+1F2E",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F97",
+      "upper": [
+        "U+1F2F",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F98",
+      "upper": [
+        "U+1F28",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F99",
+      "upper": [
+        "U+1F29",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F9A",
+      "upper": [
+        "U+1F2A",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F9B",
+      "upper": [
+        "U+1F2B",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F9C",
+      "upper": [
+        "U+1F2C",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F9D",
+      "upper": [
+        "U+1F2D",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F9E",
+      "upper": [
+        "U+1F2E",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1F9F",
+      "upper": [
+        "U+1F2F",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA0",
+      "upper": [
+        "U+1F68",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA1",
+      "upper": [
+        "U+1F69",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA2",
+      "upper": [
+        "U+1F6A",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA3",
+      "upper": [
+        "U+1F6B",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA4",
+      "upper": [
+        "U+1F6C",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA5",
+      "upper": [
+        "U+1F6D",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA6",
+      "upper": [
+        "U+1F6E",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA7",
+      "upper": [
+        "U+1F6F",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA8",
+      "upper": [
+        "U+1F68",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FA9",
+      "upper": [
+        "U+1F69",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FAA",
+      "upper": [
+        "U+1F6A",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FAB",
+      "upper": [
+        "U+1F6B",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FAC",
+      "upper": [
+        "U+1F6C",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FAD",
+      "upper": [
+        "U+1F6D",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FAE",
+      "upper": [
+        "U+1F6E",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FAF",
+      "upper": [
+        "U+1F6F",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FB3",
+      "upper": [
+        "U+0391",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FBC",
+      "upper": [
+        "U+0391",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FC3",
+      "upper": [
+        "U+0397",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FCC",
+      "upper": [
+        "U+0397",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FF3",
+      "upper": [
+        "U+03A9",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FFC",
+      "upper": [
+        "U+03A9",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FB2",
+      "upper": [
+        "U+1FBA",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FB4",
+      "upper": [
+        "U+0386",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FC2",
+      "upper": [
+        "U+1FCA",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FC4",
+      "upper": [
+        "U+0389",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FF2",
+      "upper": [
+        "U+1FFA",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FF4",
+      "upper": [
+        "U+038F",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FB7",
+      "upper": [
+        "U+0391",
+        "U+0342",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FC7",
+      "upper": [
+        "U+0397",
+        "U+0342",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+1FF7",
+      "upper": [
+        "U+03A9",
+        "U+0342",
+        "U+0399"
+      ],
+      "condition": ""
+    },
+    {
+      "source": "U+03A3",
+      "upper": [
+        "U+03A3"
+      ],
+      "condition": "Final_Sigma"
+    },
+    {
+      "source": "U+0307",
+      "upper": [],
+      "condition": "lt After_Soft_Dotted"
+    },
+    {
+      "source": "U+0049",
+      "upper": [
+        "U+0049"
+      ],
+      "condition": "lt More_Above"
+    },
+    {
+      "source": "U+004A",
+      "upper": [
+        "U+004A"
+      ],
+      "condition": "lt More_Above"
+    },
+    {
+      "source": "U+012E",
+      "upper": [
+        "U+012E"
+      ],
+      "condition": "lt More_Above"
+    },
+    {
+      "source": "U+00CC",
+      "upper": [
+        "U+00CC"
+      ],
+      "condition": "lt"
+    },
+    {
+      "source": "U+00CD",
+      "upper": [
+        "U+00CD"
+      ],
+      "condition": "lt"
+    },
+    {
+      "source": "U+0128",
+      "upper": [
+        "U+0128"
+      ],
+      "condition": "lt"
+    },
+    {
+      "source": "U+0130",
+      "upper": [
+        "U+0130"
+      ],
+      "condition": "tr"
+    },
+    {
+      "source": "U+0130",
+      "upper": [
+        "U+0130"
+      ],
+      "condition": "az"
+    },
+    {
+      "source": "U+0307",
+      "upper": [
+        "U+0307"
+      ],
+      "condition": "tr After_I"
+    },
+    {
+      "source": "U+0307",
+      "upper": [
+        "U+0307"
+      ],
+      "condition": "az After_I"
+    },
+    {
+      "source": "U+0049",
+      "upper": [
+        "U+0049"
+      ],
+      "condition": "tr Not_Before_Dot"
+    },
+    {
+      "source": "U+0049",
+      "upper": [
+        "U+0049"
+      ],
+      "condition": "az Not_Before_Dot"
+    },
+    {
+      "source": "U+0069",
+      "upper": [
+        "U+0130"
+      ],
+      "condition": "tr"
+    },
+    {
+      "source": "U+0069",
+      "upper": [
+        "U+0130"
+      ],
+      "condition": "az"
+    }
+  ],
+  "english_dispatch": "StringUTF16.toUpperCase selects localeDependent=false for English, including surrogate paths. ConditionalSpecialCasing is not selected.",
+  "isolated_surrogates": "Excluded by current UTF8 scalar-text profile; no nonidentity ASCII-target mapping in the pinned tables."
+}

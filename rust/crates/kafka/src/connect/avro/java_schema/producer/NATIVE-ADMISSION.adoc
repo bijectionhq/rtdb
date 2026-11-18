@@ -1,0 +1,133 @@
+= Native paired parse allowance
+
+ParsedPair admits the complete allowance before invoking AvroDatumPlan::parse_with_name_policy.
+The native plan and its trailing reservation remain one immutable owner after the creating ConversionContext drops.
+PairSelection borrows that owner; it never returns an owned native schema or an unchecked native plan.
+A separately returned canonical handle retains its own arena and payload leases.
+
+== Counted input
+
+B is the sum of original document UTF8 bytes, including overwritten members and whitespace.
+J counts final typed JSON values plus object member names across all input documents.
+S counts concrete schema parse occurrences, including textual uses and container branches.
+U counts the actual UTF16 full-name lengths formed for declarations and named lookups, plus every raw named-alias occurrence retained by the native parser.
+Canonical alias assembly first deduplicates raw text and then qualified names, while the native reader metadata preserves repeated raw aliases.
+For each raw-unique alias, the measure reuses its existing Name qualification and multiplies its full-name units by the equal raw-text occurrence count before canonical qualified dedup.
+Both multiplication and accumulation are checked.
+Different raw spellings that qualify to one full name contribute separately; repeated field aliases need no namespace expansion and remain covered by B/J.
+The raw alias array is borrowed for this bounded multiplicity scan, with no extra map, retained payload or qualification allocation.
+A field's textual precheck and subsequent lookup both contribute their formed names.
+A failed primary lookup and its fallback are counted separately.
+D is the greatest inline schema parse demand depth within one document.
+The pair-local native policy parses supplied reference documents incrementally in declaration order without preloading later input_schemas.
+A preceding named dependency is already parsed and returns a nominal reference; the current record's own resolving name also returns a nominal reference.
+Consequently native reference lookup cannot extend the parse stack into another document, and a chain of prior declarations does not increase D.
+All counts and products use checked arithmetic.
+The native depth profile bounds D, and the measure never follows a recursive reference back into its definition.
+
+H = sizeof(serde_json::Value) + sizeof(apache_avro::Schema) + sizeof(RecordField) + 256.
+C = (J + S + 1) * H.
+P = 8 * B + 4 * U.
+K = 2 * (D + 1) + 16.
+The allowance is 16 * K * (C + P) + 65536 bytes.
+
+These are native logical payload and collection credits, not an estimate of JVM object sizes or total process allocator residency.
+The sizeof terms adapt to the target ABI.
+The 256 per-item and 65536 owner envelopes cover map/vector owners, names and fixed bookkeeping beyond their element payloads.
+The collection factor 16 covers growth overlap, vector spare capacity, hash-table control/storage and small B-tree node capacity charged against their live items.
+This uses the same conservative collection-credit convention as the admitted canonical arena and shared collection owners.
+It is deliberately not presented as a tight retained-byte measurement.
+The whole peak allowance remains retained with the cached native plan.
+
+== Expansions removed by the scoped policy
+
+NativePolicy disables named alias indexing while preserving alias metadata.
+register_resolving_schema therefore stores one nominal reference per declaration.
+register_parsed_schema stores one schema subtree per declaration and does not clone it again under each alias.
+Field alias indexing is disabled separately; reader alias metadata stays in RecordField.
+The policy parses the actual field type node separately, preventing textual enum/fixed uses from reaching native incomplete-constructor body clones and array/map names from entering the wrong constructor.
+Flat field logicalType cannot change the native child schema on this route.
+The policy also returns nominal references for named Decimal(Fixed) uses, instead of cloning their definition and custom properties at every use.
+ParsedPair resolves those names through its own native names owner, which explicitly includes Decimal's named Fixed definition.
+Generic/global and previously existing scoped policies retain their old defaults.
+
+Successful canonical assembly precedes the native call.
+It excludes undefined/forward references, duplicate declarations and object-valued type wrappers accepted by some native routes.
+Named object constructors require their complete source declaration members.
+Consequently native incomplete-definition shortcuts cannot expand repeated record/enum/fixed bodies on this route.
+Every successful named use is nominal after the scoped policy, including a logical Fixed use.
+
+Namespace qualification is counted explicitly in U.
+Repeated short references and aliases can each acquire a long inherited namespace, so B alone is insufficient.
+Native name payloads contain valid UTF8 because the current input profile excludes isolated surrogate text.
+Four bytes per UTF16 unit covers their copied UTF8 name/namespace components and separators.
+Declaration names also cover a live enclosing-record fullname temporary used while parsing a primitive field.
+That temporary ends with the field default-resolution call and does not accumulate across primitive fields.
+
+== Source copy families
+
+One native subtree can occur in each of its inline named ancestors' parsed-map or retained names-map entries.
+That family is bounded by D+1 copies of the counted schema/payload tree.
+The parser's maps are destroyed before restore_field_defaults and collect_names run.
+Their D+1 allowance can therefore cover the union replacement walk, whose old and replacement subtrees coexist along the current inline recursion chain.
+A separate D+1 family covers Metadata::collect's retained named JSON subtrees.
+Those metadata subtrees remain live while native schemas and names are built, so the two families are added.
+
+The sixteen ordinary-copy slots cover a peak live stage, not a sum of objects from mutually exclusive stages.
+The following credits each allow a complete source forest; a current document or partial subtree is bounded by that same forest.
+
+[cols="1,3"]
+|===
+|Credits |Owner family
+|1 |Defaults' retained raw default forest and record/field maps.
+|3 |The metadata, physicalized and stripped root/reference String forests, including shadowed predecessors.
+|1 |Metadata.root, separate from the ancestry-counted Metadata.names.
+|1 |The returned or under-construction native root/reference forest, separate from the ancestry-counted native names/maps.
+|2 |Current raw JSON/cursor/serializer trees, including the current parser reference document or root input.
+|2 |Native construction and insertion temporaries, including physical/logical Fixed overlap.
+|2 |Temporary name/default copies and failure-description text within the measured input/name forest.
+|4 |Additional live-copy headroom.
+|===
+
+The source stages represented by those credits are:
+
+* Defaults' retained raw default values, record keys and field maps.
+* metadata_text and metadata_references strings.
+* Metadata.root and the temporary reference JSON tree being collected.
+* The physical_logical_types root and reference strings, including shadowed values still live until scope exit.
+* The without_field_defaults root and reference strings, including their shadowed predecessors.
+* The current serde transformation tree and serializer output being produced.
+* The native parser's current input JSON tree; the ordered route does not hold a future reference-input JSON collection.
+* The returned native root/reference schema trees.
+* Restored field-default JSON values and the current union replacement vector.
+* Native parse lists, declaration/resolving-name maps and collect_names' current insertion temporaries.
+
+The retained native and metadata named-subtree copies are charged in the two ancestry families, not substituted with an assumed single root.
+The ordinary slots also cover the extra physical Fixed box inside a logical Decimal schema.
+Every document has at least one counted JSON/schema item, so the root/reference control vectors are covered by J and S.
+The existing input_order vector is reused for duplicate-root checks and returned order, with no added table or retained state.
+Its contains scan performs at most R*(R-1)/2 name comparisons for R consumed reference documents, and each comparison is bounded by the measured name text.
+The final parse_input_schemas call sees an empty input_schemas map on this route, so it introduces no hash-order dependency or cross-document recursion.
+The constructor still allocates input_schemas capacity from the iterator size hint; empty does not mean unallocated.
+That unchanged table capacity is included in the J/S control and collection credits.
+No preload forest is needed in the ordered route; its removal only reduces the existing ordinary live-copy credits.
+The existing parse options become scalar flags and introduce no retained option string tree.
+ReaderMode, UnionOptions and Metadata parse only borrowed boolean settings; invalid-setting diagnostics contain their fixed setting names rather than copying the supplied option values.
+
+B covers temporary JSON members that are overwritten before the final typed tree is measured.
+The 8B text envelope plus the collection envelope covers their transient strings, raw-object vectors and ordinary JSON containers even when their final J contribution disappears.
+Escaping and decoded UTF8 storage are linear in original bytes on the declared standard JSON profile.
+Full-name expansion is outside that byte envelope and is charged separately through U.
+
+== Checked source chain
+
+AvroDatumPlan::parse_with_name_policy preserves the existing sequence: Defaults::parse, metadata_text, Metadata::new, logical physicalization, default stripping, native Apache parsing, default restoration and named-schema collection.
+The legacy parse entry still supplies no policy and has the same behavior.
+The paired entry supplies only its stateless scoped policy after canonical source validation.
+The native parser source includes scoped_candidate/scoped_reference, register_resolving_schema/register_parsed_schema, parse_record/enum/fixed, RecordField parsing and its custom-attribute copying.
+No default Avro value resolution can expand a field default inside native parsing because those defaults were stripped before that call.
+Restoration later copies the original metadata default nodes, which this allowance includes.
+
+This proof is tied to the retained source snapshots and scoped-policy behavior in sources.sha256.
+A change to metadata collection, schema copying, policy defaults, reference representation or native container-credit convention requires revisiting this allowance.
+No compiler, native allocation observation or runtime test has been performed in Phase 1.

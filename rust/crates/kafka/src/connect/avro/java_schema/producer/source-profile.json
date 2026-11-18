@@ -1,0 +1,38 @@
+{
+  "source_only": true,
+  "source_count": 105,
+  "primary_count": 92,
+  "backend_snapshot_count": 13,
+  "baseline_sources_unchanged": 71,
+  "manifest_sha256": "235b0cdd7a8abcb8519853f2188f9428ad0b3ecb112ff74f2ccbedef7b434645",
+  "jdk_source_archive": {
+    "path": "/tmp/rtdb-provider-sources/openjdk25-time/src.zip",
+    "sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482"
+  },
+  "source_snapshot": "/tmp/rtdb-avro-canonical-producer-sources-235b0cdd7a8abcb8",
+  "reference_profiles": [
+    "Avro1.11.4",
+    "Confluent7.8.0 retained source",
+    "Jackson databind/core2.16.0 and2.21.7",
+    "Temurin25.0.1+8 Unicode16"
+  ],
+  "input_profile": {
+    "standard_json_only": true,
+    "utf8_scalar_text_only": true,
+    "document_bytes": 262144,
+    "text_utf16_units": 50000,
+    "number_token_bytes": 1000,
+    "native_demand_depth": 128
+  },
+  "source_stages": {
+    "Schema.java": "FACTORY/MAPPER115-123; Names1560+; defaultvalidation1630+; parse1690-1820; aliases1820+",
+    "AvroSchema.java": "constructor105-122; getParser225-229",
+    "JsonNodeDeserializer.java": "default integral/floating class selection704-780 (2.16.0), corresponding2.21.7 methods",
+    "StringUTF16.java": "English upper1052-1140",
+    "FloatingDecimal.java": "readJavaFormatString, scanSymbolic, skipWhitespaces",
+    "native": "RecordField::parse; incremental prior-only referenced-document parse; parsed/resolving maps and empty future input_schemas; scoped_reference; root/reference parse pipeline; default restore; Metadata::collect; collect_names; MapHelper::aliases preserves every raw alias occurrence."
+  },
+  "qualification": "No source fixture compiled/executed. Physical native pairing is narrower than source input acceptance. Canonical source metadata/default nodes remain authoritative. The bound is a source-review proof target, not measured allocator/JVM parity.",
+  "native_reference_profile": "Incremental supplied document order; only prior declarations and current record self recursion; no preloaded future input_schemas.",
+  "native_name_measure": "Declarations and named lookups plus every raw named-alias occurrence. Existing Name qualification is reused; checked full-name units times raw multiplicity precedes canonical qualified-name dedup."
+}

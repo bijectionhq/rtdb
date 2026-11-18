@@ -63,6 +63,9 @@ impl AvroPlan {
 }
 impl AvroDatumPlan {
     pub fn parse(text: &str, references: &[String], options: &BTreeMap<String, String>) -> Result<Self> {
+        Self::parse_with_name_policy(text, references, options, None)
+    }
+    fn parse_with_name_policy(text: &str, references: &[String], options: &BTreeMap<String, String>, policy: Option<&dyn apache_avro::schema::SchemaNamePolicy>) -> Result<Self> {
         let defaults = default_json::Defaults::parse(text, references)?;
         let metadata_text = default_json::metadata_text(text)?;
         let metadata_references = references.iter().map(|text| default_json::metadata_text(text)).collect::<Result<Vec<_>>>()?;
@@ -74,7 +77,10 @@ impl AvroDatumPlan {
         let references = metadata_references.iter().map(|text| physical_logical_types(text)).collect::<Result<Vec<_>>>()?;
         let text = without_field_defaults(&text)?;
         let references = references.iter().map(|text| without_field_defaults(text)).collect::<Result<Vec<_>>>()?;
-        let (mut root, mut references) = Schema::parse_str_with_list(&text, &references).map_err(|cause| error("avro-schema", cause))?;
+        let (mut root, mut references) = match policy {
+            None => Schema::parse_str_with_list(&text, &references),
+            Some(policy) => Schema::parse_str_with_list_with_name_policy(&text, &references, policy),
+        }.map_err(|cause| error("avro-schema", cause))?;
         restore_field_defaults(&mut root, metadata.root(), &metadata);
         for schema in &mut references { restore_field_defaults(schema, metadata.root(), &metadata); }
         let mut names = BTreeMap::new(); collect_names(&root, &mut names);

@@ -1,0 +1,95 @@
+= Canonical original-input producer and native pairing
+
+Producer builds canonical Avro source objects directly from the original root and reference documents.
+References are consumed in the caller-supplied source encounter order before the root, matching AvroSchema's resolved-reference parse loop.
+The caller supplies that actual resolved-reference encounter order and an explicit SourcePolicy for default validation and the effective Fixed bytes limit.
+The policy does not guess AvroSchema.isNew or discover JVM system properties.
+
+Producer is a passive single-writer transient owning SchemasBuilder and a copied NativeFootprint measure.
+CanonicalSource is its completed source handle plus that construction measure.
+ParsedPair owns the actual AvroDatumPlan, the canonical root and the admitted native parse lease.
+PairSelection is an owner-bounded borrowed association created only by that pair's root, definition, field, union, array or map operations.
+The API accepts no unrelated native schema and matches no outside graph by name.
+The earlier canonical_native_record name-matching observation seam is explicitly test-only.
+
+== Source stages
+
+The input cursor creates admitted shared JavaString text and typed JsonNodes directly from original JSON tokens.
+It retains Int, Long, BigInteger and Double classes rather than recreating them from serde metadata or registry bean Decimal carriers.
+Overwritten object members keep the first key position and last value.
+Each document's temporary raw cursors and decoded strings are admitted scratch; there is no retained replacement Rust String schema tree.
+
+Named declarations create one canonical object before record children are parsed.
+Textual references can use the source empty-namespace fallback; object type references use only the primary namespace candidate.
+Aliases remain metadata and do not become definition bindings.
+Canonical aliases deduplicate raw text and then qualified names.
+The native allowance separately counts every raw named-alias occurrence because native reader metadata retains those repetitions.
+Namespace changes are lexical to a named parse and restored between documents.
+Primitive references create fresh retained source objects.
+
+Record processing follows required field text, child parse, field order, direct FLOAT/DOUBLE textual default conversion, field name/default validation, properties/aliases and final setFields duplicate checking.
+Textual floating defaults use the admitted shared Java Double parser, including hexadecimal literals, suffixes, signs, NaN, Infinity and control-space trimming.
+The transformed default remains a DoubleNode even for a Float field.
+Union-wrapped Float/Double defaults do not take that direct-type transformation.
+Default checking uses actual node classes and the first union member; preservation mode retains invalid defaults for the later source default-origin path.
+Raw record defaults can pass Schema.isValidDefault while retaining unknown members that JacksonUtils may reject later.
+
+Field order follows English uppercase for ASCENDING, DESCENDING and IGNORE.
+The pinned Unicode16 simple-uppercase preimages outside ASCII are dotless I and long S for these words.
+No pinned unconditional multi-codepoint uppercase expansion occurs as a substring of any target word.
+The derivation is retained in order-uppercase-proof.json.
+
+Schema/field reserved keys, enum default handling, required IntNode Fixed size, properties and aliases follow the inspected source stages.
+Logical-type properties remain their original source nodes; the native physical representation is not used as a replacement for those source values.
+The built-in logical-object/graph consumer remains separate activation work.
+
+== Pair identity and lifetime
+
+ParsedPair constructs both products internally from the same borrowed original input group.
+The input cannot change during that synchronous call.
+It validates native nominal references, physical types, declaration names, field/symbol order, container branches and Fixed size against the canonical object IDs before publication.
+Native recursive Ref resolution uses the pair's own named-definition owner, including logical Fixed definitions.
+The private NativePolicy parses each reference document immediately in supplied order, with only prior declarations and the current resolving record available.
+It does not preload future native input documents or follow their bodies during lookup.
+Each document starts with no inherited namespace; the root follows all reference documents.
+A forward dependency fails during canonical assembly before native parsing.
+A native root, a cloned native named definition and its recursive field therefore select one canonical object without inferring identity from their Rust addresses.
+A separately parsed same-name input group owns different canonical objects.
+
+The native view is a physical representation, not a source metadata/default-class authority.
+Source properties, original default classes and ignored metadata remain in the canonical arena.
+The native parse allowance is admitted before Apache/native parsing and remains in the immutable pair after the creating ConversionContext drops.
+Fresh scopes recount the existing native reservation and canonical payload owners.
+Borrowed native entries cannot outlive the pair; an independently retained canonical handle keeps its own source payloads without retaining unrelated native storage.
+link:NATIVE-ADMISSION.adoc[] records the counted native copy/ownership bound.
+
+== Current input and activation profile
+
+The current decoder accepts a declared bounded standard JSON UTF8 scalar-text profile.
+A document has at most 256 KiB, a decoded text/name at most 50000 UTF16 units and a numeric token at most 1000 bytes including punctuation.
+Exceeding those native profile caps reports unsupported-avro-input-profile; they are not presented as exact Jackson constraint errors or its full accepted domain.
+The native demand-depth limit 128 also remains an explicit partial resource boundary.
+Comments, isolated surrogate escapes, exact Jackson token/text-buffer constraint timing and the complete JavaString document decoder remain unsupported here.
+Semantic source-stage claims assume successful admission and an input within that declared lexical profile.
+
+The canonical producer can retain values that the legacy native metadata parser cannot represent, such as an overflowing numeric custom property.
+The native backend can also normalize or omit incidental metadata/default nodes, including an overflowing raw default projected to null, without changing the paired physical schema.
+Those native nodes are not a source-value authority.
+When native construction or physical pairing fails, the constructor reports unsupported-avro-native-profile or avro-native-pairing and publishes no pair.
+Native handling of error records and some logical/parser representations remains subject to that compatibility boundary.
+No production converter activates this producer in this slice.
+The existing production parse still uses its unchanged legacy policy route.
+The producer child module is registered only by the separate reviewed integration delta; the encompassing canonical module remains test-gated.
+
+All existing native/JVM assertion sources and the A09 null-default conflict remain unchanged.
+Full exact UTF16 input, graph/default provenance, generalized unions, arbitrary-key data conversion, schema/cache families, SMT retention and writer admission remain required before cohesive activation.
+The source fixtures in this directory have not been compiled or executed.
+
+== Source provenance
+
+link:sources.sha256[] pins 92 primary-source files and thirteen native backend source snapshots.
+The complete available pre-package Java prefixes, full artifact licenses and notices, the native MapHelper source prefix, and the SpecialCasing file prefix are retained in link:COPYRIGHT[].
+link:NOTICE-JACKSON[] retains the Jackson artifact notices separately.
+link:source-profile.json[] records exact source labels, native caps and the source-only qualification.
+link:order-uppercase-proof.json[] records the data-only derivation across all Unicode code points, including supplementary code points.
+There are 29 additive regression source functions across producer, pair, input and native-bound fixtures.
