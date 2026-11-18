@@ -89,7 +89,25 @@ impl LogicalType {
     /// An empty leg set denotes an unknown prepared parameter and yields `Null`.
     /// The lattice join retains `Nothing` when no input contributes a leg.
     pub fn from_legs(legs: impl IntoIterator<Item = Self>) -> Self {
-        let mut legs: BTreeSet<_> = legs.into_iter().flat_map(|leg| leg.legs()).collect();
+        Self::from_legs_set(legs.into_iter().flat_map(|leg| leg.legs()).collect())
+    }
+
+    /// `from_legs` for inputs whose leaves are already unencoded, so nested types are not rebuilt again.
+    fn from_unencoded_legs(legs: impl IntoIterator<Item = Self>) -> Self {
+        fn flatten(leg: LogicalType, out: &mut BTreeSet<LogicalType>) {
+            match leg {
+                LogicalType::Nothing => {}
+                LogicalType::Maybe(value) => { flatten(*value, out); out.insert(LogicalType::Null); }
+                LogicalType::Union(values) => for value in values { flatten(value, out); },
+                value => { out.insert(value); }
+            }
+        }
+        let mut flat = BTreeSet::new();
+        for leg in legs { flatten(leg, &mut flat); }
+        Self::from_legs_set(flat)
+    }
+
+    fn from_legs_set(mut legs: BTreeSet<Self>) -> Self {
         let nullable = legs.remove(&Self::Null);
         if legs.is_empty() { return Self::Null; }
         if legs.len() == 1 {
@@ -115,8 +133,11 @@ impl LogicalType {
     pub fn unencoded(&self) -> Self {
         match self {
             Self::RunEndEncoded { value, .. } => value.unencoded(),
-            Self::Maybe(value) => value.unencoded().maybe(),
-            Self::Union(legs) => Self::from_legs(legs.iter().map(Self::unencoded)),
+            Self::Maybe(value) => match value.unencoded() {
+                Self::Union(mut legs) => { legs.insert(Self::Null); Self::from_unencoded_legs(legs) }
+                value => value.maybe(),
+            },
+            Self::Union(legs) => Self::from_unencoded_legs(legs.iter().map(Self::unencoded)),
             Self::List { kind, element } => Self::List { kind: kind.clone(), element: Box::new(element.unencoded()) },
             Self::Struct(children) => Self::Struct(children.iter().map(|(name, ty)| (name.clone(), ty.unencoded())).collect()),
             value => value.clone(),

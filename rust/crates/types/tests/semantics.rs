@@ -214,3 +214,17 @@ fn unsigned_integers_promote_with_floats_but_not_other_integer_types() {
     assert_eq!(S::F32.promote(&S::U32), Some(S::F32));
     assert_eq!(S::U64.promote(&S::I64), None);
 }
+
+#[test]
+fn deeply_nested_union_types_unencode_and_validate_in_linear_time() {
+    let mut ty = scalar(S::I64);
+    for depth in 0..64 {
+        let other = if depth % 2 == 0 { scalar(S::Utf8) } else { T::Struct(BTreeMap::from([("v".into(), scalar(S::Bool))])) };
+        ty = T::list(T::from_legs([ty, other, T::Null]));
+    }
+    let started = std::time::Instant::now();
+    assert_eq!(ty.unencoded(), ty);
+    assert_eq!(ty.clone().maybe().unencoded(), ty.clone().maybe());
+    ty.validate().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+}
