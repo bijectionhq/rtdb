@@ -21,6 +21,25 @@ fn escaped_surrogate_slice_keeps_bmp_search_starts() {
     assert!(pattern.search("😀b", &EvalContext::default()).unwrap(), "{:?} {:?}", pattern.regex, Expr::parse_java_tree(&translated.pattern));
 }
 
+#[test]
+fn whole_matches_reuse_the_pattern_and_release_each_subject_charge() {
+    let memory = MemoryBudget::new(1 << 28);
+    let mut matcher = JavaFullMatcher::compile(JavaText::from_utf8(r"a|(?=a)ab|\uD800"), &memory).unwrap();
+    let retained = memory.used_bytes();
+    assert!(retained > 0);
+    for (source, expected) in [
+        (JavaText::from_utf8("ab"), true),
+        (JavaText::from_utf8("ba"), false),
+        (JavaText::from_utf8("ab\n"), false),
+        (JavaText::from_utf16(&[0xd800]), true),
+    ] {
+        assert_eq!(matcher.matches(source).unwrap(), expected);
+        assert_eq!(memory.used_bytes(), retained);
+    }
+    drop(matcher);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
 fn failure(pattern: &[u16], context: &EvalContext<'_>) -> failure::PatternFailure {
     match compile_text(JavaText::from_utf16(pattern), JavaText::from_utf8(""), context).err().unwrap() {
         CompileFailure::Pattern(failure) => failure,

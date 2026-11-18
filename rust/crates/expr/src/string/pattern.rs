@@ -1,7 +1,8 @@
-use crate::{EvalContext, numeric::overflow};
+use crate::{EvalContext, EvaluationScope, numeric::overflow};
 use fancy_regex::{Expr, Regex, RegexBuilder};
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::{Anomaly, MemoryBudget, Result, Value};
 use rtdb_types::java_text::JavaText;
+use std::sync::Arc;
 use super::{illegal, java_unicode, text};
 mod source;
 mod failure;
@@ -24,6 +25,33 @@ struct Translation { pattern: String, names: Vec<Option<String>>, supplementary:
 struct Translator<'a> { source: &'a PatternInput<'a>, position: usize, flags: Flags, scopes: Vec<Flags>, output: String, names: Vec<Option<String>>, literals: Vec<u32>, supplementary: bool, predicate_bmp: bool, syntax_prefix_verified: bool, syntax: Option<Syntax<'a>> }
 pub(crate) struct Pattern { regex: Regex, names: Vec<Option<String>> }
 pub(crate) struct LikePattern { pattern: Pattern, binary: bool }
+
+/// Compiled Java Pattern for independent whole-region matches on exact UTF-16 text.
+/// The owner covers compilation and one active matcher, with each input charged to the same budget.
+pub struct JavaFullMatcher {
+    pattern: Pattern,
+    allocation: EvaluationScope,
+}
+
+impl JavaFullMatcher {
+    /// Compiles with Java's default external flags and the expression engine's syntax and resource limits.
+    /// Returns a source syntax, unsupported pattern or memory admission error.
+    pub fn compile(pattern: JavaText<'_>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let allocation = EvaluationScope::new(memory)?;
+        let context = EvalContext { allocation: Some(&allocation), ..EvalContext::default() };
+        let pattern = compile_text(pattern, JavaText::from_utf8(""), &context).map_err(CompileFailure::legacy)?;
+        Ok(Self { pattern, allocation })
+    }
+
+    /// Matches once against the complete input, starting at code unit zero.
+    /// Returns a resource error on admission failure or when the configured matching limits are reached.
+    pub fn matches(&mut self, source: JavaText<'_>) -> Result<bool> {
+        let scratch = self.allocation.scratch();
+        let context = EvalContext { allocation: Some(&scratch), ..EvalContext::default() };
+        let units = input_units(source, &context)?;
+        self.pattern.regex.matches_utf16(&units).map_err(regex_error)
+    }
+}
 
 pub(crate) fn compile(pattern: &str, flags: &str, context: &EvalContext<'_>) -> Result<Pattern> {
     if pattern.len() > PATTERN_BYTES { return Err(limit("Pattern exceeds 64 KiB")); }
@@ -523,11 +551,16 @@ impl Pattern {
     }
 
     pub(crate) fn search_text(&self, source: JavaText<'_>, context: &EvalContext<'_>) -> Result<bool> {
-        context.reserve(work_bytes(source)?.checked_mul(32).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?)?;
-        let mut units = Vec::with_capacity(source.len_units());
-        units.extend(source.units());
+        let units = input_units(source, context)?;
         self.regex.captures_utf16(&units, 0, 0).map(|captures| captures.is_some()).map_err(regex_error)
     }
+}
+
+fn input_units(source: JavaText<'_>, context: &EvalContext<'_>) -> Result<Vec<u16>> {
+    context.reserve(work_bytes(source)?.checked_mul(32).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?)?;
+    let mut units = Vec::with_capacity(source.len_units());
+    units.extend(source.units());
+    Ok(units)
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -111,12 +111,20 @@ impl Program {
         self.run_positions(text, position, previous_end, previous_end, options)
     }
 
-    fn run_positions(&self, text: &[u16], position: usize, last: usize, old_last: usize, options: &RegexOptions) -> Result<Option<Vec<usize>>> {
-        let mut matcher = Matcher {
+    pub(crate) fn matches_utf16(&self, text: &[u16], options: &RegexOptions) -> Result<bool> {
+        self.matcher(text, 0, 0, 0, options, true).matches(self.root, 0)
+    }
+
+    fn matcher<'a>(&'a self, text: &'a [u16], position: usize, last: usize, old_last: usize, options: &'a RegexOptions, end_anchor: bool) -> Matcher<'a> {
+        Matcher {
             program: self, text, captures: vec![usize::MAX; self.groups * 2], locals: vec![usize::MAX; self.locals],
             failed: vec![BTreeSet::new(); self.memos], last, first: position, old_last, behind: 0,
-            depth: 0, steps: 0, options,
-        };
+            depth: 0, steps: 0, options, end_anchor,
+        }
+    }
+
+    fn run_positions(&self, text: &[u16], position: usize, last: usize, old_last: usize, options: &RegexOptions) -> Result<Option<Vec<usize>>> {
+        let mut matcher = self.matcher(text, position, last, old_last, options, false);
         let Some(guard) = text.len().checked_sub(self.minimum) else { return Ok(None); };
         let mut start = position;
         while start <= guard {
@@ -347,6 +355,7 @@ struct Matcher<'a> {
     depth: usize,
     steps: usize,
     options: &'a RegexOptions,
+    end_anchor: bool,
 }
 
 impl Matcher<'_> {
@@ -365,6 +374,7 @@ impl Matcher<'_> {
             if self.steps > self.options.backtrack_limit { return Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded)); }
             match &program.nodes[node] {
                 Node::Fail => return Ok(false),
+                Node::End if self.end_anchor && position != self.text.len() => return Ok(false),
                 Node::Accept | Node::End => {
                     self.last = position; self.captures[0] = self.first; self.captures[1] = position;
                     return Ok(true);

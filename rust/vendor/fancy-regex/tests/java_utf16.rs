@@ -37,3 +37,19 @@ fn ordinary_node_programs_keep_execution_limits() {
     let regex = RegexBuilder::new("(a|aa)*b").java_utf16(true).backtrack_limit(1).build().unwrap();
     assert!(matches!(regex.is_match("aaaac"),Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded))));
 }
+
+#[test]
+fn whole_region_matches_backtrack_at_the_root_end_without_anchoring_inner_acceptance() {
+    let ab = [0x61, 0x62];
+    assert_eq!(matcher("a|ab").captures_utf16(&ab, 0, 0).unwrap().unwrap(), [0, 1]);
+    assert!(matcher("a|ab").matches_utf16(&ab).unwrap());
+    assert!(matcher("(?=a)(?>a)b").matches_utf16(&ab).unwrap());
+    assert!(!matcher("(?>a|ab)").matches_utf16(&ab).unwrap());
+    assert!(!matcher("b").matches_utf16(&ab).unwrap());
+    assert!(!matcher("a$").matches_utf16(&[0x61, 0x0a]).unwrap());
+    assert!(matcher(r"\Gab").matches_utf16(&ab).unwrap());
+    assert!(matcher("").matches_utf16(&[]).unwrap());
+    assert!(!matcher("").matches_utf16(&[0xd800]).unwrap());
+    assert!(matcher(r"[\x{d800}]").matches_utf16(&[0xd800]).unwrap());
+    assert!(Regex::new("a").unwrap().matches_utf16(&ab).is_err());
+}

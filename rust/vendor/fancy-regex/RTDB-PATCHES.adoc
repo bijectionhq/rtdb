@@ -91,4 +91,6 @@ No tests, builds, parsers or formatters were executed while preparing these sour
 Turning Java matching off clears the graph selection; native defaults and the scalar engine remain available.
 The option bypasses scalar-tree optimization and the easy regex wrapper, then uses the same analyzer and Java Program compiler as marker-selected graphs.
 UTF16 captures retain all code-unit intervals, while borrowed UTF8 capture APIs keep their non-UTF8-boundary error contract.
+`matches_utf16` starts once at zero and requires the final Java `LastNode` to consume the complete input.
+An early endpoint can backtrack through source alternatives, and inner lookaround and atomic accepts retain their source behavior.
 `tests/java_utf16.rs` contains unexecuted regression source for explicit selection, option resets, surrogate intervals, empty matches and execution limits.

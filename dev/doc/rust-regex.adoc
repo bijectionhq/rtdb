@@ -33,6 +33,9 @@ Compilation preserves source groups, literal runs, deterministic group repetitio
 Failed-position caching follows the reference's eligible outer greedy loops and is disabled by capture references.
 The caller's depth and attempt limits bound the node executor, with an additional 512-frame native call ceiling.
 The evaluation scope covers its captures, locals, failure sets and UTF-16 buffers.
+Callers outside SQL can retain an admitted `JavaFullMatcher` for repeated `Matcher.matches` operations on exact text.
+Whole-region execution starts directly at the Java match root and requires the terminal node to consume the full region.
+Each input uses a short-lived scratch scope charged to the same budget as the compiled pattern.
 Line endings try CRLF before CR and retain the shorter endpoint when the following expression fails.
 Quantifier atom acceptance controls whether that shorter endpoint remains available.
 Replacement for these node programs assembles the complete UTF-16 result before encoding UTF-8, so adjacent surrogate halves can recombine and remaining unpaired surrogates become `?`, following Java `String.getBytes(UTF_8)`.

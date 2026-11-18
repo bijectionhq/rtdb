@@ -1119,6 +1119,15 @@ impl Regex {
         }
     }
 
+    /// Applies Java's whole-region match to all UTF-16 code units from position zero.
+    /// Requires `uses_java_nodes()`; configured execution limits return runtime errors.
+    pub fn matches_utf16(&self, text: &[u16]) -> Result<bool> {
+        match &self.inner {
+            RegexImpl::Fancy { prog, options, .. } if prog.java_program().is_some() => prog.java_program().unwrap().matches_utf16(text, options),
+            _ => Err(Error::CompileError(CompileError::FeatureNotYetSupported("UTF-16 whole matches require Java nodes".into()))),
+        }
+    }
+
     fn captures_from_positions<'t>(&self, text: &'t str, pos: usize, previous_end: Option<usize>) -> Result<Option<Captures<'t>>> {
         let named_groups = self.named_groups.clone();
         match &self.inner {

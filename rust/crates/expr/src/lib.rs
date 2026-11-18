@@ -25,6 +25,7 @@ mod admission;
 pub use rtdb_types::AllocationScope as EvaluationScope;
 pub use pg_catalog::{PgCatalogLookup, requires_pg_catalog};
 pub use string::render::allocation_bound as text_allocation_bound;
+pub use string::pattern::JavaFullMatcher;
 
 pub use cast::{cast, cast_target, parse_timestamp, query_clock_instant, timestamp_micros};
 pub use compare::{compare, compare_in_timezone, equality_allocation_bound, null_eq, null_eq_in_timezone, sql_eq, sql_eq_in_timezone, sql_not_eq_in_timezone, strict_eq};
