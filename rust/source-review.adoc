@@ -1229,3 +1229,22 @@ Other native allocations, including ordinary cache entries, rack scratch, diagno
 
 The implementation revision remains unset and the source-completeness gate remains false.
 Compilation, runtime discovery and regression execution remain pending.
+
+== Statement lists, batch range admission and binary object checkpoint
+
+The native statement list action reaches actual decision 1 and the separate optional trailing semicolon.
+Its LL loop-entry sync may request a second token.
+At loopback, the throwing listener stops recovery at the current unwanted token.
+Decision 34 now reaches the complete COMMIT, DISCARD and SET ROLE branches alongside ROLLBACK.
+The identifier tree retains all 87 nonreserved keyword alternatives and their four grouped rule calls.
+Production parsing still requires the remaining grammar and the host cache and diagnostic boundaries.
+
+The Simple Query path validates lexical input before admitting the exact nonempty statement range buffer.
+That owner retains its reservation across batch execution, while the input frame holds the source text.
+The fallback tokenizer's tokens and payloads still need allocation admission.
+Whole-batch AST validation before execution remains required.
+
+The direct source scalar reader materializes raw FixedBinary and UUID objects through its signed byte view.
+UUID demand copies the complete admitted inner span before the first or second relative read can fail.
+The returned UUID retains its own reservation after the temporary copy and its reservation drop.
+Existing-inner and selected-reader ownership still require source work.
