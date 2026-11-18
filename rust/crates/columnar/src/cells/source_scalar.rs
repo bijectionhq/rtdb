@@ -7,6 +7,8 @@ mod tests;
 pub(crate) enum SourceScalarReadFailure {
     Unsupported { declaration: SourceScalarDeclaration, method: &'static str },
     NegativeViewLength(i64),
+    UuidFirstLongUnderflow,
+    UuidSecondLongUnderflow,
 }
 
 #[derive(Debug)]
@@ -34,6 +36,32 @@ impl<'a> SourceScalarReader<'a> {
         let pointer = self.get_pointer(row);
         let length = usize::try_from(pointer.length).map_err(|_| SourceScalarReadError::Reference(SourceScalarReadFailure::NegativeViewLength(pointer.length)))?;
         Ok(SourceByteView { backing: pointer.backing, offset: pointer.offset, length })
+    }
+    pub(crate) fn binary_object0(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> Option<SourceScalarReadResult<OwnedValue>> {
+        if !self.declaration.bytes_method() { return None; }
+        Some((|| {
+            let view = self.get_bytes(row)?;
+            let source = view.demand_native()?;
+            let bound = source.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096))
+                .ok_or_else(|| SourceScalarReadError::Native(allocation()))?;
+            let copy_reservation = memory.reserve(bound).map_err(SourceScalarReadError::Native)?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(source.len()).map_err(|cause| SourceScalarReadError::Native(Anomaly::incorrect("rtdb/allocation-failed", cause.to_string())))?;
+            bytes.extend_from_slice(source);
+            if matches!(self.declaration, SourceScalarDeclaration::FixedBinary(_)) {
+                return Ok(OwnedValue { value: Value::FixedSizeBinary(bytes), _reservation: copy_reservation });
+            }
+            let high = bytes.get(..8).ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::UuidFirstLongUnderflow))?;
+            let low = bytes.get(8..16).ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::UuidSecondLongUnderflow))?;
+            let mut uuid = [0; 16];
+            uuid[..8].copy_from_slice(high);
+            uuid[8..].copy_from_slice(low);
+            let reservation = memory.reserve(4096).map_err(SourceScalarReadError::Native)?;
+            let result = OwnedValue { value: Value::Uuid(uuid), _reservation: reservation };
+            drop(bytes);
+            drop(copy_reservation);
+            Ok(result)
+        })())
     }
 }
 

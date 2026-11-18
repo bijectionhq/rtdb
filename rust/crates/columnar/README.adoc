@@ -296,18 +296,33 @@ Snapshots keep the descriptor and payload reservations independently of their or
 SDK-backed readers, checked ranges/selections, containers, named union legs and run-end wrappers return factory absence rather than a source method failure.
 The mutable reader bridge borrows sealed metadata and fixed backing from its existing scalar owner without exposing mutable storage or another publication gate.
 It remains available for prefix inspection after `NativeAborted`, as does the existing checked reader, and does not change the gate.
-The only raw operations in this increment are byte-view and pointer facts, followed by explicitly named native payload demand.
 Pointer facts retain signed wrapped offsets and lengths without checking the row, validity or retained span.
 Byte-view construction rejects a negative length at the source `MemorySegment.reinterpret` producer and otherwise retains nonnegative view facts without payload admission.
 Time getBytes retains its source unsupported-method failure; raw Time primitive, null, object and metadata reads are not exposed here.
-`SourceScalarReadError::Reference` preserves only those unsupported and negative-view-length producers.
+`SourceScalarReadError::Reference` preserves unsupported methods, negative view lengths and the first or second UUID long-read underflow producer.
 `demand_native()` separately checks the complete retained span and returns native `rtdb/unretained-byte-view` admission before borrowing payload bytes.
 Facts and admitted slices borrow the actual writer/vector region and may outlive intermediate reader/view variables while that owner borrow remains live.
 They expose no raw address, mutable alias, relative ByteBuffer cursor, pointer-reuse cache, equality or hash operation.
 Existing checked Cell and ScalarReader logical row gates remain separate, using actual native widths at their native byte-admission boundary.
-The checked UUID `Value` adapter requires exactly 16 bytes; source object underflow and surplus-byte behavior remain separate required work.
+The checked UUID `Value` adapter requires exactly 16 bytes.
 
-`cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, abort inspection and retained snapshot ownership.
+`SourceScalarReader::binary_object0` materializes a FixedBinary or UUID object from its signed byte address.
+The same raw demand applies to null rows and wrapped row offsets.
+For Time declarations it reports capability absence before reading or allocating.
+The caller supplies the finite destination budget, independently of the borrowed source budget.
+The operation constructs the byte view, admits its complete retained span, then reserves before fallibly allocating and copying the full byte array.
+Byte-vector allocation failure returns native `rtdb/allocation-failed`; checked bound overflow remains `rtdb/allocation-overflow`.
+FixedBinary returns the complete copied bytes with their `OwnedValue` reservation.
+UUID reads two consecutive eight-byte parts from that copy.
+Widths below eight fail the first read, and widths from eight through fifteen fail the second.
+Both typed failures represent the message-less source `BufferUnderflowException`.
+Larger UUID inner widths still demand and copy every byte, then use the first sixteen bytes for the UUID value.
+The inline UUID result reservation overlaps the temporary copied-byte reservation.
+The temporary owner drops before return.
+The returned object owns its bytes and destination charge independently of the original vector, snapshots and intermediate readers.
+Copy denial, underflow and result denial release their admitted temporary owners without changing source prefixes or an existing writer abort gate.
+
+`cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, binary object underflow and surplus bytes, overlapping object reservations, abort inspection and retained snapshot ownership.
 These tests are unexecuted source under the Phase 1 gate.
 Existing-inner wrapper adoption and mutable aliases remain required constructor work.
 Custom Java ZoneRulesProvider/rules support remains a mandatory open environment boundary requiring a typed retained rules representation.

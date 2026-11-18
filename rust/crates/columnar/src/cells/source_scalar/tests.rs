@@ -830,3 +830,367 @@ fn run_end_negative_scalar_failure_keeps_nullable_value_prefix_without_a_run() {
     drop((captured, child, input, values, ends));
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn binary_objects_copy_complete_bytes_from_mutable_and_immutable_readers() {
+    let source = memory();
+    let destination = memory();
+    for width in [0, 1, 16, 32] {
+        let initial: Vec<u8> = (0..width).map(|byte| byte as u8).collect();
+        let replacement = vec![91; width as usize];
+        let mut output = writer(SourceScalarDeclaration::FixedBinary(width), false, &source);
+        output.write_bytes(&initial).unwrap();
+        let first = output.source_reader().unwrap().unwrap().binary_object0(0, &destination).unwrap().unwrap();
+        output.clear();
+        output.write_bytes(&replacement).unwrap();
+        assert_eq!(first.value(), &Value::FixedSizeBinary(initial));
+        let captured = output.finish().unwrap();
+        let second = SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap().unwrap();
+        drop(captured);
+        assert_eq!(source.used_bytes(), 0);
+        assert_eq!(second.value(), &Value::FixedSizeBinary(replacement));
+        assert_eq!(destination.used_bytes(), 2 * (width as usize * 4 + 4096));
+        drop((first, second));
+        assert_eq!(destination.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn binary_object_negative_view_failure_precedes_blocked_destination_admission() {
+    let source = memory();
+    let destination = MemoryBudget::new(0);
+    for width in [i32::MIN, -1] {
+        for declaration in [SourceScalarDeclaration::FixedBinary(width), SourceScalarDeclaration::Uuid { inner_width: width }] {
+            let captured = writer(declaration, false, &source).finish().unwrap();
+            let before = prefix(&captured);
+            let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+            for row in [i32::MIN, -1, 0, 1, i32::MAX] {
+                read_reference(reader.binary_object0(row, &destination).unwrap(), SourceScalarReadFailure::NegativeViewLength(i64::from(width)));
+            }
+            assert_eq!(prefix(&captured), before);
+            assert_eq!(destination.used_bytes(), 0);
+            assert_eq!(destination.peak_bytes(), 0);
+        }
+    }
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn binary_object_native_span_admission_precedes_copy_reservation() {
+    let source = memory();
+    let destination = MemoryBudget::new(0);
+    for width in [1, i32::MAX] {
+        for declaration in [SourceScalarDeclaration::FixedBinary(width), SourceScalarDeclaration::Uuid { inner_width: width }] {
+            let captured = writer(declaration, false, &source).finish().unwrap();
+            let before = prefix(&captured);
+            let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+            for row in [i32::MIN, -1, 0, 1, i32::MAX] {
+                assert_eq!(reader.get_pointer(row).offset(), i64::from(row.wrapping_mul(width)));
+                read_native(reader.binary_object0(row, &destination).unwrap());
+            }
+            assert_eq!(prefix(&captured), before);
+            assert_eq!(destination.peak_bytes(), 0);
+        }
+    }
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn binary_objects_use_wrapped_signed_rows_without_checked_cell_admission() {
+    let source = memory();
+    let destination = memory();
+    for declaration in [SourceScalarDeclaration::FixedBinary(16), SourceScalarDeclaration::Uuid { inner_width: 16 }] {
+        let mut output = writer(declaration, false, &source);
+        output.write_bytes(&[37; 16]).unwrap();
+        let captured = output.finish().unwrap();
+        let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+        for row in [i32::MIN, 0, 268_435_456] {
+            let object = reader.binary_object0(row, &destination).unwrap().unwrap();
+            match declaration {
+                SourceScalarDeclaration::FixedBinary(_) => assert_eq!(object.value(), &Value::FixedSizeBinary(vec![37; 16])),
+                SourceScalarDeclaration::Uuid { .. } => assert_eq!(object.value(), &Value::Uuid([37; 16])),
+                _ => panic!(),
+            }
+        }
+        assert!(captured.cell(268_435_456).is_err());
+        read_native(reader.binary_object0(i32::MAX, &destination).unwrap());
+    }
+    assert_eq!(destination.used_bytes(), 0);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn uuid_object_underflow_identifies_each_relative_long_after_full_copy_admission() {
+    let source = memory();
+    for (width, expected) in [
+        (0, SourceScalarReadFailure::UuidFirstLongUnderflow),
+        (7, SourceScalarReadFailure::UuidFirstLongUnderflow),
+        (8, SourceScalarReadFailure::UuidSecondLongUnderflow),
+        (15, SourceScalarReadFailure::UuidSecondLongUnderflow),
+    ] {
+        let copy_bound = width as usize * 4 + 4096;
+        let destination = MemoryBudget::new(copy_bound);
+        let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: width }, false, &source);
+        output.write_bytes(&[27; 16]).unwrap();
+        read_reference(output.source_reader().unwrap().unwrap().binary_object0(0, &destination).unwrap(), expected);
+        assert_eq!(destination.used_bytes(), 0);
+        assert_eq!(destination.peak_bytes(), copy_bound);
+        let captured = output.finish().unwrap();
+        let before = prefix(&captured);
+        read_reference(SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap(), expected);
+        assert_eq!(prefix(&captured), before);
+        assert_eq!(destination.used_bytes(), 0);
+    }
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn uuid_object_surplus_bytes_keep_full_copy_peak_and_only_inline_result_retention() {
+    let source = memory();
+    for width in [16, 32] {
+        let bytes: Vec<u8> = (0..width).map(|byte| byte as u8).collect();
+        let copy_bound = width as usize * 4 + 4096;
+        let destination = MemoryBudget::new(copy_bound + 4096);
+        let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: width }, false, &source);
+        output.write_bytes(&bytes).unwrap();
+        let captured = output.finish().unwrap();
+        let before = prefix(&captured);
+        let object = SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap().unwrap();
+        assert_eq!(object.value(), &Value::Uuid([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]));
+        assert_eq!(destination.peak_bytes(), copy_bound + 4096);
+        assert_eq!(destination.used_bytes(), 4096);
+        assert_eq!(prefix(&captured), before);
+        assert_eq!(declaration(&captured), SourceScalarDeclaration::Uuid { inner_width: width });
+        assert_eq!(captured.descriptor().scalar_field().unwrap().data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(captured.cell(0).unwrap().object().is_ok(), width == 16);
+        drop(captured);
+        assert_eq!(source.used_bytes(), 0);
+        assert_eq!(destination.used_bytes(), 4096);
+        drop(object);
+        assert_eq!(destination.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn uuid_object_demands_unretained_surplus_even_when_first_sixteen_bytes_exist() {
+    let source = memory();
+    let destination = MemoryBudget::new(0);
+    let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: 129 }, false, &source);
+    output.write_bytes(&[71; 16]).unwrap();
+    let captured = output.finish().unwrap();
+    assert_eq!(&data(&captured).bytes.as_slice()[..16], &[71; 16]);
+    assert_eq!(data(&captured).bytes.len(), 128);
+    let before = prefix(&captured);
+    read_native(SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap());
+    assert_eq!(destination.peak_bytes(), 0);
+    assert_eq!(prefix(&captured), before);
+    drop(captured);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn binary_object0_reads_null_payload_while_checked_objects_keep_their_guard() {
+    let source = memory();
+    let destination = memory();
+    for declaration in [SourceScalarDeclaration::FixedBinary(16), SourceScalarDeclaration::Uuid { inner_width: 16 }] {
+        let mut output = writer(declaration, true, &source);
+        output.write_undefined().unwrap();
+        let captured = output.finish().unwrap();
+        let before = prefix(&captured);
+        assert!(captured.cell(0).unwrap().is_null().unwrap());
+        assert_eq!(captured.cell(0).unwrap().object().unwrap().value(), &Value::Null);
+        let object = SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap().unwrap();
+        match declaration {
+            SourceScalarDeclaration::FixedBinary(_) => assert_eq!(object.value(), &Value::FixedSizeBinary(vec![0; 16])),
+            SourceScalarDeclaration::Uuid { .. } => assert_eq!(object.value(), &Value::Uuid([0; 16])),
+            _ => panic!(),
+        }
+        assert_eq!(prefix(&captured), before);
+    }
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
+fn binary_object_copy_reservation_is_admitted_before_allocating_owned_bytes() {
+    let source = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(32), false, &source);
+    output.write_bytes(&[64; 32]).unwrap();
+    let captured = output.finish().unwrap();
+    let before = prefix(&captured);
+    let denied = MemoryBudget::new(4223);
+    assert!(matches!(SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &denied).unwrap(), Err(SourceScalarReadError::Native(error)) if error.code == "rtdb/memory-budget-exceeded"));
+    assert_eq!(denied.used_bytes(), 0);
+    assert_eq!(denied.peak_bytes(), 0);
+    let admitted = MemoryBudget::new(4224);
+    let object = SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &admitted).unwrap().unwrap();
+    assert_eq!(object.value(), &Value::FixedSizeBinary(vec![64; 32]));
+    assert_eq!(admitted.used_bytes(), 4224);
+    assert_eq!(admitted.peak_bytes(), 4224);
+    assert_eq!(prefix(&captured), before);
+    drop((captured, object));
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(admitted.used_bytes(), 0);
+}
+
+#[test]
+fn uuid_result_denial_releases_the_admitted_full_copy_without_changing_source() {
+    let source = memory();
+    let destination = MemoryBudget::new(8319);
+    let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: 32 }, false, &source);
+    output.write_bytes(&[82; 32]).unwrap();
+    let captured = output.finish().unwrap();
+    let before = prefix(&captured);
+    assert!(matches!(SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap(), Err(SourceScalarReadError::Native(error)) if error.code == "rtdb/memory-budget-exceeded"));
+    assert_eq!(destination.peak_bytes(), 4224);
+    assert_eq!(destination.used_bytes(), 0);
+    assert_eq!(prefix(&captured), before);
+    drop(captured);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn binary_object_read_preserves_aborted_writer_gate_after_success_and_denial() {
+    let source = memory();
+    let destination = memory();
+    let denied = MemoryBudget::new(0);
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(128), true, &source);
+    output.write_bytes(&[42; 128]).unwrap();
+    let blocker = block(&source, 0);
+    assert!(matches!(output.write_undefined(), Err(WriteError::Native(_))));
+    let object = output.source_reader().unwrap().unwrap().binary_object0(0, &destination).unwrap().unwrap();
+    assert_eq!(object.value(), &Value::FixedSizeBinary(vec![42; 128]));
+    assert_eq!(output.value_count(), 1);
+    assert!(matches!(output.source_reader().unwrap().unwrap().binary_object0(0, &denied).unwrap(), Err(SourceScalarReadError::Native(error)) if error.code == "rtdb/memory-budget-exceeded"));
+    read_native(output.source_reader().unwrap().unwrap().binary_object0(1, &destination).unwrap());
+    assert_eq!(output.reader().get_bytes(0).unwrap(), &[42; 128]);
+    assert!(matches!(output.write_bytes(&[]), Err(WriteError::Native(error)) if error.code == "rtdb/aborted-vector-writer"));
+    assert!(output.finish().is_err());
+    assert_eq!(source.used_bytes(), blocker.bytes());
+    drop(blocker);
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(destination.used_bytes(), 4608);
+    drop(object);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
+fn uuid_underflow_preserves_aborted_zero_count_payload_and_releases_copy() {
+    let source = memory();
+    let destination = MemoryBudget::new(4128);
+    let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: 8 }, true, &source);
+    let blocker = block(&source, 256);
+    assert!(matches!(output.write_bytes(&[42; 16]), Err(WriteError::Native(_))));
+    assert_eq!(output.value_count(), 0);
+    read_reference(output.source_reader().unwrap().unwrap().binary_object0(0, &destination).unwrap(), SourceScalarReadFailure::UuidSecondLongUnderflow);
+    assert_eq!(destination.peak_bytes(), 4128);
+    assert_eq!(destination.used_bytes(), 0);
+    assert_eq!(output.source_reader().unwrap().unwrap().get_bytes(0).unwrap().demand_native().unwrap(), &[42; 8]);
+    assert!(matches!(output.write_bytes(&[]), Err(WriteError::Native(error)) if error.code == "rtdb/aborted-vector-writer"));
+    assert!(output.finish().is_err());
+    assert_eq!(source.used_bytes(), blocker.bytes());
+    drop(blocker);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn binary_object_result_and_snapshot_keep_independent_owner_budgets() {
+    let source = memory();
+    let snapshots = memory();
+    let destination = memory();
+    for declaration in [SourceScalarDeclaration::FixedBinary(32), SourceScalarDeclaration::Uuid { inner_width: 32 }] {
+        let mut output = writer(declaration, false, &source);
+        output.write_bytes(&[63; 32]).unwrap();
+        let captured = output.finish().unwrap();
+        let snapshot = captured.snapshot_reader(&snapshots).unwrap();
+        let object = SourceScalarReader::new(&snapshot).unwrap().unwrap().binary_object0(0, &destination).unwrap().unwrap();
+        drop(captured);
+        assert!(source.used_bytes() > 0);
+        assert!(snapshots.used_bytes() > 0);
+        drop(snapshot);
+        assert_eq!(source.used_bytes(), 0);
+        assert_eq!(snapshots.used_bytes(), 0);
+        match declaration {
+            SourceScalarDeclaration::FixedBinary(_) => {
+                assert_eq!(object.value(), &Value::FixedSizeBinary(vec![63; 32]));
+                assert_eq!(destination.used_bytes(), 4224);
+            }
+            SourceScalarDeclaration::Uuid { .. } => {
+                assert_eq!(object.value(), &Value::Uuid([63; 16]));
+                assert_eq!(destination.used_bytes(), 4096);
+            }
+            _ => panic!(),
+        }
+        drop(object);
+        assert_eq!(destination.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn uuid_copy_and_result_overlap_respects_ancestor_limits_and_retains_budget_owners() {
+    let source = memory();
+    let root = MemoryBudget::new(8320);
+    let destination = root.scope();
+    let sibling = root.scope();
+    let blocker = sibling.reserve(1).unwrap();
+    let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: 32 }, false, &source);
+    output.write_bytes(&[29; 32]).unwrap();
+    let captured = output.finish().unwrap();
+    assert!(matches!(SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap(), Err(SourceScalarReadError::Native(error)) if error.code == "rtdb/memory-budget-exceeded"));
+    assert_eq!(destination.used_bytes(), 0);
+    assert_eq!(destination.peak_bytes(), 4224);
+    assert_eq!(root.used_bytes(), 1);
+    assert_eq!(root.peak_bytes(), 4225);
+    drop((blocker, sibling));
+    let object = SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap().unwrap();
+    assert_eq!(object.value(), &Value::Uuid([29; 16]));
+    assert_eq!(destination.peak_bytes(), 8320);
+    assert_eq!(root.peak_bytes(), 8320);
+    assert_eq!(destination.used_bytes(), 4096);
+    assert_eq!(root.used_bytes(), 4096);
+    let weak_root = Arc::downgrade(&root);
+    let weak_destination = Arc::downgrade(&destination);
+    drop((captured, root, destination));
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(weak_root.upgrade().unwrap().used_bytes(), 4096);
+    assert_eq!(weak_destination.upgrade().unwrap().used_bytes(), 4096);
+    drop(object);
+    assert!(weak_root.upgrade().is_none());
+    assert!(weak_destination.upgrade().is_none());
+}
+
+#[test]
+fn binary_object_capability_is_absent_for_every_time_declaration_before_admission() {
+    let source = memory();
+    let destination = MemoryBudget::new(0);
+    for unit in [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+        for declaration in [SourceScalarDeclaration::Time32(unit), SourceScalarDeclaration::Time64(unit)] {
+            let output = writer(declaration, true, &source);
+            for row in [i32::MIN, -1, 0, 1, i32::MAX] {
+                assert!(output.source_reader().unwrap().unwrap().binary_object0(row, &destination).is_none());
+            }
+            let captured = output.finish().unwrap();
+            assert!(SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).is_none());
+        }
+    }
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(destination.used_bytes(), 0);
+    assert_eq!(destination.peak_bytes(), 0);
+}
+
+#[test]
+fn uuid_copy_reservation_denial_precedes_both_long_underflow_producers() {
+    let source = memory();
+    for width in [0, 7, 8, 15] {
+        let destination = MemoryBudget::new(width as usize * 4 + 4095);
+        let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: width }, false, &source);
+        output.write_bytes(&[42; 16]).unwrap();
+        let captured = output.finish().unwrap();
+        let before = prefix(&captured);
+        assert!(matches!(SourceScalarReader::new(&captured).unwrap().unwrap().binary_object0(0, &destination).unwrap(), Err(SourceScalarReadError::Native(error)) if error.code == "rtdb/memory-budget-exceeded"));
+        assert_eq!(destination.used_bytes(), 0);
+        assert_eq!(destination.peak_bytes(), 0);
+        assert_eq!(prefix(&captured), before);
+    }
+    assert_eq!(source.used_bytes(), 0);
+}
