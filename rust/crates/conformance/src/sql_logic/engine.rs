@@ -156,9 +156,10 @@ impl Engine {
             else { insert.columns.iter().map(object_name).collect::<Result<Vec<_>>>()? };
         let mut documents = Vec::new();
         for row in &values.rows {
-            if row.len() == 1 && columns.len() != 1 { return Err(Anomaly::incorrect("rtdb.conformance/slt-assertion", "Single-expression insert requires exactly one synthetic column")); }
+            let expressions = row.expressions();
+            if expressions.len() == 1 && columns.len() != 1 { return Err(Anomaly::incorrect("rtdb.conformance/slt-assertion", "Single-expression insert requires exactly one synthetic column")); }
             let mut document = BTreeMap::from([("_id".into(), Value::Uuid(*uuid::Uuid::new_v4().as_bytes()))]);
-            for (column, expression) in columns.iter().zip(row.iter()) { document.insert(Identifier::unquoted(column).normalized(), literal(expression)?); }
+            for (column, expression) in columns.iter().zip(expressions) { document.insert(Identifier::unquoted(column).normalized(), literal(expression)?); }
             documents.push(document);
         }
         self.submit(TxOp::PutDocs { table: TableRef::new("public", name), documents: Documents::new(documents, self.node.memory())?, valid_from: None, valid_to: None }).await?;
@@ -281,11 +282,11 @@ mod tests {
         let statements = Parser::parse_sql(&GenericDialect {}, "INSERT INTO t VALUES(NULL,-102,TRUE,'101',104.5)").unwrap();
         let ast::Statement::Insert(insert) = &statements[0] else { panic!() };
         let ast::SetExpr::Values(values) = insert.source.as_ref().unwrap().body.as_ref() else { panic!() };
-        assert_eq!(values.rows[0].iter().map(literal).collect::<Result<Vec<_>>>().unwrap(), vec![Value::Null, Value::I64(-102), Value::Bool(true), Value::Utf8("101".into()), Value::F64(104.5)]);
+        assert_eq!(values.rows[0].expressions().iter().map(literal).collect::<Result<Vec<_>>>().unwrap(), vec![Value::Null, Value::I64(-102), Value::Bool(true), Value::Utf8("101".into()), Value::F64(104.5)]);
         let statements = Parser::parse_sql(&GenericDialect {}, "INSERT INTO t VALUES(100+4)").unwrap();
         let ast::Statement::Insert(insert) = &statements[0] else { panic!() };
         let ast::SetExpr::Values(values) = insert.source.as_ref().unwrap().body.as_ref() else { panic!() };
-        assert_eq!(literal(&values.rows[0][0]).unwrap_err().code, "rtdb.conformance/slt-symbol-value");
+        assert_eq!(literal(&values.rows[0].expressions()[0]).unwrap_err().code, "rtdb.conformance/slt-symbol-value");
     }
     #[test] fn synthetic_bookkeeping_has_a_retained_size_limit() {
         assert!(Bookkeeping::default().validate_size().is_ok());
