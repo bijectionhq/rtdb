@@ -3088,8 +3088,13 @@ impl<'a> Parser<'a> {
         }
 
         let mut to_expr = None;
-        if self.parse_keyword(Keyword::FOR) || self.consume_token(&Token::Comma) {
+        let for_keyword = self.parse_keyword(Keyword::FOR);
+        let length_comma = !for_keyword && self.consume_token(&Token::Comma);
+        if for_keyword || length_comma {
             to_expr = Some(self.parse_expr()?);
+        }
+        if !shorthand && !special && from_expr.is_some() && !length_comma {
+            self.parse_optional_character_length_units()?;
         }
         self.expect_token(&Token::RParen)?;
 
@@ -3117,6 +3122,7 @@ impl<'a> Parser<'a> {
         if self.parse_keyword(Keyword::FOR) {
             for_expr = Some(self.parse_expr()?);
         }
+        self.parse_optional_character_length_units()?;
         self.expect_token(&Token::RParen)?;
 
         Ok(Expr::Overlay {

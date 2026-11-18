@@ -123,6 +123,42 @@ async fn stringutil_sql_overlay_position_units_and_binary_functions() {
 }
 
 #[tokio::test]
+async fn substring_and_overlay_parse_units_without_changing_character_positions() {
+    assert_eq!(query("SELECT SUBSTRING('a😀éz' FROM 2 FOR 2 USING OCTETS) AS sub_octets, SUBSTRING('a😀éz' FROM 2 USING Characters) AS sub_chars").await.unwrap(),
+        [vec![text("😀é"), text("😀éz")]]);
+    assert_eq!(query("SELECT OVERLAY('a😀éz' PLACING 'Q' FROM 3 FOR 1 USING OCTETS) AS overlay_octets, OVERLAY('a😀éz' PLACING 'Q' FROM 3 USING octets) AS overlay_default").await.unwrap(),
+        [vec![text("a😀Qz"), text("a😀Qz")]]);
+    assert_eq!(query("SELECT SUBSTRING(NULL FROM 1 USING OCTETS) AS sub_null, SUBSTRING(X'010203' FROM 2 FOR 1 USING CHARACTERS) AS sub_bytes").await.unwrap(),
+        [vec![V::Null, V::Binary(vec![2])]]);
+}
+
+#[test]
+fn substring_and_overlay_units_require_a_complete_standard_operand_list() {
+    for sql in [
+        "SELECT SUBSTRING('abc' USING CHARACTERS)",
+        "SELECT SUBSTRING('abc', 2 USING OCTETS)",
+        "SELECT SUBSTR('abc' FROM 2 USING OCTETS)",
+        "SELECT SUBSTRING('abc' FROM 2, 1 USING OCTETS)",
+        "SELECT SUBSTRING('abc' FROM 2 USING other)",
+        r#"SELECT OVERLAY('abc' PLACING 'x' FROM 2 USING "OCTETS")"#,
+    ] {
+        assert_eq!(rtdb_sql::parse(sql).unwrap_err().code, "xtdb/sql-error", "{sql}");
+    }
+    let parsed = rtdb_sql::parse(
+        "SELECT SUBSTRING(? FROM ? FOR ? USING OCTETS), OVERLAY(? PLACING ? FROM ? FOR ? USING CHARACTERS)",
+    ).unwrap();
+    assert_eq!(parsed[0].parameter_count(), 7);
+
+    let generic = sqlparser::dialect::GenericDialect {};
+    for sql in [
+        "SELECT SUBSTRING('abc' FROM 2 USING OCTETS)",
+        "SELECT OVERLAY('abc' PLACING 'x' FROM 2 USING OCTETS)",
+    ] {
+        assert!(sqlparser::parser::Parser::parse_sql(&generic, sql).is_err(), "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn string_null_policy_is_preserved_when_virtual_columns_narrow_at_execution() {
     let context = context();
     let source = "SELECT STR(_valid_from),STRING_TO_ARRAY('ab',CAST(_valid_from AS TEXT)),FORMAT('%s',_valid_from) FROM pg_catalog.pg_namespace LIMIT 1";

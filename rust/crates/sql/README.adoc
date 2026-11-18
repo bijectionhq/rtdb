@@ -22,6 +22,11 @@ Binding visits the operand first and then requires uppercase `CHARACTERS` or `OC
 Other spellings of these keywords report `xtdb.error/illegal-arg` during binding.
 `tests/strings.rs` retains the six planning observations from `xtdb.sql.expr-test/test-character-length-expr` and `test-char-length-alias`, and adds execution and error source cases.
 `tests/generic_admission.rs` retains prepared parameter cases.
+
+`SUBSTRING(source FROM start [FOR length])` and `OVERLAY` accept a trailing `USING CHARACTERS` or `USING OCTETS` inside the parentheses.
+These clauses accept case-insensitive unit keywords.
+For either unit, positions and lengths count Unicode code points in text and bytes in binary input.
+
 The string scalar tests also cover virtual temporal columns whose runtime type is Null, preserving STR, FORMAT, and string-to-array null policies.
 REGEXP_REPLACE retains literal pattern, replacement, optional start/occurrence and flags metadata separately from its source expression.
 The SQL binder validates the literal arguments before retaining their metadata in the recipe.
