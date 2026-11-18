@@ -53,7 +53,7 @@ fn posix_parts(locale: &str) -> (String,String,String,String) {
     (language.into(),script.into(),region.into(),if modifier == "nynorsk" { "NY".into() } else { String::new() })
 }
 
-fn host_timezone(now: i64) -> Result<String> {
+pub(super) fn host_timezone(now: i64) -> Result<String> {
     let environment = std::env::var("TZ").ok().filter(|value|!value.is_empty());
     let mut zone = if let Some(value) = environment { if value.len() > 4096 { return Err(limit()); }Some(value) } else { platform_timezone()? };
     if let Some(value) = &mut zone {

@@ -3842,6 +3842,7 @@ dependencies = [
  "regex-syntax",
  "rtdb-columnar",
  "rtdb-format",
+ "rtdb-java-date",
  "rtdb-plan",
  "rtdb-types",
  "serde_json",

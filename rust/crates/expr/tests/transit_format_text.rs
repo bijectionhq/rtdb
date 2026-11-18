@@ -102,6 +102,37 @@ fn unselected_registered_shapes_keep_successful_raw_format_rendering() {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn legacy_date_cast_str_and_format_use_their_source_text_policies() {
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let dates = [
+        stored(&tag("m", T::Integer(-1))),
+        stored(&tag("m", T::String("-0x1".into()))),
+        stored(&tag("t", T::String("1969-12-31T23:59:59.999Z".into()))),
+    ];
+    let memory = MemoryBudget::new(8 << 20);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope), timezone: "Asia/Tokyo", ..Default::default() };
+        let first = scalar_call("str", &dates[..1], &context).unwrap();
+        let V::Utf8(readable) = &first else { panic!("expected readable Date text"); };
+        assert!(readable.starts_with("#inst \""));
+        assert!(readable.ends_with("-00:00\""));
+        let plain = scalar_call("format", &[text("%s"), dates[0].clone()], &context).unwrap();
+        let V::Utf8(display) = &plain else { panic!("expected scalar Date text"); };
+        assert!(matches!(display.split_whitespace().nth(1), Some("Dec" | "Jan")));
+        for date in dates {
+            assert_eq!(rtdb_expr::cast(&date, &LogicalType::Scalar(ScalarType::Utf8), "Pacific/Honolulu").unwrap(), first);
+            assert_eq!(scalar_call("str", std::slice::from_ref(&date), &context).unwrap(), first);
+            assert_eq!(scalar_call("format", &[text("%s"), date], &context).unwrap(), plain);
+        }
+        assert!(memory.used_bytes() > 4096);
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn public_format_denies_constructor_charge_after_the_existing_transit_prefix() {
     let args = [text("%s"),stored(&info(T::String("message".into()),T::Map(vec![])))];
     let retained = args.iter().map(|value|value.retained_bytes().unwrap()).sum::<usize>();

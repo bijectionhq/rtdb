@@ -118,8 +118,8 @@ impl Time {
             let text = |value: &Option<Zoned>|value.map(Zoned::text).transpose().map(|value|value.unwrap_or_else(||"null".into()));
             return Ok(format!("ZonedDateTimeRange(from={}, to={})",text(from)?,text(to)?));
         }
-        if matches!(self,Self::LegacyDate(_)) {
-            return Err(rtdb_types::Anomaly::unsupported("xtdb.expression/transit-date-text", "Date object text requires the process default time-zone provider"));
+        if let Self::LegacyDate(millis) = self {
+            return super::legacy_date_text::plain(*millis,crate::admission::Admission::Standalone);
         }
         let T::Tagged { representation,.. } = self.wire()? else { return Err(invalid()); };
         let T::String(text) = *representation else { return Err(invalid()); };Ok(text)
@@ -201,7 +201,7 @@ fn datetime_hash(value: CivilDateTime) -> i32 { date_hash(value.date()) ^ long_h
 fn string_hash(text: &str) -> i32 { text.encode_utf16().fold(0i32,|hash,ch|hash.wrapping_mul(31).wrapping_add(i32::from(ch))) }
 fn offset_zone(text: &str) -> bool { text == "Z" || text.starts_with(['+','-']) }
 fn zone_hash(zone: ZoneId) -> i32 { let text = zone.to_string();if offset_zone(&text) { zone.fixed_offset().unwrap().seconds() } else { string_hash(&text) } }
-fn decode_long(text: &str) -> Result<i64> {
+pub(super) fn decode_long(text: &str) -> Result<i64> {
     let negative = text.starts_with('-');
     let text = text.strip_prefix(['+','-']).unwrap_or(text);
     let (radix,digits) = if let Some(digits) = text.strip_prefix("0x").or_else(||text.strip_prefix("0X")).or_else(||text.strip_prefix('#')) { (16,digits) }

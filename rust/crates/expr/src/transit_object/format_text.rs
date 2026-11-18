@@ -1,11 +1,18 @@
 use std::{alloc::Layout,sync::Arc};
 use rtdb_types::Result;
 use crate::{admission::Admission,numeric::overflow};
-use super::{Map,Object,T,Throwable,Time,render};
+use super::{Map,Object,T,Throwable,Time,legacy_date_text,render};
 
 pub(crate) enum FormatArgument { Semantic(String),Wire(T) }
 
 pub(crate) fn format_argument(value: T,admission: Admission<'_>) -> Result<FormatArgument> {
+    if legacy_date_text::HOST_CAPTURE
+        && let T::Tagged { tag, representation } = &value
+        && matches!(tag.as_str(), "m" | "t")
+    {
+        let millis = legacy_date_text::wire_millis(tag, representation)?;
+        return legacy_date_text::plain(millis, admission).map(FormatArgument::Semantic);
+    }
     if let T::Tagged { tag,representation } = &value
         && matches!(tag.as_str(),"time/date" | "time/time" | "time/duration" | "time/day-of-week" | "time/month")
         && let T::String(source) = representation.as_ref()

@@ -44,15 +44,16 @@ impl DateEnvironment {
     /// Linux and macOS capture are supported; other hosts must supply explicit inputs.
     pub async fn capture(io: &Arc<rtdb_storage::IoRegion>,memory: &Arc<MemoryBudget>,initialized_at: i64,clock: Arc<dyn DateClock>) -> Result<Arc<Self>> {
         let memory = Arc::clone(memory);
-        io.run_blocking(move || {
-            let result = (|| {
-                let _scratch = memory.reserve(4 << 20)?;
-                let observed_at = clock.now_millis();
-                let input = super::date_platform::capture(initialized_at,observed_at,observed_at)?;
-                Self::build(input,&memory,DateClocks::Live(clock))
-            })();
-            Ok(result)
-        }).await.map_err(rtdb_types::Anomaly::from)?
+        io.run_blocking(move || Ok(Self::capture_process(&memory,initialized_at,clock)))
+            .await.map_err(rtdb_types::Anomaly::from)?
+    }
+    /// Captures the process defaults synchronously, with the same locale and clock policy as `capture`.
+    /// The caller owns the blocking call. Capture and construction are admitted to `memory`.
+    pub fn capture_process(memory: &Arc<MemoryBudget>,initialized_at: i64,clock: Arc<dyn DateClock>) -> Result<Arc<Self>> {
+        let _scratch = memory.reserve(4 << 20)?;
+        let observed_at = clock.now_millis();
+        let input = super::date_platform::capture(initialized_at,observed_at,observed_at)?;
+        Self::build(input,memory,DateClocks::Live(clock))
     }
     /// Consumes explicitly captured inputs and returns a shared environment retaining its allocation charges.
     /// Locale/provider errors and exhausted memory are returned before publishing any environment.

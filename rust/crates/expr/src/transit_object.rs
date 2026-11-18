@@ -8,6 +8,7 @@ mod equal;
 mod emitted;
 mod hash;
 mod time;
+pub(crate) mod legacy_date_text;
 mod path;
 mod throwable;
 mod format_text;

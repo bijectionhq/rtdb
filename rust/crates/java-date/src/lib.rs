@@ -1,6 +1,7 @@
 //! Native OpenJDK legacy Date formatting and process locale inputs.
 
 mod date_calendar;
+mod date_display;
 mod date_environment;
 mod date_locale;
 mod date_names;
@@ -13,6 +14,7 @@ mod locale_data;
 use rtdb_types::java_date as legacy_calendar;
 
 pub use date_environment::{DateClock, DateEnvironment, DateEnvironmentInput};
+pub use date_display::DateDisplay;
 pub use date_pattern::DatePattern;
 
 /// SHA-256 of the verified Temurin 25 CLDR resource archive used to build the locale tables.

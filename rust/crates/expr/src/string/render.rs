@@ -1,6 +1,6 @@
 use rtdb_format::transit::TransitValue;
 use rtdb_types::{Anomaly, Result, TimeUnit, Value};
-use crate::{numeric::overflow, temporal::IntervalParts};
+use crate::{admission::Admission, numeric::overflow, temporal::IntervalParts, transit_object::legacy_date_text};
 
 /// Bounds scratch and output retained while casting a value to text, including Transit cache expansion.
 /// Acquire this charge before calling `cast` directly and retain it until the returned text acquires its own owner.
@@ -97,6 +97,10 @@ pub(super) fn transit(value: &TransitValue, depth: usize) -> Result<String> {
             ("i8" | "i16" | "i32" | "i64", TransitValue::Integer(value)) => value.to_string(),
             ("f32", TransitValue::Float(value)) => printed_float(*value, Some(*value as f32)),
             ("f64", TransitValue::Float(value)) => printed_float(*value, None),
+            (tag @ ("m" | "t"), representation) if legacy_date_text::HOST_CAPTURE => {
+                let millis = legacy_date_text::wire_millis(tag, representation)?;
+                legacy_date_text::readable(millis, Admission::Standalone)?
+            }
             ("m", TransitValue::String(value)) => instant(value.parse().map_err(|_| Anomaly::incorrect("xtdb.expression/invalid-transit-date", "Invalid millisecond date representation"))?)?,
             ("n", TransitValue::String(value)) => format!("{value}N"), ("f", TransitValue::String(value)) => format!("{value}M"),
             ("u", TransitValue::String(value)) => tagged("uuid", value), ("r", TransitValue::String(value)) => tagged("xt/uri", &rtdb_types::UriParts::parse(value)?.to_ascii_string()),

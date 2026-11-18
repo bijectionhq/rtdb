@@ -25,6 +25,10 @@ fn write_string(text: &mut Text<'_>,value: &Object) -> Result<()> {
             for ch in value.chars() { text.character(if ch == '-' { '_' } else { ch.to_ascii_uppercase() })?; }Ok(())
         }
         Object::ClojureForm(value) => { text.push("ClojureForm(form=")?;java_string(text,value)?;text.push(")") }
+        Object::Time(Time::LegacyDate(millis)) => {
+            let value = super::legacy_date_text::plain(*millis,text.admission())?;
+            text.push(&value)
+        }
         Object::Time(value) => text.temporary(4096,||value.text()),
         Object::Path(value) => text.temporary(path_capacity(value)?,||Ok(value.text())),
         Object::TableRef(value) => { text.push("TableRef(schemaName=")?;text.push(&value.schema)?;text.push(", tableName=")?;text.push(&value.table)?;text.push(")") }
@@ -107,7 +111,10 @@ fn time(text: &mut Text<'_>,value: &Time) -> Result<()> {
             let values = [from,to].map(|value|value.map_or(Object::Null,|value|Object::Time(Time::ZonedDateTime(value))));
             text.push("#xt/tstz-range ")?;return sequence(text,SequenceKind::Vector,values.iter());
         }
-        Time::LegacyDate(_) => return Err(Anomaly::unsupported("xtdb.expression/transit-date-text", "Readable Date text requires its legacy calendar formatter")),
+        Time::LegacyDate(millis) => {
+            let value = super::legacy_date_text::readable(*millis,text.admission())?;
+            return text.push(&value);
+        }
     };
     text.admission().reserve(4096)?;text.push("#xt/")?;text.push(tag)?;text.push(" ")?;quoted(text,&value.text()?)
 }
