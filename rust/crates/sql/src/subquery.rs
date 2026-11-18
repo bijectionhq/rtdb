@@ -181,6 +181,7 @@ impl Context<'_> {
             Some((index, _)) => *index,
             None => {
                 let index = self.internal_parameter()?;
+                self.allocate_symbol()?;
                 self.outer_scopes[scope].captures.insert(field.id, (index, field.expression()));
                 index
             }

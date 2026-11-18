@@ -209,7 +209,9 @@ Table aliases can give these columns explicit names.
 When the alias omits column names, the value and ordinal use the statement's generated source symbols.
 An eager column table serves standalone UNNEST and dependent UNNEST outside the direct cross-Apply rewrite.
 Its optional ordinality is a signed 64-bit sequence for the materialized page.
+The list table binds its output fields directly in the alias scope, preserving the logical namespace through later rewrites and in EXPLAIN.
 A direct captured UNNEST under a cross Apply stages the collection expression for the full independent page before expansion.
+The staged collection has a separate rewrite symbol and is omitted from SQL name lookup and wildcard expansion.
 That expansion produces signed 32-bit positions per input collection.
 The binding pass chooses the expansion shape before resolving expressions that read the output fields.
 Predicates using independent columns can move before collection staging.

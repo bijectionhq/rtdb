@@ -295,6 +295,18 @@ fn multiple_unnests_unnest_distinct_columns() {
 }
 
 #[tokio::test]
+async fn lateral_unnest_staging_is_hidden_from_sql_lookup() {
+    let from = "FROM (VALUES (2)) AS t(k), UNNEST(ARRAY[k, k+1]) WITH ORDINALITY AS u(v, n)";
+    assert_eq!(query(&format!("SELECT * {from}"), vec![]).await.unwrap(), [
+        vec![Value::I64(2), Value::I64(2), Value::I32(1)],
+        vec![Value::I64(2), Value::I64(3), Value::I32(2)],
+    ]);
+    let context = context();
+    let err = prepare(&format!("SELECT _unnest_0 {from}"), &context.catalog, &PrepareOptions::default()).unwrap_err();
+    assert_eq!(err.code, "xtdb/column-not-found");
+}
+
+#[tokio::test]
 async fn unnest_filters_base_columns_before_staging_and_generated_columns_after() {
     let context = context();
     let baseline = context.memory.used_bytes();

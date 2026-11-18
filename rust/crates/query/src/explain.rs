@@ -477,18 +477,26 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
         }
         RelationNode::List { expr, element } => {
             let expression = expression(expr)?;
-            map(work, [("columns", text(work.pieces(&[RenderPiece::Text("{"), RenderPiece::Text(&element.name), RenderPiece::Text(" "), RenderPiece::Text(expression.as_str()), RenderPiece::Text("}")])?)?)])?
+            let element = field_symbol(element, work)?;
+            map(work, [("columns", text(work.pieces(&[RenderPiece::Text("{"), RenderPiece::Text(element.as_str()), RenderPiece::Text(" "), RenderPiece::Text(expression.as_str()), RenderPiece::Text("}")])?)?)])?
         }
         RelationNode::ColumnTable { .. } => work.null(),
-        RelationNode::PageOrdinality { field, .. } => map(work, [
-            ("append?", work.boolean(true)),
-            ("project", text(work.pieces(&[RenderPiece::Text("[{"), RenderPiece::Text(&field.name), RenderPiece::Text(" (local-row-number)}]")])?)?),
-        ])?,
+        RelationNode::PageOrdinality { field, .. } => {
+            let namespace = field.qualifier.as_ref().and_then(|qualifier| qualifier.scope_symbol());
+            let prefix = match namespace {
+                Some(symbol) => work.pieces(&[RenderPiece::Text("[#:"), RenderPiece::Text(symbol), RenderPiece::Text("{")])?,
+                None => work.copy_text("[{")?,
+            };
+            map(work, [
+                ("append?", work.boolean(true)),
+                ("project", text(work.pieces(&[RenderPiece::Text(prefix.as_str()), RenderPiece::Text(&field.name), RenderPiece::Text(" (local-row-number)}]")])?)?),
+            ])?
+        }
         RelationNode::Unnest { expr, element, ordinality, .. } => {
             let mut fields = WorkMap::new(work);
             fields.insert("from", text(expression(expr)?)?)?;
-            fields.insert("to", text(work.copy_text(&element.name)?)?)?;
-            if let Some(field) = ordinality { fields.insert("ordinality", text(work.copy_text(&field.name)?)?)?; }
+            fields.insert("to", text(field_symbol(element, work)?)?)?;
+            if let Some(field) = ordinality { fields.insert("ordinality", text(field_symbol(field, work)?)?)?; }
             fields.finish()?
         }
         RelationNode::Mark { arguments, comparison, .. } if arguments.is_empty() => {
@@ -516,11 +524,20 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
         let name = match relation.node() {
             RelationNode::Rename { prefix, .. } => work.pieces(&[RenderPiece::Text(prefix), RenderPiece::Text("/"), RenderPiece::Text(&field.name)])?,
             RelationNode::Scan(_) | RelationNode::Values { .. } | RelationNode::Project { .. } | RelationNode::Aggregate { .. } | RelationNode::Reference { .. } => work.copy_text(&field.name)?,
-            _ => work.copy_text(input_columns.values.get(&field.id).map_or(field.name.as_str(), WorkText::as_str))?,
+            _ => match input_columns.values.get(&field.id) {
+                Some(name) => work.copy_text(name.as_str())?,
+                None => field_symbol(field, work)?,
+            },
         };
         columns.insert(field.id, name)?;
     }
     Ok(Descriptor { op, explanation, children, columns })
+}
+fn field_symbol<'work>(field: &Field, work: &'work ExplainWork) -> Result<WorkText<'work>> {
+    match field.qualifier.as_ref().and_then(|qualifier| qualifier.scope_symbol()) {
+        Some(symbol) => work.pieces(&[RenderPiece::Text(symbol), RenderPiece::Text("/"), RenderPiece::Text(&field.name)]),
+        None => work.copy_text(&field.name),
+    }
 }
 fn aggregate_form<'work>(aggregate: &rtdb_plan::AggregateExpr, columns: &Columns<'work>, work: &'work ExplainWork) -> Result<WorkText<'work>> {
     let name = aggregate.function.name();

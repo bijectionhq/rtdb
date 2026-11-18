@@ -52,6 +52,7 @@ pub(crate) struct Context<'a> {
     pub(crate) wildcard_renames: Vec<crate::wildcard::WildcardRename>,
     ctes: BTreeMap<String, Cte>,
     next_symbol: u64,
+    next_rewrite_symbol: u64,
     pub(crate) hidden_columns: BTreeMap<ColumnId, HiddenColumn>,
     pub(crate) outer_scopes: Vec<crate::subquery::CorrelationScope>,
     inferred_group_scopes: Vec<InferredGroupScope>,
@@ -86,7 +87,7 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     context.admit_expression_literals(expression)?;
     let expression = context.expr(expression, &Schema::default(), &BTreeMap::new())?;
     context.literals.check()?;
@@ -148,7 +149,7 @@ fn bind_using<T>(
     let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
-    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
@@ -905,14 +906,8 @@ impl Context<'_> {
 
     fn lower_column_table_apply(&mut self, input: &Arc<Relation>, dependent: &Arc<Relation>, arguments: &[(usize, Expr)]) -> Result<Option<Arc<Relation>>> {
         let table = match dependent.node() {
-            RelationNode::Rename { input, expressions, .. }
-                if expressions.len() == input.schema().len()
-                    && expressions.iter().zip(input.schema().fields()).all(|(named, field)| named.expr == field.expression()) => input.as_ref(),
-            _ => dependent.as_ref(),
-        };
-        let table = match table.node() {
             RelationNode::PageOrdinality { input, .. } => input.as_ref(),
-            _ => table,
+            _ => dependent.as_ref(),
         };
         let RelationNode::ColumnTable { expr, .. } = table.node() else { return Ok(None); };
         let mut collection = expr.clone();
@@ -930,21 +925,21 @@ impl Context<'_> {
             return Ok(Some(join(Arc::clone(input), Arc::clone(dependent), JoinKind::Cross, None)?));
         }
 
-        let name = self.symbol("_unnest_input")?;
+        let name = format!("_unnest_{}", self.next_rewrite_symbol);
+        self.next_rewrite_symbol = self.next_rewrite_symbol.checked_add(1).ok_or_else(|| error("SQL rewrite symbol counter overflow"))?;
         let staged_field = self.binder.field(name, None, collection.data_type())?;
+        self.hidden_columns.insert(staged_field.id, HiddenColumn::Internal);
         let staged = Arc::new(Arc::clone(input).extend(vec![NamedExpr { field: staged_field.clone(), expr: collection }])?);
         let element = dependent.schema().fields()[0].clone();
         let ordinal = dependent.schema().fields().get(1).cloned().map(|mut field| {
             field.data_type = LogicalType::Scalar(ScalarType::I32);
             field
         });
-        let projection = input.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinal.iter().cloned())
-            .map(|field| NamedExpr { expr: field.expression(), field }).collect();
         let schema = Schema::new(staged.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinal.iter().cloned()).collect())?;
         let expanded = Arc::new(Relation::new(schema, RelationNode::Unnest {
             input: staged, expr: staged_field.expression(), element, ordinality: ordinal, outer: false,
         })?);
-        Ok(Some(Arc::new(expanded.project(projection)?)))
+        Ok(Some(expanded))
     }
 
     fn table_for(&mut self, table: &ast::TableFactor, purpose: TablePurpose, lateral_start: usize) -> Result<Arc<Relation>> {
@@ -1111,13 +1106,24 @@ impl Context<'_> {
             LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => Ok(*element),
             _ => Ok(LogicalType::Null),
         }).collect::<Result<Vec<_>>>()?;
-        let element_name = self.symbol(if kind == ListTableKind::Series { "_genseries" } else { "_unnest" })?;
+        let alias_name = identifier(&alias.name).normalized();
+        let symbol = self.symbol(&alias_name)?;
+        let qualifier = ColumnQualifier::ScopedAlias { alias: alias_name, symbol };
+        let element_name = match alias.columns.first() {
+            Some(column) => identifier(&column.name).normalized(),
+            None => self.symbol(if kind == ListTableKind::Series { "_genseries" } else { "_unnest" })?,
+        };
         let mut element = self.binder.field(element_name, None, LogicalType::join_all(&elements))?;
-        element.unnamed = true;
+        element.qualifier = Some(qualifier.clone());
+        element.unnamed = alias.columns.is_empty();
         let ordinality = if with_ordinality {
-            let name = self.symbol("_ordinal")?;
+            let name = match alias.columns.get(1) {
+                Some(column) => identifier(&column.name).normalized(),
+                None => self.symbol("_ordinal")?,
+            };
             let mut field = self.binder.field(name, None, LogicalType::Scalar(ScalarType::I64))?;
-            field.unnamed = true;
+            field.qualifier = Some(qualifier);
+            field.unnamed = alias.columns.is_empty();
             Some(field)
         } else { None };
         let schema = Schema::new(std::iter::once(element.clone()).chain(ordinality.clone()).collect())?;
@@ -1131,7 +1137,7 @@ impl Context<'_> {
             Some(field) => Arc::new(Relation::new(schema, RelationNode::PageOrdinality { input, field })?),
             None => input,
         };
-        self.alias(relation, alias)
+        Ok(relation)
     }
 
     fn mutation_table(&mut self, table: &ast::TableFactor, erase: bool) -> Result<Arc<Relation>> {

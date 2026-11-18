@@ -92,10 +92,15 @@ pub fn resolve_table(catalog: &dyn Catalog, name: &[Identifier], search_path: &[
 pub enum ColumnQualifier {
     BaseTable { database: String, schema: String, alias: String },
     Alias(String),
+    ScopedAlias { alias: String, symbol: String },
 }
 
 impl ColumnQualifier {
-    pub fn alias(&self) -> &str { match self { Self::BaseTable { alias, .. } | Self::Alias(alias) => alias } }
+    pub fn alias(&self) -> &str { match self { Self::BaseTable { alias, .. } | Self::Alias(alias) | Self::ScopedAlias { alias, .. } => alias } }
+
+    pub fn scope_symbol(&self) -> Option<&str> {
+        match self { Self::ScopedAlias { symbol, .. } => Some(symbol), _ => None }
+    }
 
     /// Includes this descriptor and its owned string capacities.
     pub fn retained_bytes(&self) -> Result<usize> {
@@ -103,6 +108,7 @@ impl ColumnQualifier {
         let parts: &[&String] = match self {
             Self::BaseTable { database, schema, alias } => &[database, schema, alias],
             Self::Alias(alias) => &[alias],
+            Self::ScopedAlias { alias, symbol } => &[alias, symbol],
         };
         for part in parts { bytes = bytes.checked_add(part.capacity()).ok_or_else(|| Anomaly::incorrect("rtdb.plan/qualifier-size", "Column qualifier exceeds addressable memory"))?; }
         Ok(bytes)
@@ -114,7 +120,7 @@ impl ColumnQualifier {
         match self {
             Self::BaseTable { database, schema, .. } => parts.iter().rev().nth(1).is_none_or(|part| part == schema)
                 && parts.iter().rev().nth(2).is_none_or(|part| part == database),
-            Self::Alias(_) => true,
+            Self::Alias(_) | Self::ScopedAlias { .. } => true,
         }
     }
 }
