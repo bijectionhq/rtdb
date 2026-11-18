@@ -320,7 +320,9 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete the recorded regex host-form namespace, interop/effect, function/macro and generated-local semantics, including checked-index reader/compiler/host consumers, shared object identity, source metadata normalization timing and complete pattern diagnostics, and semantic/host/codec consumers of the shared UTF16 carrier and exact-unit replacement foundation; reconcile dev/doc/rust-regex.adoc against the final implementation."
+      "requirement": "XTQL regexp-replace host-form patterns evaluate through the production expression path with reference results for the supported host forms. Host forms the reference accepts but RTDB rejects are listed in dev/doc/rust-regex.adoc; SQL patterns remain literal-only as in the reference grammar.",
+      "superseded_requirement": "Complete the recorded regex host-form namespace, interop/effect, function/macro and generated-local semantics, including checked-index reader/compiler/host consumers, shared object identity, source metadata normalization timing and complete pattern diagnostics, and semantic/host/codec consumers of the shared UTF16 carrier and exact-unit replacement foundation; reconcile dev/doc/rust-regex.adoc against the final implementation.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "transit-registered-objects",
@@ -331,7 +333,9 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete the remaining registered object families and their semantic equality, rendering and inspection consumers. Complete semantic STR and cast rendering and FORMAT beyond the reviewed root LocalDate, LocalTime, Duration, DayOfWeek, Month and bounded ExceptionInfo arguments, including source Date locale and time-zone policy and the ExceptionInfo construction state used by readable text. Complete required Path provider environments."
+      "requirement": "Every registered reference Transit family decodes, compares and renders through CAST/STR (pr-str) and FORMAT (str) with the reference text. Families or renderings that cannot be reproduced deterministically are listed.",
+      "superseded_requirement": "Complete the remaining registered object families and their semantic equality, rendering and inspection consumers. Complete semantic STR and cast rendering and FORMAT beyond the reviewed root LocalDate, LocalTime, Duration, DayOfWeek, Month and bounded ExceptionInfo arguments, including source Date locale and time-zone policy and the ExceptionInfo construction state used by readable text. Complete required Path provider environments.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "physical-expression-schedules",
@@ -341,7 +345,9 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete remaining expression invocation boundaries and source constructor/allocator/bounds environments, existing-inner aliases, Field factories, remaining mutable getters and hints, signed Slice operations and mutable-selection aliasing, routed child writer/promotion, recursive copier/relation/full-object/hash and transport integration beyond the reviewed common vector tree and source scalar declaration, signed write-copy and borrowed-byte foundations. Extend signed FixedBinary LongLong beyond the direct and first Slice paths reviewed with Arrow 19 bounds checks. Extend initial-count construction beyond the reviewed typed Null and stock Arrow 19 Int cases. Preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
+      "requirement": "Null payloads, selected union legs and every value variant survive production execution, copies and native spilling unchanged, with tests through forced spills.",
+      "superseded_requirement": "Complete remaining expression invocation boundaries and source constructor/allocator/bounds environments, existing-inner aliases, Field factories, remaining mutable getters and hints, signed Slice operations and mutable-selection aliasing, routed child writer/promotion, recursive copier/relation/full-object/hash and transport integration beyond the reviewed common vector tree and source scalar declaration, signed write-copy and borrowed-byte foundations. Extend signed FixedBinary LongLong beyond the direct and first Slice paths reviewed with Arrow 19 bounds checks. Extend initial-count construction beyond the reviewed typed Null and stock Arrow 19 Int cases. Preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "sql-grammar-and-literals",
@@ -351,7 +357,9 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Extend the reviewed two-profile statement roots, control statements and constant SELECT tree schedules beyond numeric expressions, Boolean and NULL literals, raw and prefixed character strings, raw binary strings, DATE, TIMESTAMP and INTERVAL literals, aliases, the identifier family, isolation and empty-details windows, and the SLL DATE array and field paths. Extend native synchronization, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, host policy capture and production cache ownership. Reconcile the remaining whole-batch diagnostics and locale-dependent probes. Complete admitted syntax ownership on the remaining frontend preparation paths."
+      "requirement": "Every reference SQL statement and expression construct the reference visitor accepts has a production path through pgwire, Flight SQL, embedded ADBC and the node session, with reference results and literal values. Constructs both engines reject, and remaining divergences, are listed.",
+      "superseded_requirement": "Extend the reviewed two-profile statement roots, control statements and constant SELECT tree schedules beyond numeric expressions, Boolean and NULL literals, raw and prefixed character strings, raw binary strings, DATE, TIMESTAMP and INTERVAL literals, aliases, the identifier family, isolation and empty-details windows, and the SLL DATE array and field paths. Extend native synchronization, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, host policy capture and production cache ownership. Reconcile the remaining whole-batch diagnostics and locale-dependent probes. Complete admitted syntax ownership on the remaining frontend preparation paths.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "source-signed-binary-width",
@@ -362,7 +370,9 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Extend mutable FixedSizeBinary existing-inner aliases beyond the exclusive UUID borrow, and complete cross-allocator transfers, pointer use beyond the reviewed borrowed retargeting, ordering and default equality paths, general ByteBuffer operations, remaining indirect-reader operations, transport and production consumers. Preserve signed construction and write-copy behavior, immutable captured FixedBinary adoption into UUID readers, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand, signed explicit selection lookup and receiver-class order, FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
+      "requirement": "FixedSizeBinary and UUID values round-trip through durable Arrow IPC readable by the reference, and through pgwire and Flight SQL output, with tests.",
+      "superseded_requirement": "Extend mutable FixedSizeBinary existing-inner aliases beyond the exclusive UUID borrow, and complete cross-allocator transfers, pointer use beyond the reviewed borrowed retargeting, ordering and default equality paths, general ByteBuffer operations, remaining indirect-reader operations, transport and production consumers. Preserve signed construction and write-copy behavior, immutable captured FixedBinary adoption into UUID readers, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand, signed explicit selection lookup and receiver-class order, FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "embedded-parser-error-capability",
@@ -373,7 +383,9 @@
         "client_operational_surfaces",
         "client_read"
       ],
-      "requirement": "Qualify actual receipts from the paired reference and native embedded observers through the declared-migration comparator. Enforce private native-cache nonescape before production parsing. Run the serialized pgwire and Flight comparison independently of the embedded migration and reconcile any diagnostic differences it reports."
+      "requirement": "Embedded syntax errors report the same category, code and message as the server frontends and leave the connection usable. The absent ANTLR recognizer cause is the declared `embedded_sql_parser_cause` migration.",
+      "superseded_requirement": "Qualify actual receipts from the paired reference and native embedded observers through the declared-migration comparator. Enforce private native-cache nonescape before production parsing. Run the serialized pgwire and Flight comparison independently of the embedded migration and reconcile any diagnostic differences it reports.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "planning-allocation",
@@ -383,7 +395,9 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete admission before retained tokenizer payload and scratch allocation, lexer and parser growth, AST construction and catalog-dependent binding. Preserve the located slots of elided comments, token-array replacement overlap, the overlap of retained tokens and syntax during Simple Query batch construction, and each syntax reservation until its tree is consumed or discarded. Complete coverage of retained syntax and control payload growth beyond the per-statement estimate. Reuse classified syntax during initial preparation in the remaining frontends and retain prepared outputs through their last owner. Cover remaining production preparation and operand allocations with the caller-owned finite budget."
+      "requirement": "Every production frontend admits source and syntax memory before tokenizing, and over-budget statements fail with a resource error without poisoning the session. The size limit that rejects statements the reference accepts is listed.",
+      "superseded_requirement": "Complete admission before retained tokenizer payload and scratch allocation, lexer and parser growth, AST construction and catalog-dependent binding. Preserve the located slots of elided comments, token-array replacement overlap, the overlap of retained tokens and syntax during Simple Query batch construction, and each syntax reservation until its tree is consumed or discarded. Complete coverage of retained syntax and control payload growth beyond the per-statement estimate. Reuse classified syntax during initial preparation in the remaining frontends and retain prepared outputs through their last owner. Cover remaining production preparation and operand allocations with the caller-owned finite budget.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "azure-desktop-credentials",
@@ -404,7 +418,9 @@
         "compaction_gc_adapters",
         "client_operational_surfaces"
       ],
-      "requirement": "Complete required built-in TLS algorithm/provider choices and nondefault Connect settings; reconcile native extension registrations with the shipped classpath."
+      "requirement": "Reference Kafka log and Connect configuration keys, Java client properties, TLS and SASL settings and codecs reachable from user configuration are accepted with their reference effect, or listed as rejected. Converter registrations match the shipped classpath or are documented extensions.",
+      "superseded_requirement": "Complete required built-in TLS algorithm/provider choices and nondefault Connect settings; reconcile native extension registrations with the shipped classpath.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "kafka-avro-registry-and-producer",
@@ -414,7 +430,9 @@
         "compaction_gc_adapters",
         "client_operational_surfaces"
       ],
-      "requirement": "Extend the live same-input Avro pairing from scalar UTF8 to nullable JavaString transport, and finish source LogicalType construction, admitted graph/default and union materialization, MapEntry, qualified identity witnesses, and writer/SMT/cache owners. Preserve and reconcile the explicit null-default assertion conflict and qualify traversal beyond the native depth limit. Drive the observed Registry parser from the bounded live HTTP input with persistent symbol state, admitted nullable UTF16 schema, reference and rule consumers, and branch-specific version, cache and failure timing. Bind the existing connection timing, preferred DNS address, admitted logical flights and source jitter to qualified live DNS, socket, clock, Selector and request lifecycle events, including Math results and throttle deadlines. Drive the updater, exact native exchange, fatal broadcasts and topic wait from the live sender and use the resulting fixed partition, queue budget and timestamp in actual DLQ enqueue. Audit remaining cache borrowers and extend native admission to live copies, rack scratch, admin output, construction, security and outbound/compression owners."
+      "requirement": "Schema Registry Avro and JSON values convert to the reference documents through the production Connect driver, DLQ records carry the reference contents and headers, and decompression and conversion stay within the native byte account. Rejected schema shapes are listed.",
+      "superseded_requirement": "Extend the live same-input Avro pairing from scalar UTF8 to nullable JavaString transport, and finish source LogicalType construction, admitted graph/default and union materialization, MapEntry, qualified identity witnesses, and writer/SMT/cache owners. Preserve and reconcile the explicit null-default assertion conflict and qualify traversal beyond the native depth limit. Drive the observed Registry parser from the bounded live HTTP input with persistent symbol state, admitted nullable UTF16 schema, reference and rule consumers, and branch-specific version, cache and failure timing. Bind the existing connection timing, preferred DNS address, admitted logical flights and source jitter to qualified live DNS, socket, clock, Selector and request lifecycle events, including Math results and throttle deadlines. Drive the updater, exact native exchange, fatal broadcasts and topic wait from the live sender and use the resulting fixed partition, queue budget and timestamp in actual DLQ enqueue. Audit remaining cache borrowers and extend native admission to live copies, rack scratch, admin output, construction, security and outbound/compression owners.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "recovered-block-confirmation",
@@ -440,7 +458,9 @@
         "client_operational_surfaces",
         "conformance_machinery"
       ],
-      "requirement": "Check every reviewed design surface and production configuration against a concrete source path; classify reachable unsupported branches, mock-only adapters, JVM database delegation and remaining allocation findings before recording the implementation revision."
+      "requirement": "Every reviewed design surface and production configuration has a concrete source path. rust/conformance/unsupported-inventory.json classifies every production unsupported branch as reference parity or a native divergence, and test-only emulation is removed or excluded from production evidence.",
+      "superseded_requirement": "Check every reviewed design surface and production configuration against a concrete source path; classify reachable unsupported branches, mock-only adapters, JVM database delegation and remaining allocation findings before recording the implementation revision.",
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
     },
     {
       "id": "build-and-artifacts",
@@ -472,6 +492,18 @@
         "conformance_machinery"
       ],
       "requirement": "Run temporal history, failure schedules, real backend/client lanes, JVM/Rust recovery and rollback, resource lifetime checks and matched performance measurements."
+    },
+    {
+      "id": "differential-equivalence",
+      "kind": "qualification",
+      "status": "open",
+      "targets": [
+        "sql_xtql_execution",
+        "compaction_gc_adapters",
+        "client_operational_surfaces",
+        "conformance_machinery"
+      ],
+      "requirement": "Compare reference and native engines on the observable outputs that the re-baselined Phase 1 findings no longer pin by mechanism: syntax-error expected-token text beyond the first token, Transit collection print order, regex edge cases with repeated captures, Registry response parsing limits and Kafka client timing as seen by brokers. Fix every observable mismatch the comparison reports."
     }
   ]
 }
