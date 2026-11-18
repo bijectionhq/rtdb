@@ -293,7 +293,7 @@ impl PartitionScan {
                 if header.iid >= task.range.lower { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal });break; }
             }
         }
-        let mut resolver = HistoryResolver::new(self.bounds,self.scan.clamp_valid_time);
+        let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         while let Some(head) = heads.pop() {
             self.execution.context.check_cancelled()?;
             let rows = &self.loaded[&selected[head.active]].rows;
@@ -630,27 +630,35 @@ mod tests {
             outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
         };
         let baseline = root.used_bytes();
-        let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
-        let partition = cursor.partitions.front_mut().unwrap();
-        partition.initialize().await.unwrap();
-        assert_eq!(partition.pages.entries.len(), 1);
-        partition.load(0).await.unwrap();
         let scratch = std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>()
             + std::mem::size_of::<OwnedPage>() + 256 + 4096 + 256;
+        let timestamp_bytes = std::mem::size_of::<Timestamp>();
+        let previous_ceiling = (2 * 3 + 1) * timestamp_bytes + 256;
+        let replacement_ceiling = (2 * 6 + 1) * timestamp_bytes + 256;
         let slot = std::mem::size_of::<ResolvedRow<RowSource>>();
-        let previous = 2 * slot + 256;
-        let replacement = 4 * slot + 256;
-        let limit = root.limit_bytes();
-        let pressure = root.reserve(limit - root.used_bytes() - scratch - previous - replacement + 1).unwrap();
-        let retained = root.used_bytes() + scratch + previous;
-        let error = cursor.next_page().await.err().unwrap();
-        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
-        let expected = format!("Cannot reserve {replacement} bytes from budget {limit} with {retained} retained");
-        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-        assert!(cursor.partitions.front().unwrap().output.is_empty());
-        drop((cursor, pressure));
-        assert_eq!(root.used_bytes(), baseline);
-        assert_eq!(memory.used_bytes(), baseline);
+        let previous_history = 2 * slot + 256;
+        let replacement_history = 4 * slot + 256;
+        for (requested, charged) in [
+            (replacement_ceiling, scratch + previous_ceiling),
+            (replacement_history, scratch + previous_ceiling + replacement_ceiling + previous_history),
+        ] {
+            let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
+            let partition = cursor.partitions.front_mut().unwrap();
+            partition.initialize().await.unwrap();
+            assert_eq!(partition.pages.entries.len(), 1);
+            partition.load(0).await.unwrap();
+            let limit = root.limit_bytes();
+            let pressure = root.reserve(limit - root.used_bytes() - charged - requested + 1).unwrap();
+            let retained = root.used_bytes() + charged;
+            let error = cursor.next_page().await.err().unwrap();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            let expected = format!("Cannot reserve {requested} bytes from budget {limit} with {retained} retained");
+            assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+            assert!(cursor.partitions.front().unwrap().output.is_empty());
+            drop((cursor, pressure));
+            assert_eq!(root.used_bytes(), baseline);
+            assert_eq!(memory.used_bytes(), baseline);
+        }
 
         let mut cursor = ScanCursor::new(scan, execution.clone(), None).await.unwrap();
         let cursor_open = root.used_bytes();

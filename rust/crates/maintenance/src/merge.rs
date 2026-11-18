@@ -13,7 +13,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EventBatch, StoredEvent, copy_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
-use rtdb_temporal::PolygonCalculator;
+use rtdb_temporal::AdmittedPolygonCalculator;
 use rtdb_types::{EventOp, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{CompactionExecutor, CompactionJob, RecencyMode, SnapshotSource};
@@ -171,33 +171,36 @@ fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<BTreeMap<String, 
 fn resolve_same_time(events: &[StoredEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<StoredEvent>, Vec<Arc<MemoryReservation>>)> {
     let mut result = Vec::new();
     let mut charges = Vec::new();
-    let mut calculator = PolygonCalculator::new(None);
+    let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(memory));
     let mut previous = None;
     let mut seen_erase = false;
     let mut erased_iid = None;
     for event in events {
         let group = (event.iid, event.system_from);
         if previous != Some(group) { calculator.reset(); previous = Some(group); seen_erase = false; }
-        let polygon = if erased_iid == Some(event.iid) { None } else { calculator.calculate(&event.header())? };
-        if event.header().op == EventOp::Erase { erased_iid = Some(event.iid); }
-        match polygon {
-            None => {
-                if !seen_erase {
-                    charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                    let mut event = event.clone();
-                    event.valid_time = Interval::new(Timestamp::MIN, Timestamp::MAX)?;
-                    result.push(event);
+        let header = event.header();
+        let resolved = if erased_iid == Some(event.iid) { None } else {
+            calculator.visit(&header, |polygon| {
+                for (valid_from, valid_to, system_to) in polygon.ranges() {
+                    if system_to > event.system_from {
+                        charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+                        let mut event = event.clone();
+                        event.valid_time = Interval::new(valid_from, valid_to)?;
+                        result.push(event);
+                    }
                 }
-                seen_erase = true;
+                Ok(())
+            })?
+        };
+        if header.op == EventOp::Erase { erased_iid = Some(event.iid); }
+        if resolved.is_none() {
+            if !seen_erase {
+                charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+                let mut event = event.clone();
+                event.valid_time = Interval::new(Timestamp::MIN, Timestamp::MAX)?;
+                result.push(event);
             }
-            Some(polygon) => for index in 0..polygon.range_count() {
-                if polygon.system_time_ceilings()[index] > event.system_from {
-                    charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                    let mut event = event.clone();
-                    event.valid_time = Interval::new(polygon.valid_times()[index], polygon.valid_times()[index + 1])?;
-                    result.push(event);
-                }
-            },
+            seen_erase = true;
         }
     }
     Ok((result, charges))
@@ -262,13 +265,12 @@ impl CompactionExecutor for SegmentCompactor {
                 rows.push(events);
             }
             let mut heap = planner::RowHeap::new(&rows)?;
-            let mut calculator = PolygonCalculator::new(None);
+            let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory));
             let mut buckets: BTreeMap<usize, Vec<StoredEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
             while let Some((stream, row)) = heap.next(&rows) {
                 let event = &rows[stream][row];
-                let Some(polygon) = calculator.calculate(&event.header())? else { continue; };
-                let recency = polygon.recency();
+                let Some(recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
                 let target = if job.recency_mode == RecencyMode::Partition && recency != Timestamp::MAX {
                     let date = recency_partition(recency, self.config.recency_partition)?;
                     if let Some(index) = outputs.iter().position(|output| output.recency == Some(date)) { index }
@@ -283,6 +285,7 @@ impl CompactionExecutor for SegmentCompactor {
                 event.recency = if outputs[target].carries_recency { Some(if job.recency_mode == RecencyMode::Partition { recency } else { event.recency.ok_or_else(|| crate::invalid("Historical input lost recency"))? }) } else { None };
                 buckets.entry(target).or_default().push(event);
             }
+            drop(calculator);
             for (index, events) in buckets {
                 let _charge = event_reservation(&self.memory, &events, 8)?;
                 outputs[index].write(&events, task.path.clone(), &put, &self.config)?;
@@ -335,5 +338,40 @@ impl MergeFile {
         limit_writer(&mut writer, self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?, config.temporary_byte_limit)?;
         writer.finish()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_format::data::StoredOperation;
+    use rtdb_types::Iid;
+
+    #[test]
+    fn same_time_compaction_admits_the_ceiling_before_cloning_an_output_row() {
+        let input = [StoredEvent {
+            iid: Iid([1; 16]),
+            system_from: Timestamp(100),
+            valid_time: Interval::from_micros(10, 20).unwrap(),
+            operation: StoredOperation::Delete,
+            recency: None,
+        }];
+        let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
+        let limit = ceiling - 1;
+        let memory = MemoryBudget::new(limit);
+        let error = resolve_same_time(&input, &memory).err().unwrap();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        let expected = format!("Cannot reserve {ceiling} bytes from budget {limit} with 0 retained");
+        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+        assert_eq!(memory.used_bytes(), 0);
+
+        let output = row_bytes(&input[0]).unwrap() * 2;
+        let memory = MemoryBudget::new(ceiling + output);
+        let (rows, charges) = resolve_same_time(&input, &memory).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].header(), input[0].header());
+        assert_eq!(memory.used_bytes(), output);
+        drop((rows, charges));
+        assert_eq!(memory.used_bytes(), 0);
     }
 }

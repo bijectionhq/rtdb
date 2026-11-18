@@ -1,7 +1,7 @@
-use std::cell::Cell;
+use std::{cell::Cell, sync::Arc};
 
-use rtdb_temporal::{Ceiling, HistoryResolver, Polygon, PolygonCalculator, ResolvedRow};
-use rtdb_types::{EventHeader, EventOp, Iid, Interval, MemoryBudget, TemporalBounds, Timestamp};
+use rtdb_temporal::{AdmittedPolygonCalculator, Ceiling, HistoryResolver, Polygon, PolygonCalculator, ResolvedRow};
+use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, MemoryBudget, TemporalBounds, Timestamp};
 
 fn times(values: &[i64]) -> Vec<Timestamp> { values.iter().copied().map(Timestamp).collect() }
 fn interval(lower: i64, upper: i64) -> Interval { Interval::from_micros(lower, upper).unwrap() }
@@ -210,4 +210,117 @@ fn history_filters_events_before_reserving_and_still_reports_unsorted_input() {
     let error = resolver.resolve_in(&event(1, 101, 40, 50, EventOp::Put), 1, &budget).err().unwrap();
     assert_eq!(error.code, "xtdb/unsorted-events");
     assert_eq!(budget.peak_bytes(), 0);
+}
+
+#[test]
+fn ceiling_growth_reserves_both_buffers_before_visiting_and_can_retry() {
+    let timestamp_bytes = std::mem::size_of::<Timestamp>();
+    let previous = (2 * 3 + 1) * timestamp_bytes + 256;
+    let replacement = (2 * 6 + 1) * timestamp_bytes + 256;
+    let limit = previous + replacement;
+    let root = MemoryBudget::new(limit);
+    let budget = root.scope();
+    let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&budget));
+    let delete = event(1, 200, 10, 20, EventOp::Delete);
+    let put = event(1, 100, 0, 30, EventOp::Put);
+    calculator.visit(&delete, |view| {
+        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp::MAX)]);
+        Ok(())
+    }).unwrap().unwrap();
+    assert_eq!(budget.used_bytes(), previous);
+    let pressure = root.reserve(1).unwrap();
+    let denied = calculator.visit(&put, |_| -> rtdb_types::Result<()> { panic!("refused ceiling growth reached the visitor") }).unwrap_err();
+    assert_eq!(denied.code, "rtdb/memory-budget-exceeded");
+    let retained = previous + 1;
+    let expected = format!("Cannot reserve {replacement} bytes from budget {limit} with {retained} retained");
+    assert_eq!(denied.message.as_deref(), Some(expected.as_str()));
+    assert_eq!(root.used_bytes(), retained);
+    assert_eq!(budget.used_bytes(), previous);
+    drop(pressure);
+
+    let ranges = calculator.visit(&put, |view| {
+        assert_eq!(root.used_bytes(), limit);
+        assert_eq!(budget.used_bytes(), limit);
+        Ok(view.ranges().collect::<Vec<_>>())
+    }).unwrap().unwrap();
+    assert_eq!(ranges, [
+        (Timestamp(0), Timestamp(10), Timestamp::MAX),
+        (Timestamp(10), Timestamp(20), Timestamp(200)),
+        (Timestamp(20), Timestamp(30), Timestamp::MAX),
+    ]);
+    assert_eq!(root.peak_bytes(), limit);
+    assert_eq!(root.used_bytes(), replacement);
+    assert_eq!(budget.used_bytes(), replacement);
+    calculator.reset();
+    assert_eq!(root.used_bytes(), 0);
+
+    calculator.visit(&delete, |_| Ok(())).unwrap().unwrap();
+    assert_eq!(root.used_bytes(), previous);
+    drop(calculator);
+    assert_eq!(budget.used_bytes(), 0);
+    assert_eq!(root.used_bytes(), 0);
+}
+
+#[test]
+fn visitor_failure_consumes_the_event_and_refused_iid_rollover_keeps_it_current() {
+    let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
+    let root = MemoryBudget::new(2 * ceiling);
+    let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&root));
+    let failure = Anomaly::incorrect("test/visitor", "Cannot emit ranges");
+    let first = event(1, 200, 10, 20, EventOp::Delete);
+    assert_eq!(calculator.visit(&first, |_| Err::<(), _>(failure.clone())).unwrap_err(), failure);
+    assert_eq!(root.used_bytes(), ceiling);
+
+    let pressure = root.reserve(1).unwrap();
+    let next_iid = event(2, 100, 10, 20, EventOp::Put);
+    let refused = calculator.visit(&next_iid, |_| -> rtdb_types::Result<()> { panic!("refused IID reached the visitor") }).unwrap_err();
+    assert_eq!(refused.code, "rtdb/memory-budget-exceeded");
+    let current_iid = event(1, 199, 10, 20, EventOp::Put);
+    calculator.visit(&current_iid, |view| {
+        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp(200))]);
+        Ok(())
+    }).unwrap().unwrap();
+    assert_eq!(root.used_bytes(), ceiling + 1);
+    drop(pressure);
+    calculator.visit(&next_iid, |view| {
+        assert_eq!(root.used_bytes(), 2 * ceiling);
+        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp::MAX)]);
+        Ok(())
+    }).unwrap().unwrap();
+    assert_eq!(root.used_bytes(), ceiling);
+}
+
+#[test]
+fn borrowed_ranges_and_recency_match_owned_polygons_at_boundaries_and_erases() {
+    let bounds = Some(TemporalBounds { valid_time: Interval::ALL, system_time: interval(0, 500) });
+    let memory = MemoryBudget::new(4096);
+    let mut legacy = PolygonCalculator::new(bounds);
+    let mut admitted = AdmittedPolygonCalculator::new(bounds, Arc::clone(&memory));
+    let filtered = event(1, 500, 0, 30, EventOp::Put);
+    assert!(legacy.calculate(&filtered).unwrap().is_none());
+    assert!(admitted.visit(&filtered, |_| Ok(())).unwrap().is_none());
+    assert_eq!(memory.used_bytes(), 0);
+
+    for header in [
+        event(1, 499, 10, 20, EventOp::Delete),
+        event(1, 499, 0, 30, EventOp::Put),
+        event(1, 498, i64::MIN, i64::MIN, EventOp::Put),
+        event(1, 497, i64::MAX, i64::MAX, EventOp::Put),
+        event(1, 496, 10, 20, EventOp::Put),
+        event(1, 495, i64::MIN, i64::MAX, EventOp::Erase),
+        event(1, 495, 0, 30, EventOp::Put),
+        event(2, 500, i64::MIN, i64::MAX, EventOp::Erase),
+        event(2, 499, 0, 30, EventOp::Put),
+        event(3, 490, 0, 30, EventOp::Put),
+    ] {
+        let expected = legacy.calculate(&header).unwrap().map(|polygon| {
+            let ranges = polygon.valid_times().windows(2).zip(polygon.system_time_ceilings())
+                .map(|(valid, &system_to)| (valid[0], valid[1], system_to)).collect::<Vec<_>>();
+            (ranges, polygon.recency())
+        });
+        let actual = admitted.visit(&header, |view| Ok((view.ranges().collect::<Vec<_>>(), view.recency()))).unwrap();
+        assert_eq!(actual, expected);
+    }
+    drop(admitted);
+    assert_eq!(memory.used_bytes(), 0);
 }

@@ -70,6 +70,7 @@ No Rust compilation, test execution, JVM comparison, or simulation has run durin
 Cross-JVM Arrow byte identity remains unverified, including schema child order, dictionary encoding, FlatBuffer allocation order, and exact page boundaries.
 Compressed data and metadata inputs reserve their declared decoded buffers before opening dictionaries or pages.
 The job enforces temporary disk growth before writes and holds memory reservations for input pages, decoded rows, output pages, and retained metadata.
+Same-time resolution and recency calculation reserve the current entity's temporal ceiling in the compaction budget and read polygon ranges from it.
 Those conservative estimates are not a proof of bounded peak allocation for every nested Arrow schema.
 Catalog enumeration, object-store listings, and protobuf decoding still need complete peak-memory accounting.
 

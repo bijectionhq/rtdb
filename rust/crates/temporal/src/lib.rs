@@ -25,12 +25,8 @@ impl Polygon {
     pub fn range_count(&self) -> usize { self.system_time_ceilings.len() }
 
     pub fn recency(&self) -> Timestamp {
-        let mut recency = Timestamp::MIN;
-        for idx in (0..self.range_count()).rev() {
-            recency = recency.max(self.system_time_ceilings[idx].min(self.valid_times[idx + 1]));
-            if recency >= self.valid_times[idx] { return recency; }
-        }
-        recency
+        range_recency(self.valid_times.windows(2).zip(&self.system_time_ceilings)
+            .map(|(valid, &system_to)| (valid[0], valid[1], system_to)))
     }
 }
 
@@ -42,6 +38,45 @@ impl From<Polygon> for PolygonParts {
     fn from(polygon: Polygon) -> Self { Self { valid_times: polygon.valid_times, system_time_ceilings: polygon.system_time_ceilings } }
 }
 
+fn range_recency(ranges: impl DoubleEndedIterator<Item = (Timestamp, Timestamp, Timestamp)>) -> Timestamp {
+    let mut recency = Timestamp::MIN;
+    for (valid_from, valid_to, system_to) in ranges.rev() {
+        recency = recency.max(system_to.min(valid_to));
+        if recency >= valid_from { return recency; }
+    }
+    recency
+}
+
+/// The clipped ranges from the ceiling immediately before an event.
+pub struct PolygonView<'a> {
+    valid_times: &'a [Timestamp],
+    system_time_ceilings: &'a [Timestamp],
+    interval: Interval,
+}
+
+impl<'a> PolygonView<'a> {
+    fn new(valid_times: &'a [Timestamp], system_time_ceilings: &'a [Timestamp], interval: Interval) -> Self {
+        let first = valid_times.partition_point(|bound| *bound <= interval.lower()).saturating_sub(1)
+            .min(system_time_ceilings.len() - 1);
+        let last = if interval.is_empty() { first } else {
+            valid_times.partition_point(|bound| *bound < interval.upper()) - 1
+        };
+        Self { valid_times: &valid_times[first..last + 2], system_time_ceilings: &system_time_ceilings[first..=last], interval }
+    }
+
+    /// Yields each clipped valid-time lower bound, upper bound, and system-time ceiling in ascending valid-time order.
+    /// An empty valid-time interval produces one zero-width range.
+    pub fn ranges(&self) -> impl DoubleEndedIterator<Item = (Timestamp, Timestamp, Timestamp)> + '_ {
+        self.valid_times.windows(2).zip(self.system_time_ceilings)
+            .map(move |(valid, &system_to)| (valid[0].max(self.interval.lower()), valid[1].min(self.interval.upper()), system_to))
+    }
+
+    pub fn recency(&self) -> Timestamp { range_recency(self.ranges()) }
+}
+
+const INITIAL_VALID_TIMES: &[Timestamp] = &[Timestamp::MIN, Timestamp::MAX];
+const INITIAL_SYSTEM_TIME_CEILINGS: &[Timestamp] = &[Timestamp::MAX];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ceiling {
     valid_times: Vec<Timestamp>,
@@ -50,7 +85,7 @@ pub struct Ceiling {
 
 impl Default for Ceiling {
     fn default() -> Self {
-        Self { valid_times: vec![Timestamp::MIN, Timestamp::MAX], system_time_ceilings: vec![Timestamp::MAX] }
+        Self { valid_times: INITIAL_VALID_TIMES.to_vec(), system_time_ceilings: INITIAL_SYSTEM_TIME_CEILINGS.to_vec() }
     }
 }
 
@@ -59,24 +94,14 @@ impl Ceiling {
     pub fn valid_times(&self) -> &[Timestamp] { &self.valid_times }
     pub fn system_time_ceilings(&self) -> &[Timestamp] { &self.system_time_ceilings }
 
-    fn index_at(&self, at: Timestamp) -> usize {
-        self.valid_times.partition_point(|bound| *bound <= at).saturating_sub(1)
-            .min(self.system_time_ceilings.len() - 1)
-    }
-
     pub fn polygon(&self, interval: Interval) -> Polygon {
-        let mut valid_times = vec![interval.lower()];
-        let mut system_time_ceilings = Vec::new();
-        let mut idx = self.index_at(interval.lower());
-        if interval.is_empty() {
-            return Polygon { valid_times: vec![interval.lower(), interval.upper()], system_time_ceilings: vec![self.system_time_ceilings[idx]] };
-        }
-        loop {
-            system_time_ceilings.push(self.system_time_ceilings[idx]);
-            let next = self.valid_times[idx + 1].min(interval.upper());
-            valid_times.push(next);
-            if next == interval.upper() { break; }
-            idx += 1;
+        let view = PolygonView::new(&self.valid_times, &self.system_time_ceilings, interval);
+        let mut valid_times = Vec::with_capacity(view.valid_times.len());
+        let mut system_time_ceilings = Vec::with_capacity(view.system_time_ceilings.len());
+        valid_times.push(interval.lower());
+        for (_, valid_to, system_to) in view.ranges() {
+            valid_times.push(valid_to);
+            system_time_ceilings.push(system_to);
         }
         Polygon { valid_times, system_time_ceilings }
     }
@@ -103,49 +128,153 @@ impl Ceiling {
 }
 
 #[derive(Clone, Debug)]
-struct EntityState {
+struct EntityState<C> {
     iid: Iid,
     last_system_from: Timestamp,
     erased: bool,
-    ceiling: Ceiling,
+    ceiling: Option<C>,
+}
+
+struct EventStep {
+    same_entity: bool,
+    applies: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct PolygonCalculator {
+struct CalculatorState<C> {
     bounds: Option<TemporalBounds>,
-    entity: Option<EntityState>,
+    entity: Option<EntityState<C>>,
 }
 
+impl<C> CalculatorState<C> {
+    fn new(bounds: Option<TemporalBounds>) -> Self { Self { bounds, entity: None } }
+
+    fn classify(&self, header: &EventHeader) -> Result<EventStep> {
+        let mut same_entity = false;
+        let mut erased = false;
+        if let Some(entity) = &self.entity {
+            same_entity = header.iid == entity.iid;
+            if header.iid < entity.iid || (same_entity && header.system_from > entity.last_system_from) {
+                return Err(Anomaly::incorrect("xtdb/unsorted-events", "Temporal resolution requires IID ascending and system-time descending")
+                    .with_context("iid", header.iid.to_string().into()));
+            }
+            erased = same_entity && entity.erased;
+        }
+        let outside_bounds = header.op != EventOp::Erase
+            && self.bounds.is_some_and(|bounds| header.system_from >= bounds.system_time.upper());
+        Ok(EventStep { same_entity, applies: !erased && !outside_bounds })
+    }
+
+    fn advance(&mut self, header: &EventHeader, step: EventStep) -> &mut EntityState<C> {
+        if !step.same_entity { self.entity = None; }
+        let entity = self.entity.get_or_insert_with(|| EntityState {
+            iid: header.iid, last_system_from: header.system_from, erased: false, ceiling: None,
+        });
+        entity.last_system_from = header.system_from;
+        entity.erased |= step.applies && header.op == EventOp::Erase;
+        entity
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PolygonCalculator { state: CalculatorState<Ceiling> }
+
 impl PolygonCalculator {
-    pub fn new(bounds: Option<TemporalBounds>) -> Self { Self { bounds, entity: None } }
-    pub fn reset(&mut self) { self.entity = None; }
+    pub fn new(bounds: Option<TemporalBounds>) -> Self { Self { state: CalculatorState::new(bounds) } }
+    pub fn reset(&mut self) { self.state.entity = None; }
 
     /// Consumes IID-ascending, system-time-descending events from one applied snapshot.
     /// Erases are considered even beyond the query's system-time upper bound.
     /// Equal-time events retain the caller's transaction operation ordering.
     pub fn calculate(&mut self, header: &EventHeader) -> Result<Option<Polygon>> {
-        if let Some(entity) = &self.entity {
-            if header.iid < entity.iid || (header.iid == entity.iid && header.system_from > entity.last_system_from) {
-                return Err(Anomaly::incorrect("xtdb/unsorted-events", "Temporal resolution requires IID ascending and system-time descending")
-                    .with_context("iid", header.iid.to_string().into()));
-            }
-        }
-        if self.entity.as_ref().map(|entity| entity.iid) != Some(header.iid) {
-            self.entity = Some(EntityState { iid: header.iid, last_system_from: header.system_from,
-                erased: false, ceiling: Ceiling::default() });
-        }
-        let Some(entity) = self.entity.as_mut() else {
-            return Err(Anomaly::fault("xtdb/missing-entity-state", "Temporal entity initialization failed"));
-        };
-        entity.last_system_from = header.system_from;
-        if entity.erased { return Ok(None); }
-        if header.op != EventOp::Erase && self.bounds.is_some_and(|bounds| header.system_from >= bounds.system_time.upper()) {
+        let step = self.state.classify(header)?;
+        let applies = step.applies;
+        let entity = self.state.advance(header, step);
+        if !applies { return Ok(None); }
+        let ceiling = entity.ceiling.get_or_insert_with(Ceiling::default);
+        let polygon = ceiling.polygon(header.valid_time);
+        ceiling.apply_event(header.system_from, header.valid_time);
+        Ok(Some(polygon))
+    }
+}
+
+struct AdmittedCeiling {
+    ceiling: Ceiling,
+    capacity: usize,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl AdmittedCeiling {
+    fn replacement(
+        valid_times: &[Timestamp],
+        system_time_ceilings: &[Timestamp],
+        capacity: usize,
+        interval: Interval,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<Self>> {
+        if interval.is_empty() { return Ok(None); }
+        let inserts = usize::from(valid_times.binary_search(&interval.lower()).is_err())
+            + usize::from(valid_times.binary_search(&interval.upper()).is_err());
+        let required = system_time_ceilings.len().checked_add(inserts).ok_or_else(ceiling_size)?;
+        if required <= capacity { return Ok(None); }
+        let capacity = capacity.checked_mul(2).ok_or_else(ceiling_size)?.max(required);
+        let valid_capacity = capacity.checked_add(1).ok_or_else(ceiling_size)?;
+        let bytes = capacity.checked_add(valid_capacity).and_then(|count| count.checked_mul(std::mem::size_of::<Timestamp>()))
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(ceiling_size)?;
+        let reservation = memory.reserve(bytes)?;
+        let mut valid = Vec::new();
+        let mut system = Vec::new();
+        valid.try_reserve_exact(valid_capacity).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+        system.try_reserve_exact(capacity).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+        valid.extend_from_slice(valid_times);
+        system.extend_from_slice(system_time_ceilings);
+        Ok(Some(Self { ceiling: Ceiling { valid_times: valid, system_time_ceilings: system }, capacity, _reservation: reservation }))
+    }
+}
+
+fn ceiling_size() -> Anomaly {
+    Anomaly::incorrect("rtdb.temporal/ceiling-size", "Temporal ceiling capacity exceeds addressable memory")
+}
+
+/// Resolves events in order and retains the current ceiling's storage on the supplied budget.
+pub struct AdmittedPolygonCalculator {
+    state: CalculatorState<AdmittedCeiling>,
+    memory: Arc<MemoryBudget>,
+}
+
+impl AdmittedPolygonCalculator {
+    pub fn new(bounds: Option<TemporalBounds>, memory: Arc<MemoryBudget>) -> Self {
+        Self { state: CalculatorState::new(bounds), memory }
+    }
+
+    /// Clears the event position and releases the retained ceiling.
+    pub fn reset(&mut self) { self.state.entity = None; }
+
+    /// Visits the pre-event ranges of each eligible event, including an event with an empty valid-time interval.
+    /// Uses the event order defined by [`PolygonCalculator::calculate`].
+    /// Out-of-order input returns `xtdb/unsorted-events` before advancing the ordering position.
+    /// A put or delete at or above the system-time upper bound returns `None`, as does any event for the same IID after an erase.
+    /// These skipped events still advance the stream's ordering position.
+    /// Ceiling admission errors leave the event unconsumed, and visitor errors are returned after consuming it.
+    pub fn visit<T>(&mut self, header: &EventHeader, visitor: impl for<'a> FnOnce(PolygonView<'a>) -> Result<T>) -> Result<Option<T>> {
+        let step = self.state.classify(header)?;
+        if !step.applies {
+            self.state.advance(header, step);
             return Ok(None);
         }
-        let polygon = entity.ceiling.polygon(header.valid_time);
-        entity.ceiling.apply_event(header.system_from, header.valid_time);
-        entity.erased = header.op == EventOp::Erase;
-        Ok(Some(polygon))
+
+        let current = self.state.entity.as_ref().filter(|_| step.same_entity).and_then(|entity| entity.ceiling.as_ref());
+        let (valid, system, capacity) = current.map_or((INITIAL_VALID_TIMES, INITIAL_SYSTEM_TIME_CEILINGS, 0), |current| {
+            (current.ceiling.valid_times(), current.ceiling.system_time_ceilings(), current.capacity)
+        });
+        let replacement = AdmittedCeiling::replacement(valid, system, capacity, header.valid_time, &self.memory)?;
+        let result = visitor(PolygonView::new(valid, system, header.valid_time));
+        let entity = self.state.advance(header, step);
+        if let Some(replacement) = replacement { entity.ceiling = Some(replacement); }
+        if let Some(admitted) = &mut entity.ceiling {
+            admitted.ceiling.apply_event(header.system_from, header.valid_time);
+        }
+        result.map(Some)
     }
 }
 
@@ -184,15 +313,26 @@ impl<R> ResolvedRows<R> {
     }
 }
 
+enum HistoryCalculator {
+    Legacy(PolygonCalculator),
+    Admitted(AdmittedPolygonCalculator),
+}
+
 pub struct HistoryResolver {
-    calculator: PolygonCalculator,
+    calculator: HistoryCalculator,
     bounds: TemporalBounds,
     clamp_valid_time: bool,
 }
 
 impl HistoryResolver {
     pub fn new(bounds: TemporalBounds, clamp_valid_time: bool) -> Self {
-        Self { calculator: PolygonCalculator::new(Some(bounds)), bounds, clamp_valid_time }
+        Self { calculator: HistoryCalculator::Legacy(PolygonCalculator::new(Some(bounds))), bounds, clamp_valid_time }
+    }
+
+    /// Charges the retained ceiling to `memory`.
+    /// [`Self::resolve_in`] accepts the budget for its separate output allocation.
+    pub fn new_in(bounds: TemporalBounds, clamp_valid_time: bool, memory: Arc<MemoryBudget>) -> Self {
+        Self { calculator: HistoryCalculator::Admitted(AdmittedPolygonCalculator::new(Some(bounds), memory)), bounds, clamp_valid_time }
     }
 
     pub fn resolve<R: Clone>(&mut self, header: &EventHeader, source: R) -> Result<Vec<ResolvedRow<R>>> {
@@ -207,6 +347,7 @@ impl HistoryResolver {
     /// Reserves inline row storage on `memory` before cloning the source for each emitted fragment.
     /// The returned rows retain the reservation.
     /// Uses the event order defined by [`PolygonCalculator::calculate`] and returns `xtdb/unsorted-events` for out-of-order input.
+    /// A ceiling admission error leaves the event unconsumed.
     /// The calculator has consumed the event if result admission fails.
     pub fn resolve_in<R: Clone>(&mut self, header: &EventHeader, source: R, memory: &Arc<MemoryBudget>) -> Result<ResolvedRows<R>> {
         let mut result = ResolvedRows { rows: Vec::new(), capacity: 0, _reservation: None };
@@ -217,20 +358,29 @@ impl HistoryResolver {
     }
 
     fn resolve_fragments(&mut self, header: &EventHeader, mut emit: impl FnMut(Interval, Interval) -> Result<()>) -> Result<()> {
-        let Some(polygon) = self.calculator.calculate(header)? else { return Ok(()); };
-        if header.op != EventOp::Put { return Ok(()); }
-        for idx in 0..polygon.range_count() {
-            let valid_time = Interval::new(polygon.valid_times[idx], polygon.valid_times[idx + 1])?;
-            let system_to = polygon.system_time_ceilings[idx];
-            if header.system_from >= system_to { continue; }
-            let system_time = Interval::new(header.system_from, system_to)?;
-            if !self.bounds.valid_time.intersects(valid_time) || !self.bounds.system_time.intersects(system_time) { continue; }
-            let valid_time = if self.clamp_valid_time {
-                match valid_time.intersection(self.bounds.valid_time) { Some(interval) => interval, None => continue }
-            } else { valid_time };
-            emit(valid_time, system_time)?;
+        let bounds = self.bounds;
+        let clamp_valid_time = self.clamp_valid_time;
+        let mut emit_polygon = |polygon: PolygonView<'_>| {
+            if header.op != EventOp::Put { return Ok(()); }
+            for (valid_from, valid_to, system_to) in polygon.ranges() {
+                let valid_time = Interval::new(valid_from, valid_to)?;
+                if header.system_from >= system_to { continue; }
+                let system_time = Interval::new(header.system_from, system_to)?;
+                if !bounds.valid_time.intersects(valid_time) || !bounds.system_time.intersects(system_time) { continue; }
+                let valid_time = if clamp_valid_time {
+                    match valid_time.intersection(bounds.valid_time) { Some(interval) => interval, None => continue }
+                } else { valid_time };
+                emit(valid_time, system_time)?;
+            }
+            Ok(())
+        };
+        match &mut self.calculator {
+            HistoryCalculator::Legacy(calculator) => {
+                let Some(polygon) = calculator.calculate(header)? else { return Ok(()); };
+                emit_polygon(PolygonView { valid_times: polygon.valid_times(), system_time_ceilings: polygon.system_time_ceilings(), interval: header.valid_time })
+            }
+            HistoryCalculator::Admitted(calculator) => calculator.visit(header, emit_polygon).map(|_| ()),
         }
-        Ok(())
     }
 }
 
