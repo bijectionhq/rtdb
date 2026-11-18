@@ -389,3 +389,4 @@ mod selection;
 mod exchange;
 mod updater;
 mod wait;
+mod fatal;

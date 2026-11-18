@@ -59,13 +59,19 @@ impl MetadataWait {
         now_ms: impl FnOnce() -> Result<i64>,
     ) -> std::result::Result<WaitStep, WaitFailure> {
         fatal().map_err(WaitFailure::Fatal)?;
+        self.advance(refresh, now_ms).map_err(WaitFailure::Clock)
+    }
+
+    pub(super) fn advance(
+        &mut self, refresh: &RefreshState, now_ms: impl FnOnce() -> Result<i64>,
+    ) -> Result<WaitStep> {
         if refresh.is_closed() {
             return Ok(WaitStep::Closed);
         }
         if refresh.update_version() > self.last_version {
             return Ok(WaitStep::Updated);
         }
-        self.current_ms = self.current_ms.max(now_ms().map_err(WaitFailure::Clock)?);
+        self.current_ms = self.current_ms.max(now_ms()?);
         if self.current_ms >= self.deadline_ms {
             return Ok(WaitStep::TimedOut(self.timeout_ms));
         }

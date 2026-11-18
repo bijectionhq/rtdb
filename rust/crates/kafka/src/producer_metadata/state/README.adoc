@@ -142,7 +142,14 @@ The caller owns actual native completion, connection and clock observations, dia
 The initial clock read precedes timeout validation, and the deadline saturates at the signed long maximum.
 Each evaluation checks the source fatal error, closed state and update version before demanding a new clock sample.
 Clock samples can advance cached time, and a timeout retains the original requested duration.
-The enclosing monitor supplies fatal ownership, lock synchronization and notification or timeout delivery.
+The enclosing monitor synchronizes the check and wait registration and delivers notifications or timeouts.
+
+`ProducerMetadata` admits source error payloads before construction and retains independent ordinary and bootstrap fatal slots.
+An ordinary fatal is consumed once.
+A bootstrap fatal is retained across observations and takes priority without clearing other errors.
+`poll_wait` observes the retained handle before checking the version and timer.
+The topic error path clears both recoverable sets after an ordinary fatal or a topic-specific lookup.
+The monitor must notify waiters after publishing a fatal cause.
 
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.

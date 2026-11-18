@@ -14,6 +14,7 @@ mod random;
 mod exchange;
 mod updater;
 mod wait;
+mod fatal;
 
 pub use keys::{IdentityWitness, NoIdentityWitness, TopicId, TopicPartitionKey};
 pub use owned::Text;
@@ -24,6 +25,7 @@ pub use random::{JavaRandom, JavaRandomSeeds, JavaShuffleRandom};
 pub use exchange::{MetadataExchange, MetadataTarget, SubmissionFailure};
 pub use updater::{MetadataNetwork, MetadataUpdater, SendMetadata, UpdateFailure, UpdateSettings};
 pub use wait::{MetadataWait, WaitFailure, WaitStep};
+pub use fatal::{FatalKind, MetadataError, MetadataTopicError, MetadataWaitObservation};
 use keys::Ops;
 use owned::{Budget, Lease, Shared, Vector};
 use response::{Holder, Table, invalid_metadata};
@@ -99,6 +101,8 @@ pub struct ProducerMetadata {
     errors: Option<Table<Option<Text>, i16>>,
     invalid: Table<Option<Text>, ()>,
     unauthorized: Table<Option<Text>, ()>,
+    fatal: Option<MetadataError>,
+    bootstrap_fatal: Option<MetadataError>,
     failed: bool,
 }
 
@@ -125,7 +129,8 @@ impl ProducerMetadata {
             snapshot, bootstrap_addresses: None, refresh, idle_ms: settings.metadata_idle_ms,
             active: ActiveTopics::new(), new_topics: Map::new(None)?, epochs: Map::new(None)?,
             counters: Vector::new(), errors: None, invalid: Map::new(None)?.finish(&mut budget)?,
-            unauthorized: Map::new(None)?.finish(&mut budget)?, budget, failed: false,
+            unauthorized: Map::new(None)?.finish(&mut budget)?,
+            fatal: None, bootstrap_fatal: None, budget, failed: false,
         })
     }
 
@@ -321,12 +326,14 @@ impl ProducerMetadata {
         self.usable()?;
         let contains = |set: &Table<Option<Text>, ()>| set.iter().any(|(name, _)| name.as_ref().is_some_and(|name| name.as_str() == topic));
         let error = if contains(&self.unauthorized) { Some(29) } else if contains(&self.invalid) { Some(17) } else { None };
-        let result = (|| {
-            self.invalid = Map::new(None)?.finish(&mut self.budget)?;
-            self.unauthorized = Map::new(None)?.finish(&mut self.budget)?;
-            Ok(error)
-        })();
+        let result = self.clear_recoverable_errors().map(|()| error);
         self.completed(result)
+    }
+
+    fn clear_recoverable_errors(&mut self) -> Outcome<()> {
+        self.invalid = Map::new(None)?.finish(&mut self.budget)?;
+        self.unauthorized = Map::new(None)?.finish(&mut self.budget)?;
+        Ok(())
     }
 
     /// Consumes one persistent topic counter and fixes the selected partition for this record and every retry.
