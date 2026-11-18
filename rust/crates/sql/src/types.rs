@@ -1,7 +1,7 @@
 use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
 use sqlparser::ast as ast;
 
-use crate::bind::{error, identifiers, unsupported};
+use crate::bind::{error, grammar_rejected, identifiers, unsupported};
 
 pub(crate) fn cast_target(data_type: &ast::DataType, timezone: Option<&str>) -> Result<rtdb_plan::CastTarget> {
     use ast::{DataType as D, ExactNumberInfo as N};
@@ -80,17 +80,19 @@ pub(crate) fn data_type(data_type: &ast::DataType) -> Result<LogicalType> {
         }
         D::Custom(name, arguments) => {
             let names = identifiers(name)?;
-            if names.len() != 1 { return Err(unsupported("Qualified cast type")); }
+            if names.len() != 1 { return Err(grammar_rejected("A qualified cast type")); }
             match names[0].normalized().as_str() {
                 "keyword" => ScalarType::Keyword, "uri" => ScalarType::Uri, "oid" => ScalarType::Oid,
                 "regclass" => ScalarType::RegClass, "regproc" => ScalarType::RegProc,
                 "duration" => ScalarType::Duration(time_unit(arguments.first().map(|value| value.parse::<u64>().map_err(error)).transpose()?)?),
                 "timestamptz" => ScalarType::Timestamp { unit: time_unit(arguments.first().map(|value| value.parse::<u64>().map_err(error)).transpose()?)?, timezone: Some("UTC".into()) },
                 "bpchar" | "name" => ScalarType::Utf8,
-                _ => return Err(unsupported(format!("Cast type: {data_type}"))),
+                "row" => return Err(unsupported(format!("Cast type: {data_type}"))),
+                _ => return Err(grammar_rejected(format!("Cast type {data_type}"))),
             }
         }
-        _ => return Err(unsupported(format!("Cast type: {data_type}"))),
+        D::Interval { .. } | D::Struct(..) | D::Tuple(_) => return Err(unsupported(format!("Cast type: {data_type}"))),
+        _ => return Err(grammar_rejected(format!("Cast type {data_type}"))),
     };
     scalar.validate()?;
     Ok(LogicalType::Scalar(scalar))
@@ -123,6 +125,6 @@ pub(crate) fn literal(value: &ast::Value) -> Result<Value> {
             if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(error("Binary literals require complete hexadecimal bytes")); }
             Value::Binary((0..value.len()).step_by(2).map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(error)).collect::<Result<_>>()?)
         }
-        _ => return Err(unsupported(format!("Literal: {value}"))),
+        _ => return Err(grammar_rejected(format!("Literal {value}"))),
     })
 }

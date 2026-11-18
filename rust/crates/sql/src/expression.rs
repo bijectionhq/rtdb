@@ -4,7 +4,7 @@ use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, Expr, Field, Percent
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast::{self as ast, Spanned};
 
-use crate::bind::{Context, error, identifier, identifiers, unsupported};
+use crate::bind::{Context, error, grammar_rejected, identifier, identifiers, unsupported};
 use crate::subquery::{ExpressionInput, ExpressionScope, SubqueryValue, negated_operator};
 use std::sync::Arc;
 use rtdb_plan::Relation;
@@ -111,7 +111,7 @@ impl Context<'_> {
             },
             ast::Expr::Interval(interval) => self.interval_literal(interval)?,
             ast::Expr::Floor { expr, field } | ast::Expr::Ceil { expr, field } => {
-                if !matches!(field, ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)) { return Err(unsupported("CEIL/FLOOR precision fields")); }
+                if !matches!(field, ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)) { return Err(grammar_rejected("A CEIL/FLOOR precision field")); }
                 let name = if matches!(expression, ast::Expr::Floor { .. }) { "floor" } else { "ceil" };
                 call(name.into(), vec![self.expr_bound(expr, input, replacements)?])?
             }
@@ -119,7 +119,7 @@ impl Context<'_> {
             ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if matches!(expr.as_ref(), ast::Expr::Value(value) if matches!(&value.value, ast::Value::Number(value, _) if value == "9223372036854775808")) => Expr::Literal(Value::I64(i64::MIN)),
             ast::Expr::UnaryOp { op, expr } => {
                 let expr = self.expr_bound(expr, input, replacements)?;
-                match op { ast::UnaryOperator::Plus => expr, ast::UnaryOperator::Minus => Expr::unary(UnaryOp::Negate, expr), ast::UnaryOperator::Not => Expr::unary(UnaryOp::Not, expr), ast::UnaryOperator::BitwiseNot => Expr::unary(UnaryOp::BitNot, expr), _ => return Err(unsupported(format!("Unary operator: {op}"))) }
+                match op { ast::UnaryOperator::Plus => expr, ast::UnaryOperator::Minus => Expr::unary(UnaryOp::Negate, expr), ast::UnaryOperator::Not => Expr::unary(UnaryOp::Not, expr), ast::UnaryOperator::BitwiseNot => Expr::unary(UnaryOp::BitNot, expr), _ => return Err(grammar_rejected(format!("Unary operator {op}"))) }
             }
             ast::Expr::BinaryOp { left, op, right } => {
                 if let Some(access) = crate::json_access::JsonAccess::operator(op) {
@@ -174,11 +174,11 @@ impl Context<'_> {
                 if *negated { Expr::unary(UnaryOp::Not, predicate) } else { predicate }
             }
             ast::Expr::Like { expr, pattern, negated, any,.. } | ast::Expr::ILike { expr, pattern, negated, any,.. } => {
-                if *any { return Err(unsupported("LIKE ANY")); }
+                if *any { return Err(grammar_rejected("LIKE ANY")); }
                 Expr::Like { expr: Box::new(self.expr_bound(expr, input, replacements)?), pattern: Box::new(self.expr_bound(pattern, input, replacements)?), escape: None, case_insensitive: matches!(expression, ast::Expr::ILike { .. }), negated: *negated }
             }
             ast::Expr::Cast { expr, data_type, kind, format } => {
-                if format.is_some() || !matches!(kind, ast::CastKind::Cast | ast::CastKind::DoubleColon) { return Err(unsupported("TRY_CAST or cast format")); }
+                if format.is_some() || !matches!(kind, ast::CastKind::Cast | ast::CastKind::DoubleColon) { return Err(grammar_rejected("TRY_CAST or a cast format")); }
                 Expr::Cast { expr: Box::new(self.expr_bound(expr, input, replacements)?), target: self.cast_target(data_type)? }
             }
             ast::Expr::Case { operand, conditions, else_result, .. } => {
@@ -192,7 +192,7 @@ impl Context<'_> {
             }
             ast::Expr::Function(function) => {
                 if aggregate_function(&function.name.to_string()).is_some() || percentile_kind(&function.name.to_string()).is_some() { return Err(error("Aggregates are not allowed in this context")); }
-                if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(unsupported("Window function or scalar function modifiers")); }
+                if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(grammar_rejected("A scalar function modifier")); }
                 if let Some((query, value)) = function_query(function) {
                     return self.query_value(query, input, value);
                 }
@@ -254,7 +254,7 @@ impl Context<'_> {
                             Ok(Expr::Literal(Value::Utf8(crate::temporal_syntax::trunc_field(expr)?)))
                         } else { self.expr_bound(expr,input,replacements) }
                     }
-                    _ => Err(unsupported("Named function arguments or scalar wildcard")),
+                    _ => Err(grammar_rejected("A named or wildcard scalar function argument")),
                 }).collect::<Result<Vec<_>>>()?;
                 let name = match units {
                     Some(units) => character_length_function(units)?.into(),
@@ -295,7 +295,7 @@ impl Context<'_> {
                             let data_type = rtdb_plan::function_type("nth", &[expr.data_type(), index.data_type()])?;
                             expr = Expr::Subscript { expr: Box::new(expr), index: Box::new(index), data_type };
                         }
-                        _ => return Err(unsupported("Nested field access or array slices")),
+                        _ => return Err(grammar_rejected("Nested field access or an array slice")),
                     }
                 }
                 expr
@@ -314,13 +314,13 @@ impl Context<'_> {
                 call("overlay".into(), vec![target, placing, start, length])?
             }
             ast::Expr::Trim { expr, trim_where, trim_what, trim_characters } => {
-                if trim_characters.is_some() { return Err(unsupported("TRIM character list")); }
+                if trim_characters.is_some() { return Err(grammar_rejected("A TRIM character list")); }
                 let mut args = vec![self.expr_bound(expr, input, replacements)?];
                 args.push(match trim_what { Some(what) => self.expr_bound(what, input, replacements)?, None => Expr::Literal(Value::Utf8(" ".into())) });
                 let name = match trim_where { Some(ast::TrimWhereField::Leading) => "trim_leading", Some(ast::TrimWhereField::Trailing) => "trim_trailing", _ => "trim" };
                 call(name.into(), args)?
             }
-            _ => return Err(unsupported(format!("SQL expression: {expression}"))),
+            _ => return Err(grammar_rejected(format!("SQL expression {expression}"))),
         };
         rtdb_plan::bind_clock_timezone(expression,self.cast_timezone)
     }
@@ -334,10 +334,11 @@ impl Context<'_> {
     }
 
     pub(crate) fn aggregate(&mut self, function: &ast::Function, input: &mut Arc<Relation>, index: usize) -> Result<AggregateExpr> {
-        if function.over.is_some() || function.null_treatment.is_some() { return Err(unsupported("Aggregate window or null treatment")); }
+        if function.over.is_some() { return Err(unsupported("Aggregate window functions")); }
+        if function.null_treatment.is_some() { return Err(grammar_rejected("Aggregate null treatment")); }
         if let Some(kind) = percentile_kind(&function.name.to_string()) { return self.percentile(function, kind, input, index); }
         let mut kind = aggregate_function(&function.name.to_string()).ok_or_else(|| error("Unknown aggregate"))?;
-        if !function.within_group.is_empty() { return Err(unsupported("WITHIN GROUP requires an ordered-set aggregate")); }
+        if !function.within_group.is_empty() { return Err(grammar_rejected("WITHIN GROUP outside PERCENTILE_CONT and PERCENTILE_DISC")); }
         let args = function_arguments(function)?;
         let argument = match args.as_slice() {
             [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)] if kind == AggregateFunction::Count => { kind = AggregateFunction::CountStar; None }
@@ -348,9 +349,9 @@ impl Context<'_> {
         let mut order_by = function.within_group.iter().map(|order| self.relational_sort_expr(order, input, &BTreeMap::new())).collect::<Result<Vec<_>>>()?;
         let distinct = if let ast::FunctionArguments::List(arguments) = &function.args {
             for clause in &arguments.clauses {
-                match clause { ast::FunctionArgumentClause::OrderBy(order) if kind == AggregateFunction::ArrayAgg => for expression in order { order_by.push(self.relational_sort_expr(expression, input, &BTreeMap::new())?); }, _ => return Err(unsupported("Aggregate argument modifier")) }
+                match clause { ast::FunctionArgumentClause::OrderBy(order) if kind == AggregateFunction::ArrayAgg => for expression in order { order_by.push(self.relational_sort_expr(expression, input, &BTreeMap::new())?); }, _ => return Err(grammar_rejected("An aggregate argument modifier")) }
             }
-            if kind == AggregateFunction::ArrayAgg && arguments.duplicate_treatment.is_some() { return Err(unsupported("SQL ARRAY_AGG does not accept a set quantifier")); }
+            if kind == AggregateFunction::ArrayAgg && arguments.duplicate_treatment.is_some() { return Err(grammar_rejected("An ARRAY_AGG set quantifier")); }
             arguments.duplicate_treatment == Some(ast::DuplicateTreatment::Distinct)
         } else { false };
         if distinct && !matches!(kind.canonical(), AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Average | AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::ArrayAgg) {
@@ -490,7 +491,7 @@ pub(crate) fn scalar_argument_units(arguments: &ast::FunctionArgumentList) -> Re
             _ => {}
         }
     }
-    Err(unsupported("Scalar function argument modifiers"))
+    Err(grammar_rejected("A scalar function argument modifier"))
 }
 
 pub(crate) fn character_length_function(units: &ast::CharacterLengthUnits) -> Result<&'static str> {
@@ -518,7 +519,7 @@ pub(crate) fn scalar_name(function: &ast::Function) -> Result<String> {
     let count = match &function.args {
         ast::FunctionArguments::None => 0,
         ast::FunctionArguments::List(arguments) => arguments.args.len(),
-        _ => return Err(unsupported("Function subquery arguments")),
+        _ => return Err(grammar_rejected("An unparenthesised subquery function argument")),
     };
     if let Some(arity) = generic_function_arity(&name) {
         if !arity.contains(&count) { return Err(error(format!("Function {name} arity mismatch: expected {}-{}, got {count}", arity.start(), arity.end()))); }
@@ -575,7 +576,7 @@ fn field_access(expr: Expr, name: String) -> Expr {
 }
 
 fn function_arguments(function: &ast::Function) -> Result<Vec<ast::FunctionArg>> {
-    match &function.args { ast::FunctionArguments::None => Ok(Vec::new()), ast::FunctionArguments::List(arguments) => Ok(arguments.args.clone()), _ => Err(unsupported("Function subquery arguments")) }
+    match &function.args { ast::FunctionArguments::None => Ok(Vec::new()), ast::FunctionArguments::List(arguments) => Ok(arguments.args.clone()), _ => Err(grammar_rejected("An unparenthesised subquery function argument")) }
 }
 
 fn binary_operator(operator: &ast::BinaryOperator) -> Result<BinaryOp> {
@@ -586,7 +587,7 @@ fn binary_operator(operator: &ast::BinaryOperator) -> Result<BinaryOp> {
         A::And => BinaryOp::And, A::Or => BinaryOp::Or, A::StringConcat => BinaryOp::Concat,
         A::BitwiseAnd => BinaryOp::BitAnd, A::BitwiseOr => BinaryOp::BitOr, A::PGBitwiseXor | A::BitwiseXor => BinaryOp::BitXor,
         A::PGBitwiseShiftLeft => BinaryOp::ShiftLeft, A::PGBitwiseShiftRight => BinaryOp::ShiftRight,
-        _ => return Err(unsupported(format!("Binary operator: {operator}"))),
+        _ => return Err(grammar_rejected(format!("Binary operator {operator}"))),
     })
 }
 

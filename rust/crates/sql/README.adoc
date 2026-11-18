@@ -137,6 +137,19 @@ The pinned planner's `xt.not_found` scan and unresolved-column null projections 
 `tests/missing_names.rs` maps `test-operators-with-unresolved-column-references-3640`, `TableRefVisitor`, and `ExprPlanVisitor` without treating those intermediate values as executable success.
 An empty table declared in the catalog still supplies its schema without requiring any data rows.
 
+== Rejected constructs
+
+A construct sqlparser admits but the pinned `Sql.g4` has no production for is a parse error, as it is for the reference listener: Incorrect, `xtdb/sql-error`, with a message beginning `Errors parsing SQL statement:`.
+The binder raises it through `grammar_rejected`, and binding then reparses the statement under the ported `directSqlStatement` grammar; where that recognizer reports the input, its listener text replaces the binder's description.
+Text before the statement is blanked rather than dropped, so line and column count from the start of the batch.
+A grammar rejection is reported alone rather than folded into accumulated planning diagnostics, since the reference parses before it plans.
+
+Constructs the grammar admits keep the pinned visitor's outcome.
+Its `err/unsupported` codes are reproduced exactly; window names, window frames, a second window function and CTE column aliases, which the visitor rejects with a raw JVM exception or assertion, are Unsupported `xtdb/sql-unsupported` with the visitor's message.
+Remaining Unsupported sites are native gaps for constructs the grammar admits, such as ranks, NTILE and aggregate windows, DISTINCT on aggregates without a reference distinct factory, schema-qualified wildcards and TIME WITH TIME ZONE casts.
+The four standard isolation levels are accepted and ignored, as in the reference transaction-characteristics visitor.
+`tests/grammar_rejections.rs` covers a representative of each group.
+
 == Qualified columns
 
 Qualified plan fields own a passive `ColumnQualifier` describing their binding namespace.
@@ -308,7 +321,7 @@ They retain the operand type with nullability, respect null rows, and return nul
 
 The pinned planner rejects multiple window calls in one SELECT, explicit frames, direct named-window references, default expressions, and explicit null treatment.
 Its WINDOW definitions and existing name inside `OVER (name ...)` are inert; they do not supply partitioning or ordering.
-QUALIFY is unsupported, while an outer query can filter a projected window result.
+QUALIFY is outside the pinned grammar, while an outer query can filter a projected window result.
 Ranks, NTILE, value-selection functions, and aggregate windows have no implemented reference window factory and remain unsupported.
 Subqueries and output ordinals in window ORDER BY remain rejected.
 

@@ -122,7 +122,7 @@ fn parse_extent(tokens: &[TokenWithSpan], source: &str, span: sqlparser::tokeniz
 
 impl Context<'_> {
     fn setting_value(&mut self, expression: &ast::Expr) -> Result<SettingValue> {
-        use crate::bind::{error, unsupported};
+        use crate::bind::{error, grammar_rejected, unsupported};
         if let ast::Expr::Nested(expression) | ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus, expr: expression } = expression { return self.setting_value(expression); }
         if let ast::Expr::BinaryOp { left,op,right } = expression {
             if let Some(access) = crate::json_access::JsonAccess::operator(op) {
@@ -133,11 +133,12 @@ impl Context<'_> {
             }
         }
         if let ast::Expr::Function(function) = expression {
-            if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(unsupported("Window function or scalar function modifiers")); }
+            if function.over.is_some() { return Err(unsupported("Window functions in a query setting")); }
+            if function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(grammar_rejected("A scalar function modifier")); }
             let (arguments, units): (&[ast::FunctionArg], _) = match &function.args {
                 ast::FunctionArguments::None => (&[], None),
                 ast::FunctionArguments::List(arguments) => (&arguments.args, crate::expression::scalar_argument_units(arguments)?),
-                _ => return Err(unsupported("Scalar function argument modifiers")),
+                _ => return Err(grammar_rejected("A scalar function argument modifier")),
             };
             let name = crate::expression::scalar_name(function)?;
             setting_function_arity(&name, arguments.len())?;
@@ -145,7 +146,7 @@ impl Context<'_> {
             if matches!(name.as_str(),"date_bin" | "range_bins") && !matches!(arguments.first(),Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Interval(_))))) { return Err(error("Temporal bin functions require an interval literal stride")); }
             let mut parameter_count = 0;
             for (index,argument) in arguments.iter().enumerate() {
-                let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument)) = argument else { return Err(unsupported("Named function arguments or scalar wildcard")); };
+                let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument)) = argument else { return Err(grammar_rejected("A named or wildcard scalar function argument")); };
                 if name == "date_trunc" && index == 0 {
                     crate::temporal_syntax::trunc_field(argument)?;
                     continue;
@@ -160,11 +161,11 @@ impl Context<'_> {
             return Ok(SettingValue::Unevaluated { parameter_count: 0 });
         }
         if let ast::Expr::Floor { field, .. } | ast::Expr::Ceil { field, .. } = expression {
-            if !matches!(field, ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)) { return Err(unsupported("CEIL/FLOOR precision fields")); }
+            if !matches!(field, ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)) { return Err(grammar_rejected("A CEIL/FLOOR precision field")); }
         }
         if let ast::Expr::Extract { field,syntax,.. } = expression { crate::temporal_syntax::extract_field(field,syntax)?; }
         if let ast::Expr::Cast { data_type, kind, format, .. } = expression {
-            if format.is_some() || !matches!(kind, ast::CastKind::Cast | ast::CastKind::DoubleColon) { return Err(unsupported("TRY_CAST or cast format")); }
+            if format.is_some() || !matches!(kind, ast::CastKind::Cast | ast::CastKind::DoubleColon) { return Err(grammar_rejected("TRY_CAST or a cast format")); }
             self.cast_target(data_type)?;
         }
         if let ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } = expression {

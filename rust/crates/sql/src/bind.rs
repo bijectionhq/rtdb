@@ -144,6 +144,34 @@ fn bind_using<T>(
     options: &PrepareOptions,
     bind: impl FnOnce(&mut Context<'_>, &Syntax, QuerySettings) -> Result<T>,
 ) -> Result<T> {
+    let (input, span, forms) = (parsed.tree.source.input, parsed.span, parsed.forms);
+    bind_parsed(parsed, catalog, options, bind).map_err(|error| grammar_report(error, input, span, forms))
+}
+
+/// Replaces a binder-detected grammar rejection with the reference listener's report when the ported grammar produces one.
+/// The statement keeps its line and column: text before it is blanked rather than removed.
+fn grammar_report(error: Anomaly, input: &str, span: SourceSpan, forms: FormAllocation<'_>) -> Anomaly {
+    if !is_grammar_rejection(&error) { return error; }
+    let mut source: String = input[..span.start].chars().map(|ch| if matches!(ch, '\n' | '\r') { ch } else { ' ' }).collect();
+    source.push_str(&input[span.start..span.end]);
+    let untracked;
+    let memory = match forms.memory() {
+        Some(memory) => memory,
+        None => { untracked = MemoryBudget::new(usize::MAX); &untracked }
+    };
+    match crate::parser::statement_syntax_diagnostic(&source, &error, memory) {
+        Ok(Some(report)) => report.anomaly().clone(),
+        Ok(None) => error,
+        Err(admission) => admission,
+    }
+}
+
+fn bind_parsed<T>(
+    parsed: ParsedStatement<'_>,
+    catalog: &dyn Catalog,
+    options: &PrepareOptions,
+    bind: impl FnOnce(&mut Context<'_>, &Syntax, QuerySettings) -> Result<T>,
+) -> Result<T> {
     let next_parameter = parsed.parameter_count();
     let forms = parsed.forms;
     let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
@@ -200,7 +228,7 @@ impl Context<'_> {
     }
 
     fn check_diagnostics(&mut self, terminal: Option<&Anomaly>) -> Result<()> {
-        if terminal.is_some_and(|error| !error.is_caller_error() || error.code.starts_with("rtdb/")) {
+        if terminal.is_some_and(|error| !error.is_caller_error() || error.code.starts_with("rtdb/") || is_grammar_rejection(error)) {
             return Ok(());
         }
         let mut errors = std::mem::take(&mut self.diagnostics).into_iter();
@@ -356,12 +384,13 @@ impl Context<'_> {
     }
 
     fn insert_rows(&mut self, insert: &ast::Insert) -> std::result::Result<InsertRows, InsertRowsError> {
-        if insert.returning.is_some() || insert.on.is_some() || insert.overwrite || insert.ignore || insert.replace_into || insert.or.is_some() || !insert.assignments.is_empty() || insert.output.is_some() {
-            return Err(unsupported("INSERT modifiers and RETURNING").into());
+        if insert.returning.is_some() { return Err(unsupported("INSERT RETURNING").into()); }
+        if insert.on.is_some() || insert.overwrite || insert.ignore || insert.replace_into || insert.or.is_some() || !insert.assignments.is_empty() || insert.output.is_some() {
+            return Err(grammar_rejected("An INSERT modifier").into());
         }
-        let ast::TableObject::TableName(name) = &insert.table else { return Err(unsupported("Dynamic INSERT target").into()); };
+        let ast::TableObject::TableName(name) = &insert.table else { return Err(grammar_rejected("A dynamic INSERT target").into()); };
         let table = self.target(name)?;
-        let source = insert.source.as_ref().ok_or_else(|| unsupported("INSERT DEFAULT VALUES"))?;
+        let source = insert.source.as_ref().ok_or_else(|| grammar_rejected("INSERT DEFAULT VALUES"))?;
         let expected = insert.columns.len();
         if let ast::SetExpr::Values(values) = source.body.as_ref() {
             if expected == 0 {
@@ -428,13 +457,14 @@ impl Context<'_> {
                 Statement::Dml(Dml::Insert { table, input })
             }
             ast::Statement::Update(update) => {
-                if update.from.is_some() || update.returning.is_some() || update.output.is_some() || !update.order_by.is_empty() || update.limit.is_some() || !update.table.joins.is_empty() { return Err(unsupported("UPDATE FROM, joined targets, ordering, or RETURNING")); }
+                if update.returning.is_some() { return Err(unsupported("UPDATE RETURNING")); }
+                if update.from.is_some() || update.output.is_some() || !update.order_by.is_empty() || update.limit.is_some() || !update.table.joins.is_empty() { return Err(grammar_rejected("UPDATE FROM, a joined target or ordering")); }
                 let mut input = self.mutation_table(&update.table.relation, false)?;
                 let (target, valid_time) = scan_target(&input)?;
                 let target_columns = input.schema().fields().iter().filter(|field| !matches!(field.name.as_str(), "_valid_time" | "_system_time")).map(|field| field.id).collect();
                 if let Some(predicate) = &update.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
                 let assignments = update.assignments.iter().map(|assignment| {
-                    let ast::AssignmentTarget::ColumnName(name) = &assignment.target else { return Err(unsupported("Tuple assignments")); };
+                    let ast::AssignmentTarget::ColumnName(name) = &assignment.target else { return Err(grammar_rejected("A tuple assignment")); };
                     let names = identifiers(name)?;
                     if names.len() != 1 { return Err(error("UPDATE assignment target must be a column")); }
                     let name = names[0].normalized();
@@ -446,12 +476,14 @@ impl Context<'_> {
             }
             ast::Statement::Delete(delete) => return self.delete(delete, false),
             ast::Statement::StartTransaction { modes, statements, .. } => {
-                if !statements.is_empty() { return Err(unsupported("SQL procedural transaction blocks")); }
+                if !statements.is_empty() { return Err(grammar_rejected("A procedural transaction block")); }
                 let mut access_mode = None;
                 for mode in modes {
                     match mode {
                         ast::TransactionMode::AccessMode(mode) => access_mode = Some(match mode { ast::TransactionAccessMode::ReadOnly => AccessMode::ReadOnly, ast::TransactionAccessMode::ReadWrite => AccessMode::ReadWrite }),
-                        _ => return Err(unsupported("Transaction isolation modifiers")),
+                        ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::ReadUncommitted | ast::TransactionIsolationLevel::ReadCommitted
+                            | ast::TransactionIsolationLevel::RepeatableRead | ast::TransactionIsolationLevel::Serializable) => (),
+                        _ => return Err(grammar_rejected("A transaction isolation level other than the four standard levels")),
                     }
                 }
                 Statement::Begin { access_mode, system_time: None }
@@ -459,16 +491,20 @@ impl Context<'_> {
             ast::Statement::Commit { chain, .. } if !chain => Statement::Commit,
             ast::Statement::Rollback { chain, savepoint, .. } if !chain && savepoint.is_none() => Statement::Rollback,
             ast::Statement::Explain { statement, analyze, describe_alias, verbose, query_plan, estimate, format, options } => {
-                if *describe_alias != ast::DescribeAlias::Explain || *verbose || *query_plan || *estimate || format.is_some() || options.is_some() { return Err(unsupported("EXPLAIN options other than ANALYZE")); }
+                if *describe_alias != ast::DescribeAlias::Explain || *verbose || *query_plan || *estimate || format.is_some() || options.is_some() { return Err(grammar_rejected("An EXPLAIN option other than ANALYZE")); }
                 let Statement::Query(relation) = self.standard(statement)? else { return Err(error("EXPLAIN requires a query expression")); };
                 Statement::Explain { relation, mode: if *analyze { ExplainMode::Analyze } else { ExplainMode::Plan } }
             }
-            _ => return Err(unsupported(format!("SQL statement: {statement}"))),
+            ast::Statement::Copy { .. } | ast::Statement::Prepare { .. } | ast::Statement::Execute { .. } | ast::Statement::Discard { .. }
+            | ast::Statement::AttachDatabase { .. } | ast::Statement::AttachDuckDBDatabase { .. } | ast::Statement::DetachDuckDBDatabase { .. }
+            | ast::Statement::Set(_) | ast::Statement::ShowVariable { .. } | ast::Statement::ShowVariables { .. } => return Err(unsupported(format!("SQL statement: {statement}"))),
+            _ => return Err(grammar_rejected(format!("SQL statement {statement}"))),
         })
     }
 
     fn delete(&mut self, delete: &ast::Delete, erase: bool) -> Result<Statement> {
-        if delete.using.is_some() || delete.returning.is_some() || delete.output.is_some() || !delete.order_by.is_empty() || delete.limit.is_some() || !delete.tables.is_empty() { return Err(unsupported("DELETE USING, ordering, or RETURNING")); }
+        if delete.returning.is_some() { return Err(unsupported("DELETE RETURNING")); }
+        if delete.using.is_some() || delete.output.is_some() || !delete.order_by.is_empty() || delete.limit.is_some() || !delete.tables.is_empty() { return Err(grammar_rejected("DELETE USING, ordering or a multi-table target")); }
         let tables = match &delete.from { ast::FromTable::WithFromKeyword(tables) | ast::FromTable::WithoutKeyword(tables) => tables };
         if tables.len() != 1 || !tables[0].joins.is_empty() { return Err(error("DELETE and ERASE require one target table")); }
         let mut input = self.mutation_table(&tables[0].relation, erase)?;
@@ -479,14 +515,14 @@ impl Context<'_> {
     }
 
     pub(crate) fn query(&mut self, query: &ast::Query) -> Result<Arc<Relation>> {
-        if !query.locks.is_empty() || query.for_clause.is_some() || !query.pipe_operators.is_empty() || query.settings.is_some() { return Err(unsupported("Query locking, output clauses, pipes, or settings")); }
+        if !query.locks.is_empty() || query.for_clause.is_some() || !query.pipe_operators.is_empty() || query.settings.is_some() { return Err(grammar_rejected("Query locking, an output clause, a pipe or SETTINGS")); }
         let old_ctes = self.ctes.clone();
         let mut bindings = Vec::new();
         if let Some(with) = &query.with {
             if with.recursive { return Err(Anomaly::unsupported("xtdb.sql/recursive-ctes", "Recursive CTEs are not supported yet")); }
             for cte in &with.cte_tables {
-                if !cte.alias.columns.is_empty() { return Err(unsupported("CTE column aliases")); }
-                if cte.materialized == Some(ast::CteAsMaterialized::NotMaterialized) { return Err(unsupported("AS NOT MATERIALIZED")); }
+                if !cte.alias.columns.is_empty() { return Err(unsupported("Column aliases are not supported yet")); }
+                if cte.materialized == Some(ast::CteAsMaterialized::NotMaterialized) { return Err(grammar_rejected("AS NOT MATERIALIZED")); }
                 let input = self.query(&cte.query)?;
                 let name = identifier(&cte.alias.name).normalized();
                 let symbol = self.symbol(&name)?;
@@ -505,7 +541,7 @@ impl Context<'_> {
             body => self.set_expr(body)?,
         };
         if let Some(order) = query.order_by.as_ref().filter(|_| !integrated_order) {
-            let ast::OrderByKind::Expressions(expressions) = &order.kind else { return Err(unsupported("ORDER BY ALL")); };
+            let ast::OrderByKind::Expressions(expressions) = &order.kind else { return Err(grammar_rejected("ORDER BY ALL")); };
             let fields = input.schema().fields().to_vec();
             let order = expressions.iter().map(|order| {
                 if let Some(index) = ordinal(&order.expr)? {
@@ -522,16 +558,16 @@ impl Context<'_> {
         if let Some(limit) = &query.limit_clause {
             match limit {
                 ast::LimitClause::LimitOffset { limit, offset: value, limit_by } => {
-                    if !limit_by.is_empty() { return Err(unsupported("LIMIT BY")); }
+                    if !limit_by.is_empty() { return Err(grammar_rejected("LIMIT BY")); }
                     fetch = limit.as_ref().map(|expr| self.row_count(expr)).transpose()?;
                     offset = value.as_ref().map(|offset| self.row_count(&offset.value)).transpose()?;
                 }
-                ast::LimitClause::OffsetCommaLimit { .. } => return Err(unsupported("Comma LIMIT syntax")),
+                ast::LimitClause::OffsetCommaLimit { .. } => return Err(grammar_rejected("Comma LIMIT syntax")),
             }
         }
         if let Some(value) = &query.fetch {
             if fetch.is_some() { return Err(error("LIMIT and FETCH cannot both specify the row count")); }
-            if value.percent || value.with_ties { return Err(unsupported("FETCH PERCENT or WITH TIES")); }
+            if value.percent || value.with_ties { return Err(grammar_rejected("FETCH PERCENT or WITH TIES")); }
             fetch = Some(value.quantity.as_ref().map(|expr| self.row_count(expr)).transpose()?.unwrap_or(Expr::Literal(Value::I64(1))));
         }
         if offset.is_some() || fetch.is_some() { input = Arc::new(input.limit(offset, fetch)?); }
@@ -586,16 +622,16 @@ impl Context<'_> {
                 let right = self.set_expr(right)?;
                 if left.schema().len() != right.schema().len() { return Err(error("Set inputs have different column counts")); }
                 let fields = left.schema().fields().iter().zip(right.schema().fields()).map(|(left, right)| self.binder.field(left.name.clone(), None, left.data_type.join(&right.data_type))).collect::<Result<_>>()?;
-                let operator = match op { ast::SetOperator::Union => SetOperator::Union, ast::SetOperator::Intersect => SetOperator::Intersect, ast::SetOperator::Except => SetOperator::Except, _ => return Err(unsupported("Set operator")) };
-                let all = match set_quantifier { ast::SetQuantifier::All => true, ast::SetQuantifier::None | ast::SetQuantifier::Distinct => false, _ => return Err(unsupported("Set correspondence modifiers")) };
+                let operator = match op { ast::SetOperator::Union => SetOperator::Union, ast::SetOperator::Intersect => SetOperator::Intersect, ast::SetOperator::Except => SetOperator::Except, _ => return Err(grammar_rejected(format!("Set operator {op}"))) };
+                let all = match set_quantifier { ast::SetQuantifier::All => true, ast::SetQuantifier::None | ast::SetQuantifier::Distinct => false, _ => return Err(grammar_rejected("A set operation correspondence modifier")) };
                 Ok(Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Set { left, right, operator, all })?))
             }
-            _ => Err(unsupported("Query body")),
+            _ => Err(grammar_rejected(format!("Query body {set}"))),
         }
     }
 
     fn select(&mut self, select: &ast::Select, order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
-        if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.lateral_views.is_empty() || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty() || !select.sort_by.is_empty() || !select.connect_by.is_empty() { return Err(unsupported("SELECT extension")); }
+        if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.lateral_views.is_empty() || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty() || !select.sort_by.is_empty() || !select.connect_by.is_empty() { return Err(grammar_rejected("A dialect-specific SELECT clause")); }
         let mut input = self.table_input(&select.from)?;
         if let Some(predicate) = &select.selection {
             input = self.bind_filter(input, predicate)?;
@@ -603,7 +639,7 @@ impl Context<'_> {
         let distinct = match &select.distinct {
             None | Some(ast::Distinct::All) => false,
             Some(ast::Distinct::Distinct) => true,
-            Some(ast::Distinct::On(_)) => return Err(unsupported("DISTINCT ON")),
+            Some(ast::Distinct::On(_)) => return Err(grammar_rejected("DISTINCT ON")),
         };
         self.select_projection(input, SelectProjection {
             items: &select.projection,
@@ -672,7 +708,7 @@ impl Context<'_> {
         let groups = match select.group_by {
             None => &[][..],
             Some(ast::GroupByExpr::Expressions(expressions, modifiers)) if modifiers.is_empty() => expressions,
-            _ => return Err(unsupported("GROUP BY ALL or grouping sets")),
+            _ => return Err(grammar_rejected("A GROUP BY modifier")),
         };
         let empty_grouping_set = groups.iter().any(|group| matches!(group, ast::Expr::Tuple(elements) if elements.is_empty()));
         let groups = groups.iter().filter(|group| !matches!(group, ast::Expr::Tuple(elements) if elements.is_empty())).collect::<Vec<_>>();
@@ -731,7 +767,7 @@ impl Context<'_> {
             (input, projected, names)
         };
         if let Some(order_by) = order_by {
-            let ast::OrderByKind::Expressions(expressions) = &order_by.kind else { return Err(unsupported("ORDER BY ALL")); };
+            let ast::OrderByKind::Expressions(expressions) = &order_by.kind else { return Err(grammar_rejected("ORDER BY ALL")); };
             let fields = projected.iter().map(|projection| projection.field.clone()).collect::<Vec<_>>();
             let mut retained = input.schema().fields().iter().map(|field| {
                 let mut output = field.clone();
@@ -780,7 +816,7 @@ impl Context<'_> {
         for item in projection {
             if let ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } = item { crate::expression::window_calls(expression, &mut windows); }
         }
-        if windows.len() > 1 { return Err(unsupported("Only one window function per SELECT is supported")); }
+        if windows.len() > 1 { return Err(unsupported("TODO: only one window function supported at the moment!")); }
         if let Some((key, function)) = windows.pop() {
             let window = self.bind_window(input.relational_schema()?, &function, replacements)?;
             let field = window.output().clone();
@@ -803,7 +839,7 @@ impl Context<'_> {
                 ast::SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::ObjectName(name), options) => {
                     projected.extend(self.wildcard(input.relational_schema()?, Some(name), options, &BTreeSet::new())?);
                 }
-                _ => return Err(unsupported("Projection shape")),
+                _ => return Err(grammar_rejected("An expression wildcard or multi-alias projection")),
             }
         }
         let wildcards = projection.iter().enumerate().filter_map(|(index, item)| match item { ast::SelectItem::Wildcard(options) => Some((index, options)), _ => None }).collect::<Vec<_>>();
@@ -830,7 +866,7 @@ impl Context<'_> {
                 ast::JoinOperator::RightOuter(constraint) | ast::JoinOperator::Right(constraint) => (JoinKind::Right, Some(constraint)),
                 ast::JoinOperator::FullOuter(constraint) => (JoinKind::Full, Some(constraint)),
                 ast::JoinOperator::CrossJoin(_) => (JoinKind::Cross, None),
-                _ => return Err(unsupported("Join operator")),
+                _ => return Err(grammar_rejected("A dialect-specific join operator")),
             };
             let (right, mut arguments) = self.from_scope(left.schema().clone(), |context, start| {
                 let start = if kind == JoinKind::Cross || matches!(constraint, Some(ast::JoinConstraint::Natural)) { start } else { lateral_start };
@@ -965,8 +1001,8 @@ impl Context<'_> {
     fn table_for(&mut self, table: &ast::TableFactor, purpose: TablePurpose, lateral_start: usize) -> Result<Arc<Relation>> {
         match table {
             ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, with_ordinality, json_path, index_hints } => {
-                if version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() || json_path.is_some() || !index_hints.is_empty() { return Err(unsupported("Table sample or dialect-specific modifier")); }
-                if args.is_some() { return Err(unsupported("Table function modifier")); }
+                if version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() || json_path.is_some() || !index_hints.is_empty() { return Err(grammar_rejected("A table sample or dialect-specific table modifier")); }
+                if args.is_some() { return Err(grammar_rejected("Table arguments")); }
                 if *with_ordinality { return Err(unsupported("WITH ORDINALITY requires a list table")); }
                 if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)).cloned() {
                     let arguments = inline.parameters.iter().map(|index| (*index,self.options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Nothing))).collect::<Vec<_>>();
@@ -1063,11 +1099,11 @@ impl Context<'_> {
                 match alias { Some(alias) => self.alias(relation, alias), None => Ok(relation) }
             }
             ast::TableFactor::UNNEST { array_exprs, alias, with_ordinality, with_offset, .. } => {
-                if array_exprs.len() != 1 || *with_offset { return Err(unsupported("Multi-array UNNEST or OFFSET")); }
+                if array_exprs.len() != 1 || *with_offset { return Err(grammar_rejected("Multi-array UNNEST or WITH OFFSET")); }
                 let expr = self.lateral_scope(lateral_start, |context| context.expr(&array_exprs[0], &Schema::default(), &BTreeMap::new()))?;
                 self.list_table(expr, alias.as_ref(), *with_ordinality, ListTableKind::Unnest)
             }
-            _ => Err(unsupported("Table source")),
+            _ => Err(grammar_rejected(format!("Table source {table}"))),
         }
     }
 
@@ -1267,13 +1303,24 @@ impl Context<'_> {
 }
 
 pub(crate) fn sort_descending(options: &ast::OrderByOptions) -> Result<bool> {
-    match &options.sort { Some(ast::OrderBySort::Desc) => Ok(true), None | Some(ast::OrderBySort::Asc) => Ok(false), Some(ast::OrderBySort::Using(_)) => Err(unsupported("ORDER BY USING")) }
+    match &options.sort { Some(ast::OrderBySort::Desc) => Ok(true), None | Some(ast::OrderBySort::Asc) => Ok(false), Some(ast::OrderBySort::Using(_)) => Err(grammar_rejected("ORDER BY USING")) }
 }
 
 pub(crate) fn identifier(identifier: &ast::Ident) -> Identifier { Identifier { text: identifier.value.clone(), quoted: identifier.quote_style.is_some() } }
-pub(crate) fn identifiers(name: &ast::ObjectName) -> Result<Vec<Identifier>> { name.0.iter().map(|part| part.as_ident().map(identifier).ok_or_else(|| unsupported("Computed identifiers"))).collect() }
+pub(crate) fn identifiers(name: &ast::ObjectName) -> Result<Vec<Identifier>> { name.0.iter().map(|part| part.as_ident().map(identifier).ok_or_else(|| grammar_rejected("A computed identifier"))).collect() }
 pub(crate) fn error(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb/sql-error", message.to_string()) }
 pub(crate) fn unsupported(message: impl std::fmt::Display) -> Anomaly { Anomaly::unsupported("xtdb/sql-unsupported", message.to_string()) }
+
+const GRAMMAR_REJECTION: &str = "Errors parsing SQL statement:\n  - ";
+
+/// A construct the vendor parser admits but the reference `Sql.g4` grammar has no production for.
+pub(crate) fn grammar_rejected(construct: impl std::fmt::Display) -> Anomaly {
+    Anomaly::incorrect("xtdb/sql-error", format!("{GRAMMAR_REJECTION}{construct} is not part of the XTDB SQL grammar"))
+}
+
+fn is_grammar_rejection(error: &Anomaly) -> bool {
+    error.code == "xtdb/sql-error" && error.message.as_deref().is_some_and(|message| message.starts_with(GRAMMAR_REJECTION))
+}
 
 fn scan_target(input: &Relation) -> Result<(QualifiedTable, TemporalFilter)> {
     match input.node() {

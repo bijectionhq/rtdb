@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_plan::{ColumnId, Expr, Field, NamedExpr, Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{Anomaly, Result};
 use sqlparser::ast;
-use crate::bind::{Context, HiddenColumn, error, identifiers, unsupported};
+use crate::bind::{Context, HiddenColumn, error, grammar_rejected, identifiers, unsupported};
 use crate::expression::Replacements;
 
 pub(crate) struct BoundWindow {
@@ -36,18 +36,21 @@ impl BoundWindow {
 
 impl Context<'_> {
     pub(crate) fn bind_window(&mut self, schema: &Schema, function: &ast::Function, replacements: &Replacements) -> Result<BoundWindow> {
-        let Some(ast::WindowType::WindowSpec(specification)) = &function.over else { return Err(unsupported("Named windows")); };
-        if specification.window_frame.is_some() { return Err(unsupported("Window frames")); }
-        if function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) || function.uses_odbc_syntax { return Err(unsupported("Window function modifiers")); }
+        let names = identifiers(&function.name)?;
+        if names.len() != 1 { return Err(grammar_rejected("A qualified window function name")); }
+        let name = names[0].normalized();
+        let aggregate = AGGREGATE_WINDOW_FUNCTIONS.contains(&name.as_str());
+        let modifier = |construct: &str| if aggregate { unsupported(construct) } else { grammar_rejected(format!("{construct} on {name}")) };
+        let Some(ast::WindowType::WindowSpec(specification)) = &function.over else { return Err(unsupported("TODO: Window names currently not supported!")); };
+        if specification.window_frame.is_some() { return Err(unsupported("TODO: Window frames currently not supported!")); }
+        if function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) || function.uses_odbc_syntax { return Err(modifier("Window function modifiers")); }
         let ast::FunctionArguments::List(arguments) = &function.args else { return Err(error("Window function requires an argument list")); };
-        if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() { return Err(unsupported("Window argument modifiers")); }
+        if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() { return Err(modifier("Window argument modifiers")); }
         let arguments = arguments.args.iter().map(|argument| match argument {
             ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Ok(expr),
-            _ => Err(unsupported("Named window arguments and wildcard arguments")),
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) if name == "count" => Err(unsupported("Window function count")),
+            _ => Err(grammar_rejected("A named or wildcard window function argument")),
         }).collect::<Result<Vec<_>>>()?;
-        let names = identifiers(&function.name)?;
-        if names.len() != 1 { return Err(unsupported("Qualified window function names")); }
-        let name = names[0].normalized();
         let function = match name.as_str() {
             "row_number" if arguments.is_empty() && function.null_treatment.is_none() => WindowFunction::RowNumber,
             "lead" | "lag" => {
@@ -58,7 +61,8 @@ impl Context<'_> {
                 let offset = arguments.get(1).map(|argument| offset(argument)).transpose()?.unwrap_or(1);
                 if name == "lead" { WindowFunction::Lead { column, offset } } else { WindowFunction::Lag { column, offset } }
             }
-            _ => return Err(unsupported(format!("Window function {name}"))),
+            _ if REFERENCE_WINDOW_FUNCTIONS.contains(&name.as_str()) || aggregate => return Err(unsupported(format!("Window function {name}"))),
+            _ => return Err(grammar_rejected(format!("Window function {name}"))),
         };
         let result_name = format!("xt${name}_{}", self.allocate_symbol()?);
         // Inline specifications occupy a symbol between the window result and the projected sort keys.
@@ -87,6 +91,12 @@ impl Context<'_> {
         Ok(BoundWindow { keys, partition_by, order_by, expression: WindowExpr { field, function } })
     }
 }
+
+const REFERENCE_WINDOW_FUNCTIONS: &[&str] = &["rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "first_value", "last_value", "nth_value"];
+const AGGREGATE_WINDOW_FUNCTIONS: &[&str] = &[
+    "count", "array_agg", "avg", "max", "min", "sum", "every", "bool_and", "bool_or",
+    "stddev_pop", "stddev_samp", "var_samp", "var_pop", "percentile_cont", "percentile_disc",
+];
 
 fn offset(expression: &ast::Expr) -> Result<u64> {
     match expression {

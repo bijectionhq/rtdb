@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rtdb_plan::{ColumnId, Identifier, NamedExpr, Schema};
 use rtdb_types::Result;
 use sqlparser::{ast, tokenizer::{Span, Token, TokenWithSpan}};
-use crate::{bind::{Context, error, identifier, identifiers, unsupported}, parse::{sql_error, word}};
+use crate::{bind::{Context, error, grammar_rejected, identifier, identifiers, unsupported}, parse::{sql_error, word}};
 
 #[derive(Clone, Debug)]
 pub(crate) struct WildcardRename { source: Span, columns: Vec<Identifier> }
@@ -108,7 +108,7 @@ fn exclude_end(tokens: &[TokenWithSpan], mut index: usize, source: &str) -> Resu
 
 impl Context<'_> {
     pub(crate) fn wildcard(&mut self, schema: &Schema, qualifier: Option<&ast::ObjectName>, options: &ast::WildcardAdditionalOptions, explicit_names: &BTreeSet<String>) -> Result<Vec<NamedExpr>> {
-        if options.opt_ilike.is_some() || options.opt_except.is_some() || options.opt_replace.is_some() || options.opt_alias.is_some() { return Err(unsupported("Wildcard modifier")); }
+        if options.opt_ilike.is_some() || options.opt_except.is_some() || options.opt_replace.is_some() || options.opt_alias.is_some() { return Err(grammar_rejected("A wildcard ILIKE, EXCEPT, REPLACE or alias")); }
         let qualifier = qualifier.map(|name| {
             let names = identifiers(name)?;
             if names.len() != 1 { return Err(unsupported("Schema-qualified wildcard")); }
