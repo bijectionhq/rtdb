@@ -5,7 +5,7 @@ use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast::{self as ast, Spanned};
 
 use crate::bind::{Context, error, identifier, identifiers, unsupported};
-use crate::subquery::{ExpressionInput, SubqueryValue, negated_operator};
+use crate::subquery::{ExpressionInput, ExpressionScope, SubqueryValue, negated_operator};
 use std::sync::Arc;
 use rtdb_plan::Relation;
 
@@ -15,7 +15,7 @@ pub(crate) type Replacements = BTreeMap<ReplacementKey, Field>;
 
 impl Context<'_> {
     pub(crate) fn expr(&mut self, expression: &ast::Expr, schema: &Schema, replacements: &Replacements) -> Result<Expr> {
-        self.expr_bound(expression, &mut ExpressionInput::Scalar(schema), replacements)
+        self.expr_bound(expression, &mut ExpressionInput::Scalar(ExpressionScope::Columns(schema)), replacements)
     }
 
     pub(crate) fn relational_expr(&mut self, expression: &ast::Expr, input: &mut Arc<Relation>, replacements: &Replacements) -> Result<Expr> {
@@ -54,7 +54,7 @@ impl Context<'_> {
                 if let Some(function) = bare_scalar_name(&name, 1) {
                     call(function, Vec::new())?
                 } else {
-                    match self.resolve_column(std::slice::from_ref(&name), input.schema()) {
+                    match input.scope().resolve(self, std::slice::from_ref(&name)) {
                         Err(missing) if missing.code == "xtdb/column-not-found" && name.normalized() == "user" => {
                             call("current_user".into(), Vec::new())?
                         }
@@ -66,7 +66,7 @@ impl Context<'_> {
                 let names: Vec<_> = names.iter().map(identifier).collect();
                 if let Some(function) = names.last().and_then(|name| bare_scalar_name(name, names.len())) {
                     call(function, Vec::new())?
-                } else { self.resolve_column(&names, input.schema())? }
+                } else { input.scope().resolve(self, &names)? }
             }
             ast::Expr::Value(value) => match &value.value {
                 ast::Value::Placeholder(parameter) => {

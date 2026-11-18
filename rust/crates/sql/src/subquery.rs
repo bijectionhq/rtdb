@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, Identifier, JoinKind, NamedExpr, Relation, RelationNode, Schema, UnaryOp};
-use rtdb_types::{LogicalType, Result, ScalarType, Value};
+use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
 use sqlparser::ast;
 use crate::bind::{Context, HiddenColumn, aggregate_relation, error};
 use crate::expression::Replacements;
@@ -18,23 +18,41 @@ pub(crate) enum SubqueryValue {
     Array,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ExpressionScope<'a> {
+    Columns(&'a Schema),
+    TablePeriod,
+}
+impl ExpressionScope<'_> {
+    pub(crate) fn resolve(self, context: &mut Context<'_>, names: &[Identifier]) -> Result<Expr> {
+        match self {
+            Self::Columns(schema) => context.resolve_column(names, schema),
+            Self::TablePeriod => {
+                let column = names.last().ok_or_else(|| error("Missing column reference"))?.normalized();
+                Err(Anomaly::incorrect("xtdb.sql/no-column-refs-allowed", format!("No column reference allowed in table period specification: {column}")))
+            }
+        }
+    }
+}
+
 pub(crate) enum ExpressionInput<'a> {
-    Scalar(&'a Schema),
+    Scalar(ExpressionScope<'a>),
     Relational(&'a mut Arc<Relation>),
     Deferred(&'a mut DeferredExpressionInput),
 }
 impl ExpressionInput<'_> {
-    pub fn schema(&self) -> &Schema {
+    pub(crate) fn scope(&self) -> ExpressionScope<'_> {
         match self {
-            Self::Scalar(schema) => schema,
-            Self::Relational(input) => input.schema(),
-            Self::Deferred(input) => &input.schema,
+            Self::Scalar(scope) => *scope,
+            Self::Relational(input) => ExpressionScope::Columns(input.schema()),
+            Self::Deferred(input) => ExpressionScope::Columns(&input.schema),
         }
     }
-    fn require_relation(&self) -> Result<()> {
+    pub(crate) fn relational_schema(&self) -> Result<&Schema> {
         match self {
             Self::Scalar(_) => Err(error("Subqueries are not allowed in this context")),
-            Self::Relational(_) | Self::Deferred(_) => Ok(()),
+            Self::Relational(input) => Ok(input.schema()),
+            Self::Deferred(input) => Ok(&input.schema),
         }
     }
 
@@ -249,8 +267,7 @@ impl Context<'_> {
     }
 
     fn dependent(&mut self, query: &ast::Query, input: &ExpressionInput<'_>) -> Result<(Arc<Relation>, Vec<(usize, Expr)>)> {
-        input.require_relation()?;
-        self.outer_scopes.push(CorrelationScope::new(input.schema().clone()));
+        self.outer_scopes.push(CorrelationScope::new(input.relational_schema()?.clone()));
         let relation = self.query(query);
         let arguments = self.outer_scopes.pop().ok_or_else(|| error("Subquery correlation scope is unavailable"))?.arguments();
         Ok((relation?, arguments))
@@ -301,12 +318,13 @@ impl Context<'_> {
         let constructors = values.iter().map(in_row).collect::<Result<Vec<_>>>()?;
         let scalar = values.len() <= 8 && constructors.iter().all(Option::is_none);
         if scalar {
-            let values = values.iter().map(|value| self.expr(value, input.schema(), &Replacements::new())).collect::<Result<Vec<_>>>()?;
+            let mut scalar = ExpressionInput::Scalar(input.scope());
+            let values = values.iter().map(|value| self.expr_bound(value, &mut scalar, &Replacements::new())).collect::<Result<Vec<_>>>()?;
             return Ok(values.into_iter().map(|value| Expr::binary(BinaryOp::Eq, needle.clone(), value))
                 .reduce(|left, right| Expr::binary(BinaryOp::Or, left, right)).unwrap());
         }
         let needle = self.materialize(needle, input)?;
-        self.outer_scopes.push(CorrelationScope::new(input.schema().clone()));
+        self.outer_scopes.push(CorrelationScope::new(input.relational_schema()?.clone()));
         let rows = values.iter().zip(constructors).map(|(value, constructor)| {
             let value = constructor.unwrap_or(value);
             self.expr(value, &Schema::default(), &Replacements::new()).map(|expr| vec![expr])

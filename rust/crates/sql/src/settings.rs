@@ -8,6 +8,7 @@ use sqlparser::ast::VisitMut;
 
 use crate::bind::Context;
 use crate::parse::{TemporalExtent, expression, sql_error, word};
+use crate::subquery::{ExpressionInput, ExpressionScope};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ParsedSettings {
@@ -201,14 +202,17 @@ impl Context<'_> {
     }
 
     pub(crate) fn bind_extent(&mut self, extent: TemporalExtent) -> Result<TemporalFilter> {
-        Ok(match extent {
+        let mut input = ExpressionInput::Scalar(ExpressionScope::TablePeriod);
+        let replacements = BTreeMap::new();
+        let mut bind = |expr| self.expr_bound(expr, &mut input, &replacements);
+        Ok(match &extent {
             TemporalExtent::All => TemporalFilter::All,
-            TemporalExtent::At(at) => TemporalFilter::At(self.expr(&at, &Schema::default(), &BTreeMap::new())?),
+            TemporalExtent::At(at) => TemporalFilter::At(bind(at)?),
             TemporalExtent::FromTo(from, to) => TemporalFilter::FromTo {
-                from: self.expr(&from, &Schema::default(), &BTreeMap::new())?,
-                to: to.as_ref().map(|to| self.expr(to, &Schema::default(), &BTreeMap::new())).transpose()?.unwrap_or(Expr::Literal(Value::Timestamp { value: i64::MAX, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })),
+                from: bind(from)?,
+                to: to.as_ref().map(bind).transpose()?.unwrap_or(Expr::Literal(Value::Timestamp { value: i64::MAX, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })),
             },
-            TemporalExtent::Between(from, to) => TemporalFilter::Between { from: self.expr(&from, &Schema::default(), &BTreeMap::new())?, to: self.expr(&to, &Schema::default(), &BTreeMap::new())? },
+            TemporalExtent::Between(from, to) => TemporalFilter::Between { from: bind(from)?, to: bind(to)? },
         })
     }
 }

@@ -557,7 +557,7 @@ impl Context<'_> {
         }
         if windows.len() > 1 { return Err(unsupported("Only one window function per SELECT is supported")); }
         if let Some((key, function)) = windows.pop() {
-            let window = self.bind_window(input.schema(), &function, replacements)?;
+            let window = self.bind_window(input.relational_schema()?, &function, replacements)?;
             let field = window.output().clone();
             input.attach(ExpressionAttachment::Window(window))?;
             replacements.insert(ReplacementKey::Expression(key), field);
@@ -569,14 +569,14 @@ impl Context<'_> {
                     let expression = self.expr_bound(expr, input, replacements)?;
                     let name = match item {
                         ast::SelectItem::ExprWithAlias { alias, .. } => identifier(alias).normalized(),
-                        _ => implicit_expression_label(expr, &expression, input.schema())
+                        _ => implicit_expression_label(expr, &expression, input.relational_schema()?)
                             .unwrap_or_else(|| format!("_column_{}", index + 1)),
                     };
                     let field = self.binder.field(name, None, expression.data_type())?;
                     projected.push(NamedExpr { field, expr: expression });
                 }
                 ast::SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::ObjectName(name), options) => {
-                    projected.extend(self.wildcard(input.schema(), Some(name), options, &BTreeSet::new())?);
+                    projected.extend(self.wildcard(input.relational_schema()?, Some(name), options, &BTreeSet::new())?);
                 }
                 _ => return Err(unsupported("Projection shape")),
             }
@@ -585,7 +585,7 @@ impl Context<'_> {
         if let Some((index, options)) = wildcards.first() {
             if wildcards.len() != 1 || (*index != 0 && *index + 1 != projection.len()) { return Err(error("Unqualified wildcard must occur once, at the beginning or end of the projection")); }
             let explicit_names = projected.iter().map(|projection| projection.field.name.clone()).collect::<BTreeSet<_>>();
-            let mut expanded = self.wildcard(input.schema(), None, options, &explicit_names)?;
+            let mut expanded = self.wildcard(input.relational_schema()?, None, options, &explicit_names)?;
             expanded.extend(projected);
             projected = expanded;
         }
@@ -766,6 +766,7 @@ impl Context<'_> {
                         return match alias { Some(alias) => self.alias(input, alias), None => self.rename(input, Some(names[0].normalized()), None) };
                     }
                 }
+                let (valid_time, system_time, clamp_valid_time) = self.temporal_filters(name)?;
                 let binding = resolve_table(self.catalog, &names, &self.options.search_path)?;
                 let qualifier = alias.as_ref().map(|alias| identifier(&alias.name).normalized()).unwrap_or_else(|| binding.name.table.table.clone());
                 if purpose != TablePurpose::Query && alias.as_ref().is_some_and(|alias| !alias.columns.is_empty()) { return Err(error("Mutation targets do not accept column lists")); }
@@ -801,7 +802,6 @@ impl Context<'_> {
                     else { columns.push(field.clone()); }
                     output.push(field);
                 }
-                let (valid_time, system_time, clamp_valid_time) = self.temporal_filters(name)?;
                 let relation = Arc::new(Relation::scan(Scan { table: binding, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates: Vec::new() })?);
                 let relation = if purpose == TablePurpose::Query {
                     let prefix = self.symbol(&qualifier)?;

@@ -7,6 +7,21 @@ use rtdb_types::{LogicalType, Result, ScalarType, TableRef, Value};
 struct Fixture;
 
 #[test]
+fn table_periods_have_no_local_or_outer_column_scope() {
+    for (source, column) in [
+        ("SELECT * FROM absent.docs FOR SYSTEM_TIME AS OF foo", "foo"),
+        ("SELECT * FROM foo FOR VALID_TIME BETWEEN source.region AND other", "region"),
+        ("SELECT * FROM (VALUES (CURRENT_TIMESTAMP)) q(at_time), LATERAL (SELECT * FROM foo FOR SYSTEM_TIME AS OF q.at_time) t", "at_time"),
+        ("SELECT * FROM foo FOR VALID_TIME AS OF CASE WHEN 1 IN (2, bad) THEN CURRENT_TIMESTAMP ELSE CURRENT_TIMESTAMP END", "bad"),
+    ] {
+        let error = prepare(source, &Fixture, &PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.code, "xtdb.sql/no-column-refs-allowed", "{source}");
+        assert_eq!(error.message.as_deref(), Some(format!("No column reference allowed in table period specification: {column}").as_str()), "{source}");
+    }
+    assert!(prepare("SELECT * FROM foo FOR SYSTEM_TIME AS OF CURRENT_TIMESTAMP", &Fixture, &PrepareOptions::default()).is_ok());
+}
+
+#[test]
 fn invalid_interval_default_reports_its_source_occurrence_once() {
     let error = prepare("SETTING DEFAULT VALID_TIME AS OF INTERVAL 'bad' SELECT * FROM foo",&Fixture,&PrepareOptions::default()).unwrap_err();
     assert_eq!(error.message.as_deref(),Some("Errors planning SQL statement:\n  - Cannot parse interval: bad - failed with message null"));

@@ -390,6 +390,9 @@ VALUES accepts scalar rows, parenthesized rows and explicit `ROW` constructors.
 Each row supplies the same number of columns, including zero columns for an empty row constructor.
 Without an explicit column list, the result columns use `_column_1`, `_column_2` and subsequent names.
 
+Table-period expressions use a scope without local or outer columns.
+They admit parameters and scalar expressions that resolve without a column.
+
 == Series expression lowering
 
 SQL GENERATE_SERIES and RANGE accept two or three arguments and one optional schema qualifier.

@@ -181,6 +181,7 @@
 (deftest-original-api original-sql/test-current-catalog)
 (deftest-original-api original-sql/test-c-style-escapes-3415)
 (deftest-original-api original-sql/test-delete-with-unqualified-col-3017)
+(deftest-original-api original-sql/test-disallow-col-refs-in-period-specs-3447)
 (deftest-original-api original-sql/forbid-updating-core-cols-3433)
 
 (deftest unnest-actor-results
