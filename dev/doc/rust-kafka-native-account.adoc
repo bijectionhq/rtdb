@@ -22,6 +22,7 @@ This profile establishes neither a whole-consumer nor a whole-producer allocatio
 An exhausted receive or handshake admission follows the existing native broker failure, ordinary error and reconnect/backoff route.
 The consumer can report CRIT_SYS_RESOURCE as MessageConsumption, with the existing duplicate-error suppression and other connection errors still in effect.
 Native fatal state remains a separate flag and produces MessageConsumptionFatal.
+Destruction after a fatal error shuts down the consumer group before releasing the native client and its account.
 The account does not add a fatal latch, retry guarantee or rollback of earlier Metadata effects.
 
 Kafka may return the first large record batch beyond its requested fetch target.

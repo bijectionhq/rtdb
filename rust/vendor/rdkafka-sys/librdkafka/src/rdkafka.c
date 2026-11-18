@@ -1165,9 +1165,10 @@ static void rd_kafka_destroy_app(rd_kafka_t *rk, int flags) {
         static const char *rd_kafka_destroy_flags_names[] = {
             "Terminate", "DestroyCalled", "Immediate", "NoConsumerClose", NULL};
 
-        /* Fatal errors and _F_IMMEDIATE also sets .._NO_CONSUMER_CLOSE */
+        /* Teardown must see fatal state even for client profiles that skip
+         * checking it in their normal polling loops. */
         if (flags & RD_KAFKA_DESTROY_F_IMMEDIATE ||
-            rd_kafka_fatal_error_code(rk))
+            rd_atomic32_get(&rk->rk_fatal.err))
                 flags |= RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE;
 
         rd_flags2str(flags_str, sizeof(flags_str), rd_kafka_destroy_flags_names,
@@ -1223,7 +1224,13 @@ static void rd_kafka_destroy_app(rd_kafka_t *rk, int flags) {
         if (rk->rk_cgrp) {
                 rd_kafka_dbg(rk, GENERIC, "TERMINATE",
                              "Terminating consumer group handler");
-                rd_kafka_consumer_close(rk);
+                if (rd_kafka_consumer_close(rk) == RD_KAFKA_RESP_ERR__FATAL) {
+                        flags |= RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE;
+                        rd_atomic32_set(
+                            &rk->rk_terminate,
+                            flags | RD_KAFKA_DESTROY_F_DESTROY_CALLED);
+                        rd_kafka_consumer_close(rk);
+                }
         }
 
         /* Await telemetry termination. This method blocks until the last

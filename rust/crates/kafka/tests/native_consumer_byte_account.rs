@@ -169,6 +169,7 @@ fn explicit_native_fatal_state_keeps_its_distinct_consumer_error() {
         }
         assert!(Instant::now() < deadline, "no native fatal event reached the consumer");
     }
+    assert!(matches!(consumer.close_queue(), Err(KafkaError::ConsumerQueueClose(RDKafkaErrorCode::Fail))));
     drop(config);
     drop(consumer);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
