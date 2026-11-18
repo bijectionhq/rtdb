@@ -11,6 +11,7 @@ mod tests;
 
 const INTEGER_LITERAL: u16 = 13;
 const LITERAL: u16 = 14;
+const DOLLAR_STRING_TEXT: u16 = 15;
 const CHARACTER_STRING: u16 = 16;
 const EXPR: u16 = 33;
 const COMMON_VALUE: u16 = 34;
@@ -34,6 +35,9 @@ const LITERAL_BASE: PredictionAction = prediction(LITERAL, 709, 55, 13, SyncShap
 const FLOAT_SIGN: SyncAction = SyncAction { state: 689, rule: LITERAL, shape: SyncShape::RequiredBlock };
 const INTEGER_SIGN: SyncAction = SyncAction { state: 684, rule: INTEGER_LITERAL, shape: SyncShape::RequiredBlock };
 const CHARACTER_STRING_BASE: SyncAction = SyncAction { state: 723, rule: CHARACTER_STRING, shape: SyncShape::RequiredBlock };
+const DOLLAR_BODY: SyncAction = SyncAction { state: 720, rule: CHARACTER_STRING, shape: SyncShape::RequiredBlock };
+const DOLLAR_TEXT_START: SyncAction = SyncAction { state: 712, rule: DOLLAR_STRING_TEXT, shape: SyncShape::RequiredPlusBlock };
+const DOLLAR_TEXT_BACKEDGE: SyncAction = SyncAction { state: 714, rule: DOLLAR_STRING_TEXT, shape: SyncShape::NullablePlusLoopback };
 
 const EXPR_VALUE: CallAction = CallAction {
     state: 1000, rule: EXPR, called: COMMON_VALUE, start: 68, follow: 1002, precedence: 0,
@@ -46,6 +50,9 @@ const LITERAL_INTEGER: CallAction = CallAction {
 };
 const LITERAL_CHARACTER_STRING: CallAction = CallAction {
     state: 693, rule: LITERAL, called: CHARACTER_STRING, start: 32, follow: 710, precedence: 0,
+};
+const DOLLAR_TEXT: CallAction = CallAction {
+    state: 719, rule: CHARACTER_STRING, called: DOLLAR_STRING_TEXT, start: 30, follow: 721, precedence: 0,
 };
 const FACTOR_RHS: CallAction = CallAction {
     state: 1641, rule: COMMON_VALUE, called: COMMON_VALUE, start: 68, follow: 1660, precedence: 62,
@@ -62,6 +69,9 @@ const MATCH_BOOLEAN: TerminalAction = TerminalAction { state: 707, rule: LITERAL
 const MATCH_NULL: TerminalAction = TerminalAction { state: 708, rule: LITERAL, target: 710, tokens: TokenAction::Atom(220) };
 const MATCH_STANDARD_STRING: TerminalAction = TerminalAction { state: 716, rule: CHARACTER_STRING, target: 724, tokens: TokenAction::Atom(6) };
 const MATCH_C_ESCAPE_STRING: TerminalAction = TerminalAction { state: 717, rule: CHARACTER_STRING, target: 724, tokens: TokenAction::Atom(7) };
+const MATCH_DOLLAR_OPEN: TerminalAction = TerminalAction { state: 718, rule: CHARACTER_STRING, target: 720, tokens: TokenAction::Atom(364) };
+const MATCH_DOLLAR_CLOSE: TerminalAction = TerminalAction { state: 722, rule: CHARACTER_STRING, target: 724, tokens: TokenAction::Atom(367) };
+const MATCH_DOLLAR_TEXT: TerminalAction = TerminalAction { state: 711, rule: DOLLAR_STRING_TEXT, target: 713, tokens: TokenAction::Atom(368) };
 const MATCH_FACTOR: TerminalAction = TerminalAction { state: 1640, rule: COMMON_VALUE, target: 1641, tokens: TokenAction::Set(&[28, 29, 30]) };
 const MATCH_TERM: TerminalAction = TerminalAction { state: 1643, rule: COMMON_VALUE, target: 1644, tokens: TokenAction::Set(SIGN_TOKENS) };
 const FACTOR_PREDICATE: PredicateAction = PredicateAction { state: 1639, rule: COMMON_VALUE, target: 1640, minimum: 61 };
@@ -177,12 +187,32 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             let (class, terminal) = match session.lookahead_action(CHARACTER_STRING_BASE)?.number() {
                 6 => (ContextClass::SqlStandardString, MATCH_STANDARD_STRING),
                 7 => (ContextClass::CEscapesString, MATCH_C_ESCAPE_STRING),
-                364 => return session.decline_numeric_site(),
+                364 => (ContextClass::DollarString, MATCH_DOLLAR_OPEN),
                 _ => return session.generated_no_viable().map_err(PassError::from),
             };
             *local = session.labelled_context(*local, class)?;
             session.enter_outer_alt(*local)?;
-            session.match_tree_action(*local, terminal)
+            session.match_tree_action(*local, terminal)?;
+            if class == ContextClass::DollarString {
+                if session.lookahead_action(DOLLAR_BODY)?.number() == 368 {
+                    session.generated_call(DOLLAR_TEXT)?;
+                    session.dollar_string_text()?;
+                }
+                session.match_tree_action(*local, MATCH_DOLLAR_CLOSE)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn dollar_string_text(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(DOLLAR_STRING_TEXT, |session, local| {
+            session.lookahead_action(DOLLAR_TEXT_START)?;
+            loop {
+                session.match_tree_action(*local, MATCH_DOLLAR_TEXT)?;
+                if session.lookahead_action(DOLLAR_TEXT_BACKEDGE)?.number() != 368 {
+                    return Ok(());
+                }
+            }
         })
     }
 
@@ -288,11 +318,22 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             (Some(ContextClass::CharacterStringLiteral), InvocationRole::Ordinary, ParserState::State(693)) => LITERAL_CHARACTER_STRING,
             _ => return Ok(false),
         };
-        Ok(self.records.last().is_some_and(|child| {
-            child.rule == call.called && child.parent == Some(current)
-                && child.invoking == ParserState::State(call.state)
-                && child.start.is_some()
-                && matches!(child.role, InvocationRole::OrdinaryTreeAttachmentFailed)
-        }))
+        let Some(child) = self.records.last() else { return Ok(false); };
+        if child.start.is_none() || !matches!(child.role, InvocationRole::OrdinaryTreeAttachmentFailed) {
+            return Ok(false);
+        }
+        if child.rule == call.called && child.parent == Some(current) && child.invoking == ParserState::State(call.state) {
+            return Ok(true);
+        }
+        if call.state != LITERAL_CHARACTER_STRING.state || child.rule != DOLLAR_STRING_TEXT
+            || child.invoking != ParserState::State(DOLLAR_TEXT.state) || child.stop.is_none()
+        {
+            return Ok(false);
+        }
+        let Some(parent) = child.parent else { return Ok(false); };
+        let string = self.record(parent)?;
+        Ok(string.rule == CHARACTER_STRING && string.class == Some(ContextClass::DollarString)
+            && string.invoking == ParserState::State(call.state) && string.parent == Some(current)
+            && string.start.is_some() && string.stop.is_some() && matches!(string.role, InvocationRole::Ordinary))
     }
 }

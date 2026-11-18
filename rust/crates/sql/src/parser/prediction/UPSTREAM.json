@@ -379,7 +379,15 @@
     "source_geometry_sha256": "4d57b5e828cbb1c2229bdcd9373676c8ddeed3c35d85f839b7704574dedc32e8",
     "generated": "Rule 14 decision 55 alternatives 3, 12 and 13, Boolean set at 707 and NULL atom at 708. Rule 16 is called at 693 and switches on LA(1) after required synchronization at 723. Standard and C-escaped labels retain atoms at 716 and 717.",
     "cleanup": "A denied rule 16 attachment leaves its entered literal label as the actual return context at call 693 after literal finally. The bounded common-value unroll checks that failed child before restoring and reparenting to its saved expression caller.",
-    "scope": "Private raw literal trees through the standalone, direct-statement and multi-statement roots with the existing two profiles. Dollar parsing, exact-unit string materialization and production parser adoption remain open.",
+    "scope": "Private fixed-token literal trees through the standalone, direct-statement and multi-statement roots with the existing two profiles.",
+    "qualification": "Static source and ATN inspection. Execution remains pending."
+  },
+  "dollar_string_trees": {
+    "predecessor": "3847d67688394eaddf9329158211f21006d8c9f3",
+    "source_plan_sha256": "3b16fcdeea766c6f3bebaa102240f96c34d2cc018e99d3ff23ac7937e1c215e7",
+    "source_geometry_sha256": "159e323433cb5fdd2c40e37ff0adde7fec67bf33eda1b54144a699f44d4c1e20",
+    "generated": "Rule 16 keeps opening atom 718, required optional-body sync 720, rule 15 call at 719 and closing atom 722. Rule 15 uses required plus-block 712, atom 711 and nullable plus-loopback 714 with source LA(1).",
+    "cleanup": "The denied rule 15 attachment leaves a failed child whose exited dollar string parent links the current literal residue to call 693.",
     "qualification": "Static source and ATN inspection. Execution remains pending."
   },
   "private_runtime_full_domain": {

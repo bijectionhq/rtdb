@@ -563,3 +563,38 @@ fn fixed_scalar_projections_share_the_generated_direct_and_multiple_statement_ro
     });
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn dollar_string_semicolons_are_indexed_text_before_the_real_statement_delimiter() {
+    let ((), memory) = environment(|environment, work, _| {
+        both_profiles(environment, "SELECT $q$a;$q$ AS dollar_val, $$$$; ROLLBACK;", work, true, |session, root| {
+            let (_, _, list) = projection(session, root, 0, 358, 0, false);
+            for (list_index, first, start, stop, tag) in [(0, true, 1, 3, "$q$"), (2, false, 7, 8, "$$")] {
+                let column = derived(session, list.key(), list_index, first);
+                let expr = child(session, column.key(), 0, 33, 2405);
+                bounds(expr, start, stop);
+                let value = child(session, expr.key(), 0, 34, 1000);
+                let literal = child(session, value.key(), 0, 14, 1140);
+                assert_eq!(literal.class(), Some(ContextClass::CharacterStringLiteral));
+                let string = child(session, literal.key(), 0, 16, 693);
+                assert_eq!(string.class(), Some(ContextClass::DollarString));
+                assert_eq!(string.children().len(), if first { 3 } else { 2 });
+                terminal(string.children()[0], start, tag);
+                if first {
+                    let text = child(session, string.key(), 1, 15, 719);
+                    terminal(text.children()[0], 2, "a;");
+                    let alias = child(session, column.key(), 1, AS_CLAUSE, 2406);
+                    terminal(alias.children()[0], 4, "AS");
+                }
+                terminal(*string.children().last().unwrap(), stop, tag);
+            }
+            let root_view = session.invocation_view().context(root).unwrap();
+            terminal(root_view.children()[1], 9, ";");
+            let rollback = child(session, root, 2, STATEMENT, 360);
+            assert_eq!(rollback.class(), Some(ContextClass::RollbackStatement));
+            terminal(root_view.children()[3], 11, ";");
+            complete_root(session, root, 1, 12);
+        });
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}

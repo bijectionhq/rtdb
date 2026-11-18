@@ -492,34 +492,93 @@ fn scalar_literal_first_tokens_reach_ll_deletion_and_keep_unknown_distinct() {
 }
 
 #[test]
-fn dollar_string_scope_stops_after_the_generated_character_string_switch() {
+fn generated_dollar_string_preserves_empty_and_multichunk_text_in_both_profiles() {
     let ((), memory) = environment(|environment, work, _| {
-        for profile in [ParserProfile::SllBail, ParserProfile::LlDefault] {
-            with_parser_session(environment, "$q$text$q$", work, |session| {
-                session.profile = profile;
-                let action = session.numeric_expression();
-                assert!(matches!(action, Err(PassError::Runtime(RuntimeError::Control(RuntimeProblem::PredictionSite)))));
+        for (source, tag, parts) in [
+            ("$$$$; @", "$$", &[][..]),
+            ("$Q$a;$q$b$Q$; @", "$Q$", &["a;", "$", "q", "$", "b"][..]),
+        ] {
+            both_profiles(environment, source, work, |session, root| {
+                let close = parts.len() + 1;
+                let value = expr_value(session, root, close);
                 let tree = session.invocation_view();
-                let expr = tree.context(InvocationKey::at(1)).unwrap();
-                let value = tree.context(child_rule(expr.children())).unwrap();
-                let literal = tree.context(child_rule(value.children())).unwrap();
+                let literal = tree.context(child_rule(tree.context(value).unwrap().children())).unwrap();
                 let string = tree.context(child_rule(literal.children())).unwrap();
                 assert_eq!(literal.class(), Some(ContextClass::CharacterStringLiteral));
-                assert_eq!((string.rule(), string.class(), string.invoking_state()),
-                    (CHARACTER_STRING, None, ParserState::State(693)));
-                let opening = string.start().unwrap();
-                assert_eq!((opening.index(), opening.lexeme().kind(), opening.lexeme().raw()), (0, Kind::DollarStart, "$q$"));
-                assert!(string.children().is_empty());
-                assert!(string.stop().is_none());
-                assert!(tree.exception(string.key()).is_none());
-                assert_eq!((session.current(), session.precedence(), session.input_index()), (None, 0, Some(0)));
-                assert_eq!(session.syntax_errors, 0);
+                assert_eq!((string.rule(), string.class(), string.parent(), string.invoking_state()),
+                    (CHARACTER_STRING, Some(ContextClass::DollarString), Some(literal.key()), ParserState::State(693)));
+                let children = string.children();
+                assert_eq!(children.len(), if parts.is_empty() { 2 } else { 3 });
+                only_terminal(&children[..1], 0, tag);
+                only_terminal(&children[children.len() - 1..], close, tag);
+                assert_eq!((string.start().unwrap().index(), string.stop().unwrap().index()), (0, close));
+                if !parts.is_empty() {
+                    let text = tree.context(child_rule(&children[1..2])).unwrap();
+                    assert_eq!((text.rule(), text.class(), text.parent(), text.invoking_state()),
+                        (DOLLAR_STRING_TEXT, None, Some(string.key()), ParserState::State(719)));
+                    assert_eq!((text.start().unwrap().index(), text.stop().unwrap().index()), (1, parts.len()));
+                    assert_eq!(text.children().len(), parts.len());
+                    for (index, raw) in parts.iter().enumerate() {
+                        only_terminal(&text.children()[index..=index], index + 1, raw);
+                    }
+                }
+                assert_eq!(session.input_index(), Some(close + 1));
+                assert_eq!(session.buffered_token(close + 1).unwrap().lexeme().raw(), ";");
+                assert!(session.buffered_token(close + 2).is_none());
                 assert!(!session.matched_eof);
-                Ok(())
-            }).unwrap();
+            });
         }
     });
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn dollar_string_rule_distinguishes_the_empty_body_sync_and_missing_closer_after_text() {
+    for (source, eof, ll_state, message) in [
+        ("$q$", 1, Some(ParserState::State(720)), "mismatched input '<EOF>' expecting {DM_END_TAG, DM_TEXT}"),
+        ("$q$text", 2, None, "missing DM_END_TAG at '<EOF>'"),
+    ] {
+        let (result, memory) = environment(|environment, work, _| {
+            let mut passes = Vec::new();
+            let result = with_bail_fallback(environment, source, work, |session, mode| {
+                let labelled = InvocationKey::at(session.records.len() + 1);
+                let action = session.character_string();
+                passes.push(mode);
+                let tree = session.invocation_view();
+                let string = tree.context(labelled).unwrap();
+                assert_eq!(string.class(), Some(ContextClass::DollarString));
+                assert_eq!((string.start().unwrap().index(), string.stop().unwrap().index()), (0, eof - 1));
+                assert_eq!(string.children().len(), eof);
+                only_terminal(&string.children()[..1], 0, "$q$");
+                if eof == 2 {
+                    let text = tree.context(child_rule(&string.children()[1..])).unwrap();
+                    assert_eq!(text.invoking_state(), ParserState::State(719));
+                    only_terminal(text.children(), 1, "text");
+                }
+                if mode == PredictionMode::Sll {
+                    assert!(matches!(action, Err(PassError::Cancelled(_))));
+                    assert!(matches!(tree.exception(labelled), Some(InvocationCause::InputMismatch(cause))
+                        if cause.state == ParserState::State(722)));
+                } else {
+                    assert_eq!(tree.exception(labelled).is_some(), ll_state.is_some());
+                    if eof == 2 {
+                        let capture = session.next_tokens_capture.unwrap();
+                        assert_eq!((capture.context, capture.state), (child_rule(&string.children()[1..]), 714));
+                    }
+                }
+                assert_eq!((session.current(), session.input_index(), session.matched_eof), (None, Some(eof), false));
+                action.map(|_| ())
+            });
+            assert_eq!(passes, [PredictionMode::Sll, PredictionMode::Ll]);
+            result
+        });
+        let Err(RuntimeError::ReportedTokenSyntax(report)) = result else { panic!("generated dollar string report"); };
+        assert_eq!(report.cause().map(|cause| cause.state), ll_state);
+        assert_eq!((report.offending().index(), report.offending().lexeme().kind()), (eof, Kind::Eof));
+        assert!(report.anomaly().message.as_deref().unwrap().ends_with(message));
+        drop(report);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }
 
 #[test]
@@ -581,6 +640,62 @@ fn warmed_string_child_attachment_denial_unrolls_the_actual_literal_residue() {
             })?;
         }
         assert_eq!(memory.used_bytes(), retained);
+        Ok::<(), RuntimeError<'_>>(())
+    });
+    result.unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn warmed_dollar_text_attachment_denial_restores_through_both_entered_string_ancestors() {
+    let (result, memory) = environment(|environment, work, memory| {
+        let source = "$q$text$q$";
+        let baseline = work.memory_budget().used_bytes();
+        {
+            let parse_work = AllocationScope::new(memory).unwrap();
+            with_bail_fallback(environment, source, &parse_work, |session, mode| {
+                assert_eq!(mode, PredictionMode::Sll);
+                session.numeric_expression().map(|_| ())
+            })?;
+        }
+        assert_eq!(memory.used_bytes(), baseline);
+        let arena = Layout::array::<InvocationRecord<'_, '_>>(16).unwrap().size() + 256;
+        let slot = Layout::new::<ContextChild<'_, '_>>().size() + 256;
+        {
+            let parse_work = AllocationScope::new(memory).unwrap();
+            with_parser_session(environment, source, &parse_work, |session| {
+                session.profile = ParserProfile::SllBail;
+                let held = memory.reserve(memory.limit_bytes() - memory.used_bytes() - arena - 3 * slot).unwrap();
+                let action = session.numeric_expression();
+                let Err(PassError::Runtime(RuntimeError::Prediction(PredictionError::Admission(error)))) = action
+                    else { panic!("dollar-text child allocation denial"); };
+                assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                let prefix = format!("Cannot reserve {slot} bytes from budget ");
+                assert!(error.message.as_deref().unwrap().starts_with(prefix.as_str()));
+
+                let tree = session.invocation_view();
+                let expr = tree.context(InvocationKey::at(1)).unwrap();
+                let literal = tree.context(InvocationKey::at(5)).unwrap();
+                let string = tree.context(InvocationKey::at(7)).unwrap();
+                let text = tree.context(InvocationKey::at(8)).unwrap();
+                assert_eq!((literal.parent(), literal.class()), (Some(expr.key()), Some(ContextClass::CharacterStringLiteral)));
+                assert_eq!((string.parent(), string.class(), string.invoking_state()),
+                    (Some(literal.key()), Some(ContextClass::DollarString), ParserState::State(693)));
+                assert_eq!((text.parent(), text.rule(), text.invoking_state()),
+                    (Some(string.key()), DOLLAR_STRING_TEXT, ParserState::State(719)));
+                assert!(matches!(session.records[text.key().index].role, InvocationRole::OrdinaryTreeAttachmentFailed));
+                assert_eq!((text.start().unwrap().index(), text.stop().unwrap().index()), (1, 0));
+                assert_eq!(string.stop().unwrap().index(), 0);
+                assert_eq!(literal.stop().unwrap().index(), 0);
+                only_terminal(string.children(), 0, "$q$");
+                assert!(expr.children().is_empty() && text.children().is_empty());
+                assert_eq!((session.current(), session.input_index(), session.precedence()), (None, Some(1), 0));
+                assert!(!session.matched_eof);
+                drop(held);
+                Ok(())
+            })?;
+        }
+        assert_eq!(memory.used_bytes(), baseline);
         Ok::<(), RuntimeError<'_>>(())
     });
     result.unwrap();

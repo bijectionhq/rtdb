@@ -879,7 +879,7 @@ A denied characterString entry at 693 follows the same lexical finally order, wi
 A denial of outer attachment leaves the recursive precedence popped and saved caller restored.
 These failure paths keep the admission error category and execute the entered ancestor finally.
 
-== Fixed-token literal alternatives
+== Boolean, NULL and character string literals
 
 Decision 55 selects the labelled BooleanLiteral and NullLiteral contexts before the set match at 707 or the NULL atom at 708.
 The Boolean set contains FALSE, OFF, ON and TRUE.
@@ -888,11 +888,19 @@ UNKNOWN belongs to the separate Boolean predicate grammar.
 The CharacterStringLiteral alternative invokes the ordinary characterString rule at 693.
 That child synchronizes at 723 and switches on its own current token.
 The standard and C-escaped branches install distinct primary labels and match their atoms at 716 and 717.
-The dollar token reaches the private scope boundary through the same live switch.
-The entered generic string context survives that boundary without a dollar label or terminal.
+The dollar branch installs its primary label and matches the opening token at 718.
+Required sync at 720 precedes the lookahead for the optional dollarStringText child.
+The reached child checks its required plus-block at 712, consumes its first text token at 711 and checks the nullable plus-backedge at 714 before each repeat.
+The outer string matches the closing token at 722.
 
-Standard quote transformations and C escape interpretation belong to the separate string visitor.
-The raw tokens preserve doubled apostrophes, escape spelling and source spans through the scalar expression and SELECT trees.
+A missing closer immediately after the opener reaches LL mismatch reporting at 720.
+At EOF after text, the nullable backedge retains its context at 714.
+When EOF is in the closing atom's follow set, LL reports a missing DM_END_TAG with a null cause.
+If the text rule's attachment is denied before its try, the entered string and literal finally operations leave the literal current.
+Common-value unroll authenticates that residue by following the failed text record through the exited dollar string to the original literal call.
+
+Quote transformations, C escape interpretation and dollar-text assembly belong to the separate string visitor.
+The scalar expression and SELECT trees retain the raw token spellings and source spans.
 
 == Generated SELECT statement shell
 
