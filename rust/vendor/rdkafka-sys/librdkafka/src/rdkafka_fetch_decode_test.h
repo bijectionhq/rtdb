@@ -245,6 +245,8 @@ static int ut_fetch_snappy_java_demand(void) {
 }
 #endif
 
+#include "rdkafka_fetch_gzip_test.h"
+
 int unittest_fetch_decode_admission(void) {
         int fails = 0;
         fails += ut_fetch_decode_output_admission();
@@ -253,6 +255,13 @@ int unittest_fetch_decode_admission(void) {
 #if WITH_SNAPPY
         fails += ut_fetch_snappy_raw_demand();
         fails += ut_fetch_snappy_java_demand();
+#endif
+#if WITH_ZLIB
+        fails += ut_fetch_gzip_allocator_boundaries();
+        fails += ut_fetch_gzip_matches_terminating_source();
+        fails += ut_fetch_gzip_partial_input_terminates_without_progress();
+        fails += ut_fetch_gzip_overlap_and_each_malloc_failure();
+        fails += ut_fetch_gzip_final_event_retains_the_extra_output_byte();
 #endif
         return fails;
 }

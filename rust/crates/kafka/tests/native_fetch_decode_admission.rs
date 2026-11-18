@@ -126,3 +126,59 @@ async fn snappy_output_denial_preserves_the_accepted_prefix_and_failed_offset() 
     assert!(weak.upgrade().is_none());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn retained_gzip_fetch_keeps_decoded_storage_until_final_message_drop() {
+    retained_compressed_fetch("gzip").await;
+}
+
+#[tokio::test]
+async fn gzip_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
+    let cluster = MockCluster::new(1).unwrap();
+    let topic = "account-gzip-denial";
+    cluster.create_topic(topic, 1, 1).unwrap();
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", cluster.bootstrap_servers())
+        .set("message.max.bytes", "12000000")
+        .set("compression.type", "gzip").create().unwrap();
+    let first = producer.send(FutureRecord::to(topic).partition(0).payload("accepted").key("key"),
+                              Duration::from_secs(5)).await.unwrap();
+    let payload = vec![b'x'; 8 << 20];
+    let failed = producer.send(FutureRecord::to(topic).partition(0).payload(payload.as_slice()).key("key"),
+                               Duration::from_secs(5)).await.unwrap();
+    assert_eq!(failed.offset, first.offset + 1);
+    let (account, drops) = account(2 << 20);
+    let weak = Arc::downgrade(&account);
+    let (config, consumer) = assigned_consumer(&cluster, topic, account);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let accepted = loop {
+        match RetainedConsumerMessage::poll_from(&consumer, Duration::from_millis(100)) {
+            Some(Ok(message)) => break message,
+            Some(Err(error)) => panic!("error before accepted prefix: {error:?}"),
+            None => assert!(Instant::now() < deadline, "no accepted Gzip prefix arrived"),
+        }
+    };
+    assert_eq!(accepted.as_borrowed().offset(), first.offset);
+    assert_eq!(accepted.as_borrowed().payload(), Some(b"accepted".as_slice()));
+    loop {
+        match consumer.poll(Duration::from_millis(100)) {
+            Some(Err(KafkaError::MessageConsumption(RDKafkaErrorCode::CriticalSystemResource))) => break,
+            Some(Err(error)) => panic!("unexpected Gzip denial: {error:?}"),
+            Some(Ok(message)) => panic!("denied message was published at {}", message.offset()),
+            None => (),
+        }
+        assert!(Instant::now() < deadline, "no Gzip resource error arrived");
+    }
+    assert_eq!(consumer.position().unwrap().find_partition(topic, 0).unwrap().offset(), Offset::Offset(failed.offset));
+    let mut error = [0 as std::ffi::c_char; 512];
+    assert_eq!(unsafe { sys::rd_kafka_fatal_error(consumer.client().native_ptr(), error.as_mut_ptr(), error.len()) },
+               sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR);
+    assert_eq!(accepted.as_borrowed().payload(), Some(b"accepted".as_slice()));
+    assert!(weak.upgrade().unwrap().used() <= 2 << 20);
+    drop(config);
+    drop(consumer);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(accepted);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}

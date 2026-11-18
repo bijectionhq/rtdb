@@ -16,11 +16,13 @@ No account-to-client reference cycle is introduced.
 The ceiling applies to implemented allocation classes: receive frames, selected request/control owners, ApiVersions arrays and the admitted Metadata parser, cache, rack-scratch and topic-info owners.
 An uncompressed fetched message retains its shared admitted receive frame until the last referencing event is destroyed.
 RetainedConsumerMessage also retains the originating consumer and destroys its event before releasing that consumer.
-Accounted raw and Xerial Snappy output and shadow metadata retain their exact physical charges through the last referencing Fetch event.
-Admission occurs after the source length/framing demands and before allocation; shadow metadata is demanded only after complete codec validation.
+Accounted gzip and raw or Xerial Snappy output and shadow metadata retain their exact physical charges through the last referencing Fetch event.
+Gzip also admits each actual zlib allocator request, with inflater initialization preceding input validation, first-pass output overlapping the still-live inflater state and output retaining its terminal NUL byte.
+Output admission follows each codec's preceding length, framing or measuring demands; shadow metadata is demanded only after complete codec validation.
 A denied expansion preserves earlier accepted messages and the failed batch's offset through the existing nonfatal decompression error/backoff path.
 link:../../rust/vendor/rdkafka/src/native_byte_account/FETCH-DECODE.adoc[The decode contract] describes those ownership and error boundaries.
 Other codec buffers, individual fetch/error ops and strings, request/list scratch, native client/queue/thread construction, allocator overhead and other native allocations require separate bounds.
+An observed full-output zero-progress Z_BUF_ERROR state returns BAD_COMPRESSION in the accounted path, as a bounded native correction of the legacy helper's nonreturning loop.
 This profile establishes neither a whole-consumer nor a whole-producer allocation bound.
 
 An exhausted receive or handshake admission follows the existing native broker failure, ordinary error and reconnect/backoff route.

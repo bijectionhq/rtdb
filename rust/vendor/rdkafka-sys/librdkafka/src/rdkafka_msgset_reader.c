@@ -80,6 +80,7 @@
 #endif
 
 #include "rdkafka_fetch_decode.h"
+#include "rdkafka_fetch_gzip.h"
 
 
 static RD_INLINE int64_t
@@ -288,6 +289,14 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
         switch (codec) {
 #if WITH_ZLIB
         case RD_KAFKA_COMPRESSION_GZIP: {
+                if (decode_account) {
+                        err = rd_kafka_fetch_gzip(
+                            decode_account, compressed, compressed_size,
+                            &iov.iov_base, &iov.iov_len, malloc);
+                        if (err)
+                                goto err;
+                        break;
+                }
                 uint64_t outlenx = 0;
 
                 /* Decompress Message payload */
@@ -463,7 +472,8 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
         /* Create a new buffer pointing to the uncompressed
          * allocated buffer (outbuf) and let messages keep a reference to
          * this new buffer. */
-        if (decode_account && codec == RD_KAFKA_COMPRESSION_SNAPPY) {
+        if (decode_account && (codec == RD_KAFKA_COMPRESSION_SNAPPY ||
+                               codec == RD_KAFKA_COMPRESSION_GZIP)) {
                 rkbufz = rd_kafka_fetch_decode_shadow(
                     iov.iov_base, iov.iov_len, malloc);
                 if (!rkbufz) {

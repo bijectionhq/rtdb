@@ -1,0 +1,311 @@
+#if WITH_ZLIB
+static const unsigned char ut_fetch_gzip_abc[] = {
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x03, 0x00, 0xfc, 0xff, 0x61,
+        0x62, 0x63, 0xc2, 0x41, 0x24, 0x35, 0x03, 0x00, 0x00, 0x00
+};
+
+static const unsigned char ut_fetch_gzip_empty[] = {
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const unsigned char ut_fetch_gzip_large[] = {
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x01, 0x04, 0xfe, 0xfb, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+        0x91, 0xf1, 0x2f, 0x58, 0x01, 0x04, 0x00, 0x00
+};
+
+static const unsigned char ut_fetch_zlib_abc[] = {
+        0x78, 0x01, 0x01, 0x03, 0x00, 0xfc, 0xff, 0x61, 0x62, 0x63, 0x02, 0x4d, 0x01, 0x27
+};
+
+static int ut_fetch_gzip_allocator_boundaries(void) {
+        size_t bytes, capacity;
+        size_t unchanged = 73;
+        rd_kafka_byte_account_t *exact, *short_account, *empty;
+        rd_kafka_fetch_zlib_allocator_t allocator;
+        void *allocation;
+        RD_UT_ASSERT(rd_kafka_fetch_zlib_size(3, 7, &bytes), "measure actual zlib item product plus prefix");
+        exact = rd_kafka_byte_account_new(bytes);
+        short_account = rd_kafka_byte_account_new(bytes - 1);
+        empty = rd_kafka_byte_account_new(sizeof(rd_kafka_fetch_zlib_owner_t));
+        RD_UT_ASSERT(exact && short_account && empty, "create zlib callback accounts");
+        RD_UT_ASSERT(!rd_kafka_fetch_zlib_size(SIZE_MAX, 2, &unchanged) && unchanged == 73 &&
+                         !rd_kafka_fetch_zlib_size(1, SIZE_MAX, &unchanged) && unchanged == 73,
+                     "item product and aligned-prefix overflow preserve the size result");
+        RD_UT_ASSERT(rd_kafka_fetch_gzip_output_size(INT_MAX, &capacity) && capacity == (size_t)INT_MAX + 1 &&
+                         !rd_kafka_fetch_gzip_output_size((size_t)INT_MAX + 1, &unchanged) && unchanged == 73 &&
+                         !rd_kafka_fetch_gzip_output_size(SIZE_MAX, &unchanged) && unchanged == 73,
+                     "decoded output includes its NUL and preserves the native signed second-pass boundary");
+        allocator = (rd_kafka_fetch_zlib_allocator_t){short_account, malloc, rd_false};
+        RD_UT_ASSERT(!rd_kafka_fetch_zlib_alloc(&allocator, 3, 7) && allocator.allocation_failed &&
+                         !rd_kafka_byte_account_used(short_account),
+                     "zlib admission denial reports resource failure without retaining storage");
+        allocator = (rd_kafka_fetch_zlib_allocator_t){exact, ut_fetch_decode_no_malloc, rd_false};
+        RD_UT_ASSERT(!rd_kafka_fetch_zlib_alloc(&allocator, 3, 7) && allocator.allocation_failed &&
+                         !rd_kafka_byte_account_used(exact),
+                     "zlib malloc failure returns its admission and reports resource failure");
+        allocator = (rd_kafka_fetch_zlib_allocator_t){exact, malloc, rd_false};
+        allocation = rd_kafka_fetch_zlib_alloc(&allocator, 3, 7);
+        RD_UT_ASSERT(allocation && !allocator.allocation_failed &&
+                         !((uintptr_t)allocation % sizeof(void *)) && rd_kafka_byte_account_used(exact) == bytes,
+                     "exact zlib allocation returns aligned storage with its full charge");
+        memset(allocation, 0xa5, 21);
+        rd_kafka_fetch_zlib_free(NULL, allocation);
+        RD_UT_ASSERT(!rd_kafka_byte_account_used(exact), "zlib finalizer releases from its own prefix after freeing storage");
+        allocator = (rd_kafka_fetch_zlib_allocator_t){empty, malloc, rd_false};
+        allocation = rd_kafka_fetch_zlib_alloc(&allocator, 0, 0);
+        RD_UT_ASSERT(allocation && rd_kafka_byte_account_used(empty) == sizeof(rd_kafka_fetch_zlib_owner_t),
+                     "zero-size zlib request still owns its positive aligned prefix");
+        rd_kafka_fetch_zlib_free(NULL, allocation);
+        rd_kafka_fetch_zlib_free(NULL, NULL);
+        RD_UT_ASSERT(!rd_kafka_byte_account_used(empty), "zero request and NULL zfree leave no charge");
+        rd_kafka_byte_account_destroy(empty);
+        rd_kafka_byte_account_destroy(short_account);
+        rd_kafka_byte_account_destroy(exact);
+        RD_UT_PASS();
+}
+
+static int ut_fetch_gzip_matches_terminating_source(void) {
+        unsigned char trailing[sizeof(ut_fetch_gzip_abc) + 3];
+        unsigned char members[2 * sizeof(ut_fetch_gzip_abc)];
+        unsigned char bad_crc[sizeof(ut_fetch_gzip_abc)];
+        const unsigned char *inputs[] = {
+            ut_fetch_gzip_abc, ut_fetch_zlib_abc, trailing, members, ut_fetch_gzip_empty};
+        const size_t lengths[] = {
+            sizeof(ut_fetch_gzip_abc), sizeof(ut_fetch_zlib_abc), sizeof(trailing),
+            sizeof(members), sizeof(ut_fetch_gzip_empty)};
+        rd_kafka_byte_account_t *account = rd_kafka_byte_account_new(1 << 20);
+        rd_kafka_byte_account_t *denied = rd_kafka_byte_account_new(0);
+        size_t i;
+        RD_UT_ASSERT(account && denied, "create real gzip decoder accounts");
+        memcpy(trailing, ut_fetch_gzip_abc, sizeof(ut_fetch_gzip_abc));
+        memset(trailing + sizeof(ut_fetch_gzip_abc), 0xff, 3);
+        memcpy(members, ut_fetch_gzip_abc, sizeof(ut_fetch_gzip_abc));
+        memcpy(members + sizeof(ut_fetch_gzip_abc), ut_fetch_gzip_abc, sizeof(ut_fetch_gzip_abc));
+        for (i = 0; i < RD_ARRAYSIZE(inputs); i++) {
+                void *output = NULL;
+                void *legacy;
+                size_t output_size = 97;
+                uint64_t legacy_size = 0;
+                size_t expected_size = i == 4 ? 0 : 3;
+                RD_UT_ASSERT(!rd_kafka_fetch_gzip(account, inputs[i], lengths[i], &output,
+                                                 &output_size, malloc) && output && output_size == expected_size &&
+                                 !((char *)output)[output_size] &&
+                                 (!output_size || !memcmp(output, "abc", output_size)) &&
+                                 rd_kafka_byte_account_used(account) ==
+                                     sizeof(rd_kafka_fetch_decode_owner_t) + output_size + 1,
+                             "gzip/zlib wrappers, trailing data, first member and empty output retain exact output plus NUL after zlib cleanup");
+                legacy = rd_gz_decompress(inputs[i], (int)lengths[i], &legacy_size);
+                RD_UT_ASSERT(legacy && legacy_size == output_size && !memcmp(legacy, output, output_size + 1),
+                             "terminating output and NUL match the unchanged native helper");
+                rd_free(legacy);
+                rd_kafka_fetch_decode_free(output);
+                RD_UT_ASSERT(!rd_kafka_byte_account_used(account), "matched stream returns all output credit");
+        }
+        memcpy(bad_crc, ut_fetch_gzip_abc, sizeof(bad_crc));
+        bad_crc[sizeof(bad_crc) - 8] ^= 1;
+        {
+                void *output = NULL;
+                size_t output_size = 97;
+                RD_UT_ASSERT(rd_kafka_fetch_gzip(account, bad_crc, sizeof(bad_crc), &output, &output_size, malloc) ==
+                                 RD_KAFKA_RESP_ERR__BAD_COMPRESSION && !output && output_size == 97 &&
+                                 !rd_kafka_byte_account_used(account),
+                             "gzip checksum failure preserves output results and releases all inflater storage");
+                RD_UT_ASSERT(rd_kafka_fetch_gzip(denied, bad_crc, sizeof(bad_crc), &output, &output_size, malloc) ==
+                                 RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE && !output && output_size == 97 &&
+                                 !rd_kafka_byte_account_used(denied),
+                             "inflater state admission precedes checksum validation");
+        }
+        rd_kafka_byte_account_destroy(denied);
+        rd_kafka_byte_account_destroy(account);
+        RD_UT_PASS();
+}
+
+static int ut_fetch_gzip_partial_input_terminates_without_progress(void) {
+        const size_t lengths[] = {0, 10, 16, sizeof(ut_fetch_gzip_abc) - 1};
+        rd_kafka_byte_account_t *account = rd_kafka_byte_account_new(1 << 20);
+        size_t i;
+        RD_UT_ASSERT(account, "create partial-input correction account");
+        for (i = 0; i < RD_ARRAYSIZE(lengths); i++) {
+                void *output = NULL;
+                size_t output_size = 79;
+                RD_UT_ASSERT(rd_kafka_fetch_gzip(account, ut_fetch_gzip_abc, lengths[i],
+                                                 &output, &output_size, malloc) ==
+                                 RD_KAFKA_RESP_ERR__BAD_COMPRESSION && !output && output_size == 79 &&
+                                 !rd_kafka_byte_account_used(account),
+                             "observed full-output zero-progress truncation returns BAD_COMPRESSION without leaked state or partial output");
+        }
+        rd_kafka_byte_account_destroy(account);
+        RD_UT_PASS();
+}
+
+static struct {
+        rd_kafka_byte_account_t *account;
+        size_t calls;
+        size_t fail_at;
+        size_t peak;
+        size_t output_bytes;
+        size_t output_call;
+        size_t used_at_output;
+} ut_fetch_gzip_allocations;
+
+static void *ut_fetch_gzip_observed_malloc(size_t bytes) {
+        size_t used = rd_kafka_byte_account_used(ut_fetch_gzip_allocations.account);
+        ut_fetch_gzip_allocations.calls++;
+        ut_fetch_gzip_allocations.peak = RD_MAX(ut_fetch_gzip_allocations.peak, used);
+        if (bytes == ut_fetch_gzip_allocations.output_bytes && !ut_fetch_gzip_allocations.output_call) {
+                ut_fetch_gzip_allocations.output_call = ut_fetch_gzip_allocations.calls;
+                ut_fetch_gzip_allocations.used_at_output = used;
+        }
+        if (ut_fetch_gzip_allocations.calls == ut_fetch_gzip_allocations.fail_at)
+                return NULL;
+        return malloc(bytes);
+}
+
+static int ut_fetch_gzip_overlap_and_each_malloc_failure(void) {
+        const size_t output_bytes = sizeof(rd_kafka_fetch_decode_owner_t) + 1025 + 1;
+        rd_kafka_byte_account_t *account = rd_kafka_byte_account_new(1 << 20);
+        void *output = NULL;
+        size_t output_size = 83;
+        size_t calls, peak, i;
+        RD_UT_ASSERT(account, "create observed gzip allocator account");
+        memset(&ut_fetch_gzip_allocations, 0, sizeof(ut_fetch_gzip_allocations));
+        ut_fetch_gzip_allocations.account = account;
+        ut_fetch_gzip_allocations.output_bytes = output_bytes;
+        RD_UT_ASSERT(!rd_kafka_fetch_gzip(account, ut_fetch_gzip_large, sizeof(ut_fetch_gzip_large),
+                                          &output, &output_size, ut_fetch_gzip_observed_malloc) &&
+                         output_size == 1025 && !memcmp(output, ut_fetch_gzip_large + 15, output_size) &&
+                         ut_fetch_gzip_allocations.used_at_output > output_bytes &&
+                         ut_fetch_gzip_allocations.calls > ut_fetch_gzip_allocations.output_call &&
+                         rd_kafka_byte_account_used(account) == output_bytes,
+                     "first-pass zlib allocations overlap output admission and second-pass allocations finish before output publication");
+        calls = ut_fetch_gzip_allocations.calls;
+        peak = ut_fetch_gzip_allocations.peak;
+        rd_kafka_fetch_decode_free(output);
+        ut_fetch_gzip_allocations.account = NULL;
+        RD_UT_ASSERT(!rd_kafka_byte_account_used(account) && peak > output_bytes,
+                     "observed peak includes actual temporary inflater storage");
+        rd_kafka_byte_account_destroy(account);
+        for (i = 0; i <= calls + 1; i++) {
+                size_t capacity = i == 0 ? peak : (i == calls + 1 ? peak - 1 : 1 << 20);
+                account = rd_kafka_byte_account_new(capacity);
+                RD_UT_ASSERT(account, "create exact peak or allocation-failure account");
+                memset(&ut_fetch_gzip_allocations, 0, sizeof(ut_fetch_gzip_allocations));
+                ut_fetch_gzip_allocations.account = account;
+                ut_fetch_gzip_allocations.output_bytes = output_bytes;
+                if (i && i <= calls)
+                        ut_fetch_gzip_allocations.fail_at = i;
+                output = NULL;
+                output_size = 83;
+                if (!i) {
+                        RD_UT_ASSERT(!rd_kafka_fetch_gzip(account, ut_fetch_gzip_large, sizeof(ut_fetch_gzip_large),
+                                                          &output, &output_size, ut_fetch_gzip_observed_malloc) &&
+                                         output_size == 1025 && rd_kafka_byte_account_used(account) == output_bytes,
+                                     "exact observed peak admits both real inflater passes and retained output");
+                        rd_kafka_fetch_decode_free(output);
+                } else {
+                        RD_UT_ASSERT(rd_kafka_fetch_gzip(account, ut_fetch_gzip_large, sizeof(ut_fetch_gzip_large),
+                                                         &output, &output_size, ut_fetch_gzip_observed_malloc) ==
+                                         RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE && !output && output_size == 83,
+                                     "each actual zlib/output malloc failure and one-byte-short peak propagate resource failure without output publication");
+                }
+                ut_fetch_gzip_allocations.account = NULL;
+                RD_UT_ASSERT(!rd_kafka_byte_account_used(account), "every first/second-pass and output failure releases all acquired storage");
+                rd_kafka_byte_account_destroy(account);
+        }
+        RD_UT_PASS();
+}
+
+static int ut_fetch_gzip_final_event_retains_the_extra_output_byte(void) {
+        rd_kafka_byte_account_t *account = rd_kafka_byte_account_new(1 << 20);
+        rd_kafka_buf_t *shadow;
+        rd_kafka_op_t *event;
+        void *output = NULL;
+        size_t output_size = 0;
+        size_t output_bytes = sizeof(rd_kafka_fetch_decode_owner_t) + 4;
+        size_t charge = output_bytes + rd_kafka_fetch_decode_shadow_size();
+        RD_UT_ASSERT(account && !rd_kafka_fetch_gzip(account, ut_fetch_gzip_abc, sizeof(ut_fetch_gzip_abc),
+                                                    &output, &output_size, malloc) && output_size == 3,
+                     "decode the actual gzip payload before constructing its native frame");
+        shadow = rd_kafka_fetch_decode_shadow(output, output_size, malloc);
+        RD_UT_ASSERT(shadow && rd_kafka_byte_account_used(account) == charge,
+                     "post-codec shadow retains physical NUL capacity beyond its logical payload length");
+        event = rd_kafka_op_new(RD_KAFKA_OP_FETCH);
+        event->rko_evtype = RD_KAFKA_EVENT_FETCH;
+        event->rko_u.fetch.rkbuf = shadow;
+        event->rko_u.fetch.rkm.rkm_payload = output;
+        event->rko_u.fetch.rkm.rkm_len = output_size;
+        rd_kafka_buf_keep(shadow);
+        rd_kafka_buf_destroy(shadow);
+        RD_UT_ASSERT(rd_kafka_byte_account_used(account) == charge && !memcmp(output, "abc\0", 4),
+                     "native Fetch event retains gzip output, NUL byte and shadow metadata");
+        rd_kafka_event_destroy(event);
+        RD_UT_ASSERT(!rd_kafka_byte_account_used(account), "final event releases the complete gzip frame");
+        rd_kafka_byte_account_destroy(account);
+        RD_UT_PASS();
+}
+#endif
