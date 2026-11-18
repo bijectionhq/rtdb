@@ -397,3 +397,25 @@ fn captured_class_assertion_status_controls_the_reached_prediction_assertion() {
         assert_eq!(memory.used_bytes(), 0);
     }
 }
+
+#[test]
+fn completed_prediction_releases_its_work_while_the_parser_owns_its_context() {
+    fixture("1", |session, memory| {
+        let mut entry = recursive(session, 26, 0)?;
+        let parser_bytes = memory.used_bytes();
+        for _ in 0..2 {
+            session.with_prediction(83, |round, _, input| {
+                let mut full = round.enter_full(input)?;
+                let start = full.full_start()?;
+                assert!(full.parts().0.view_set(start.key()).len() > 0);
+                assert!(memory.used_bytes() > parser_bytes);
+                Ok(())
+            })?;
+            assert_eq!(memory.used_bytes(), parser_bytes);
+        }
+        assert_eq!(session.current(), Some(entry.key));
+        assert_eq!(session.input_index(), Some(0));
+        session.unroll_recursion(&mut entry)?;
+        Ok(())
+    }).unwrap();
+}

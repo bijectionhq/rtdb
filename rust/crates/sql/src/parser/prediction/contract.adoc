@@ -181,6 +181,8 @@ An operation accepting a context owner or merge round checks that collaborator b
 An aborted collaborator seals the configuration owner on entry; mode entry propagates a failed participant check to every supplied owner before returning.
 Completed nonallocating views remain available; no owned error string or cloned anomaly is cached.
 Scoped reservations remain with the scope until its destruction, including discarded scratch and copied set storage.
+The parser owns one scratch scope per adaptive prediction call.
+The token stream and invocation records retain their parser-session scope, and the environment retains only its charged predictor storage across calls.
 
 The factory and view signatures also carry the lifetime tests as source contracts.
 Returning a `ConfigKey`, `ConfigSetKey`, `ConflictKey` or a workspace carrying that brand as the factory's independent result is not permitted by the invariant callback lifetime.

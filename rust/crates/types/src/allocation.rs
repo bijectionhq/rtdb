@@ -19,6 +19,11 @@ impl AllocationScope {
         Ok(Self { memory: Arc::clone(memory), reservations: Mutex::new(vec![initial]) })
     }
 
+    /// Opens an empty child scope that charges the same budget and releases its reservations independently.
+    pub fn scratch(&self) -> Self {
+        Self { memory: Arc::clone(&self.memory), reservations: Mutex::new(Vec::new()) }
+    }
+
     /// Reserves bytes plus bookkeeping before allocation; charges last until the scope is dropped.
     /// Calls may share the scope across threads; budget exhaustion returns without granting a reservation.
     pub fn reserve(&self, bytes: usize) -> Result<()> {

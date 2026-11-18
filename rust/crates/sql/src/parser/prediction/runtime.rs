@@ -661,11 +661,12 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
             if self.environment.storage.grammar_view().decision(decision)?.state().rule().number() != record.rule { return Err(RuntimeError::Control(RuntimeProblem::PredictionSite)); }
             Ok(origin)
         })();
-        let origin = match self.finish(entered) { Ok(origin) => origin, Err(error) => return Err(error) };
+        let origin = self.finish(entered)?;
+        let round_work = self.work.scratch();
         let state = self.state; let precedence = self.precedence(); let options = self.environment.policy.options;
         let view = InvocationView { records: &self.records, current: self.current };
         let mut restoration = PredictionRestoration::new(&mut self.input, &mut self.control, origin);
-        let result: RuntimeResult<'sql, R> = with_prediction_storage_result(&mut self.environment.storage, self.work, |access| {
+        let result: RuntimeResult<'sql, R> = with_prediction_storage_result(&mut self.environment.storage, &round_work, |access| {
             let (dfas, configs, contexts) = access.dfa_parts();
             let selected = match contexts.grammar().decision(decision) {
                 Ok(selected) => selected,

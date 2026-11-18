@@ -48,3 +48,22 @@ fn rejected_scope_construction_releases_parent_admission() {
     assert_eq!(parent.used_bytes(), 0);
     assert_eq!(child.used_bytes(), 0);
 }
+
+#[test]
+fn scratch_scope_charges_on_demand_and_releases_before_its_parent() {
+    let memory = MemoryBudget::new(8192);
+    let parent = AllocationScope::new(&memory).unwrap();
+    parent.reserve(123).unwrap();
+    let parent_bytes = memory.used_bytes();
+    let block = memory.reserve(memory.limit_bytes() - parent_bytes).unwrap();
+    let scratch = parent.scratch();
+    assert_eq!(memory.used_bytes(), memory.limit_bytes());
+    assert!(matches!(scratch.reserve(1), Err(error) if error.code == "rtdb/memory-budget-exceeded"));
+    drop(block);
+    scratch.reserve(1).unwrap();
+    assert_eq!(memory.used_bytes(), parent_bytes + 257);
+    drop(scratch);
+    assert_eq!(memory.used_bytes(), parent_bytes);
+    drop(parent);
+    assert_eq!(memory.used_bytes(), 0);
+}
