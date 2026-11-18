@@ -1162,3 +1162,25 @@ Cache entries, independent clones, rack scratch, admin output copies and the oth
 
 The implementation revision remains unset and the source-completeness gate remains false.
 Compilation, runtime discovery and regression execution remain pending.
+
+== Generated parser and migration evidence checkpoint
+
+The generated isolation rules use one action for both profiles, including real LL synchronization and inline matching after SLL Bail.
+The tree fixtures distinguish the generic context used during required-block failure and the labelled context used during inline failure.
+The recursive DATE and field paths preserve one precedence pop and the actual current child when its attachment fails before the generated try.
+The recursive finally can attach the failed child to its outer field.
+A denial at that second append supersedes the original error.
+
+The bounded window path retains the first nullable sync context through later misses and rule exit.
+Its live parent catch assigns the mismatch before computing the expected set from the exited child.
+An accepted sync clears the captured context, and a successful token match preserves it.
+The private class policy decoder resolves the supplied Java environment value and the parser simulator's assertion setting without retaining the provider or text.
+Actual host capture, shared cache ownership, the remaining grammar and production parser entry adoption remain required.
+
+The pgwire and remote Flight SQL fixtures observe serialized syntax diagnostics and connection reuse through their actual protocol entry points.
+The embedded migration comparator requires separate exact observations for the reference's live cause and the native diagnostic projection.
+A confirmed declaration contributes a separate case disposition and remains in the strict agreement denominator.
+The paired embedded observation adapters and exact source-to-native diagnostic comparisons remain required.
+
+The implementation revision remains unset and the source-completeness gate remains false.
+Compilation, runtime discovery and regression execution remain pending.
