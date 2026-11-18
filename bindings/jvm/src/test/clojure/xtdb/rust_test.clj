@@ -3,6 +3,12 @@
             [xtdb.api :as xt]
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.sql.expr-test :as original-expr]
+            [xtdb.sql.correlated-subquery-nulls-test :as original-correlated]
+            [xtdb.sql.exists-decorrelation-test :as original-exists]
+            [xtdb.sql.generate-series-test :as original-series]
+            [xtdb.sql.interval-test :as original-interval]
+            [xtdb.sql.operator-precedence-test :as original-precedence]
+            [xtdb.sql.temporal-test :as original-temporal]
             [xtdb.sql.identifier-test :as original-identifiers]
             [xtdb.sql.with-test :as original-with]
             [xtdb.node-test :as original-node]
@@ -93,8 +99,8 @@
       (throw (ex-info "Unsupported original API fixture" {:test (str original)})))
     ((t/join-fixtures native-fixtures) (:test (meta original)))))
 
-(defmacro ^:private deftest-original-api [original]
-  `(deftest ~(symbol (name original))
+(defmacro ^:private deftest-original-api [original & [local-name]]
+  `(deftest ~(or local-name (symbol (name original)))
      (run-original-api-case (var ~original))))
 
 (deftest-original-api original-sql/multiple-query-tails)
@@ -332,6 +338,38 @@
 (deftest-original-api original-expr/test-interval-past-interval-range-raises-overflow-error)
 (deftest-original-api original-expr/test-timezone-single-word-syntax)
 (deftest-original-api original-expr/variadic-overlaps-3441)
+
+(deftest-original-api original-precedence/multiplication-binds-tighter-than-addition)
+(deftest-original-api original-precedence/bitwise-operators-share-a-level-and-associate-left)
+(deftest-original-api original-precedence/element-access-binds-tighter-than-arithmetic)
+(deftest-original-api original-precedence/predicates-bind-tighter-than-comparisons)
+(deftest-original-api original-precedence/comparisons-bind-tighter-than-is)
+(deftest-original-api original-precedence/boolean-operators-bind-loosest)
+(deftest-original-api original-exists/decorrelated-exists-returns-the-rows-the-apply-plan-returned)
+(deftest-original-api original-correlated/not-exists-ignores-inner-rows-its-where-filters-out-6313)
+(deftest-original-api original-correlated/exists-in-a-projection-is-false-when-its-where-filters-out-every-row-6313)
+(deftest-original-api original-correlated/correlated-in-is-false-when-its-where-filters-out-every-row-6313)
+(deftest-original-api original-correlated/not-in-stays-unknown-against-a-null-the-where-keeps)
+(deftest-original-api original-interval/test-interval-literals)
+(deftest-original-api original-interval/test-interval-fns)
+(deftest-original-api original-temporal/all-system-time)
+(deftest-original-api original-temporal/test-inconsistent-valid-time-range-2494)
+(deftest-original-api original-temporal/test-period-intersection-3493)
+(deftest-original-api original-temporal/update-delete-and-patch-explicit-null-behaviour)
+(deftest-original-api original-temporal/from-explicit-null-behaviour)
+(deftest-original-api original-temporal/no-portion-of-valid-time-dml-4650)
+(deftest-original-api original-temporal/patch-gaps-filling-test-4649)
+(deftest-original-api original-temporal/duration-abs-sql-test)
+(deftest-original-api original-with/cte-exporting-valid-time-4054)
+(deftest-original-api original-with/test-materialized-cte-ordering-with-many-ctes-5109)
+(deftest-original-api original-series/test-range-3212 series-test-range-3212)
+(deftest-original-api original-series/test-range-datetimes-4067)
+(deftest-original-api original-series/test-generate-series-3212 series-test-generate-series-3212)
+(deftest-original-api original-series/test-negative-step)
+(deftest-original-api original-series/test-generate-series-datetimes-4067)
+(deftest-original-api original-series/test-generate-series-limit-batching-4412)
+(deftest-original-api original-identifiers/semi-reserved-keywords-are-usable-as-an-as-alias-6014)
+(deftest-original-api original-identifiers/semi-reserved-keywords-are-usable-as-a-derived-table-column-alias-6014)
 
 (deftest unnest-actor-results
   (with-open [allocator (RootAllocator.)
