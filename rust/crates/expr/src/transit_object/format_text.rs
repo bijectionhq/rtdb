@@ -1,11 +1,18 @@
 use std::{alloc::Layout,sync::Arc};
 use rtdb_types::Result;
 use crate::{admission::Admission,numeric::overflow};
-use super::{Map,Object,T,Throwable,render};
+use super::{Map,Object,T,Throwable,Time,render};
 
 pub(crate) enum FormatArgument { Semantic(String),Wire(T) }
 
 pub(crate) fn format_argument(value: T,admission: Admission<'_>) -> Result<FormatArgument> {
+    if let T::Tagged { tag,representation } = &value
+        && matches!(tag.as_str(),"time/date" | "time/time")
+        && let T::String(source) = representation.as_ref()
+        && let Some(time) = Time::read_text(tag,source)?
+    {
+        return render::string(&Object::Time(time),admission).map(FormatArgument::Semantic);
+    }
     let Some(message_bytes) = message_bytes(&value) else { return Ok(FormatArgument::Wire(value)); };
     let retained = Layout::new::<Throwable>().size().checked_add(32).and_then(|bytes|bytes.checked_add(message_bytes)).ok_or_else(overflow)?;
     admission.reserve(retained)?;
@@ -147,6 +154,37 @@ mod tests {
             assert_eq!(error.code,"rtdb/memory-budget-exceeded");
             assert_eq!(error.message.as_deref(),Some(format!("Cannot reserve 320 bytes from budget {} with {} retained",4096 + retained + 256,4096 + retained + 256).as_str()));
             assert_eq!(memory.used_bytes(),4096 + retained + 256);
+        }
+        assert_eq!(memory.used_bytes(),0);
+    }
+
+    #[test]
+    fn local_time_scalar_reserves_temporary_text_before_output_growth() {
+        let value = ||tag("time/time",T::String("08:09:00".into()));
+        let scope_bytes = 4096;
+        let temporary_bytes = 4096 + 256;
+        let output_bytes = 64 + 256;
+        for (limit,retained,requested) in [
+            (scope_bytes + temporary_bytes - 1,scope_bytes,temporary_bytes),
+            (scope_bytes + temporary_bytes + output_bytes - 1,scope_bytes + temporary_bytes,output_bytes),
+        ] {
+            let memory = MemoryBudget::new(limit);
+            {
+                let scope = EvaluationScope::new(&memory).unwrap();
+                let error = failure(value(),Admission::Tracked(&scope));
+                assert_eq!(error.code,"rtdb/memory-budget-exceeded");
+                let message = format!("Cannot reserve {requested} bytes from budget {limit} with {retained} retained");
+                assert_eq!(error.message.as_deref(),Some(message.as_str()));
+                assert_eq!(memory.used_bytes(),retained);
+            }
+            assert_eq!(memory.used_bytes(),0);
+        }
+        let limit = scope_bytes + temporary_bytes + output_bytes;
+        let memory = MemoryBudget::new(limit);
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            assert_eq!(semantic(value(),Admission::Tracked(&scope)),"08:09");
+            assert_eq!(memory.used_bytes(),limit);
         }
         assert_eq!(memory.used_bytes(),0);
     }

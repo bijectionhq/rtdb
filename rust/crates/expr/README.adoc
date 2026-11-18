@@ -29,7 +29,8 @@ Control results carry their scope through pending protocol writes, and dropping 
 STR and text casts share a native renderer for nested reader values, decimals, floating point, temporal values, binary, URI, and decoded Transit.
 Reader-based sets print as vectors and struct keys remain strings, as in `expression.clj/resolve-value`.
 DateMilli text casts and nested objects both use `DateVector.kt`'s truncating millisecond-to-day conversion; the `expression/temporal.clj` cast receives that normalized day value through `read-value-code`.
-FORMAT prints the primitive reader representation of temporal arguments, while STR and text casts produce Java temporal strings.
+FORMAT prints the primitive reader values of typed dates, times, timestamps and durations.
+STR and text casts produce Java temporal strings for those values.
 `tests/strings.rs` preserves assertions from `test-str`, `test-cast-any-to-text`, `test-trim`, `test-binary-trim`, `test-format`, `test-like-regex`, and `PgFormatTest`, and adds allocation exhaustion and UTF-16 edge cases.
 The shared `rtdb_types::java_f32_text` and `java_f64_text` helpers retain fixed/scientific thresholds, signed zero, special values, and exponent changes in two-digit subnormal spelling.
 Shortest floating-point ties, collection order, and FORMAT arguments whose pinned reader prints JVM object identity still require reference qualification.
@@ -326,6 +327,9 @@ General registered-object text rendering requires the source Date environment an
 FORMAT uses scalar ExceptionInfo text for a root stored MessagePack `xtdb/exception-info` with exactly two array elements, a string or null message, and null or empty-map data.
 This shape uses the Throwable constructor and scalar renderer under the default Clojure print-binding profile.
 Its message copy and local Throwable acquire a construction reservation before allocation, and text growth retains the existing caller-scope admission.
+FORMAT resolves root stored MessagePack `time/date` and `time/time` string representations through their registered ISO constructors.
+It uses LocalDate scalar text with signed extended years and LocalTime scalar text with three, six or nine fractional digits when needed.
+The scalar renderer admits temporary text and output growth in the existing caller scope.
 FORMAT decodes MessagePack once per Transit argument.
 Other Transit shapes use raw rendering.
 `tests/transit_format_text.rs` records the scalar and expression routes, formatting demand order, exclusions and allocation lifetime as unexecuted regression source.

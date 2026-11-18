@@ -130,3 +130,44 @@ fn public_format_denies_constructor_charge_after_the_existing_transit_prefix() {
     }
     assert_eq!(memory.used_bytes(),0);
 }
+
+#[test]
+fn format_renders_stored_local_dates_and_times_as_scalars() {
+    let memory = MemoryBudget::new(8 << 20);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        for context in [EvalContext::default(),EvalContext { allocation: Some(&scope),..Default::default() }] {
+            for (tag_name,source,expected) in [
+                ("time/date","0000-02-29","0000-02-29"),
+                ("time/date","-00001-01-02","-0001-01-02"),
+                ("time/date","+010000-12-31","+10000-12-31"),
+                ("time/time","08:09:00.000000000","08:09"),
+                ("time/time","08:09:10.","08:09:10"),
+                ("time/time","08:09:10.12","08:09:10.120"),
+                ("time/time","08:09:10.00012","08:09:10.000120"),
+                ("time/time","08:09:10.000000001","08:09:10.000000001"),
+            ] {
+                let args = [text("%s"),stored(&tag(tag_name,T::String(source.into())))];
+                assert_eq!(scalar_call("format",&args,&context).unwrap(),text(expected));
+            }
+            let date = stored(&tag("time/date",T::String("2024-02-29".into())));
+            let time = stored(&tag("time/time",T::String("08:09:00".into())));
+            let args = [text("%2$L/%1$I"),date,time];
+            assert_eq!(scalar_call("format",&args,&context).unwrap(),text("'08:09'/\"2024-02-29\""));
+        }
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
+
+#[test]
+fn invalid_stored_local_dates_and_times_fail_before_format_directives() {
+    for (tag_name,source,code) in [
+        ("time/date","2023-02-29","xtdb/invalid-date"),
+        ("time/date","-0000-01-01","xtdb/invalid-date"),
+        ("time/time","24:00","xtdb/invalid-time"),
+        ("time/time","08:09:10.0000000001","xtdb/invalid-time"),
+    ] {
+        let args = [text("%0$s"),stored(&tag(tag_name,T::String(source.into())))];
+        assert_eq!(scalar_call("format",&args,&EvalContext::default()).unwrap_err().code,code);
+    }
+}

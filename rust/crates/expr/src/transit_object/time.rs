@@ -43,7 +43,9 @@ impl Time {
             };
             return Ok(Some(Self::LegacyDate(millis)));
         }
-        let text = representation.text()?;
+        Self::read_text(tag,representation.text()?)
+    }
+    pub(super) fn read_text(tag: &str,text: &str) -> Result<Option<Self>> {
         Ok(Some(match tag {
             "t" => Self::LegacyDate(xml_date::parse(text)?),
             "time/period" => Self::Period(Period::parse(text)?),
