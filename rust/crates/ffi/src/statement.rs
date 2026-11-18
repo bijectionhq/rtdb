@@ -116,7 +116,7 @@ impl StatementHandle {
                     if prepared.is_dml() { return crate::arrow::OwnedSchema::empty(self.session.region.memory()); }
                     let context = session.prepare_context_for(&self.creation_database, token).await?;
                     let types = vec![rtdb_types::LogicalType::Null; prepared.parameter_count()];
-                    crate::arrow::OwnedSchema::logical(&prepared.result_schema(&context, &types)?, self.session.region.memory())
+                    crate::arrow::OwnedSchema::logical(prepared.result_schema(&context, &types)?.schema(), self.session.region.memory())
                 }
                 Source::Show { statement: control, prepared } => {
                     if !*prepared { return Err(not_prepared()); }

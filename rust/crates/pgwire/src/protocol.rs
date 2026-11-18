@@ -172,8 +172,10 @@ impl ProtocolSession {
             _ => None,
         };
         if let Some(cursor) = cursor {
-            let actual = cursor.schema();
-            if let Some(columns) = &portal.columns { if columns.len() != actual.len() || columns.iter().zip(actual.fields()).any(|(column, field)| !column.ty.accepts_result(&field.data_type).unwrap_or(false)) { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "xtdb/prepared-query-out-of-date", "cached plan must not change result type")); } }
+            if let (PreparedKind::Control(_), Some(columns)) = (&prepared.kind, &portal.columns) {
+                let actual = cursor.runtime_schema();
+                if columns.len() != actual.len() || columns.iter().zip(actual.fields()).any(|(column, field)| !column.ty.accepts_result(&field.data_type).unwrap_or(false)) { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "xtdb/prepared-query-out-of-date", "cached plan must not change result type")); }
+            }
             portal.state = PortalState::Query(QueryPortal { cursor, batch: None, row: 0, sent: 0 });
         }
         Ok(portal)

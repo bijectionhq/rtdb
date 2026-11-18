@@ -22,7 +22,7 @@ impl Service {
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
         let schema = if prepared.is_dml() { None } else {
             let types = match params { Some(params) => { let batch = wire::parameter_batch(params, self.memory())?; batch.batch().schema().fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? }, None => prepared.parameter_types().to_vec() };
-            Some(wire::plan_schema(&prepared.result_schema(&context, &types).map_err(status)?, self.memory())?)
+            Some(wire::plan_schema(prepared.result_schema(&context, &types).map_err(status)?.schema(), self.memory())?)
         };
         Ok(Shape { schema, parameters: prepared.parameter_count() })
     }
@@ -71,7 +71,7 @@ impl Service {
             let context = native.query_context_at(&basis, &token).await.map_err(status)?;
             let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
             let types = match &params { Some(params) => { let batch = wire::parameter_batch(params, self.memory())?; batch.batch().schema().fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? }, None => prepared.parameter_types().to_vec() };
-            wire::plan_schema(&prepared.result_schema(&context, &types).map_err(status)?, self.memory())?
+            wire::plan_schema(prepared.result_schema(&context, &types).map_err(status)?.schema(), self.memory())?
         };
         let basis_bytes = basis.snapshot.databases.iter().try_fold(8192usize, |size, (database, times)| wire::add(size, wire::add(wire::mul(database.len(), 8)?, wire::mul(times.len(), 128)?)?))?;
         let _ticket = self.memory().reserve(wire::add(basis_bytes, wire::mul(wire::add(source.len(), params.as_ref().map_or(0, Bytes::len))?, 8)?)?).map_err(status)?;

@@ -11,17 +11,20 @@ use crate::cursor::{BoxCursor, OwnedRow, RowCursor};
 use crate::operators::rows_equal;
 use crate::pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor};
 use crate::spill::{SpillReader, SpillWriter};
-use crate::runtime_schema::EmittedRelation;
+use crate::runtime_schema::{EmissionMode, EmittedRelation};
 use crate::{invalid, sort::SortCursor};
 
 pub(crate) struct AggregateTypes { input: LogicalType, declared_output: LogicalType, output: LogicalType }
 
 impl AggregateTypes {
-    pub fn derive(expression: &AggregateExpr, input: LogicalType, global: bool) -> Result<Self> {
+    pub fn derive(expression: &AggregateExpr, input: LogicalType, global: bool, mode: EmissionMode) -> Result<Self> {
         use AggregateFunction as A;
         use LogicalType as T;
         use ScalarType as S;
-        let declared_input = expression.argument.as_ref().map_or(T::Nothing, rtdb_plan::Expr::data_type);
+        let declared_input = match mode {
+            EmissionMode::ArrowFields => input.clone(),
+            EmissionMode::Execution => expression.argument.as_ref().map_or(T::Nothing, rtdb_plan::Expr::data_type),
+        };
         let promoted = || T::least_upper_bound(std::slice::from_ref(&declared_input))
             .ok_or_else(|| rtdb_types::Anomaly::incorrect("xtdb.group-by/incomparable-aggregate-types", format!("Cannot compute {:?} over {declared_input:?}", expression.function)));
         let output = match expression.function.canonical() {
@@ -32,7 +35,9 @@ impl AggregateTypes {
             A::Percentile { kind: PercentileKind::Discrete, .. } => declared_input.clone().maybe(),
             A::ArrayAgg | A::VecAgg => {
                 let list = T::list(declared_input.join(&input));
-                if expression.filter.is_some() || (global && expression.function.canonical() == A::ArrayAgg) { list.maybe() } else { list }
+                if (global && expression.function.canonical() == A::ArrayAgg) || (matches!(mode, EmissionMode::Execution) && expression.filter.is_some()) {
+                    list.maybe()
+                } else { list }
             }
             A::Sum => promoted()?.maybe(),
             A::Average => match promoted()? {
@@ -52,7 +57,7 @@ impl AggregateTypes {
                 _ => return Err(rtdb_types::Anomaly::unsupported("xtdb.group-by/unsupported-min-max-type", format!("Unsupported type in min/max aggregate: {input:?}"))),
             },
         };
-        Ok(Self { input, output: rtdb_columnar::execution_type(&output), declared_output: output })
+        Ok(Self { input, output: mode.field_type(&output), declared_output: output })
     }
     pub fn output_type(&self) -> &LogicalType { &self.output }
 }

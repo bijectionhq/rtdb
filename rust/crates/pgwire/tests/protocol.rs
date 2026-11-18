@@ -113,6 +113,31 @@ async fn sql_parse_failures_return_anomaly_details_and_an_idle_connection() {
 }
 
 #[tokio::test]
+async fn min_max_incomparable_default_json_pgwire() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id, v) VALUES (1, 12)").await), b"CZ");
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id, v) VALUES (2, TIMESTAMP '2022-08-01T13:34:00+01:00[Europe/London]')").await), b"CZ");
+
+    let frames = client.query("SELECT MAX(v) AS m FROM docs").await;
+    assert_eq!(tags(&frames), b"EZ");
+    assert_eq!(frames[1].1, b"I");
+    let fields = frames[0].1.split(|&byte| byte == 0).filter_map(|field| field.split_first()).collect::<std::collections::BTreeMap<_, _>>();
+    let message = std::str::from_utf8(fields[&b'M']).unwrap();
+    assert!(message.contains("Incomparable types in min/max aggregate"));
+    assert!(message.contains("#xt/type"));
+    let detail: serde_json::Value = serde_json::from_slice(fields[&b'D']).unwrap();
+    assert_eq!(detail["category"], "incorrect");
+    assert_eq!(detail["code"], "xtdb.group-by/incomparable-min-max-types");
+    assert_eq!(detail["message"], message);
+    assert!(detail["data"]["from-type"].as_str().unwrap().contains("#xt/type"));
+    assert_eq!(rows(&client.query("SELECT 42 AS answer").await), vec![vec![Some(b"42".to_vec())]]);
+
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn percentile_planning_warning_precedes_simple_and_extended_results_without_repeating_at_bind() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

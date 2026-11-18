@@ -207,7 +207,7 @@ fn primitive_cursor(execution: &Execution,function: AggregateFunction,declared: 
     let schema = Schema::new(vec![field(0,input.clone())]).unwrap();
     let argument = field(0,declared).expression();
     let mut aggregate = AggregateExpr { field: field(1,LogicalType::Null),function,argument: Some(argument),distinct: false,filter,order_by: vec![] };
-    aggregate.field.data_type = AggregateTypes::derive(&aggregate,input,true).unwrap().output_type().clone();
+    aggregate.field.data_type = AggregateTypes::derive(&aggregate,input,true,EmissionMode::Execution).unwrap().output_type().clone();
     cursor(execution,schema,pages.into_iter().map(|page|page.into_iter().map(|value|vec![value]).collect()).collect(),vec![],vec![aggregate],None).0
 }
 async fn primitive_result(mut cursor: AggregateCursor) -> Value {
@@ -314,7 +314,7 @@ fn failing_duration_average_sum_does_not_start_the_count_pass() {
     let input = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond)).maybe();
     let argument = field(0,input.clone()).expression();
     let aggregate = AggregateExpr { field: field(1,input.clone()),function: AggregateFunction::Average,argument: Some(argument),distinct: false,filter: None,order_by: vec![] };
-    let types = AggregateTypes::derive(&aggregate,input,true).unwrap();
+    let types = AggregateTypes::derive(&aggregate,input,true,EmissionMode::Execution).unwrap();
     let mut page = PageBuilder::new(2,&execution.context.memory).unwrap();
     for value in [Value::Duration { value: 10,unit: TimeUnit::Millisecond },Value::Null] { page.push(OwnedRow::new(vec![value],&execution.context.memory).unwrap()).unwrap(); }
     let page = page.finish();let scope = execution.scope().unwrap();

@@ -237,14 +237,17 @@ fn promoting_sum_and_minmax_use_the_argument_computation_type() {
 }
 
 #[test]
-fn minmax_rejects_incomparable_and_unsupported_argument_types_340() {
+fn minmax_planning_preserves_argument_types_for_factory_emission() {
     for argument in [
         LogicalType::join_all([&LogicalType::Scalar(ScalarType::I64), &LogicalType::Scalar(ScalarType::Utf8)]),
         LogicalType::Scalar(ScalarType::Bool),
         LogicalType::list(LogicalType::Scalar(ScalarType::I64)),
     ] {
-        let options = PrepareOptions { parameter_types: BTreeMap::from([(0, argument)]), ..Default::default() };
-        assert!(prepare("SELECT min($1) FROM docs", &Fixture, &options).is_err());
+        let options = PrepareOptions { parameter_types: BTreeMap::from([(0, argument.clone())]), ..Default::default() };
+        let plan = prepare("SELECT MIN($1) AS m FROM docs", &Fixture, &options).unwrap();
+        let Statement::Query(plan) = plan.statement else { panic!("expected query") };
+        assert_eq!(plan.schema().fields()[0].name, "m");
+        assert_eq!(plan.schema().fields()[0].data_type, argument.maybe());
     }
 }
 

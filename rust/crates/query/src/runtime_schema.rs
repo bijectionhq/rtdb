@@ -6,35 +6,54 @@ use rtdb_types::{LogicalType as L, Result, ScalarType};
 
 use crate::{CatalogSnapshot, invalid};
 
-pub(crate) fn parameter_types(relation: &Relation, values: &[rtdb_types::Value]) -> Vec<L> {
-    fn collect(relation: &Relation, declarations: &mut [Option<L>], local: &mut Vec<usize>) {
+pub(crate) fn parameter_types(relation: &Relation, values: &[rtdb_types::Value], mode: EmissionMode) -> Vec<L> {
+    fn collect(relation: &Relation, declarations: &mut [Option<L>], local: &mut Vec<usize>, mode: EmissionMode) {
         for expression in relation.expressions() {
             expression.visit(&mut |expression| {
                 if let Expr::Parameter { index, data_type } = expression {
                     if local.contains(index) || matches!(data_type, L::Nothing | L::Null) { return; }
                     if let Some(declared) = declarations.get_mut(*index) {
-                        let ty = rtdb_columnar::execution_type(data_type);
+                        let ty = mode.field_type(data_type);
                         *declared = Some(match declared.take() { Some(previous) => L::join_all(&[previous, ty]), None => ty });
                     }
                 }
             });
         }
         if let RelationNode::Apply { input, dependent, arguments, .. } | RelationNode::Mark { input, dependent, arguments, .. } = relation.node() {
-            collect(input, declarations, local);
+            collect(input, declarations, local, mode);
             let outer = local.len();
             local.extend(arguments.iter().map(|(index, _)| *index));
-            collect(dependent, declarations, local);
+            collect(dependent, declarations, local, mode);
             local.truncate(outer);
         } else {
-            for child in relation.children() { collect(child, declarations, local); }
+            for child in relation.children() { collect(child, declarations, local, mode); }
         }
     }
     let mut declarations = vec![None; values.len()];
-    collect(relation, &mut declarations, &mut Vec::new());
+    collect(relation, &mut declarations, &mut Vec::new(), mode);
     declarations.into_iter().zip(values).map(|(declared, value)| declared.filter(|ty| !matches!(value, rtdb_types::Value::Null) || ty.nullable()).unwrap_or_else(|| value.logical_type())).collect()
 }
 
-pub(crate) struct RuntimeSchema { schema: Schema, _reservation: Arc<MemoryReservation> }
+/// Result fields emitted from the plan and a catalog snapshot, with their memory reservation.
+pub struct RuntimeSchema { schema: Schema, _reservation: Arc<MemoryReservation> }
+
+#[derive(Clone, Copy)]
+pub(crate) enum EmissionMode { ArrowFields, Execution }
+
+impl EmissionMode {
+    pub(crate) fn field_type(self, ty: &L) -> L {
+        match self { Self::ArrowFields => ty.clone(), Self::Execution => rtdb_columnar::execution_type(ty) }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Emitter<'a> {
+    catalog: &'a CatalogSnapshot,
+    mode: EmissionMode,
+    parameters: &'a BTreeMap<usize, L>,
+    outer: &'a [Schema],
+    reservation: &'a Arc<MemoryReservation>,
+}
 
 pub(crate) struct EmittedRelation {
     relation: Arc<Relation>,
@@ -67,15 +86,19 @@ impl EmittedRelation {
 
 impl EmittedRelation {
     pub fn derive(relation: Arc<Relation>, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        Self::emit(relation, catalog, parameters, memory, EmissionMode::Execution)
+    }
+
+    pub fn emit(relation: Arc<Relation>, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>, mode: EmissionMode) -> Result<Arc<Self>> {
         let bound = parameters.iter().try_fold(allocation_bound(&relation)?, |bytes, ty| add(bytes, add(multiply(ty.retained_bytes()?, 32)?, 512)?))?;
         let reservation = memory.reserve(bound)?;
         let parameters = parameters.iter().enumerate().map(|(index, ty)| (index, ty.clone())).collect();
-        relation_types(&relation, catalog, &parameters, &[], &reservation)
+        relation_types(&relation, &Emitter { catalog, mode, parameters: &parameters, outer: &[], reservation: &reservation })
     }
 }
 
 impl RuntimeSchema {
-    pub fn fixed(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    pub(crate) fn fixed(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(schema_bound(schema)?)?;
         Ok(Arc::new(Self { schema: schema.clone(), _reservation: reservation }))
     }
@@ -182,11 +205,12 @@ pub(crate) fn allocation_bound(relation: &Relation) -> Result<usize> {
 }
 
 fn field_type(field: &Field, data_type: L) -> Field { let mut field = field.clone(); field.data_type = data_type; field }
-fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameters: &BTreeMap<usize, L>, outer: &[Schema], reservation: &Arc<MemoryReservation>) -> Result<Arc<EmittedRelation>> {
+fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc<EmittedRelation>> {
+    let type_of = |expr: &Expr, input: &Schema| expression_type(expr, input, emitter);
     let mut children = Vec::new();
     let mut aggregates = Vec::new();
     let mut child = |input: &Arc<Relation>| {
-        let runtime = relation_types(input, catalog, parameters, outer, reservation)?;
+        let runtime = relation_types(input, emitter)?;
         let schema = runtime.schema().clone();
         children.push(runtime);
         Ok::<_, rtdb_types::Anomaly>(schema)
@@ -194,29 +218,32 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
     let schema = match relation.node() {
         RelationNode::Values { rows } => {
             Schema::new(relation.schema().fields().iter().enumerate().map(|(index, field)| {
-                let types = rows.iter().map(|row| expression_type(&row[index], &Schema::default(), parameters, outer)).collect::<Result<Vec<_>>>()?;
+                let types = rows.iter().map(|row| type_of(&row[index], &Schema::default())).collect::<Result<Vec<_>>>()?;
                 Ok(if rows.iter().map(|row| row[index].data_type()).eq(types.iter().cloned()) { field.clone() } else { field_type(field, L::join_all(&types)) })
             }).collect::<Result<_>>()?)?
         }
         RelationNode::Scan(scan) => {
-            let schema = Schema::new(scan.columns.iter().map(|field| field_type(field, catalog.runtime_scan_type(&scan.table, field))).collect())?;
+            let schema = Schema::new(scan.columns.iter().map(|field| match emitter.mode {
+                EmissionMode::ArrowFields => field.clone(),
+                EmissionMode::Execution => field_type(field, emitter.catalog.runtime_scan_type(&scan.table, field)),
+            }).collect())?;
             for filter in [&scan.valid_time, &scan.system_time] {
                 match filter {
-                    rtdb_plan::TemporalFilter::At(at) => { expression_type(at, &Schema::default(), parameters, outer)?; }
+                    rtdb_plan::TemporalFilter::At(at) => { type_of(at, &Schema::default())?; }
                     rtdb_plan::TemporalFilter::FromTo { from, to } | rtdb_plan::TemporalFilter::Between { from, to } => {
-                        expression_type(from, &Schema::default(), parameters, outer)?;
-                        expression_type(to, &Schema::default(), parameters, outer)?;
+                        type_of(from, &Schema::default())?;
+                        type_of(to, &Schema::default())?;
                     }
                     rtdb_plan::TemporalFilter::Default | rtdb_plan::TemporalFilter::All => {}
                 }
             }
-            for predicate in &scan.predicates { expression_type(predicate, &schema, parameters, outer)?; }
+            for predicate in &scan.predicates { type_of(predicate, &schema)?; }
             schema
         }
         RelationNode::Project { input, expressions } | RelationNode::Extend { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
             let input = child(input)?;
             let fields = expressions.iter().map(|expr| {
-                let ty = expression_type(&expr.expr, &input, parameters, outer)?;
+                let ty = type_of(&expr.expr, &input)?;
                 Ok(if ty == expr.expr.data_type() { expr.field.clone() } else { field_type(&expr.field, ty) })
             }).collect::<Result<Vec<_>>>()?;
             if matches!(relation.node(), RelationNode::Extend { .. }) {
@@ -224,15 +251,15 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
             } else { Schema::new(fields)? }
         }
         RelationNode::Let { binding, body } => { child(&binding.relation)?; child(body)? }
-        RelationNode::Reference { binding } => relation_types(&binding.relation, catalog, parameters, outer, reservation)?.schema().clone(),
+        RelationNode::Reference { binding } => relation_types(&binding.relation, emitter)?.schema().clone(),
         RelationNode::Filter { input, predicate } => {
             let input = child(input)?;
-            expression_type(predicate, &input, parameters, outer)?;
+            type_of(predicate, &input)?;
             input
         }
         RelationNode::Sort { input, order_by } | RelationNode::SortLimit { input, order_by, .. } => {
             let input = child(input)?;
-            for order in order_by { expression_type(&order.expr, &input, parameters, outer)?; }
+            for order in order_by { type_of(&order.expr, &input)?; }
             input
         }
         RelationNode::Limit { input, .. } | RelationNode::Distinct { input } => child(input)?,
@@ -244,7 +271,7 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
         }
         RelationNode::Join { left, right, kind, condition } => {
             let (left, right) = (child(left)?, child(right)?);
-            if let Some(condition) = condition { expression_type(condition, &left.concat(&right)?, parameters, outer)?; }
+            if let Some(condition) = condition { type_of(condition, &left.concat(&right)?)?; }
             match kind {
                 JoinKind::Semi | JoinKind::Anti => left,
                 JoinKind::Left => left.concat(&right.nullable()?)?,
@@ -259,12 +286,12 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
         }
         RelationNode::Aggregate { input, groups, aggregates: expressions } => {
             let input = child(input)?;
-            let mut fields = groups.iter().map(|group| Ok(field_type(&group.field, expression_type(&group.expr, &input, parameters, outer)?))).collect::<Result<Vec<_>>>()?;
+            let mut fields = groups.iter().map(|group| Ok(field_type(&group.field, type_of(&group.expr, &input)?))).collect::<Result<Vec<_>>>()?;
             for expression in expressions {
-                let input_type = expression.argument.as_ref().map(|argument| expression_type(argument, &input, parameters, outer)).transpose()?.unwrap_or(L::Nothing);
-                if let Some(filter) = &expression.filter { expression_type(filter, &input, parameters, outer)?; }
-                for order in &expression.order_by { expression_type(&order.expr, &input, parameters, outer)?; }
-                let types = crate::aggregate::AggregateTypes::derive(expression, input_type, groups.is_empty())?;
+                let input_type = expression.argument.as_ref().map(|argument| type_of(argument, &input)).transpose()?.unwrap_or(L::Nothing);
+                if let Some(filter) = &expression.filter { type_of(filter, &input)?; }
+                for order in &expression.order_by { type_of(&order.expr, &input)?; }
+                let types = crate::aggregate::AggregateTypes::derive(expression, input_type, groups.is_empty(), emitter.mode)?;
                 fields.push(field_type(&expression.field, types.output_type().clone()));
                 aggregates.push(types);
             }
@@ -272,13 +299,13 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
         }
         RelationNode::Window { input, expressions, order_by, .. } => {
             let input = child(input)?;
-            for order in order_by { expression_type(&order.expr, &input, parameters, outer)?; }
+            for order in order_by { type_of(&order.expr, &input)?; }
             let mut fields = input.fields().to_vec();
             for expr in expressions { fields.push(field_type(&expr.field, expr.function.result_type(&input)?)); }
             Schema::new(fields)?
         }
         RelationNode::List { expr, element } | RelationNode::ColumnTable { expr, element } => {
-            let types = expression_type(expr, &Schema::default(), parameters, outer)?.legs().into_iter().map(|ty| match ty.unencoded() {
+            let types = type_of(expr, &Schema::default())?.legs().into_iter().map(|ty| match ty.unencoded() {
                 L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element,
                 _ => L::Null,
             }).collect::<Vec<_>>();
@@ -290,7 +317,7 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
         }
         RelationNode::Unnest { input, expr, element, ordinality, outer: nullable } => {
             let input = child(input)?;
-            let types = expression_type(expr, &input, parameters, outer)?.legs().into_iter().map(|ty| match ty { L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element, _ => L::Null }).collect::<Vec<_>>();
+            let types = type_of(expr, &input)?.legs().into_iter().map(|ty| match ty { L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element, _ => L::Null }).collect::<Vec<_>>();
             let ty = if types.is_empty() { L::Null } else { L::join_all(&types) };
             let mut fields = input.fields().to_vec();
             fields.push(field_type(element, if *nullable { ty.maybe() } else { ty }));
@@ -299,20 +326,20 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
         }
         RelationNode::Mark { input, dependent, arguments, comparison, output } => {
             let input = child(input)?;
-            let mut bound = parameters.clone();
-            for (index, expr) in arguments { bound.insert(*index, expression_type(expr, &input, parameters, outer)?); }
-            let mut scopes = outer.to_vec(); scopes.push(input.clone());
-            let dependent_types = relation_types(dependent, catalog, &bound, &scopes, reservation)?;
-            expression_type(comparison, &input.concat(dependent_types.schema())?, parameters, outer)?;
+            let mut bound = emitter.parameters.clone();
+            for (index, expr) in arguments { bound.insert(*index, type_of(expr, &input)?); }
+            let mut scopes = emitter.outer.to_vec(); scopes.push(input.clone());
+            let dependent_types = relation_types(dependent, &Emitter { parameters: &bound, outer: &scopes, ..*emitter })?;
+            type_of(comparison, &input.concat(dependent_types.schema())?)?;
             children.push(dependent_types);
             input.concat(&Schema::new(vec![field_type(output, L::Scalar(ScalarType::Bool).maybe())])?)?
         }
         RelationNode::Apply { input, dependent, arguments, kind, output } => {
             let input = child(input)?;
-            let mut bound = parameters.clone();
-            for (index, expr) in arguments { bound.insert(*index, expression_type(expr, &input, parameters, outer)?); }
-            let mut scopes = outer.to_vec(); scopes.push(input.clone());
-            let dependent_types = relation_types(dependent, catalog, &bound, &scopes, reservation)?;
+            let mut bound = emitter.parameters.clone();
+            for (index, expr) in arguments { bound.insert(*index, type_of(expr, &input)?); }
+            let mut scopes = emitter.outer.to_vec(); scopes.push(input.clone());
+            let dependent_types = relation_types(dependent, &Emitter { parameters: &bound, outer: &scopes, ..*emitter })?;
             let dependent = dependent_types.schema().clone();
             children.push(dependent_types);
             match kind {
@@ -338,13 +365,13 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
             | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::PageOrdinality { .. } | RelationNode::PatchGaps { .. }, [input]) => EmittedNode::Unary(Arc::clone(input)),
         _ => return Err(invalid("runtime-plan", "Runtime relation children disagree with its plan")),
     };
-    Ok(Arc::new(EmittedRelation { relation: Arc::clone(relation), output: Arc::new(RuntimeSchema { schema, _reservation: Arc::clone(reservation) }), node }))
+    Ok(Arc::new(EmittedRelation { relation: Arc::clone(relation), output: Arc::new(RuntimeSchema { schema, _reservation: Arc::clone(emitter.reservation) }), node }))
 }
 
-fn coalesce_type(args: &[Expr],input: &Schema,parameters: &BTreeMap<usize,L>,outer: &[Schema]) -> Result<L> {
+fn coalesce_type(args: &[Expr], input: &Schema, emitter: &Emitter<'_>) -> Result<L> {
     let mut result = L::Nothing;
     for (index,arg) in args.iter().enumerate() {
-        let ty = expression_type(arg,input,parameters,outer)?;
+        let ty = expression_type(arg, input, emitter)?;
         for leg in ty.legs() { if leg != L::Null || index + 1 == args.len() { result = result.join(&leg); } }
         if !ty.nullable() { break; }
     }
@@ -352,14 +379,14 @@ fn coalesce_type(args: &[Expr],input: &Schema,parameters: &BTreeMap<usize,L>,out
 }
 
 fn typed(data_type: L) -> Expr { Expr::column(ColumnId(0), data_type) }
-fn expression_type(expr: &Expr, input: &Schema, parameters: &BTreeMap<usize, L>, outer: &[Schema]) -> Result<L> {
-    let child = |expr: &Expr| expression_type(expr, input, parameters, outer);
+fn expression_type(expr: &Expr, input: &Schema, emitter: &Emitter<'_>) -> Result<L> {
+    let child = |expr: &Expr| expression_type(expr, input, emitter);
     Ok(match expr {
         Expr::Literal(value) => value.logical_type(),
         Expr::RegexReplace { source,recipe,.. } => recipe.output_type(&child(source)?)?,
         Expr::Column { id, .. } => input.get(*id).ok_or_else(|| invalid("runtime-column", "Runtime input column is absent"))?.data_type.clone(),
-        Expr::Parameter { index, data_type } => parameters.get(index).cloned().unwrap_or_else(|| if *data_type == L::Nothing { L::Null } else { rtdb_columnar::execution_type(data_type) }),
-        Expr::Correlated { depth, id, data_type } => outer.iter().rev().nth(*depth).and_then(|schema| schema.get(*id)).map_or_else(|| data_type.clone(), |field| field.data_type.clone()),
+        Expr::Parameter { index, data_type } => emitter.parameters.get(index).cloned().unwrap_or_else(|| if *data_type == L::Nothing { L::Null } else { emitter.mode.field_type(data_type) }),
+        Expr::Correlated { depth, id, data_type } => emitter.outer.iter().rev().nth(*depth).and_then(|schema| schema.get(*id)).map_or_else(|| data_type.clone(), |field| field.data_type.clone()),
         Expr::Cast { expr, target } => {
             let source = child(expr)?;
             target.validate_source(&source)?;
@@ -386,7 +413,7 @@ fn expression_type(expr: &Expr, input: &Schema, parameters: &BTreeMap<usize, L>,
             else { Expr::binary(*op, typed(left_type), typed(right_type)).data_type() }
         }
         Expr::Call { name, args, return_type } => {
-            if name.eq_ignore_ascii_case("coalesce") { return coalesce_type(args,input,parameters,outer); }
+            if name.eq_ignore_ascii_case("coalesce") { return coalesce_type(args, input, emitter); }
             let types = args.iter().map(child).collect::<Result<Vec<_>>>()?;
             if ["null_eq", "null-eq", "distinct_from", "distinct-from", "nullif"].iter().any(|candidate| name.eq_ignore_ascii_case(candidate)) && types.len() == 2 { rtdb_plan::validate_equality_types(&types[0], &types[1])?; }
             if args.iter().map(Expr::data_type).eq(types.iter().cloned()) { return Ok(return_type.clone()); }
@@ -415,7 +442,7 @@ fn expression_type(expr: &Expr, input: &Schema, parameters: &BTreeMap<usize, L>,
         Expr::Case { branches, otherwise } => {
             let mut types = branches.iter().map(|(condition, value)| { child(condition)?; child(value) }).collect::<Result<Vec<_>>>()?; types.push(child(otherwise)?); L::join_all(&types)
         }
-        Expr::Coalesce(args) => coalesce_type(args,input,parameters,outer)?,
+        Expr::Coalesce(args) => coalesce_type(args, input, emitter)?,
         Expr::List(args) => L::list(L::join_all(&args.iter().map(child).collect::<Result<Vec<_>>>()?)),
         Expr::Struct(fields) => L::Struct(fields.iter().map(|(name, expr)| Ok((name.clone(), child(expr)?))).collect::<Result<_>>()?),
         Expr::RowCopy(fields) => L::Struct(fields.iter().map(|field| {
@@ -453,7 +480,7 @@ mod parameter_tests {
     #[test]
     fn unknown_parameter_annotations_infer_the_admitted_cell_type() {
         let input = parameter(0, L::Null);
-        assert_eq!(parameter_types(&input, &[Value::I64(7)]), [L::Scalar(ScalarType::I64)]);
+        assert_eq!(parameter_types(&input, &[Value::I64(7)], EmissionMode::Execution), [L::Scalar(ScalarType::I64)]);
     }
 
     #[test]
@@ -461,7 +488,7 @@ mod parameter_tests {
         for ty in [L::Scalar(ScalarType::I64), L::Scalar(ScalarType::I64).maybe()] {
             let input = parameter(0, ty.clone());
             let expected = if ty.nullable() { ty } else { L::Null };
-            assert_eq!(parameter_types(&input, &[Value::Null]), [expected]);
+            assert_eq!(parameter_types(&input, &[Value::Null], EmissionMode::Execution), [expected]);
         }
     }
 
@@ -477,7 +504,7 @@ mod parameter_tests {
         let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
         let mark = Relation::new(schema, RelationNode::Mark { input, dependent, arguments, comparison: Expr::Literal(Value::Bool(true)), output }).unwrap();
         for relation in [&apply, &mark] {
-            assert_eq!(parameter_types(relation, &[Value::I64(-1)]), [L::Scalar(ScalarType::I64).maybe()]);
+            assert_eq!(parameter_types(relation, &[Value::I64(-1)], EmissionMode::Execution), [L::Scalar(ScalarType::I64).maybe()]);
         }
     }
 }

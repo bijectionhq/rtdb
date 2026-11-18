@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{ColumnId, Field, Schema, SqlNotice};
-use rtdb_query::{PreparedQuery, QueryContext, QueryCursor};
+use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
 use rtdb_sql::{PrepareOptions, StatementKind};
 use rtdb_tx::{SqlArguments, TxOp};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, MemoryBudget, PgType, Result, Value};
@@ -72,7 +72,12 @@ impl PreparedSql {
                     if !options.parameter_types.contains_key(index) { parameters[*index] = ty.clone(); }
                 }
                 notices = prepared.notices.clone();
-                let schema = PreparedQuery::from_prepared(prepared, &context.memory)?.schema().clone();
+                let query = PreparedQuery::from_prepared(prepared, &context.memory)?;
+                let schema = if policy == ResultSignaturePolicy::PostgreSql && !dynamic_pg {
+                    query.result_schema(context)?.schema().clone()
+                } else {
+                    query.schema().clone()
+                };
                 let pg_types = schema.fields().iter().map(|field| if dynamic_pg || policy != ResultSignaturePolicy::PostgreSql { Ok(PgType::Default) } else { PgType::from_logical(&field.data_type) }).collect::<Result<_>>()?;
                 PreparedResult::Query { schema, pg_types }
             }
@@ -101,8 +106,8 @@ impl PreparedSql {
     }
 
     /// Returns the current Arrow signature from supplied physical parameter fields without opening vectors.
-    pub fn result_schema(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType]) -> Result<Schema> {
-        Ok(self.bind(context, argument_types, false)?.schema().clone())
+    pub fn result_schema(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType]) -> Result<Arc<RuntimeSchema>> {
+        self.bind(context, argument_types, false)?.result_schema(context)
     }
 
     pub async fn open_query(&self, context: Arc<QueryContext>, arguments: Vec<Value>) -> Result<QueryCursor> {
@@ -119,8 +124,10 @@ impl PreparedSql {
         arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], &rtdb_columnar::execution_type(ty), &context.timezone)?; }
         let query = self.bind(&context, types, true)?;
-        self.check_signature(query.schema())?;
-        query.execute_with_text(context, arguments, Some(self.source())).await
+        if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
+        let cursor = query.execute_with_text(context, arguments, Some(self.source())).await?;
+        if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
+        Ok(cursor)
     }
 
     /// Preserves absent arguments and an explicitly empty argument batch as distinct source operations.

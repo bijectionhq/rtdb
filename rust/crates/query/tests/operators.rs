@@ -36,6 +36,22 @@ async fn direct_parameters_admit_signed_values_before_rows_and_keep_advertised_f
 }
 
 #[tokio::test]
+async fn direct_query_uses_the_argument_type_to_open_an_undeclared_field() {
+    let schema = Schema::new(vec![field(0, "v", LogicalType::Null)]).unwrap();
+    let relation = Arc::new(Relation::new(schema, RelationNode::Values {
+        rows: vec![vec![Expr::Parameter { index: 0, data_type: LogicalType::Null }]],
+    }).unwrap());
+    let context = query_context(Default::default());
+    let prepared = PreparedQuery::new(relation).unwrap();
+    assert_eq!(prepared.result_schema(&context).unwrap().schema().fields()[0].data_type, LogicalType::Null);
+    let mut cursor = prepared.execute(context, vec![Value::I64(7)]).await.unwrap();
+    assert_eq!(cursor.schema().fields()[0].data_type, scalar(ScalarType::I64));
+    assert_eq!(cursor.runtime_schema(), cursor.schema());
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::I64(7));
+}
+
+#[tokio::test]
 async fn admitted_unsigned_values_sort_exactly_through_spills_and_release_on_cancel() {
     let ty = scalar(ScalarType::U64);
     let field = field(0, "v", ty.clone());
@@ -360,7 +376,9 @@ async fn filtered_array_and_vec_aggregate_groups_promote_output_nullability() {
         array.filter = Some(Expr::Literal(Value::Bool(false)));
         let relation = aggregate(input, vec![group], vec![array]);
         let context = query_context(QueryOptions { batch_rows: 1, ..Default::default() });
-        let mut cursor = PreparedQuery::new(relation).unwrap().execute(Arc::clone(&context), vec![]).await.unwrap();
+        let prepared = PreparedQuery::new(relation).unwrap();
+        let mut cursor = prepared.execute(Arc::clone(&context), vec![]).await.unwrap();
+        assert_eq!(cursor.schema(), prepared.result_schema(&context).unwrap().schema());
         assert!(!cursor.schema().fields()[1].data_type.nullable());
         assert!(cursor.runtime_schema().fields()[1].data_type.nullable());
         for key in [1, 2] {

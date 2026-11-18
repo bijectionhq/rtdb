@@ -406,11 +406,8 @@ fn aggregate_type(function: &AggregateFunction, argument: &LogicalType) -> Resul
             T::Nothing | T::Null | T::Scalar(S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 | S::F16 | S::F32 | S::F64 | S::Decimal { .. }) => T::Scalar(S::F64).maybe(),
             _ => return Err(error(format!("Cannot compute AVERAGE over type {argument:?}"))),
         },
-        A::Min | A::Max => match promoted()? {
-            ty @ (T::Nothing | T::Null | T::Scalar(S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 | S::F16 | S::F32 | S::F64 | S::Decimal { .. }
-                | S::Duration(_) | S::DateDay | S::DateMilli | S::Timestamp { .. } | S::Time { .. } | S::Utf8 | S::Binary | S::Keyword | S::Uri)) => ty.maybe(),
-            _ => return Err(rtdb_types::Anomaly::unsupported("xtdb.group-by/unsupported-min-max-type", format!("Unsupported type in min/max aggregate: {argument:?}"))),
-        },
+        // Before factory emission this field preserves the possible input types for column binding.
+        A::Min | A::Max => T::least_upper_bound(std::slice::from_ref(argument)).unwrap_or_else(|| argument.clone()).maybe(),
     })
 }
 

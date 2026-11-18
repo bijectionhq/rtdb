@@ -26,7 +26,7 @@ async fn prepared_temporal_cast_schema_rebinds_to_execution_timezone() {
     let later = QueryContext::new(catalog,Arc::clone(&memory),Timestamp(100),"Europe/Paris",QueryOptions::default(),&CancellationToken::new()).unwrap();
     let statement = PreparedSql::prepare("SELECT CAST('1970-01-01Z' AS TIMESTAMPTZ) AS value",&initial,PrepareOptions::default(),ResultSignaturePolicy::Dynamic).unwrap();
     let expected = LogicalType::Scalar(ScalarType::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("Europe/Paris".into()) });
-    assert_eq!(statement.result_schema(&later,&[]).unwrap().fields()[0].data_type,expected);
+    assert_eq!(statement.result_schema(&later,&[]).unwrap().schema().fields()[0].data_type,expected);
     let mut cursor = statement.open_query(Arc::clone(&later),vec![]).await.unwrap();
     assert_eq!(cursor.runtime_schema().fields()[0].data_type,expected);
     let page = cursor.next_batch().await.unwrap().unwrap();
@@ -38,6 +38,55 @@ fn write(state: &PartitionState, tx: i64, value: Value, memory: &Arc<MemoryBudge
     let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(memory)).unwrap();
     buffer.put(TableRef::new("public", "docs"), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), value)]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
     state.apply(&buffer.stage().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn minmax_type_errors_are_emitted_without_reading_input_rows() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    for (values, category, code) in [
+        ("(12), ('twelve')", rtdb_types::AnomalyCategory::Incorrect, "xtdb.group-by/incomparable-min-max-types"),
+        ("(true)", rtdb_types::AnomalyCategory::Unsupported, "xtdb.group-by/unsupported-min-max-type"),
+        ("(ARRAY[12])", rtdb_types::AnomalyCategory::Unsupported, "xtdb.group-by/unsupported-min-max-type"),
+    ] {
+        let sql = format!("SELECT MIN(v) AS m FROM (VALUES {values}) AS t(v) WHERE FALSE");
+        let statement = PreparedSql::prepare(&sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        assert_eq!(statement.prepared_schema().unwrap().fields()[0].name, "m");
+        let description_error = statement.result_schema(&context, &[]).err().unwrap();
+        assert_eq!(description_error.category, category);
+        assert_eq!(description_error.code, code);
+        let opening_error = statement.open_query(Arc::clone(&context), vec![]).await.err().unwrap();
+        assert_eq!(description_error, opening_error);
+    }
+
+    let statement = PreparedSql::prepare("SELECT MAX(v) AS m FROM (VALUES (1)) AS t(v) WHERE FALSE", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let described = statement.result_schema(&context, &[]).unwrap();
+    let mut cursor = statement.open_query(context, vec![]).await.unwrap();
+    assert_eq!(described.schema(), cursor.runtime_schema());
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(read_value(batch.batch().schema().field(0), batch.batch().column(0).as_ref(), 0).unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn emitted_array_aggregate_fields_agree_for_description_and_open() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    let sql = "SELECT k, ARRAY_AGG(v) AS a FROM (VALUES (1, 12), (1, 13)) AS t(k, v) GROUP BY k";
+    let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let described = statement.result_schema(&context, &[]).unwrap();
+    let cursor = statement.open_query(context, vec![]).await.unwrap();
+    assert_eq!(described.schema().fields()[1].data_type, LogicalType::list(LogicalType::Scalar(ScalarType::I64)));
+    assert_eq!(described.schema(), cursor.schema());
+    assert_eq!(described.schema(), cursor.runtime_schema());
+}
+
+#[tokio::test]
+async fn aggregate_factory_errors_precede_sql_setting_values() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    let sql = "SETTING CLOCK_TIME=? SELECT MIN(v) FROM (VALUES (1), ('a')) AS t(v)";
+    let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let description_error = statement.result_schema(&context, &[LogicalType::Scalar(ScalarType::Utf8)]).err().unwrap();
+    assert_eq!(description_error.code, "xtdb.group-by/incomparable-min-max-types");
+    let opening_error = statement.open_query(context, vec![Value::Utf8("bad".into())]).await.err().unwrap();
+    assert_eq!(opening_error, description_error);
 }
 
 #[tokio::test]
@@ -68,7 +117,7 @@ async fn typed_unsigned_nulls_and_empty_lists_keep_opened_vector_fields() {
         (LogicalType::Scalar(ScalarType::U64).maybe(), Value::Null, LogicalType::Scalar(ScalarType::I64).maybe()),
         (LogicalType::list(LogicalType::Scalar(ScalarType::U8)), Value::List(vec![]), LogicalType::list(LogicalType::Scalar(ScalarType::I8))),
     ] {
-        assert_eq!(statement.result_schema(&context, std::slice::from_ref(&ty)).unwrap().fields()[0].data_type, ty);
+        assert_eq!(statement.result_schema(&context, std::slice::from_ref(&ty)).unwrap().schema().fields()[0].data_type, ty);
         let mut cursor = statement.open_query_typed(Arc::clone(&context), vec![value.clone()], &[ty]).await.unwrap();
         assert_eq!(cursor.runtime_schema().fields()[0].data_type, expected);
         let page = cursor.next_batch().await.unwrap().unwrap();

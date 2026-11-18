@@ -31,3 +31,18 @@ async fn shared_preparation_exposes_explain_schema_and_analyze_executes_during_o
     assert_eq!(context.memory.used_bytes(), 0);
     assert_eq!(context.spill_bytes(), 0);
 }
+
+#[tokio::test]
+async fn explain_description_and_open_check_aggregate_factory_types() {
+    let context = context();
+    let invalid = PreparedSql::prepare("EXPLAIN SELECT MIN(v) FROM (VALUES (1), ('a')) AS t(v)", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let error = invalid.result_schema(&context, &[]).err().unwrap();
+    assert_eq!(error.code, "xtdb.group-by/incomparable-min-max-types");
+    assert_eq!(invalid.open_query(Arc::clone(&context), vec![]).await.err().unwrap(), error);
+
+    let valid = PreparedSql::prepare("EXPLAIN SELECT MIN(v) FROM (VALUES (1)) AS t(v)", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let described = valid.result_schema(&context, &[]).unwrap();
+    let mut cursor = valid.open_query(context, vec![]).await.unwrap();
+    assert_eq!(described.schema(), cursor.schema());
+    assert!(cursor.next_batch().await.unwrap().is_some());
+}

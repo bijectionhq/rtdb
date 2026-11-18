@@ -5,9 +5,10 @@ use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_builder_bytes_refs, to_field};
 use rtdb_plan::{Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Relation, Schema};
-use rtdb_types::{Result, Value};
+use rtdb_types::{LogicalType, Result, Value};
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
+use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, parameter_types};
 
 pub(crate) struct OwnedRow { pub values: Vec<Value>, reservation: Arc<MemoryReservation> }
 impl OwnedRow {
@@ -89,6 +90,20 @@ impl PreparedQuery {
     }
     pub fn schema(&self) -> &Schema { match &self.output { QueryOutput::Rows => self.relation.schema(), QueryOutput::Plan(plan) => &plan.schema, QueryOutput::Analyze(schema) => schema } }
     pub fn relation(&self) -> &Arc<Relation> { &self.relation }
+    /// Emits result fields against the pinned catalog using the parameter types in the plan.
+    pub fn result_schema(&self, context: &QueryContext) -> Result<Arc<RuntimeSchema>> {
+        self.emit_result_schema(context, &[])
+    }
+    fn emit_result_schema(&self, context: &QueryContext, parameter_fields: &[LogicalType]) -> Result<Arc<RuntimeSchema>> {
+        context.check_cancelled()?;
+        let emitted = EmittedRelation::emit(Arc::clone(&self.relation), &context.catalog, parameter_fields, &context.memory, EmissionMode::ArrowFields)?;
+        let schema = match &self.output {
+            QueryOutput::Rows => emitted.schema(),
+            QueryOutput::Plan(plan) => &plan.schema,
+            QueryOutput::Analyze(schema) => schema,
+        };
+        RuntimeSchema::fixed(schema, &context.memory)
+    }
     /// Opens referenced materializations before returning; ANALYZE consumes and closes the query first.
     /// Dropping this future releases partially opened cursors and their reservations.
     pub async fn execute(&self, context: Arc<QueryContext>, parameters: Vec<Value>) -> Result<QueryCursor> {
@@ -96,13 +111,18 @@ impl PreparedQuery {
     }
     pub async fn execute_with_text(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
-        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         for dependency in self.relation.dependencies() {
             let current = context.catalog.table(&dependency.name)?.ok_or_else(|| invalid("stale-plan", "Prepared table is no longer present"))?;
             if current.oid != dependency.oid || current.columns != dependency.columns {
                 return Err(invalid("stale-plan", "Prepared table OID or column types changed; prepare against the execution snapshot"));
             }
         }
+        let bound = parameters.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, value| {
+            bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
+        })?;
+        let temporary = context.memory.reserve(bound)?;
+        let schema = self.emit_result_schema(&context, &parameter_types(&self.relation, &parameters, EmissionMode::ArrowFields))?;
+        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         let context = context.apply_settings(&self.settings, &parameters)?;
         let query_span = crate::trace::QueryTrace::start(&context, text);
         let context = Arc::clone(&context).with_tracer(context.tracer.clone(), query_span.as_ref().map(|span| span.context()));
@@ -113,14 +133,10 @@ impl PreparedQuery {
             cursor.plan_reservation = self._plan_reservation.clone();
             return Ok(cursor);
         }
-        let bound = parameters.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, value| {
-            bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
-        })?;
-        let temporary = context.memory.reserve(bound)?;
-        let types = crate::runtime_schema::parameter_types(&self.relation, &parameters);
+        let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
         let parameters = Arc::new(crate::parameters::BoundParameters::new(parameters, types, &context.memory)?);
         drop(temporary);
-        let runtime_schema = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, parameters.types(), &context.memory)?;
+        let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, parameters.types(), &context.memory)?;
         let analysis = if matches!(&self.output, QueryOutput::Analyze(_)) { Some(crate::analysis::AnalysisNode::new(&self.relation, &context)?) } else { None };
         let execution = Execution { context: Arc::clone(&context), parameters, outer: crate::context::OuterRows::empty(&context.memory)?, bindings: None, analysis: analysis.clone() };
         let cancellation = context.cancellation.clone();
@@ -139,11 +155,11 @@ impl PreparedQuery {
             return Ok(cursor);
         }
         let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
-        Ok(QueryCursor { schema: self.relation.schema().clone(), runtime_schema: runtime_schema.output(), input: Some(input), context, sample, trace, query_span, plan_reservation: self._plan_reservation.clone() })
+        Ok(QueryCursor { schema, runtime_schema: runtime_schema.output(), input: Some(input), context, sample, trace, query_span, plan_reservation: self._plan_reservation.clone() })
     }
 }
 
-pub struct QueryCursor { schema: Schema, runtime_schema: Arc<crate::runtime_schema::RuntimeSchema>, input: Option<BoxCursor>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
+pub struct QueryCursor { schema: Arc<RuntimeSchema>, runtime_schema: Arc<RuntimeSchema>, input: Option<BoxCursor>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
 impl QueryCursor {
     /// The caller reserves before allocating rows; the reservation must cover their complete retained capacities.
     /// The returned cursor owns the rows and a child cancellation scope; its parent context stays usable after cancellation.
@@ -156,11 +172,11 @@ impl QueryCursor {
             bytes.checked_add(row_bytes(row, row.capacity())?).ok_or_else(|| invalid("row-size", "Owned row size overflow"))
         })?;
         if retained > reservation.bytes() { return Err(invalid("row-reservation", "Owned rows exceed their memory reservation")); }
-        let runtime_schema = crate::runtime_schema::RuntimeSchema::fixed(&schema, &context.memory)?;
+        let runtime_schema = RuntimeSchema::fixed(&schema, &context.memory)?;
         let sample = sample.or_else(|| Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query)));
-        Ok(Self { schema, runtime_schema, input: Some(Box::new(OwnedRows { rows: rows.into_iter(), reservation })), context: context.execution_child(), sample, trace: None, query_span: None, plan_reservation: None })
+        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(Box::new(OwnedRows { rows: rows.into_iter(), reservation })), context: context.execution_child(), sample, trace: None, query_span: None, plan_reservation: None })
     }
-    pub fn schema(&self) -> &Schema { &self.schema }
+    pub fn schema(&self) -> &Schema { self.schema.schema() }
     /// Batch fields derived from this execution's pinned catalog, before any rows are read.
     /// The advertised result fields remain available through `schema`.
     pub fn runtime_schema(&self) -> &Schema { self.runtime_schema.schema() }
@@ -192,7 +208,7 @@ impl QueryCursor {
         let mut rows = Vec::with_capacity(self.context.options.batch_rows);
         while rows.len() < self.context.options.batch_rows {
             let Some(row) = input.next().await? else { break; };
-            if row.values.len() != self.schema.len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
+            if row.values.len() != self.schema.schema().len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
             rows.push(row);
         }
         if rows.is_empty() { return Ok(None); }
