@@ -54,8 +54,11 @@ Native addresses, region IDs and allocation counters do not supply Java identity
 ** String comparisons use unsigned UTF16 units; UUID comparisons use signed 64-bit halves.
 Primitive integer and UUID lookup operations have no externally supplied callbacks.
 ** Java math/random operations remain supplied through the refresh observation provider.
-** The network adapter must resolve source bootstrap endpoints, supply the qualified Java shuffle authority, select brokers and own throttles, fatal errors and waiter notification.
-It must carry the captured request scope into `apply` after connection throttling and use `PreparedSend` for actual enqueue retries.
+** The network adapter must resolve source bootstrap endpoints, supply the qualified Java shuffle authority and select brokers.
+The ordered receive operation consumes the oldest accepted body before field validation, applies the versioned throttle to the remaining flights and connection deadline, then applies metadata through the monitor with the captured request scope.
+Updater completion follows successful application.
+Native completion errors leave their logical flights available to the disconnect stage.
+The sender must drive these stages and use `PreparedSend` for actual enqueue retries.
 ** Construction, broker/thread growth, automatic native metadata caches, ApiVersions sort storage, TLS/SASL, ordinary outbound owners and compression overlap need their own finite admitted domain.
 Receive-frame and ordered-request accounting do not bound those owners.
 ** The production module is awaiting its coordinated registration and DLQ adapter.

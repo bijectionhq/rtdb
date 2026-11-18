@@ -10,7 +10,7 @@ use rdkafka::{
 
 use super::*;
 
-fn open_native(endpoint: &str, account: Arc<NativeByteAccount>) -> BaseProducer {
+pub(super) fn open_native(endpoint: &str, account: Arc<NativeByteAccount>) -> BaseProducer {
     ClientConfig::new()
         .set("bootstrap.servers", endpoint)
         .set("enable.sparse.connections", "false")
@@ -20,7 +20,7 @@ fn open_native(endpoint: &str, account: Arc<NativeByteAccount>) -> BaseProducer 
         .create().unwrap()
 }
 
-fn ready_observation<'a>(native: &'a BaseProducer, host: &str, port: u16) -> NativeConnectionObservation<'a> {
+pub(super) fn ready_observation<'a>(native: &'a BaseProducer, host: &str, port: u16) -> NativeConnectionObservation<'a> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let observation = native.client().observe_native_endpoint(host, port).unwrap();

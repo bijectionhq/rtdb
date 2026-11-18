@@ -28,6 +28,7 @@ struct Network {
     connectable: bool,
     unsupported_version: bool,
     reject_fatal: bool,
+    accepted_request: Option<MetadataRequest>,
 }
 
 impl ConnectionObservations<Node> for Network {
@@ -89,6 +90,7 @@ impl MetadataNetwork for Network {
         if self.unsupported_version {
             Ok(SendMetadata::UnsupportedVersion(Anomaly::unsupported("fixture/metadata-version", "No usable Metadata version")))
         } else {
+            self.accepted_request = Some(request);
             Ok(SendMetadata::Accepted)
         }
     }
@@ -169,6 +171,66 @@ fn tick(
     shuffle: &mut Shuffle, network: &mut Network,
 ) -> i64 {
     updater.maybe_update(producer, now_ms, math, &mut NoIdentityWitness, shuffle, network).unwrap()
+}
+
+#[test]
+fn observed_response_retires_the_request_and_publishes_the_matching_scope_once() {
+    use std::time::{Duration, Instant};
+    use crate::refresh::{ConnectionBackoffs, ConnectionSettings};
+    use rdkafka::{mocking::MockCluster, native_byte_account::NativeByteAccount, producer::Producer};
+    use super::observed_exchange::{open_native, ready_observation};
+
+    let cluster = MockCluster::new(1).unwrap();
+    cluster.create_topic("original", 2, 1).unwrap();
+    let endpoint = cluster.bootstrap_servers();
+    let (host, port) = endpoint.rsplit_once(':').unwrap();
+    let account = NativeByteAccount::new(4 << 20, ()).unwrap();
+    let native = open_native(&endpoint, account.clone());
+    assert_eq!(native.client().fetch_metadata(None, Duration::from_secs(5)).unwrap().brokers().len(), 1);
+
+    let mut math = Math::default();
+    let mut shuffle = Shuffle::default();
+    let mut producer = producer_with_cluster(&mut math, &mut shuffle, true);
+    producer.add_topic("original", 90, &mut NoIdentityWitness).unwrap();
+    let mut updater = updater();
+    let mut network = Network { ready_node: Some(-1), capacity: true, ..Network::default() };
+    assert_eq!(tick(&mut updater, &mut producer, 100, &mut math, &mut shuffle, &mut network), 300);
+    let request = network.accepted_request.take().unwrap();
+    assert_eq!(updater.in_progress(), Some(request.scope()));
+    let monitor = MetadataMonitor::new(producer).unwrap();
+    let queue_budget = MemoryBudget::new(1 << 16);
+    let mut flights = InFlightQueue::new(1, queue_budget.clone()).unwrap();
+    let connection_backoffs = ConnectionBackoffs::new(ConnectionSettings {
+        reconnect_ms: 10, reconnect_max_ms: 10, setup_ms: 20, setup_max_ms: 20,
+    }, &mut math);
+    let mut connection = connection_backoffs.connecting::<()>(99, &mut math);
+    connection.ready(&connection_backoffs, &mut math);
+
+    let observation = ready_observation(&native, host, port.parse().unwrap());
+    let exchange = request.submit_observed(observation, 65536, Duration::from_secs(5)).unwrap();
+    flights.add(PendingRequest::new(exchange, 100, 300, true)).unwrap();
+    assert!(flights.complete_send().unwrap().is_none());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut poll = |flights: &mut InFlightQueue<MetadataExchange>| {
+        flights.poll_metadata(&mut connection, &monitor, &mut updater, 102, &mut NoIdentityWitness, &mut shuffle)
+    };
+    loop {
+        if let Some(result) = poll(&mut flights).unwrap() {
+            assert!(matches!(result, ResponseAction::Published));
+            break;
+        }
+        assert_eq!(flights.count(), 1);
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(flights.count(), 0);
+    assert!(monitor.snapshot().unwrap().partition("original", 1).is_some());
+    assert!(poll(&mut flights).unwrap().is_none());
+    assert!(updater.in_progress().is_none());
+    drop(flights);
+    assert_eq!(queue_budget.used_bytes(), 0);
+    drop(native);
+    assert_eq!(account.used(), 0);
 }
 
 #[test]

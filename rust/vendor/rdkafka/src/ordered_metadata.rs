@@ -145,17 +145,19 @@ impl OrderedMetadataRequest {
     /// Unconsumed suffix bytes are retained; see MetadataView::trailing_bytes.
     /// Native failures precede wire validation and preserve their integer codes.
     pub fn poll(&self) -> Option<Result<MetadataView<'_>, OrderedMetadataError>> {
-        self.response().map(|result| result.and_then(|(version, bytes)| MetadataView::parse(version, bytes).map_err(OrderedMetadataError::Protocol)))
+        self.poll_body().map(|result| result.and_then(|(version, bytes)| MetadataView::parse(version, bytes).map_err(OrderedMetadataError::Protocol)))
     }
 
     /// Polls without waiting or output allocation, preserving malformed UTF8 as raw string bytes.
     /// Native failures precede structural validation; no caller visitor runs before the complete field prefix and tags validate.
     /// The borrowed view and its strings cannot outlive this request; replacement decoding remains caller-owned.
     pub fn poll_raw(&self) -> Option<Result<RawMetadataView<'_>, OrderedMetadataError>> {
-        self.response().map(|result| result.and_then(|(version, bytes)| RawMetadataView::parse(version, bytes).map_err(OrderedMetadataError::Protocol)))
+        self.poll_body().map(|result| result.and_then(|(version, bytes)| RawMetadataView::parse(version, bytes).map_err(OrderedMetadataError::Protocol)))
     }
 
-    fn response(&self) -> Option<Result<(i16, &[u8]), OrderedMetadataError>> {
+    /// Polls for the negotiated version and exact native body before Rust field validation.
+    /// Once published, the terminal result remains available until this owner drops.
+    pub fn poll_body(&self) -> Option<Result<(i16, &[u8]), OrderedMetadataError>> {
         let mut error = sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR;
         let mut version = 0;
         let mut body = std::ptr::null();

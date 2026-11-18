@@ -96,6 +96,11 @@ impl<T> InFlightQueue<T> {
         self.storage.as_ref()?.requests.back()
     }
 
+    /// Borrows the oldest request for receive readiness before transferring its slot.
+    pub fn oldest(&self) -> Option<&PendingRequest<T>> {
+        self.storage.as_ref()?.requests.front()
+    }
+
     /// Records the Selector's completed send for the newest request.
     /// A send expecting no response completes immediately and transfers its original owner.
     /// An empty queue returns an error, corresponding to Kafka's invalid completion.

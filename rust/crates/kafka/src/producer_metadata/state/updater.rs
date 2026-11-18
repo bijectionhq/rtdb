@@ -84,6 +84,8 @@ impl MetadataUpdater {
     /// A synchronous unsupported-version send can publish a scope without accepting a wire request.
     pub fn in_progress(&self) -> Option<RequestScope> { self.in_progress }
 
+    pub(super) fn rebootstrap_enabled(&self) -> bool { self.settings.rebootstrap_enabled }
+
     /// Checks whether an attempt exceeded the signed millisecond threshold, strictly.
     /// Elapsed time uses Java long wrapping arithmetic.
     pub fn needs_rebootstrap(&self, now_ms: i64, trigger_ms: i64) -> bool {

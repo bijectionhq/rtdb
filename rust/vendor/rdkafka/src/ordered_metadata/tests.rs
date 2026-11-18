@@ -63,6 +63,7 @@ fn all_versions_preserve_order_errors_uuid_arrays_and_epoch_reliability() {
         assert_eq!(view.has_reliable_leader_epochs(), version >= 9);
         assert_eq!((view.summary().brokers, view.summary().topics, view.summary().partitions), (2,2,4));
         assert_eq!(view.summary().error, if version >= 13 {29002} else {0});
+        assert_eq!(view.summary().throttle_ms, if version >= 3 { 37 } else { 0 });
         let mut brokers = Vec::new(); let mut topics = Vec::new(); let mut partitions = Vec::new();
         view.visit(|event| match event {
             Event::Broker(broker) => { brokers.push(broker.id); assert_eq!(broker.host,"host"); assert_eq!(broker.rack,None); }

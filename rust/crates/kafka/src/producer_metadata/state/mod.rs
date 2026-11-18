@@ -25,7 +25,7 @@ pub use response::{Node, Partition};
 pub use snapshot::Snapshot;
 pub use bootstrap::{BootstrapAddresses, ResolvedEndpoint, JavaShuffleObservations, MissingShuffleObservations, ShuffleAdmission};
 pub use random::{JavaRandom, JavaRandomSeeds, JavaShuffleRandom};
-pub use exchange::{MetadataExchange, MetadataTarget, SubmissionFailure};
+pub use exchange::{MetadataExchange, MetadataTarget, ReceiveFailure, SubmissionFailure};
 pub use updater::{MetadataNetwork, MetadataUpdater, SendMetadata, UpdateFailure, UpdateSettings};
 pub use wait::{MetadataWait, WaitFailure, WaitStep};
 pub use fatal::{FatalKind, MetadataError, MetadataTopicError, MetadataWaitObservation};

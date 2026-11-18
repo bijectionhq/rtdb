@@ -32,6 +32,8 @@ pub struct Summary {
     pub string_bytes: usize,
     /// Top-level Kafka error code; zero before Metadata v13.
     pub error: i16,
+    /// Signed broker throttle time in milliseconds; zero before Metadata v3.
+    pub throttle_ms: i32,
 }
 
 /// Borrowed broker fields in response order; IDs and ports retain signed wire values.
@@ -319,7 +321,8 @@ fn walk<'a, const VALIDATE_UTF8: bool>(version: i16, bytes: &'a [u8], visitor: &
     if !(0..=13).contains(&version) { return Err(ProtocolError::UnsupportedVersion); }
     let mut c = Cursor::<VALIDATE_UTF8> { bytes, at: 0, flexible: version >= 9, strings: 0 };
     let mut summary = Summary::default();
-    visitor(RawEvent::Throttle(if version >= 3 { c.i32()? } else { 0 }))?;
+    summary.throttle_ms = if version >= 3 { c.i32()? } else { 0 };
+    visitor(RawEvent::Throttle(summary.throttle_ms))?;
     summary.brokers = c.array()?;
     for _ in 0..summary.brokers {
         let id = c.i32()?;
