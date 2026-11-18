@@ -46,6 +46,9 @@ Parse/Bind/Describe/Execute/Close/Flush/Sync retain named prepared statements an
 Extended Parse validates the grammar of every SQL `PREPARE` body before sending ParseComplete.
 Extended Parse charges any increase in the temporary syntax estimate between the complete Parse SQL input and the DBeaver namespace replacement.
 The original input classification and any supplemental syntax charge stay reserved through ordinary SQL preparation.
+Prepared statements admit their projected parameter OID capacity before expanding it.
+A Bind admits its typed argument slots, reservation handles and retained portal name before creating the argument vectors.
+The portal carries the charge through argument and cursor release.
 During extended Parse, the node's memory budget covers the temporary tokens used to identify a control statement.
 A directly prepared control retains its estimated parsing and binding allowance while a statement registration or bound portal holds it.
 A bound portal retains the body selected at Bind when a later Parse replaces the statement name.

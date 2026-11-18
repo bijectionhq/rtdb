@@ -77,6 +77,7 @@ external entity SqlParser {
     -- Each parsed statement resolves its operands when the connection reaches it.
     -- Native Extended Parse lexes the full input before classifying the statement.
     -- If classification cannot reserve memory, existing prepared statements remain registered.
+    -- Bind reserves argument slots before publishing a portal.
     -- Extended Parse validates the grammar of every nested PREPARE body before installing the prepared statement.
     -- Executing a PREPARE prepares its immediate child in the current session context.
     -- Native pgwire reports locations in structured errors from a reached SQL PREPARE child as byte positions in the normalized Simple Query message that supplied it.

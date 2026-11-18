@@ -48,7 +48,15 @@ impl Prepared {
 struct RegisteredStatement { prepared: Arc<Prepared>, _reservation: Arc<MemoryReservation> }
 struct QueryPortal { cursor: QueryCursor, batch: Option<OwnedBatch>, row: usize, sent: u64 }
 enum PortalState { Query(QueryPortal), Ready }
-struct Portal { prepared: Arc<Prepared>, arguments: Vec<Value>, _charges: Vec<Arc<MemoryReservation>>, columns: Option<Vec<Column>>, state: PortalState, cancellation: CancellationToken }
+struct Portal {
+    prepared: Arc<Prepared>,
+    arguments: Vec<Value>,
+    columns: Option<Vec<Column>>,
+    state: PortalState,
+    cancellation: CancellationToken,
+    _charges: Vec<Arc<MemoryReservation>>,
+    _bind_storage: Option<Arc<MemoryReservation>>,
+}
 
 pub(crate) struct ProtocolSession {
     session: NativeSession,
@@ -101,20 +109,29 @@ impl ProtocolSession {
             b'Q' => { let sql = input.string()?; input.end()?; self.simple(sql, writer).await?; }
             b'P' => {
                 self.extended = true;
-                let name = input.string()?.to_owned(); let sql = input.string()?;
+                let name = input.string()?; let sql = input.string()?;
                 let count = usize::from(input.short()?); let oids = (0..count).map(|_| input.integer()).collect::<Result<Vec<_>>>()?; input.end()?;
                 let prepared = self.prepare_client(sql, oids).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
                 Self::planning_warnings(&prepared, writer).await?;
-                self.register_statement(name.into(), prepared)?; writer.empty(b'1').await?;
+                self.register_statement(Cow::Borrowed(name), prepared)?; writer.empty(b'1').await?;
             }
             b'B' => {
                 self.extended = true;
-                let name = input.string()?.to_owned(); let statement = input.string()?;
+                let name = input.string()?; let statement = input.string()?;
                 let prepared = Arc::clone(&self.statements.get(statement).ok_or_else(|| protocol("no prepared statement"))?.prepared);
                 let count = usize::from(input.short()?); let formats = (0..count).map(|_| Format::from_code(input.short()? as i16)).collect::<Result<Vec<_>>>()?;
                 let count = usize::from(input.short()?);
                 if matches!(prepared.ordinary_kind(), Some(PreparedKind::Dml(_))) && count != prepared.oids.len() { self.record_transaction_error(); return Err(Anomaly::incorrect("xtdb.pgwire/missing-arg-types", "Missing types for args - client must specify types for all non-null params in DML statements")); }
-                let mut arguments = Vec::with_capacity(count); let mut charges = Vec::with_capacity(count + 1);
+                let charge_slots = count + 2;
+                let bytes = count.checked_mul(std::mem::size_of::<Value>())
+                    .and_then(|bytes| bytes.checked_add(charge_slots.checked_mul(std::mem::size_of::<Arc<MemoryReservation>>())?))
+                    .and_then(|bytes| bytes.checked_add(name.len()))
+                    .and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| protocol("Portal argument slots are too large"))?;
+                let storage = self.node.memory().reserve(bytes)?;
+                let mut arguments = Vec::new();
+                arguments.try_reserve_exact(count).map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
+                let mut charges = Vec::new();
+                charges.try_reserve_exact(charge_slots).map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
                 for index in 0..count {
                     let length = input.integer()?; if length == -1 { arguments.push(Value::Null); continue; }
                     let bytes = input.take(usize::try_from(length).map_err(|_| protocol("Negative argument length"))?)?;
@@ -129,9 +146,11 @@ impl ProtocolSession {
                     || matches!(prepared.control(), Some(ControlStatement::Execute { .. }));
                 if requires_exact_arity && count != prepared.oids.len() { return Err(protocol("Argument count differs from prepared statement")); }
                 let count = usize::from(input.short()?); let result_formats = (0..count).map(|_| Format::from_code(input.short()? as i16)).collect::<Result<Vec<_>>>()?; input.end()?;
-                if name.is_empty() { self.portals.remove(&name); } else if self.portals.contains_key(&name) { return Err(protocol("Named portals must be explicit closed before they can be redefined")); }
+                if name.is_empty() { self.portals.remove(name); } else if self.portals.contains_key(name) { return Err(protocol("Named portals must be explicit closed before they can be redefined")); }
                 charges.push(Arc::clone(&frame.charge));
-                let portal = self.bind(prepared, arguments, charges, &result_formats).await?; self.portals.insert(name, portal); writer.empty(b'2').await?;
+                let mut portal = self.bind(prepared, arguments, charges, &result_formats).await?;
+                portal._bind_storage = Some(storage);
+                self.portals.insert(name.to_owned(), portal); writer.empty(b'2').await?;
             }
             b'D' => {
                 let kind = input.byte()?; let name = input.string()?; input.end()?;
@@ -203,9 +222,12 @@ impl ProtocolSession {
 
     fn retain_prepared(&self, source: &str, mut oids: Vec<i32>, shape: PreparedShape) -> Result<Arc<Prepared>> {
         let PreparedShape { kind, columns, parameter_count } = shape;
-        oids.resize(parameter_count, 0);
+        let oid_capacity = oids.capacity().max(parameter_count);
         let column_bytes = columns.as_deref().unwrap_or_default().iter().try_fold(0usize, |bytes, column| bytes.checked_add(column.name.capacity()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Column descriptors are too large")))?;
-        let reservation = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(parameter_count.checked_mul(256)?)).and_then(|n| n.checked_add(oids.capacity().checked_mul(std::mem::size_of::<i32>())?)).and_then(|n| n.checked_add(column_bytes)).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Prepared statement is too large"))?)?;
+        let reservation = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(parameter_count.checked_mul(256)?)).and_then(|n| n.checked_add(oid_capacity.checked_mul(std::mem::size_of::<i32>())?)).and_then(|n| n.checked_add(column_bytes)).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Prepared statement is too large"))?)?;
+        oids.try_reserve_exact(parameter_count.saturating_sub(oids.len()))
+            .map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
+        oids.resize(parameter_count, 0);
         Ok(Arc::new(Prepared { body: PreparedBody::Ordinary { source: source.into(), kind }, oids, columns, _reservation: reservation }))
     }
 
@@ -234,7 +256,7 @@ impl ProtocolSession {
         let bound = prepared.columns.as_deref().unwrap_or_default().iter().try_fold(8192usize, |bytes, column| bytes.checked_add(column.name.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Portal descriptors are too large")))?;
         charges.push(self.node.memory().reserve(bound)?);
         let columns = prepared.columns.as_ref().map(|columns| columns.iter().enumerate().map(|(index, column)| Ok(Column { name: column.name.clone(), ty: column.ty, format: item_format(formats, columns.len(), index)? })).collect::<Result<Vec<_>>>()).transpose()?;
-        let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, _charges: charges, columns, state: PortalState::Ready, cancellation: token.clone() };
+        let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, _bind_storage: None };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
             (Some(PreparedKind::Query(query)), _) => { let checked = !self.session.state().is_read_write(); let context = self.session.query_context_with(&token, checked).await?; Some(query.open_query(context, std::mem::take(&mut portal.arguments)).await?) },
@@ -770,6 +792,44 @@ mod tests {
         let startup = Startup { parameters: BTreeMap::new(), reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
+    }
+
+    #[tokio::test]
+    async fn bind_argument_slots_are_admitted_before_publishing_a_portal() {
+        let (mut frontend, driver) = test_frontend().await;
+        let memory = Arc::clone(frontend.node.memory());
+        let prepared = frontend.prepare_client("SET TIME ZONE 'UTC'", Vec::new()).await.unwrap();
+        frontend.register_statement(Cow::Borrowed("zone"), prepared).unwrap();
+
+        let count = 1024u16;
+        let mut body = Vec::new();
+        crate::wire::cstring(&mut body, "candidate").unwrap();
+        crate::wire::cstring(&mut body, "zone").unwrap();
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&count.to_be_bytes());
+        for _ in 0..count { body.extend_from_slice(&(-1i32).to_be_bytes()); }
+        body.extend_from_slice(&0u16.to_be_bytes());
+        let charge = memory.reserve(body.len() * 16 + 8192).unwrap();
+        let frame = Frame { tag: b'B', body, charge };
+        let before = memory.used_bytes();
+        let blocked = memory.reserve(memory.limit_bytes() - before - 1).unwrap();
+        let mut writer = Writer::new(tokio::io::sink(), Arc::clone(&memory));
+        let error = frontend.message(&frame, &mut writer).await.unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert!(!frontend.portals.contains_key("candidate"));
+        assert!(frontend.statements.contains_key("zone"));
+        assert_eq!(memory.used_bytes(), before + blocked.bytes());
+        drop(blocked);
+
+        frontend.message(&frame, &mut writer).await.unwrap();
+        let portal = frontend.portals.get("candidate").unwrap();
+        assert_eq!(portal.arguments.len(), usize::from(count));
+        assert!(portal.arguments.iter().all(|argument| matches!(argument, Value::Null)));
+        assert!(memory.used_bytes() >= before + usize::from(count) * std::mem::size_of::<Value>());
+        frontend.portals.clear();
+        assert_eq!(memory.used_bytes(), before);
+        drop((frame, writer, frontend));
+        driver.close_without_run().await.unwrap();
     }
 
     #[tokio::test]
