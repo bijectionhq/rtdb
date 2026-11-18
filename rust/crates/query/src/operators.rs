@@ -165,7 +165,7 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
         RelationNode::ColumnTable { expr, .. } => {
-            let pages = Box::new(crate::column_table::ColumnTableCursor::open(&execution, expr.clone()).await?);
+            let pages = crate::column_table::open(&execution, expr.clone()).await?;
             let pages = crate::pages::retain_page_state(pages, state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
         }

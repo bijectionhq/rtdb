@@ -101,6 +101,19 @@ pub(crate) trait PageCursor: Send {
 }
 pub(crate) type BoxPageCursor = Box<dyn PageCursor>;
 
+pub(crate) fn single_page(page: Option<OwnedPage>, context: Arc<QueryContext>) -> BoxPageCursor {
+    Box::new(SinglePage { page, context })
+}
+
+struct SinglePage { page: Option<OwnedPage>, context: Arc<QueryContext> }
+#[async_trait]
+impl PageCursor for SinglePage {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        self.context.check_cancelled()?;
+        Ok(self.page.take())
+    }
+}
+
 pub(crate) fn from_rows(input: BoxCursor, context: Arc<QueryContext>) -> BoxPageCursor {
     Box::new(RowPageCursor { input, context, exhausted: false })
 }
