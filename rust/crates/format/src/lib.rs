@@ -13,7 +13,9 @@ pub mod keys;
 pub mod memory_trie;
 pub mod metadata;
 mod statistics;
+pub mod temporal_text;
 pub mod transit;
+mod transit_cell;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/xtdb.rs"));

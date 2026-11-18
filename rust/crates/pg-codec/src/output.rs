@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_format::temporal_text::{TimestampText, date_text, interval_text, nanos};
 use rtdb_format::transit::TransitValue;
+use rtdb_types::format_iso_duration as duration_text;
 use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
 use crate::{EncodedValue, binary::{PG_EPOCH_DAYS, PG_EPOCH_MICROS}, invalid, size_error};
 
@@ -65,7 +67,10 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
                 let nanos = nanos(*value, *unit);
                 let micros = if ty == PgType::Timestamp { nanos / 1000 } else { nanos.div_euclid(1000) };
                 i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS).to_be_bytes().to_vec()
-            } else { timestamp_text(*value, *unit, timezone.as_deref().filter(|_| ty == PgType::TimestampTz), environment.parameter("datestyle") == Some("iso8601"), true)?.into_bytes() }
+            } else {
+                let format = if environment.parameter("datestyle") == Some("iso8601") { TimestampText::Iso } else { TimestampText::Pg };
+                timestamp_text(*value, *unit, timezone.as_deref().filter(|_| ty == PgType::TimestampTz), format)?.into_bytes()
+            }
         }
         PgType::Date => {
             let days = match value {
@@ -79,13 +84,13 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         PgType::Time => { let Value::Time { value, unit, .. } = value else { return Err(incompatible(ty, value)); }; let value = nanos(*value, *unit); if binary { i64::try_from(value / 1000).map_err(invalid)?.to_be_bytes().to_vec() } else { time_text(value, true)?.into_bytes() } }
         PgType::Interval => { let (months, days, nanos) = interval_parts(value)?; interval_text(months, days, nanos / 1000 * 1000).into_bytes() }
         PgType::Duration => { if binary { return Err(unsupported(ty, "binary writer")); } let Value::Duration { value, unit } = value else { return Err(incompatible(ty, value)); }; duration_text(nanos(*value, *unit)).into_bytes() }
-        PgType::TsTzRange => { let Value::TimestampTzRange { lower, upper } = value else { return Err(incompatible(ty, value)); }; let bound = |value: i64, absent: i64| if value == absent { Ok(String::new()) } else { timestamp_text(value, TimeUnit::Microsecond, Some("UTC"), false, false) }; format!("[{},{})", bound(*lower, i64::MIN)?, bound(*upper, i64::MAX)?).into_bytes() }
+        PgType::TsTzRange => { let Value::TimestampTzRange { lower, upper } = value else { return Err(incompatible(ty, value)); }; let bound = |value: i64, absent: i64| if value == absent { Ok(String::new()) } else { timestamp_text(value, TimeUnit::Microsecond, Some("UTC"), TimestampText::Pg) }; format!("[{},{})", bound(*lower, i64::MIN)?, bound(*upper, i64::MAX)?).into_bytes() }
         PgType::Bytes => { let bytes = match value { Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => bytes, _ => return Err(incompatible(ty, value)) }; if binary { bytes.clone() } else { let mut output = String::from("\\x"); for byte in bytes { use std::fmt::Write; write!(&mut output, "{byte:02x}").map_err(invalid)?; } output.into_bytes() } }
         PgType::Uuid => { let Value::Uuid(bytes) = value else { return Err(incompatible(ty, value)); }; if binary { bytes.to_vec() } else { uuid::Uuid::from_bytes(*bytes).to_string().into_bytes() } }
         PgType::Oid | PgType::RegClass | PgType::RegProc => { let number = match value { Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) | Value::I32(value) => *value as u32, _ => return Err(incompatible(ty, value)) }; number.to_string().into_bytes() }
         PgType::Int4s | PgType::Int8s | PgType::Texts => array_write(ty, format, value, environment)?,
         PgType::Json | PgType::JsonLd => { let mut output = String::new(); json(value, ty == PgType::JsonLd, &mut output, 0)?; output.into_bytes() }
-        PgType::Transit => rtdb_format::transit::encode_json(&build_transit(value, 0)?)?,
+        PgType::Transit => rtdb_format::transit::encode_json(&to_transit(value)?)?,
         PgType::Jsonb => return Err(unsupported(ty, "writer")),
         PgType::Default => return Err(unsupported(ty, "writer")),
     };
@@ -114,38 +119,9 @@ fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironme
     }
 }
 
-pub(crate) fn nanos(value: i64, unit: TimeUnit) -> i128 { i128::from(value) * match unit { TimeUnit::Second => 1_000_000_000, TimeUnit::Millisecond => 1_000_000, TimeUnit::Microsecond => 1000, TimeUnit::Nanosecond => 1 } }
-fn date_text(days: i64) -> Result<String> { Ok(rtdb_types::CivilDate::from_epoch_day(days)?.to_string()) }
-fn fraction(nanos: u32, grouped: bool) -> String {
-    if nanos == 0 { return String::new(); }
-    let width = if grouped { if nanos % 1_000_000 == 0 { 3 } else if nanos % 1000 == 0 { 6 } else { 9 } } else { 9 };
-    let mut value = format!("{nanos:09}"); value.truncate(width); if !grouped { while value.ends_with('0') { value.pop(); } } format!(".{value}")
+fn interval_parts(value: &Value) -> Result<(i32, i32, i64)> {
+    rtdb_format::temporal_text::interval_parts(value).ok_or_else(|| incompatible(PgType::Interval, value))
 }
-fn time_text(value: i128, force_seconds: bool) -> Result<String> {
-    if !(0..86_400_000_000_000).contains(&value) { return Err(invalid("Time is outside a day")); }
-    let seconds = value / 1_000_000_000; let nanos = (value % 1_000_000_000) as u32;
-    let mut text = format!("{:02}:{:02}", seconds / 3600, seconds / 60 % 60);
-    if force_seconds || seconds % 60 != 0 || nanos != 0 { text.push_str(&format!(":{:02}{}", seconds % 60, fraction(nanos, !force_seconds))); } Ok(text)
-}
-fn timestamp_text(value: i64, unit: TimeUnit, timezone: Option<&str>, iso: bool, include_zone: bool) -> Result<String> {
-    let total = nanos(value, unit); let seconds = i64::try_from(total.div_euclid(1_000_000_000)).map_err(invalid)?; let sub = total.rem_euclid(1_000_000_000) as u32;
-    let offset = timezone.map(rtdb_types::ZoneId::parse).transpose()?.map_or(Ok(rtdb_types::FixedOffset::UTC), |zone| zone.offset_at(seconds))?;
-    let local = rtdb_types::CivilDateTime::from_epoch_second(seconds.checked_add(i64::from(offset.seconds())).ok_or_else(|| invalid("Timestamp offset overflow"))?, sub)?;
-    let second = local.second_of_day();
-    let mut output = if iso { format!("{}T{}", local.date(), time_text(i128::from(local.nano_of_day()), false)?) }
-    else { format!("{} {:02}:{:02}:{:02}{}", local.date(), second / 3600, second / 60 % 60, second % 60, fraction(local.nano() / 1000 * 1000, false)) };
-    if let Some(zone) = timezone { if !iso && offset.seconds() == 0 { output.push_str("+00:00"); } else { output.push_str(&offset.to_string()); } if iso && include_zone && !matches!(zone, "Z") && !zone.starts_with(['+', '-']) { output.push('['); output.push_str(zone); output.push(']'); } }
-    Ok(output)
-}
-fn duration_text(nanos: i128) -> String {
-    if nanos == 0 { return "PT0S".into(); }
-    let seconds = nanos / 1_000_000_000; let remainder = nanos % 1_000_000_000;
-    let hours = seconds / 3600; let minutes = seconds / 60 % 60; let sec = seconds % 60;
-    let mut output = String::from("PT"); if hours != 0 { output.push_str(&format!("{hours}H")); } if minutes != 0 { output.push_str(&format!("{minutes}M")); }
-    if sec != 0 || remainder != 0 || (hours == 0 && minutes == 0) { if sec == 0 && remainder < 0 { output.push('-'); } output.push_str(&sec.to_string()); output.push_str(&fraction(remainder.unsigned_abs() as u32, false)); output.push('S'); } output
-}
-fn interval_parts(value: &Value) -> Result<(i32, i32, i64)> { match value { Value::IntervalYearMonth(months) => Ok((*months, 0, 0)), Value::IntervalDayTime { days, milliseconds } => Ok((0, *days, i64::from(*milliseconds) * 1_000_000)), Value::IntervalMonthDayNano { months, days, nanoseconds } | Value::IntervalMonthDayMicro { months, days, nanoseconds } => Ok((*months, *days, *nanoseconds)), _ => Err(incompatible(PgType::Interval, value)) } }
-fn interval_text(months: i32, days: i32, nanos: i64) -> String { let mut text = String::from("P"); if months / 12 != 0 { text.push_str(&format!("{}Y", months / 12)); } if months % 12 != 0 { text.push_str(&format!("{}M", months % 12)); } if days != 0 { text.push_str(&format!("{days}D")); } if nanos != 0 { text.push_str(&duration_text(i128::from(nanos))[1..]); } text }
 fn decimal_text(value: &rtdb_types::DecimalValue) -> String { rtdb_expr::decimal_text(value) }
 fn float_text(value: f64, single: Option<f32>) -> String {
     single.map_or_else(|| rtdb_types::java_f64_text(value), rtdb_types::java_f32_text)
@@ -178,7 +154,7 @@ fn scalar_text(value: &Value) -> Result<(&'static str, String)> {
         Value::Keyword(value) => ("xt:keyword", value.as_str().into()), Value::Uuid(value) => ("xt:uuid", uuid::Uuid::from_bytes(*value).to_string()),
         Value::DateDay(days) => ("xt:date", date_text(i64::from(*days))?), Value::DateMilli(value) => ("xt:date", date_text(value / 86_400_000)?),
         Value::Time { value, unit, .. } => ("xt:time", time_text(nanos(*value, *unit), false)?),
-        Value::Timestamp { value, unit, timezone } => (if timezone.is_some() { "xt:timestamptz" } else { "xt:timestamp" }, timestamp_text(*value, *unit, timezone.as_deref(), true, true)?),
+        Value::Timestamp { value, unit, timezone } => (if timezone.is_some() { "xt:timestamptz" } else { "xt:timestamp" }, timestamp_text(*value, *unit, timezone.as_deref(), TimestampText::Iso)?),
         Value::Duration { value, unit } => ("xt:duration", duration_text(nanos(*value, *unit))),
         value @ (Value::IntervalYearMonth(_) | Value::IntervalDayTime { .. } | Value::IntervalMonthDayMicro { .. } | Value::IntervalMonthDayNano { .. }) => { let (months, days, nanos) = interval_parts(value)?; ("xt:interval", interval_text(months, days, nanos)) },
         _ => return Err(Anomaly::incorrect("xtdb/json-encode-error", "Value has no pinned JSON representation")),
@@ -189,26 +165,24 @@ fn display_key(value: &Value) -> Result<String> { match value { Value::Utf8(valu
 /// Converts an admitted cell to Transit using the caller's allocation reservation.
 pub fn to_transit(value: &Value) -> Result<TransitValue> {
     if value.has_calendar_object() { return Err(invalid("PostgreSQL output requires admitted calendar values")); }
-    build_transit(value, 0)
+    rtdb_format::transit::value_to_transit(value).map_err(translate_output_error)
 }
 
-fn build_transit(value: &Value, depth: usize) -> Result<TransitValue> {
-    use TransitValue as T;
-    if depth > 128 { return Err(size_error()); }
-    Ok(match value {
-        Value::Undefined | Value::Null => T::Null, Value::Bool(value) => T::Bool(*value), Value::I8(value) => T::Integer(i64::from(*value)), Value::I16(value) => T::Integer(i64::from(*value)), Value::I32(value) => T::Integer(i64::from(*value)), Value::I64(value) => T::Integer(*value),
-        Value::F32(value) => T::Float(f64::from(*value)), Value::F64(value) => T::Float(*value), Value::Utf8(value) => T::String(value.clone()), Value::Keyword(value) => T::Keyword(value.as_str().into()),
-        Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => T::Bytes(bytes.clone()), Value::Transit(bytes) => rtdb_format::transit::decode_msgpack(bytes)?,
-        Value::Decimal(value) => tag("f", T::String(decimal_text(value))), Value::Uuid(bytes) => tag("u", T::String(uuid::Uuid::from_bytes(*bytes).to_string())), Value::Uri(value) => tag("r", T::String(value.clone())),
-        Value::List(values) | Value::FixedSizeList(values) => T::Array(values.iter().map(|value| build_transit(value, depth + 1)).collect::<Result<_>>()?),
-        Value::Set(values) => tag("set", T::Array(values.iter().map(|value| build_transit(value, depth + 1)).collect::<Result<_>>()?)),
-        Value::Struct(values) => T::Map(values.iter().map(|(key, value)| Ok((T::String(key.clone()), build_transit(value, depth + 1)?))).collect::<Result<_>>()?),
-        Value::Map { entries, .. } => T::Map(entries.iter().map(|(key, value)| Ok((build_transit(key, depth + 1)?, build_transit(value, depth + 1)?))).collect::<Result<_>>()?),
-        Value::TimestampTzRange { lower, upper } => { let bound = |value, absent| if value == absent { Ok(T::Null) } else { Ok(tag("time/zoned-date-time", T::String(timestamp_text(value, TimeUnit::Microsecond, Some("UTC"), true, true)?))) }; tag("xtdb/tstz-range", T::Array(vec![bound(*lower, i64::MIN)?, bound(*upper, i64::MAX)?])) },
-        value => { let (kind, text) = scalar_text(value)?; let kind = match kind { "xt:date" => "time/date", "xt:time" => "time/time", "xt:timestamp" => "time/date-time", "xt:timestamptz" => "time/zoned-date-time", "xt:duration" => "time/duration", "xt:interval" => "xtdb/interval", _ => return Err(unsupported(PgType::Transit, "value encoder")) }; tag(kind, T::String(text)) },
-    })
+fn time_text(value: i128, force_seconds: bool) -> Result<String> {
+    rtdb_format::temporal_text::time_text(value, force_seconds).map_err(translate_output_error)
 }
-fn tag(tag: &str, representation: TransitValue) -> TransitValue { TransitValue::Tagged { tag: tag.into(), representation: Box::new(representation) } }
+
+fn timestamp_text(value: i64, unit: TimeUnit, timezone: Option<&str>, format: TimestampText) -> Result<String> {
+    rtdb_format::temporal_text::timestamp_text(value, unit, timezone, format).map_err(translate_output_error)
+}
+
+fn translate_output_error(error: Anomaly) -> Anomaly {
+    match error.code.as_str() {
+        "rtdb.format/temporal-text" => invalid(error.message.as_deref().unwrap_or(&error.code)),
+        "rtdb.format/transit-value-depth" => size_error(),
+        _ => error,
+    }
+}
 
 pub fn encode_error(error: &Anomaly, format: PgType) -> Result<Vec<u8>> {
     use rtdb_format::{diagnostics, transit};

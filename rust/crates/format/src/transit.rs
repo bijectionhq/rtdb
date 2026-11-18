@@ -9,6 +9,8 @@ const CACHE_LIMIT: usize = 44 * 44;
 pub use rtdb_types::transit_value::{TransitValue, from_json_value, json_value_allocation_bound, to_json_value};
 use rtdb_types::transit_value::MAX_DEPTH;
 
+pub use crate::transit_cell::{document_to_transit, value_to_transit};
+
 /// Constructs decoded values before they enter the Transit cache; cache hits clone `Value`.
 /// Array and map states remain caller-owned until completion; item insertion runs in wire order and may fail.
 /// Sizes are allocation hints for raw containers, whose tags or JSON map markers can select another constructor.

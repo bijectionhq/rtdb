@@ -3935,7 +3935,9 @@ dependencies = [
  "arrow-schema",
  "base64 0.22.1",
  "chrono",
+ "half",
  "lz4_flex",
+ "num-bigint",
  "prost",
  "prost-build",
  "prost-types",
@@ -3948,6 +3950,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "uuid",
  "zstd",
 ]
 
