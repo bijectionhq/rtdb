@@ -204,6 +204,7 @@ impl BuildTable {
         Ok(Self { rows,index,unmatched,_reservation: reservation })
     }
     pub fn candidates(&self,hash: u32) -> Candidates<'_> { self.index.candidates(hash) }
+    #[cfg(test)]
     pub fn add_match(&mut self,row: usize) -> Result<()> {
         if let Some(unmatched) = &mut self.unmatched { *unmatched.get_mut(row).ok_or_else(||invalid("join-row","Matched build row is absent"))? = 0; }
         Ok(())

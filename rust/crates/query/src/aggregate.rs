@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rtdb_expr::{cast, compare_in_timezone, is_true, number, sql_eq_in_timezone};
-use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileFraction, PercentileKind, Schema, SortExpr};
+use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileFraction, PercentileKind, Schema};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 
 use crate::context::Execution;

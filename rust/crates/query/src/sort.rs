@@ -4,7 +4,7 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_expr::{ordered_compare_in_timezone, validate_order_type};
 use rtdb_plan::{Schema, SortExpr};
 use rtdb_types::{LogicalType, Result, Value};
-use crate::{context::Execution, cursor::{BoxCursor, OwnedRow, RowCursor}, invalid, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, spill::{SpillFile, SpillReader}};
+use crate::{context::Execution, cursor::{OwnedRow, RowCursor}, invalid, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, spill::{SpillFile, SpillReader}};
 
 mod records;
 mod timsort;
@@ -41,9 +41,6 @@ impl SortOutput {
     }
 }
 impl SortCursor {
-    pub fn new(input: BoxCursor, schema: Schema, order: Vec<SortExpr>, execution: Execution) -> Self {
-        Self::from_pages(crate::pages::from_rows(input, Arc::clone(&execution.context)), schema, order, execution)
-    }
     pub fn from_pages(input: BoxPageCursor, schema: Schema, order: Vec<SortExpr>, execution: Execution) -> Self {
         Self::with_row_limit(input, schema, order, i64::MAX as u64, execution)
     }

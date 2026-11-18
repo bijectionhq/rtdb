@@ -265,10 +265,6 @@ impl Execution {
         };
         crate::list::ListCursor::open(Box::pin(stream), context).await
     }
-    pub async fn evaluate_list(&self, scope: &rtdb_expr::EvaluationScope, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, row: &[Value]) -> Result<rtdb_expr::EvaluatedList> {
-        let invocation = self.prepare_expression(expression,schema,scope)?;
-        self.evaluate_list_invocation(scope,&invocation,row).await
-    }
     pub async fn evaluate_list_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &[Value]) -> Result<rtdb_expr::EvaluatedList> {
         self.context.check_cancelled()?;
         let _decimal_validation = self.context.memory.reserve(4096)?;

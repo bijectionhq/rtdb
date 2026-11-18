@@ -1,7 +1,7 @@
 use super::*;
 use std::{collections::{BTreeMap,VecDeque},sync::atomic::{AtomicUsize,Ordering}};
 use rtdb_columnar::MemoryBudget;
-use rtdb_plan::{BinaryOp,ColumnId,Expr,Field,Relation,RelationNode};
+use rtdb_plan::{BinaryOp,ColumnId,Expr,Field,Relation,RelationNode,SortExpr};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
 use rtdb_types::{Anomaly,TimeUnit,Timestamp};
 use tokio_util::sync::CancellationToken;

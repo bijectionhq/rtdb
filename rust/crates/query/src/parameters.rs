@@ -12,6 +12,7 @@ pub(crate) struct BoundParameters {
 }
 
 impl BoundParameters {
+    #[cfg(test)]
     pub fn infer(values: Vec<Value>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let values = OwnedRow::new(values, memory)?;
         let bound = values.values.iter().try_fold(4096usize, |bytes, value| {

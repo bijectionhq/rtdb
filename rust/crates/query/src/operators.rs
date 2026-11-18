@@ -25,10 +25,6 @@ pub(crate) struct DeferredInput {
     constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
 }
 impl DeferredInput {
-    pub async fn open(self, own: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<BoxCursor> {
-        let context = Arc::clone(&self.execution.context);
-        Ok(crate::pages::rows(self.open_pages(own).await?,context))
-    }
     pub async fn open_pages(self, own: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<BoxPageCursor> {
         let pushdowns = crate::pushdown::Pushdowns::merge(self.pushdowns.as_ref(), own, &self.execution.context.memory)?;
         build_pages_constrained(self.runtime, self.execution, self.constraints, pushdowns).await

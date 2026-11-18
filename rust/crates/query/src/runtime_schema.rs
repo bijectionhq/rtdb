@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_plan::{ApplyKind, BinaryOp, ColumnId, Expr, Field, JoinKind, Relation, RelationNode, Schema, UnaryOp};
+use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, JoinKind, Relation, RelationNode, Schema, UnaryOp};
 use rtdb_types::{LogicalType as L, Result, ScalarType};
 
 use crate::{CatalogSnapshot, invalid};
@@ -472,6 +472,7 @@ fn expression_type(expr: &Expr, input: &Schema, emitter: &Emitter<'_>) -> Result
 #[cfg(test)]
 mod parameter_tests {
     use super::*;
+    use rtdb_plan::ApplyKind;
     use rtdb_types::Value;
 
     fn field(id: u32, ty: L) -> Field { Field { id: ColumnId(id), name: format!("c{id}"), qualifier: None, qualified_only: false, unnamed: false, data_type: ty } }
