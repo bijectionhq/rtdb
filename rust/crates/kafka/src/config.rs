@@ -117,8 +117,33 @@ pub fn producer_properties(properties: &BTreeMap<String, String>, pipelined: boo
     result
 }
 
+/// Java client properties librdkafka has no equivalent for.
+/// kafka-clients would apply them; the native client ignores them, and [`native_client_properties`] reports each one it drops.
+const IGNORED_JAVA_PROPERTIES: &[&str] = &[
+    "auto.include.jmx.reporter", "default.api.timeout.ms", "exclude.internal.topics", "max.block.ms", "max.poll.records",
+    "metadata.max.idle.ms", "metadata.recovery.rebootstrap.trigger.ms", "metric.reporters", "metrics.num.samples",
+    "metrics.recording.level", "metrics.sample.window.ms", "partitioner.adaptive.partitioning.enable",
+    "partitioner.availability.timeout.ms", "partitioner.class", "partitioner.ignore.keys", "rebalance.timeout.ms",
+    "sasl.kerberos.ticket.renew.jitter", "sasl.kerberos.ticket.renew.window.factor", "sasl.login.connect.timeout.ms",
+    "sasl.login.read.timeout.ms", "sasl.login.refresh.buffer.seconds", "sasl.login.refresh.min.period.seconds",
+    "sasl.login.refresh.window.factor", "sasl.login.refresh.window.jitter", "sasl.login.retry.backoff.max.ms",
+    "sasl.login.retry.backoff.ms", "sasl.oauthbearer.clock.skew.seconds", "sasl.oauthbearer.expected.audience",
+    "sasl.oauthbearer.expected.issuer", "sasl.oauthbearer.header.urlencode", "sasl.oauthbearer.jwks.endpoint.refresh.ms",
+    "sasl.oauthbearer.jwks.endpoint.retry.backoff.max.ms", "sasl.oauthbearer.jwks.endpoint.retry.backoff.ms",
+    "sasl.oauthbearer.jwks.endpoint.url", "sasl.oauthbearer.scope.claim.name", "sasl.oauthbearer.sub.claim.name",
+    "security.providers", "socket.connection.setup.timeout.max.ms",
+];
+const SERIALIZER_PROPERTIES: &[&str] = &["key.serializer", "value.serializer", "key.deserializer", "value.deserializer"];
+const UNSUPPORTED_JAVA_PROPERTIES: &[&str] = &["interceptor.classes", "sasl.client.callback.handler.class", "sasl.login.callback.handler.class", "sasl.login.class"];
+
 pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    native_client_properties(properties).map(|(properties, _)| properties)
+}
+
+/// Translates Java client properties to their librdkafka equivalents, returning the Java-only names it dropped.
+pub(crate) fn native_client_properties(properties: &BTreeMap<String, String>) -> Result<(BTreeMap<String, String>, Vec<String>)> {
     let mut properties = properties.clone();
+    let ignored = java_client_properties(&mut properties)?;
     if let Some(wait) = properties.remove("fetch.max.wait.ms") {
         let wait = signed_integer(&wait).and_then(|wait| i32::try_from(wait).ok()).filter(|wait| *wait >= 0)
             .ok_or_else(|| Anomaly::incorrect("xtdb.kafka/invalid-config", "fetch.max.wait.ms must be a nonnegative signed integer"))?;
@@ -149,8 +174,67 @@ pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeM
             _ => return Err(Anomaly::unsupported("xtdb.kafka/jaas-login-module", "Kafka login module requires a native credential adapter")),
         }
     }
-    Ok(properties)
+    Ok((properties, ignored))
 }
+
+fn java_client_properties(properties: &mut BTreeMap<String, String>) -> Result<Vec<String>> {
+    for name in UNSUPPORTED_JAVA_PROPERTIES {
+        if properties.remove(*name).is_some_and(|value| !trim_java(&value).is_empty()) {
+            return Err(Anomaly::unsupported("xtdb.kafka/unsupported-config", format!("Kafka property {name} requires a native adapter")));
+        }
+    }
+    for name in SERIALIZER_PROPERTIES { properties.remove(*name); }
+    let mut ignored: Vec<String> = IGNORED_JAVA_PROPERTIES.iter().filter(|name| properties.remove(**name).is_some()).map(|name| (*name).into()).collect();
+    for (java, native) in [("send.buffer.bytes", "socket.send.buffer.bytes"), ("receive.buffer.bytes", "socket.receive.buffer.bytes")] {
+        if let Some(value) = properties.remove(java) {
+            let size = signed_integer(&value).and_then(|size| i32::try_from(size).ok()).filter(|size| *size >= -1)
+                .ok_or_else(|| invalid_config(format!("{java} must be -1 or a nonnegative integer")))?;
+            translate(properties, java, native, size.max(0).to_string())?;
+        }
+    }
+    if let Some(value) = properties.remove("buffer.memory") {
+        let kilobytes = signed_integer(&value).and_then(|bytes| u64::try_from(bytes).ok()).map(|bytes| bytes.div_ceil(1024).max(1))
+            .filter(|kilobytes| *kilobytes <= i32::MAX as u64).ok_or_else(|| invalid_config("buffer.memory must be a nonnegative integer within the native queue limit"))?;
+        translate(properties, "buffer.memory", "queue.buffering.max.kbytes", kilobytes.to_string())?;
+    }
+    if let Some(value) = properties.remove("max.request.size") {
+        translate(properties, "max.request.size", "message.max.bytes", trim_java(&value).into())?;
+    }
+    let codec = properties.get("compression.type").map(|codec| trim_java(codec).to_ascii_lowercase());
+    for java_codec in ["gzip", "lz4", "zstd"] {
+        let name = format!("compression.{java_codec}.level");
+        if let Some(level) = properties.remove(&name) {
+            if codec.as_deref() == Some(java_codec) { translate(properties, &name, "compression.level", trim_java(&level).into())?; }
+        }
+    }
+    if let Some(reset) = properties.get_mut("auto.offset.reset") {
+        if trim_java(reset) == "none" { *reset = "error".into(); }
+    }
+    if let Some(strategy) = properties.remove("partition.assignment.strategy") {
+        let native = strategy.split(',').map(trim_java).filter(|assignor| !assignor.is_empty()).map(|assignor| match assignor {
+            "org.apache.kafka.clients.consumer.RangeAssignor" => Some("range"),
+            "org.apache.kafka.clients.consumer.RoundRobinAssignor" => Some("roundrobin"),
+            "org.apache.kafka.clients.consumer.CooperativeStickyAssignor" => Some("cooperative-sticky"),
+            native if !native.contains('.') => Some(native),
+            _ => None,
+        }).collect::<Option<Vec<_>>>();
+        match native {
+            Some(native) if !native.is_empty() => { properties.insert("partition.assignment.strategy".into(), native.join(",")); }
+            _ => ignored.push("partition.assignment.strategy".into()),
+        }
+    }
+    Ok(ignored)
+}
+
+fn translate(properties: &mut BTreeMap<String, String>, java: &str, native: &str, value: String) -> Result<()> {
+    if properties.get(native).is_some_and(|configured| trim_java(configured) != value) {
+        return Err(Anomaly::incorrect("xtdb.kafka/conflicting-config", format!("Java {java} and native {native} disagree")));
+    }
+    properties.insert(native.into(), value);
+    Ok(())
+}
+
+fn invalid_config(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-config", message.into()) }
 
 pub(crate) fn parse_jaas(jaas: &str) -> Result<(String, BTreeMap<String, String>)> {
     let mut tokens = jaas_tokens(jaas).into_iter();

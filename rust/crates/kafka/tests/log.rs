@@ -274,6 +274,28 @@ async fn partitioned_topics_and_oversized_records_are_rejected_before_receipt() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn java_client_properties_open_a_writable_log() {
+    let cluster = MockCluster::new(1).unwrap();
+    cluster.create_topic("java-props", 1, 1).unwrap();
+    let mut configuration = KafkaClusterConfig::new(cluster.bootstrap_servers());
+    configuration.properties_map = [
+        ("max.request.size", "2097152"), ("buffer.memory", "33554432"), ("max.block.ms", "60000"), ("send.buffer.bytes", "-1"),
+        ("default.api.timeout.ms", "60000"), ("max.poll.records", "500"), ("request.timeout.ms", "30000"), ("retries", "2147483647"),
+        ("linger.ms", "5"), ("key.serializer", "org.apache.kafka.common.serialization.ByteArraySerializer"),
+        ("value.deserializer", "org.apache.kafka.common.serialization.ByteArrayDeserializer"),
+    ].into_iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
+    let mut options = KafkaLogOptions::new("java-props");
+    options.auto_create_topic = false;
+    let opened = KafkaLog::open(&configuration, options, Arc::new(Warnings::default()), MemoryBudget::new(64 << 20)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let driver = tokio::spawn(opened.driver.unwrap().run(cancellation.clone()));
+    let receipt = opened.log.enqueue(Bytes::from_static(b"java"), Timestamp(0)).await.unwrap().durable().await.unwrap();
+    assert_eq!(opened.log.read_range(receipt.offset, LogOffset(receipt.offset.0 + 1)).await.unwrap()[0].payload, Bytes::from_static(b"java"));
+    cancellation.cancel();
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_only_log_reads_batches_written_with_every_java_producer_codec() {
     let cluster = MockCluster::new(1).unwrap();
     let endpoint = cluster.bootstrap_servers();

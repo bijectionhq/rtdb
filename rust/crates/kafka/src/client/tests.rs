@@ -30,6 +30,60 @@ fn java_fetch_wait_is_translated_before_native_consumer_configuration() {
     assert_eq!(prepare(&properties, &memory).unwrap_err().code, "xtdb.kafka/invalid-config");
 }
 
+fn options(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()
+}
+
+#[test]
+fn java_client_properties_take_their_native_equivalents() {
+    let memory = MemoryBudget::new(1 << 20);
+    let configuration = prepare(&options(&[
+        ("send.buffer.bytes", "-1"), ("receive.buffer.bytes", "65536"), ("buffer.memory", "33554433"), ("max.request.size", " 2097152 "),
+        ("compression.type", "zstd"), ("compression.zstd.level", "7"), ("compression.gzip.level", "3"), ("auto.offset.reset", "none"),
+        ("partition.assignment.strategy", "org.apache.kafka.clients.consumer.RangeAssignor, org.apache.kafka.clients.consumer.CooperativeStickyAssignor"),
+        ("acks", "all"), ("linger.ms", "20"), ("retries", "3"), ("request.timeout.ms", "40000"), ("delivery.timeout.ms", "120000"),
+    ]), &memory).unwrap();
+    for (name, value) in [
+        ("socket.send.buffer.bytes", "0"), ("socket.receive.buffer.bytes", "65536"), ("queue.buffering.max.kbytes", "32769"),
+        ("message.max.bytes", "2097152"), ("compression.level", "7"), ("auto.offset.reset", "error"),
+        ("partition.assignment.strategy", "range,cooperative-sticky"), ("acks", "all"), ("linger.ms", "20"),
+    ] {
+        assert_eq!(configuration.get(name), Some(value), "{name}");
+    }
+    for name in ["send.buffer.bytes", "receive.buffer.bytes", "buffer.memory", "max.request.size", "compression.zstd.level", "compression.gzip.level"] {
+        assert_eq!(configuration.get(name), None, "{name}");
+    }
+    configuration.create_native_config().unwrap();
+}
+
+#[test]
+fn java_only_client_properties_are_dropped_and_reported() {
+    let memory = MemoryBudget::new(1 << 20);
+    let java = options(&[
+        ("bootstrap.servers", "localhost:9092"), ("key.serializer", "org.apache.kafka.common.serialization.ByteArraySerializer"),
+        ("value.deserializer", "org.apache.kafka.common.serialization.ByteArrayDeserializer"), ("max.block.ms", "60000"),
+        ("max.poll.records", "500"), ("default.api.timeout.ms", "60000"), ("metric.reporters", ""), ("interceptor.classes", " "),
+        ("partition.assignment.strategy", "org.apache.kafka.clients.consumer.StickyAssignor"),
+    ]);
+    let (native, ignored) = crate::config::native_client_properties(&java).unwrap();
+    assert_eq!(native, options(&[("bootstrap.servers", "localhost:9092")]));
+    assert_eq!(ignored, ["default.api.timeout.ms", "max.block.ms", "max.poll.records", "metric.reporters", "partition.assignment.strategy"]);
+    prepare(&java, &memory).unwrap().create_native_config().unwrap();
+}
+
+#[test]
+fn java_client_properties_without_native_meaning_or_agreement_are_rejected() {
+    for (entries, code) in [
+        (&[("interceptor.classes", "com.example.Interceptor")][..], "xtdb.kafka/unsupported-config"),
+        (&[("sasl.login.callback.handler.class", "com.example.Handler")][..], "xtdb.kafka/unsupported-config"),
+        (&[("buffer.memory", "1024"), ("queue.buffering.max.kbytes", "2")][..], "xtdb.kafka/conflicting-config"),
+        (&[("send.buffer.bytes", "-2")][..], "xtdb.kafka/invalid-config"),
+        (&[("buffer.memory", "-1")][..], "xtdb.kafka/invalid-config"),
+    ] {
+        assert_eq!(crate::config::native_client_properties(&options(entries)).unwrap_err().code, code, "{entries:?}");
+    }
+}
+
 #[test]
 fn java_tls_options_are_consumed_and_unknown_native_properties_are_preserved() {
     let memory = MemoryBudget::new(32 << 20);
