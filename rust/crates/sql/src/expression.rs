@@ -51,15 +51,13 @@ impl Context<'_> {
             }
             ast::Expr::Identifier(name) => {
                 let name = identifier(name);
-                if !name.quoted && ["current_timestamp", "current_date", "current_time", "current_timezone", "localtimestamp", "localtime", "localdate", "local_timestamp", "local_time", "local_date", "snapshot_token", "current_user", "current_schema", "current_catalog"].contains(&name.normalized().as_str()) {
-                    call(if name.normalized() == "current_catalog" { "current_database".into() } else { name.normalized() }, Vec::new())?
-                }
+                if let Some(function) = bare_scalar_name(&name, 1) { call(function, Vec::new())? }
                 else { self.resolve_column(&[name], input.schema())? }
             }
             ast::Expr::CompoundIdentifier(names) => {
                 let names: Vec<_> = names.iter().map(identifier).collect();
-                if names.len() == 2 && !names[1].quoted && ["current_user", "current_schema", "current_catalog"].contains(&names[1].normalized().as_str()) {
-                    call(if names[1].normalized() == "current_catalog" { "current_database".into() } else { names[1].normalized() }, Vec::new())?
+                if let Some(function) = names.last().and_then(|name| bare_scalar_name(name, names.len())) {
+                    call(function, Vec::new())?
                 } else { self.resolve_column(&names, input.schema())? }
             }
             ast::Expr::Value(value) => match &value.value {
@@ -414,6 +412,19 @@ fn aggregate_type(function: &AggregateFunction, argument: &LogicalType) -> Resul
         // Before factory emission this field preserves the possible input types for column binding.
         A::Min | A::Max => T::least_upper_bound(std::slice::from_ref(argument)).unwrap_or_else(|| argument.clone()).maybe(),
     })
+}
+
+pub(crate) fn bare_scalar_name(name: &rtdb_plan::Identifier, parts: usize) -> Option<String> {
+    if name.quoted { return None; }
+    let function = name.text.to_ascii_lowercase();
+    match function.as_str() {
+        "current_catalog" if parts <= 2 => Some("current_database".into()),
+        "current_user" | "current_schema" if parts <= 2 => Some(function),
+        "current_timestamp" | "current_date" | "current_time" | "current_timezone"
+        | "localtimestamp" | "localtime" | "localdate" | "local_timestamp" | "local_time"
+        | "local_date" | "snapshot_token" if parts == 1 => Some(function),
+        _ => None,
+    }
 }
 
 pub(crate) fn scalar_name(function: &ast::Function) -> Result<String> {

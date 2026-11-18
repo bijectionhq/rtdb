@@ -13,6 +13,67 @@ impl Catalog for EmptyCatalog {
 }
 
 #[test]
+fn select_column_labels_follow_expression_provenance_and_sublist_positions() {
+    for (source, labels) in [
+        (
+            "SELECT ARRAY_AGG(v), COUNT(*), SUM(v), SUM(v) FROM (VALUES (1),(2)) t(v)",
+            vec!["_column_1", "_column_2", "_column_3", "_column_4"],
+        ),
+        (
+            "SELECT ABS(v), ABS(v), ((v)), +v AS identity, (-v) FROM (VALUES (-2)) t(v)",
+            vec!["_column_1", "_column_2", "v", "identity", "_column_5"],
+        ),
+        ("SELECT +((v)) FROM (VALUES (1)) t(v)", vec!["v"]),
+        (
+            r#"SELECT (v).nested, ((v).nested)."Mixed Case", v FROM (VALUES ({nested: {"Mixed Case": 4}})) AS t(v)"#,
+            vec!["nested", "Mixed Case", "v"],
+        ),
+        (
+            "SELECT p.*, ABS(v), ABS(v) FROM (VALUES (1)) t(v), (VALUES (7,8)) p(x,y)",
+            vec!["x", "y", "_column_2", "_column_3"],
+        ),
+        (
+            "SELECT *, ABS(v), ABS(v) FROM (VALUES (1)) t(v)",
+            vec!["v", "_column_1", "_column_2"],
+        ),
+        ("SELECT q._column_1 FROM (SELECT ABS(1)) q", vec!["_column_1"]),
+        ("SELECT xt.VERSION()", vec!["version"]),
+        ("SELECT pg_catalog.VERSION()", vec!["version"]),
+        (
+            "SELECT version(), snapshot_token(), current_database(), current_user, current_schema, CURRENT_TIMESTAMP",
+            vec!["version", "_column_2", "_column_3", "_column_4", "_column_5", "_column_6"],
+        ),
+        ("SELECT SNAPSHOT_TOKEN", vec!["_column_1"]),
+        (
+            "SELECT COUNT(*), SNAPSHOT_TOKEN FROM (VALUES (1)) t(v) GROUP BY SNAPSHOT_TOKEN",
+            vec!["_column_1", "_column_2"],
+        ),
+        (
+            "SELECT COUNT(*), pg_catalog.CURRENT_USER FROM (VALUES (1)) t(v) GROUP BY pg_catalog.CURRENT_USER",
+            vec!["_column_1", "_column_2"],
+        ),
+    ] {
+        let prepared = prepare(source, &EmptyCatalog, &PrepareOptions::default()).unwrap();
+        let rtdb_plan::Statement::Query(relation) = prepared.statement else { panic!("Expected a query") };
+        let actual: Vec<_> = relation.schema().fields().iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(actual, labels, "{source}");
+    }
+}
+
+#[test]
+fn implicit_and_explicit_labels_share_duplicate_checks() {
+    for source in [
+        "SELECT (v), v FROM (VALUES (1)) t(v)",
+        "SELECT ARRAY_AGG(v), 12 AS _column_1 FROM (VALUES (1)) t(v)",
+        "SELECT VERSION(), pg_catalog.VERSION()",
+    ] {
+        let error = prepare(source, &EmptyCatalog, &PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error", "{source}: {error}");
+        assert!(error.message.as_deref().is_some_and(|message| message.starts_with("Duplicate column projection: ")), "{source}: {error}");
+    }
+}
+
+#[test]
 fn identifiers_retain_pinned_quoted_and_regular_spellings() {
     for source in ["SELECT 1 AS a1_$", "SELECT 1 AS _"] {
         assert!(prepare(source, &EmptyCatalog, &PrepareOptions::default()).is_ok(), "{source}");

@@ -52,6 +52,15 @@
 (deftest duration-literal-query
   (run-original-api-case #'original-expr/duration-literal-query))
 
+(deftest plan-agg-subqueries-before-group-by-3821
+  (run-original-api-case #'original-sql/plan-agg-subqueries-before-group-by-3821))
+
+(deftest test-select-without-from
+  (run-original-api-case #'original-sql/test-select-without-from))
+
+(deftest test-xt-version
+  (run-original-api-case #'original-sql/test-xt-version))
+
 (deftest unnest-actor-results
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]

@@ -461,12 +461,14 @@ impl Context<'_> {
         for (index, group) in groups.iter().enumerate() {
             let group = ordinal_projection(group, projection)?.unwrap_or(group);
             let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
-            let qualifier = match &expr {
-                Expr::Column { id, .. } => input.schema().get(*id).and_then(|field| field.qualifier.clone()),
+            let source = match &expr {
+                Expr::Column { id, .. } => input.schema().get(*id),
                 _ => None,
             };
-            let mut field = self.binder.field(expression_name(group, index), None, expr.data_type())?;
-            field.qualifier = qualifier;
+            let name = expression_label(group, &expr, input.schema(), index);
+            let mut field = self.binder.field(name, None, expr.data_type())?;
+            field.qualifier = source.and_then(|field| field.qualifier.clone());
+            field.unnamed = source.is_some_and(|field| field.unnamed);
             replacements.insert(ReplacementKey::Expression(group.to_string()), field.clone());
             named_groups.push(NamedExpr { field, expr });
         }
@@ -559,8 +561,10 @@ impl Context<'_> {
             match item {
                 ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
                     let expression = self.expr_bound(expr, input, replacements)?;
-                    let unnamed = matches!(&expression, Expr::Column { id, .. } if input.schema().get(*id).is_some_and(|field| field.unnamed));
-                    let name = if let ast::SelectItem::ExprWithAlias { alias, .. } = item { identifier(alias).normalized() } else if unnamed { format!("_column_{}", index + 1) } else { expression_name(expr, index) };
+                    let name = match item {
+                        ast::SelectItem::ExprWithAlias { alias, .. } => identifier(alias).normalized(),
+                        _ => expression_label(expr, &expression, input.schema(), index),
+                    };
                     let field = self.binder.field(name, None, expression.data_type())?;
                     projected.push(NamedExpr { field, expr: expression });
                 }
@@ -1003,8 +1007,42 @@ pub(crate) fn aggregate_relation(input: Arc<Relation>, groups: Vec<NamedExpr>, a
     Ok(Arc::new(Relation::new(schema, RelationNode::Aggregate { input, groups, aggregates })?))
 }
 
-fn expression_name(expr: &ast::Expr, index: usize) -> String {
-    match expr { ast::Expr::Identifier(name) => identifier(name).normalized(), ast::Expr::CompoundIdentifier(names) => names.last().map(|name| identifier(name).normalized()).unwrap_or_default(), ast::Expr::Function(function) if function.over.is_none() && !function.name.0.last().and_then(ast::ObjectNamePart::as_ident).is_some_and(|name| name.quote_style.is_none() && matches!(name.value.to_ascii_lowercase().as_str(), "generate_series" | "range")) => function.name.to_string().to_lowercase(), _ => format!("_column_{}", index + 1) }
+fn expression_label(mut syntax: &ast::Expr, expression: &Expr, schema: &Schema, index: usize) -> String {
+    while let ast::Expr::Nested(inner) | ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus, expr: inner } = syntax {
+        syntax = inner;
+    }
+    let column = match syntax {
+        ast::Expr::Identifier(name) => Some((name, 1)),
+        ast::Expr::CompoundIdentifier(names) => names.last().map(|name| (name, names.len())),
+        _ => None,
+    };
+    let name = if let Some((column, parts)) = column {
+        let column = identifier(column);
+        if crate::expression::bare_scalar_name(&column, parts).is_some() {
+            None
+        } else {
+            match expression {
+                Expr::Column { id, .. } => schema.get(*id).filter(|field| !field.unnamed).map(|field| field.name.clone()),
+                Expr::Parameter { .. } => Some(column.normalized()),
+                _ => None,
+            }
+        }
+    } else {
+        match syntax {
+            ast::Expr::CompoundFieldAccess { access_chain, .. } => match access_chain.last() {
+                Some(ast::AccessExpr::Dot(ast::Expr::Identifier(name))) => Some(identifier(name).normalized()),
+                _ => None,
+            },
+            ast::Expr::Function(function) if function.name.0.last()
+                .and_then(ast::ObjectNamePart::as_ident)
+                .is_some_and(|name| name.quote_style.is_none() && name.value.eq_ignore_ascii_case("version")) =>
+            {
+                Some("version".into())
+            }
+            _ => None,
+        }
+    };
+    name.unwrap_or_else(|| format!("_column_{}", index + 1))
 }
 
 fn ordinal(expr: &ast::Expr) -> Result<Option<usize>> {

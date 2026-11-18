@@ -33,7 +33,9 @@ async fn session_information_keywords_aliases_and_scalar_calls_share_reference_v
         [vec![text("xtdb"),text("xtdb"),text("public"),text("public"),text("xtdb"),text("public"),V::List(vec![text("pg_catalog"),text("public")]),V::List(vec![text("public")]),text("public"),text("160000")]]);
     assert_eq!(query("SELECT CURRENT_SCHEMAS(NULL),CURRENT_SETTING(NULL)").await.unwrap(), [vec![V::Null,V::Null]]);
     assert_eq!(query("SELECT CURRENT_SETTING('xtdb.version')").await.unwrap(), [vec![text(rtdb_types::runtime_version())]]);
-    assert_eq!(query("SELECT VERSION(),pg_catalog.VERSION()").await.unwrap(), [vec![text(&format!("PostgreSQL 16 (XTDB {})",rtdb_types::runtime_version()));2]]);
+    for source in ["SELECT VERSION()", "SELECT pg_catalog.VERSION()"] {
+        assert_eq!(query(source).await.unwrap(), [vec![text(&format!("PostgreSQL 16 (XTDB {})", rtdb_types::runtime_version()))]]);
+    }
     let expected = match rtdb_types::runtime_revision() {
         Some(revision) => format!("XTDB @ {} [{revision}]",rtdb_types::runtime_version()),
         None => format!("XTDB @ {}",rtdb_types::runtime_version()),

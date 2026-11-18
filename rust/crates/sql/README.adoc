@@ -215,6 +215,11 @@ The unqualified common name binds to the original left column, including RIGHT a
 An unmatched right row consequently has a null unqualified common value.
 Wildcard expansion retains both common columns; duplicate output names are rejected.
 Explicit output names suppress matching names from an unqualified wildcard, and those explicit outputs follow the expanded columns.
+A SELECT item uses its explicit alias when supplied.
+Column references and field access retain their names through parentheses and unary plus, and the VERSION function supplies the label `version`.
+Other expressions receive `_column_N`, where `N` is the one-based position in the select sublist.
+A qualified wildcard occupies one sublist position and expands its fields in place.
+An unqualified wildcard expands before the sublist and uses its own positions for unnamed fields.
 Column binding metadata belongs to the immutable plan field and remains attached when a scope is captured by a subquery.
 New table aliases establish a fresh name-binding scope.
 
