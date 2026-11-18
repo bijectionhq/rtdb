@@ -524,7 +524,8 @@ async fn simple_empty_groups_and_canned_keyword_result_keep_protocol_shapes() {
     let semicolon = client.query("; SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords(); ;").await;
     assert_eq!(semicolon, vec![(b'n', vec![]), (b'C', b" 0\0".to_vec()), (b'Z', b"I".to_vec())]);
     let canned = client.query("SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()").await;
-    assert_eq!(tags(&canned), b"TDCZ");
+    assert_eq!(tags(&canned), b"nDCZ");
+    assert!(canned[0].1.is_empty());
     assert_eq!(rows(&canned), vec![vec![Some(b"xtdb".to_vec())]]);
     assert_eq!(canned[2].1, b"SELECT 1\0");
     assert_eq!(canned[3].1, b"I");
@@ -594,5 +595,85 @@ async fn dbeaver_namespace_projection_is_rewritten_only_for_the_whole_simple_mes
     let message = frames[3].1.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(b"M"));
     assert_eq!(message, Some(b"Duplicate column projection: oid".as_slice()));
     assert_eq!(frames[4].1, b"I");
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn whole_simple_keyword_marker_ignores_its_suffix_and_preserves_explicit_status() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("SET application_name = 'before'").await), b"SCZ");
+    let prefix = "\u{1c}SeLECt StriNG_AGG(word, ',') FROM pg_catalog.pg_get_\u{212a}EYWORDS()";
+    for source in [
+        format!("{prefix}; SET application_name = 'changed'; SELECT @"),
+        format!("{prefix};\u{2028}"),
+    ] {
+        let marker = client.query(&source).await;
+        assert_eq!(tags(&marker), b"nDCZ");
+        assert!(marker[0].1.is_empty());
+        assert_eq!(rows(&marker), vec![vec![Some(b"xtdb".to_vec())]]);
+        assert_eq!(marker[2].1, b"SELECT 1\0");
+        assert_eq!(marker[3].1, b"I");
+    }
+    assert_eq!(rows(&client.query("SHOW application_name").await), vec![vec![Some(b"before".to_vec())]]);
+
+    let begun = client.query("BEGIN").await;
+    assert_eq!(tags(&begun), b"CZ");
+    assert_eq!(begun[1].1, b"T");
+    let failed = client.query("BEGIN").await;
+    assert_eq!(tags(&failed), b"EZ");
+    assert_eq!(failed[1].1, b"E");
+    let marker = client.query(prefix).await;
+    assert_eq!(tags(&marker), b"nDCZ");
+    assert!(marker[0].1.is_empty());
+    assert_eq!(rows(&marker), vec![vec![Some(b"xtdb".to_vec())]]);
+    assert_eq!(marker[2].1, b"SELECT 1\0");
+    assert_eq!(marker[3].1, b"E");
+    let rolled_back = client.query("ROLLBACK").await;
+    assert_eq!(tags(&rolled_back), b"CZ");
+    assert_eq!(rolled_back[1].1, b"I");
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn later_keyword_text_in_a_simple_batch_reaches_ordinary_table_binding() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let frames = client.query("SELECT 42 AS answer; SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()").await;
+    assert_eq!(tags(&frames), b"TDCEZ");
+    assert_eq!(rows(&frames), vec![vec![Some(b"42".to_vec())]]);
+    let fields = frames[3].1.split(|&byte| byte == 0).filter_map(|field| field.split_first()).collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(fields[&b'M'], b"Table function");
+    let detail: serde_json::Value = serde_json::from_slice(fields[&b'D']).unwrap();
+    assert_eq!(detail["code"], "xtdb/sql-unsupported");
+    assert_eq!(frames[4].1, b"I");
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn locale_dependent_simple_and_extended_keyword_responses_keep_their_descriptions() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let locale_dependent = client.query("SELECT STRING_AGG(word, ',') FROM pg_catalog.pg_get_keywords()").await;
+    assert_eq!(tags(&locale_dependent), b"TDCZ");
+    assert_eq!(rows(&locale_dependent), vec![vec![Some(b"xtdb".to_vec())]]);
+    assert_eq!(locale_dependent[2].1, b"SELECT 1\0");
+    assert_eq!(locale_dependent[3].1, b"I");
+
+    client.parse("keywords", "SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()", &[]).await;
+    let mut describe = vec![b'S'];
+    describe.extend_from_slice(&cstring("keywords"));
+    client.send(b'D', &describe).await;
+    client.bind("", "keywords").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    let extended = client.through(b'Z').await;
+    assert_eq!(tags(&extended), b"1T2DCZ");
+    let columns = &extended[1].1;
+    assert_eq!(&columns[..7], b"\0\x01col1\0");
+    assert_eq!(i32::from_be_bytes(columns[13..17].try_into().unwrap()), 1043);
+    assert_eq!(rows(&extended), vec![vec![Some(b"xtdb".to_vec())]]);
+    assert_eq!(extended[4].1, b"SELECT 1\0");
+    assert_eq!(extended[5].1, b"I");
     drop(client); running.stop().await;
 }

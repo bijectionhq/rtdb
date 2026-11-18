@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(ControlStatement), Keywords }
-enum DriverRewrite { CheckRange, WholeQueryChecked }
+#[derive(Clone, Copy)]
+enum PrepareInput { Standalone, SimpleRange, LocaleDependentSimpleRange }
 struct Prepared { source: String, kind: PreparedKind, oids: Vec<i32>, columns: Option<Vec<Column>>, _reservation: Arc<MemoryReservation> }
 struct RegisteredStatement { prepared: Arc<Prepared>, _reservation: Arc<MemoryReservation> }
 struct QueryPortal { cursor: QueryCursor, batch: Option<OwnedBatch>, row: usize, sent: u64 }
@@ -66,7 +67,7 @@ impl ProtocolSession {
                 self.extended = true;
                 let name = input.string()?.to_owned(); let sql = input.string()?;
                 let count = usize::from(input.short()?); let oids = (0..count).map(|_| input.integer()).collect::<Result<Vec<_>>>()?; input.end()?;
-                let prepared = self.prepare(sql, oids, DriverRewrite::CheckRange).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
+                let prepared = self.prepare(sql, oids, PrepareInput::Standalone).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
                 Self::planning_warnings(&prepared, writer).await?;
                 self.register_statement(name, prepared)?; writer.empty(b'1').await?;
             }
@@ -122,18 +123,19 @@ impl ProtocolSession {
         Ok(())
     }
 
-    async fn prepare(&mut self, source: &str, mut oids: Vec<i32>, rewrite: DriverRewrite) -> Result<Arc<Prepared>> {
+    async fn prepare(&mut self, source: &str, mut oids: Vec<i32>, input: PrepareInput) -> Result<Arc<Prepared>> {
         let _scratch = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("SQL is too large"))?)?;
         let spans = rtdb_sql::split_statements(source)?;
         if spans.len() > 1 { return Err(protocol("A prepared statement must contain exactly one statement")); }
         let source = spans.first().map_or("", |span| &source[span.start..span.end]);
-        let source = match rewrite {
-            DriverRewrite::CheckRange => replace_namespace_query(source, (source, "")),
-            DriverRewrite::WholeQueryChecked => source,
+        let source = match input {
+            PrepareInput::Standalone => replace_namespace_query(source, (source, "")),
+            PrepareInput::SimpleRange | PrepareInput::LocaleDependentSimpleRange => source,
         };
+        let legacy_keywords = matches!(input, PrepareInput::Standalone | PrepareInput::LocaleDependentSimpleRange);
         let options = self.options(); let token = self.token();
         let (kind, columns, count) = if source.is_empty() { (PreparedKind::Empty, None, 0) }
-        else if source.to_ascii_lowercase().starts_with("select string_agg(word, ',') from pg_catalog.pg_get_keywords()") { (PreparedKind::Keywords, Some(vec![Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }]), 0) }
+        else if legacy_keywords && source.to_ascii_lowercase().starts_with(KEYWORDS_PREFIX) { (PreparedKind::Keywords, Some(vec![Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }]), 0) }
         else if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.node.memory())? {
             let count = match &control { ControlStatement::Execute { .. } => control.parameter_count(), ControlStatement::Show { .. } => 0, _ => oids.len() }; let columns = control_schema(&control)?.map(|schema| schema.fields().iter().map(|field| Ok(Column { name: field.name.clone(), ty: PgType::from_logical(&field.data_type)?, format: Format::Text })).collect::<Result<_>>()).transpose()?;
             (PreparedKind::Control(control), columns, count)
@@ -227,7 +229,7 @@ impl ProtocolSession {
                         if matches!(statement, ControlStatement::SetRole) { return Ok(()); }
                         writer.string(b'C', &tag).await
                     }
-                    ControlResult::Prepare { name, source, allocation: _allocation } => { let prepared = self.prepare(&source, Vec::new(), DriverRewrite::CheckRange).await?; Self::planning_warnings(&prepared, writer).await?; self.register_statement(name, prepared)?; writer.string(b'C', "PREPARE").await },
+                    ControlResult::Prepare { name, source, allocation: _allocation } => { let prepared = self.prepare(&source, Vec::new(), PrepareInput::Standalone).await?; Self::planning_warnings(&prepared, writer).await?; self.register_statement(name, prepared)?; writer.string(b'C', "PREPARE").await },
                     ControlResult::CopyIn { table, format, allocation: _allocation } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
                     _ => Err(protocol("Unexpected control execution result")),
                 }
@@ -270,7 +272,10 @@ impl ProtocolSession {
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
         let normalized = normalized_simple_text(source);
-        if let Some(marker) = simple_query_marker(normalized) {
+        let keyword = keyword_prefix(normalized);
+        let marker = simple_query_marker(normalized)
+            .or((keyword == KeywordPrefix::MatchesEveryLocale).then_some(SimpleQueryMarker::Keywords));
+        if let Some(marker) = marker {
             self.begin_implicit(None)?;
             let result: Result<()> = async {
                 match marker {
@@ -278,6 +283,11 @@ impl ProtocolSession {
                     SimpleQueryMarker::Semicolon => {
                         writer.empty(b'n').await?;
                         writer.string(b'C', " 0").await
+                    }
+                    SimpleQueryMarker::Keywords => {
+                        writer.empty(b'n').await?;
+                        writer.send(b'D', KEYWORDS_DATA_ROW).await?;
+                        writer.string(b'C', "SELECT 1").await
                     }
                 }
             }.await;
@@ -288,11 +298,16 @@ impl ProtocolSession {
         let source = replace_namespace_query(source, normalized);
         let spans = rtdb_sql::split_statements_in(source, self.node.memory())?;
         if spans.is_empty() { writer.empty(b'I').await?; return Ok(()); }
+        let input = if keyword == KeywordPrefix::LocaleDependent {
+            PrepareInput::LocaleDependentSimpleRange
+        } else {
+            PrepareInput::SimpleRange
+        };
         for span in spans.as_slice() {
             let sql = &source[span.start..span.end]; let control = rtdb_sql::parse_control_in(sql, &self.options(), self.node.memory())?;
             if !matches!(control, Some(ControlStatement::Begin(_) | ControlStatement::Discard(_) | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })) { self.begin_implicit(None)?; }
             let result: Result<()> = async {
-                let prepared = self.prepare(sql, Vec::new(), DriverRewrite::WholeQueryChecked).await?;
+                let prepared = self.prepare(sql, Vec::new(), input).await?;
                 Self::planning_warnings(&prepared, writer).await?;
                 if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
                 let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
@@ -332,6 +347,36 @@ impl ProtocolSession {
 enum SimpleQueryMarker {
     Empty,
     Semicolon,
+    Keywords,
+}
+
+const KEYWORDS_PREFIX: &str = "select string_agg(word, ',') from pg_catalog.pg_get_keywords()";
+const KEYWORDS_DATA_ROW: &[u8] = b"\0\x01\0\0\0\x04xtdb";
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeywordPrefix {
+    MatchesEveryLocale,
+    LocaleDependent,
+    DoesNotMatch,
+}
+
+fn keyword_prefix((body, suffix): (&str, &str)) -> KeywordPrefix {
+    let mut characters = body.chars().chain(suffix.chars()).peekable();
+    let mut disposition = KeywordPrefix::MatchesEveryLocale;
+    for expected in KEYWORDS_PREFIX.chars() {
+        let Some(character) = characters.next() else { return KeywordPrefix::DoesNotMatch; };
+        match (expected, character) {
+            ('i', 'I') => {
+                let _ = characters.next_if_eq(&'\u{307}');
+                disposition = KeywordPrefix::LocaleDependent;
+            }
+            ('i', '\u{130}') => disposition = KeywordPrefix::LocaleDependent,
+            ('k', '\u{212a}') => (),
+            _ if character.eq_ignore_ascii_case(&expected) => (),
+            _ => return KeywordPrefix::DoesNotMatch,
+        }
+    }
+    disposition
 }
 
 fn simple_query_marker((body, suffix): (&str, &str)) -> Option<SimpleQueryMarker> {
@@ -453,6 +498,34 @@ mod tests {
         ] {
             let rewritten = replace_namespace_query(&source, normalized_simple_text(&source));
             assert!(std::ptr::eq(rewritten, source.as_str()));
+        }
+    }
+
+    #[test]
+    fn keyword_prefix_distinguishes_openjdk_locale_independent_and_dependent_spellings() {
+        for (spelling, expected) in [
+            ("StriNG", KeywordPrefix::MatchesEveryLocale),
+            ("STRING", KeywordPrefix::LocaleDependent),
+            ("STR\u{130}NG", KeywordPrefix::LocaleDependent),
+            ("STRI\u{307}NG", KeywordPrefix::LocaleDependent),
+            ("STRi\u{307}NG", KeywordPrefix::DoesNotMatch),
+            ("STR\u{130}\u{307}NG", KeywordPrefix::DoesNotMatch),
+            ("STRI\u{323}\u{307}NG", KeywordPrefix::DoesNotMatch),
+            ("STRI\u{307}\u{307}NG", KeywordPrefix::DoesNotMatch),
+            ("STR\u{131}NG", KeywordPrefix::DoesNotMatch),
+            ("STRINGER", KeywordPrefix::DoesNotMatch),
+        ] {
+            let source = format!("SELECT {spelling}_AGG(word, ',') FROM pg_catalog.pg_get_\u{212a}EYWORDS();\u{2028}");
+            assert_eq!(keyword_prefix(normalized_simple_text(&source)), expected, "{source:?}");
+        }
+        let lower = KEYWORDS_PREFIX;
+        assert_eq!(keyword_prefix(normalized_simple_text(&format!("\u{1c}{lower}unexpected @"))), KeywordPrefix::MatchesEveryLocale);
+        for source in [
+            format!("SELECT 42; {lower}"),
+            lower.replacen('s', "\u{17f}", 1),
+            lower.trim_end_matches(')').to_owned(),
+        ] {
+            assert_eq!(keyword_prefix(normalized_simple_text(&source)), KeywordPrefix::DoesNotMatch, "{source:?}");
         }
     }
 }

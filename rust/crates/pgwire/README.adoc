@@ -72,10 +72,14 @@ Inside an explicit transaction, all batches remain buffered until the user's com
 Keyword document keys use the source normalization, including `:xt/id` to `_id`; the literal string `xt/id` remains a different key.
 
 Frame, parameter, environment, prepared-registration, portal-descriptor, decoded-row, and encoded-value owners retain memory reservations.
-Simple Query recognizes empty, line-comment-only and leading-semicolon markers on the whole message before tokenization.
+Simple Query recognizes empty, line-comment-only, leading-semicolon and locale-independent keyword probe markers on the whole message before tokenization.
 The marker check left-trims Java whitespace and removes one semicolon at the end or before the final line terminator, allowing ASCII regex whitespace after the semicolon.
 A leading semicolon that survives that check returns NoData and a zero-row command tag.
 The empty marker returns EmptyQueryResponse.
+A normalized message selects the keyword marker when its prefix lowercases to `select string_agg(word, ',') from pg_catalog.pg_get_keywords()` under every Java default locale.
+It ignores the rest of the message and returns NoData, one text row containing `xtdb`, and the `SELECT 1` command tag.
+For locale-dependent prefixes, Simple Query tokenizes the message and recognizes keyword probes per statement using ASCII lowercasing.
+A probe prepared that way carries a RowDescription.
 On success the markers preserve an existing explicit transaction's status and settle an implicit transaction through the normal Simple Query path.
 The DBeaver namespace query rewrite matches the complete normalized Simple message before tokenization.
 The namespace query keeps its original projection when it appears in a multi-statement message.
