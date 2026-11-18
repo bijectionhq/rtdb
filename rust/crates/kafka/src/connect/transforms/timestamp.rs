@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap,VecDeque}, sync::Arc};
 use rtdb_types::{Result, TimeUnit, Value};
 use super::{ConnectData, ConnectSchema, SchemaKind, SinkRecord, Transform, error, fields_with_defaults, required, string_map};
 
-use super::super::{DateEnvironment, date_pattern::DatePattern};
+use super::super::{DateEnvironment, DatePattern};
 
 enum Target { String, Unix, Date, Time, Timestamp }
 enum Precision { Seconds, Millis, Micros, Nanos }

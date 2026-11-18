@@ -1,0 +1,8 @@
+= OpenJDK legacy Date
+
+`rtdb-java-date` implements the captured locale, legacy calendar and `SimpleDateFormat` paths used by Kafka Connect.
+`DateEnvironment` keeps the process FORMAT locale, default timezone and calendar timezone separately.
+Callers can supply explicit settings and observation times, or capture the process defaults on Linux and macOS in their joined I/O region.
+`DatePattern` uses those inputs and keeps its own parsing and display caches within the caller's memory budget.
+The build decodes the retained OpenJDK resource declarations into immutable locale tables.
+The archive, provider data and license provenance are in link:data/locale/README.adoc[the locale bundle record].

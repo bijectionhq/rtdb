@@ -4,7 +4,9 @@ use super::{date_calendar::{CalendarField,CalendarFields,CalendarSystem},date_en
 use CalendarField::*;
 
 enum Part { Literal(String),Field(char,usize) }
-pub(super) struct DatePattern {
+/// Compiled legacy date pattern with a retained locale profile and caller-owned memory budget.
+/// Calls that parse or format require exclusive access to its reusable timezone caches.
+pub struct DatePattern {
     parts: Vec<Part>,
     environment: Arc<DateEnvironment>,
     calendar: CalendarSystem,
@@ -15,13 +17,18 @@ pub(super) struct DatePattern {
     pivot_year: i32,
     standalone_month: bool,
     maximum_output: usize,
-    _charge: Arc<rtdb_columnar::MemoryReservation>,
+    _charge: Arc<rtdb_types::MemoryReservation>,
 }
 impl DatePattern {
+    /// Bounds a UTF-8 result before compiling pattern text against the supplied locale.
+    /// Returns an allocation overflow error if the bound cannot fit in `usize`.
     pub fn uncompiled_output_bound(text: &str,environment: &DateEnvironment) -> Result<usize> {
         environment.locale.maximum_text_bytes().checked_mul(8).and_then(|width|width.checked_add(64))
             .and_then(|width|text.len().checked_mul(width)).ok_or_else(||error("allocation-overflow","Date pattern output exceeds range"))
     }
+    /// Compiles SimpleDateFormat fields and literals against the captured date environment.
+    /// Selects UTC when `utc` is true and the captured calendar zone otherwise.
+    /// Invalid patterns, unavailable calendar rules and admission failures return an error.
     pub fn compile(text: &str,environment: Arc<DateEnvironment>,utc: bool) -> Result<Self> {
         if text.len() > 1 << 20 { return Err(error("invalid-plugin-config","Date pattern exceeds its byte bound")); }
         let bound = text.len().checked_mul(64).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(||error("allocation-overflow","Date pattern allocation exceeds range"))?;
@@ -54,11 +61,14 @@ impl DatePattern {
         let zone = if utc { LegacyTimeZone::parse("UTC") } else { environment.calendar_zone };
         Ok(Self { parts,environment,calendar,zone,zone_names: None,zone_display: None,pivot,pivot_year,standalone_month,maximum_output,_charge: charge })
     }
+    /// Returns the UTF-8 result bound to admit before formatting.
     pub fn maximum_output_bytes(&self) -> usize { self.maximum_output }
     fn ensure_zone_names(&mut self) -> Result<()> {
         if self.zone_names.is_none() { self.zone_names = Some(ZoneNames::new(&self.environment.locale,&||self.environment.observed_at(),self.environment.memory())?); }
         Ok(())
     }
+    /// Formats signed Date milliseconds, returning timezone and cache admission failures.
+    /// The caller admits the transient UTF-8 output using `maximum_output_bytes`.
     pub fn format(&mut self,millis: i64) -> Result<String> {
         let view = self.calendar.view(millis,self.zone)?;
         let mut output = String::with_capacity(self.maximum_output);
@@ -94,7 +104,10 @@ impl DatePattern {
         }
         Ok(output)
     }
+    /// Parses a nonempty prefix into signed Date milliseconds using the lenient calendar.
     pub fn read(&mut self,text: &str) -> Result<i64> { self.read_prefix(text).and_then(|(millis,consumed)|if consumed == 0 { Err(mismatch()) } else { Ok(millis) }) }
+    /// Parses a prefix and returns signed Date milliseconds and the consumed UTF-8 byte count.
+    /// Invalid input and temporary allocation failures return an error.
     pub fn read_prefix(&mut self,text: &str) -> Result<(i64,usize)> {
         let bound = text.len().checked_mul(4).and_then(|size|size.checked_add(4096)).ok_or_else(||error("allocation-overflow","Date parse scratch exceeds range"))?;
         let _scratch = self.environment.memory().reserve(bound)?;
@@ -222,7 +235,7 @@ fn mismatch() -> rtdb_types::Anomaly { error("transform-error","Timestamp does n
 mod tests {
     use super::*;
     use rtdb_types::CivilDate;
-    use rtdb_columnar::MemoryBudget;
+    use rtdb_types::MemoryBudget;
     use super::super::date_environment::DateEnvironmentInput;
     use std::collections::BTreeMap;
     fn environment(language: &str,region: &str,zone: &str,clock: i64) -> Arc<DateEnvironment> {

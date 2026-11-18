@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
 use base64::Engine;
 use rtdb_types::{Result, Value};
 use super::{ConnectData, ConnectSchema, SchemaKind, SinkRecord, Transform, error, fields_with_defaults, list, string_map};
-use super::super::{DateEnvironment,date_pattern::DatePattern};
+use super::super::{DateEnvironment,DatePattern};
 
 #[derive(Clone, Copy)]
 enum Target { I8, I16, I32, I64, F32, F64, Bool, String }

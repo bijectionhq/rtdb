@@ -17,6 +17,7 @@ repository = "https://github.com/bijectionhq/rtdb"
 
 [workspace.dependencies]
 rtdb-types = { path = "crates/types" }
+rtdb-java-date = { path = "crates/java-date" }
 rtdb-columnar = { path = "crates/columnar" }
 rtdb-temporal = { path = "crates/temporal" }
 rtdb-trie = { path = "crates/trie" }

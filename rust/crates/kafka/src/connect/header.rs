@@ -188,7 +188,7 @@ fn temporal(text: &str, environment: &Arc<super::DateEnvironment>) -> Result<Opt
         24 => (SchemaKind::I64, "Timestamp", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"),
         _ => return Ok(None),
     };
-    let mut pattern = super::date_pattern::DatePattern::compile(pattern,Arc::clone(environment),false)?;
+    let mut pattern = super::DatePattern::compile(pattern,Arc::clone(environment),false)?;
     let millis = match pattern.read(&text) {
         Ok(value) => value,
         Err(cause) if cause.category == rtdb_types::AnomalyCategory::Incorrect => return Ok(None),
