@@ -38,7 +38,7 @@ async fn a_provider_object_at_the_namespace_root_is_not_a_relative_object() {
 
 #[tokio::test]
 async fn multipart_file_publication_uses_an_immutable_destination_and_hides_staging() {
-    use object_store::{ObjectStore as _, ObjectStoreExt as _};
+    use object_store::ObjectStoreExt as _;
     let provider = Arc::new(object_store::memory::InMemory::new());
     let store = RemoteStore::new(provider.clone(), Some(ObjectKey::new("db").unwrap()));
     let source = tempfile::tempdir().unwrap();
