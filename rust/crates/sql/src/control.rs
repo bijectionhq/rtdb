@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, DiscardTarget, Expr, Identifier, ReadOnlyOptions, ReadWriteOptions, TransactionOptions};
-use rtdb_types::{Result, Value};
-use sqlparser::{parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
+use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, DiscardTarget, Identifier, ReadOnlyOptions, ReadWriteOptions, TransactionOptions};
+use rtdb_types::Result;
+use sqlparser::{ast, parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
 
 use crate::{PrepareOptions, parse::{source_span, sql_error}};
 
@@ -10,13 +10,42 @@ pub fn parse_control(source: &str, options: &PrepareOptions) -> Result<Option<Co
     parse_control_with(source, options, crate::bind::FormAllocation::Untracked)
 }
 
-/// Parses control expressions using the caller's existing budget at the original source-demand point.
+/// Binds control expressions in the caller's existing budget after parsing the command.
 /// A non-control probe creates no raw owner; native allocation/admission errors propagate.
 pub fn parse_control_in(source: &str, options: &PrepareOptions, memory: &std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Option<ControlStatement>> {
     parse_control_with(source, options, crate::bind::FormAllocation::Tracked(memory))
 }
 
 fn parse_control_with(source: &str, options: &PrepareOptions, forms: crate::bind::FormAllocation<'_>) -> Result<Option<ControlStatement>> {
+    parse_control_syntax(source, forms)?.map(|syntax| syntax.bind(options)).transpose()
+}
+
+/// A parsed session command whose expressions bind against the later statement context.
+pub struct ParsedControl<'input> {
+    source: &'input str,
+    forms: crate::bind::FormAllocation<'input>,
+    syntax: ControlStatement<ast::Expr>,
+}
+
+impl ParsedControl<'_> {
+    /// Compiles the control expressions using their original source and raw metadata budget.
+    pub fn bind(self, options: &PrepareOptions) -> Result<ControlStatement> {
+        let bind = |expression| crate::bind::control_expression(self.source, &expression, options, self.forms);
+        self.syntax.try_map_expressions(bind, |expression| {
+            match crate::settings::clock_timestamp_literal(&expression)? {
+                Some(text) => Ok(ControlValue::TimestampLiteral(text)),
+                None => bind(expression).map(ControlValue::Expression),
+            }
+        })
+    }
+}
+
+/// Parses the outer control command and retains its expression syntax for binding.
+pub fn parse_control_syntax_in<'input>(source: &'input str, memory: &'input std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Option<ParsedControl<'input>>> {
+    parse_control_syntax(source, crate::bind::FormAllocation::Tracked(memory))
+}
+
+fn parse_control_syntax<'input>(source: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<Option<ParsedControl<'input>>> {
     let mut tokens: Vec<_> = crate::parse::tokenize(source)?
         .into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
     if tokens.last().is_some_and(|token| token.token == Token::SemiColon) { tokens.pop(); }
@@ -32,13 +61,13 @@ fn parse_control_with(source: &str, options: &PrepareOptions, forms: crate::bind
             }
         }
     }
-    let mut parser = ControlParser { source, options, tokens, index: 0, forms };
-    let statement = parser.statement()?;
+    let mut parser = ControlParser { source, tokens, index: 0 };
+    let syntax = parser.statement()?;
     if parser.index != parser.tokens.len() { return Err(parser.error("Unexpected input after control statement")); }
-    Ok(Some(statement))
+    Ok(Some(ParsedControl { source, forms, syntax }))
 }
 
-struct ControlParser<'a> { source: &'a str, options: &'a PrepareOptions, tokens: Vec<TokenWithSpan>, index: usize, forms: crate::bind::FormAllocation<'a> }
+struct ControlParser<'a> { source: &'a str, tokens: Vec<TokenWithSpan>, index: usize }
 
 impl ControlParser<'_> {
     fn error(&self, message: impl Into<String>) -> rtdb_types::Anomaly {
@@ -71,29 +100,21 @@ impl ControlParser<'_> {
         };
         self.index += 1; Ok(value)
     }
-    fn expression(&mut self) -> Result<Expr> {
-        if self.eat("ON") { return Ok(Expr::Literal(Value::Bool(true))); }
-        if self.eat("OFF") { return Ok(Expr::Literal(Value::Bool(false))); }
+    fn expression(&mut self) -> Result<ast::Expr> {
+        if self.eat("ON") { return Ok(ast::Expr::Value(ast::Value::Boolean(true).into())); }
+        if self.eat("OFF") { return Ok(ast::Expr::Value(ast::Value::Boolean(false).into())); }
         let dialect = crate::dialect::SqlDialect::default();
         let mut parser = Parser::new(&dialect).with_tokens_with_locations(self.tokens[self.index..].to_vec());
         let expression = dialect.checked(parser.parse_expr()).map_err(|error| self.error(error.to_string()))?;
         self.index += parser.index();
-        crate::bind::control_expression(self.source, &expression, self.options, self.forms)
+        Ok(expression)
     }
-    fn option_value(&mut self, clock: bool) -> Result<ControlValue> {
+    fn option_value(&mut self, literal_only: bool) -> Result<ControlValue<ast::Expr>> {
         self.token(Token::Eq);
         if self.eat("DEFAULT") { return Ok(ControlValue::Default); }
-        if clock && !word(self.tokens.get(self.index),"ON") && !word(self.tokens.get(self.index),"OFF") {
-            let dialect = crate::dialect::SqlDialect::default();
-            let mut parser = Parser::new(&dialect).with_tokens_with_locations(self.tokens[self.index..].to_vec());
-            let expression = dialect.checked(parser.parse_expr()).map_err(|error| self.error(error.to_string()))?;
-            self.index += parser.index();
-            return match crate::settings::clock_timestamp_literal(&expression)? {
-                Some(text) => Ok(ControlValue::TimestampLiteral(text)),
-                None => crate::bind::control_expression(self.source,&expression,self.options,self.forms).map(ControlValue::Expression),
-            };
-        }
-        self.expression().map(ControlValue::Expression)
+        let value = self.expression()?;
+        if literal_only && !is_literal(&value) { return Err(self.error("ASYNC requires a literal or DEFAULT")); }
+        Ok(ControlValue::Expression(value))
     }
     fn isolation(&mut self) -> Result<()> {
         self.expect("LEVEL")?;
@@ -102,7 +123,7 @@ impl ControlParser<'_> {
         else if self.eat("REPEATABLE") { self.expect("READ")?; return Ok(()); }
         Err(self.error("Invalid transaction isolation level"))
     }
-    fn transaction_options(&mut self, begin: bool) -> Result<TransactionOptions> {
+    fn transaction_options(&mut self, begin: bool) -> Result<TransactionOptions<ast::Expr>> {
         let mut access = None;
         let mut values = BTreeMap::new();
         let mut in_with = false;
@@ -128,8 +149,7 @@ impl ControlParser<'_> {
                 if !["timezone", "snapshot_token", "snapshot_time", "clock_time", "await_token", "system_time", "metadata", "async"].contains(&name.as_str()) {
                     return Err(self.error(format!("Unknown transaction option: {name}")));
                 }
-                let value = self.option_value(name == "clock_time")?;
-                if name == "async" && !matches!(&value, ControlValue::Default | ControlValue::Expression(Expr::Literal(_))) { return Err(self.error("ASYNC requires a literal or DEFAULT")); }
+                let value = self.option_value(name == "async")?;
                 values.insert(name, value); saw_mode = true;
             }
             if !self.token(Token::Comma) {
@@ -156,7 +176,7 @@ impl ControlParser<'_> {
         if !values.is_empty() { return Err(self.error("Transaction option does not belong to the declared access mode")); }
         Ok(TransactionOptions { access, timezone })
     }
-    fn statement(&mut self) -> Result<ControlStatement> {
+    fn statement(&mut self) -> Result<ControlStatement<ast::Expr>> {
         if self.eat("BEGIN") { self.eat("TRANSACTION"); return Ok(ControlStatement::Begin(self.transaction_options(true)?)); }
         if self.eat("START") { self.expect("TRANSACTION")?; return Ok(ControlStatement::Begin(self.transaction_options(true)?)); }
         if self.eat("COMMIT") {
@@ -187,7 +207,7 @@ impl ControlParser<'_> {
                 "timezone" => ControlStatement::SetTimeZone(value),
                 "await_token" if !session => ControlStatement::SetAwaitToken(value),
                 _ => {
-                    if !literal_expression(&value) { return Err(self.error("Session parameter requires a literal")); }
+                    if !is_literal(&value) { return Err(self.error("Session parameter requires a literal")); }
                     ControlStatement::SetParameter { name, value }
                 }
             });
@@ -256,10 +276,38 @@ fn word(token: Option<&TokenWithSpan>, expected: &str) -> bool {
     token.is_some_and(|token| matches!(&token.token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)))
 }
 
-fn literal_expression(expression: &Expr) -> bool {
+fn character_string(value: &ast::Value) -> bool {
+    matches!(value, ast::Value::SingleQuotedString(_) | ast::Value::DollarQuotedString(_) | ast::Value::EscapedStringLiteral(_))
+}
+
+fn typed_literal(value: &ast::TypedString) -> bool {
+    use ast::{DataType as D, TimezoneInfo as Z};
+    if value.uses_odbc_syntax || !character_string(&value.value.value) {
+        return false;
+    }
+    match &value.data_type {
+        D::Date | D::Uuid | D::Time(None, Z::None)
+        | D::Timestamp(None, Z::None | Z::WithTimeZone | Z::WithoutTimeZone) => true,
+        D::Custom(name, modifiers) => matches!(name.0.as_slice(), [ast::ObjectNamePart::Identifier(name)]
+            if modifiers.is_empty() && name.quote_style.is_none() && name.value.eq_ignore_ascii_case("URI")),
+        _ => false,
+    }
+}
+
+fn is_literal(expression: &ast::Expr) -> bool {
+    let signed_number = |expression: &ast::Expr| matches!(expression, ast::Expr::Value(value) if matches!(value.value, ast::Value::Number(..)));
     match expression {
-        Expr::Literal(_) => true,
-        Expr::Cast { expr, .. } | Expr::Unary { expr, .. } => literal_expression(expr),
+        ast::Expr::Value(value) => character_string(&value.value)
+            || matches!(value.value, ast::Value::Null | ast::Value::Boolean(_) | ast::Value::Number(..) | ast::Value::HexStringLiteral(_)),
+        ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus | ast::UnaryOperator::Minus, expr } => signed_number(expr),
+        ast::Expr::TypedString(value) => typed_literal(value),
+        ast::Expr::Interval(interval) => {
+            let value = match interval.value.as_ref() {
+                ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus | ast::UnaryOperator::Minus, expr } => expr.as_ref(),
+                value => value,
+            };
+            matches!(value, ast::Expr::Value(value) if character_string(&value.value))
+        }
         _ => false,
     }
 }

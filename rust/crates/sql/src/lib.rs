@@ -25,7 +25,7 @@ mod literal_text;
 
 pub use parse::{ParsedStatement, StatementKind, parse, parse_in};
 pub use mutation::{Mutation, StaticMutation, prepare_tx, prepare_tx_in, prepare_patch, prepare_static, prepare_static_in};
-pub use control::{parse_control, parse_control_in};
+pub use control::{ParsedControl, parse_control, parse_control_in, parse_control_syntax_in};
 pub use split::{SplitStatements, split_statements, split_statements_in};
 
 use rtdb_plan::{Catalog, PreparedStatement};
@@ -115,6 +115,85 @@ mod owner_tests {
         assert_eq!(memory.peak_bytes(), 0);
         assert_eq!(memory.used_bytes(), 0);
     }
+    #[test]
+    fn control_syntax_completes_before_expression_admission() {
+        let source = "SET TIME ZONE REGEXP_REPLACE('UTC', 'U', 'U')";
+        let budget = MemoryBudget::new(0);
+        let parsed = parse_control_syntax_in(source, &budget).unwrap().unwrap();
+        assert_eq!(budget.peak_bytes(), 0);
+        let error = parsed.bind(&PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(budget.used_bytes(), 0);
+
+        let trailing = format!("{source} TRAILING");
+        let error = parse_control_in(&trailing, &PrepareOptions::default(), &budget).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert_eq!(budget.peak_bytes(), 0);
+    }
+
+    #[test]
+    fn control_syntax_checks_literal_positions_and_leaves_clock_values_to_binding() {
+        let budget = MemoryBudget::new(1 << 20);
+        for source in [
+            "BEGIN READ WRITE, ASYNC ?, ASYNC TRUE",
+            "BEGIN READ WRITE, ASYNC BOOL 'true', ASYNC TRUE",
+            "SET application_name = ?",
+            "SET application_name = CAST('x' AS VARCHAR)",
+            "SET application_name = VARCHAR 'x'",
+            "SET application_name = TIMESTAMP(3) '2020-01-01'",
+            "SET application_name = TIME WITH TIME ZONE '00:00:00Z'",
+        ] {
+            let Err(error) = parse_control_syntax_in(source, &budget) else { panic!("accepted {source}"); };
+            assert_eq!(error.code, "xtdb/sql-error", "{source}");
+        }
+        let source = "BEGIN READ ONLY WITH (CLOCK_TIME TIMESTAMP 'bad')";
+        let parsed = parse_control_syntax_in(source, &budget).unwrap().unwrap();
+        let error = parsed.bind(&PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert!(error.message.unwrap().starts_with("Cannot parse timestamp: bad"));
+
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn control_literal_syntax_accepts_typed_datetime_uuid_and_uri_strings() {
+        let budget = MemoryBudget::new(0);
+        for literal in [
+            "DATE '2020-01-01'",
+            "TIME '00:00:00'",
+            "TIMESTAMP '2020-01-01T00:00:00'",
+            "TIMESTAMP WITH TIME ZONE '2020-01-01T00:00:00Z'",
+            "TIMESTAMP WITHOUT TIME ZONE '2020-01-01T00:00:00'",
+            "UUID '01234567-89ab-cdef-0123-456789abcdef'",
+            "URI 'https://example.com'",
+        ] {
+            let source = format!("SET application_name = {literal}");
+            assert!(parse_control_syntax_in(&source, &budget).unwrap_or_else(|error| panic!("{source}: {error:?}")).is_some());
+        }
+        assert_eq!(budget.peak_bytes(), 0);
+    }
+
+    #[test]
+    fn transaction_options_bind_final_occurrences_in_option_order() {
+        let budget = MemoryBudget::new(1 << 20);
+        let source = "BEGIN READ ONLY WITH (CLOCK_TIME TIMESTAMP 'bad', CLOCK_TIME TIMESTAMP '2020-01-01T00:00:00Z')";
+        let parsed = parse_control_syntax_in(source, &budget).unwrap().unwrap();
+        let command = parsed.bind(&PrepareOptions::default()).unwrap();
+        let rtdb_plan::ControlStatement::Begin(options) = command else { panic!("begin command"); };
+        let Some(rtdb_plan::ControlAccessOptions::ReadOnly(options)) = options.access else { panic!("read-only options"); };
+        assert_eq!(options.clock_time, Some(rtdb_plan::ControlValue::TimestampLiteral("2020-01-01T00:00:00Z".into())));
+
+        for (source, first_error) in [
+            ("BEGIN READ WRITE, METADATA first_unknown(), SYSTEM_TIME second_unknown()", "second_unknown"),
+            ("BEGIN READ ONLY, CLOCK_TIME TIMESTAMP 'bad', TIME ZONE first_unknown()", "first_unknown"),
+        ] {
+            let parsed = parse_control_syntax_in(source, &budget).unwrap().unwrap();
+            let error = parsed.bind(&PrepareOptions::default()).unwrap_err();
+            assert!(error.message.unwrap().contains(first_error), "{source}");
+        }
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
     #[test]
     fn original_literal_checks_precede_copy_admission() {
         let memory = MemoryBudget::new(0);
