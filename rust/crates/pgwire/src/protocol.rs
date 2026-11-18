@@ -806,7 +806,7 @@ mod tests {
         let options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
         let (node, driver) = Node::open(options, services).await.unwrap();
         let session = node.session("xtdb", identity).unwrap();
-        let startup = Startup { parameters: BTreeMap::new(), reservation: node.memory().reserve(0).unwrap() };
+        let startup = Startup { parameters: BTreeMap::new(), _reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
     }

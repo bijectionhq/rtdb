@@ -15,7 +15,7 @@ trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
 type Stream = Box<dyn Socket>;
 
-pub(crate) struct Startup { pub parameters: BTreeMap<String, String>, pub reservation: Arc<MemoryReservation> }
+pub(crate) struct Startup { pub parameters: BTreeMap<String, String>, pub _reservation: Arc<MemoryReservation> }
 pub(crate) struct ConnectionDriver { process: i32, stream: TcpStream, address: SocketAddr, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken }
 impl ConnectionDriver {
     pub fn new(process: i32, stream: TcpStream, address: SocketAddr, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken) -> Self { Self { process, stream, address, node, auth, config, registry, cancellation, draining } }
@@ -121,7 +121,7 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 if method != Method::DeviceAuth { writer.auth(0).await?; }
                 apply_startup(&mut session, &parameters, &mut writer).await?;
                 writer.backend_key(process).await?; writer.ready(b'I').await?;
-                return Ok(Some((session, Startup { parameters, reservation })));
+                return Ok(Some((session, Startup { parameters, _reservation: reservation })));
             }
             _ => return Err(protocol("Unknown protocol version")),
         }
