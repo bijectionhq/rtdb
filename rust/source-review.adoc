@@ -1248,3 +1248,26 @@ The direct source scalar reader materializes raw FixedBinary and UUID objects th
 UUID demand copies the complete admitted inner span before the first or second relative read can fail.
 The returned UUID retains its own reservation after the temporary copy and its reservation drop.
 Existing-inner and selected-reader ownership still require source work.
+
+== Kafka connection state and paired Avro source checkpoint
+
+The per-connection source state now retains its reconnect and setup schedules, authentication cause and throttle deadline.
+An admitted preferred-family address cursor retains its last attempted IP and original IPv6 scope.
+An admitted in-flight deque retains the source order for recent sends, incoming responses, timeouts and disconnect cleanup.
+The live sender still must supply the actual DNS, socket, Selector, clock and request lifecycle events and use the retained wait budget during DLQ enqueue.
+
+The bounded Avro source parser now pairs canonical schema identities with the native AvroDatumPlan built from the same declarations.
+The opt-in native parser consumes references in declaration order.
+The native parse allowance charges each raw expanded alias while the canonical arena deduplicates aliases.
+The pair is available through the source fixture module.
+Exact JavaString input, logical types, graph and default consumers, SMT and writer integration, and the existing null-default discrepancy remain open.
+
+The native Metadata cache now owns the rack values and selected replica and ISR arrays it retains.
+Full entries preserve the parsed rack pointer presence.
+A reliable merge preserves the existing optional-rack rule and the selected replica and ISR pointer presence.
+Rack-aware topic-info comparison reads a zero count for partitions without racks.
+The cache still needs per-entry admission and broader caller-lock validation.
+Observation fixtures use the ordinary and admin parser paths with separate lifetimes for parsed results and retained cache entries.
+
+The implementation revision remains unset and the source-completeness gate remains false.
+Compilation, runtime discovery and regression execution remain pending.
