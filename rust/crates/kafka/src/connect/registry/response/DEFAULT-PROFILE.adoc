@@ -14,3 +14,13 @@ Archive entry inspection found one owner each for the Jackson 2 JsonFactory, Obj
 link:default-profile.json[The record] retains the argument file digest, archive digests and class-byte digests.
 The worker evidence supplies the default parser version for the pinned reference profile.
 Packaged JVM classloader selection, effective recycler and intern ownership, and factory seed observations remain qualification items.
+
+== Interning
+
+Jackson's `InternCache` checks its strong cache before clearing at its entry threshold and then calls `String.intern()` on a miss.
+The retained Jackson 2.16.0 `InternCache.java` has SHA256 `bf4ed8841ad597f79ec120c0d8c6f937484730252c6a891497227d674f8a696c` and a 180-name threshold.
+The 2.21.7 source has SHA256 `eed3d1644b930a4a92d75390a599f1d2ebd18101fa906283b4afb8be79cf6d57` and a 280-name threshold.
+
+The native cache admits strong slots and weak entries separately from exact UTF16 symbols.
+The strong cache clears on a full miss, and the weak index can recover a symbol held by another live canonicalizer.
+The serialized native clear schedule and symbols owned by external JVM components have independent qualification boundaries.
