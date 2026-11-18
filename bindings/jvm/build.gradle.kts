@@ -39,6 +39,22 @@ tasks.test {
     useJUnitPlatform { excludeTags("integration") }
 }
 
+tasks.register<JavaExec>("corpus") {
+    description = "Runs every original test Var against the native engine and records one outcome per Var."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("clojure.main")
+    args("-m", "xtdb.rust.corpus")
+    providers.gradleProperty("corpusNs").orNull?.let { args(it.split(",")) }
+    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(25)) })
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "--add-opens=java.base/java.nio=ALL-UNNAMED", "-Xmx4g")
+    systemProperty("io.netty.noUnsafe", "false")
+    systemProperty("io.netty.tryReflectionSetAccessible", "true")
+    systemProperty("xtdb.corpus.root", rootProject.file("src/test/clojure").absolutePath)
+    systemProperty("xtdb.corpus.out", providers.gradleProperty("corpusOut").orNull ?: layout.buildDirectory.file("corpus/results.jsonl").get().asFile.absolutePath)
+    providers.gradleProperty("corpusTimeoutMs").orNull?.let { systemProperty("xtdb.corpus.timeout-ms", it) }
+    providers.systemProperty("xtdb.native.library").orNull?.let { systemProperty("xtdb.native.library", it) }
+}
+
 tasks.register<Test>("integration-test") {
     val unitTests = tasks.test.get()
     testClassesDirs = unitTests.testClassesDirs

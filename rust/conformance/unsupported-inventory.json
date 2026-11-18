@@ -1,0 +1,747 @@
+{
+ "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+ "codes": [
+  {
+   "code": "rtdb.config/environment-platform",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/server/src/config/bounded.rs:224"
+   ]
+  },
+  {
+   "code": "rtdb.conformance/column-table-fixture-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/conformance/src/controls/table_column.rs:25"
+   ]
+  },
+  {
+   "code": "rtdb.conformance/slt-format",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/conformance/src/sql_logic/format.rs:6"
+   ]
+  },
+  {
+   "code": "rtdb.conformance/slt-harness-gap",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/conformance/src/sql_logic/engine.rs:276"
+   ]
+  },
+  {
+   "code": "rtdb.conformance/slt-symbol-value",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/conformance/src/sql_logic/engine.rs:275"
+   ]
+  },
+  {
+   "code": "rtdb.expr/async-required",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/expr/src/functions.rs:76"
+   ]
+  },
+  {
+   "code": "rtdb.expr/regex-host-form",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/expr/src/evaluate/invocation/host.rs:785"
+   ]
+  },
+  {
+   "code": "rtdb.format/decimal-metadata",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/format/src/ipc_decimal.rs:134"
+   ]
+  },
+  {
+   "code": "rtdb.format/metadata-flavour",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/format/src/statistics.rs:154"
+   ]
+  },
+  {
+   "code": "rtdb.format/non-byte-bloom",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/format/src/bloom.rs:67"
+   ]
+  },
+  {
+   "code": "rtdb.format/storage-version",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/format/src/keys.rs:59"
+   ]
+  },
+  {
+   "code": "rtdb.metrics/cloudwatch-not-compiled",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/server/src/metric_export/mod.rs:49"
+   ]
+  },
+  {
+   "code": "rtdb.metrics/missing-step-provider",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/plan/src/runtime.rs:54"
+   ]
+  },
+  {
+   "code": "rtdb.node/prepared-session-statement",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/node/src/statement.rs:110"
+   ]
+  },
+  {
+   "code": "rtdb.query/boolean-setter",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/query/src/aggregate.rs:407",
+    "rust/crates/query/src/aggregate.rs:527"
+   ]
+  },
+  {
+   "code": "rtdb.query/min-max-setter",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/query/src/aggregate.rs:514"
+   ]
+  },
+  {
+   "code": "rtdb.query/small-integer-sum",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/query/src/aggregate.rs:588"
+   ]
+  },
+  {
+   "code": "rtdb.query/variance-input",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/query/src/aggregate.rs:625"
+   ]
+  },
+  {
+   "code": "rtdb.tls/unsupported-identifier",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/tls/src/identifiers.rs:205",
+    "rust/crates/tls/src/identifiers.rs:209"
+   ]
+  },
+  {
+   "code": "rtdb.tx/removed-operation",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/tx/src/source.rs:200"
+   ]
+  },
+  {
+   "code": "rtdb/arrow-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/cells/open.rs:63",
+    "rust/crates/columnar/src/read_allocation.rs:119",
+    "rust/crates/columnar/src/schema.rs:274"
+   ]
+  },
+  {
+   "code": "rtdb/avro-custom-logical-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/java_schema/logical.rs:159"
+   ]
+  },
+  {
+   "code": "rtdb/avro-java-identity-required",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/schema_objects/evaluation.rs:17"
+   ]
+  },
+  {
+   "code": "rtdb/avro-java-text-reader-required",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/java_text.rs:45"
+   ]
+  },
+  {
+   "code": "rtdb/avro-logical-math-profile-required",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/java_schema/logical.rs:44"
+   ]
+  },
+  {
+   "code": "rtdb/avro-reader-buffer-profile",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader/buffers.rs:88",
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader.rs:32"
+   ]
+  },
+  {
+   "code": "rtdb/avro-reader-native-profile",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader/syntax.rs:211",
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader.rs:29"
+   ]
+  },
+  {
+   "code": "rtdb/avro-reader-native-projection",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader/projection.rs:16"
+   ]
+  },
+  {
+   "code": "rtdb/decimal-width",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/schema.rs:139"
+   ]
+  },
+  {
+   "code": "rtdb/encoded-union-leg",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/read_allocation.rs:113",
+    "rust/crates/columnar/src/schema.rs:56",
+    "rust/crates/columnar/src/schema.rs:252"
+   ]
+  },
+  {
+   "code": "rtdb/half-vector",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/cells/open.rs:56"
+   ]
+  },
+  {
+   "code": "rtdb/jvm-half-float",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/hash.rs:78",
+    "rust/crates/plan/src/expr.rs:39"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-address-list-size",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/addresses.rs:76"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-bootstrap-budget-domain",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/bootstrap.rs:85"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-bootstrap-list-size",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/bootstrap.rs:68"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-cluster-node-order-required",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/snapshot.rs:137"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-fatal-error-budget-domain",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/fatal.rs:77"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-in-flight-size",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/in_flight.rs:87"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-java-identity-required",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/keys.rs:22"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-java-shuffle-range",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/bootstrap.rs:42"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-java-shuffle-required",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/bootstrap.rs:33"
+   ]
+  },
+  {
+   "code": "rtdb/kafka-partition-list-size",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/state/mod.rs:375",
+    "rust/crates/kafka/src/producer_metadata/state/monitor/topic.rs:119"
+   ]
+  },
+  {
+   "code": "rtdb/run-end-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/schema.rs:35",
+    "rust/crates/columnar/src/schema.rs:270"
+   ]
+  },
+  {
+   "code": "rtdb/too-many-union-legs",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/schema.rs:47"
+   ]
+  },
+  {
+   "code": "rtdb/unknown-arrow-extension",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/read_allocation.rs:86",
+    "rust/crates/columnar/src/schema.rs:191"
+   ]
+  },
+  {
+   "code": "rtdb/unrepresentable-vector-schema",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/cells/descriptor.rs:412"
+   ]
+  },
+  {
+   "code": "rtdb/unsupported-producer-node-list",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/producer_metadata/node_selection.rs:103"
+   ]
+  },
+  {
+   "code": "rtdb/vector-depth",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/cells/snapshot.rs:13"
+   ]
+  },
+  {
+   "code": "rtdb/vector-schema-depth",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/columnar/src/cells/descriptor.rs:287",
+    "rust/crates/columnar/src/cells/open.rs:30",
+    "rust/crates/columnar/src/cells/write/owner/tree.rs:50"
+   ]
+  },
+  {
+   "code": "xtdb.authn/device-auth-unsupported",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/auth/src/oidc.rs:120"
+   ]
+  },
+  {
+   "code": "xtdb.azure/credential-selector",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/azure/src/credential.rs:34"
+   ]
+  },
+  {
+   "code": "xtdb.expression/array-dimension-error",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/expr/src/collection.rs:6"
+   ]
+  },
+  {
+   "code": "xtdb.expression/attempting-to-cast-int-to-multi-field-interval",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/plan/src/deferred_cast.rs:96",
+    "rust/crates/plan/src/temporal_cast.rs:101"
+   ]
+  },
+  {
+   "code": "xtdb.expression/cannot-abs-mixed-intervals",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/expr/src/temporal.rs:50"
+   ]
+  },
+  {
+   "code": "xtdb.expression/cannot-divide-mixed-intervals",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/expr/src/temporal.rs:139"
+   ]
+  },
+  {
+   "code": "xtdb.expression/extract-not-supported",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/plan/src/temporal_functions.rs:54",
+    "rust/crates/plan/src/temporal_functions.rs:59"
+   ]
+  },
+  {
+   "code": "xtdb.expression/multi-dimensional-array-literal",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/expr/src/cast.rs:291"
+   ]
+  },
+  {
+   "code": "xtdb.expression/non-literal-interval-metadata",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/plan/src/interval_constructor.rs:36"
+   ]
+  },
+  {
+   "code": "xtdb.expression/non-literal-precision",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/plan/src/temporal_functions.rs:209"
+   ]
+  },
+  {
+   "code": "xtdb.expression/non-literal-scale",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/plan/src/expr.rs:516"
+   ]
+  },
+  {
+   "code": "xtdb.expression/non-literal-temporal-field",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/plan/src/temporal_functions.rs:189"
+   ]
+  },
+  {
+   "code": "xtdb.expression/non-literal-timezone",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/plan/src/temporal_functions.rs:195"
+   ]
+  },
+  {
+   "code": "xtdb.expression/range-bins-unit",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/plan/src/temporal_functions.rs:150"
+   ]
+  },
+  {
+   "code": "xtdb.expression/set-equality",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/plan/src/equality.rs:14"
+   ]
+  },
+  {
+   "code": "xtdb.expression/transit-throwable-text",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/expr/src/transit_object/render.rs:93"
+   ]
+  },
+  {
+   "code": "xtdb.expression/unsupported",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/plan/src/series.rs:34",
+    "rust/crates/plan/src/series.rs:35"
+   ]
+  },
+  {
+   "code": "xtdb.expression/unsupported-cast",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/plan/src/temporal_cast.rs:122"
+   ]
+  },
+  {
+   "code": "xtdb.expression/unsupported-round-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/plan/src/expr.rs:521"
+   ]
+  },
+  {
+   "code": "xtdb.expression/unsupported-setting",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/expr/src/session_info.rs:23"
+   ]
+  },
+  {
+   "code": "xtdb.kafka-connect-source/registry-symbol-intern",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/registry/response/symbols/bytes.rs:113",
+    "rust/crates/kafka/src/connect/registry/response/symbols.rs:129"
+   ]
+  },
+  {
+   "code": "xtdb.kafka-connect-source/unsupported-avro-input-profile",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/input.rs:9"
+   ]
+  },
+  {
+   "code": "xtdb.kafka-connect-source/unsupported-avro-native-profile",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/java_schema/producer/pair.rs:73"
+   ]
+  },
+  {
+   "code": "xtdb.kafka-connect-source/unsupported-avro-reader",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/avro/reader.rs:67"
+   ]
+  },
+  {
+   "code": "xtdb.kafka-connect-source/unsupported-source-profile",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/connect/registry/response/cursor/text_buffer.rs:48",
+    "rust/crates/kafka/src/connect/registry/response/symbols/bytes.rs:76",
+    "rust/crates/kafka/src/connect/registry/response/window.rs:113"
+   ]
+  },
+  {
+   "code": "xtdb.kafka/config-provider-class",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/config/providers.rs:60"
+   ]
+  },
+  {
+   "code": "xtdb.kafka/config-provider-environment-encoding",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/config/providers/environment.rs:34",
+    "rust/crates/kafka/src/config/providers/environment.rs:61"
+   ]
+  },
+  {
+   "code": "xtdb.kafka/jaas-login-module",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/config.rs:149"
+   ]
+  },
+  {
+   "code": "xtdb.pgwire/unknown-client-msg",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/pgwire/src/protocol.rs:178"
+   ]
+  },
+  {
+   "code": "xtdb.pgwire/unsupported-binary-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/pg-codec/src/binary.rs:26"
+   ]
+  },
+  {
+   "code": "xtdb.pgwire/unsupported-execute",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/pgwire/src/protocol.rs:267"
+   ]
+  },
+  {
+   "code": "xtdb.pgwire/unsupported-param-type",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/pgwire/src/protocol.rs:140"
+   ]
+  },
+  {
+   "code": "xtdb.pgwire/unsupported-value-operation",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/pg-codec/src/output.rs:129"
+   ]
+  },
+  {
+   "code": "xtdb.postgres/unsupported-json-ld-value",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/pg-codec/src/text.rs:92"
+   ]
+  },
+  {
+   "code": "xtdb.postgres/unsupported-map-key",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/pg-codec/src/text.rs:117"
+   ]
+  },
+  {
+   "code": "xtdb.postgres/unsupported-pgoutput-message",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/pg-source/src/decoder.rs:72"
+   ]
+  },
+  {
+   "code": "xtdb.postgres/unsupported-symbol",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/pg-codec/src/text.rs:188"
+   ]
+  },
+  {
+   "code": "xtdb.postgres/unsupported-text-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/pg-codec/src/text.rs:30"
+   ]
+  },
+  {
+   "code": "xtdb.postgres/unsupported-transit-value",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/pg-codec/src/text.rs:185"
+   ]
+  },
+  {
+   "code": "xtdb.sql/lead-lag-default-expr",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/sql/src/window.rs:54"
+   ]
+  },
+  {
+   "code": "xtdb.sql/lead-lag-expr",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/sql/src/window.rs:57"
+   ]
+  },
+  {
+   "code": "xtdb.sql/lead-lag-ignore-nulls",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/sql/src/window.rs:55"
+   ]
+  },
+  {
+   "code": "xtdb.sql/non-literal-field-access",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/sql/src/json_access.rs:67"
+   ]
+  },
+  {
+   "code": "xtdb.sql/non-literal-json-path",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/sql/src/json_access.rs:35"
+   ]
+  },
+  {
+   "code": "xtdb.sql/recursive-ctes",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/sql/src/bind.rs:471"
+   ]
+  },
+  {
+   "code": "xtdb/col-meta-float-precision",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/format/src/columns.rs:157"
+   ]
+  },
+  {
+   "code": "xtdb/col-meta-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/format/src/columns.rs:174"
+   ]
+  },
+  {
+   "code": "xtdb/col-meta-unsigned-int",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/format/src/columns.rs:156"
+   ]
+  },
+  {
+   "code": "xtdb/fixed-database-catalog",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/node/src/catalog.rs:89"
+   ]
+  },
+  {
+   "code": "xtdb/sql-unsupported",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/sql/src/bind.rs:1256"
+   ]
+  },
+  {
+   "code": "xtdb/unknown-function",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/expr/src/functions.rs:236"
+   ]
+  },
+  {
+   "code": "xtdb/unsupported-cast",
+   "classification": "reference-parity",
+   "sites": [
+    "rust/crates/expr/src/cast.rs:88"
+   ]
+  },
+  {
+   "code": "xtdb/unsupported-run-end-type",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/types/src/logical.rs:131"
+   ]
+  },
+  {
+   "code": "xtdb/unsupported-type-rendering",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/types/src/type_edn.rs:119"
+   ]
+  }
+ ]
+}
