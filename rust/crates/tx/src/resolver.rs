@@ -260,8 +260,12 @@ impl<'a> OpenTransaction<'a> {
     pub async fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &options, &context.memory)?;
-        PreparedQuery::from_prepared(prepared, &context.memory)?.execute_with_text(context, arguments, Some(sql)).await
+        let query = {
+            let _syntax = admit_sql_syntax(sql, &context.memory)?;
+            let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &options, &context.memory)?;
+            PreparedQuery::from_prepared(prepared, &context.memory)?
+        };
+        query.execute_with_text(context, arguments, Some(sql)).await
     }
 
     pub async fn execute_sql(&mut self, sql: &str, arguments: Option<&[Value]>) -> Result<()> {
@@ -277,8 +281,7 @@ impl<'a> OpenTransaction<'a> {
         };
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let with_sql = |error: Anomaly| error.with_context("sql", sql.into());
-        let syntax = rtdb_sql::statement_syntax_estimate(sql.len()).ok_or_else(overflow)
-            .and_then(|bytes| context.memory.reserve(bytes)).map_err(with_sql)?;
+        let syntax = admit_sql_syntax(sql, &context.memory).map_err(with_sql)?;
         let mutation = rtdb_sql::prepare_tx_in(sql, &context.catalog, &options, &context.memory).map_err(with_sql)?;
         self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
     }
@@ -428,6 +431,10 @@ impl<'a> OpenTransaction<'a> {
 fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {
     let encoded = match operation { Some(DbOp::AttachDatabase(value)) => value.encoded_len(), Some(DbOp::DetachDatabase(value)) => value.encoded_len(), None => 0 };
     encoded.checked_mul(4).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)
+}
+
+fn admit_sql_syntax(sql: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {
+    memory.reserve(rtdb_sql::statement_syntax_estimate(sql.len()).ok_or_else(overflow)?)
 }
 
 async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {

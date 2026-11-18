@@ -24,6 +24,58 @@ fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp:
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
 
 #[tokio::test]
+async fn external_writer_query_admits_sql_and_reads_its_own_staged_rows() {
+    struct ReadBackWriter(Arc<MemoryBudget>);
+
+    #[async_trait::async_trait]
+    impl TransactionWriter for ReadBackWriter {
+        async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult> {
+            let baseline = self.0.used_bytes();
+            let malformed = format!("SELECT '{}'; SELECT @", "é".repeat(64));
+            let syntax = rtdb_sql::statement_syntax_estimate(malformed.len()).unwrap();
+            let expected = rtdb_sql::parse_in(&malformed, &self.0).unwrap_err();
+            assert_eq!(expected.code, "xtdb/sql-error");
+            let held = self.0.reserve(self.0.limit_bytes() - baseline - syntax + 1)?;
+            let error = transaction.open_query(&malformed, Vec::new()).await.err().unwrap();
+            let retained = baseline + held.bytes();
+            let message = format!("Cannot reserve {syntax} bytes from budget {} with {retained} retained", self.0.limit_bytes());
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            assert_eq!(error.message.as_deref(), Some(message.as_str()));
+            assert_eq!(self.0.used_bytes(), retained);
+            drop(held);
+            assert_eq!(transaction.open_query(&malformed, Vec::new()).await.err().unwrap(), expected);
+            assert_eq!(self.0.used_bytes(), baseline);
+
+            transaction.append(table(), rtdb_format::data::StoredEvent {
+                iid: Value::I64(1).entity_id()?.iid(), system_from: transaction.tx_key().system_time,
+                valid_time: Interval::ALL, operation: StoredOperation::Put(document(7)), recency: None,
+            })?;
+            let staged = self.0.used_bytes();
+            let mut query = transaction.open_query("SELECT v FROM docs", Vec::new()).await?;
+            let page = query.next_batch().await?.unwrap();
+            let batch = page.batch();
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(rtdb_columnar::read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?, Value::I64(7));
+            drop(page);
+            assert!(query.next_batch().await?.is_none());
+            drop(query);
+            assert_eq!(self.0.used_bytes(), staged);
+            Ok(WriterResult::Committed { user_metadata: None })
+        }
+    }
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let mut writer = ReadBackWriter(Arc::clone(&context.memory));
+    let resolved = resolver.resolve_external(state.value().snapshot(), Timestamp(100), None, Some(vec![42]), &mut writer, &context).await.unwrap();
+    assert!(resolved.result().committed());
+    assert_eq!(resolved.external_token(), Some(&[42_u8][..]));
+    assert_eq!(resolved.writes().tables()[&table()].batch().unwrap().len(), 1);
+    assert!(!state.value().snapshot().tables().contains(&table()));
+}
+
+#[tokio::test]
 async fn insert_queries_build_independent_subqueries_before_probing_an_empty_input() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();
