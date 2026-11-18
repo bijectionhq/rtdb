@@ -41,7 +41,7 @@
     },
     "writes_replication_recovery": {
       "status": "pending",
-      "conclusion": "The reviewed traces include selected receipts and terminal fault publication. The driver reserves delivery and envelope decoding for the selected record on writable local, region-backed read-only local, memory and Kafka logs. Fault-wrapper admission and final design-surface reconciliation remain open.",
+      "conclusion": "The reviewed traces include selected receipts and terminal fault publication. The driver reserves delivery and envelope decoding for the selected record on writable local, region-backed read-only local, memory and Kafka logs. The fault adapter can select the admitted replay path per log. Final design-surface reconciliation remains open.",
       "implementation_paths": [
         "rust/crates/tx/src/submission.rs",
         "rust/crates/tx/src/resolver.rs",
@@ -80,7 +80,7 @@
     },
     "conformance_machinery": {
       "status": "pending",
-      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. Other paired adapters and their evidence bindings need source completion.",
+      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. A scoped receipt reader accepts archived execution evidence and observed storage versions for one pinned SQL logic assertion. Other paired adapters and full assertion bindings need source completion.",
       "implementation_paths": [
         "rust/crates/conformance/src/main.rs",
         "rust/conformance/source_inventory.py",
@@ -88,7 +88,10 @@
         "rust/conformance/run_controls.py",
         "rust/conformance/run_recovery.py",
         "rust/release/run_matrix.py",
-        "rust/conformance/source_gate.py"
+        "rust/conformance/source_gate.py",
+        "rust/conformance/external_inventory.py",
+        "rust/conformance/emit_sql_logic_case.py",
+        "rust/crates/conformance/src/faults.rs"
       ]
     }
   },
