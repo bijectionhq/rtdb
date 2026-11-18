@@ -8,8 +8,21 @@ pub(in crate::connect::avro) struct ParsedPair {
     source: SchemaHandle,
     charge: Arc<MemoryReservation>,
 }
+pub(in crate::connect::avro) struct AdmittedSource {
+    root: SchemaHandle,
+    completion: Arc<MemoryReservation>,
+}
 #[derive(Clone, Copy)]
-pub(in crate::connect::avro) struct PairSelection<'a> { pair: &'a ParsedPair, native: &'a Schema, id: SchemaId }
+struct PairOwner<'a> {
+    datum: &'a AvroDatumPlan,
+    source: &'a SchemaHandle,
+}
+#[derive(Clone, Copy)]
+pub(in crate::connect::avro) struct PairSelection<'a> {
+    pair: PairOwner<'a>,
+    native: &'a Schema,
+    id: SchemaId,
+}
 struct NativePolicy;
 impl SchemaNamePolicy for NativePolicy {
     fn name(&self, name: &str, namespace: &Namespace) -> apache_avro::AvroResult<NativeName> { JavaNames.name(name, namespace) }
@@ -39,31 +52,60 @@ impl ParsedPair {
                 .map_err(|cause| Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-avro-native-profile", cause.to_string()))
         })?;
         let pair = Self { datum, source: canonical.root, charge };
-        pair.validate(&pair.datum.root, pair.source.id, 0)?;
+        pair.owner().validate(&pair.datum.root, pair.source.id, 0)?;
         for (name, native) in &pair.datum.names {
             let id = pair.source.owner.bindings.iter().find_map(|(full, id)| full.view().units().eq(name.encode_utf16()).then_some(*id))
                 .ok_or_else(|| error("avro-native-pairing", "Native named definition has no source declaration"))?;
-            pair.validate(native, id, 0)?;
+            pair.owner().validate(native, id, 0)?;
         }
         Ok(pair)
     }
-    pub(in crate::connect::avro) fn root(&self) -> PairSelection<'_> { PairSelection { pair: self, native: &self.datum.root, id: self.source.id } }
-    pub(in crate::connect::avro) fn definition(&self, name: &str) -> Result<PairSelection<'_>> {
+    fn owner(&self) -> PairOwner<'_> { PairOwner { datum: &self.datum, source: &self.source } }
+    pub(in crate::connect::avro) fn root(&self) -> PairSelection<'_> { self.owner().root() }
+    pub(in crate::connect::avro) fn definition(&self, name: &str) -> Result<PairSelection<'_>> { self.owner().definition(name) }
+    pub(in crate::connect::avro) fn retain(&self, context: &mut ConversionContext) -> Result<()> {
+        retain_canonical_then_completion(&self.source, &self.charge, context)
+    }
+    pub(in crate::connect::avro) fn into_datum(self) -> AvroDatumPlan {
+        let Self { mut datum, source, charge } = self;
+        datum.source = Some(AdmittedSource { root: source, completion: charge });
+        datum
+    }
+    #[cfg(test)]
+    fn resolved<'a>(&'a self, native: &'a Schema) -> Result<&'a Schema> { self.owner().resolved(native) }
+}
+fn retain_canonical_then_completion(source: &SchemaHandle, completion: &Arc<MemoryReservation>, context: &mut ConversionContext) -> Result<()> {
+    if context.retains(completion) { return Ok(()); }
+    source.retain(context)?;
+    context.retain(Arc::clone(completion))
+}
+impl AdmittedSource {
+    pub(in crate::connect::avro) fn retain(&self, context: &mut ConversionContext) -> Result<()> {
+        retain_canonical_then_completion(&self.root, &self.completion, context)
+    }
+}
+impl AvroDatumPlan {
+    pub(in crate::connect::avro) fn paired_root(&self) -> Option<PairSelection<'_>> {
+        self.source.as_ref().map(|source| PairOwner { datum: self, source: &source.root }.root())
+    }
+    pub(in crate::connect::avro) fn paired_definition(&self, name: &str) -> Result<Option<PairSelection<'_>>> {
+        self.source.as_ref().map(|source| PairOwner { datum: self, source: &source.root }.definition(name)).transpose()
+    }
+}
+impl<'a> PairOwner<'a> {
+    fn root(self) -> PairSelection<'a> { PairSelection { pair: self, native: &self.datum.root, id: self.source.id } }
+    fn definition(self, name: &str) -> Result<PairSelection<'a>> {
         let native = self.datum.names.get(name).ok_or_else(|| error("avro-native-pairing", "Native definition is absent"))?;
         let id = self.source.owner.bindings.iter().find_map(|(full, id)| full.view().units().eq(name.encode_utf16()).then_some(*id))
             .ok_or_else(|| error("avro-native-pairing", "Canonical definition is absent"))?;
         Ok(PairSelection { pair: self, native, id })
     }
-    pub(in crate::connect::avro) fn retain(&self, context: &mut ConversionContext) -> Result<()> {
-        context.retain(Arc::clone(&self.charge))?;
-        self.source.retain(context)
-    }
-    fn resolved<'a>(&'a self, native: &'a Schema) -> Result<&'a Schema> { crate::connect::avro::resolve(native, &self.datum.names) }
+    fn resolved(&self, native: &'a Schema) -> Result<&'a Schema> { crate::connect::avro::resolve(native, &self.datum.names) }
     fn ref_id(&self, name: &NativeName) -> Result<SchemaId> {
         for (full, id) in &self.source.owner.bindings { if native_name(name, full)? { return Ok(*id); } }
         Err(error("avro-native-pairing", "Native reference does not select a canonical declaration"))
     }
-    fn validate(&self, native: &Schema, id: SchemaId, depth: usize) -> Result<()> {
+    fn validate(&self, native: &'a Schema, id: SchemaId, depth: usize) -> Result<()> {
         guard_depth(depth, "Native pairing exceeds the native traversal depth limit of 128")?;
         self.source.owner.require(id)?;
         if let Schema::Ref { name } = native {

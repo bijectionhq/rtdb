@@ -175,3 +175,198 @@ fn declared_document_dependencies_share_nominal_pair_associations_in_encounter_o
     assert!(error.code.ends_with("avro-schema"));
     assert!(error.message.unwrap().contains("Undefined"));
 }
+
+#[test]
+fn consuming_the_pair_moves_native_storage_and_preserves_source_identity_in_the_datum_owner() {
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let pair = parse(r#"{"type":"record","name":"R","fields":[{"name":"next","type":["null","R"]}]}"#, &[], &mut context);
+    let source = pair.root().canonical().unwrap();
+    let native_fields = match pair.root().native() { Schema::Record(record) => record.fields.as_ptr(), _ => panic!("expected record") };
+    let charge = Arc::downgrade(&pair.charge);
+    let datum = Arc::new(pair.into_datum());
+    drop(context);
+    let selected = datum.paired_root().unwrap();
+    assert!(selected.canonical().unwrap().same_object(&source));
+    assert!(selected.field(0).unwrap().variant(1).unwrap().canonical().unwrap().same_object(&source));
+    assert!(datum.paired_definition("R").unwrap().unwrap().canonical().unwrap().same_object(&source));
+    assert!(matches!(selected.native(), Schema::Record(record) if record.fields.as_ptr() == native_fields));
+    assert!(charge.upgrade().is_some());
+    drop(datum);
+    assert!(charge.upgrade().is_none());
+    assert!(budget.used_bytes() > 0);
+    drop(source);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn admitted_datum_assembly_runs_through_the_real_connect_plan_and_decode_owner() {
+    use crate::connect::avro::Avro;
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let datum = Arc::new(AvroDatumPlan::parse_admitted_source(r#"{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}"#, &[], &BTreeMap::new(), policy(), &mut context).unwrap());
+    let source = Arc::downgrade(&datum.source.as_ref().unwrap().completion);
+    let connect = datum.connect_plan(None, Some(3), &mut 0, &mut context).unwrap();
+    drop(context);
+    let mut next = ConversionContext::new(Arc::clone(&budget));
+    let physical = datum.decode_datum(&[14], &mut next).unwrap();
+    assert_eq!(physical.value, Avro::Record(vec![("x".into(), Avro::Int(7))]));
+    let converted = connect.convert(physical, &mut 0, &mut next).unwrap();
+    assert_eq!(converted.value, rtdb_types::Value::Struct(BTreeMap::from([("x".into(), rtdb_types::Value::I32(7))])));
+    assert_eq!(converted.schema.as_ref().unwrap().version, Some(3));
+    assert!(next.retains(&datum.source.as_ref().unwrap().completion));
+    drop(datum);
+    drop(connect);
+    assert!(source.upgrade().is_some());
+    drop(converted);
+    drop(next);
+    assert!(source.upgrade().is_none());
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn repeated_admitted_source_entries_do_not_repeat_canonical_retention_scratch() {
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let datum = parse(r#"{"type":"record","name":"R","fields":[]}"#, &[], &mut context).into_datum();
+    drop(context);
+    let mut next = ConversionContext::new(Arc::clone(&budget));
+    datum.retain_source(&mut next).unwrap();
+    let remaining = next.allocation_remaining();
+    let used = budget.used_bytes();
+    datum.retain_source(&mut next).unwrap();
+    assert_eq!(next.allocation_remaining(), remaining);
+    assert_eq!(budget.used_bytes(), used);
+    assert_eq!(Arc::strong_count(&datum.source.as_ref().unwrap().completion), 2);
+    drop(datum);
+    drop(next);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn a_failed_source_retain_does_not_publish_the_completion_marker() {
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let datum = parse(r#"{"type":"record","name":"R","fields":[{"name":"x","type":"string","default":"kept"}]}"#, &[], &mut context).into_datum();
+    drop(context);
+    let completion = &datum.source.as_ref().unwrap().completion;
+    let mut denied = ConversionContext::with_limit(Arc::clone(&budget), completion.bytes());
+    assert!(datum.retain_source(&mut denied).is_err());
+    assert!(!denied.retains(completion));
+    assert!(datum.retain_source(&mut denied).is_err());
+    assert!(!denied.retains(completion));
+    assert_eq!(Arc::strong_count(completion), 1);
+    let mut admitted = ConversionContext::new(Arc::clone(&budget));
+    datum.retain_source(&mut admitted).unwrap();
+    assert!(admitted.retains(completion));
+    drop(datum);
+    drop(denied);
+    drop(admitted);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn retained_reservation_queries_use_pointer_identity_and_do_not_change_the_scope() {
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let retained = context.reserve(64).unwrap();
+    let distinct = budget.reserve(64).unwrap();
+    let remaining = context.allocation_remaining();
+    assert!(context.retains(&Arc::clone(&retained)));
+    assert!(!context.retains(&distinct));
+    assert_eq!(context.allocation_remaining(), remaining);
+    context.retain(Arc::clone(&distinct)).unwrap();
+    assert!(context.retains(&distinct));
+    assert_eq!(context.allocation_remaining(), remaining - 64);
+    context.retain(Arc::clone(&distinct)).unwrap();
+    assert_eq!(context.allocation_remaining(), remaining - 64);
+}
+
+#[test]
+fn admitted_resolution_keeps_both_source_owners_and_applies_the_existing_reader_default() {
+    use crate::connect::avro::{Avro, AvroResolution};
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let writer = Arc::new(AvroDatumPlan::parse_admitted_source(r#"{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}"#, &[], &BTreeMap::new(), policy(), &mut context).unwrap());
+    let reader = Arc::new(AvroDatumPlan::parse_admitted_source(r#"{"type":"record","name":"R","fields":[{"name":"x","type":"long"},{"name":"y","type":"string","default":"fallback"}]}"#, &[], &BTreeMap::new(), policy(), &mut context).unwrap());
+    let writer_charge = Arc::downgrade(&writer.source.as_ref().unwrap().completion);
+    let reader_charge = Arc::downgrade(&reader.source.as_ref().unwrap().completion);
+    let resolution = AvroResolution::compile(&writer, &reader, &mut context).unwrap();
+    drop(context);
+    let mut denied = ConversionContext::with_limit(Arc::clone(&budget), 0);
+    assert!(resolution.decode_datum(&[], &mut denied).err().unwrap().code.ends_with("batch-too-large"));
+    let mut next = ConversionContext::new(Arc::clone(&budget));
+    let decoded = resolution.decode_datum(&[14], &mut next).unwrap();
+    assert_eq!(decoded.value, Avro::Record(vec![("x".into(), Avro::Long(7)), ("y".into(), Avro::String("fallback".into()))]));
+    assert!(decoded.plan.paired_root().unwrap().canonical().unwrap().same_object(&reader.paired_root().unwrap().canonical().unwrap()));
+    assert!(next.retains(&writer.source.as_ref().unwrap().completion));
+    assert!(next.retains(&reader.source.as_ref().unwrap().completion));
+    drop(writer);
+    drop(reader);
+    drop(resolution);
+    assert!(writer_charge.upgrade().is_some());
+    assert!(reader_charge.upgrade().is_some());
+    drop(decoded);
+    drop(next);
+    drop(denied);
+    assert!(writer_charge.upgrade().is_none());
+    assert!(reader_charge.upgrade().is_none());
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn admitted_migration_recounts_the_actual_datum_source_before_json_conversion() {
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let datum = Arc::new(AvroDatumPlan::parse_admitted_source(r#"{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}"#, &[], &BTreeMap::new(), policy(), &mut context).unwrap());
+    drop(context);
+    let mut next = ConversionContext::new(Arc::clone(&budget));
+    let value = datum.from_json_datum(serde_json::json!({"x":7}), &mut next).unwrap();
+    assert!(next.retains(&datum.source.as_ref().unwrap().completion));
+    assert!(value.plan.paired_root().unwrap().canonical().unwrap().same_object(&datum.paired_root().unwrap().canonical().unwrap()));
+    assert_eq!(datum.to_json_datum(value, &mut next).unwrap(), serde_json::json!({"x":7}));
+    drop(datum);
+    drop(next);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn legacy_parsing_keeps_no_admitted_source_and_no_source_retain_work() {
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let datum = AvroDatumPlan::parse("\"int\"", &[], &BTreeMap::new()).unwrap();
+    assert!(datum.paired_root().is_none());
+    assert!(datum.paired_definition("R").unwrap().is_none());
+    let mut context = ConversionContext::with_limit(Arc::clone(&budget), 0);
+    datum.retain_source(&mut context).unwrap();
+    assert_eq!(context.allocation_remaining(), 0);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn cross_plan_output_keeps_both_admitted_source_families_in_the_conversion_scope() {
+    use crate::connect::avro::AvroOutput;
+    let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let text = r#"{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}"#;
+    let actual = Arc::new(AvroDatumPlan::parse_admitted_source(text, &[], &BTreeMap::new(), policy(), &mut context).unwrap());
+    let target = Arc::new(AvroDatumPlan::parse_admitted_source(text, &[], &BTreeMap::new(), policy(), &mut context).unwrap());
+    let connect = target.connect_plan(None, None, &mut 0, &mut context).unwrap();
+    assert!(!actual.paired_root().unwrap().canonical().unwrap().same_object(&target.paired_root().unwrap().canonical().unwrap()));
+    drop(context);
+    let mut next = ConversionContext::new(Arc::clone(&budget));
+    let datum = actual.decode_datum(&[14], &mut next).unwrap();
+    let (selected, datum) = actual.prepare_output(&target, datum, &mut next).unwrap();
+    assert_eq!(selected, AvroOutput::Reader { branch: None });
+    let output = connect.convert(datum, &mut 0, &mut next).unwrap();
+    assert_eq!(output.value, rtdb_types::Value::Struct(BTreeMap::from([("x".into(), rtdb_types::Value::I32(7))])));
+    assert!(next.retains(&actual.source.as_ref().unwrap().completion));
+    assert!(next.retains(&target.source.as_ref().unwrap().completion));
+    assert_eq!(Arc::strong_count(&actual.source.as_ref().unwrap().completion), 2);
+    assert_eq!(Arc::strong_count(&target.source.as_ref().unwrap().completion), 2);
+    drop(actual);
+    drop(target);
+    drop(connect);
+    drop(output);
+    drop(next);
+    assert_eq!(budget.used_bytes(), 0);
+}

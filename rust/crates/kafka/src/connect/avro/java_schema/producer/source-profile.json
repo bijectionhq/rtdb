@@ -4,12 +4,12 @@
   "primary_count": 92,
   "backend_snapshot_count": 13,
   "baseline_sources_unchanged": 71,
-  "manifest_sha256": "235b0cdd7a8abcb8519853f2188f9428ad0b3ecb112ff74f2ccbedef7b434645",
+  "manifest_sha256": "d84a9b35d79c18a7b8b5f879a5b4e38d31a2f3ca81d942d802312138cfe0cd17",
   "jdk_source_archive": {
     "path": "/tmp/rtdb-provider-sources/openjdk25-time/src.zip",
     "sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482"
   },
-  "source_snapshot": "/tmp/rtdb-avro-canonical-producer-sources-235b0cdd7a8abcb8",
+  "source_snapshot": "/tmp/rtdb-avro-canonical-producer-sources-d84a9b35d79c18a7",
   "reference_profiles": [
     "Avro1.11.4",
     "Confluent7.8.0 retained source",
@@ -34,5 +34,6 @@
   },
   "qualification": "No source fixture compiled/executed. Physical native pairing is narrower than source input acceptance. Canonical source metadata/default nodes remain authoritative. The bound is a source-review proof target, not measured allocator/JVM parity.",
   "native_reference_profile": "Incremental supplied document order; only prior declarations and current record self recursion; no preloaded future input_schemas.",
-  "native_name_measure": "Declarations and named lookups plus every raw named-alias occurrence. Existing Name qualification is reused; checked full-name units times raw multiplicity precedes canonical qualified-name dedup."
+  "native_name_measure": "Declarations and named lookups plus every raw named-alias occurrence. Existing Name qualification is reused; checked full-name units times raw multiplicity precedes canonical qualified-name dedup.",
+  "admitted_owner_scope": "parse_admitted_source moves the validated pair into actual AvroDatumPlan; context-aware datum/connect/migration/resolution consumers retain that source family. Registry and Connect graph/default algorithms remain legacy until later activation."
 }

@@ -1,7 +1,8 @@
 = Canonical Avro schema relations and cycle collections
 
-The Avro source fixture target registers this module for owned schema objects, scoped Schema relations and the concrete cycle collections needed by graph construction.
-Production parsing, Registry lookup, graph construction, conversion, SMT and writer routes still need those objects wired into their owners.
+The canonical module is registered for owned source objects, scoped Schema relations, cycle collections and explicit admitted-source datum assembly.
+link:producer/ADMITTED-OWNER.adoc[] records that actual datum-plan ownership and its consumer retention.
+The Registry entry still uses the legacy parser, and canonical graph/default/conversion/SMT/writer consumers remain required before full activation.
 All 53 regression functions are source observations; none has been compiled or executed under the Phase 1 work order.
 
 == Objects and lifetime

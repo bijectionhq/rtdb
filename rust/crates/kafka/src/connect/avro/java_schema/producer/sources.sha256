@@ -51,7 +51,7 @@ ad8ea5af9257c41a4f863496a89399be908437615b92cac6a176b7d1c6558c61  jackson-databi
 ef022c4c9a83fe2b708636ad944bd7933868e4d756db2ffef7160e7e4cf1c8b3  jackson-databind-2.21.7/com/fasterxml/jackson/databind/node/NumericNode.java
 87545566cdde43a5c1ff66c035cb4dff3c3326696a05e4cd20eaf3a4fe1e652c  jackson-databind-2.21.7/com/fasterxml/jackson/databind/node/ObjectNode.java
 87c83256b57eb314ce6b5104483574d250520c0877c4ccbc77a5e718804834e8  jackson-databind-2.21.7/com/fasterxml/jackson/databind/node/TextNode.java
-bc8f745a923f3a4273a9306d01cf384cd18bdfbaffef576c5f8cdab6917be2c4  repo/rust/crates/kafka/src/connect/avro.rs
+668f2179917bf877f6540665337b422c666cd79d08759d9b503d1dcbedb2a671  repo/rust/crates/kafka/src/connect/avro.rs
 efb1ff767e2fa86a4c7dd4722c6093004fb98b178a73a8bb0996af0588b8a53d  repo/rust/crates/kafka/src/connect/avro/default_json.rs
 b25f4348bee8fc98c988f51a3042ec1773ccac2d06cbde99b82d67cabdc77074  repo/rust/crates/kafka/src/connect/avro/graph.rs
 d7a2fd4b00d01dce358dc117aab87ad521ba8238c303eedcd145a1acc9cbae45  repo/rust/crates/kafka/src/connect/avro/metadata.rs

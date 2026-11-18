@@ -7,6 +7,8 @@ use super::{Avro, AvroMap, MapKey, AvroDatumPlan, AvroDatum, ConversionContext, 
 
 impl AvroDatumPlan {
     pub fn to_json_datum(&self, datum: AvroDatum, context: &mut ConversionContext) -> Result<Json> {
+        self.retain_source(context)?;
+        datum.plan.retain_source(context)?;
         let bound = super::resolution::value_bound(&datum.value, 0)?.checked_mul(2).and_then(|bytes| bytes.checked_add(datum.plan.schema_bytes.checked_mul(16)?)).ok_or_else(overflow)?;
         context.reserve(bound)?;
         let (schema, value) = unwrap(&datum.plan.root, datum.value, &datum.plan.names)?;
@@ -18,6 +20,7 @@ impl AvroDatumPlan {
     }
 
     pub fn from_json_datum(self: &std::sync::Arc<Self>, value: Json, context: &mut ConversionContext) -> Result<AvroDatum> {
+        self.retain_source(context)?;
         self.validate_reader(Some(self))?;
         context.reserve(json_bound(&value, 0)?.checked_add(self.schema_bytes.checked_mul(16).ok_or_else(overflow)?).ok_or_else(overflow)?)?;
         Ok(AvroDatum { value: decode(&self.root, &value, &self.names, 0)?, plan: std::sync::Arc::clone(self) })

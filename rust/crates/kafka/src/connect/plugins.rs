@@ -25,9 +25,12 @@ impl ConversionContext {
         let charge = self.memory.reserve(bytes)?; self.charges.push(Arc::clone(&charge)); self.reserved = reserved; Ok(charge)
     }
     pub fn retain(&mut self, charge: Arc<MemoryReservation>) -> Result<()> {
-        if self.charges.iter().any(|existing| Arc::ptr_eq(existing, &charge)) { return Ok(()); }
+        if self.retains(&charge) { return Ok(()); }
         let reserved = self.reserved.checked_add(charge.bytes()).filter(|bytes| *bytes <= self.limit).ok_or_else(|| error("batch-too-large", "Retained converter allocation exceeds its per-record limit"))?;
         self.charges.push(charge); self.reserved = reserved; Ok(())
+    }
+    pub(crate) fn retains(&self, charge: &Arc<MemoryReservation>) -> bool {
+        self.charges.iter().any(|existing| Arc::ptr_eq(existing, charge))
     }
     pub(super) fn set_registry_key(&mut self, bytes: Option<&[u8]>) -> Result<()> {
         if let Some(bytes) = bytes { self.reserve(bytes.len().checked_add(64).ok_or_else(|| error("allocation-overflow", "Registry key allocation overflow"))?)?; }

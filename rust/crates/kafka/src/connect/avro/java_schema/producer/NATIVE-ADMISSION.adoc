@@ -2,6 +2,8 @@
 
 ParsedPair admits the complete allowance before invoking AvroDatumPlan::parse_with_name_policy.
 The native plan and its trailing reservation remain one immutable owner after the creating ConversionContext drops.
+A validated ParsedPair can move that reservation and its canonical source handle into the actual AvroDatumPlan without cloning native trees.
+The optional completed capability and borrowed PairOwner/PairSelection views add fixed-size owner fields, covered by the existing owner envelope; no new native tree or retained index is created.
 PairSelection borrows that owner; it never returns an owned native schema or an unchecked native plan.
 A separately returned canonical handle retains its own arena and payload leases.
 

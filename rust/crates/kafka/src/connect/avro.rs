@@ -19,13 +19,22 @@ mod default_property;
 mod default_materialize;
 mod to_connect_context;
 mod schema_objects;
-#[cfg(test)]
 mod java_schema;
+pub(super) use java_schema::{FixedBytesLimit, SourcePolicy};
 pub(super) use datum::AvroDatum;
 use datum::{PhysicalValue as Avro, AvroMap, MapKey};
 pub(super) use resolution::AvroResolution;
 
-pub(super) struct AvroDatumPlan { root: Schema, names: BTreeMap<String, Schema>, metadata: metadata::Metadata, defaults: default_json::Defaults, unions: graph::UnionOptions, reader: reader::ReaderMode, schema_bytes: usize }
+pub(super) struct AvroDatumPlan {
+    root: Schema,
+    names: BTreeMap<String, Schema>,
+    metadata: metadata::Metadata,
+    defaults: default_json::Defaults,
+    unions: graph::UnionOptions,
+    reader: reader::ReaderMode,
+    schema_bytes: usize,
+    source: Option<java_schema::AdmittedSource>,
+}
 pub(super) struct AvroPlan { datum: Arc<AvroDatumPlan>, branch: Option<u32>, connect: Arc<ConnectSchema>, charges: Vec<Arc<rtdb_columnar::MemoryReservation>> }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum AvroOutput { Writer, Reader { branch: Option<u32> } }
@@ -43,6 +52,8 @@ impl AvroPlan {
     }
     pub fn datum_plan(&self) -> &AvroDatumPlan { &self.datum }
     pub fn convert(&self, datum: AvroDatum, next_union: &mut i32, context: &mut ConversionContext) -> Result<ConnectData> {
+        self.datum.retain_source(context)?;
+        datum.plan.retain_source(context)?;
         for charge in &self.charges { context.retain(Arc::clone(charge))?; }
         let bytes = resolution::value_bound(&datum.value, 0)?.checked_mul(self.connect.view_allocation_bound().checked_div(4096).unwrap_or(0).checked_add(2).ok_or_else(resolution::overflow)?).ok_or_else(resolution::overflow)?;
         context.reserve(bytes)?;
@@ -62,6 +73,20 @@ impl AvroPlan {
     }
 }
 impl AvroDatumPlan {
+    /// Admits and retains the bounded same-input source/native assembly; Connect graph/default conversion remains a separate stage.
+    pub fn parse_admitted_source(
+        text: &str,
+        references: &[String],
+        options: &BTreeMap<String, String>,
+        policy: SourcePolicy,
+        context: &mut ConversionContext,
+    ) -> Result<Self> {
+        java_schema::ParsedPair::parse(text, references, options, policy, context).map(java_schema::ParsedPair::into_datum)
+    }
+    fn retain_source(&self, context: &mut ConversionContext) -> Result<()> {
+        if let Some(source) = &self.source { source.retain(context)?; }
+        Ok(())
+    }
     pub fn parse(text: &str, references: &[String], options: &BTreeMap<String, String>) -> Result<Self> {
         Self::parse_with_name_policy(text, references, options, None)
     }
@@ -85,10 +110,11 @@ impl AvroDatumPlan {
         for schema in &mut references { restore_field_defaults(schema, metadata.root(), &metadata); }
         let mut names = BTreeMap::new(); collect_names(&root, &mut names);
         for reference in &references { collect_names(reference, &mut names); }
-        Ok(Self { root, names, metadata, defaults, unions, reader, schema_bytes })
+        Ok(Self { root, names, metadata, defaults, unions, reader, schema_bytes, source: None })
     }
     pub fn validate_reader(&self, selected: Option<&Self>) -> Result<()> { self.reader.validate(self, selected) }
     pub fn connect_plan(self: &Arc<Self>, branch: Option<u32>, version: Option<i32>, next_union: &mut i32, context: &mut ConversionContext) -> Result<AvroPlan> {
+        self.retain_source(context)?;
         let bytes = self.connect_allocation_bound(branch)?;
         let charge = context.reserve(bytes)?;
         let connect = self.build_connect(branch, version, next_union)?;
@@ -114,6 +140,7 @@ impl AvroDatumPlan {
         self.schema_bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(65_536)).and_then(|bytes| bytes.checked_add(defaults)).ok_or_else(resolution::overflow)
     }
     pub fn decode_datum(self: &Arc<Self>, bytes: &[u8], context: &mut ConversionContext) -> Result<AvroDatum> {
+        self.retain_source(context)?;
         if self.raw_bytes() {
             context.reserve(bytes.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Avro byte value allocation overflow"))?)?;
             return Ok(AvroDatum { value: Avro::Bytes(bytes.to_vec()), plan: Arc::clone(self) });
@@ -132,11 +159,16 @@ impl AvroDatumPlan {
         if !matches!(resolve(reader.selected_root(branch)?, &reader.names)?, Schema::Record(_)) { return Err(error("avro-decode", "Record writer resolved to a non-record output")); }
         Ok(AvroOutput::Reader { branch })
     }
-    pub fn prepare_output(&self, reader: &Self, datum: AvroDatum, _context: &mut ConversionContext) -> Result<(AvroOutput, AvroDatum)> {
+    pub fn prepare_output(&self, reader: &Self, datum: AvroDatum, context: &mut ConversionContext) -> Result<(AvroOutput, AvroDatum)> {
+        self.retain_source(context)?;
+        reader.retain_source(context)?;
+        datum.plan.retain_source(context)?;
         let output = self.select_output(reader, &datum)?;
         Ok((output, datum))
     }
     pub fn binary_result(self: &Arc<Self>, mut datum: AvroDatum, context: &mut ConversionContext) -> Result<AvroDatum> {
+        self.retain_source(context)?;
+        datum.plan.retain_source(context)?;
         if matches!(resolve(&self.root, &self.names)?, Schema::String) {
             let mut value = datum.value;
             while let Avro::Union(_, child) = value { value = *child; }

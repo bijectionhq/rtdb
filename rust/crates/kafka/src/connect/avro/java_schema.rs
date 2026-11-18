@@ -22,7 +22,8 @@ pub(super) use json::{JsonNode, JsonValue, Members};
 pub(super) use properties::Properties;
 pub(super) use evaluation::{Evaluation, RecursionState, Witness};
 pub(super) use context::{CycleContext, CycleReference};
-pub(super) use producer::{ParsedPair, PairSelection, SourcePolicy};
+pub(super) use producer::{AdmittedSource, ParsedPair, PairSelection};
+pub(in crate::connect) use producer::SourcePolicy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SchemaId { region: u64, index: usize }
@@ -32,7 +33,7 @@ pub(super) enum Type { Record, Enum, Array, Map, Union, Fixed, String, Bytes, In
 pub(super) enum FieldOrder { Ascending, Descending, Ignore }
 /// Supplies the effective source bytes limit after property parsing; DEFAULT covers an absent or invalid property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct FixedBytesLimit { effective: i32 }
+pub(in crate::connect) struct FixedBytesLimit { effective: i32 }
 
 pub(super) struct SchemasBuilder { owner: Schemas }
 struct Schemas {
@@ -150,8 +151,8 @@ fn validate_named(name: &Name) -> Result<()> {
 }
 
 impl FixedBytesLimit {
-    pub(super) const DEFAULT: Self = Self { effective: MAX_ARRAY_VM_LIMIT };
-    pub(super) fn effective(value: i32) -> Self { Self { effective: value } }
+    pub(in crate::connect) const DEFAULT: Self = Self { effective: MAX_ARRAY_VM_LIMIT };
+    pub(in crate::connect) fn effective(value: i32) -> Self { Self { effective: value } }
     fn check(self, size: i32) -> Result<()> {
         if size < 0 {
             return Err(error("avro-schema-unchecked", "Malformed fixed data length is negative"));

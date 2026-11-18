@@ -1,0 +1,53 @@
+= Admitted source ownership in Avro datum plans
+
+AvroDatumPlan::parse_admitted_source constructs the canonical source and native physical plan from the same original root/reference group under an explicit SourcePolicy and ConversionContext.
+The bounded lexical/native profile and canonical/native source distinctions are described in link:PRODUCER.adoc[].
+SourcePolicy and FixedBytesLimit are the existing copied effective policy values, reexported within connect for the eventual caller.
+No JVM property discovery, custom logical factory discovery or Registry entry change is introduced.
+
+== Owners and associations
+
+AvroDatumPlan is the passive immutable owner of its native schema trees, named definitions, metadata, defaults and optional AdmittedSource.
+AdmittedSource contains one canonical SchemaHandle and the native parsing reservation.
+Only a successfully validated ParsedPair can transfer that capability into its own datum plan.
+The transfer moves native trees and leases without cloning them, creating another index or retaining the wrapper object.
+The source capability is the final field of AvroDatumPlan, and its native reservation is the final field of AdmittedSource, so native payloads are destroyed before that reservation releases.
+A separately retained canonical handle keeps its own source arena leases independently.
+
+PairOwner is a private copied borrowed view of that actual datum owner and its validated source handle.
+PairSelection uses it for root, named definition, recursive Ref, field, union, array and map associations.
+No API attaches an unrelated same-name source graph, and native pointer equality is not a source identity relation.
+The published ParsedPair interface continues to support selection and retention as an independent owner.
+
+== Per-record retention
+
+ConversionContext::retains performs the same reservation Arc pointer-equality scan used by retain, without mutation or allocation.
+The native reservation is private to the assembly owner and is its completed-family marker in a conversion scope.
+During initial construction all canonical reservations precede native admission.
+On a fresh scope, canonical arena/text/default/property owners are retained first and the native reservation is inserted last.
+A failed canonical walk or native-retain limit cannot mark an incomplete family complete.
+Once complete, repeated source-consumer entries in the same scope do not repeat canonical traversal or its temporary scratch reservations.
+Fresh scopes still recount the retained source/native reservations against their own ceiling without reserving a second native owner.
+The existing context fields, reserve/retain arithmetic and shared MemoryBudget authority are unchanged.
+
+Real Connect-plan construction, datum decoding, output preparation, conversion and binary-result entry points now retain their actual source owners when present.
+Migration retains both the receiving plan and actual datum plan; resolution compilation/application/guided decoding retain writer and reader families, plus the actual datum family when supplied.
+AvroPlan and AvroResolution already retain their datum-plan Arcs, and AvroDatum retains its actual datum-plan Arc, so source provenance follows those real cache/value lifetimes.
+No matching, aliases, defaults, reader selection, wire or conversion algorithm is changed by these conditional retention calls.
+A legacy plan has no source capability and performs no source-retention work.
+
+== Integration scope
+
+The canonical module is registered for ordinary source compilation and this admitted-source datum API.
+The current Registry entry still calls the legacy parser and has not activated the new naming/source profile.
+The real Connect graph/default algorithms remain their existing route; moving the source capability does not qualify their old allocation multiplier or default/union behavior.
+ConnectData currently contains the existing public schema/value projection, with its containing conversion region retaining charges.
+Future typed source-schema/default/data IDs must remain in the graph/value owner that still demands them; the datum owner alone does not establish that later export boundary.
+
+Exact JavaString Connect text carriers, source LogicalType construction, canonical typed graph/default/cycle integration, generalized unions, arbitrary-key conversion and SMT/writer provenance remain required before full activation.
+Schema.parse's source LogicalType stage and AvroData's raw case-insensitive logicalType-property stage remain separate obligations.
+The existing A09 assertion conflict and every prior fixture body remain unchanged.
+
+Nine additive source regression functions cover ownership transfer without native-tree cloning, real Connect planning/decode, repeated-context retention, partial-retain rejection, pointer queries, resolution/default ownership, migration, cross-plan output and the legacy no-op path.
+The reader-default String expectation preserves the published reader_aliases_project_reorder_and_supply_defaults and nested guided-default observations.
+No regression, compiler, formatter, project helper or runtime has been executed under the Phase 1 work order.

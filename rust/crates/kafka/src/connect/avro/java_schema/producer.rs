@@ -4,10 +4,10 @@ mod input;
 mod native_bound;
 mod pair;
 use native_bound::NativeFootprint;
-pub(in crate::connect::avro) use pair::{ParsedPair, PairSelection};
+pub(in crate::connect::avro) use pair::{AdmittedSource, ParsedPair, PairSelection};
 
 #[derive(Clone, Copy)]
-pub(in crate::connect::avro) struct SourcePolicy { pub validate_defaults: bool, pub fixed_bytes: FixedBytesLimit }
+pub(in crate::connect) struct SourcePolicy { pub validate_defaults: bool, pub fixed_bytes: FixedBytesLimit }
 pub(super) struct CanonicalSource { pub root: SchemaHandle, native: NativeFootprint }
 struct Producer { builder: SchemasBuilder, policy: SourcePolicy, native: NativeFootprint }
 const SCHEMA_RESERVED: &[&str] = &["doc", "fields", "items", "name", "namespace", "size", "symbols", "values", "type", "aliases"];

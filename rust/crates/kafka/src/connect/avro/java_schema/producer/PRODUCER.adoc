@@ -79,7 +79,9 @@ When native construction or physical pairing fails, the constructor reports unsu
 Native handling of error records and some logical/parser representations remains subject to that compatibility boundary.
 No production converter activates this producer in this slice.
 The existing production parse still uses its unchanged legacy policy route.
-The producer child module is registered only by the separate reviewed integration delta; the encompassing canonical module remains test-gated.
+The canonical module is registered for the explicit admitted-source datum-plan API.
+The existing Registry entry still selects the legacy parser.
+link:ADMITTED-OWNER.adoc[] records source-capability transfer into actual datum/Connect/resolution owners and fresh-scope retention.
 
 All existing native/JVM assertion sources and the A09 null-default conflict remain unchanged.
 Full exact UTF16 input, graph/default provenance, generalized unions, arbitrary-key data conversion, schema/cache families, SMT retention and writer admission remain required before cohesive activation.
@@ -92,4 +94,4 @@ The complete available pre-package Java prefixes, full artifact licenses and not
 link:NOTICE-JACKSON[] retains the Jackson artifact notices separately.
 link:source-profile.json[] records exact source labels, native caps and the source-only qualification.
 link:order-uppercase-proof.json[] records the data-only derivation across all Unicode code points, including supplementary code points.
-There are 29 additive regression source functions across producer, pair, input and native-bound fixtures.
+There are 38 additive regression source functions across producer, pair, input and native-bound fixtures, including nine admitted-owner integration functions.

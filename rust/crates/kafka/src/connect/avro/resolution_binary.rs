@@ -4,6 +4,8 @@ use super::super::{AvroMap, BinaryWindow, MapKey, Preflight, datum};
 
 impl AvroResolution {
     pub fn decode_datum(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<AvroDatum> {
+        self.writer.retain_source(context)?;
+        self.reader.retain_source(context)?;
         if self.writer.raw_bytes() { return self.resolve(self.writer.decode_datum(bytes, context)?, context); }
         for charge in &self.charges { context.retain(Arc::clone(charge))?; }
         let mut reader = Preflight { bytes, offset: 0, window: BinaryWindow::new(bytes.len()), allocated: 4096, limit: context.allocation_limit(), names: &self.writer.names, view_bytes: 0 };

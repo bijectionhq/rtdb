@@ -27,6 +27,8 @@ enum Kind { Null, Boolean, Int, Long, Float, Double, String, Bytes, Fixed, Enum,
 
 impl AvroResolution {
     pub fn compile(writer: &Arc<AvroDatumPlan>, reader: &Arc<AvroDatumPlan>, context: &mut ConversionContext) -> Result<Self> {
+        writer.retain_source(context)?;
+        reader.retain_source(context)?;
         let bytes = writer.schema_bytes.checked_add(reader.schema_bytes).and_then(|bytes| bytes.checked_mul(64)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(overflow)?;
         let charge = context.reserve(bytes)?;
         let mut aliases = AliasIndex::default();
@@ -39,6 +41,9 @@ impl AvroResolution {
     }
 
     pub fn resolve(&self, datum: AvroDatum, context: &mut ConversionContext) -> Result<AvroDatum> {
+        self.writer.retain_source(context)?;
+        self.reader.retain_source(context)?;
+        datum.plan.retain_source(context)?;
         for charge in &self.charges { context.retain(Arc::clone(charge))?; }
         let bound = self.bound(self.root, &datum.value, 0)?;
         context.reserve(bound)?;
