@@ -40,6 +40,15 @@ async fn sql_range_bins_lower_period_bounds_and_support_lazy_cardinality() {
 }
 
 #[tokio::test]
+async fn range_bins_fields_allow_underscore_names_on_parenthesized_values() {
+    let sql = "SELECT (b.bin)._weight FROM UNNEST(RANGE_BINS(INTERVAL 'P30D', PERIOD(DATE '2024-01-01', DATE '2024-06-01'))) b(bin)";
+    let rows = query(sql, "UTC").await.unwrap();
+    assert_eq!(rows, [0.1118421052631579, 0.19736842105263158, 0.19736842105263158, 0.19736842105263158, 0.19736842105263158, 0.09868421052631579]
+        .map(|weight| vec![V::F64(weight)]));
+    assert_eq!(query("SELECT ({_field: 1})._field", "UTC").await.unwrap(), [vec![V::I64(1)]]);
+}
+
+#[tokio::test]
 async fn now_uses_the_query_clock_in_each_form() {
     let rows = query("SELECT NOW, now(), Now(3), CURRENT_TIMESTAMP(3), t.\"now\" FROM (VALUES (1)) t(\"now\")", "UTC").await.unwrap();
     let timestamp = |unit| V::Timestamp { value: 0, unit, timezone: Some("UTC".into()) };

@@ -1390,20 +1390,12 @@ impl<'a> Tokenizer<'a> {
                 }
                 // numbers and period
                 '0'..='9' | '.' => {
-                    // special case where if ._ is encountered after a word then that word
-                    // is a table and the _ is the start of the col name.
-                    // if the prev token is not a word, then this is not a valid sql
-                    // word or number.
                     if ch == '.' && chars.peekable.clone().nth(1) == Some('_') {
-                        if let Some(Token::Word(_)) = prev_token {
+                        if matches!(prev_token, Some(Token::Word(_) | Token::RParen | Token::RBracket | Token::RBrace)) {
                             chars.next();
                             return Ok(Some(Token::Period));
                         }
-
-                        return self.tokenizer_error(
-                            chars.location(),
-                            "Unexpected character '_'".to_string(),
-                        );
+                        return self.tokenizer_error(chars.location(), "Unexpected character '_'".to_string());
                     }
 
                     let mut s = self.tokenize_number_part(chars, |ch| ch.is_ascii_digit())?;

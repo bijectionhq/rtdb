@@ -455,6 +455,7 @@ SQL normalizes literal truncation fields to uppercase and accepts the grammar's 
 `AGE(end, start)` retains calendar period and duration components.
 `DATE_BIN` requires an interval literal stride; `RANGE_BINS` takes that stride, a period and an optional origin, lowering the period to its lower and upper bounds.
 An unbounded upper period bound propagates null through `RANGE_BINS`.
+Each bin exposes `_from`, `_to` and `_weight` through ordinary field access, including `(bin)._weight`.
 Current and local clock forms support their unsigned integer precision argument; `CURRENT_TIMEZONE` exposes the session zone.
 `NOW` is a synonym for `CURRENT_TIMESTAMP` in expressions, including table periods and query settings.
 `CURRENT_TIME`, `LOCAL_TIME` and `LOCAL_TIMESTAMP` require a precision when parentheses are present; `CURRENT_TIMESTAMP()` and `NOW()` retain their empty forms.
