@@ -20,6 +20,7 @@
             [xtdb.update-test :as original-update]
             [xtdb.operator.patch-test :as original-patch]
             [xtdb.operator.group-by.percentile-test :as original-percentile]
+            [xtdb.operator.scan-test :as original-scan]
             [xtdb.operator.unnest-test :as original-unnest]
             [xtdb.expression.pg-test :as original-pg-expression]
             [xtdb.test-util :as tu]
@@ -514,6 +515,8 @@
 (deftest-original-api original-unnest/test-vector-not-found-4343)
 
 (deftest-original-api original-unnest/unnest-ordinality-join-issue-4131)
+
+(deftest-original-api original-scan/live-hash-trie-branches-get-expanded-3247)
 
 (deftest-original-api original-pg-expression/test-col-description)
 

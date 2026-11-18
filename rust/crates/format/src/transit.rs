@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, mem::size_of, sync::Arc};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 
 const CACHE_LIMIT: usize = 44 * 44;
 
@@ -67,13 +67,44 @@ enum Decoded<V> {
     Tag(String),
 }
 
-struct ReadCache<V> { slots: Vec<Decoded<V>>,next: usize }
+#[derive(Default)]
+struct ReadAdmission(Option<Arc<MemoryReservation>>);
+impl ReadAdmission {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> { Ok(Self(Some(memory.reserve(4096)?))) }
+    fn items<T>(&mut self, count: usize) -> Result<()> {
+        self.bytes(count.checked_mul(size_of::<T>()).ok_or_else(read_overflow)?)
+    }
+    fn bytes(&mut self, bytes: usize) -> Result<()> {
+        if let Some(reservation) = &mut self.0 {
+            let total = reservation.bytes().checked_add(bytes).ok_or_else(read_overflow)?;
+            Arc::get_mut(reservation).expect("Transit decode owns its reservation").grow_to(total)?;
+        }
+        Ok(())
+    }
+}
+fn read_overflow() -> Anomaly { invalid("Transit decode allocation exceeds addressable memory") }
+
+struct CacheEntry<V> { value: Decoded<V>, clone_bytes: usize }
+struct ReadCache<V> { slots: Vec<CacheEntry<V>>, next: usize, admission: ReadAdmission }
 impl<V: Clone> ReadCache<V> {
-    fn new() -> Self { Self { slots: Vec::new(),next: 0 } }
-    fn insert(&mut self,value: Decoded<V>) {
+    fn new() -> Self { Self { slots: Vec::new(), next: 0, admission: ReadAdmission::default() } }
+    fn get(&mut self, index: usize) -> Result<Decoded<V>> {
+        let entry = self.slots.get(index).ok_or_else(|| invalid("Transit cache code references an unwritten entry"))?;
+        self.admission.bytes(entry.clone_bytes)?;
+        Ok(entry.value.clone())
+    }
+    fn insert(&mut self, value: &Decoded<V>, clone_bytes: usize) -> Result<()> {
+        if self.slots.len() == self.slots.capacity() && self.slots.len() < CACHE_LIMIT && self.admission.0.is_some() {
+            let capacity = (self.slots.len() * 2).clamp(8, CACHE_LIMIT);
+            self.admission.items::<CacheEntry<V>>(capacity)?;
+            self.slots.try_reserve_exact(capacity - self.slots.len()).map_err(invalid)?;
+        }
+        self.admission.bytes(clone_bytes)?;
+        let entry = CacheEntry { value: value.clone(), clone_bytes };
         if self.next == CACHE_LIMIT { self.next = 0; }
-        if self.next < self.slots.len() { self.slots[self.next] = value; } else { self.slots.push(value); }
+        if self.next < self.slots.len() { self.slots[self.next] = entry; } else { self.slots.push(entry); }
         self.next += 1;
+        Ok(())
     }
 }
 
@@ -87,11 +118,18 @@ pub fn decode_msgpack(bytes: &[u8]) -> Result<TransitValue> {
     unpack_value(packed_msgpack(bytes)?, false, &mut ReadCache::new(), 0, &mut WireValues)
 }
 
+/// Decodes one MessagePack value, admitting wire containers and cache expansion before allocation.
+/// Retain the returned lease until the value is dropped or adopted by another charged owner.
+pub fn decode_msgpack_in(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<(TransitValue, Arc<MemoryReservation>)> {
+    let mut cursor = Cursor { bytes, offset: 0, admission: ReadAdmission::new(memory)? };
+    let packed = cursor.complete_value()?;
+    let mut cache = ReadCache { admission: ReadAdmission::new(memory)?, ..ReadCache::new() };
+    let value = unpack_value(packed, false, &mut cache, 0, &mut WireValues)?;
+    Ok((value, cache.admission.0.expect("tracked Transit decode has a reservation")))
+}
+
 fn packed_msgpack(bytes: &[u8]) -> Result<Packed> {
-    let mut cursor = Cursor { bytes, offset: 0 };
-    let packed = cursor.value(0)?;
-    if cursor.offset != bytes.len() { return Err(invalid("Trailing bytes after Transit value")); }
-    Ok(packed)
+    Cursor { bytes, offset: 0, admission: ReadAdmission::default() }.complete_value()
 }
 
 /// Decodes Transit JSON, retaining object entry order for Transit cache references.
@@ -120,7 +158,7 @@ pub fn decode_json_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
 
 /// Reads consecutive top-level values; a truncated trailing value is an error.
 pub fn decode_msgpack_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
-    let mut cursor = Cursor { bytes, offset: 0 };
+    let mut cursor = Cursor { bytes, offset: 0, admission: ReadAdmission::default() };
     let mut values = Vec::new();
     while cursor.offset < bytes.len() { values.push(unpack_value(cursor.value(0)?, false, &mut ReadCache::new(), 0, &mut WireValues)?); }
     Ok(values)
@@ -265,8 +303,10 @@ fn string_value<B: TransitReadBuilder>(value: String, key: bool, cache: &mut Rea
             [high, low] if (48..92).contains(high) && (48..92).contains(low) => usize::from(*high - 48) * 44 + usize::from(*low - 48),
             _ => return Err(invalid("Invalid Transit cache code")),
         };
-        return cache.slots.get(index).cloned().ok_or_else(|| invalid("Transit cache code references an unwritten entry"));
+        return cache.get(index);
     }
+    let clone_bytes = value.len().checked_mul(2).and_then(|bytes| bytes.checked_add(size_of::<B::Value>())).ok_or_else(read_overflow)?;
+    cache.admission.bytes(clone_bytes)?;
     let decoded = if let Some(tag) = value.strip_prefix("~#") {
         Decoded::Tag(tag.into())
     } else if value.starts_with("~~") || value.starts_with("~^") || value.starts_with("~`") {
@@ -286,7 +326,7 @@ fn string_value<B: TransitReadBuilder>(value: String, key: bool, cache: &mut Rea
         Decoded::Value(builder.string(value.clone())?)
     };
     if cacheable(&value, key) {
-        cache.insert(decoded.clone());
+        cache.insert(&decoded, clone_bytes)?;
     }
     Ok(decoded)
 }
@@ -309,6 +349,7 @@ fn unpack<B: TransitReadBuilder>(packed: Packed, key: bool, cache: &mut ReadCach
         Packed::Array(values) => return unpack_array(values,None,cache,depth,builder).map(Decoded::Value),
         Packed::Map(entries) => {
             let count = entries.len();
+            cache.admission.items::<(B::Value, B::Value)>(count)?;
             let mut map = builder.start_map(count)?;
             for (key, value) in entries {
                 match unpack(key, true, cache, depth + 1, builder)? {
@@ -329,6 +370,10 @@ fn unpack_tagged<B: TransitReadBuilder>(tag: String,representation: Packed,cache
     if builder.array_handler(&tag) {
         if let Packed::Array(values) = representation { return unpack_array(values,Some(&tag),cache,depth,builder); }
     }
+    cache.admission.items::<B::Value>(1)?;
+    if let ("cmap", Packed::Array(values)) = (tag.as_str(), &representation) {
+        cache.admission.items::<(B::Value, B::Value)>(values.len() / 2)?;
+    }
     let representation = unpack_value(representation,false,cache,depth,builder)?;
     builder.tagged(tag,representation)
 }
@@ -336,9 +381,11 @@ fn unpack_tagged<B: TransitReadBuilder>(tag: String,representation: Packed,cache
 fn unpack_array<B: TransitReadBuilder>(values: Vec<Packed>,tag: Option<&str>,cache: &mut ReadCache<B::Value>,depth: usize,builder: &mut B) -> Result<B::Value> {
     if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
     let size = values.len();let mut values = values.into_iter();
+    cache.admission.items::<B::Value>(size)?;
     let mut array = builder.start_array(tag,size)?;
     if let Some(first) = values.next() {
         if matches!(&first,Packed::String(marker) if marker == "^ ") {
+            cache.admission.items::<(B::Value, B::Value)>(size / 2)?;
             let mut map = builder.start_map(size / 2)?;
             while let Some(key) = values.next() {
                 let value = values.next().ok_or_else(||invalid("Transit map has an unmatched key"))?;
@@ -367,7 +414,7 @@ fn tagged(tag: String, representation: TransitValue) -> Result<TransitValue> {
         let TransitValue::Array(values) = representation else { return Err(invalid("Composite map representation is not an array")); };
         if values.len() % 2 != 0 { return Err(invalid("Composite map has an unmatched key")); }
         let mut values = values.into_iter();
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(values.len() / 2);
         while let Some(key) = values.next() { entries.push((key, values.next().ok_or_else(|| invalid("Composite map has no value"))?)); }
         return Ok(TransitValue::Map(entries));
     }
@@ -387,9 +434,15 @@ fn tagged(tag: String, representation: TransitValue) -> Result<TransitValue> {
     Ok(TransitValue::Tagged { tag, representation: Box::new(representation) })
 }
 
-struct Cursor<'a> { bytes: &'a [u8], offset: usize }
+struct Cursor<'a> { bytes: &'a [u8], offset: usize, admission: ReadAdmission }
 
 impl<'a> Cursor<'a> {
+    fn complete_value(&mut self) -> Result<Packed> {
+        let value = self.value(0)?;
+        if self.offset != self.bytes.len() { return Err(invalid("Trailing bytes after Transit value")); }
+        Ok(value)
+    }
+
     fn take(&mut self, count: usize) -> Result<&'a [u8]> {
         let end = self.offset.checked_add(count).ok_or_else(|| invalid("MessagePack length overflow"))?;
         let bytes = self.bytes.get(self.offset..end).ok_or_else(|| invalid("Truncated MessagePack value"))?;
@@ -402,11 +455,14 @@ impl<'a> Cursor<'a> {
     }
 
     fn text(&mut self, len: usize) -> Result<Packed> {
-        Ok(Packed::String(std::str::from_utf8(self.take(len)?).map_err(invalid)?.into()))
+        let text = std::str::from_utf8(self.take(len)?).map_err(invalid)?;
+        self.admission.bytes(len)?;
+        Ok(Packed::String(text.into()))
     }
 
     fn array(&mut self, count: usize, depth: usize) -> Result<Packed> {
         if count > self.bytes.len().saturating_sub(self.offset) { return Err(invalid("MessagePack array exceeds its input")); }
+        self.admission.items::<Packed>(count)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count { values.push(self.value(depth + 1)?); }
         Ok(Packed::Array(values))
@@ -414,6 +470,7 @@ impl<'a> Cursor<'a> {
 
     fn map(&mut self, count: usize, depth: usize) -> Result<Packed> {
         if count > self.bytes.len().saturating_sub(self.offset) / 2 { return Err(invalid("MessagePack map exceeds its input")); }
+        self.admission.items::<(Packed, Packed)>(count)?;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count { entries.push((self.value(depth + 1)?, self.value(depth + 1)?)); }
         Ok(Packed::Map(entries))

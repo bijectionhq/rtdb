@@ -153,7 +153,7 @@ impl SourceTransaction {
 }
 
 struct SourceOperation<'a> {
-    body: Value,
+    body: BTreeMap<String, Value>,
     documents: Option<(String, &'a Documents)>,
 }
 
@@ -199,7 +199,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         }
         Operation::Removed(name) => return Err(Anomaly::unsupported("rtdb.tx/removed-operation", format!("Cannot encode removed operation {name}"))),
     };
-    Ok((tag.into(), SourceOperation { body: Value::Struct(body), documents: docs }))
+    Ok((tag.into(), SourceOperation { body, documents: docs }))
 }
 
 pub(crate) fn document_id(document: &BTreeMap<String, Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
@@ -246,23 +246,29 @@ fn named_union<T>(
 
 fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
     let (values, documents): (Vec<_>, Vec<_>) = values.into_iter().map(|value| (value.body, value.documents)).unzip();
-    let mut ty = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
-    if let LogicalType::Struct(fields) = &mut ty {
-        for temporal in ["_valid_from", "_valid_to"] {
-            if fields.contains_key(temporal) { fields.insert(temporal.into(), LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).maybe()); }
+    let types = values.iter().map(|value| LogicalType::Struct(value.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect())).collect::<Vec<_>>();
+    let LogicalType::Struct(mut types) = LogicalType::join_all(&types) else { return Err(invalid("Transaction operation leg has no struct layout")); };
+    for temporal in ["_valid_from", "_valid_to"] {
+        if let Some(ty) = types.get_mut(temporal) {
+            *ty = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).maybe();
         }
-        if fields.contains_key("iids") { fields.insert("iids".into(), LogicalType::list(LogicalType::Scalar(ScalarType::FixedSizeBinary(16)))); }
-        if fields.contains_key("args") { fields.insert("args".into(), LogicalType::Scalar(ScalarType::Binary).maybe()); }
     }
-    let array = arrays.column(estimate_builder_bytes(&ty, &values)?, || copy_array(&ty, &values))?;
-    if documents.iter().all(Option::is_none) { return Ok(array); }
-    let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
-    let structs = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document operation is not a struct"))?;
-    let mut fields = structs.fields().to_vec();
-    let mut columns = structs.columns().to_vec();
-    fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
-    columns.push(documents);
-    Ok(Arc::new(StructArray::try_new(fields.into(), columns, structs.nulls().cloned()).map_err(|error| invalid(error.to_string()))?))
+    if let Some(ty) = types.get_mut("iids") { *ty = LogicalType::list(LogicalType::Scalar(ScalarType::FixedSizeBinary(16))); }
+    if let Some(ty) = types.get_mut("args") { *ty = LogicalType::Scalar(ScalarType::Binary).maybe(); }
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    for (name, ty) in types {
+        let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
+        let bound = estimate_builder_bytes_refs(&ty, cells())?;
+        columns.push(arrays.column(bound, || copy_array(&ty, &cells().cloned().collect::<Vec<_>>()))?);
+        fields.push(Arc::new(to_field(&name, &ty)?));
+    }
+    if documents.iter().any(Option::is_some) {
+        let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
+        fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
+        columns.push(documents);
+    }
+    Ok(Arc::new(StructArray::try_new_with_length(fields.into(), columns, None, values.len()).map_err(|error| invalid(error.to_string()))?))
 }
 
 fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {

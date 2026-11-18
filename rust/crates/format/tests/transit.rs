@@ -1,5 +1,5 @@
-use rtdb_format::transit::{TransitValue as V, decode_anomaly, decode_msgpack, encode_anomaly, encode_msgpack, from_json_value, to_json_value};
-use rtdb_types::Anomaly;
+use rtdb_format::transit::{TransitValue as V, decode_anomaly, decode_msgpack, decode_msgpack_in, encode_anomaly, encode_msgpack, from_json_value, to_json_value};
+use rtdb_types::{Anomaly, MemoryBudget};
 
 #[test]
 fn keyword_and_symbol_cache_references_preserve_their_types() {
@@ -8,6 +8,24 @@ fn keyword_and_symbol_cache_references_preserve_their_types() {
     assert!(bytes.windows(2).any(|pair| pair == b"^0"));
     assert!(bytes.windows(2).any(|pair| pair == b"^1"));
     assert_eq!(decode_msgpack(&bytes).unwrap(), value);
+}
+
+#[test]
+fn budgeted_transit_decode_charges_each_cache_expansion() {
+    let repeated_key = V::Keyword("long".repeat(4096));
+    let value = V::Array(vec![repeated_key; 256]);
+    let bytes = encode_msgpack(&value).unwrap();
+    assert!(bytes.len() < 1 << 15);
+    let small = MemoryBudget::new(1 << 20);
+    assert_eq!(decode_msgpack_in(&bytes, &small).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(small.used_bytes(), 0);
+    let large = MemoryBudget::new(16 << 20);
+    let (decoded, reservation) = decode_msgpack_in(&bytes, &large).unwrap();
+    assert_eq!(decoded, value);
+    assert!(large.used_bytes() >= 4 << 20);
+    drop(decoded);
+    drop(reservation);
+    assert_eq!(large.used_bytes(), 0);
 }
 
 #[test]

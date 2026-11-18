@@ -37,6 +37,7 @@ JSON-LD and Transit use the pinned scalar and container representations.
 Transit legacy dates accept signed epoch milliseconds and convert them to UTC timestamps for storage and query arguments.
 Transit UUIDs accept both text and the JVM MessagePack pair of signed 64-bit words.
 Transit vectors and tagged sequential lists both map to Arrow lists, including nested and empty lists.
+Embedded MessagePack requests reserve native conversion storage from the decoded Transit graph and retain the resulting value's storage until its next owner adopts it.
 
 Several pinned encoders differ from PostgreSQL's usual binary representations.
 Interval and timestamp-range output remain textual in both formats, and OID/regclass/regproc output remains unsigned decimal ASCII in both formats.

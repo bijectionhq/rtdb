@@ -32,10 +32,7 @@ pub(crate) struct TransactionInput {
 
 impl TransactionInput {
     pub(crate) fn decode(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let mut reservation = memory.reserve(crate::add(crate::mul(bytes.len(), 4096)?, 8192)?)?;
-        let value = rtdb_pg_codec::from_transit(rtdb_format::transit::decode_msgpack(bytes)?)?;
-        let retained = crate::add(value.retained_bytes()?, 8192)?;
-        Arc::get_mut(&mut reservation).expect("input decoding owns its reservation").shrink_to(retained)?;
+        let (value, reservation) = rtdb_pg_codec::decode_transit_msgpack(bytes, memory)?.into_parts();
         Ok(Self { value, reservation })
     }
 }

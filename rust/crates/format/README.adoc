@@ -18,6 +18,8 @@ Neither protobuf generation nor compilation has run during Phase 1.
 
 The source and replica envelopes retain the source header, optional term sequence, optional external token, database operation, and transaction payload bytes.
 The Transit codec retains tagged values, legacy error tags, and cache substitutions while decoding MessagePack.
+Budgeted MessagePack decoding admits the packing graph, decoded containers and each cache expansion before allocating them.
+The returned Transit value retains its own reservation after the packing graph is consumed.
 The current schema writer records version 6; other storage generations must be qualified and registered before recovery accepts them.
 Legacy source transaction bytes and obsolete flush records retain the JVM dispatch behavior.
 Trie recency keys use `CivilDate` across the nonnegative Java calendar range through year 999999999, rendering unsigned years of at least four digits.
