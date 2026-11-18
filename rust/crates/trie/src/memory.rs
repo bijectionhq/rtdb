@@ -56,7 +56,7 @@ impl Leaf {
     pub fn sorted_rows<R: IidReader + ?Sized>(&self, reader: &R) -> Result<Arc<[u32]>> {
         if self.log.is_empty() { return Ok(Arc::clone(&self.data)); }
         if let Some(sorted) = self.sorted.get() { return Ok(Arc::clone(sorted)); }
-        let log = sort(reader, &self.log)?;
+        let log = sort(reader, self.log.iter().copied())?;
         let merged: Arc<[u32]> = merge(reader, &self.data, &log)?.into();
         let _ = self.sorted.set(Arc::clone(&merged));
         Ok(merged)
@@ -118,18 +118,30 @@ impl MemoryHashTrie {
     pub fn add<R: IidReader + ?Sized>(&self, reader: &R, row: u32) -> Result<Self> { self.add_all(reader, &[row]) }
 
     pub fn add_all<R: IidReader + ?Sized>(&self, reader: &R, rows: &[u32]) -> Result<Self> {
-        for row in rows {
-            if !Bucketer::DEFAULT.contains(self.root.path(), reader.iid(*row)?)? {
+        self.add_rows(reader, rows.iter().copied())
+    }
+
+    /// Returns a trie with the indexes in `start..start + count` added.
+    /// A zero count returns a clone that shares this root.
+    ///
+    /// # Errors
+    ///
+    /// An exclusive end outside `u32` returns `rtdb/trie-row-overflow` before any IID lookup.
+    /// Reader errors propagate.
+    /// Validation stops with `rtdb/trie-root-path` at the first IID outside this root's path.
+    pub fn add_range<R: IidReader + ?Sized>(&self, reader: &R, start: u32, count: u32) -> Result<Self> {
+        let end = start.checked_add(count).ok_or_else(|| Anomaly::incorrect("rtdb/trie-row-overflow", "Trie row range exceeds u32"))?;
+        self.add_rows(reader, start..end)
+    }
+
+    fn add_rows<R: IidReader + ?Sized>(&self, reader: &R, rows: impl ExactSizeIterator<Item = u32> + Clone) -> Result<Self> {
+        for row in rows.clone() {
+            if !Bucketer::DEFAULT.contains(self.root.path(), reader.iid(row)?)? {
                 return Err(Anomaly::incorrect("rtdb/trie-root-path", "Added IID lies outside the trie's root path"));
             }
         }
-        if rows.is_empty() { return Ok(self.clone()); }
-        Ok(Self { root: add_all(&self.root, reader, rows, self.config)?, config: self.config })
-    }
-
-    pub fn add_range<R: IidReader + ?Sized>(&self, reader: &R, start: u32, count: u32) -> Result<Self> {
-        let end = start.checked_add(count).ok_or_else(|| Anomaly::incorrect("rtdb/trie-row-overflow", "Trie row range exceeds u32"))?;
-        self.add_all(reader, &(start..end).collect::<Vec<_>>())
+        if rows.len() == 0 { return Ok(self.clone()); }
+        Ok(Self { root: insert_rows(&self.root, reader, rows, self.config)?, config: self.config })
     }
 
     pub fn compact_logs<R: IidReader + ?Sized>(&self, reader: &R) -> Result<Self> {
@@ -163,8 +175,8 @@ fn compare<R: IidReader + ?Sized>(reader: &R, left: u32, right: u32) -> Result<O
     Ok(reader.iid(left)?.cmp(&reader.iid(right)?).then_with(|| right.cmp(&left)))
 }
 
-fn sort<R: IidReader + ?Sized>(reader: &R, rows: &[u32]) -> Result<Vec<u32>> {
-    let mut keyed = rows.iter().map(|row| Ok((reader.iid(*row)?, *row))).collect::<Result<Vec<_>>>()?;
+fn sort<R: IidReader + ?Sized>(reader: &R, rows: impl Iterator<Item = u32>) -> Result<Vec<u32>> {
+    let mut keyed = rows.map(|row| Ok((reader.iid(row)?, row))).collect::<Result<Vec<_>>>()?;
     keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
     Ok(keyed.into_iter().map(|(_, row)| row).collect())
 }
@@ -181,11 +193,13 @@ fn merge<R: IidReader + ?Sized>(reader: &R, left: &[u32], right: &[u32]) -> Resu
     Ok(merged)
 }
 
-fn add_all<R: IidReader + ?Sized>(node: &Arc<TrieNode>, reader: &R, rows: &[u32], config: TrieConfig) -> Result<Arc<TrieNode>> {
+fn insert_rows<R: IidReader + ?Sized>(
+    node: &Arc<TrieNode>, reader: &R, rows: impl ExactSizeIterator<Item = u32>, config: TrieConfig,
+) -> Result<Arc<TrieNode>> {
     match node.as_ref() {
         TrieNode::Branch { path, children } => {
             let mut buckets: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::new());
-            for row in rows { buckets[Bucketer::DEFAULT.bucket(reader.iid(*row)?, path.len())? as usize].push(*row); }
+            for row in rows { buckets[Bucketer::DEFAULT.bucket(reader.iid(row)?, path.len())? as usize].push(row); }
             let mut next = children.clone();
             for (bucket, rows) in buckets.iter().enumerate() {
                 if rows.is_empty() { continue; }
@@ -193,7 +207,7 @@ fn add_all<R: IidReader + ?Sized>(node: &Arc<TrieNode>, reader: &R, rows: &[u32]
                     Some(child) => Arc::clone(child),
                     None => Arc::new(TrieNode::Leaf(Leaf::empty(path.child(bucket as u8, Bucketer::DEFAULT)?))),
                 };
-                next[bucket] = Some(add_all(&child, reader, rows, config)?);
+                next[bucket] = Some(insert_rows(&child, reader, rows.iter().copied(), config)?);
             }
             Ok(Arc::new(TrieNode::Branch { path: path.clone(), children: next }))
         }
@@ -201,12 +215,12 @@ fn add_all<R: IidReader + ?Sized>(node: &Arc<TrieNode>, reader: &R, rows: &[u32]
             let count = leaf.log.len().checked_add(rows.len()).ok_or_else(|| Anomaly::incorrect("rtdb/trie-size", "Trie pending row count overflow"))?;
             if count <= config.log_limit {
                 let mut log = leaf.log.to_vec();
-                log.extend_from_slice(rows);
+                log.extend(rows);
                 let next = Arc::new(TrieNode::Leaf(Leaf::new(leaf.path.clone(), Arc::clone(&leaf.data), log.into())));
                 if count == config.log_limit { compact(&next, reader, config) } else { Ok(next) }
             } else {
                 let new_rows = sort(reader, rows)?;
-                let pending = sort(reader, &leaf.log)?;
+                let pending = sort(reader, leaf.log.iter().copied())?;
                 let merged = merge(reader, &leaf.data, &merge(reader, &pending, &new_rows)?)?;
                 build_subtree(leaf.path.clone(), merged, reader, config, true)
             }

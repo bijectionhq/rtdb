@@ -1,7 +1,7 @@
-use std::convert::Infallible;
+use std::{cell::RefCell, convert::Infallible, sync::Arc};
 
-use rtdb_trie::{Bucketer, ColumnSummary, Comparison, EventMerge, EventRow, MemoryHashTrie, PageSummary, Path, PersistedNode, PersistedTrie, PruningOptions, ScalarBounds, TemporalSummary, TrieConfig, select_pages};
-use rtdb_types::{EventHeader, EventOp, Iid, Interval, TemporalBounds, Timestamp, Value};
+use rtdb_trie::{Bucketer, ColumnSummary, Comparison, EventMerge, EventRow, IidReader, MemoryHashTrie, PageSummary, Path, PersistedNode, PersistedTrie, PruningOptions, ScalarBounds, TemporalSummary, TrieConfig, select_pages};
+use rtdb_types::{EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 fn iid(value: u32) -> Iid {
     let mut iid = [0; 16];
@@ -95,6 +95,37 @@ fn independent_derivations_cannot_overwrite_each_others_pending_rows() {
     assert_eq!(first.sorted_rows(&iids).unwrap(), vec![0, 1, 2]);
     assert_eq!(second.sorted_rows(&iids).unwrap(), vec![0, 3]);
     assert_eq!(base.sorted_rows(&iids).unwrap(), vec![0]);
+}
+
+#[test]
+fn adding_a_range_stops_at_the_first_outside_iid_and_checks_overflow_before_lookup() {
+    struct Reader<'a> {
+        iids: &'a [Iid],
+        visited: RefCell<Vec<u32>>,
+    }
+
+    impl IidReader for Reader<'_> {
+        fn iid(&self, row: u32) -> Result<Iid> {
+            self.visited.borrow_mut().push(row);
+            self.iids.iid(row)
+        }
+    }
+
+    let trie = MemoryHashTrie::with_root_path(TrieConfig::new(1, 1).unwrap(), Path::new(vec![0], Bucketer::DEFAULT).unwrap()).unwrap();
+    let iids = [iid(0), iid(0x1000_0000), iid(0x4000_0000), iid(0x2000_0000)];
+    let reader = Reader { iids: &iids, visited: RefCell::new(Vec::new()) };
+
+    let unchanged = trie.add_range(&reader, u32::MAX, 0).unwrap();
+    assert!(Arc::ptr_eq(trie.root(), unchanged.root()));
+    let overflow = trie.add_range(&reader, u32::MAX, 1).unwrap_err();
+    assert_eq!(overflow.code, "rtdb/trie-row-overflow");
+    assert!(reader.visited.borrow().is_empty());
+
+    let outside = trie.add_range(&reader, 1, 3).unwrap_err();
+    assert_eq!(outside.code, "rtdb/trie-root-path");
+    assert_eq!(reader.visited.borrow().as_slice(), &[1, 2]);
+    assert!(trie.root().as_ref().path().as_slice() == [0]);
+    assert!(trie.sorted_rows(&iids[..]).unwrap().is_empty());
 }
 
 #[test]
