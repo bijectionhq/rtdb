@@ -67,7 +67,9 @@ link:COPYRIGHT[] preserves every full primary pre-package prefix, including empt
 link:source-profile.json[] records the source intervals, native owner/admission profile and activation boundary.
 Existing link:../../names/LICENSE-APACHE[], link:../../names/LICENSE[] and link:../../names/ADDITIONAL_LICENSE_INFO[] remain retained.
 
-Four new pool regression sources cover overlapping captures and replacement, domain/native-thread isolation, retained lease accounting after context drop, and rejected thread-index growth before mutation.
+TokenBuffer exposes its existing fixed-length immutable/mutable unit slices and retain operation within Connect so a Registry Reader can borrow the admitted backing without allocating a replacement.
+The window borrow ends before returning that same owner through the captured InputBuffers authority.
+Five pool regression sources cover overlapping captures and replacement, domain/native-thread isolation, retained lease accounting after context drop, rejected thread-index growth before mutation, and same-thread borrowed-backing/content reuse.
 Two additive Reader regression sources cover real acquisition/snapshot interleaving and IOContext-close failure order.
 An additive Runtime source induces real context denial during parser creation and token return, verifies skipped source cleanup and successful fresh-context retry, and checks final reservation release.
 Every previously published Runtime6, corrected StringReader22 and older Avro assertion body remains unchanged.

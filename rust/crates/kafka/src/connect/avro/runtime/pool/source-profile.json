@@ -83,7 +83,7 @@
   },
   "activation": "Avro-only runtime/Reader module/export gates and two Reader entry-method gates removed; root-owned stock factory/Registry consumer co-published",
   "regression_functions": {
-    "new_pool": 4,
+    "new_pool": 5,
     "additive_reader": 2,
     "published_runtime_preserved": 6,
     "published_corrected_reader_prefix_preserved": 22,
@@ -94,5 +94,6 @@
     "broader Registry input-window pull/nullable DTO activation and char-slot sharing",
     "typed graph/default/generalized-union/arbitrary-key/cache/SMT/writer integration",
     "native unmatched/nonfinite representations and A09 assertion/source conflict"
-  ]
+  ],
+  "token_buffer_view": "existing data/data_mut/retain visible within Connect; borrowed fixed-length UTF16 backing and captured lease, no replacement buffer"
 }

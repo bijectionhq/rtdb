@@ -10,9 +10,9 @@ impl TokenBuffer {
         Ok(Self { units, charge })
     }
     pub(in crate::connect) fn len(&self) -> usize { self.units.len() }
-    pub(super) fn data(&self) -> &[u16] { &self.units }
-    pub(super) fn data_mut(&mut self) -> &mut [u16] { &mut self.units }
-    fn retain(&self, context: &mut ConversionContext) -> Result<()> { context.retain(Arc::clone(&self.charge)) }
+    pub(in crate::connect) fn data(&self) -> &[u16] { &self.units }
+    pub(in crate::connect) fn data_mut(&mut self) -> &mut [u16] { &mut self.units }
+    pub(in crate::connect) fn retain(&self, context: &mut ConversionContext) -> Result<()> { context.retain(Arc::clone(&self.charge)) }
 }
 
 /// A parser's capture lasts through close or native abandonment; storage stays charged through final use.

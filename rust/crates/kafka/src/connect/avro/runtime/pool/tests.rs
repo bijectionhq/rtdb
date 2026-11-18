@@ -131,3 +131,37 @@ fn thread_index_growth_is_admitted_before_reallocation_and_rejected_insert_stays
     assert_eq!(entries.values.len(), 5);
     assert!(entries.values.capacity() >= 8);
 }
+
+#[test]
+fn borrowed_token_units_and_backing_survive_return_and_same_thread_reacquisition() {
+    let budget = MemoryBudget::new(usize::MAX);
+    let mut context = ConversionContext::new(Arc::clone(&budget));
+    let pool = ThreadTokenPool::new(Profile::Jackson221, &mut context).unwrap();
+    let mut first = pool.buffers();
+    first.acquire(&mut context).unwrap();
+    let mut buffer = first.take(0, &mut context).unwrap();
+    buffer.data_mut()[..4].copy_from_slice(&[0xd800, 0, 0xdc00, 65]);
+    let backing = buffer.data().as_ptr();
+    first.give(buffer, &mut context).unwrap();
+    first.close(&mut context).unwrap();
+    drop(first);
+    drop(context);
+    let used = budget.used_bytes();
+    let mut next = ConversionContext::new(Arc::clone(&budget));
+    let mut second = pool.buffers();
+    second.acquire(&mut next).unwrap();
+    let buffer = second.take(0, &mut next).unwrap();
+    assert_eq!(buffer.data().as_ptr(), backing);
+    assert_eq!(&buffer.data()[..4], &[0xd800, 0, 0xdc00, 65]);
+    let mut denied = ConversionContext::with_limit(Arc::clone(&budget), 0);
+    assert!(buffer.retain(&mut denied).is_err());
+    buffer.retain(&mut next).unwrap();
+    assert_eq!(budget.used_bytes(), used);
+    second.give(buffer, &mut next).unwrap();
+    second.close(&mut next).unwrap();
+    drop(second);
+    drop(pool);
+    drop(next);
+    drop(denied);
+    assert_eq!(budget.used_bytes(), 0);
+}
