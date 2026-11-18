@@ -1379,6 +1379,8 @@ Invalid valid-time intervals retain typed instant bounds in the durable transact
 Local and zoned timestamp casts from strings retain syntax diagnostics for a rejected field or parse position.
 Transaction resolution reports the typed table reference when it rejects a SQL mutation targeting a reserved table.
 Submission rejects document writes targeting reserved schemas, including statically expanded SQL inserts.
+Source document replay supplies its declared put column types when building stored batches.
+Block and compaction writers release per-page metadata construction work once each leaf summary is retained.
 The public recovery and shutdown trace hashes include the optional embedded transaction clock.
 Catalog recovery precedes opening logs, and embedded close joins native work before the Java callback arena closes.
 
@@ -1426,7 +1428,10 @@ Native database buffer pools charge keys and fetch coordination to the node budg
 A persisted scan reserves its reference vector before borrowing serving catalog entries and releases it before task planning.
 It holds an admitted per-file traversal stack with inline IID paths while it visits metadata nodes.
 The regression sources check refusal before the first object fetch and while growing metadata traversal, and retain the independent file and page refusal checks.
-The summary and selection containers and shared live-index allocations, including sorted live-leaf storage, still require admission work.
+The scan charges its combined summaries before selection and holds both reservations while growing the vector to include live page summaries.
+It charges selection worklists and copied file indexes before allocation.
+The worklists end before metadata reads, and the selected indexes remain charged through traversal.
+The shared live-index allocations, including sorted live-leaf storage, still require admission work.
 Ordinary IID narrowing and broader metadata predicates remain open.
 
 Each reference control receipt binds the exact JVM runtime manifest, the verified runtime files and the artifact verifier source.
@@ -1436,7 +1441,10 @@ The optional historical erase mapping preserves the two original SQL statements 
 Its paired and comparator inputs are present in source.
 The original Gradle invocation, the paired execution and the mismatch result are pending.
 The mixed-IID JVM recorder selects its original Jovial invocation and keeps each of its 14 assertion observations and corroborating physical file evidence.
-Portable transfer of its first closed layout, the matching native lane and wire comparisons remain pending.
+The native fixture runs the same two ingest ranges and rewrites the IID column after closing its first mixed store.
+The comparison source checks serving plain and run-end files plus ordered SQL history, direct IID join and intersection, and PATCH read-back.
+After reopening, the fixture synchronizes both manually configured nodes before their next explicit compaction request.
+Portable transfer of the first closed layout, native pgwire and Flight SQL observations, and paired execution remain pending.
 The SQL-logic release lane checks the selected native executable, the pinned script roster, and the archived process and observation files.
 Offline verification recomputes the paired and repeated-reference comparisons from the retained streams.
 The external inventory validator checks normalized SQL-logic records against retained original SQL source bytes.
