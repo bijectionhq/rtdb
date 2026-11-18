@@ -43,6 +43,7 @@ tasks.register<JavaExec>("corpus") {
     description = "Runs every original test Var against the native engine and records one outcome per Var."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("clojure.main")
+    workingDir = rootProject.projectDir
     args("-m", "xtdb.rust.corpus")
     providers.gradleProperty("corpusNs").orNull?.let { args(it.split(",")) }
     javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(25)) })
