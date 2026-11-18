@@ -178,3 +178,26 @@ fn coalescing_argument_batches_preserves_old_clones_and_joined_types() {
     drop(args); drop(original); drop(clone);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn static_and_direct_puts_share_missing_id_validation_before_encoding() {
+    use rtdb_format::transit::{TransitValue as T, from_json_value};
+    let memory = MemoryBudget::new(1 << 25);
+    let direct = TxOp::PutDocs {
+        table: rtdb_types::TableRef::new("public", "docs"),
+        documents: Documents::new(vec![[("v".to_owned(), Value::Utf8("value".into()))].into()], &memory).unwrap(),
+        valid_from: None,
+        valid_to: None,
+    };
+    for operation in [
+        direct,
+        TxOp::Sql { sql: "INSERT INTO docs (v) VALUES ('value')".into(), args: None },
+        TxOp::Sql { sql: "INSERT INTO docs RECORDS {v: 'value'}".into(), args: None },
+    ] {
+        let tx = prepare_submission(vec![operation], SubmitOptions::default(), "xtdb", &memory).unwrap();
+        let error = tx.encode().unwrap_err();
+        assert_eq!(error.code, "missing-id");
+        assert_eq!(error.message.as_deref(), Some("missing '_id'"));
+        assert_eq!(from_json_value(&error.context["doc"]).unwrap(), T::Map(vec![(T::String("v".into()), T::String("value".into()))]));
+    }
+}

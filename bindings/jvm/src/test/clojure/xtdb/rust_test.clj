@@ -102,6 +102,32 @@
 
 (deftest-original-api original-sql/test-char-type)
 
+(deftest-original-api original-sql/disallow-inserting-to-system-time-cols-3748)
+
+(deftest-original-api original-sql/forbid-invalid-columns-insert)
+
+(deftest static-and-dynamic-document-writes-report-their-validation-stage
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (let [payload (fn [write]
+                    (try (write)
+                         (catch xtdb.api.error.Incorrect error (ex-data error))))
+          missing (payload #(xt/submit-tx node [[:sql "INSERT INTO docs RECORDS {v: 'value'}"]]))]
+      (is (= :missing-id (:xtdb.error/code missing)))
+      (is (= {"v" "value"} (:doc missing)))
+      (is (= 0 (:tx-id (xt/execute-tx node [[:sql "INSERT INTO docs RECORDS {_id: 1}"]]))))
+      (let [forbidden (payload #(xt/execute-tx node [[:sql "INSERT INTO docs RECORDS {_id: 2, _z: 3, _a: 4}"]]))
+            dynamic (payload #(xt/execute-tx node [[:sql "INSERT INTO docs (_id, _z, _a) SELECT 3, 4, 5"]]))]
+        (is (= :xtdb/forbidden-columns (:xtdb.error/code forbidden)))
+        (is (= ["_z" "_a"] (:forbidden-cols forbidden)))
+        (is (= :xtdb/sql-error (:xtdb.error/code dynamic)))
+        (is (= 2 (get-in dynamic [:tx-key :tx-id]))))
+      (is (= [{:xt/id 0, :committed true}
+              {:xt/id 1, :committed false}
+              {:xt/id 2, :committed false}]
+             (xt/q node "SELECT _id, committed FROM xt.txs ORDER BY _id")))
+      (is (= [{:xt/id 1}] (xt/q node "SELECT * FROM docs"))))))
+
 (deftest-original-api original-with/disallow-period-specs-on-ctes-3440)
 
 (deftest-original-api original-expr/duration-literal-query)

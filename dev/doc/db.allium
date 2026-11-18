@@ -721,6 +721,8 @@ rule ClientSubmitsTransaction {
     -- Static expansion reads the referenced argument positions and can expand an operation that supplies additional arguments.
     -- An operation missing a referenced argument proceeds to transaction resolution as SQL, where the argument failure aborts the transaction.
     -- A document write aimed at a system schema is rejected at submission.
+    -- Before append, the source writer validates the entity ID of each concrete document, including documents produced by static SQL expansion.
+    -- A missing ID reports the original document in the rejection data.
     when: ClientSubmitsTx(client, database, tx_ops, opts)
 
     requires: database.external_source = null
@@ -772,6 +774,8 @@ rule LeaderProcessesTx {
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.
+    -- For concrete document writes, forbidden columns abort with the table reference and offending column names in source schema order.
+    -- SQL insert plans report each forbidden projection as a planning error.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }

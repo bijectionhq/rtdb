@@ -107,20 +107,32 @@ pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: 
     })
 }
 
-pub(crate) fn bind_static_values(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<Option<InsertRows>> {
+pub(crate) fn bind_static_document_source(
+    parsed: ParsedStatement<'_>,
+    catalog: &dyn Catalog,
+    options: &PrepareOptions,
+) -> Result<Option<crate::StaticMutation>> {
+    use crate::{StaticMutation, StaticMutationKind};
+    match &parsed.tree.statement {
+        Syntax::Records { .. } => (),
+        Syntax::Standard(ast::Statement::Insert(insert))
+            if !insert.columns.is_empty() && insert.source.as_ref().is_some_and(|query|
+                matches!(query.body.as_ref(), ast::SetExpr::Values(_)) && query.with.is_none() && query.order_by.is_none() && query.limit_clause.is_none()) => (),
+        _ => return Ok(None),
+    }
     bind_using(parsed, catalog, options, |context, statement, _settings| {
-        let Syntax::Standard(ast::Statement::Insert(insert)) = statement else {
-            return Err(Anomaly::fault("rtdb.sql/static-insert", "Expected a static INSERT with VALUES"));
-        };
-        match context.insert_rows(insert) {
-            Ok(rows) => {
-                let valid = context.validate_insert_columns(&rows.input);
-                context.check_bound(valid)?;
-                Ok(Some(rows))
+        let result = match statement {
+            Syntax::Records { patch, table, records } => context.record_rows(*patch, table, records).map(Some),
+            Syntax::Standard(ast::Statement::Insert(insert)) => {
+                match context.insert_rows(insert) {
+                    Ok(InsertRows { table, input }) => Ok(Some(StaticMutation { table, input, kind: StaticMutationKind::Put })),
+                    Err(InsertRowsError::Projection { .. }) => Ok(None),
+                    Err(InsertRowsError::Other(error)) => Err(error),
+                }
             }
-            Err(InsertRowsError::Projection { .. }) => Ok(None),
-            Err(InsertRowsError::Other(error)) => context.check_bound(Err(error)),
-        }
+            _ => return Ok(None),
+        };
+        context.check_bound(result)
     })
 }
 
@@ -261,23 +273,25 @@ impl Context<'_> {
             }
             Syntax::GrantRole { user, role, revoke } => Ok(Statement::Dml(Dml::GrantRole { user: user.normalized(), role: role.normalized(), revoke: *revoke })),
             Syntax::Records { patch, table, records } => {
-                let expressions = records.iter().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).collect::<Result<Vec<_>>>()?;
-                let mut columns = BTreeMap::<String, LogicalType>::new();
-                for expression in &expressions {
-                    for leg in expression.data_type().legs() {
-                        let LogicalType::Struct(fields) = leg else { return Err(error("RECORDS requires document values")); };
-                        for (name, ty) in fields { columns.entry(name).and_modify(|old| *old = old.join(&ty)).or_insert(ty); }
+                use crate::{StaticMutation, StaticMutationKind};
+                let StaticMutation { table, input, kind } = self.record_rows(*patch, table, records)?;
+                Ok(Statement::Dml(match kind {
+                    StaticMutationKind::Put => {
+                        self.validate_insert_columns(&input)?;
+                        Dml::Insert { table, input }
                     }
-                }
-                if !columns.contains_key("_id") { return Err(error("RECORDS requires an _id column")); }
-                if columns.keys().any(|name| name.starts_with('_') && !(if *patch { ["_id", "_fn"].contains(&name.as_str()) } else { ["_id", "_fn", "_valid_from", "_valid_to"].contains(&name.as_str()) })) { return Err(error("RECORDS cannot write internal columns")); }
-                let fields = columns.iter().map(|(name, ty)| self.binder.field(name.clone(), None, ty.clone().maybe())).collect::<Result<Vec<_>>>()?;
-                let rows = expressions.into_iter().map(|expr| fields.iter().map(|field| Expr::Field { expr: Box::new(expr.clone()), name: field.name.clone(), data_type: field.data_type.clone() }).collect()).collect();
-                let input = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?);
-                let target = self.target(table)?;
-                let (valid_time, system_time, _) = self.temporal_filters(table)?;
-                if system_time != TemporalFilter::Default || (!*patch && valid_time != TemporalFilter::Default) { return Err(error("Invalid temporal clause for RECORDS")); }
-                Ok(Statement::Dml(if *patch { Dml::Patch { table: target, input, valid_time } } else { Dml::Insert { table: target, input } }))
+                    StaticMutationKind::Patch(valid_time) => {
+                        if !input.schema().fields().iter().any(|field| field.name == "_id") {
+                            return Err(error("RECORDS requires an _id column"));
+                        }
+                        let forbidden: Vec<_> = input.schema().fields().iter().map(|field| field.name.as_str())
+                            .filter(|name| name.starts_with('_') && *name != "_id").collect();
+                        if !forbidden.is_empty() {
+                            return Err(self.planning_failure(PlanningDiagnostic::new(format!("Cannot PATCH ({}) column", forbidden.join(" ")))));
+                        }
+                        Dml::Patch { table, input, valid_time }
+                    }
+                }))
             }
             Syntax::Set { name, value, local } => Ok(Statement::Set { name: name.clone(), value: self.expr(value, &Schema::default(), &BTreeMap::new())?, local: *local }),
             Syntax::Show(name) => Ok(Statement::Show { name: name.clone() }),
@@ -287,6 +301,41 @@ impl Context<'_> {
                 Ok(Statement::Dml(Dml::Assert { input: Arc::new(input.filter(predicate)?), message: message.clone() }))
             }
         }
+    }
+
+    fn record_rows(&mut self, patch: bool, table: &ast::ObjectName, records: &[ast::Expr]) -> Result<crate::StaticMutation> {
+        let expressions = records.iter().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).collect::<Result<Vec<_>>>()?;
+        let mut types = BTreeMap::<String, LogicalType>::new();
+        let mut order = Vec::new();
+        let mut register = |name: String, ty: LogicalType| match types.entry(name) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => { let joined = entry.get().join(&ty); entry.insert(joined); }
+            std::collections::btree_map::Entry::Vacant(entry) => { order.push(entry.key().clone()); entry.insert(ty); }
+        };
+        for expression in &expressions {
+            if let Expr::Struct(fields) = expression {
+                for (name, value) in fields { register(name.clone(), value.data_type()); }
+                continue;
+            }
+            for leg in expression.data_type().legs() {
+                let LogicalType::Struct(fields) = leg else { return Err(error("RECORDS requires document values")); };
+                for (name, ty) in fields { register(name, ty); }
+            }
+        }
+        let fields = order.into_iter().map(|name| {
+            let ty = types.remove(&name).expect("ordered column has a type");
+            self.binder.field(name, None, ty.maybe())
+        }).collect::<Result<Vec<_>>>()?;
+        let rows = expressions.into_iter().map(|expr| fields.iter().map(|field| Expr::Field {
+            expr: Box::new(expr.clone()), name: field.name.clone(), data_type: field.data_type.clone(),
+        }).collect()).collect();
+        let input = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?);
+        let target = self.target(table)?;
+        let (valid_time, system_time, _) = self.temporal_filters(table)?;
+        if system_time != TemporalFilter::Default || (!patch && valid_time != TemporalFilter::Default) {
+            return Err(error("Invalid temporal clause for RECORDS"));
+        }
+        let kind = if patch { crate::StaticMutationKind::Patch(valid_time) } else { crate::StaticMutationKind::Put };
+        Ok(crate::StaticMutation { table: target, input, kind })
     }
 
     fn insert_rows(&mut self, insert: &ast::Insert) -> std::result::Result<InsertRows, InsertRowsError> {
@@ -327,9 +376,15 @@ impl Context<'_> {
     }
 
     fn validate_insert_columns(&mut self, input: &Relation) -> Result<()> {
-        if !input.schema().fields().iter().any(|field| field.name == "_id") { return Err(self.planning_failure(insert_missing_id())); }
-        if input.schema().fields().iter().any(|field| field.name.starts_with('_') && !["_id", "_fn", "_valid_from", "_valid_to"].contains(&field.name.as_str())) {
-            return Err(error("INSERT cannot write internal identity or system-time columns"));
+        use rtdb_types::transit_value::{TransitValue, to_json_value};
+        if !input.schema().fields().iter().any(|field| field.name == "_id") {
+            self.diagnostics.push(insert_missing_id());
+        }
+        for name in input.schema().fields().iter().map(|field| field.name.as_str()) {
+            if name.starts_with('_') && !["_id", "_valid_from", "_valid_to"].contains(&name) {
+                self.diagnostics.push(PlanningDiagnostic::new(format!("Cannot INSERT {name} column"))
+                    .with_detail("col", to_json_value(&TransitValue::Symbol(name.into()))?));
+            }
         }
         Ok(())
     }

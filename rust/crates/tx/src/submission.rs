@@ -5,6 +5,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_expr::{EvalContext, evaluate};
 use rtdb_plan::{Catalog, QualifiedTable, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
 use rtdb_types::{Anomaly, Result, Timestamp, Value};
+use rtdb_sql::StaticMutationKind;
 
 use crate::{Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
 
@@ -50,9 +51,10 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         requires_clock || expr.is_volatile() || rtdb_expr::requires_pg_catalog(expr)
     }
     fn needs_resolver(input: &Relation) -> bool { input.expressions().iter().any(|expr| resolve_only(expr)) || input.children().iter().any(|input| needs_resolver(input)) }
-    if needs_resolver(&plan.input) || plan.valid_time.expressions().iter().any(|expr| resolve_only(expr)) { return Ok(None); }
+    let valid_time = plan.valid_time();
+    if needs_resolver(&plan.input) || valid_time.expressions().iter().any(|expr| resolve_only(expr)) { return Ok(None); }
     if args.is_some_and(|args| args.row_count() == 0) { return Ok(None); }
-    let parameter_count = plan.input.parameter_count().max(plan.valid_time.expressions().iter().map(|expr| {
+    let parameter_count = plan.input.parameter_count().max(valid_time.expressions().iter().map(|expr| {
         let mut count = 0; expr.visit(&mut |expr| { if let rtdb_plan::Expr::Parameter { index, .. } = expr { count = count.max(index + 1); } }); count
     }).max().unwrap_or(0));
     if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
@@ -70,7 +72,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let mut parameters = parameters.to_vec();
         parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         let context = EvalContext { parameters: &parameters, parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
-        let temporal = match &plan.valid_time {
+        let temporal = match valid_time {
             TemporalFilter::Default => (None, None),
             TemporalFilter::All => (Some(Timestamp::MIN), Some(Timestamp::MAX)),
             TemporalFilter::FromTo { from, to } => (patch_bound_value(from, Timestamp::MIN, &context)?, patch_bound_value(to, Timestamp::MAX, &context)?),
@@ -78,12 +80,11 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         };
         for row in materialize(&plan.input, &context)? {
             let mut document: BTreeMap<_, _> = plan.input.schema().fields().iter().zip(row).map(|(field, value)| (field.name.clone(), value)).collect();
-            let bounds = if plan.patch { temporal } else {
+            let bounds = if matches!(&plan.kind, StaticMutationKind::Patch(_)) { temporal } else {
                 let from = document.remove("_valid_from").filter(|value| !matches!(value, Value::Null | Value::Undefined)).map(|value| rtdb_expr::timestamp_micros(&value, &options.default_tz)).transpose()?;
                 let to = document.remove("_valid_to").filter(|value| !matches!(value, Value::Null | Value::Undefined)).map(|value| rtdb_expr::timestamp_micros(&value, &options.default_tz)).transpose()?;
                 (from, to)
             };
-            document.get("_id").ok_or_else(|| Anomaly::incorrect("xtdb.tx/missing-id", "missing _id"))?.entity_id()?;
             if let Some((_, rows)) = groups.iter_mut().find(|(key, _)| *key == bounds) { rows.push(document); }
             else { groups.push((bounds, vec![document])); }
         }
@@ -91,9 +92,15 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     let operations = groups.into_iter().map(|((valid_from, valid_to), documents)| {
         let mut documents = documents;
         for document in &mut documents { for value in document.values_mut() { infer_document_decimals(value)?; } }
-        let documents = Documents::new(documents, memory)?;
+        let columns = plan.input.schema().fields().iter().map(|field| field.name.as_str())
+            .filter(|name| matches!(&plan.kind, StaticMutationKind::Patch(_)) || !matches!(*name, "_valid_from" | "_valid_to"))
+            .map(str::to_owned).collect();
+        let documents = Documents::with_column_order(documents, columns, memory)?;
         let table = plan.table.table.clone();
-        Ok(if plan.patch { TxOp::PatchDocs { table, documents, valid_from, valid_to } } else { TxOp::PutDocs { table, documents, valid_from, valid_to } })
+        Ok(match &plan.kind {
+            StaticMutationKind::Patch(_) => TxOp::PatchDocs { table, documents, valid_from, valid_to },
+            StaticMutationKind::Put => TxOp::PutDocs { table, documents, valid_from, valid_to },
+        })
     }).collect::<Result<Vec<_>>>()?;
     Ok((!operations.is_empty()).then_some(operations))
 }

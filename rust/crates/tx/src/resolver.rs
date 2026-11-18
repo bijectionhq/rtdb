@@ -158,6 +158,11 @@ impl TxResolver {
         } else {
             let mut outcome = Ok(());
             for (index, operation) in request.operations.iter().enumerate() {
+                context.check_cancelled()?;
+                if let Err(error) = validate_document_operation(operation) {
+                    outcome = Err(error);
+                    break;
+                }
                 if let Err(error) = tx.apply(operation).await {
                     outcome = Err(error.with_context("tx-op-idx", index.into()).with_context("tx-key", tx_key_context(key)?));
                     break;
@@ -377,7 +382,6 @@ impl<'a> OpenTransaction<'a> {
     async fn patch_documents(&mut self, table: &TableRef, documents: &[BTreeMap<String, Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         use rtdb_plan::{Binder, Expr, Relation, RelationNode, Schema, QualifiedTable, TemporalFilter};
         use rtdb_types::{LogicalType, ScalarType};
-        check_table(table)?;
         if iids.is_some_and(|iids| iids.len() != documents.len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
         let interval = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
         let bytes = documents.iter().try_fold(65_536usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?.checked_mul(8).ok_or_else(overflow)?).ok_or_else(overflow))?;
@@ -385,8 +389,7 @@ impl<'a> OpenTransaction<'a> {
         let mut rows = Vec::with_capacity(documents.len());
         let mut document_type = LogicalType::Struct(BTreeMap::new());
         for (index, document) in documents.iter().enumerate() {
-            if document.keys().any(|name| name.starts_with('_') && !["_id", "_fn"].contains(&name.as_str())) { return Err(Anomaly::incorrect("xtdb/forbidden-columns", "Cannot patch documents with internal columns")); }
-            let iid = match iids { Some(iids) => iids[index], None => document.get("_id").ok_or_else(|| Anomaly::incorrect("xtdb.tx/missing-id", "missing _id"))?.entity_id()?.iid() };
+            let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
             let document = Value::Struct(document.clone());
             document_type = document_type.join(&document.logical_type());
             rows.push(vec![Expr::Literal(Value::FixedSizeBinary(iid.0.to_vec())), Expr::Literal(document)]);
@@ -399,11 +402,9 @@ impl<'a> OpenTransaction<'a> {
         self.execute_mutation(mutation, context, None, None).await
     }
     fn put_documents(&mut self, table: &TableRef, documents: &[BTreeMap<String, Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
-        check_table(table)?;
         if iids.is_some_and(|iids| iids.len() != documents.len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
         for (index, document) in documents.iter().enumerate() {
-            if document.keys().any(|name| name.starts_with('_') && !["_id", "_fn", "_valid_from", "_valid_to"].contains(&name.as_str())) { return Err(Anomaly::incorrect("xtdb/forbidden-columns", "Cannot put documents with internal columns")); }
-            let iid = match iids { Some(iids) => iids[index], None => document.get("_id").ok_or_else(|| Anomaly::incorrect("xtdb.tx/missing-id", "missing _id"))?.entity_id()?.iid() };
+            let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
             let default_from = from.unwrap_or(self.tx_key().system_time);
             let default_to = to.unwrap_or(Timestamp::MAX);
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
@@ -446,6 +447,23 @@ async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, ar
     drop(syntax);
     query.execute(context, arguments.to_vec()).await
 }
+fn validate_document_operation(operation: &Operation) -> Result<()> {
+    let (table, documents, verb, permitted) = match operation {
+        Operation::Public(TxOp::PutDocs { table, documents, .. }) | Operation::PutIids { table, documents, .. } =>
+            (table, documents, "put", &["_id", "_fn", "_valid_from", "_valid_to"][..]),
+        Operation::Public(TxOp::PatchDocs { table, documents, .. }) | Operation::PatchIids { table, documents, .. } =>
+            (table, documents, "patch", &["_id", "_fn"][..]),
+        _ => return Ok(()),
+    };
+    check_table(table)?;
+    let forbidden: Vec<_> = documents.columns().iter().map(String::as_str)
+        .filter(|name| name.starts_with('_') && !permitted.contains(name)).collect();
+    if forbidden.is_empty() { return Ok(()); }
+    Err(Anomaly::incorrect("xtdb/forbidden-columns", format!("Cannot {verb} documents with columns: [{}]", forbidden.join(", ")))
+        .with_transit_context("table", &T::table_ref(table))?
+        .with_context("forbidden-cols", serde_json::json!(forbidden)))
+}
+
 fn check_table(table: &TableRef) -> Result<()> {
     if is_reserved_write_schema(&table.schema) {
         return Err(Anomaly::incorrect("xtdb/forbidden-table", format!("Cannot write to table: {}", table_name(table)))

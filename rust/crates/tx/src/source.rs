@@ -178,7 +178,9 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             "sql"
         }
         Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to } | TxOp::PatchDocs { table, documents, valid_from, valid_to }) => {
-            let iids = documents.rows().iter().map(|document| document.get("_id").ok_or_else(|| Anomaly::incorrect("missing-id", "missing '_id'"))?.entity_id().map(|id| Value::FixedSizeBinary(id.iid().0.to_vec()))).collect::<Result<_>>()?;
+            let iids = documents.rows().iter().map(|document| {
+                document_id(document, memory).map(|id| Value::FixedSizeBinary(id.iid().0.to_vec()))
+            }).collect::<Result<_>>()?;
             body.insert("iids".into(), Value::List(iids));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), DocumentList::from(documents)));
@@ -204,6 +206,21 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         Operation::Removed(name) => return Err(Anomaly::unsupported("rtdb.tx/removed-operation", format!("Cannot encode removed operation {name}"))),
     };
     Ok((tag.into(), SourceOperation { body: Value::Struct(body), documents: docs }))
+}
+
+pub(crate) fn document_id(document: &BTreeMap<String, Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
+    if let Some(id) = document.get("_id").filter(|id| !matches!(id, Value::Null | Value::Undefined)) {
+        return id.entity_id();
+    }
+    let bound = document.iter().try_fold(4096usize, |bytes, (key, value)| {
+        let key_bytes = key.len().checked_mul(8).ok_or_else(overflow)?;
+        let value_bytes = rtdb_expr::text_allocation_bound(value)?;
+        bytes.checked_add(key_bytes).and_then(|bytes| bytes.checked_add(value_bytes)).ok_or_else(overflow)
+    })?;
+    let _scratch = memory.reserve(bound)?;
+    let typed = rtdb_format::transit::document_to_transit(document)?;
+    let _json = memory.reserve(rtdb_format::transit::json_value_allocation_bound(&typed)?)?;
+    Err(Anomaly::incorrect("missing-id", "missing '_id'").with_transit_context("doc", &typed)?)
 }
 
 fn named_union<T>(
