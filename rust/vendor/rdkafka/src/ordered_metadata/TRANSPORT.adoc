@@ -97,9 +97,10 @@ Validation does not allocate an output collection or grow a buffer.
 The caller owns the topic-input array, any application result, and runtime timer/task allocation used by wait.
 
 The attached account also tracks ApiVersions handshake request buffers and the broker's decoded and fallback array payloads through their respective final release.
-The ordinary Metadata parser admits its contiguous response arena before allocation and keeps that charge with the arena after transfer.
+The ordinary Metadata parser admits its root arena and any additional storage segments before allocation and keeps their charges with the result after transfer.
 Retained native topic-cache arenas also acquire the actual client account before allocation and release it at their common final free.
-Native client construction, bootstrap and discovered broker growth, broker threads and stacks, independent clones, rack scratch, admin output copies, ApiVersions sort storage, TLS/SASL, ordinary outbound requests, allocator overhead and the monitor require separate bounds.
+Ordinary Metadata rack computation also admits its temporary matching-rack pointer buffer on that same account.
+Native client construction, bootstrap and discovered broker growth, broker threads and stacks, independent clones and their rack scratch, admin output copies, native sort internals, TLS/SASL, ordinary outbound requests, allocator overhead and the monitor require separate bounds.
 A whole-producer bound still requires a separately pre-admitted construction/background domain or admission interception for every reachable owner in that domain.
 Neither the completion cap nor borrowed validation establishes that bound.
 Java snapshot retention and partial/full merge, UUID/leader-epoch state, HashMap encounter order, metadata refresh/throttle scheduling, per-topic signed RoundRobin counters and once-per-send explicit partition binding remain separate integration work.
@@ -265,10 +266,38 @@ The shared Metadata parser retains its existing void consumer-group notification
 
 The retained list is owned by the serialized consumer-group actor and is cleared or replaced before final group destruction.
 The built-in range, roundrobin and sticky member-metadata callbacks synchronously copy topic names into their own encoded storage.
-Those encoded outputs, candidate-list and topic-error scratch, consumer error ops/strings, full Metadata copies, rack scratch and other assignor/admin owners still require separate admission.
+Those encoded outputs, candidate-list and topic-error scratch, consumer error ops/strings, full Metadata copies and their rack scratch, and other assignor/admin owners still require separate admission.
 
 Public accounted construction currently supports producers only.
 The actual topic-info projection callers belong to classic consumers, whose supported public construction still uses NULL accounts.
 The deterministic consumer fixtures exercise the internal fallible copy boundary with an internal account and caller-thread group state.
 An accounted public consumer profile requires separate activation.
 They cover exact and short admission, malloc rollback, rack geometry and lifetime, old/new overlap, partial projection prefixes, complete projections, both consumer failure paths, adopted input ownership, equal/changed effective lists, built-in member-metadata lifetime and final group destruction.
+
+== Ordinary Metadata rack computation
+
+For each partition with replicas, the ordinary Metadata helper counts the nonnull rack pointers found in the parsed broker array before allocating scratch storage.
+A passive call-local owner holds one exact pointer buffer and its account charge; its native list header stays on the stack.
+Checked pointer products and the native list-count limit precede account acquisition and allocation.
+A denied account or failed malloc returns the existing native resource error.
+NULL-account clients retain the native aborting allocation policy.
+Zero matches allocate no scratch, while retaining the existing present-empty output array for a nonempty replica list and the absent output for a zero-replica list.
+
+The buffer borrows rack strings from the unpublished parsed root and segments.
+The same native list sort and string comparator determine lexical order and the representative pointer for equal rack values.
+Compaction retains the full allocated capacity until the buffer is freed.
+The unique output array uses the existing parsed Metadata allocator while scratch is still charged, so a new output segment requires admission for both allocations at once.
+The helper frees scratch before releasing its charge on every success and failure return.
+The root and segments continue to own all retained rack text and output arrays through final Metadata destruction.
+The sorting library's internal storage has a separate admission obligation.
+
+The shared ordinary/admin parser reaches rack computation after decoding the response and updating broker inventory.
+A denial preserves those broker changes and all earlier topic/cache updates, and occurs before the current topic's live-topic or cache update.
+It returns CRIT_SYS_RESOURCE with NULL parsed output, purges requested hints, propagates earlier cache changes, schedules their expiry and destroys the parsed root and segments.
+It retains the existing output-count-before-output-pointer order if output allocation fails after scratch succeeds.
+No rollback of the earlier mutation prefix is promised.
+
+The unexecuted source fixtures compare the native sort/dedup value and representative-pointer geometry, test checked sizing, zero and duplicate racks, exact/short admission, malloc rollback, bounded appends and scratch/output-segment overlap.
+Eight ordinary/admin parser profiles cover first/later denial with and without a requested hint, retained previous cache values, observer delivery, expiry, unchanged freshness and final account balance.
+They use one indexed fixture broker with the response's exact existing ID and endpoint, so broker update needs neither a replacement thread nor a queued node update.
+This slice does not activate accounted consumer construction, charge independent full Metadata clone scratch or establish a whole-native bound.

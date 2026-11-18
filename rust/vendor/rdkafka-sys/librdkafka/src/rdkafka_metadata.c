@@ -524,6 +524,88 @@ rd_bool_t rd_kafka_has_reliable_leader_epochs(rd_kafka_broker_t *rkb) {
         return ApiVersion >= 9;
 }
 
+struct rd_kafka_metadata_rack_scratch {
+        rd_list_t racks;
+        rd_kafka_byte_account_t *account;
+        size_t charge;
+};
+
+static rd_bool_t rd_kafka_metadata_rack_scratch_size(size_t count, size_t *bytes) {
+        if (count > SIZE_MAX / sizeof(void *) || count > INT_MAX)
+                return rd_false;
+        *bytes = count * sizeof(void *);
+        return rd_true;
+}
+
+static rd_bool_t rd_kafka_metadata_rack_scratch_init(
+    struct rd_kafka_metadata_rack_scratch *scratch,
+    rd_kafka_byte_account_t *account,
+    size_t count,
+    void *(*allocate)(size_t)) {
+        size_t bytes;
+        void **pointers;
+        rd_list_init(&scratch->racks, 0, NULL);
+        scratch->account = NULL;
+        scratch->charge = 0;
+        if (!rd_kafka_metadata_rack_scratch_size(count, &bytes))
+                return rd_false;
+        if (!count)
+                return rd_true;
+        if (!rd_kafka_byte_account_acquire(account, bytes))
+                return rd_false;
+        pointers = account ? allocate(bytes) : rd_malloc(bytes);
+        if (!pointers) {
+                rd_kafka_byte_account_release(account, bytes);
+                return rd_false;
+        }
+        scratch->racks.rl_elems = pointers;
+        scratch->racks.rl_size = (int)count;
+        scratch->racks.rl_flags = RD_LIST_F_FIXED_SIZE;
+        scratch->account = account;
+        scratch->charge = account ? bytes : 0;
+        return rd_true;
+}
+
+static rd_bool_t rd_kafka_metadata_rack_scratch_add(
+    struct rd_kafka_metadata_rack_scratch *scratch, char *rack) {
+        if (!rack || scratch->racks.rl_cnt >= scratch->racks.rl_size)
+                return rd_false;
+        scratch->racks.rl_elems[scratch->racks.rl_cnt++] = rack;
+        return rd_true;
+}
+
+static void rd_kafka_metadata_rack_scratch_deduplicate(
+    struct rd_kafka_metadata_rack_scratch *scratch) {
+        int source, unique = 0;
+        rd_list_sort(&scratch->racks, rd_strcmp2);
+        for (source = 0; source < scratch->racks.rl_cnt; source++) {
+                char *rack = scratch->racks.rl_elems[source];
+                if (unique && !rd_strcmp2(rack, scratch->racks.rl_elems[unique - 1]))
+                        continue;
+                scratch->racks.rl_elems[unique++] = rack;
+        }
+        scratch->racks.rl_cnt = unique;
+}
+
+static void rd_kafka_metadata_rack_scratch_destroy(
+    struct rd_kafka_metadata_rack_scratch *scratch) {
+        rd_kafka_byte_account_t *account = scratch->account;
+        size_t charge = scratch->charge;
+        rd_list_destroy(&scratch->racks);
+        scratch->account = NULL;
+        scratch->charge = 0;
+        rd_kafka_byte_account_release(account, charge);
+}
+
+static char *rd_kafka_metadata_replica_rack(
+    rd_kafka_metadata_broker_internal_t *brokers, size_t count, int32_t replica) {
+        rd_kafka_metadata_broker_internal_t key = {.id = replica};
+        rd_kafka_metadata_broker_internal_t *broker =
+            bsearch(&key, brokers, count, sizeof(*brokers),
+                    rd_kafka_metadata_broker_internal_cmp);
+        return broker ? broker->rack_id : NULL;
+}
+
 /* Populates the topic partition to rack mapping for the the topic given by
  * `topic_idx` in the `mdi`. It's assumed that the internal broker metadata is
  * already populated. */
@@ -542,49 +624,46 @@ rd_kafka_populate_metadata_topic_racks(rd_tmpabuf_t *tbuf,
 
         brokers_internal = mdi->brokers;
         broker_cnt       = mdi->metadata.broker_cnt;
-
         mdt  = &mdi->metadata.topics[topic_idx];
         mdti = &mdi->topics[topic_idx];
 
         for (i = 0; i < mdt->partition_cnt; i++) {
-                int j;
+                int j, matching = 0;
                 rd_kafka_metadata_partition_t *mdp = &mdt->partitions[i];
                 rd_kafka_metadata_partition_internal_t *mdpi =
                     &mdti->partitions[i];
-
-                rd_list_t *curr_list;
-                char *rack;
+                struct rd_kafka_metadata_rack_scratch scratch;
 
                 if (mdp->replica_cnt == 0)
                         continue;
-
-                curr_list =
-                    rd_list_new(0, NULL); /* use a list for de-duplication */
+                if (mdp->replica_cnt < 0 || !mdp->replicas)
+                        return rd_false;
+                for (j = 0; j < mdp->replica_cnt; j++)
+                        if (rd_kafka_metadata_replica_rack(
+                                brokers_internal, broker_cnt, mdp->replicas[j]))
+                                matching++;
+                if (!rd_kafka_metadata_rack_scratch_init(
+                        &scratch, mdi->byte_account, matching, malloc))
+                        return rd_false;
                 for (j = 0; j < mdp->replica_cnt; j++) {
-                        rd_kafka_metadata_broker_internal_t key = {
-                            .id = mdp->replicas[j]};
-                        rd_kafka_metadata_broker_internal_t *broker =
-                            bsearch(&key, brokers_internal, broker_cnt,
-                                    sizeof(rd_kafka_metadata_broker_internal_t),
-                                    rd_kafka_metadata_broker_internal_cmp);
-                        if (!broker || !broker->rack_id)
-                                continue;
-                        rd_list_add(curr_list, broker->rack_id);
+                        char *rack = rd_kafka_metadata_replica_rack(
+                            brokers_internal, broker_cnt, mdp->replicas[j]);
+                        if (rack && !rd_kafka_metadata_rack_scratch_add(&scratch, rack)) {
+                                rd_kafka_metadata_rack_scratch_destroy(&scratch);
+                                return rd_false;
+                        }
                 }
-                rd_list_deduplicate(&curr_list, rd_strcmp2);
-
-                mdpi->racks_cnt = rd_list_cnt(curr_list);
+                rd_kafka_metadata_rack_scratch_deduplicate(&scratch);
+                mdpi->racks_cnt = rd_list_cnt(&scratch.racks);
                 mdpi->racks = rd_kafka_metadata_alloc(
                     tbuf, mdi, sizeof(char *) * mdpi->racks_cnt);
-                if (!mdpi->racks) {
-                        rd_list_destroy(curr_list);
+                if (mdpi->racks) {
+                        for (j = 0; j < rd_list_cnt(&scratch.racks); j++)
+                                mdpi->racks[j] = rd_list_elem(&scratch.racks, j);
+                }
+                rd_kafka_metadata_rack_scratch_destroy(&scratch);
+                if (!mdpi->racks)
                         return rd_false;
-                }
-                RD_LIST_FOREACH(rack, curr_list, j) {
-                        mdpi->racks[j] = rack; /* Don't copy, rack points inside
-                                                  tbuf already*/
-                }
-                rd_list_destroy(curr_list);
         }
         return rd_true;
 }
@@ -2345,3 +2424,4 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
 #include "rdkafka_metadata_tag_update_lock_test.h"
 
 #include "rdkafka_topic_info_metadata_admission_test.h"
+#include "rdkafka_metadata_rack_scratch_test.h"
