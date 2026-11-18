@@ -302,9 +302,12 @@ fn validate_child(child: usize, parent: usize) -> Result<()> {
 
 fn column_stat_field(name: &str, ty: &LogicalType) -> Result<Field> {
     let data_type = match name {
-        "numbers" | "date-times" | "times-of-day" | "durations" => DataType::Struct(vec![
-            Field::new("min", DataType::Float64, true), Field::new("max", DataType::Float64, true),
-        ].into()),
+        "numbers" | "date-times" | "times-of-day" | "durations" => {
+            // As the reference's vectors do, a bound is nullable only once some page lacked it.
+            let bounds = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+            let nullable = |bound: &str| match bounds { LogicalType::Struct(children) => children.get(bound).is_none_or(|ty| *ty != LogicalType::Scalar(rtdb_types::ScalarType::F64)), _ => true };
+            DataType::Struct(vec![Field::new("min", DataType::Float64, nullable("min")), Field::new("max", DataType::Float64, nullable("max"))].into())
+        }
         "bytes" => DataType::Struct(vec![Field::new("bloom", DataType::Binary, true)].into()),
         "list" | "set" => DataType::Int32,
         "struct" => DataType::List(Arc::new(Field::new("$data$", DataType::Int32, false))),

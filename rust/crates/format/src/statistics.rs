@@ -132,7 +132,7 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
     let ty = rtdb_columnar::from_field(field)?;
     if ty == LogicalType::Nothing { return Ok(()); }
     let extension = field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
-    let presence = matches!(field.data_type(), DataType::Boolean | DataType::Interval(_)) || matches!(extension, Some("xt/oid" | "xt/regclass" | "xt/regproc" | "xt/interval-month-day-micro"));
+    let presence = matches!(field.data_type(), DataType::Boolean | DataType::Interval(_)) || matches!(extension, Some("xt/oid" | "xt/regclass" | "xt/regproc" | "xt/interval-month-day-micro" | "xt/transit+msgpack"));
     if presence {
         let mono = match &ty { LogicalType::Maybe(value) => value.as_ref(), value => value };
         statistics.fields.insert(rtdb_columnar::leg_name(mono)?, Value::Bool(true));
