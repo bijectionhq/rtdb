@@ -1,0 +1,319 @@
+{
+  "source_only": true,
+  "runtime_execution": false,
+  "effective_profile": null,
+  "archives": [
+    {
+      "artifact": "jackson-core-2.16.0-sources.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-core/2.16.0/jackson-core-2.16.0-sources.jar",
+      "sha256": "ea95a196a9ad7abdcd0b72fa079b307cccaa1d123b727dfb62b0cbefe6cfd864"
+    },
+    {
+      "artifact": "jackson-core-2.21.7-sources.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-core/2.21.7/jackson-core-2.21.7-sources.jar",
+      "sha256": "8c463d7b86fc44851f180c38e91580d32505b5e06443514212ca93c40efdde5c"
+    },
+    {
+      "artifact": "kafka-schema-registry-client-7.8.0-sources.jar",
+      "url": "https://packages.confluent.io/maven/io/confluent/kafka-schema-registry-client/7.8.0/kafka-schema-registry-client-7.8.0-sources.jar",
+      "sha256": "0bede2ed51df1c97cc1a86c49e5dc1bdebca570d791e81183b39cd3b5004feaf"
+    }
+  ],
+  "sources": [
+    {
+      "profile": "2.16.0",
+      "entry": "com/fasterxml/jackson/core/sym/ByteQuadsCanonicalizer.java",
+      "sha256": "64275393776bbfe69f6daf776b06901eaa5d595cf7eb1ed1635fdac80207a632",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "retained_prefix": "../../COPYRIGHT",
+      "published_prefix_manifest": "../../artifacts.json"
+    },
+    {
+      "profile": "2.16.0",
+      "entry": "com/fasterxml/jackson/core/JsonFactory.java",
+      "sha256": "c0cf7e68abb53f4801ecfaf1781fce0e0cbffcd4b12f9acb5e6c745c9bf6c2ff",
+      "prefix_bytes": 95,
+      "prefix_sha256": "334d59e865e73128ab8cca5e1e1448fa7b076c29e0ecac418279c48aa5740f6e",
+      "retained_prefix": "../../COPYRIGHT",
+      "published_prefix_manifest": "../../artifacts.json"
+    },
+    {
+      "profile": "2.16.0",
+      "entry": "com/fasterxml/jackson/core/json/UTF8StreamJsonParser.java",
+      "sha256": "58835e18553e83e3fbcb2099f441b375c1ff32cf5ee99ec63663caf8af483594",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "retained_prefix": "../../COPYRIGHT",
+      "published_prefix_manifest": "../../artifacts.json"
+    },
+    {
+      "profile": "2.16.0",
+      "entry": "com/fasterxml/jackson/core/util/InternCache.java",
+      "sha256": "bf4ed8841ad597f79ec120c0d8c6f937484730252c6a891497227d674f8a696c",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "retained_prefix": "../COPYRIGHT",
+      "published_prefix_manifest": "../sources.json"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "com/fasterxml/jackson/core/sym/ByteQuadsCanonicalizer.java",
+      "sha256": "3f786e9c6371dcef2bdda460a6f433a1d00e8acb3d73594ed8328c3745ea20fb",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "retained_prefix": "../../COPYRIGHT",
+      "published_prefix_manifest": "../../artifacts.json"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "com/fasterxml/jackson/core/JsonFactory.java",
+      "sha256": "974906459e29d3141eb96e7db9506112e1059ac03e45c11fde84495bf8b5dad1",
+      "prefix_bytes": 95,
+      "prefix_sha256": "334d59e865e73128ab8cca5e1e1448fa7b076c29e0ecac418279c48aa5740f6e",
+      "retained_prefix": "../../COPYRIGHT",
+      "published_prefix_manifest": "../../artifacts.json"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "com/fasterxml/jackson/core/json/UTF8StreamJsonParser.java",
+      "sha256": "a8edcbaeda31eba77ad5b588f9e2ae173691349905f5da16d6fc989f71fa69e6",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "retained_prefix": "../../COPYRIGHT",
+      "published_prefix_manifest": "../../artifacts.json"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "com/fasterxml/jackson/core/util/InternCache.java",
+      "sha256": "eed3d1644b930a4a92d75390a599f1d2ebd18101fa906283b4afb8be79cf6d57",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "retained_prefix": "../COPYRIGHT",
+      "published_prefix_manifest": "../sources.json"
+    },
+    {
+      "profile": "confluent-7.8.0",
+      "entry": "io/confluent/kafka/schemaregistry/utils/JacksonMapper.java",
+      "sha256": "d370dce0c7217902e42af91dbc4c3474e9afb8665919e88fe87aff6308dee5ae",
+      "prefix_bytes": 595,
+      "prefix_sha256": "df7f93c6193a1c126519694f137319c154d1450268a11a9295025ea68b94d0e1",
+      "retained_prefix": "../../COPYRIGHT",
+      "published_prefix_manifest": "../../artifacts.json"
+    }
+  ],
+  "legal_members": [
+    {
+      "profile": "2.16.0",
+      "entry": "META-INF/jackson-core-LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "bytes": 11358,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "2.16.0",
+      "entry": "META-INF/jackson-core-NOTICE",
+      "sha256": "0a0042db627fe915c6a1d9ef74927af5081446063e8888494be6718d692dd2b8",
+      "bytes": 1227,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "2.16.0",
+      "entry": "META-INF/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "bytes": 11358,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "META-INF/FastDoubleParser-LICENSE",
+      "sha256": "59067508e44346bf93dc9c5e4d673a67ecd77988c2020bb5e0f8667eb199f396",
+      "bytes": 3228,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "META-INF/FastDoubleParser-ThirdParty-LICENSE",
+      "sha256": "dbc36f9422a40d58d1a214080583667cfd37d61c2fae1657d981edda2a60727f",
+      "bytes": 4578,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "META-INF/Schubfach-LICENSE",
+      "sha256": "12d39a6615219d73202300715e365bec2b958f858d1e837c8f2dace57f905969",
+      "bytes": 1064,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "META-INF/jackson-core-LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "bytes": 11358,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "META-INF/jackson-core-NOTICE",
+      "sha256": "e6aef1c0f4cf5b0f802c16b31fce309b3c3737450b93c40d6291bf6540aae3d1",
+      "bytes": 1616,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "2.21.7",
+      "entry": "META-INF/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "bytes": 11358,
+      "retained_in": "../LICENSES"
+    },
+    {
+      "profile": "confluent-7.8.0",
+      "entry": "LICENSE-APACHE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "bytes": 11358,
+      "retained_in": "../../../references/LICENSE-APACHE"
+    }
+  ],
+  "published_dependencies": {
+    "rust/crates/kafka/src/connect/registry/response/artifacts.json": "707627115ba6541c3830b8fd503878b55ac320b873045529c642e1c559281475",
+    "rust/crates/kafka/src/connect/registry/response/sources.sha256": "ea40eb56a84d964721de81972ede327971251a24175bf4c97fc1e6285db229e2",
+    "rust/crates/kafka/src/connect/registry/response/COPYRIGHT": "a15466c6a61ae66c86deec4c58789620eec28c7567fd3c088b3f5a5623f1f8c7",
+    "rust/crates/kafka/src/connect/registry/response/LICENSES": "94221d4fcede4db86b4594656a98a84c2e68c17062e942fcebf24d024208ad7e",
+    "rust/crates/kafka/src/connect/registry/response/symbols/sources.json": "cf23f88ff9671b91e89aaddc6e637d14899be7a3f60ae63d2857e06960b73b28",
+    "rust/crates/kafka/src/connect/registry/response/symbols/COPYRIGHT": "a0fe91c712f57fea96ec0583d6fa8098d4e5602df2105fcc234c5f8cfbaa0008",
+    "rust/crates/kafka/src/connect/registry/response/symbols/LICENSES": "7063a45f38e10a7eb0112bbb1a33a5bb1ca734993d069c2243110b903e056d10",
+    "rust/crates/kafka/src/connect/registry/response/symbols/profiles.json": "f479bee84252ebb7e81f7d353dd117bdacad818256e3e5007ea60be1de810784"
+  },
+  "profile_differences": {
+    "count_threshold": [
+      {
+        "size": 64,
+        "jackson216_threshold_floor": 51,
+        "jackson221_threshold": 51,
+        "first_passing_integer_count": 52
+      },
+      {
+        "size": 128,
+        "jackson216_threshold_floor": 102,
+        "jackson221_threshold": 102,
+        "first_passing_integer_count": 103
+      },
+      {
+        "size": 256,
+        "jackson216_threshold_floor": 204,
+        "jackson221_threshold": 204,
+        "first_passing_integer_count": 205
+      },
+      {
+        "size": 512,
+        "jackson216_threshold_floor": 409,
+        "jackson221_threshold": 409,
+        "first_passing_integer_count": 410
+      },
+      {
+        "size": 1024,
+        "jackson216_threshold_floor": 819,
+        "jackson221_threshold": 819,
+        "first_passing_integer_count": 820
+      },
+      {
+        "size": 2048,
+        "jackson216_threshold_floor": 1638,
+        "jackson221_threshold": 1638,
+        "first_passing_integer_count": 1639
+      },
+      {
+        "size": 4096,
+        "jackson216_threshold_floor": 3276,
+        "jackson221_threshold": 3276,
+        "first_passing_integer_count": 3277
+      },
+      {
+        "size": 8192,
+        "jackson216_threshold_floor": 6553,
+        "jackson221_threshold": 6553,
+        "first_passing_integer_count": 6554
+      },
+      {
+        "size": 16384,
+        "jackson216_threshold_floor": 13107,
+        "jackson221_threshold": 13107,
+        "first_passing_integer_count": 13108
+      },
+      {
+        "size": 32768,
+        "jackson216_threshold_floor": 26214,
+        "jackson221_threshold": 26214,
+        "first_passing_integer_count": 26215
+      },
+      {
+        "size": 65536,
+        "jackson216_threshold_floor": 52428,
+        "jackson221_threshold": 52428,
+        "first_passing_integer_count": 52429
+      }
+    ],
+    "long_name_offset": "2.21.7 throws IllegalStateException for negative wrapped newStart;2.16.0 reaches System.arraycopy index bounds failure;profile retained in the source failure value",
+    "normalization": "No claim that the full implementations are byte-identical"
+  },
+  "fixture_derivation": {
+    "kind": "Pinned Java source-expression integer arithmetic only, no project/Java execution",
+    "hash_literals": [
+      {
+        "seed": 7,
+        "quads": [
+          0,
+          0,
+          0
+        ],
+        "u32": 3894712
+      },
+      {
+        "seed": 7,
+        "quads": [
+          0,
+          0,
+          0,
+          4294967295
+        ],
+        "u32": 508735817
+      },
+      {
+        "seed": -1,
+        "quads": [
+          305419896
+        ],
+        "u32": 2209376324
+      }
+    ],
+    "collision_family": "[0,0,0,index,1000-index],0<=index<=1000;arithmetic right-shift terms are zero and the last two folded terms sum to1000",
+    "spill_geometry": [
+      {
+        "size": 64,
+        "accepted_before_resize": 13
+      },
+      {
+        "size": 128,
+        "accepted_before_resize": 21
+      },
+      {
+        "size": 256,
+        "accepted_before_resize": 41
+      },
+      {
+        "size": 512,
+        "accepted_before_resize": 73
+      },
+      {
+        "size": 1024,
+        "accepted_before_resize": 137
+      },
+      {
+        "size": 2048,
+        "accepted_before_constraint": 273
+      }
+    ],
+    "intern_demands_through_first_constraint": "274 incoming +13+21+41+73+137 rehash names =559"
+  },
+  "scope": "Default enabled canonicalization/interning/fail-on-overflow table capability only; exact lexical quad input and missed-name decode stage belong to the next cursor integration; actual Java factory/read/intern authority remains required"
+}

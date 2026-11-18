@@ -4,6 +4,7 @@ use super::ConversionContext;
 pub(in crate::connect) use super::Profile;
 
 mod storage;
+pub(in crate::connect) mod bytes;
 use storage::{Bucket, OverflowBits, Table};
 
 const INITIAL_SIZE: usize = 64;
