@@ -195,7 +195,7 @@ impl ProtocolSession {
         } else if legacy_keyword_probe(source) {
             keyword_shape()
         } else if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.node.memory())? {
-            control_shape(PreparedControl::Extended(control), oids.len())?
+            self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?)
         } else {
             let context = self.session.prepare_context(&self.token()).await?;
             let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
@@ -211,7 +211,7 @@ impl ProtocolSession {
         let options = self.options();
         let shape = match syntax {
             ExecutableSyntax::FrontendResponse(_) => keyword_shape(),
-            ExecutableSyntax::Control(control) => control_shape(PreparedControl::Batch(control.bind(&options)?), 0)?,
+            ExecutableSyntax::Control(control) => self.execute_columns(control_shape(PreparedControl::Batch(control.bind(&options)?), 0)?),
             ExecutableSyntax::Sql(syntax) => {
                 let context = self.session.prepare_context(&self.token()).await?;
                 sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
@@ -279,6 +279,13 @@ impl ProtocolSession {
             portal.state = PortalState::Query(QueryPortal { cursor, batch: None, row: 0, sent: 0 });
         }
         Ok(portal)
+    }
+    /// An EXECUTE describes the rows of the statement it names, as that statement is prepared when the EXECUTE is.
+    fn execute_columns(&self, mut shape: PreparedShape) -> PreparedShape {
+        if let PreparedKind::Control(control) = &shape.kind && let ControlStatement::Execute { name, .. } = control.statement() {
+            shape.columns = self.statements.get(name).and_then(|statement| statement.prepared.columns.clone());
+        }
+        shape
     }
     fn control_options(&self) -> ControlExecutionOptions { ControlExecutionOptions { frontend: ControlFrontend::PostgreSql, implicit_transaction: self.implicit } }
     fn record_transaction_error(&self) { if let Some(observer) = self.node.execution_observer() { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }

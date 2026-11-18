@@ -1329,3 +1329,18 @@ async fn extended_parse_reports_the_reference_multi_statement_grammar_error() {
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn an_extended_execute_describes_the_rows_of_the_statement_it_names() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("PREPARE foo AS SELECT $1::bigint forty_two").await), b"CZ");
+    client.parse("", "EXECUTE foo ($1)", &[20]).await;
+    client.send(b'D', b"S\0").await;
+    client.send(b'S', &[]).await;
+    let described = client.through(b'Z').await;
+    assert_eq!(tags(&described), b"1tTZ");
+    assert!(described[2].1.windows(9).any(|name| name == b"forty_two"));
+    drop(client);
+    running.stop().await;
+}
