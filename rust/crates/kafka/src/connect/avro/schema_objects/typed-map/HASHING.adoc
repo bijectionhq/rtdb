@@ -15,10 +15,10 @@ The materializer supplies an already-admitted payload lease; key-control allocat
 Map owners retain that payload lease and every shared-engine storage lease after the temporary ConversionContext drops.
 Replacement returns a passive PreviousValue owning the moved JavaValue before a trailing Arc of the map's payload lease.
 Its accessor borrows the value; no unchecked owned extraction is exposed, and the value drops before that lease.
-PreviousValue.retain counts that payload first and then the shared JavaValue traversal's nested binary/map owners against a fresh context's limit.
+PreviousValue.retain counts that payload first and then the shared JavaValue traversal's nested text/binary/map owners against a fresh context's limit.
 Existing reservations are retained rather than reserved a second time; repeated retention in one context deduplicates their handles.
 Schema-dependent uses still require the retained source family in addition to this payload owner.
-Cached arena retention visits map storage, key payload/control reservations and nested binary owners against the fresh context's limit.
+Cached arena retention visits map storage, key payload/control reservations and nested text/binary owners against the fresh context's limit.
 
 ValueOwner is a passive borrowed view of the complete creating arena/import family.
 ObjectView continues to identify one source schema object.
@@ -49,8 +49,9 @@ No global structural-key deduplication is added.
 Source-equal Struct keys can retain different source schema hashes and remain distinct Java mappings.
 
 Scalar hashing preserves Java wrapper classes, canonical NaNs, signed zeros and UTF16 String units.
-The current typed String/name/parameter carriers are Rust String and do not represent isolated Java UTF16 surrogates.
-Their coordinated carrier/parser expansion remains required before whole graph/default activation; this slice does not replace those units or establish that domain's parity.
+The typed String, field/name/doc and parameter carriers preserve isolated UTF16 units through the shared admitted JavaString-backed Text value.
+Legacy programmatic String inputs remain the same Java String class and compare/hash/order across the two native representations.
+link:../TEXT.adoc[The exact typed-text contract] qualifies the remaining input-decoder, parameter-iteration and writer/export boundaries before whole graph/default activation.
 Byte arrays hash by their observed object identity; ByteBuffer hashes reversed signed bytes in its remaining range.
 Concrete heap/direct/read-only buffer classes do not pass HashMap's declared Comparable<C> screen merely because ByteBuffer's superclass implements Comparable<ByteBuffer>.
 List values use source ArrayList equality/hash behavior; built field lists use List.copyOf's immutable-list behavior.

@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, mem::size_of, sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}}};
 use rtdb_columnar::MemoryReservation;
-use rtdb_types::Result;
+use rtdb_types::{Result, java_text::JavaText};
+use super::java_schema::Text;
 use super::{error, super::{ConversionContext, schema_graph::Scalar}};
 
 mod equality;
@@ -34,17 +35,17 @@ enum Object { Builder { body: Body, state: BuilderState }, Built { builder: Obje
 enum BuilderState { Building, Complete }
 struct Body { kind: Kind, metadata: Metadata }
 enum Kind { Scalar(Scalar), Array(ObjectId), Map(ObjectId, ObjectId), Struct(Vec<Field>) }
-struct Field { name: String, schema: ObjectId }
+struct Field { name: Text, schema: ObjectId }
 #[derive(Default)]
 struct Metadata {
-    optional: bool, name: Option<String>, version: Option<i32>, doc: Option<String>,
-    parameters: Option<BTreeMap<String, String>>, default: Option<JavaValue>,
+    optional: bool, name: Option<Text>, version: Option<i32>, doc: Option<Text>,
+    parameters: Option<BTreeMap<Text, Text>>, default: Option<JavaValue>,
 }
 
 #[derive(Debug)]
 pub(super) enum JavaValue {
     Null, Bool(bool), I8(i8), I16(i16), I32(i32), I64(i64), F32(f32), F64(f64),
-    String(String), ByteArray(Arc<ByteStorage>), ByteBuffer(ByteBuffer), Date(i64), Decimal(BigDecimal),
+    String(String), StringUnits(Text), ByteArray(Arc<ByteStorage>), ByteBuffer(ByteBuffer), Date(i64), Decimal(BigDecimal),
     Array(Vec<JavaValue>), Map(JavaMap), Struct { schema: ObjectId, values: Vec<JavaValue> },
 }
 #[derive(Debug)]
@@ -108,30 +109,52 @@ impl SchemaObjectsBuilder {
     pub(super) fn array(&mut self, element: ObjectId, context: &mut ConversionContext) -> Result<ObjectId> { self.require(element)?; self.builder(Kind::Array(element), context) }
     pub(super) fn map(&mut self, key: ObjectId, value: ObjectId, context: &mut ConversionContext) -> Result<ObjectId> { self.require(key)?; self.require(value)?; self.builder(Kind::Map(key, value), context) }
     pub(super) fn field(&mut self, builder: ObjectId, name: &str, schema: ObjectId, context: &mut ConversionContext) -> Result<()> {
+        self.field_text(builder, JavaText::from_utf8(name), schema, context)
+    }
+    pub(super) fn field_text(&mut self, builder: ObjectId, name: JavaText<'_>, schema: ObjectId, context: &mut ConversionContext) -> Result<()> {
         self.require(schema)?;
         let Kind::Struct(fields) = &self.building(builder)?.kind else { return Err(invalid("Only a Struct builder can receive fields")); };
-        if fields.iter().any(|field| field.name == name) { return Err(invalid("Schema builder has duplicate Struct fields")); }
+        if fields.iter().any(|field| field.name.view().units().eq(name.units())) { return Err(invalid("Schema builder has duplicate Struct fields")); }
         let next = capacity(fields)?;
-        self.admit(add(name.len(), next.map_or(0, |(_, bytes)| bytes))?, context)?;
+        self.admit(next.map_or(0, |(_, bytes)| bytes), context)?;
+        let name = Text::copy(name, context)?;
         let Kind::Struct(fields) = &mut self.building(builder)?.kind else { unreachable!() };
-        grow(fields, next)?; fields.push(Field { name: name.into(), schema }); Ok(())
+        grow(fields, next)?;
+        fields.push(Field { name, schema });
+        Ok(())
     }
     pub(super) fn optional(&mut self, builder: ObjectId, optional: bool) -> Result<()> { self.building(builder)?.metadata.optional = optional; Ok(()) }
     pub(super) fn version(&mut self, builder: ObjectId, version: Option<i32>) -> Result<()> { self.building(builder)?.metadata.version = version; Ok(()) }
     pub(super) fn name(&mut self, builder: ObjectId, name: Option<&str>, context: &mut ConversionContext) -> Result<()> {
+        self.name_text(builder, name.map(JavaText::from_utf8), context)
+    }
+    pub(super) fn name_text(&mut self, builder: ObjectId, name: Option<JavaText<'_>>, context: &mut ConversionContext) -> Result<()> {
         self.building(builder)?;
-        self.admit(add(256, name.map_or(0, str::len))?, context)?;
-        self.building(builder)?.metadata.name = name.map(str::to_owned); Ok(())
+        self.admit(256, context)?;
+        let name = name.map(|name| Text::copy(name, context)).transpose()?;
+        self.building(builder)?.metadata.name = name;
+        Ok(())
     }
     pub(super) fn doc(&mut self, builder: ObjectId, doc: Option<&str>, context: &mut ConversionContext) -> Result<()> {
+        self.doc_text(builder, doc.map(JavaText::from_utf8), context)
+    }
+    pub(super) fn doc_text(&mut self, builder: ObjectId, doc: Option<JavaText<'_>>, context: &mut ConversionContext) -> Result<()> {
         self.building(builder)?;
-        self.admit(add(256, doc.map_or(0, str::len))?, context)?;
-        self.building(builder)?.metadata.doc = doc.map(str::to_owned); Ok(())
+        self.admit(256, context)?;
+        let doc = doc.map(|doc| Text::copy(doc, context)).transpose()?;
+        self.building(builder)?.metadata.doc = doc;
+        Ok(())
     }
     pub(super) fn parameter(&mut self, builder: ObjectId, name: &str, value: &str, context: &mut ConversionContext) -> Result<()> {
+        self.parameter_text(builder, JavaText::from_utf8(name), JavaText::from_utf8(value), context)
+    }
+    pub(super) fn parameter_text(&mut self, builder: ObjectId, name: JavaText<'_>, value: JavaText<'_>, context: &mut ConversionContext) -> Result<()> {
         self.building(builder)?;
-        self.admit(add(add(name.len(), value.len())?, 1024)?, context)?;
-        self.building(builder)?.metadata.parameters.get_or_insert_with(BTreeMap::new).insert(name.into(), value.into()); Ok(())
+        self.admit(add(mul(size_of::<(Text, Text)>(), 16)?, 256)?, context)?;
+        let name = Text::copy(name, context)?;
+        let value = Text::copy(value, context)?;
+        self.building(builder)?.metadata.parameters.get_or_insert_with(BTreeMap::new).insert(name, value);
+        Ok(())
     }
     pub(super) fn byte_array(&mut self, bytes: &[u8], context: &mut ConversionContext) -> Result<JavaValue> {
         if bytes.len() > i32::MAX as usize { return Err(error("batch-too-large", "Java byte-array length exceeds its signed 32-bit domain")); }
@@ -195,13 +218,24 @@ impl SchemaObjects {
 }
 
 impl JavaValue {
+    pub(super) fn string(source: JavaText<'_>, context: &mut ConversionContext) -> Result<Self> {
+        Ok(Self::StringUnits(Text::copy(source, context)?))
+    }
+    pub(super) fn string_text(&self) -> Option<JavaText<'_>> {
+        match self {
+            Self::String(value) => Some(JavaText::from_utf8(value)),
+            Self::StringUnits(value) => Some(value.view()),
+            _ => None,
+        }
+    }
     fn retain(&self, context: &mut ConversionContext, depth: usize) -> Result<()> {
         if depth > 128 { return Err(invalid("Typed value nesting depth exceeded")); }
         match self {
+            JavaValue::StringUnits(text) => text.retain(context)?,
             JavaValue::ByteArray(storage) => storage.retain(context)?,
             JavaValue::ByteBuffer(buffer) => buffer.retain(context)?,
             JavaValue::Array(children) | JavaValue::Struct { values: children, .. } => for child in children { child.retain(context, depth + 1)?; },
-            JavaValue::Map(entries) => { entries.retain(context)?; for (key, child) in entries.iter() { key.retain(context, depth + 1)?; child.retain(context, depth + 1)?; } },
+            JavaValue::Map(entries) => entries.retain_at(context, depth)?,
             _ => (),
         }
         Ok(())
@@ -224,7 +258,15 @@ impl SchemaHandle {
             for object in &arena.objects {
                 match object {
                     Object::Imported(imported) => walk(&imported.arena, seen, context, depth + 1)?,
-                    Object::Builder { body, .. } => if let Some(value) = &body.metadata.default { value.retain(context, 0)?; },
+                    Object::Builder { body, .. } => {
+                        if let Some(name) = &body.metadata.name { name.retain(context)?; }
+                        if let Some(doc) = &body.metadata.doc { doc.retain(context)?; }
+                        if let Some(parameters) = &body.metadata.parameters {
+                            for (name, value) in parameters { name.retain(context)?; value.retain(context)?; }
+                        }
+                        if let Kind::Struct(fields) = &body.kind { for field in fields { field.name.retain(context)?; } }
+                        if let Some(value) = &body.metadata.default { value.retain(context, 0)?; }
+                    },
                     _ => (),
                 }
             }
@@ -267,3 +309,6 @@ impl<'a> ObjectView<'a> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod text_tests;

@@ -1,0 +1,11 @@
+20f8c2fe25a68cee9a82b238d8dca9aea7423110725aca83ee6a0780d567c696  kafka-connect-api-4.4.0/org/apache/kafka/connect/data/ConnectSchema.java
+e7b4cb744e0a3a31727831dd84f876a9d8d0094fc89659e1bcaa373556d8ee63  kafka-connect-api-4.4.0/org/apache/kafka/connect/data/Field.java
+2498d3af7097b373cf5c75280fc22ad6fa2bbaf66a3d9d2832cc8500ed165b9d  kafka-connect-api-4.4.0/org/apache/kafka/connect/data/SchemaBuilder.java
+15cc88d0676a2193b72f56e6f1bb7efcebff9bf97ce5d1fdc01732636a23e38a  temurin-25.0.1+8/java.base/java/lang/String.java
+5fe7ee0677d47fba9957ecba865779eee7ddd51923b888af5b68c97fc1def6e0  temurin-25.0.1+8/java.base/java/lang/StringLatin1.java
+c35534168fa008192936362530a877ed323f924228361df1395f81d9d5edf6e3  temurin-25.0.1+8/java.base/java/lang/StringUTF16.java
+662db46c25f481caeff7587af522637892ce7487ffd6a76b092b66a33c81daef  temurin-25.0.1+8/java.base/java/util/AbstractMap.java
+d65de11a3b36fa7aea676086da7901e8565fc495323d0faead9b4e194088e25a  temurin-25.0.1+8/java.base/jdk/internal/util/ArraysSupport.java
+e54d1344405fa1b4bf07448fbe2762a6074dfe5f5f6ddbff9ab81be5677c02e6  native-carriers/rust/crates/types/src/java_text.rs
+4bab4043ba47b40fec6a660f09b335708ff069e7fff63ece37cab9da77133639  native-carriers/rust/crates/types/src/java_text/iter.rs
+fde7c7e06cef62280ea48d6f2b9529b4716f8ce9b5745dfb6997bc661d414289  native-carriers/rust/crates/kafka/src/connect/avro/java_schema/text.rs

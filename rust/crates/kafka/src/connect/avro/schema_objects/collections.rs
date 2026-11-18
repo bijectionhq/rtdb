@@ -34,7 +34,7 @@ impl JavaKey {
         match self.value() {
             JavaValue::Null => "", JavaValue::Bool(_) => "java.lang.Boolean", JavaValue::I8(_) => "java.lang.Byte",
             JavaValue::I16(_) => "java.lang.Short", JavaValue::I32(_) => "java.lang.Integer", JavaValue::I64(_) => "java.lang.Long",
-            JavaValue::F32(_) => "java.lang.Float", JavaValue::F64(_) => "java.lang.Double", JavaValue::String(_) => "java.lang.String",
+            JavaValue::F32(_) => "java.lang.Float", JavaValue::F64(_) => "java.lang.Double", JavaValue::String(_) | JavaValue::StringUnits(_) => "java.lang.String",
             JavaValue::ByteArray(_) => "[B", JavaValue::ByteBuffer(buffer) => buffer.class_name(), JavaValue::Date(_) => "java.util.Date",
             JavaValue::Decimal(_) => "java.math.BigDecimal", JavaValue::Array(_) => "java.util.ArrayList", JavaValue::Map(_) => "java.util.HashMap",
             JavaValue::Struct { .. } => "org.apache.kafka.connect.data.Struct",
@@ -90,6 +90,16 @@ impl JavaMap {
         context.retain(Arc::clone(&self._payload))?;
         for charge in self.map.leases() { context.retain(Arc::clone(charge))?; }
         for (key, _) in self.map.iter() { context.retain(Arc::clone(&key._payload))?; context.retain(Arc::clone(&key._allocation))?; }
+        Ok(())
+    }
+    /// The caller retains the creating schema family when entries contain Struct IDs.
+    pub(in crate::connect::avro) fn retain_contents(&self, context: &mut ConversionContext) -> Result<()> {
+        self.retain_at(context, 0)
+    }
+    pub(super) fn retain_at(&self, context: &mut ConversionContext, depth: usize) -> Result<()> {
+        if depth > 128 { return Err(invalid("Typed value nesting depth exceeded")); }
+        self.retain(context)?;
+        for (key, value) in self.map.iter() { key.value().retain(context, depth + 1)?; value.retain(context, depth + 1)?; }
         Ok(())
     }
 }

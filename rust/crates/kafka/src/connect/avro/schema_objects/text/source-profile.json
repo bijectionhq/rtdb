@@ -1,0 +1,61 @@
+{
+  "source_only": true,
+  "runtime_discovery": false,
+  "primary_source_count": 8,
+  "native_source_count": 3,
+  "jdk_release_tag": "jdk-25.0.1+8",
+  "jdk_source_archive_sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
+  "kafka_connect_api": "4.4.0",
+  "source_intervals": {
+    "String.java": [
+      "1920-1927",
+      "2103-2113",
+      "2421-2441"
+    ],
+    "StringLatin1.java": [
+      "98-151",
+      "194-196"
+    ],
+    "StringUTF16.java": [
+      "455-480",
+      "585-587"
+    ],
+    "ArraysSupport.java": [
+      "248-313"
+    ],
+    "AbstractMap.java": [
+      "451-477",
+      "497-502",
+      "843-845"
+    ],
+    "SchemaBuilder.java": [
+      "149-153",
+      "182-186",
+      "199-205",
+      "323-337"
+    ],
+    "ConnectSchema.java": [
+      "218-246",
+      "309-331"
+    ],
+    "Field.java": [
+      "67-79"
+    ]
+  },
+  "native_carriers": [
+    "rust/crates/types/src/java_text.rs",
+    "rust/crates/types/src/java_text/iter.rs",
+    "rust/crates/kafka/src/connect/avro/java_schema/text.rs"
+  ],
+  "source_snapshot": "/tmp/rtdb-avro-exact-text-sources",
+  "operator_scope": "Exact successful String equality/hash/Comparable and logical-name class recognition; no JVM internal String memo or OOME-timing equivalence.",
+  "remaining_scope": [
+    "actual decoder and Registry input pairing for isolated UTF16",
+    "source LinkedHashMap parameter encounter iteration",
+    "public Value/SMT/writer projection and consumer provenance",
+    "complete source graph/default construction and LogicalType objects",
+    "full union and arbitrary-key data conversion"
+  ],
+  "existing_primary_notice_owner": "../typed-map/COPYRIGHT",
+  "identity_profile": "String unit operators need no invented Java identity; the metadata fixture supplies Schema.Type hash7 explicitly."
+}

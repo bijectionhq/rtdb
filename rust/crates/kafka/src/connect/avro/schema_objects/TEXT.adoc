@@ -1,0 +1,49 @@
+= Exact typed Connect text
+
+This registered schema-object capability preserves every Java UTF16 unit in field names, schema names/docs, parameter keys/values and admitted String-class values.
+The production graph and default path still needs to adopt this capability.
+The existing programmatic JavaValue::String(String) representation and the admitted JavaValue::StringUnits(Text) representation describe the same java.lang.String class.
+Java object identity remains a separate observation.
+
+== Values, operators and owners
+
+Text is the existing passive immutable owner of shared JavaString storage and its captured reservation.
+JavaValue::string copies a borrowed JavaText after admission; string_text borrows either String representation without encoding or allocation.
+String equality compares exact units, hash computes the wrapping 31-fold over those units, and Comparable subtracts the first differing unsigned UTF16 units or the signed32 unit counts.
+Logical-name recognition likewise compares the complete exact name against the recognized ASCII name.
+
+Field and Metadata remain passive values inside the immutable SchemaObjects owner produced by the passive single-writer SchemaObjectsBuilder transient.
+The existing &str setters delegate to borrowed JavaText setters.
+Duplicate field detection compares units before text admission or copying.
+The builder retains its existing source-stage contract; the eventual graph caller must still preserve actual SchemaBuilder checkCanSet and metadata assignment timing.
+
+SchemaHandle retention first retains each arena's existing structural charges, then visits its actual name/doc text, parameter key/value text, field-name text and default value owners in object order.
+Imported families preserve those original owners and their existing reservations.
+Typed default, List, Map and PreviousValue traversal reaches independently admitted text in the same nested-owner walk as binary/map storage.
+JavaMap::retain covers map storage and key control storage.
+`retain_contents` additionally visits the actual entry values and key values.
+The creating schema family remains a separate caller obligation whenever a value can contain Struct IDs.
+
+link:ADMISSION.adoc[The arena admission contract] specifies the checked text temporary/storage and Text-containing slot bounds.
+Copies admit their temporary unit buffer and final shared backing separately because both coexist during construction.
+Only the backing's lease is captured by Text; the temporary reservation remains in the current conversion context.
+Fresh contexts retain the captured existing reservation rather than reserving that heap again.
+
+== Source scope
+
+The primary source profile is Temurin25.0.1+8 and Kafka Connect4.4.0.
+link:text/sources.sha256[] pins eight exact primary files and three existing native text-carrier files.
+link:text/COPYRIGHT[] retains each primary file's full pre-package prefix; link:text/source-profile.json[] records the archive, intervals and native qualification.
+The source licenses remain in link:../names/LICENSE[GPLv2 with Classpath exception] and link:../names/LICENSE-APACHE[Apache2].
+The separately pinned link:typed-map/HASHING.adoc[typed collection contract] supplies the shared HashMap/tree and source schema hash/memo context.
+
+Kafka SchemaBuilder.parameter uses LinkedHashMap.
+The internal BTreeMap supplies exact String-map equality and hashing with UTF16 key ordering.
+Source encounter order and public builder scheduling still need integration.
+The borrowed unit fold computes the successful String hash value.
+JVM hash memo writes, allocation timing and OOME behavior require separate qualification.
+
+Ten additional regression functions cover isolated-unit values, cross-representation equality/hash/order/class validation, field/name/doc/parameter relations, collision trees, equal-key replacement, imported text owners, map contents retention, replaced-value retention, admission failure and cached exact String defaults.
+The metadata hash fixture uses the explicit Schema.Type hash observation7 and source polynomial arithmetic, rather than a discovered JVM identity profile.
+The full Avro path still needs isolated UTF16 from the schema input decoder and Registry boundary.
+Production integration also needs the public Value, SMT and writer projection, source graph and default construction, LogicalType objects, union selection and consumer provenance.

@@ -76,6 +76,9 @@ impl<W: IdentityWitness> Evaluation<'_, W> {
     }
     pub(super) fn values(&mut self, left: &JavaValue, left_owner: &SchemaObjects, right: &JavaValue, right_owner: &SchemaObjects, depth: usize, deep: bool) -> Result<bool> {
         if std::ptr::eq(left, right) { return Ok(true); } guard(depth)?;
+        if let Some(left) = left.string_text() {
+            return Ok(right.string_text().is_some_and(|right| left.units().eq(right.units())));
+        }
         use JavaValue as V;
         Ok(match (left, right) {
             (V::Null, V::Null) => true, (V::Bool(left), V::Bool(right)) => left == right,
@@ -83,7 +86,6 @@ impl<W: IdentityWitness> Evaluation<'_, W> {
             (V::I32(left), V::I32(right)) => left == right, (V::I64(left), V::I64(right)) => left == right,
             (V::F32(left), V::F32(right)) => left.to_bits() == right.to_bits() || left.is_nan() && right.is_nan(),
             (V::F64(left), V::F64(right)) => left.to_bits() == right.to_bits() || left.is_nan() && right.is_nan(),
-            (V::String(left), V::String(right)) => left == right,
             (V::ByteArray(left), V::ByteArray(right)) => if deep { left.bytes() == right.bytes() } else { Arc::ptr_eq(left, right) },
             (V::ByteBuffer(left), V::ByteBuffer(right)) => left.remaining() == right.remaining(),
             (V::Date(left), V::Date(right)) => left == right,
@@ -118,13 +120,16 @@ impl<W: IdentityWitness> Evaluation<'_, W> {
         let bad_class = || DefaultAttempt::Invalid(error("avro-schema", "Typed default does not match its Java schema object"));
         guard(depth)?; let schema = destination.body()?;
         if matches!(value, JavaValue::Null) { return Ok(if schema.optional { DefaultAttempt::Value(()) } else { bad_class() }); }
-        let class_matches = match schema.body.metadata.name.as_deref() {
-            Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp") => matches!(value, JavaValue::Date(_)),
-            Some("org.apache.kafka.connect.data.Decimal") => matches!(value, JavaValue::Decimal(_)),
-            _ => match (&schema.body.kind, value) {
-                (Kind::Scalar(Scalar::Bool), JavaValue::Bool(_)) | (Kind::Scalar(Scalar::I8), JavaValue::I8(_)) | (Kind::Scalar(Scalar::I16), JavaValue::I16(_)) | (Kind::Scalar(Scalar::I32), JavaValue::I32(_)) | (Kind::Scalar(Scalar::I64), JavaValue::I64(_)) | (Kind::Scalar(Scalar::F32), JavaValue::F32(_)) | (Kind::Scalar(Scalar::F64), JavaValue::F64(_)) | (Kind::Scalar(Scalar::String), JavaValue::String(_)) | (Kind::Scalar(Scalar::Bytes), JavaValue::ByteArray(_) | JavaValue::ByteBuffer(_)) | (Kind::Array(_), JavaValue::Array(_)) | (Kind::Map(_, _), JavaValue::Map(_)) | (Kind::Struct(_), JavaValue::Struct { .. }) => true,
+        let named = |expected: &str| schema.body.metadata.name.as_ref().is_some_and(|name| name.view().units().eq(expected.encode_utf16()));
+        let class_matches = if ["org.apache.kafka.connect.data.Date", "org.apache.kafka.connect.data.Time", "org.apache.kafka.connect.data.Timestamp"].into_iter().any(|expected| named(expected)) {
+            matches!(value, JavaValue::Date(_))
+        } else if named("org.apache.kafka.connect.data.Decimal") {
+            matches!(value, JavaValue::Decimal(_))
+        } else {
+            match (&schema.body.kind, value) {
+                (Kind::Scalar(Scalar::Bool), JavaValue::Bool(_)) | (Kind::Scalar(Scalar::I8), JavaValue::I8(_)) | (Kind::Scalar(Scalar::I16), JavaValue::I16(_)) | (Kind::Scalar(Scalar::I32), JavaValue::I32(_)) | (Kind::Scalar(Scalar::I64), JavaValue::I64(_)) | (Kind::Scalar(Scalar::F32), JavaValue::F32(_)) | (Kind::Scalar(Scalar::F64), JavaValue::F64(_)) | (Kind::Scalar(Scalar::String), JavaValue::String(_) | JavaValue::StringUnits(_)) | (Kind::Scalar(Scalar::Bytes), JavaValue::ByteArray(_) | JavaValue::ByteBuffer(_)) | (Kind::Array(_), JavaValue::Array(_)) | (Kind::Map(_, _), JavaValue::Map(_)) | (Kind::Struct(_), JavaValue::Struct { .. }) => true,
                 _ => false,
-            },
+            }
         };
         if !class_matches { return Ok(bad_class()); }
         macro_rules! child { ($value:expr, $schema:expr, $owner:expr) => { if let DefaultAttempt::Invalid(cause) = self.validate($value, $owner, $schema, depth + 1)? { return Ok(DefaultAttempt::Invalid(cause)); } }; }

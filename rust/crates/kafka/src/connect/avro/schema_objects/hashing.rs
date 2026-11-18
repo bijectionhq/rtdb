@@ -3,7 +3,7 @@ use super::evaluation::{Evaluation, IdentityWitness, SchemaType};
 
 fn step(hash: i32, value: i32) -> i32 { hash.wrapping_mul(31).wrapping_add(value) }
 fn guard(depth: usize) -> Result<()> { if depth > 128 { Err(invalid("Typed Java hashing depth exceeded")) } else { Ok(()) } }
-pub(super) fn text(value: &str) -> i32 { value.encode_utf16().fold(0i32, |hash, unit| step(hash, i32::from(unit))) }
+pub(super) fn text(value: JavaText<'_>) -> i32 { value.java_hash_code() }
 pub(super) fn boolean(value: bool) -> i32 { if value { 1231 } else { 1237 } }
 fn long(value: i64) -> i32 { value as i32 ^ (value >> 32) as i32 }
 fn float(value: f32) -> i32 { if value.is_nan() { 0x7fc00000 } else { value.to_bits() as i32 } }
@@ -36,7 +36,7 @@ pub(super) fn schema(view: ObjectView<'_>, evaluation: &mut Evaluation<'_, impl 
                 let mut fields_hash = 1;
                 for (index, field) in fields.iter().enumerate() {
                     let index = i32::try_from(index).map_err(|_| super::super::resolution::overflow())?;
-                    let field_hash = step(step(step(1, text(&field.name)), index), schema(ObjectView { arena: body.arena, object: field.schema }, evaluation, depth + 1)?);
+                    let field_hash = step(step(step(1, text(field.name.view())), index), schema(ObjectView { arena: body.arena, object: field.schema }, evaluation, depth + 1)?);
                     fields_hash = step(fields_hash, field_hash);
                 }
                 fields_hash
@@ -46,10 +46,10 @@ pub(super) fn schema(view: ObjectView<'_>, evaluation: &mut Evaluation<'_, impl 
             computed = step(computed, match &body.body.kind {
                 Kind::Map(_, element) | Kind::Array(element) => schema(ObjectView { arena: body.arena, object: *element }, evaluation, depth + 1)?, _ => 0,
             });
-            computed = step(computed, metadata.name.as_deref().map_or(0, text));
+            computed = step(computed, metadata.name.as_ref().map_or(0, |name| text(name.view())));
             computed = step(computed, metadata.version.unwrap_or(0));
-            computed = step(computed, metadata.doc.as_deref().map_or(0, text));
-            computed = step(computed, metadata.parameters.as_ref().map_or(0, |parameters| parameters.iter().fold(0i32, |hash, (key, value)| hash.wrapping_add(text(key) ^ text(value)))));
+            computed = step(computed, metadata.doc.as_ref().map_or(0, |doc| text(doc.view())));
+            computed = step(computed, metadata.parameters.as_ref().map_or(0, |parameters| parameters.iter().fold(0i32, |hash, (key, value)| hash.wrapping_add(text(key.view()) ^ text(value.view())))));
             if hash.set(computed).is_err() && hash.get() != Some(&computed) { return Err(invalid("Conflicting source schema hash observations")); }
             Ok(computed)
         }
@@ -63,7 +63,8 @@ pub(super) fn value(source: &JavaValue, owner: &SchemaObjects, evaluation: &mut 
         JavaValue::Null => 0, JavaValue::Bool(value) => boolean(*value),
         JavaValue::I8(value) => i32::from(*value), JavaValue::I16(value) => i32::from(*value), JavaValue::I32(value) => *value,
         JavaValue::I64(value) | JavaValue::Date(value) => long(*value), JavaValue::F32(value) => float(*value), JavaValue::F64(value) => long(double_bits(*value)),
-        JavaValue::String(value) => text(value), JavaValue::ByteArray(storage) => evaluation.witness.byte_array_hash(storage, evaluation.context)?,
+        JavaValue::String(value) => text(JavaText::from_utf8(value)),
+        JavaValue::StringUnits(value) => text(value.view()), JavaValue::ByteArray(storage) => evaluation.witness.byte_array_hash(storage, evaluation.context)?,
         JavaValue::ByteBuffer(buffer) => buffer.remaining().iter().rev().fold(1i32, |hash, byte| step(hash, i32::from(*byte as i8))),
         JavaValue::Decimal(decimal) => magnitude_hash(&decimal.coefficient).wrapping_mul(31).wrapping_add(decimal.scale),
         JavaValue::Array(values) => {
@@ -126,13 +127,23 @@ pub(super) fn comparable(value: &JavaValue) -> Option<Comparable> {
     Some(match value {
         JavaValue::Bool(_) => Comparable::Bool, JavaValue::I8(_) => Comparable::I8, JavaValue::I16(_) => Comparable::I16,
         JavaValue::I32(_) => Comparable::I32, JavaValue::I64(_) => Comparable::I64, JavaValue::F32(_) => Comparable::F32,
-        JavaValue::F64(_) => Comparable::F64, JavaValue::String(_) => Comparable::String, JavaValue::Date(_) => Comparable::Date,
+        JavaValue::F64(_) => Comparable::F64, JavaValue::String(_) | JavaValue::StringUnits(_) => Comparable::String, JavaValue::Date(_) => Comparable::Date,
         JavaValue::Decimal(_) => Comparable::Decimal, _ => return None,
     })
 }
 fn order(order: std::cmp::Ordering) -> i32 { match order { std::cmp::Ordering::Less => -1, std::cmp::Ordering::Equal => 0, std::cmp::Ordering::Greater => 1 } }
 pub(super) fn compare(class: Comparable, left: &JavaValue, right: &JavaValue, context: &mut ConversionContext) -> Result<i32> {
     if comparable(right) != Some(class) { return Ok(0); }
+    if class == Comparable::String {
+        let left = left.string_text().ok_or_else(|| invalid("Screened Java Comparable class differs from its candidate"))?;
+        let right = right.string_text().ok_or_else(|| invalid("Screened Java Comparable class differs from its candidate"))?;
+        for (left, right) in left.units().zip(right.units()) {
+            if left != right { return Ok(i32::from(left) - i32::from(right)); }
+        }
+        let left = i32::try_from(left.len_units()).map_err(|_| super::super::resolution::overflow())?;
+        let right = i32::try_from(right.len_units()).map_err(|_| super::super::resolution::overflow())?;
+        return Ok(left - right);
+    }
     Ok(match (left, right) {
         (JavaValue::Bool(left), JavaValue::Bool(right)) => order(left.cmp(right)),
         (JavaValue::I8(left), JavaValue::I8(right)) => i32::from(*left) - i32::from(*right),
@@ -141,11 +152,6 @@ pub(super) fn compare(class: Comparable, left: &JavaValue, right: &JavaValue, co
         (JavaValue::I64(left), JavaValue::I64(right)) | (JavaValue::Date(left), JavaValue::Date(right)) => order(left.cmp(right)),
         (JavaValue::F32(left), JavaValue::F32(right)) => if left < right { -1 } else if left > right { 1 } else { order(float(*left).cmp(&float(*right))) },
         (JavaValue::F64(left), JavaValue::F64(right)) => if left < right { -1 } else if left > right { 1 } else { order(double_bits(*left).cmp(&double_bits(*right))) },
-        (JavaValue::String(left), JavaValue::String(right)) => {
-            for (left, right) in left.encode_utf16().zip(right.encode_utf16()) { if left != right { return Ok(i32::from(left) - i32::from(right)); } }
-            let left = i32::try_from(left.encode_utf16().count()).map_err(|_| super::super::resolution::overflow())?;
-            let right = i32::try_from(right.encode_utf16().count()).map_err(|_| super::super::resolution::overflow())?; left - right
-        }
         (JavaValue::Decimal(left), JavaValue::Decimal(right)) => decimal_compare(left, right, context)?,
         _ => return Err(invalid("Screened Java Comparable class differs from its candidate")),
     })

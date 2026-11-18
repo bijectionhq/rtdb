@@ -93,7 +93,11 @@ The eventual data/schema owner must retain semantic provenance even when an SMT 
 An initial 4096-byte reservation precedes the initial lease vector allocation.
 Each object, field, lease or temporary traversal-vector growth checks its doubled requested capacity and admits 16 times that slot storage plus 256 bytes before allocation.
 Old leases remain retained while old/new growth buffers can overlap.
-Names/docs admit their byte length plus 256 bytes, and parameter entries admit both string lengths plus 1024 bytes.
+Field names, schema names/docs and parameter keys/values own exact shared UTF16 text and its separately retained reservation.
+The text copy admits a checked two-byte-per-unit temporary buffer plus 256 bytes before allocation, then uses the shared JavaString constructor's checked backing/control bound before publishing its owner.
+The temporary buffer's lease remains in the current context; the resulting Text retains its own storage lease after that context drops.
+Name/doc assignments admit 256 bytes of arena bookkeeping, and parameter entries admit sixteen Text-pair slots plus 256 bytes of node/control allowance before copying either text.
+All object/field capacity calculations use their actual Text-containing element sizes.
 Binary storage admits its full bytes plus 4096 bytes before copying the payload and publishing its shared owner.
 Default construction receives a caller-proved checked bound covering its typed container slots and payloads.
 The shared borrowed Measure/Materialize integration must supply that proof before creating any typed output tree.
@@ -104,6 +108,7 @@ A new conversion context retains those existing charges against its own per-reco
 Its bounded admitted seen-vector avoids repeatedly traversing the same imported arena.
 Property-comparison pair scratch and cache-retention traversal scratch belong to the temporary context, which retains their leases through the call.
 Typed values and separately exported Value/ConnectSchema copies may coexist and require separate retained admission.
+link:TEXT.adoc[The exact typed-text contract] records String-class compatibility, retained text traversal and the remaining input/export boundaries.
 
 == Source and regression scope
 
