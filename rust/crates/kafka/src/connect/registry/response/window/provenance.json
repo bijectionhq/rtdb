@@ -1,0 +1,138 @@
+{
+  "source_only": true,
+  "runtime_execution": false,
+  "effective_profile": null,
+  "selected_sources": 26,
+  "published_source_prefix_reuse": 26,
+  "new_full_prefixes": {},
+  "published_dependencies": {
+    "rust/crates/kafka/src/connect/registry/response/artifacts.json": "707627115ba6541c3830b8fd503878b55ac320b873045529c642e1c559281475",
+    "rust/crates/kafka/src/connect/registry/response/sources.sha256": "ea40eb56a84d964721de81972ede327971251a24175bf4c97fc1e6285db229e2",
+    "rust/crates/kafka/src/connect/registry/response/COPYRIGHT": "a15466c6a61ae66c86deec4c58789620eec28c7567fd3c088b3f5a5623f1f8c7",
+    "rust/crates/kafka/src/connect/registry/response/LICENSES": "94221d4fcede4db86b4594656a98a84c2e68c17062e942fcebf24d024208ad7e",
+    "rust/crates/kafka/src/connect/registry/input_window/artifacts.json": "d7123c8e7b320a7837424b7cbe32abfee836ee2b83a1f7e638b446133d5e997a",
+    "rust/crates/kafka/src/connect/registry/input_window/sources.sha256": "1bfa7bbf7d3e45b75271c26c72be78cf75806483a71150ffefd8489a15de8226",
+    "rust/crates/kafka/src/connect/registry/input_window/COPYRIGHT": "ec7dea209e7bbedeec96047d48e8dcc9f2153dddead9c7286723d56a219957c9",
+    "rust/crates/kafka/src/connect/registry/input_window/LICENSES": "2c5bf96fc6ce61982dcbb0f4295b85ba0f6513ac77f3b4e257acc8ff4c4f1cc3",
+    "rust/crates/kafka/src/connect/registry/input_window/utf16/source-profile.json": "f680ca159fd48aacd6fce4a408565faba3e0ba2107e17d913a091656d448f913"
+  },
+  "legal_reuse": "All 26 selected sources and complete prefixes reuse the published ../artifacts.json, ../COPYRIGHT and ../LICENSES archive/legal entries.",
+  "position_units": {
+    "UTF8": "InputStream bytes including skipped BOM",
+    "UTF16": "Reader UTF16 units excluding skipped BOM",
+    "UTF32": "Reader UTF16 units excluding skipped BOM"
+  },
+  "source_archives": {
+    "confluent-7.8.0": "0bede2ed51df1c97cc1a86c49e5dc1bdebca570d791e81183b39cd3b5004feaf",
+    "jackson-core-2.16.0": "ea95a196a9ad7abdcd0b72fa079b307cccaa1d123b727dfb62b0cbefe6cfd864",
+    "jackson-core-2.21.7": "8c463d7b86fc44851f180c38e91580d32505b5e06443514212ca93c40efdde5c",
+    "jackson-databind-2.16.0": "9967c9d76cd6cabdce763149d643bc0b66e580208d635684b1bda5e09da44b30",
+    "jackson-databind-2.21.7": "9d0088f4990df572c2e3aa1c14d4c03fd8200283d801836c8044d01b9ccb7e73"
+  },
+  "verified_reused_prefixes": {
+    "confluent-7.8.0/io/confluent/kafka/schemaregistry/client/rest/RestService.java": {
+      "bytes": 595,
+      "sha256": "1a213df5f633cee7547228673a81db1aa052a73bd9bd16c13f76472ccbc7c053"
+    },
+    "confluent-7.8.0/io/confluent/kafka/schemaregistry/utils/JacksonMapper.java": {
+      "bytes": 595,
+      "sha256": "df7f93c6193a1c126519694f137319c154d1450268a11a9295025ea68b94d0e1"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/StreamReadConstraints.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/base/ParserBase.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/base/ParserMinimalBase.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/json/ReaderBasedJsonParser.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/json/UTF8StreamJsonParser.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/sym/ByteQuadsCanonicalizer.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/sym/CharsToNameCanonicalizer.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/util/TextBuffer.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/StreamReadConstraints.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/base/ParserBase.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/base/ParserMinimalBase.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/json/ReaderBasedJsonParser.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/json/UTF8StreamJsonParser.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/sym/ByteQuadsCanonicalizer.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/sym/CharsToNameCanonicalizer.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/util/TextBuffer.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.16.0/com/fasterxml/jackson/databind/DeserializationFeature.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.16.0/com/fasterxml/jackson/databind/ObjectMapper.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.16.0/com/fasterxml/jackson/databind/deser/BeanDeserializer.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.16.0/com/fasterxml/jackson/databind/deser/impl/PropertyBasedCreator.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.21.7/com/fasterxml/jackson/databind/DeserializationFeature.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.21.7/com/fasterxml/jackson/databind/ObjectMapper.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.21.7/com/fasterxml/jackson/databind/deser/BeanDeserializer.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.21.7/com/fasterxml/jackson/databind/deser/impl/PropertyBasedCreator.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}

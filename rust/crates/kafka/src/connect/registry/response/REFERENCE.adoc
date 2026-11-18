@@ -2,7 +2,7 @@
 
 The ordered-byte decoder constructs nullable REST bean owners.
 The production Registry HTTP routes continue to use their published response path.
-The Registry test build includes 30 decoder regression source fixtures, with execution pending Phase 2.
+The Registry test build includes 30 published decoder regression source fixtures and24 observed-window integration fixture sources, with execution pending Phase 2.
 HTTP stream segmentation, persistent Jackson symbol-table state and effective shipped Jackson selection remain required before typed HTTP activation.
 The Phase 2, whole-native memory and source-completeness gates remain open.
 
@@ -48,7 +48,10 @@ SchemaEntity computes normalizedPath at construction; later reflected entityPath
 
 The Registry transport returns a passive RawResponse whose RawBody retains the admitted byte vector through decoding or final release.
 The existing generic response path parses these borrowed bytes through the admitted JSON materializer.
-Cursor and Input are passive call-local borrowed lexical state; Name retains an Input snapshot rather than a decoded-name allocation.
+Cursor is a passive call-local choice between the borrowed slice cursor and the observed-window lexical transient.
+SliceCursor and Input retain the published borrowed-byte rules; SliceName retains an Input snapshot.
+The observed branch owns one existing parser window, admitted field-name values and a bounded inline numeric spelling.
+Name is a complete slice-name or admitted JavaString value, so repeated name comparisons and retained map keys never repeat an observed source read.
 Token, Frame, Profile, Utf8Demand and the failure variants are passive value tags.
 TextBufferObservation is a passive caller-owned observation of the actual source text-segment capacity in UTF16 units at a demanded value's opening-quote byte offset.
 Cursor borrows those observations with the response bytes; it retains no observation allocation or authority callback.
@@ -95,8 +98,10 @@ RestService320–323 passes HttpURLConnection.getInputStream directly to ObjectM
 UTF32Reader and ReaderBasedJsonParser decode ahead in source-dependent input windows.
 An invalid UTF32 suffix can fail before a completed root bean is returned, and a supplementary character at an output-buffer boundary uses UTF32Reader's retained pending-char branch.
 Core2.21.7 also reports a non-identifier UTF8 literal suffix when decoding that suffix reloads its input buffer.
-The current byte-only cursor has no HTTP read-segmentation observation and does not reproduce those reader-window effects.
-A transport/reader observation boundary is required before claiming those cases.
+The legacy byte-only cursor has no HTTP read-segmentation observation and does not reproduce those reader-window effects.
+The inactive link:window/REFERENCE.adoc[observed-window entry points] consume the published UTF8/UTF16/UTF32 windows directly for the qualified lexical branches.
+They retain a borrowed successful canonicalizer-result observation at each field occurrence and explicitly reject unmodeled error-token, rewind and over-limit Reader branches.
+Actual HTTP observation capture and persistent mapper symbol state remain required before activation.
 
 JsonFactory also shares seeded ByteQuadsCanonicalizer/CharsToNameCanonicalizer state across parser calls and enables FAIL_ON_SYMBOL_HASH_OVERFLOW by default.
 The borrowed cursor preserves decoded names and member order but carries no persistent mapper symbol state.

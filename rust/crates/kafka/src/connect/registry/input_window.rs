@@ -262,6 +262,7 @@ impl<'a> Utf32Reader<'a> {
 
 pub(super) struct ReaderWindow<'a> { reader: Utf32Reader<'a>, buffer: Option<Buffer<u16>>, ptr: usize, end: usize, processed: i64, attached: bool, closed: bool }
 impl<'a> ReaderWindow<'a> {
+    pub(super) fn profile(&self) -> Profile { self.reader.profile }
     pub(super) fn new(reader: Utf32Reader<'a>, capacity: usize, context: &mut ConversionContext) -> Result<'a, Self> {
         if capacity == 0 { return Err(Failure::Observation { index: reader.observations_consumed(), expected: Call::Read(ReadRequest { method: ReadMethod::Slice, offset: 0, length: 0 }), detail: "Parser character buffer must have positive observed capacity" }); }
         Ok(Self { reader, buffer: Some(Buffer::new(capacity, context)?), ptr: 0, end: 0, processed: 0, attached: true, closed: false })

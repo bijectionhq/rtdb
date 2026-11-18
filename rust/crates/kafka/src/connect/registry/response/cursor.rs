@@ -14,8 +14,8 @@ struct Frame { kind: Kind, first: bool }
 struct Token { kind: Kind, start: usize, end: usize, active: bool }
 
 #[derive(Clone, Copy)]
-pub(super) struct Name<'a> { input: Input<'a>, profile: Profile }
-impl Name<'_> {
+pub(super) struct SliceName<'a> { input: Input<'a>, profile: Profile }
+impl SliceName<'_> {
     pub(super) fn is(&self, expected: &str) -> Result<bool> {
         let mut input = self.input;
         let mut units = expected.encode_utf16();
@@ -28,10 +28,10 @@ impl Name<'_> {
     }
 }
 
-pub(super) struct Cursor<'a> {
+pub(super) struct SliceCursor<'a> {
     input: Input<'a>, profile: Profile, frames: Values<Frame>, token: Option<Token>, text_buffers: &'a [TextBufferObservation],
 }
-impl<'a> Cursor<'a> {
+impl<'a> SliceCursor<'a> {
     pub(super) fn new(bytes: &'a [u8], profile: Profile) -> Result<Self> {
         Self::with_text_buffers(bytes, profile, &[])
     }
@@ -63,7 +63,7 @@ impl<'a> Cursor<'a> {
         self.token = None;
         Ok(())
     }
-    pub(super) fn field(&mut self) -> Result<Option<Name<'a>>> {
+    pub(super) fn field(&mut self) -> Result<Option<SliceName<'a>>> {
         self.discard_scalar()?;
         let first = self.frames.as_slice().last().filter(|frame| frame.kind == Kind::Object)
             .ok_or_else(|| self.syntax("Expected an object context"))?.first;
@@ -77,7 +77,7 @@ impl<'a> Cursor<'a> {
         self.expect(0x3a, "Expected a colon after the field name")?;
         self.frames.as_mut_slice().last_mut().unwrap().first = false;
         self.token = Some(self.lex(false)?);
-        Ok(Some(Name { input: start, profile: self.profile }))
+        Ok(Some(SliceName { input: start, profile: self.profile }))
     }
     pub(super) fn element(&mut self) -> Result<bool> {
         self.discard_scalar()?;
@@ -342,4 +342,65 @@ fn escaped(input: &mut Input<'_>) -> Result<u16> {
         }
         _ => return Err(Failure::at(FailureKind::Syntax, at, "Invalid JSON string escape")),
     })
+}
+
+
+mod observed;
+
+pub(super) enum Name<'a> { Slice(SliceName<'a>), Observed(JavaString) }
+impl Name<'_> {
+    pub(super) fn is(&self, expected: &str) -> Result<bool> {
+        match self { Self::Slice(name) => name.is(expected), Self::Observed(name) => Ok(name.view().units().eq(expected.encode_utf16())) }
+    }
+    pub(super) fn copy(&self, context: &mut ConversionContext) -> Result<JavaString> {
+        match self { Self::Slice(name) => name.copy(context), Self::Observed(name) => Ok(name.clone()) }
+    }
+}
+
+pub(super) enum Cursor<'a> { Slice(SliceCursor<'a>), Observed(observed::ObservedCursor<'a>) }
+impl<'a> Cursor<'a> {
+    pub(super) fn new(bytes: &'a [u8], profile: Profile) -> Result<Self> { Ok(Self::Slice(SliceCursor::new(bytes, profile)?)) }
+    pub(super) fn with_text_buffers(bytes: &'a [u8], profile: Profile, observations: &'a [TextBufferObservation]) -> Result<Self> {
+        Ok(Self::Slice(SliceCursor::with_text_buffers(bytes, profile, observations)?))
+    }
+    pub(super) fn observed(input: super::window::WindowInput<'a>, profile: Profile, observations: super::window::LexicalObservations<'a>) -> Self {
+        Self::Observed(observed::ObservedCursor::new(input, profile, observations))
+    }
+    pub(super) fn start(&mut self) -> Result<()> { match self { Self::Slice(_) => Ok(()), Self::Observed(cursor) => cursor.start() } }
+    pub(super) fn offset(&self) -> usize { match self { Self::Slice(cursor) => cursor.offset(), Self::Observed(cursor) => cursor.offset() } }
+    pub(super) fn profile(&self) -> Profile { match self { Self::Slice(cursor) => cursor.profile(), Self::Observed(cursor) => cursor.profile() } }
+    pub(super) fn kind(&mut self, context: &mut ConversionContext) -> Result<Kind> {
+        match self { Self::Slice(cursor) => cursor.kind(context), Self::Observed(cursor) => cursor.kind(context) }
+    }
+    pub(super) fn begin_object(&mut self, context: &mut ConversionContext) -> Result<()> {
+        match self { Self::Slice(cursor) => cursor.begin_object(context), Self::Observed(cursor) => cursor.begin_object(context) }
+    }
+    pub(super) fn begin_array(&mut self, context: &mut ConversionContext) -> Result<()> {
+        match self { Self::Slice(cursor) => cursor.begin_array(context), Self::Observed(cursor) => cursor.begin_array(context) }
+    }
+    pub(super) fn field(&mut self, context: &mut ConversionContext) -> Result<Option<Name<'a>>> {
+        match self { Self::Slice(cursor) => Ok(cursor.field()?.map(Name::Slice)), Self::Observed(cursor) => Ok(cursor.field(context)?.map(Name::Observed)) }
+    }
+    pub(super) fn element(&mut self) -> Result<bool> {
+        match self { Self::Slice(cursor) => cursor.element(), Self::Observed(cursor) => cursor.element() }
+    }
+    pub(super) fn take_null(&mut self, context: &mut ConversionContext) -> Result<bool> {
+        match self { Self::Slice(cursor) => cursor.take_null(context), Self::Observed(cursor) => cursor.take_null(context) }
+    }
+    pub(super) fn string(&mut self, context: &mut ConversionContext) -> Result<JavaString> {
+        match self { Self::Slice(cursor) => cursor.string(context), Self::Observed(cursor) => cursor.string(context) }
+    }
+    pub(super) fn take_boolean_token(&mut self, context: &mut ConversionContext) -> Result<Option<bool>> {
+        match self { Self::Slice(cursor) => cursor.take_boolean_token(context), Self::Observed(cursor) => cursor.take_boolean_token(context) }
+    }
+    pub(super) fn number_text(&mut self, context: &mut ConversionContext) -> Result<JavaString> {
+        match self { Self::Slice(cursor) => cursor.number_text(context), Self::Observed(cursor) => cursor.number_text(context) }
+    }
+    pub(super) fn skip(&mut self, context: &mut ConversionContext) -> Result<()> {
+        match self { Self::Slice(cursor) => cursor.skip(context), Self::Observed(cursor) => cursor.skip(context) }
+    }
+    pub(super) fn coercion(&self, detail: &'static str) -> Failure { Failure::at(FailureKind::Coercion, self.offset(), detail) }
+    pub(super) fn constructor(&self, detail: &'static str) -> Failure { Failure::at(FailureKind::Constructor, self.offset(), detail) }
+    pub(super) fn close(&mut self) -> Result<()> { match self { Self::Slice(_) => Ok(()), Self::Observed(cursor) => cursor.close() } }
+    pub(super) fn observations_consumed(&self) -> usize { match self { Self::Slice(_) => 0, Self::Observed(cursor) => cursor.observations_consumed() } }
 }

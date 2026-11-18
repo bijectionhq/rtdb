@@ -29,7 +29,7 @@ pub(super) fn properties(cursor: &mut Cursor<'_>, context: &mut ConversionContex
     if cursor.take_null(context)? { return Ok(None); }
     cursor.begin_object(context)?;
     let mut values: Values<(JavaString, Option<JavaString>)> = Values::new();
-    while let Some(name) = cursor.field()? {
+    while let Some(name) = cursor.field(context)? {
         let key = name.copy(context)?;
         let value = scalars::text(cursor, context)?;
         if let Some(old) = values.as_mut_slice().iter_mut().find(|(old, _)| old.view().units().eq(key.view().units())) {
@@ -43,7 +43,7 @@ pub(super) fn tags(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> 
     if cursor.take_null(context)? { return Ok(None); }
     cursor.begin_object(context)?;
     let mut values: Values<(JavaString, Option<StringSet>)> = Values::new();
-    while let Some(name) = cursor.field()? {
+    while let Some(name) = cursor.field(context)? {
         let key = name.copy(context)?;
         let value = strings(cursor, context)?;
         if let Some(old) = values.as_mut_slice().iter_mut().find(|(old, _)| old.view().units().eq(key.view().units())) {

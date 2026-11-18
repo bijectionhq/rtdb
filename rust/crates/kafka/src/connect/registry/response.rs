@@ -8,6 +8,9 @@ mod beans;
 mod scalars;
 mod collections;
 mod decode;
+mod window;
+
+pub(super) use window::{LexicalObservations, NameObservation, ObservedDecode, WindowInput, schema_from_window, schema_string_from_window};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Profile { Jackson216, Jackson221 }
@@ -38,7 +41,7 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Native(cause) => fmt::Display::fmt(cause, f),
-            Self::Decode { kind, offset, detail } => write!(f, "Registry response {kind:?} at byte {offset}: {detail}"),
+            Self::Decode { kind, offset, detail } => write!(f, "Registry response {kind:?} at offset {offset}: {detail}"),
         }
     }
 }

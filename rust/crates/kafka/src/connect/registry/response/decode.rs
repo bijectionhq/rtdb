@@ -16,7 +16,7 @@ pub(super) fn schema_string(cursor: &mut Cursor<'_>, context: &mut ConversionCon
             references: Some(Values::new()), metadata: None, rule_set: None, schema_tags: None, max_id: None }));
     }
     cursor.begin_object(context)?;
-    let mut field = cursor.field()?;
+    let mut field = cursor.field(context)?;
     let mut value = SchemaString { schema_type: Some(scalars::constant("AVRO", context)?), schema: None,
         references: Some(Values::new()), metadata: None, rule_set: None, schema_tags: None, max_id: None };
     while let Some(name) = field {
@@ -28,7 +28,7 @@ pub(super) fn schema_string(cursor: &mut Cursor<'_>, context: &mut ConversionCon
         else if name.is("schemaTags")? { value.schema_tags = collections::list(cursor, context, schema_tags)?; }
         else if name.is("maxId")? { value.max_id = scalars::integer(cursor, context)?; }
         else { cursor.skip(context)?; }
-        field = cursor.field()?;
+        field = cursor.field(context)?;
     }
     Ok(Some(value))
 }
@@ -40,7 +40,7 @@ pub(super) fn schema(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -
         metadata: None, rule_set: None, schema: None, schema_tags: None };
     let mut creator = Creator::new(9);
     let mut setters = Values::new();
-    let mut field = cursor.field()?;
+    let mut field = cursor.field(context)?;
     while let Some(name) = field {
         if name.is("subject")? { value.subject = scalars::text(cursor, context)?; creator.assign(0); }
         else if name.is("version")? { value.version = scalars::integer(cursor, context)?; creator.assign(1); }
@@ -59,7 +59,7 @@ pub(super) fn schema(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -
             if creator.built { value.rule_set = rules; } else { setters.push(rules, context)?; }
         }
         else { cursor.skip(context)?; }
-        field = cursor.field()?;
+        field = cursor.field(context)?;
         if creator.ready() { finish_schema(&mut value, &mut setters, context)?; creator.built = true; }
     }
     if !creator.built { finish_schema(&mut value, &mut setters, context)?; }
@@ -77,7 +77,7 @@ fn reference(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Result
     if cursor.take_null(context)? { return Ok(None); }
     cursor.begin_object(context)?;
     let mut value = Reference { name: None, subject: None, version: None };
-    while let Some(name) = cursor.field()? {
+    while let Some(name) = cursor.field(context)? {
         if name.is("name")? { value.name = scalars::text(cursor, context)?; }
         else if name.is("subject")? { value.subject = scalars::text(cursor, context)?; }
         else if name.is("version")? { value.version = scalars::integer(cursor, context)?; }
@@ -91,7 +91,7 @@ fn metadata(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Result<
     cursor.begin_object(context)?;
     let mut value = Metadata { tags: None, properties: None, sensitive: None };
     let mut creator = Creator::new(3);
-    let mut field = cursor.field()?;
+    let mut field = cursor.field(context)?;
     while let Some(name) = field {
         if name.is("tags")? {
             let tags = collections::tags(cursor, context)?;
@@ -109,7 +109,7 @@ fn metadata(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Result<
             value.sensitive = sensitive; creator.assign(2);
         }
         else { cursor.skip(context)?; }
-        field = cursor.field()?;
+        field = cursor.field(context)?;
         if creator.ready() { finish_metadata(&mut value, cursor)?; creator.built = true; }
     }
     if !creator.built { finish_metadata(&mut value, cursor)?; }
@@ -131,12 +131,12 @@ fn rule_set(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Result<
     cursor.begin_object(context)?;
     let mut value = RuleSet { migration_rules: None, domain_rules: None };
     let mut creator = Creator::new(2);
-    let mut field = cursor.field()?;
+    let mut field = cursor.field(context)?;
     while let Some(name) = field {
         if name.is("migrationRules")? { value.migration_rules = collections::list(cursor, context, rule)?; creator.assign(0); }
         else if name.is("domainRules")? { value.domain_rules = collections::list(cursor, context, rule)?; creator.assign(1); }
         else { cursor.skip(context)?; }
-        field = cursor.field()?;
+        field = cursor.field(context)?;
         if creator.ready() { finish_rule_set(&mut value); creator.built = true; }
     }
     if !creator.built { finish_rule_set(&mut value); }
@@ -154,7 +154,7 @@ fn rule(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Result<Opti
     let mut value = Rule { name: None, doc: None, kind: None, mode: None, rule_type: None, tags: None,
         params: None, expr: None, on_success: None, on_failure: None, disabled: false };
     let mut creator = Creator::new(11);
-    let mut field = cursor.field()?;
+    let mut field = cursor.field(context)?;
     while let Some(name) = field {
         if name.is("name")? { value.name = scalars::text(cursor, context)?; creator.assign(0); }
         else if name.is("doc")? { value.doc = scalars::text(cursor, context)?; creator.assign(1); }
@@ -176,7 +176,7 @@ fn rule(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Result<Opti
         else if name.is("onFailure")? { value.on_failure = scalars::text(cursor, context)?; creator.assign(9); }
         else if name.is("disabled")? { value.disabled = scalars::boolean(cursor, context)?; creator.assign(10); }
         else { cursor.skip(context)?; }
-        field = cursor.field()?;
+        field = cursor.field(context)?;
         if creator.ready() { finish_rule(&mut value, cursor)?; creator.built = true; }
     }
     if !creator.built { finish_rule(&mut value, cursor)?; }
@@ -197,7 +197,7 @@ fn schema_tags(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Resu
     if cursor.take_null(context)? { return Ok(None); }
     cursor.begin_object(context)?;
     let mut value = SchemaTags { entity: None, tags: None };
-    while let Some(name) = cursor.field()? {
+    while let Some(name) = cursor.field(context)? {
         if name.is("schemaEntity")? { value.entity = entity(cursor, context)?; }
         else if name.is("tags")? { value.tags = collections::list(cursor, context, scalars::text)?; }
         else { cursor.skip(context)?; }
@@ -212,12 +212,12 @@ fn entity(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Result<Op
     let mut entity_type = None;
     let mut normalized_path = None;
     let mut creator = Creator::new(2);
-    let mut field = cursor.field()?;
+    let mut field = cursor.field(context)?;
     while let Some(name) = field {
         if name.is("entityPath")? { path = scalars::text(cursor, context)?; creator.assign(0); }
         else if name.is("entityType")? { entity_type = scalars::enumeration(cursor, context, &["sr_record", "sr_field"])?.map(|index| [EntityType::Record, EntityType::Field][index]); creator.assign(1); }
         else { cursor.skip(context)?; }
-        field = cursor.field()?;
+        field = cursor.field(context)?;
         if creator.ready() { normalized_path = Some(normalize_path(path.as_ref(), cursor, context)?); creator.built = true; }
     }
     if !creator.built { normalized_path = Some(normalize_path(path.as_ref(), cursor, context)?); }
