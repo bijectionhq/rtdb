@@ -9,7 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build_support/tzdb.rs");
     println!("cargo:rerun-if-changed=build_support/legacy_tzdb.rs");
     let path = env::var_os("RTDB_TZDB_PATH").map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory")).join("data/tzdb/2025b.dat"));
+        .unwrap_or_else(|| PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory")).join("data/tzdb/2026e.dat"));
     println!("cargo:rerun-if-changed={}", path.display());
     let mut bytes = Vec::new();
     File::open(&path).expect("Open selected OpenJDK TZDB data").take(tzdb::MAX_BYTES as u64 + 1).read_to_end(&mut bytes).expect("Read selected OpenJDK TZDB data");

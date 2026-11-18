@@ -3,9 +3,9 @@ mod tzdb;
 
 #[test]
 fn packaged_tzdb_decodes_without_jvm_and_rejects_truncated_records() {
-    let bytes = include_bytes!("../data/tzdb/2025b.dat");
+    let bytes = include_bytes!("../data/tzdb/2026e.dat");
     let database = tzdb::decode(bytes).unwrap();
-    assert_eq!(database.version, "2025b");
+    assert_eq!(database.version, "2026e");
     let source = database.rust_source("fixture-digest");
     assert!(source.contains("Europe/Paris"));
     assert!(source.contains("TransitionRule {"));

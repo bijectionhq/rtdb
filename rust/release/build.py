@@ -92,7 +92,7 @@ def jvm_recipe(original, runtime_image):
 
 
 def retain_tzdb(context, override=None):
-    source = override if override is not None else context / "rust/crates/types/data/tzdb/2025b.dat"
+    source = override if override is not None else context / "rust/crates/types/data/tzdb/2026e.dat"
     if not source.is_file():
         raise ValueError("selected TZDB input must be a regular file")
     with source.open("rb") as stream:

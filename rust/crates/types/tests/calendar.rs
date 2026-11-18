@@ -50,8 +50,16 @@ fn strict_extended_year_spelling_and_subsecond_epoch_flooring() {
 #[test]
 fn pinned_tzdb_preserves_future_recurring_rules_and_pre_history_offset() {
     if std::option_env!("RTDB_TZDB_PATH").is_none() {
-        assert_eq!(TZDB_VERSION, "2025b");
-        assert_eq!(TZDB_SHA256, "7be2a3adf10ff841579629f7725b15f0db41e8856527ec72847b5477073a3d29");
+        assert_eq!(TZDB_VERSION, "2026e");
+        assert_eq!(TZDB_SHA256, "a02e3a23d67255782b11ab81070902235ab564080f0f65ffe2a989cdaa86fe89");
+        for (zone, year, month, offset) in [
+            ("Canada/Mountain", 2026, 1, -25200), ("Canada/Mountain", 2027, 1, -21600), ("Canada/Mountain", 2100, 1, -21600),
+            ("Africa/Casablanca", 2026, 7, 3600), ("Africa/Casablanca", 2027, 1, 0), ("Africa/Casablanca", 2100, 7, 0),
+            ("Africa/El_Aaiun", 2026, 7, 3600), ("Africa/El_Aaiun", 2027, 7, 0),
+        ] {
+            let zone = ZoneId::parse(zone).unwrap();
+            assert_eq!(zone.offset_at(local(year, month, 1, 0, 0).epoch_second()).unwrap().seconds(), offset, "{zone:?} {year}-{month}");
+        }
     }
     let paris = ZoneId::parse("Europe/Paris").unwrap();
     for year in [2100, 2400, 300_000, 999_999_999] {

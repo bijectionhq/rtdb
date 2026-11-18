@@ -25,7 +25,7 @@ class PackagedClientTests(unittest.TestCase):
         manifest.update(source_manifest_sha256=hashlib.sha256(sources).hexdigest(), version="0.1.0", features=[], platform="linux/amd64",
                         tzdb={"sha256": hashlib.sha256(timezone).hexdigest(), "bytes": len(timezone), "selection": "bundled"})
         report = {"schema_version": 1, "engine": "rust", "version": manifest["version"], "revision": manifest["revision"],
-                  "tzdb_version": "2025b", "tzdb_sha256": manifest["tzdb"]["sha256"]}
+                  "tzdb_version": "2026e", "tzdb_sha256": manifest["tzdb"]["sha256"]}
         (root / "artifacts/build.json").write_text(json.dumps(manifest))
         (root / "artifacts/tzdb.dat").write_bytes(timezone)
         for name in ["rtdb", "rtdb-config"]:

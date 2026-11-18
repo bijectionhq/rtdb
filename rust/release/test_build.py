@@ -128,7 +128,7 @@ class ReleaseSelectionTests(unittest.TestCase):
             root = Path(directory)
             (root / "tzdb.dat").write_bytes(b"selected database")
             metadata = {"revision": "a" * 40, "version": "0.1.0", "tzdb": {"sha256": release.digest(root / "tzdb.dat"), "bytes": 17}}
-            report = {"schema_version": 1, "engine": "rust", "version": "0.1.0", "revision": "a" * 40, "tzdb_version": "2025b", "tzdb_sha256": metadata["tzdb"]["sha256"]}
+            report = {"schema_version": 1, "engine": "rust", "version": "0.1.0", "revision": "a" * 40, "tzdb_version": "2026e", "tzdb_sha256": metadata["tzdb"]["sha256"]}
             for executable in ["rtdb", "rtdb-config"]:
                 (root / (executable + "-build-info.json")).write_text(json.dumps(report))
             self.assertEqual(release.verify_native_build_info({"artifacts/" + path.name: path for path in root.iterdir()}, metadata), report)
