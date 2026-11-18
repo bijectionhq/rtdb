@@ -18,7 +18,7 @@
     },
     "storage_indexing_historical_visibility": {
       "status": "pending",
-      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Join narrowing now distinguishes physical key domains. Safe narrowing for explicit replay IIDs, ordinary IID narrowing, broader metadata predicates and retained scan allocation need source completion.",
+      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. Ordinary IID narrowing, broader metadata predicates and retained scan allocation need source completion.",
       "implementation_paths": [
         "rust/crates/storage/src/lib.rs",
         "rust/crates/index/src/live.rs",
@@ -41,7 +41,7 @@
     },
     "writes_replication_recovery": {
       "status": "pending",
-      "conclusion": "The reviewed traces include selected receipts and terminal fault publication. Local replay batches are limited and framing inspection uses fixed scratch. Caller-owned replay admission and final design-surface reconciliation remain open.",
+      "conclusion": "The reviewed traces include selected receipts and terminal fault publication. Writable local and memory replay reserve selected-record delivery and envelope decoding before delivery. Read-only local, Kafka, fault-wrapper admission and final design-surface reconciliation remain open.",
       "implementation_paths": [
         "rust/crates/tx/src/submission.rs",
         "rust/crates/tx/src/resolver.rs",
@@ -80,7 +80,7 @@
     },
     "conformance_machinery": {
       "status": "pending",
-      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. An optional paired historical erase mapping uses the original SQL and checks the applied transaction and physical layout. Remaining paired assertion adapters and their evidence bindings need source completion before runtime discovery and qualification.",
+      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. Other paired adapters and their evidence bindings need source completion.",
       "implementation_paths": [
         "rust/crates/conformance/src/main.rs",
         "rust/conformance/source_inventory.py",
@@ -120,10 +120,10 @@
         "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
         "rust/crates/node/src/statement.rs": "774fe64696107af46520549c216522a0ae10ad62bd68e504562bab6177a6ff0d",
         "rust/crates/tx/src/submission.rs": "4c3fcdc19bdd31e2cd0b7d230c00656dc203f7c5ac2b44638a5849424955dd01",
-        "rust/crates/tx/src/resolver.rs": "a7b83d51518ebbb28bc232b028f1d1586c25b490b2956173c716109dc4f2723e",
+        "rust/crates/tx/src/resolver.rs": "ae65fc053307e9a9ae8446f0ab71ab1a8324580a139abc1b976f336c56732115",
         "rust/crates/replication/src/appender.rs": "fdaaf5ed638cb76098397c0329762b82b7df5814c362c3d24940d5035514a8ef",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
-        "rust/crates/replication/src/driver.rs": "0f6fc56c2773f830d63ce75511a49d3e69a0d1a807d5074e6d6edfe45042d6c2"
+        "rust/crates/replication/src/driver.rs": "7c24eee5bfe68b1ecbe6f8ca4a45ae7f4f7873698a9e72fc958e0d9de264d6d6"
       }
     },
     "replica_recovery": {
@@ -142,7 +142,7 @@
         "rust/crates/server/src/runtime.rs": "a8662ff85a43dcd6955419ac9536e1955de1a8d1c1943a5106f1eabb1bb7092f",
         "rust/crates/node/src/runtime.rs": "8e4da0daa9192e112b4542e127f022f6cf83f626b889825ac688ab534136e8fc",
         "rust/crates/node/src/database.rs": "dd8235d4ee0c1608f6b04ec029958abdf64b2a0deb06ea2f8e09d75f83ab5b86",
-        "rust/crates/replication/src/driver.rs": "0f6fc56c2773f830d63ce75511a49d3e69a0d1a807d5074e6d6edfe45042d6c2",
+        "rust/crates/replication/src/driver.rs": "7c24eee5bfe68b1ecbe6f8ca4a45ae7f4f7873698a9e72fc958e0d9de264d6d6",
         "rust/crates/replication/src/blocks.rs": "31568965ca15b2d27490dd3e537659dd1cd764f8999c99bc70b6b722875e329d"
       }
     },
@@ -164,8 +164,8 @@
         "rust/crates/maintenance/src/job.rs": "34e3d43ca7baef270ca9b6c4d4ee7b1eedeab56156bc6a85de0e741f34244274",
         "rust/crates/maintenance/src/merge.rs": "c48d933439beed33360993769d1b3f91a7a200b911955d70c7b1f6d471906151",
         "rust/crates/maintenance/src/publication.rs": "d9214c092e3a873df597dfad81f3ac2dc8b7b178c9b8f4b933ef090116a27740",
-        "rust/crates/replication/src/driver.rs": "0f6fc56c2773f830d63ce75511a49d3e69a0d1a807d5074e6d6edfe45042d6c2",
-        "rust/crates/index/src/trie_catalog.rs": "ec294a4c8554ef3123dadce80c7775116d3edfca4317f62c2fb1b897099f94c0"
+        "rust/crates/replication/src/driver.rs": "7c24eee5bfe68b1ecbe6f8ca4a45ae7f4f7873698a9e72fc958e0d9de264d6d6",
+        "rust/crates/index/src/trie_catalog.rs": "517d3a6fd0478555db85153f92e97cdf0597aa0dcfa7be912677a3609c0bc8c8"
       }
     },
     "cdc_restart": {
@@ -187,7 +187,7 @@
         "rust/crates/pg-source/src/stream.rs": "24f3c47d194ae231bdede32105bece10c303867cd7ba5a6672b1195fe4468261",
         "rust/crates/pg-source/src/indexer.rs": "8eda7ab84068564f692bdb98eb02f88d5e7acd1e745379e8ad6b1d465269f590",
         "rust/crates/pg-source/src/token.rs": "b7dbcb8f4b601ae64231b1e8c4d30d65373d5d0afc160c0f530fa56da188f0c0",
-        "rust/crates/replication/src/driver.rs": "0f6fc56c2773f830d63ce75511a49d3e69a0d1a807d5074e6d6edfe45042d6c2"
+        "rust/crates/replication/src/driver.rs": "7c24eee5bfe68b1ecbe6f8ca4a45ae7f4f7873698a9e72fc958e0d9de264d6d6"
       }
     },
     "database_shutdown": {

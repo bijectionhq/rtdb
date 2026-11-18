@@ -1346,13 +1346,21 @@ The in-memory tail delivers a contiguous prefix with a limit on record count and
 It retains room for one maximum-size record and resumes at the next offset after delivery.
 The writable local tail also bounds the delivered record count and payload bytes before reading the next consecutive frame.
 Writable startup and resume, and read-only tip and resume inspection, validate framing with fixed scratch while still reading the payload and reporting I/O failures.
-The caller's replay budget does not yet own delivery allocations.
+Writable local and memory replay can report the next record without allocating its payload.
+The driver reserves the selected head's delivery and envelope decode together before reading it.
+A refused reservation reports a read failure at the same cursor position.
+Local I/O keeps the delivery reservation through disposal of a cancelled waiter's result.
+Memory replay charges a delivered alias while the append-owned backing remains shared.
+Read-only local, Kafka and fault-wrapped replay use batch polling.
+Single-record native replay checks flush deadlines between records, so elapsed time can place a block cut differently from batch delivery.
 
 A static SQL insert can expand only when its referenced arguments are available.
 The static expansion uses the referenced prefix and leaves a statement with missing arguments for transaction resolution.
 A VALUES insert without a column list is also left for resolution and receives the planning diagnostics there.
 The resolver attaches the original SQL to preparation and execution failures.
 Invalid valid-time intervals retain typed instant bounds in the durable transaction error.
+Transaction resolution reports the typed table reference when it rejects a SQL mutation targeting a reserved table.
+Submission rejects document writes targeting reserved schemas, including statically expanded SQL inserts.
 The public recovery and shutdown trace hashes include the optional embedded transaction clock.
 Catalog recovery precedes opening logs, and embedded close joins native work before the Java callback arena closes.
 
@@ -1360,9 +1368,12 @@ A persisted page can be excluded as a source of matches for a direct document-co
 The existing selector retains pages that can constrain or erase matching history.
 The scan still applies the row predicate after visibility resolution.
 Join filters retain Bloom candidates across byte-equivalent logical types.
-Entity ID join narrowing checks the reached build domain against the physical probe after column remapping and relies on canonical stored IIDs.
-The replay codec preserves explicitly supplied IIDs, including IIDs different from the document ID's hash.
-Safe entity ID narrowing for such histories, ordinary IID narrowing, broader metadata predicates and retained scan descriptor allocation remain open.
+Logical ID join narrowing requires a matching build domain and verified live inputs across the captured probe partitions.
+An unproved segment or a serving persisted trie disables logical IID pruning.
+Logical-key Bloom filtering remains available for persisted pages.
+Physical IID joins still use the stored bytes.
+A real source log fixture covers an explicit noncanonical IID, a later put under that same physical IID and both current and historical results before flush, after flush and after restart.
+Ordinary IID narrowing, broader metadata predicates and retained scan descriptor allocation remain open.
 
 Each reference control receipt binds the exact JVM runtime manifest, the verified runtime files and the artifact verifier source.
 Release comparison uses the ledger submitted to inventory reconciliation and retains the comparator process, input snapshots and report for each platform and native variant.
@@ -1370,6 +1381,10 @@ Native control receipts identify the same production executable as the compariso
 The optional historical erase mapping preserves the two original SQL statements and checks each engine's live and later adopted L0 layout at its applied erase transaction.
 Its paired and comparator inputs are present in source.
 The original Gradle invocation, the paired execution and the mismatch result are pending.
+The SQL-logic release lane checks the selected native executable, the pinned script roster, and the archived process and observation files.
+Offline verification recomputes the paired and repeated-reference comparisons from the retained streams.
+The external inventory validator checks normalized SQL-logic records against retained original SQL source bytes.
+Flight SQL GetFlightInfo retains the classified update through argument decoding while the shared session owns execution and transaction buffering.
 Other adapter-specific receipt closures and complete assertion mappings still require source work.
 The full ledger and release matrix have no execution receipts from this source checkpoint.
 
