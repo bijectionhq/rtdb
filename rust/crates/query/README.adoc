@@ -457,6 +457,9 @@ An element failure prevents opening; cancellation or dropping the opening future
 
 The passive List cursor opens one expression reader and then demands elements in semantic pages of 1,024 rows by default.
 `QueryOptions::list_batch_rows` controls those pages independently of public client batches.
+An OFFSET over an integer series can advance past entire semantic pages by index.
+Column-only projections and page ordinality preserve those boundaries, so ordinality on a retained page still begins at one.
+Computed projections and element readers continue to evaluate earlier pages when their results or errors can affect the query.
 Each emitted slice owns its evaluation charges until the slice is released, and dropping the cursor releases the retained reader and captured expression region.
 Integer-series descriptors remain constant-size even when LIMIT or OFFSET selects a small suffix of a large series.
 The PageOrdinality projection appends signed 64-bit positions starting at one for each semantic input page.

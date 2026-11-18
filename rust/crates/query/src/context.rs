@@ -251,17 +251,16 @@ impl Execution {
             let eval = rtdb_expr::EvalContext { parameters: execution.parameters.values(), parameter_types: Some(execution.parameters.types()), current_time: execution.context.current_time,
                 timezone: &execution.context.timezone, outer_rows: &outer_rows, snapshot_token: execution.context.snapshot_token(), allocation: Some(&scope), catalog: Some(&execution.context.catalog) };
             let invocation = rtdb_expr::ExpressionInvocation::prepare(&expression, &schema, &eval)?;
-            let mut list = invocation.open_list(&[], &eval, execution.context.options.list_batch_rows).await?;
-            yield crate::list::ListEvent::Opened;
-            while let Some(batch) = list.next_batch().await? {
-                execution.context.check_cancelled()?;
-                let mut page = crate::pages::PageBuilder::new(batch.values().len(), &execution.context.memory)?;
-                for value in batch.values() {
-                    execution.context.check_cancelled()?;
-                    page.push(crate::cursor::OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?)?;
+            let list = invocation.open_list(&[], &eval, execution.context.options.list_batch_rows).await?;
+            match list.into_indexed() {
+                Ok(batches) => yield crate::list::ListEvent::Opened(Some(batches)),
+                Err(mut list) => {
+                    yield crate::list::ListEvent::Opened(None);
+                    while let Some(batch) = list.next_batch().await? {
+                        yield crate::list::ListEvent::Batch(batch);
+                    }
                 }
-                yield crate::list::ListEvent::Page(page.finish());
-            }
+            };
         };
         crate::list::ListCursor::open(Box::pin(stream), context).await
     }

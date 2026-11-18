@@ -96,6 +96,9 @@ impl PageCursor for CoalescingPages {
 #[async_trait]
 pub(crate) trait PageCursor: Send {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>>;
+    /// Advances an available prefix of complete pages within the row budget.
+    /// Any remainder must still be consumed with `next_page`.
+    fn skip_complete_pages(&mut self, _rows: u64) -> Result<u64> { Ok(0) }
     fn trace_attributes(&self, _span: &mut dyn rtdb_plan::TraceSpan) {}
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { None }
 }
@@ -140,6 +143,7 @@ struct RetainedPageState { input: BoxPageCursor, _reservation: Arc<MemoryReserva
 #[async_trait]
 impl PageCursor for RetainedPageState {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> { self.input.next_page().await }
+    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> { self.input.skip_complete_pages(rows) }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }

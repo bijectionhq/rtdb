@@ -212,7 +212,15 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
         let frame = EvaluationFrame { schema, row, context, asynchronous: true, replacements: Some(replacements) };
         let continuation = scalar::prepare(expr, &frame)?.await?;
         let value = if continuation.is_list() { Some(continuation.demand().await?) } else { None };
-        yield super::ListEvent::Opened;
+        if let Some(EvalValue::List(_, reader)) = &value
+            && let ListReader::IntegerSeries(series) = reader.as_ref()
+        {
+            yield super::ListEvent::Opened(Some(super::IndexedListBatches {
+                series: *series, position: 0, rows_per_batch: batch_rows, memory: allocation.memory_budget().clone(),
+            }));
+            return;
+        }
+        yield super::ListEvent::Opened(None);
         if let Some(value) = value {
             let size = len(&value)?;
             let mut position = 0usize;
@@ -224,12 +232,9 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                 {
                     let page_context = context.with_allocation(&scope);
                     let page_frame = EvaluationFrame { schema, row, context: &page_context, asynchronous: true, replacements: Some(replacements) };
-                    let integers = match &value { EvalValue::List(_, reader) => match reader.as_ref() { ListReader::IntegerSeries(series) => Some(*series), _ => None }, _ => None };
                     for index in position..position + count {
-                        let mut cell = if let Some(series) = integers { series.nth(index) } else {
-                            let cell = nth(clone_value(&value, &page_frame)?, index, &page_frame)?.await?;
-                            materialize(cell, &page_frame)?.await?
-                        };
+                        let cell = nth(clone_value(&value, &page_frame)?, index, &page_frame)?.await?;
+                        let mut cell = materialize(cell, &page_frame)?.await?;
                         cell.admit_expression_dates()?;
                         super::validate_projection_value(&cell)?;
                         values.push(cell);

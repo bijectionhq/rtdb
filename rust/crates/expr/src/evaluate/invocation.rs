@@ -91,7 +91,13 @@ impl<'expr> ExpressionInvocation<'expr> {
         use futures::StreamExt;
         let mut events = reader::list_events(self.expression, self.schema, row, context, &self.replacements, batch_rows);
         match events.next().await.transpose()? {
-            Some(super::ListEvent::Opened) => Ok(super::ListExpression { events }),
+            Some(super::ListEvent::Opened(batches)) => {
+                let batches = match batches {
+                    Some(batches) => super::ListBatches::Indexed(batches),
+                    None => super::ListBatches::Stream(events),
+                };
+                Ok(super::ListExpression { batches })
+            },
             _ => Err(Anomaly::fault("rtdb.expr/list-state", "List descriptor did not open")),
         }
     }

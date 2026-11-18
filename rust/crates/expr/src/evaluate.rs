@@ -76,7 +76,7 @@ impl CompiledExpr {
 }
 
 enum ListEvent {
-    Opened,
+    Opened(Option<IndexedListBatches>),
     Batch(ListBatch),
 }
 
@@ -89,15 +89,62 @@ impl ListBatch {
 /// Caller-polled list evaluation, with its descriptor selected once at opening.
 /// Each pull completes one semantic page.
 /// Dropping the reader releases its retained reader state; returned batches and caller-owned preparation charges keep their own lifetimes.
-pub struct ListExpression<'a> { events: futures::stream::BoxStream<'a, Result<ListEvent>> }
+pub struct ListExpression<'a> { batches: ListBatches<'a> }
+
+enum ListBatches<'a> {
+    Indexed(IndexedListBatches),
+    Stream(futures::stream::BoxStream<'a, Result<ListEvent>>),
+}
+
 impl ListExpression<'_> {
+    /// Transfers the independent indexed reader, when list opening selected one.
+    pub fn into_indexed(self) -> std::result::Result<IndexedListBatches, Self> {
+        match self.batches {
+            ListBatches::Indexed(batches) => Ok(batches),
+            ListBatches::Stream(_) => Err(self),
+        }
+    }
+
     pub async fn next_batch(&mut self) -> Result<Option<ListBatch>> {
         use futures::StreamExt;
-        match self.events.next().await.transpose()? {
-            Some(ListEvent::Batch(batch)) => Ok(Some(batch)),
-            Some(ListEvent::Opened) => Err(Anomaly::fault("rtdb.expr/list-state", "List descriptor opened twice")),
-            None => Ok(None),
+        match &mut self.batches {
+            ListBatches::Indexed(batches) => batches.next_batch(),
+            ListBatches::Stream(events) => match events.next().await.transpose()? {
+                Some(ListEvent::Batch(batch)) => Ok(Some(batch)),
+                Some(ListEvent::Opened(_)) => Err(Anomaly::fault("rtdb.expr/list-state", "List descriptor opened twice")),
+                None => Ok(None),
+            },
         }
+    }
+}
+
+/// Pages over an opened integer series, with a position that only changes at page boundaries.
+pub struct IndexedListBatches {
+    series: crate::series::IntegerSeries,
+    position: usize,
+    rows_per_batch: usize,
+    memory: std::sync::Arc<rtdb_types::MemoryBudget>,
+}
+
+impl IndexedListBatches {
+    /// Advances whole pages within the given row budget and returns the number of skipped cells.
+    pub fn skip_complete_batches(&mut self, rows: u64) -> u64 {
+        let remaining = self.series.len() - self.position;
+        let requested = usize::try_from(rows).unwrap_or(usize::MAX);
+        let skipped = if requested >= remaining { remaining } else { requested / self.rows_per_batch * self.rows_per_batch };
+        self.position += skipped;
+        skipped as u64
+    }
+
+    pub fn next_batch(&mut self) -> Result<Option<ListBatch>> {
+        let count = (self.series.len() - self.position).min(self.rows_per_batch);
+        if count == 0 { return Ok(None); }
+        let scope = crate::EvaluationScope::new(&self.memory)?;
+        scope.reserve(count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+        let end = self.position + count;
+        let values = (self.position..end).map(|index| self.series.nth(index)).collect();
+        self.position = end;
+        Ok(Some(ListBatch { values, _scope: scope }))
     }
 }
 

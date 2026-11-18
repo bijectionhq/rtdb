@@ -260,6 +260,14 @@ impl PageCursor for PageProject {
         let Some(page) = self.input.next_page().await? else { return Ok(None); };
         crate::pages::project(&page,&self.schema,self.expressions.iter().map(|expression|&expression.expr),&self.execution).await.map(Some)
     }
+
+    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> {
+        if self.expressions.iter().all(|expression| matches!(&expression.expr, Expr::Column { .. })) {
+            self.input.skip_complete_pages(rows)
+        } else {
+            Ok(0)
+        }
+    }
 }
 struct PageExtend { input: BoxPageCursor, schema: Schema, expressions: Vec<NamedExpr>, execution: Execution }
 #[async_trait]
@@ -298,6 +306,10 @@ impl PageCursor for Limit {
             self.execution.context.check_cancelled()?;
             if self.remaining == Some(0) && self.offset == 0 { self.input = None;return Ok(None); }
             let Some(input) = &mut self.input else { return Ok(None); };
+            if self.offset != 0 {
+                self.offset -= input.skip_complete_pages(self.offset)?;
+                if self.remaining == Some(0) && self.offset == 0 { self.input = None; return Ok(None); }
+            }
             let Some(mut page) = input.next_page().await? else { self.input = None;return Ok(None); };
             let skipped = self.offset.min(page.len() as u64) as usize;
             self.offset -= skipped as u64;

@@ -229,6 +229,7 @@ Direct scalar field calls validate applicability, and checked arithmetic delegat
 Three arguments exclude the endpoint.
 Integer results retain a checked signed 32-bit length and compute individual values with wrapping signed arithmetic.
 Array size and element consumers can read that view without allocating its other cells.
+An opened integer series can also advance its page cursor by index while preserving the original batching boundaries.
 Temporal results materialize eagerly, apply calendar months and days before duration fields, and yield on the caller's future during long construction.
 Date/month iteration clamps each successive month; timestamp iteration preserves the common endpoint zone or uses UTC for differing endpoint zones.
 `evaluate_list_async` retains a constant-size integer-series result for table iteration and applies ordinary projection validation to other materialized list results.

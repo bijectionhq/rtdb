@@ -88,6 +88,43 @@ async fn list_cells_are_demanded_only_in_complete_emitted_pages() {
 }
 
 #[tokio::test]
+async fn integer_list_fast_forward_preserves_full_and_partial_pages() {
+    let execution = execution(1);
+    let baseline = execution.context.memory.used_bytes();
+    let mut cursor = open(list(series(8, 1, -1, true)), &execution).await.unwrap();
+
+    assert_eq!(cursor.skip_complete_pages(4).unwrap(), 3);
+    let page = cursor.next_page().await.unwrap().unwrap();
+    assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), numbers(&[5, 4, 3]));
+    drop(page);
+    assert_eq!(cursor.skip_complete_pages(1).unwrap(), 0);
+    assert_eq!(cursor.skip_complete_pages(2).unwrap(), 2);
+    assert!(cursor.next_page().await.unwrap().is_none());
+
+    drop(cursor);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn fast_forward_preserves_errors_in_lists_and_computed_projections() {
+    let execution = execution(1);
+    let mut lazy = open(list(Expr::List(vec![division_by_zero()])), &execution).await.unwrap();
+    assert_eq!(lazy.skip_complete_pages(3).unwrap(), 0);
+    assert_eq!(lazy.next_page().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+
+    let input = list(series(0, 9, 1, false));
+    let column = input.schema().fields()[0].clone();
+    let original = column.expression();
+    let computed = Arc::new(input.project(vec![rtdb_plan::NamedExpr {
+        field: column,
+        expr: Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), original),
+    }]).unwrap());
+    let limited = Arc::new(computed.limit(Some(Expr::Literal(Value::I64(3))), Some(Expr::Literal(Value::I64(1)))).unwrap());
+    let mut cursor = open(limited, &execution).await.unwrap();
+    assert_eq!(cursor.next_page().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+}
+
+#[tokio::test]
 async fn list_descriptor_errors_happen_while_the_cursor_opens() {
     let execution = execution(1);
     let args = vec![division_by_zero(), Expr::Literal(Value::I64(5)), Expr::Literal(Value::I64(1)), Expr::Literal(Value::Bool(false))];
