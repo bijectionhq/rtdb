@@ -192,3 +192,43 @@ fn declared_schema_metadata_is_reserved_before_exact_or_adapted_clones() {
         assert_eq!(memory.used_bytes(), 0);
     }
 }
+
+fn promoted_union_field() -> Field {
+    let fields = UnionFields::try_new([0, 1, 2], [Field::new("f64", DataType::Float64, true), Field::new("utf8", DataType::Utf8, false), Field::new("null", DataType::Null, true)]).unwrap();
+    Field::new("v", DataType::Union(fields, UnionMode::Dense), false)
+}
+
+fn leg_names(field: &Field, union: &UnionArray) -> Vec<String> {
+    let DataType::Union(fields, _) = field.data_type() else { panic!("Expected a union field") };
+    (0..union.len()).map(|row| fields.iter().find(|(id, _)| *id == union.type_id(row)).unwrap().1.name().clone()).collect()
+}
+
+#[test]
+fn written_union_nulls_land_in_the_null_leg_even_after_a_nullable_leg() {
+    let declared = promoted_union_field();
+    let logical = rtdb_columnar::from_field(&declared).unwrap();
+    assert_eq!(logical, LogicalType::from_legs([LogicalType::Scalar(ScalarType::F64), LogicalType::Scalar(ScalarType::Utf8), LogicalType::Null]));
+    let values = vec![Value::F64(1.5), Value::Null, Value::Utf8("a".into()), Value::Null];
+    let built = rtdb_columnar::build_array(&logical, &values).unwrap();
+    let built_field = to_field("v", &logical).unwrap();
+    let union = built.as_any().downcast_ref::<UnionArray>().unwrap();
+    assert_eq!(leg_names(&built_field, union), ["f64", "null", "utf8", "null"]);
+    let DataType::Union(fields, _) = built_field.data_type() else { unreachable!() };
+    let f64_leg = fields.iter().find(|(_, field)| field.name() == "f64").unwrap().0;
+    assert_eq!(union.child(f64_leg).null_count(), 0);
+    assert_eq!((0..4).map(|row| read_value(&built_field, union, row).unwrap()).collect::<Vec<_>>(), values);
+}
+
+#[test]
+fn nulls_already_in_a_nullable_leg_read_as_null_and_rewrite_into_the_null_leg() {
+    let declared = promoted_union_field();
+    let DataType::Union(fields, _) = declared.data_type() else { unreachable!() };
+    let children: Vec<Arc<dyn Array>> = vec![Arc::new(arrow_array::Float64Array::from(vec![Some(1.5), None])), Arc::new(StringArray::from(vec!["a"])), Arc::new(NullArray::new(1))];
+    let promoted = UnionArray::try_new(fields.clone(), ScalarBuffer::from(vec![0, 0, 1, 2]), Some(ScalarBuffer::from(vec![0, 1, 0, 0])), children).unwrap();
+    let values = (0..4).map(|row| read_value(&declared, &promoted, row).unwrap()).collect::<Vec<_>>();
+    assert_eq!(values, [Value::F64(1.5), Value::Null, Value::Utf8("a".into()), Value::Null]);
+    let logical = rtdb_columnar::from_field(&declared).unwrap();
+    let copied = copy_array(&logical, &values).unwrap();
+    let union = copied.as_any().downcast_ref::<UnionArray>().unwrap();
+    assert_eq!(leg_names(&to_field("v", &logical).unwrap(), union), ["f64", "null", "utf8", "null"]);
+}
