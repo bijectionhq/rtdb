@@ -16,6 +16,7 @@ mod property_order;
 mod evaluation;
 mod context;
 mod producer;
+mod logical;
 pub(super) use text::Text;
 pub(super) use names::Name;
 pub(super) use json::{JsonNode, JsonValue, Members};
@@ -24,6 +25,7 @@ pub(super) use evaluation::{Evaluation, RecursionState, Witness};
 pub(super) use context::{CycleContext, CycleReference};
 pub(super) use producer::{AdmittedSource, ParsedPair, PairSelection};
 pub(in crate::connect) use producer::SourcePolicy;
+pub(in crate::connect::avro) use logical::{Builtin as LogicalBuiltin, FactoryOutcome, LogicalEnvironment, LogicalIdentity, LogicalType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SchemaId { region: u64, index: usize }
@@ -49,6 +51,7 @@ pub(super) struct SchemaView<'a> { owner: &'a Schemas, id: SchemaId }
 struct Node {
     kind: Kind,
     properties: Properties,
+    logical: Option<LogicalType>,
     doc: Option<Text>,
     aliases: Vec<Name>,
     hash: AtomicI32,
@@ -204,7 +207,7 @@ impl SchemasBuilder {
         self.admit(add(next.map_or(0, |(_, bytes)| bytes), if full.is_some() { 1024 } else { 0 })?, context)?;
         grow(&mut self.owner.nodes, next)?;
         let id = SchemaId { region: self.owner.region, index: self.owner.nodes.len() };
-        self.owner.nodes.push(Node { kind, properties: Properties::empty(), doc: None, aliases: Vec::new(), hash: AtomicI32::new(NO_HASHCODE) });
+        self.owner.nodes.push(Node { kind, properties: Properties::empty(), logical: None, doc: None, aliases: Vec::new(), hash: AtomicI32::new(NO_HASHCODE) });
         if let Some(full) = full { self.owner.bindings.insert(full, id); }
         Ok(id)
     }
@@ -280,11 +283,21 @@ impl SchemasBuilder {
         Ok(())
     }
     pub(super) fn annotations_with(&mut self, id: SchemaId, doc: Option<Text>, bound: usize, context: &mut ConversionContext, build: impl FnOnce() -> Result<Vec<Name>>) -> Result<()> {
+        self.aliases_with(id, bound, context, build)?;
+        self.owner.nodes[id.index].doc = doc;
+        Ok(())
+    }
+    pub(super) fn named_doc(&mut self, id: SchemaId, doc: Option<Text>) -> Result<()> {
+        self.require(id)?;
+        if named(&self.owner.nodes[id.index].kind).is_none() { return Err(invalid("Unnamed Avro type cannot receive named annotations")); }
+        self.owner.nodes[id.index].doc = doc;
+        Ok(())
+    }
+    pub(super) fn aliases_with(&mut self, id: SchemaId, bound: usize, context: &mut ConversionContext, build: impl FnOnce() -> Result<Vec<Name>>) -> Result<()> {
         self.require(id)?;
         if named(&self.owner.nodes[id.index].kind).is_none() { return Err(invalid("Unnamed Avro type cannot receive named annotations")); }
         self.admit(bound, context)?;
         self.owner.nodes[id.index].aliases = build()?;
-        self.owner.nodes[id.index].doc = doc;
         Ok(())
     }
     pub(super) fn reference(&mut self, name: JavaText<'_>, namespace: Option<JavaText<'_>>, context: &mut ConversionContext) -> Result<SchemaId> {

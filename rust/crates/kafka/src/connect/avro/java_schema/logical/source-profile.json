@@ -1,0 +1,69 @@
+{
+  "source_only": true,
+  "runtime_discovery": false,
+  "source_count": 9,
+  "avro": "1.11.4",
+  "confluent_avro_data": "7.8.0",
+  "jdk": "temurin-25.0.1+8",
+  "jdk_source_archive_sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
+  "source_snapshot": "/tmp/rtdb-avro-source-logical-sources",
+  "source_intervals": {
+    "Schema.java": [
+      "142",
+      "195-201",
+      "789-798",
+      "910-918",
+      "1069-1096",
+      "1288-1297",
+      "1706-1725",
+      "1755-1758",
+      "1802-1818"
+    ],
+    "JsonProperties.java": [
+      "223-225",
+      "240-242"
+    ],
+    "JacksonUtils.java": [
+      "100-174"
+    ],
+    "LogicalType.java": [
+      "36-45",
+      "84-91"
+    ],
+    "LogicalTypes.java": [
+      "61-66",
+      "124-197",
+      "215-265",
+      "269-378",
+      "383-491"
+    ],
+    "GenericData.java": [
+      "92"
+    ],
+    "SpecificData.java": [
+      "89-91"
+    ],
+    "AvroData.java": [
+      "1769-1810"
+    ],
+    "Math.java": [
+      "363-389",
+      "506-528",
+      "808-863"
+    ]
+  },
+  "default_environment": "Explicit Unregistered built-in profile; no ServiceLoader or manual registry discovery.",
+  "factory_boundary": "No type, RuntimeException and actual pinned singleton outcomes are modeled; arbitrary returned classes and reused Decimal factory objects require an actual retained class/value model.",
+  "math_boundary": "The two source-permitted log10(2) results bound the validation verdict; only a threshold-dependent verdict asks the effective source maxPrecision operator.",
+  "raw_connect_boundary": "AvroData raw logicalType comparisons remain distinct and case-insensitive even when the source logical object is absent.",
+  "admission": "LogicalType storage resides in admitted Node slots; factory/math callbacks admit their own native scratch through ConversionContext; callbacks are never retained.",
+  "regression_function_count": 15,
+  "existing_fixture_assertions_preserved": true,
+  "remaining_integration": [
+    "exact JavaText document input and Registry source pairing",
+    "actual custom logical class/value consumers",
+    "complete typed graph/default/union/arbitrary-key data path",
+    "source-provenance retention through SMT and writer/export"
+  ],
+  "named_doc_stage": "Record doc before fields; Enum/Fixed doc before properties/logical construction; aliases only after logical construction."
+}

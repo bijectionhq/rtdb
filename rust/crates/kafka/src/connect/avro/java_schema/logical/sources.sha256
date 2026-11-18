@@ -1,0 +1,9 @@
+32bfe421ef8c304207797c21ad9564a472e725708d4da42f0c4f4503ec065528  avro-1.11.4/org/apache/avro/JsonProperties.java
+ad6fa2272b263c958b28a81243e5c3b4dadef2d35b31ca1402e3c89b0997fa65  avro-1.11.4/org/apache/avro/LogicalType.java
+896d5ab20f623a234af7a9cb3df258c41ef7c8a387f92eea39df90737e11031f  avro-1.11.4/org/apache/avro/LogicalTypes.java
+eb45c1650db37862bf6b663663cf00f5632e4a5dc72f39382fb2b92acfefd08c  avro-1.11.4/org/apache/avro/Schema.java
+3c9bd8bf3bab2bdbff3110f3fb150ab6b6542c36e99116d5c20f9e811e9b540b  avro-1.11.4/org/apache/avro/generic/GenericData.java
+04a4f0fa4a2d1959a9a7c8adc6794514682e8e32546ff126569523a15335209b  avro-1.11.4/org/apache/avro/specific/SpecificData.java
+8ab3b11281aebb154f985a93f0f71506066365a9fd6651fcbd29f7d5d889e18c  avro-1.11.4/org/apache/avro/util/internal/JacksonUtils.java
+06737a7b6212899ba328e840607fba76d833662e0520bf4d0ff7821594364eb1  confluent-7.8.0/io/confluent/connect/avro/AvroData.java
+a7196d1d35ff4b9e08117f39c6ca892e2219f19ca21c49b721a96e5ecbedb928  temurin-25.0.1+8/java.base/java/lang/Math.java

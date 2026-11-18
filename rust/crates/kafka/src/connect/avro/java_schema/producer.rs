@@ -9,12 +9,15 @@ pub(in crate::connect::avro) use pair::{AdmittedSource, ParsedPair, PairSelectio
 #[derive(Clone, Copy)]
 pub(in crate::connect) struct SourcePolicy { pub validate_defaults: bool, pub fixed_bytes: FixedBytesLimit }
 pub(super) struct CanonicalSource { pub root: SchemaHandle, native: NativeFootprint }
-struct Producer { builder: SchemasBuilder, policy: SourcePolicy, native: NativeFootprint }
+struct Producer<'a> { builder: SchemasBuilder, policy: SourcePolicy, native: NativeFootprint, logical: &'a mut dyn LogicalEnvironment }
 const SCHEMA_RESERVED: &[&str] = &["doc", "fields", "items", "name", "namespace", "size", "symbols", "values", "type", "aliases"];
 const FIELD_RESERVED: &[&str] = &["default", "doc", "name", "order", "type", "aliases"];
 
 pub(super) fn parse(text: &str, references: &[String], policy: SourcePolicy, context: &mut ConversionContext) -> Result<CanonicalSource> {
-    let mut producer = Producer { builder: SchemasBuilder::new(context)?, policy, native: NativeFootprint::new() };
+    parse_with_logical(text, references, policy, &mut logical::Unregistered, context)
+}
+pub(super) fn parse_with_logical(text: &str, references: &[String], policy: SourcePolicy, logical: &mut dyn LogicalEnvironment, context: &mut ConversionContext) -> Result<CanonicalSource> {
+    let mut producer = Producer { builder: SchemasBuilder::new(context)?, policy, native: NativeFootprint::new(), logical };
     for reference in references {
         let document = input::parse(reference, context)?;
         producer.native.document(reference.len(), &document)?;
@@ -52,7 +55,7 @@ fn vector_bytes<T>(count: usize) -> Result<usize> { add(mul(mul(count, size_of::
 fn number(node: &JsonNode) -> bool {
     matches!(node.value(), JsonValue::I32(_) | JsonValue::I64(_) | JsonValue::Integer(_) | JsonValue::F32(_) | JsonValue::F64(_) | JsonValue::Decimal(_))
 }
-impl Producer {
+impl Producer<'_> {
     fn lookup(&mut self, reference: JavaText<'_>, space: Option<JavaText<'_>>, fallback: bool, context: &mut ConversionContext) -> Result<SchemaId> {
         let name = Name::new(Some(reference), space, context)?;
         self.native.name(&name)?;
@@ -86,6 +89,7 @@ impl Producer {
     fn object(&mut self, raw: &JsonNode, inherited: Option<JavaText<'_>>, context: &mut ConversionContext, depth: usize) -> Result<SchemaId> {
         let kind = text(raw, "type")?;
         let named = ["record", "error", "enum", "fixed"].iter().any(|name| is(kind, name));
+        let doc = if named { raw.get("doc").and_then(JsonNode::as_text).cloned() } else { None };
         let name = if named {
             let space = raw.get("namespace").and_then(JsonNode::as_text).map(Text::view).or(inherited);
             Some(Name::new(Some(text(raw, "name")?.view()), space, context)?)
@@ -96,6 +100,7 @@ impl Producer {
             self.builder.primitive(kind, context)?
         } else if is(kind, "record") || is(kind, "error") {
             let id = self.builder.record(name.as_ref().unwrap().clone(), is(kind, "error"), context)?;
+            self.builder.named_doc(id, doc.clone())?;
             let fields = array(required(raw, "fields")?)?;
             self.builder.admit(vector_bytes::<Field>(fields.len())?, context)?;
             let mut parsed = Vec::new();
@@ -108,7 +113,7 @@ impl Producer {
             let name = name.as_ref().unwrap().clone();
             validate_named(&name)?;
             let default = raw.get("default").and_then(JsonNode::as_text).cloned();
-            self.builder.enumeration_with(name, default, vector_bytes::<Text>(symbols.len())?, context, || {
+            let id = self.builder.enumeration_with(name, default, vector_bytes::<Text>(symbols.len())?, context, || {
                 let mut parsed = Vec::new();
                 parsed.try_reserve_exact(symbols.len()).map_err(allocation)?;
                 for symbol in symbols {
@@ -118,10 +123,14 @@ impl Producer {
                     parsed.push(symbol.clone());
                 }
                 Ok(parsed)
-            })?
+            })?;
+            self.builder.named_doc(id, doc.clone())?;
+            id
         } else if is(kind, "fixed") {
             let JsonValue::I32(size) = required(raw, "size")?.value() else { return Err(error("avro-schema", "Fixed size is not an IntNode")); };
-            self.builder.fixed(name.as_ref().unwrap().clone(), *size, self.policy.fixed_bytes, context)?
+            let id = self.builder.fixed(name.as_ref().unwrap().clone(), *size, self.policy.fixed_bytes, context)?;
+            self.builder.named_doc(id, doc.clone())?;
+            id
         } else if is(kind, "array") {
             let element = self.schema(required(raw, "items")?, space, context, depth + 1)?;
             self.builder.array(element, context)?
@@ -133,6 +142,7 @@ impl Producer {
         };
         let properties = self.properties(raw, false, is(kind, "enum"), context)?;
         self.builder.properties(id, properties)?;
+        self.builder.construct_logical(id, &mut *self.logical, context)?;
         if let Some(name) = name {
             let aliases = self.aliases(raw, context)?;
             let raw_aliases = raw.get("aliases").map(array).transpose()?.unwrap_or(&[]);
@@ -146,8 +156,7 @@ impl Producer {
                 self.native.name_occurrences(&alias, occurrences)?;
                 if !parsed.contains(&alias) { parsed.push(alias); }
             }
-            let doc = raw.get("doc").and_then(JsonNode::as_text).cloned();
-            self.builder.annotations_with(id, doc, 0, context, || Ok(parsed))?;
+            self.builder.aliases_with(id, 0, context, || Ok(parsed))?;
         }
         Ok(id)
     }

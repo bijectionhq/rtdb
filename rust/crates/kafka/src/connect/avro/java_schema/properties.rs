@@ -7,6 +7,7 @@ pub(in crate::connect::avro) struct Properties {
 }
 impl Properties {
     pub(in crate::connect::avro) fn empty() -> Self { Self { members: Members::empty(), order: Vec::new(), charges: Vec::new() } }
+    pub(super) fn get(&self, key: &str) -> Option<&JsonNode> { self.members.get_text(JavaText::from_utf8(key)) }
     pub(in crate::connect::avro) fn from_members(members: Members, context: &mut ConversionContext) -> Result<Self> {
         let (order, charge) = super::property_order::snapshot(&members, context)?;
         Ok(Self { members, order, charges: vec![charge] })

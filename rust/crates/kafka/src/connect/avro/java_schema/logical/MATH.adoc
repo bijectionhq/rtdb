@@ -1,0 +1,30 @@
+= Fixed Decimal precision decision
+
+Avro1.11.4 LogicalTypes.Decimal.maxPrecision returns Math.round(Math.floor(Math.log10(2)*(8*size-1))) for Fixed and Integer.MAX_VALUE for Bytes.
+The multiplication/subtraction in8*size-1 wraps as Java signed32 arithmetic before conversion to double.
+Every resulting product has magnitude below2^30, so floor is an exactly representable integer and the following Math.round does not change it.
+
+Temurin25.0.1+8 Math.log10 specifies a result within one ulp of the exact logarithm; its intrinsic result is not selected by this source-only profile.
+The exact result lies strictly between binary64 values3fd34413509f79fe and3fd34413509f79ff.
+The ulp at that exponent is2^-54.
+The interval from exact-minus-one-ulp through exact-plus-one-ulp contains exactly those two binary64 values.
+Consequently every source-permitted returned double is one of those two values.
+
+link:math-proof.json[] proves these statements using exact rational arithmetic.
+For z=(x-1)/(x+1), ln(x)=2*sum(z^(2k+1)/(2k+1)) for k>=0.
+After n terms, the positive remainder is at most2*z^(2n+1)/((2n+1)*(1-z*z)).
+Using z=1/3,n=128 for ln2 and z=9/11,n=384 for ln10 bounds their ratio with exact rational endpoints.
+Comparing those rational endpoints and their one-ulp offsets against adjacent binary64 rationals proves the finite result set without executing a logarithm implementation.
+
+The native helper multiplies each endpoint by the exact converted signed32 factor with binary64 round-to-nearest behavior, swaps endpoint order for a negative factor, and floors both results.
+Monotonicity then bounds every possible source maxPrecision.
+If the requested precision is at most the lower bound or above the upper bound, the validation verdict is independent of the source intrinsic.
+Otherwise LogicalEnvironment supplies the effective source maxPrecision at that demand.
+An observation outside the proved bounds is rejected; the Unregistered profile reports a required source-math observation instead of choosing one.
+No source Math result is memoized by the native logical object.
+
+The ordinary Fixed2 precision4 and Fixed16 precision38 controls need no observation.
+A pure arithmetic control uses size129397790 and the threshold311620929, whose two permitted maxPrecision results are311620928 and311620929.
+That control allocates no declared Fixed payload or large schema tree.
+Size268435456 wraps8*size-1 to-1 and rejects every positive Decimal precision.
+These are source-derived data expectations; no regression was executed.

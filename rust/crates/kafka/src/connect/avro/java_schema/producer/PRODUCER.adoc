@@ -41,7 +41,10 @@ The derivation is retained in order-uppercase-proof.json.
 
 Schema/field reserved keys, enum default handling, required IntNode Fixed size, properties and aliases follow the inspected source stages.
 Logical-type properties remain their original source nodes; the native physical representation is not used as a replacement for those source values.
-The built-in logical-object/graph consumer remains separate activation work.
+Record documentation is retained on its declaration before field schemas; Enum/Fixed documentation precedes the property/logical stage.
+The source LogicalTypes.fromSchemaIgnoreInvalid construction stage runs after properties and before named aliases.
+link:../logical/LOGICAL.adoc[] records the built-in source objects, ignored invalid declarations, explicit factory/math environment and remaining custom-type profile.
+The actual graph/data logical consumer remains separate integration work.
 
 == Pair identity and lifetime
 

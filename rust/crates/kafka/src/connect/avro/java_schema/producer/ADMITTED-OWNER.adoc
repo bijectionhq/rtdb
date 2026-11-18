@@ -44,8 +44,9 @@ The real Connect graph/default algorithms remain their existing route; moving th
 ConnectData currently contains the existing public schema/value projection, with its containing conversion region retaining charges.
 Future typed source-schema/default/data IDs must remain in the graph/value owner that still demands them; the datum owner alone does not establish that later export boundary.
 
-Exact JavaString Connect text carriers, source LogicalType construction, canonical typed graph/default/cycle integration, generalized unions, arbitrary-key conversion and SMT/writer provenance remain required before full activation.
-Schema.parse's source LogicalType stage and AvroData's raw case-insensitive logicalType-property stage remain separate obligations.
+Exact JavaString Connect text carriers are available in the typed arena, and link:../logical/LOGICAL.adoc[] records source LogicalType construction in the admitted datum producer.
+Exact document input, remaining custom logical/profile consumers, canonical typed graph/default/cycle integration, generalized unions, arbitrary-key conversion and SMT/writer provenance remain required before full activation.
+Schema.parse's constructed LogicalType object and AvroData's raw case-insensitive logicalType property remain separate source values and consumer stages.
 The existing A09 assertion conflict and every prior fixture body remain unchanged.
 
 Nine additive source regression functions cover ownership transfer without native-tree cloning, real Connect planning/decode, repeated-context retention, partial-retain rejection, pointer queries, resolution/default ownership, migration, cross-plan output and the legacy no-op path.

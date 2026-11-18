@@ -74,6 +74,7 @@ impl AvroPlan {
 }
 impl AvroDatumPlan {
     /// Admits and retains the bounded same-input source/native assembly; Connect graph/default conversion remains a separate stage.
+    /// Uses the unregistered LogicalTypes profile; threshold-dependent Fixed Decimal precision reports a required source-math observation.
     pub fn parse_admitted_source(
         text: &str,
         references: &[String],
@@ -82,6 +83,17 @@ impl AvroDatumPlan {
         context: &mut ConversionContext,
     ) -> Result<Self> {
         java_schema::ParsedPair::parse(text, references, options, policy, context).map(java_schema::ParsedPair::into_datum)
+    }
+    pub(in crate::connect::avro) fn parse_admitted_source_with_logical(
+        text: &str,
+        references: &[String],
+        options: &BTreeMap<String, String>,
+        policy: SourcePolicy,
+        logical: &mut dyn java_schema::LogicalEnvironment,
+        context: &mut ConversionContext,
+    ) -> Result<Self> {
+        java_schema::ParsedPair::parse_with_logical(text, references, options, policy, logical, context)
+            .map(java_schema::ParsedPair::into_datum)
     }
     fn retain_source(&self, context: &mut ConversionContext) -> Result<()> {
         if let Some(source) = &self.source { source.retain(context)?; }

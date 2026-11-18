@@ -1,0 +1,67 @@
+= Parsed source LogicalType objects
+
+The canonical producer constructs Avro1.11.4 LogicalType values at Schema.parse1811, after the object's properties and before named aliases.
+The actual admitted AvroDatumPlan owns that canonical arena, so its root, named definitions and recursive/reference selections retain the same source logical object.
+The legacy Registry parser and converter remain unchanged.
+Named documentation is installed at its constructor prefix: Record doc precedes field schema construction, and Enum/Fixed doc precedes properties/logical construction.
+Aliases remain absent during logical factory callbacks and are installed afterward.
+
+== Values, identity and source validation
+
+Node is a passive schema-object value within the immutable Schemas owner.
+It owns an optional LogicalType source-class/value sum, with storage admitted through the actual Node slot size.
+No duplicate logical-property tree or additional payload allocation is retained.
+Pinned built-in instances are class singletons; a direct decimal declaration creates a fresh Decimal identity scoped to its actual schema node.
+Decimal ordinary equality compares precision and scale, and hash is31*precision+scale with Java int wrapping, despite those distinct object identities.
+Schema equality/hash ignores the constructed logical object and continues to use the unchanged raw properties.
+
+Construction obtains logicalType only from a textual property and matches the built-in names case-sensitively.
+Unknown names reach the supplied factory environment.
+UUID uses the plain LogicalType superclass and has no base-type restriction.
+Date/time-millis require Int; time-micros, timestamp and local-timestamp variants require Long; big-decimal requires Bytes.
+Every accepted type checks the four source incompatible properties using textual getProp, so an empty text rejects while null or another nontext node does not.
+
+Decimal construction demands an actual Java Integer precision and then an optional actual Integer scale before validation.
+Missing precision or any other present precision class is ignored as invalid.
+JacksonUtils.toObject turns unmatched BigInteger/Decimal nodes into Java null; an unmatched scale is consequently absent and defaults to0.
+An explicit NullNode becomes the non-null NULL_VALUE sentinel, so that present scale fails Integer validation.
+Byte-backed Decimal accepts positive precision and0<=scale<=precision.
+Fixed-backed Decimal additionally applies the source signed32 wrapping size expression and maxPrecision check before scale validation.
+link:MATH.adoc[] proves the native decision interval and identifies the exact source-math observation boundary.
+
+Source RuntimeException outcomes from construction/validation produce no constructed object while preserving all raw properties.
+Native allocation, traversal, ownership, unsupported-profile and observation failures remain outer Result errors.
+The implementation does not reproduce source diagnostic string construction, logging allocations or JVM OOME timing.
+
+== Effective factory and math environment
+
+LogicalEnvironment is a passive synchronous call-local operator seam borrowed during assembly and never retained.
+The existing entry uses the explicit Unregistered built-in profile; it discovers no ServiceLoader providers or manual Java registrations.
+The profiled canonical, ParsedPair and admitted-datum entries accept an effective environment from their caller.
+Factories are consulted only after the built-in switch, and see the complete current properties/record fields before aliases.
+Their outcomes distinguish no returned type, RuntimeException, an actual pinned built-in singleton and an unmodelled returned class.
+An actual singleton return undergoes its own source validation independently of the raw requested name.
+An unmodelled class is an outer unsupported demand before its unknown validation; it is not silently erased or reduced to a name/token.
+Factory-returned Decimal objects are within that boundary because arbitrary factories can reuse those identities across schemas.
+The source environment must supply actual singleton/factory outcomes and the demanded Fixed precision result, rather than native identity or guessed JVM observations.
+Each precision observation is demanded only when the two source-permitted Math results can change validation's outcome.
+
+Schema.parse's object and AvroData's raw property remain separate.
+AvroData reads logicalType case-insensitively and can choose a Connect Date/Decimal builder even when Avro ignored a mismatched-case or invalid source logical declaration.
+The canonical raw_logical_name accessor preserves that exact original text rather than projecting LogicalType.name back into the property.
+No Connect graph/default behavior is activated by constructing the source object.
+
+== Source and regression scope
+
+link:sources.sha256[] pins nine primary sources, with every full pre-package prefix in link:COPYRIGHT[].
+link:source-profile.json[] records exact source intervals and the effective-environment and native-math qualifications.
+The existing link:../../names/LICENSE-APACHE[Apache license] and link:../../names/LICENSE[GPLv2 with Classpath exception] remain retained.
+link:math-proof.json[] is an exact rational data derivation from the logarithm series and the pinned Math contract; it is not a JVM observation or executed regression result.
+
+Fifteen additional source regression functions cover built-ins and UUID's unrestricted base; raw/constructed case and invalid distinctions; incompatible-property classes; Decimal Integer/null/fallthrough distinctions; Fixed arithmetic and observed thresholds; factory precedence/failure/unknown-class/resource behavior; child/property/doc/alias stage order; singleton versus Decimal identity/equality; schema relation independence; and actual same-owner datum/reference lifetime.
+All previously published fixture inputs/assertions and the A09 explicit-null conflict remain unchanged.
+No compiler, formatter, test, runtime or project helper was executed.
+
+The exact JavaText document seam, complete registered custom logical class/value consumers, typed graph/default/union/arbitrary-key construction and data/SMT/writer provenance remain integration work.
+The existing bounded UTF8/native-depth input profile continues to apply.
+This capability does not establish whole-pipeline parity or activate JavaNames/Registry parsing.
