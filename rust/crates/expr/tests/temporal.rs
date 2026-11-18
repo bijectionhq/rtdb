@@ -140,3 +140,11 @@ fn unsupported_interval_duration_casts_keep_pinned_error_identity() {
         assert_eq!(error.context.get("interval-unit"), Some(&serde_json::json!(interval_unit)));
     }
 }
+
+#[test]
+fn a_timestamp_within_an_offset_of_the_long_limit_casts_to_its_local_date_and_time() {
+    let limit = V::Timestamp { value: i64::MAX, unit: U::Microsecond, timezone: Some("+05:00".into()) };
+    assert_eq!(cast(&limit, &T::Scalar(S::DateDay), "+05:00").unwrap(), V::DateDay(106_751_991));
+    let time = T::Scalar(S::Time { unit: U::Microsecond, bit_width: 64 });
+    assert_eq!(cast(&limit, &time, "+05:00").unwrap(), V::Time { value: (9 * 3600 + 54) * 1_000_000 + 775_807, unit: U::Microsecond, bit_width: 64 });
+}

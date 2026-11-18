@@ -23,9 +23,10 @@ fn shift_zone(value: i64, unit: TimeUnit, timezone: &str, to_local: bool) -> Res
     if to_local { value.checked_add(adjustment) } else { value.checked_sub(adjustment) }.ok_or_else(overflow)
 }
 
+/// Floors to seconds before shifting, so an instant within an offset of the unit's limit still has a local reading.
 fn local_seconds(value: i64, unit: TimeUnit, timezone: Option<&str>) -> Result<i64> {
-    let local = match timezone { None => value, Some(timezone) => shift_zone(value, unit, timezone, true)? };
-    Ok(local.div_euclid(unit.units_per_second()))
+    let seconds = value.div_euclid(unit.units_per_second());
+    match timezone { None => Ok(seconds), Some(timezone) => shift_zone(seconds, TimeUnit::Second, timezone, true) }
 }
 
 pub fn timestamp_micros(value: &Value, timezone: &str) -> Result<Timestamp> {
