@@ -20,10 +20,25 @@ class InventoryInitIntegrationTests(unittest.TestCase):
             (project / "buildSrc/build.gradle").write_text('plugins { id "java" }\n')
             (project / "empty").mkdir()
             (project / "spec/src/test/java/example").mkdir(parents=True)
+            clojure_dir = project / "spec/custom-clojure/example"
+            clojure_dir.mkdir(parents=True)
+            (clojure_dir / "discovery_test.clj").write_text("""
+(ns example.discovery-test
+  (:require [clojure.test :refer [deftest is]]))
+(deftest has-a-source-identity (is (= 1 1)))
+""")
+            (clojure_dir / "excluded_test.clj").write_text("""
+(ns example.excluded-test
+  (:require [clojure.test :refer [deftest is]]))
+(deftest excluded-source (is (= 1 1)))
+""")
             (project / "build.gradle").write_text('''
 allprojects {
     apply plugin: "java"
-    repositories { mavenCentral() }
+    repositories {
+        mavenCentral()
+        maven { url = uri("https://repo.clojars.org/") }
+    }
     tasks.withType(Test).configureEach { useJUnitPlatform(); systemProperty "rtdb.fixture.property", "retained" }
 }
 dependencies {
@@ -33,7 +48,14 @@ dependencies {
     testRuntimeOnly "com.fasterxml.jackson.core:jackson-databind:2.21.2"
 }
 project(":spec") {
+    def clojureSources = objects.sourceDirectorySet("clojure", "Clojure test sources")
+    clojureSources.srcDir("custom-clojure")
+    clojureSources.include("**/*.clj")
+    clojureSources.exclude("**/excluded_test.clj")
+    sourceSets.test.extensions.add("clojure", clojureSources)
     dependencies {
+        testRuntimeOnly "org.clojure:clojure:1.12.0"
+        testRuntimeOnly "dev.clojurephant:jovial:0.4.3"
         testImplementation "org.junit.jupiter:junit-jupiter-api:6.1.3"
         testImplementation "org.junit.jupiter:junit-jupiter-params:6.1.3"
         testRuntimeOnly "org.junit.jupiter:junit-jupiter-engine:6.1.3"
@@ -70,6 +92,10 @@ class InventoryTest {
             self.assertEqual({lane["task"] for lane in lanes}, {":test", ":empty:test", ":spec:test"})
             empty = json.loads((evidence / "_empty-discovery.json").read_text())
             self.assertFalse(any(value["is_test"] for value in empty["descriptors"]))
+            spec = json.loads((evidence / "_spec-discovery.json").read_text())
+            self.assertEqual(spec["test_clojure_sources"], ["example/discovery_test.clj"])
+            self.assertEqual([value["clojure_var"] for value in spec["descriptors"] if "clojure_var" in value],
+                             ["example.discovery-test/has-a-source-identity"])
             plans = [read_plan(path) for path in evidence.glob("**/*.jsonl")]
             self.assertTrue(plans)
             self.assertFalse([error for plan in plans for error in plan["errors"]])

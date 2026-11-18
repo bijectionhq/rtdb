@@ -45,8 +45,18 @@ gradle.projectsEvaluated {
                 jvmArgs baseline.get().jvmArgs
                 systemProperties baseline.get().systemProperties
                 systemProperty "rtdb.inventory.project", project.path
+                def testSources = project.extensions.getByType(SourceSetContainer).getByName("test")
+                def clojure = testSources.extensions.findByName("clojure")
+                def clojureResources = [] as Set
+                if (clojure != null) {
+                    classpath += project.files(clojure.srcDirs)
+                    clojure.visit { details ->
+                        if (!details.directory) clojureResources.add(details.relativePath.pathString)
+                    }
+                }
                 args([new File(evidence, project.path.replace(':', '_') + "-discovery.json").absolutePath] +
-                    baseline.get().testClassesDirs.files.collect { it.absolutePath })
+                    baseline.get().testClassesDirs.files.collect { it.absolutePath }.sort() +
+                    ["--clojure-sources"] + clojureResources.sort())
                 outputs.upToDateWhen { false }
             }
         }

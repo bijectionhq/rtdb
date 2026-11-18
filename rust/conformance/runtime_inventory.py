@@ -78,7 +78,7 @@ def source_name(descriptor):
     source = descriptor.get("source", {})
     if source.get("class_name") and source.get("method_name"):
         return source["class_name"] + "/" + source["method_name"]
-    return None
+    return descriptor.get("clojure_var")
 
 
 def case_key(identity):

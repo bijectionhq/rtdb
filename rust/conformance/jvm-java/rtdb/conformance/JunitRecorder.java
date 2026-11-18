@@ -33,6 +33,15 @@ public final class JunitRecorder implements TestExecutionListener {
         value.put("is_test", identifier.isTest());
         value.put("is_container", identifier.isContainer());
         value.put("tags", identifier.getTags().stream().map(Object::toString).sorted().toList());
+        var id = identifier.getUniqueIdObject();
+        var segments = id.getSegments();
+        if (identifier.isTest()
+                && id.getEngineId().filter("dev.clojurephant.jovial.clojure-test"::equals).isPresent()
+                && segments.size() == 3
+                && segments.get(1).getType().equals("namespace")
+                && segments.get(2).getType().equals("name")) {
+            value.put("clojure_var", segments.get(1).getValue() + "/" + segments.get(2).getValue());
+        }
         identifier.getSource().ifPresent(source -> {
             var details = new LinkedHashMap<String, Object>();
             details.put("type", source.getClass().getName());

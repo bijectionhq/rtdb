@@ -109,6 +109,37 @@ class RuntimeEvidenceTests(unittest.TestCase):
             self.assertTrue(report["complete"])
             self.assertEqual(report["assertion_denominator"], 1)
 
+    def test_jovial_var_identity_binds_source_and_runtime_without_an_alias(self):
+        qualified_name = "xtdb.operator.table-test/test-single-col"
+        unique_id = ("[engine:dev.clojurephant.jovial.clojure-test]"
+                     "/[namespace:xtdb.operator.table-test]/[name:test-single-col]")
+        source_path = "src/test/clojure/xtdb/operator/table_test.clj"
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = inventory_fixture(directory, (unique_id,))
+            inputs[0]["candidates"][0].update(kind="clojure_var_candidate", identity={"source": source_path, "name": qualified_name})
+            inputs[1]["cases"][0]["identity"].update(source=source_path, qualified_name=qualified_name)
+            discovery_path = Path(directory) / "root-discovery.json"
+            discovery = json.loads(discovery_path.read_bytes())
+            recorded = discovery["descriptors"][0]
+            recorded["source"] = {"type": "org.junit.platform.engine.support.descriptor.ClassSource",
+                                  "class_name": "xtdb.operator.table_test__init"}
+            recorded["clojure_var"] = qualified_name
+            discovery_path.write_text(json.dumps(discovery))
+            plan = Path(directory) / "plan.jsonl"
+            events = [json.loads(line) for line in plan.read_text().splitlines()]
+            for event in events:
+                if "descriptor" in event:
+                    event["descriptor"] = recorded
+            plan_file(directory, events)
+
+            result = reconcile(*inputs)
+            self.assertEqual(result["errors"], [])
+            self.assertTrue(result["complete"])
+            self.assertEqual(result["assertion_denominator"], 1)
+            self.assertEqual(result["candidates"][0]["runtime_status"], "observed")
+            self.assertEqual(result["unmapped_runtime"], [])
+            self.assertEqual(result["unmapped_discovery"], [])
+
     def test_unfiltered_discovery_keeps_unknown_excluded_tests_visible(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs = inventory_fixture(directory)

@@ -130,6 +130,9 @@ The recorder uses the JUnit and Jackson library artifacts selected by that root'
 The recorder serializes each worker's plan, dynamic registrations, skips, outcomes, and report entries into its own event stream.
 A recording error omits the terminal event, so reconciliation rejects the stream even when JUnit logs and suppresses a listener exception.
 The unfiltered discovery command retains templates omitted by normal task tags; concrete parameterized invocations come from execution.
+Discovery selects the Gradle test class directories and the Clojure resources declared by the test source set.
+For Jovial tests, both recorders retain the Clojure Var identity from the JUnit namespace and name segments.
+The reconciler matches that identity to the source declaration and requires an explicit fixture and configuration binding for each runtime invocation.
 The recorder uses the https://docs.junit.org/current/api/org.junit.platform.launcher/org/junit/platform/launcher/TestExecutionListener.html[JUnit launcher listener contract].
 
 [source,shell]
