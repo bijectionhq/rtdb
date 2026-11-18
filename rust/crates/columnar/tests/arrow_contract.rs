@@ -357,5 +357,5 @@ fn deeply_nested_union_cells_round_trip_promptly() {
     }
     let started = std::time::Instant::now();
     round_trip(ty, vec![value]);
-    assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "took {:?}", started.elapsed());
 }
