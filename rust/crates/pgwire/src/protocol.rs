@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(ControlStatement), Keywords }
+enum DriverRewrite { CheckRange, WholeQueryChecked }
 struct Prepared { source: String, kind: PreparedKind, oids: Vec<i32>, columns: Option<Vec<Column>>, _reservation: Arc<MemoryReservation> }
 struct RegisteredStatement { prepared: Arc<Prepared>, _reservation: Arc<MemoryReservation> }
 struct QueryPortal { cursor: QueryCursor, batch: Option<OwnedBatch>, row: usize, sent: u64 }
@@ -65,7 +66,7 @@ impl ProtocolSession {
                 self.extended = true;
                 let name = input.string()?.to_owned(); let sql = input.string()?;
                 let count = usize::from(input.short()?); let oids = (0..count).map(|_| input.integer()).collect::<Result<Vec<_>>>()?; input.end()?;
-                let prepared = self.prepare(sql, oids).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
+                let prepared = self.prepare(sql, oids, DriverRewrite::CheckRange).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
                 Self::planning_warnings(&prepared, writer).await?;
                 self.register_statement(name, prepared)?; writer.empty(b'1').await?;
             }
@@ -121,11 +122,15 @@ impl ProtocolSession {
         Ok(())
     }
 
-    async fn prepare(&mut self, source: &str, mut oids: Vec<i32>) -> Result<Arc<Prepared>> {
+    async fn prepare(&mut self, source: &str, mut oids: Vec<i32>, rewrite: DriverRewrite) -> Result<Arc<Prepared>> {
         let _scratch = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("SQL is too large"))?)?;
         let spans = rtdb_sql::split_statements(source)?;
         if spans.len() > 1 { return Err(protocol("A prepared statement must contain exactly one statement")); }
-        let source = replace_query(spans.first().map_or("", |span| &source[span.start..span.end]));
+        let source = spans.first().map_or("", |span| &source[span.start..span.end]);
+        let source = match rewrite {
+            DriverRewrite::CheckRange => replace_namespace_query(source, (source, "")),
+            DriverRewrite::WholeQueryChecked => source,
+        };
         let options = self.options(); let token = self.token();
         let (kind, columns, count) = if source.is_empty() { (PreparedKind::Empty, None, 0) }
         else if source.to_ascii_lowercase().starts_with("select string_agg(word, ',') from pg_catalog.pg_get_keywords()") { (PreparedKind::Keywords, Some(vec![Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }]), 0) }
@@ -222,7 +227,7 @@ impl ProtocolSession {
                         if matches!(statement, ControlStatement::SetRole) { return Ok(()); }
                         writer.string(b'C', &tag).await
                     }
-                    ControlResult::Prepare { name, source, allocation: _allocation } => { let prepared = self.prepare(&source, Vec::new()).await?; Self::planning_warnings(&prepared, writer).await?; self.register_statement(name, prepared)?; writer.string(b'C', "PREPARE").await },
+                    ControlResult::Prepare { name, source, allocation: _allocation } => { let prepared = self.prepare(&source, Vec::new(), DriverRewrite::CheckRange).await?; Self::planning_warnings(&prepared, writer).await?; self.register_statement(name, prepared)?; writer.string(b'C', "PREPARE").await },
                     ControlResult::CopyIn { table, format, allocation: _allocation } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
                     _ => Err(protocol("Unexpected control execution result")),
                 }
@@ -264,7 +269,8 @@ impl ProtocolSession {
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
-        if let Some(marker) = simple_query_marker(source) {
+        let normalized = normalized_simple_text(source);
+        if let Some(marker) = simple_query_marker(normalized) {
             self.begin_implicit(None)?;
             let result: Result<()> = async {
                 match marker {
@@ -279,13 +285,14 @@ impl ProtocolSession {
             return self.settle_simple_transaction().await;
         }
 
+        let source = replace_namespace_query(source, normalized);
         let spans = rtdb_sql::split_statements_in(source, self.node.memory())?;
         if spans.is_empty() { writer.empty(b'I').await?; return Ok(()); }
         for span in spans.as_slice() {
             let sql = &source[span.start..span.end]; let control = rtdb_sql::parse_control_in(sql, &self.options(), self.node.memory())?;
             if !matches!(control, Some(ControlStatement::Begin(_) | ControlStatement::Discard(_) | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })) { self.begin_implicit(None)?; }
             let result: Result<()> = async {
-                let prepared = self.prepare(sql, Vec::new()).await?;
+                let prepared = self.prepare(sql, Vec::new(), DriverRewrite::WholeQueryChecked).await?;
                 Self::planning_warnings(&prepared, writer).await?;
                 if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
                 let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
@@ -327,8 +334,7 @@ enum SimpleQueryMarker {
     Semicolon,
 }
 
-fn simple_query_marker(source: &str) -> Option<SimpleQueryMarker> {
-    let (body, suffix) = simple_marker_text(source);
+fn simple_query_marker((body, suffix): (&str, &str)) -> Option<SimpleQueryMarker> {
     if body.starts_with(';') {
         return Some(SimpleQueryMarker::Semicolon);
     }
@@ -345,7 +351,7 @@ fn simple_query_marker(source: &str) -> Option<SimpleQueryMarker> {
     Some(SimpleQueryMarker::Empty)
 }
 
-fn simple_marker_text(source: &str) -> (&str, &str) {
+fn normalized_simple_text(source: &str) -> (&str, &str) {
     let source = source.trim_start_matches(java_whitespace);
     if let Some(body) = source.trim_end_matches(java_regex_whitespace).strip_suffix(';') {
         return (body, "");
@@ -377,11 +383,24 @@ fn item_format(formats: &[Format], count: usize, index: usize) -> Result<Format>
 fn head(source: &str) -> String { source.split_whitespace().next().unwrap_or_default().to_ascii_uppercase() }
 fn dml_tag(source: &str) -> String { match head(source).as_str() { "INSERT" => "INSERT 0 0".into(), "UPDATE" => "UPDATE 0".into(), "DELETE" => "DELETE 0".into(), "PATCH" => "PATCH 0".into(), "ERASE" => "ERASE 0".into(), "CREATE" => "CREATE TABLE".into(), value => value.into() } }
 fn is_type_probe(source: &str) -> bool { let mut prior_space = false; source.chars().filter(|character| { let repeated = *character == ' ' && prior_space; prior_space = *character == ' '; !repeated }).collect::<String>() == "SELECT pg_type.oid, typname FROM pg_catalog.pg_type LEFT JOIN (select ns.oid as nspoid, ns.nspname, r.r from pg_namespace as ns join ( select s.r, (current_schemas(false))[s.r] as nspname from generate_series(1, array_upper(current_schemas(false), 1)) as s(r) ) as r using ( nspname ) ) as sp ON sp.nspoid = typnamespace WHERE typname = $1 ORDER BY sp.r, pg_type.oid DESC LIMIT 1" }
-fn replace_query(source: &str) -> &str { if source == "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname" { "SELECT n.oid,n.nspname,n.nspowner,n.nspacl,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname" } else { source } }
+const DBEAVER_NAMESPACE_QUERY: &str = "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
+const DBEAVER_NAMESPACE_REPLACEMENT: &str = "SELECT n.oid,n.nspname,n.nspowner,n.nspacl,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
+
+fn replace_namespace_query<'source>(source: &'source str, (body, suffix): (&str, &str)) -> &'source str {
+    if body == DBEAVER_NAMESPACE_QUERY && suffix.is_empty() {
+        DBEAVER_NAMESPACE_REPLACEMENT
+    } else {
+        source
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn simple_query_marker(source: &str) -> Option<SimpleQueryMarker> {
+        super::simple_query_marker(normalized_simple_text(source))
+    }
 
     #[test]
     fn whole_simple_markers_use_java_blankness_comments_and_regex_end_anchors() {
@@ -414,6 +433,26 @@ mod tests {
                 assert_eq!(error.context["arg-idx"], 2);
                 assert_eq!(error.context["arg-format"], if format == Format::Binary { "binary" } else { "text" });
             }
+        }
+    }
+
+    #[test]
+    fn namespace_rewrite_matches_only_the_complete_normalized_simple_query() {
+        let query = DBEAVER_NAMESPACE_QUERY;
+        let normalized = format!("\u{1c}\u{2003}{query};\t\r\n");
+        for source in [query, normalized.as_str()] {
+            let rewritten = replace_namespace_query(source, normalized_simple_text(source));
+            assert_eq!(rewritten, DBEAVER_NAMESPACE_REPLACEMENT);
+        }
+        for source in [
+            query.to_ascii_lowercase(),
+            format!("SELECT 1; {query}"),
+            format!("{query} "),
+            format!("{query};\u{2028}"),
+            format!("\u{a0}{query};"),
+        ] {
+            let rewritten = replace_namespace_query(&source, normalized_simple_text(&source));
+            assert!(std::ptr::eq(rewritten, source.as_str()));
         }
     }
 }

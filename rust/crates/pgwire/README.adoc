@@ -77,6 +77,8 @@ The marker check left-trims Java whitespace and removes one semicolon at the end
 A leading semicolon that survives that check returns NoData and a zero-row command tag.
 The empty marker returns EmptyQueryResponse.
 On success the markers preserve an existing explicit transaction's status and settle an implicit transaction through the normal Simple Query path.
+The DBeaver namespace query rewrite matches the complete normalized Simple message before tokenization.
+The namespace query keeps its original projection when it appears in a multi-statement message.
 Ordinary Simple Query admits located-token array growth as the tokenizer emits each token.
 The prior array retains its charge until replacement storage has been admitted and the tokens have moved.
 A denied append ends tokenization, and a lexical error already observed by the validator keeps precedence.

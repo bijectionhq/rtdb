@@ -536,3 +536,39 @@ async fn whole_simple_markers_bypass_tokenization_and_preserve_transaction_statu
     assert_eq!(rolled_back[1].1, b"I");
     drop(client); running.stop().await;
 }
+
+#[tokio::test]
+async fn dbeaver_namespace_projection_is_rewritten_only_for_the_whole_simple_message() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let query = "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
+    let normalized = format!("\u{1c}\u{2003}{query};\t\r\n");
+    for source in [query, normalized.as_str()] {
+        let frames = client.query(source).await;
+        assert_eq!(tags(&frames), b"TDDDDCZ");
+        let (count, mut fields) = frames[0].1.split_at(2);
+        assert_eq!(count, &5u16.to_be_bytes());
+        for name in ["oid", "nspname", "nspowner", "nspacl", "description"] {
+            let end = fields.iter().position(|&byte| byte == 0).unwrap();
+            assert_eq!(&fields[..end], name.as_bytes());
+            fields = &fields[end + 19..];
+        }
+        assert!(fields.is_empty());
+        let rows = rows(&frames);
+        for (row, name) in rows.iter().zip(["information_schema", "pg_catalog", "public", "xt"]) {
+            assert_eq!(row.len(), 5);
+            assert_eq!(row[1].as_deref(), Some(name.as_bytes()));
+            assert!(row[3].is_none() && row[4].is_none());
+        }
+        assert_eq!(frames[5].1, b"SELECT 4\0");
+        assert_eq!(frames[6].1, b"I");
+    }
+
+    let frames = client.query(&format!("SELECT 42 AS answer; {query}")).await;
+    assert_eq!(tags(&frames), b"TDCEZ");
+    assert_eq!(rows(&frames), vec![vec![Some(b"42".to_vec())]]);
+    let message = frames[3].1.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(b"M"));
+    assert_eq!(message, Some(b"Duplicate column projection: oid".as_slice()));
+    assert_eq!(frames[4].1, b"I");
+    drop(client); running.stop().await;
+}
