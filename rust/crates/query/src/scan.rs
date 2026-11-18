@@ -20,6 +20,24 @@ use crate::{context::Execution, cursor::OwnedRow, pages::{OwnedPage,PageBuilder,
 enum DataState { Unopened, Open { reader: ArrowFile, _reservation: Arc<MemoryReservation> } }
 struct DataFile { storage: Arc<BufferPool>, key: ObjectKey, state: DataState }
 
+#[derive(Default)]
+struct FileDescriptors {
+    entries: Vec<DataFile>,
+    _reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl FileDescriptors {
+    fn admit(&mut self, count: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
+        if self._reservation.is_some() { return Ok(()); }
+        let bytes = count.checked_mul(std::mem::size_of::<DataFile>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| invalid("scan-file-size", "Scan file descriptor capacity exceeds addressable memory"))?;
+        let reservation = memory.reserve(bytes)?;
+        self.entries.try_reserve_exact(count).map_err(|error| invalid("scan-file-size", error))?;
+        self._reservation = Some(reservation);
+        Ok(())
+    }
+}
+
 enum PageSource { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File { file: usize, page: usize } }
 struct Page { lower: Iid, upper: Iid, priority: usize, source: PageSource, summary: PageSummary, content_matches: bool }
 
@@ -73,7 +91,7 @@ struct PartitionScan {
     execution: Execution,
     bounds: TemporalBounds,
     initialized: bool,
-    files: Vec<DataFile>,
+    files: FileDescriptors,
     pages: PageDescriptors,
     tasks: Option<ScanTaskPlan>,
     loaded: BTreeMap<usize, LoadedPage>,
@@ -103,7 +121,7 @@ impl ScanCursor {
         for snapshot in &database.partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(&database.storage), scan: scan.clone(), execution: execution.clone(), bounds,
-                initialized: false, files: Vec::new(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
+                initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
                 output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
         }
         Ok(Self { partitions, completed: ScanCounts::default(), database: name, source, _reservation: reservation })
@@ -181,8 +199,10 @@ impl PartitionScan {
             combined.push(summary);
         }
         let selected: Vec<_> = select_pages(&combined, self.pruning(), |_| true).iter().filter(|summary| summary.iid_range.is_none_or(|(lower, upper)| self.path_matches(lower, upper))).map(|summary| summary.page_index as usize).filter(|index| *index < tries.len()).collect();
-        self.counts.files_pruned = (tries.len() - selected.len()) as u64;
-        self.counts.files_used = selected.len() as u64;
+        let file_count = selected.len();
+        self.counts.files_pruned = (tries.len() - file_count) as u64;
+        self.counts.files_used = file_count as u64;
+        let mut files = FileDescriptors::default();
         for index in selected {
             let trie = &tries[index];
             let (lower, upper) = path_range(trie.key.part())?;
@@ -194,8 +214,9 @@ impl PartitionScan {
             let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
             let _reservation = self.execution.context.memory.reserve(layout.full_allocation_bound()?)?;
             let metadata = MetadataFile::read_reader(cursor)?;
-            let file = self.files.len();
-            self.files.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, state: DataState::Unopened });
+            files.admit(file_count, &self.execution.context.memory)?;
+            let file = files.entries.len();
+            files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, state: DataState::Unopened });
             let trie_recency = recency(trie.key.recency())?;
             let mut pending = metadata.root_index().map(|root| vec![(root, Vec::new(), trie_recency)]).unwrap_or_default();
             while let Some((node, path, recency)) = pending.pop() {
@@ -218,6 +239,7 @@ impl PartitionScan {
         }
         for (index, page) in pages.entries.iter_mut().enumerate() { page.summary.page_index = u32::try_from(index).map_err(|error| invalid("page-count", error))?; }
         self.tasks = Some(ScanTaskPlan::new(pages.entries.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),&self.execution.context.memory)?);
+        self.files = files;
         self.pages = pages;
         self.initialized = true;
         Ok(())
@@ -230,7 +252,7 @@ impl PartitionScan {
         let rows = match &page.source {
             PageSource::Live { table, rows } => ActiveRows::Live { table: Arc::clone(table),rows: Arc::clone(rows) },
             PageSource::File { file, page: page_index } => {
-                let data = &mut self.files[*file];
+                let data = &mut self.files.entries[*file];
                 if matches!(&data.state, DataState::Unopened) {
                     let lease = data.storage.get(&data.key).await?;
                     let mut cursor = Cursor::new(lease);
@@ -496,11 +518,32 @@ mod tests {
         let before_cursor = memory.used_bytes();
         let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
         let cursor_open = memory.used_bytes();
+        let file_extent = if files_used == 0 { 0 } else { std::mem::size_of::<DataFile>() + 256 };
+        if files_used != 0 {
+            let headroom = metadata_charge + file_extent - 1;
+            let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
+            let retained = cursor_open + pressure.bytes() + metadata_charge;
+            let error = cursor.next_page().await.err().unwrap();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            let expected = format!("Cannot reserve {file_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
+            assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+            let partition = cursor.partitions.front().unwrap();
+            assert!(partition.files.entries.is_empty());
+            assert!(partition.files._reservation.is_none());
+            assert!(partition.tasks.is_none());
+            assert!(partition.loaded.is_empty());
+            assert_eq!(storage.retained_bytes(), metadata_size);
+            assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
+            drop((cursor, pressure));
+            assert_eq!(memory.used_bytes(), before_cursor);
+            cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
+            assert_eq!(memory.used_bytes(), cursor_open);
+        }
         let old_extent = 2 * std::mem::size_of::<Page>() + 256;
         let replacement_extent = 4 * std::mem::size_of::<Page>() + 256;
-        let headroom = metadata_charge + old_extent + replacement_extent - 1;
+        let headroom = metadata_charge + file_extent + old_extent + replacement_extent - 1;
         let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
-        let retained_at_growth = cursor_open + pressure.bytes() + metadata_charge + old_extent;
+        let retained_at_growth = cursor_open + pressure.bytes() + metadata_charge + file_extent + old_extent;
         let error = cursor.next_page().await.err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let expected = format!("Cannot reserve {replacement_extent} bytes from budget {} with {retained_at_growth} retained", memory.limit_bytes());
@@ -510,8 +553,8 @@ mod tests {
         assert!(partition.pages._reservation.is_none());
         assert!(partition.tasks.is_none());
         assert!(partition.loaded.is_empty());
-        assert_eq!(partition.files.len(), files_used);
-        assert!(partition.files.iter().all(|file| matches!(&file.state, DataState::Unopened)));
+        assert!(partition.files.entries.is_empty());
+        assert!(partition.files._reservation.is_none());
         assert_eq!(storage.retained_bytes(), metadata_size);
         assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
         drop((cursor, pressure));
@@ -521,7 +564,10 @@ mod tests {
         assert_eq!(memory.used_bytes(), cursor_open);
         let mut rows = Vec::new();
         while let Some(page) = cursor.next_page().await.unwrap() {
-            let descriptors = &cursor.partitions.front().unwrap().pages;
+            let partition = cursor.partitions.front().unwrap();
+            assert_eq!(partition.files.entries.len(), files_used);
+            assert_eq!(partition.files._reservation.as_ref().map_or(0, |lease| lease.bytes()), file_extent);
+            let descriptors = &partition.pages;
             assert_eq!(descriptors.entries.len(), 3);
             assert_eq!(descriptors._reservation.as_ref().unwrap().bytes(), replacement_extent);
             rows.extend(page.rows().iter().map(|row| row.values[0].clone()));
