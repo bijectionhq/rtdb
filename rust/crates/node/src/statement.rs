@@ -29,8 +29,14 @@ pub struct PreparedSql(Arc<PreparedData>);
 impl PreparedSql {
     pub fn prepare(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
         let source_reservation = admit_source(source, context, &mut options)?;
-        let _syntax = admit_sql_syntax(source, &context.memory)?;
-        let parsed = one_statement(source, &context.memory)?;
+        let syntax = admit_sql_syntax(source, &context.memory)?;
+        let parsed = match one_statement(source, &context.memory) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                drop((syntax, source_reservation));
+                return Err(statement_syntax_error(source, error, &context.memory));
+            }
+        };
         Self::prepare_parsed(parsed, context, options, policy, false, false, source_reservation)
     }
 
@@ -207,6 +213,14 @@ fn admit_sql_syntax(source: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<Memo
 
 fn one_statement<'input>(source: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<ParsedStatement<'input>> {
     exactly_one_statement(rtdb_sql::parse_in(source, memory)?)
+}
+
+fn statement_syntax_error(source: &str, error: Anomaly, memory: &Arc<MemoryBudget>) -> Anomaly {
+    match rtdb_sql::statement_syntax_diagnostic(source, &error, memory) {
+        Ok(Some(diagnostic)) => diagnostic.anomaly().clone(),
+        Ok(None) => error,
+        Err(admission) => admission,
+    }
 }
 
 fn exactly_one_statement(mut parsed: Vec<ParsedStatement<'_>>) -> Result<ParsedStatement<'_>> {

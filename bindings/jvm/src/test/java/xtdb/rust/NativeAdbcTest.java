@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.arrow.adbc.core.AdbcConnection.GetObjectsDepth;
 import org.apache.arrow.adbc.core.AdbcStatusCode;
@@ -86,7 +87,10 @@ final class NativeAdbcTest {
         Clojure.var("clojure.core", "require").invoke(Clojure.read("xtdb.rust"));
         var query = Clojure.var("xtdb.api", "q");
         try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
-            for (String sql : List.of("SELEC 1", "extra SELECT 1")) {
+            for (var expected : Map.of(
+                    "SELEC 1", "Errors parsing SQL statement:\n  - line 1:0 mismatched input 'SELEC' expecting ",
+                    "extra SELECT 1", "Errors parsing SQL statement:\n  - line 1:0 extraneous input 'extra' expecting ").entrySet()) {
+                String sql = expected.getKey();
                 NativeException diagnostic;
                 try (var statement = connection.createStatement(sql)) {
                     diagnostic = assertThrows(NativeException.class, statement::prepare);
@@ -94,8 +98,7 @@ final class NativeAdbcTest {
                 assertEquals(AdbcStatusCode.INVALID_ARGUMENT, diagnostic.getStatus());
                 assertEquals("incorrect", diagnostic.category());
                 assertEquals("xtdb/sql-error", diagnostic.code());
-                assertNotNull(diagnostic.getMessage());
-                assertFalse(diagnostic.getMessage().isEmpty());
+                assertTrue(diagnostic.getMessage().startsWith(expected.getValue()), diagnostic.getMessage());
                 assertTrue(diagnostic.transit().length > 0);
                 assertNull(diagnostic.getCause());
 

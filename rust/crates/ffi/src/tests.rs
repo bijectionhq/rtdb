@@ -13,12 +13,15 @@ fn ok(status: i32, error: u64) {
     assert_eq!(error, 0);
 }
 
-fn incorrect(status: i32, error: u64, code: &str) {
+fn incorrect(status: i32, error: u64, code: &str) { incorrect_anomaly(status, error, code); }
+
+fn incorrect_anomaly(status: i32, error: u64, code: &str) -> rtdb_types::Anomaly {
     assert_eq!(status, 1);
     let Handle::Error(diagnostic) = handles::get(error).unwrap() else { panic!("expected diagnostic") };
     handles::release(error).unwrap();
     assert_eq!(diagnostic.error.category, AnomalyCategory::Incorrect);
     assert_eq!(diagnostic.error.code, code);
+    (*diagnostic.error).clone()
 }
 
 struct Native { database: u64, session: u64, retained: Vec<u64> }
@@ -513,9 +516,18 @@ fn adbc_rejected_replacement_keeps_preparation_and_bind_until_valid_sql_is_insta
     assert_eq!(Schema::try_from(&parameters).unwrap().fields().len(), 1);
     assert_eq!(native.query_value(statement, operation), rtdb_types::Value::I64(17));
 
-    native.set_sql(statement, "SELEC 1");
-    let status = unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) };
-    incorrect(status, error, "xtdb/sql-error");
+    for (sql, report) in [
+        ("SELEC 1", "line 1:0 mismatched input 'SELEC' expecting {'(', 'ASSERT', "),
+        ("SELECT 1 LIMIT ALL", "line 1:15 mismatched input 'ALL' expecting {UNSIGNED_INTEGER, POSTGRES_PARAMETER_SPECIFICATION, '?'}"),
+        ("SELECT 1; SELEC 1", "line 1:10 mismatched input 'SELEC' expecting <EOF>"),
+    ] {
+        native.set_sql(statement, sql);
+        let status = unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) };
+        let anomaly = incorrect_anomaly(status, error, "xtdb/sql-error");
+        let message = anomaly.message.as_deref().unwrap();
+        assert!(message.starts_with(&format!("Errors parsing SQL statement:\n  - {report}")), "{message}");
+        assert!(anomaly.context.is_empty());
+    }
 
     native.set_sql(statement, "SELECT CAST(42 AS BIGINT) AS value");
     let mut schema = FFI_ArrowSchema::empty();

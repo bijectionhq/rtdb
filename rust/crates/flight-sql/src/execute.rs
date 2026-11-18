@@ -9,7 +9,7 @@ use rtdb_query::QueryContext;
 use rtdb_tx::SqlArguments;
 use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
-use crate::{error::{cancelled, initial_prepare_status, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::Ticket, wire};
+use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::Ticket, wire};
 
 pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize }
 impl Service {
@@ -23,7 +23,7 @@ impl Service {
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
-            .map_err(|error| initial_prepare_status(source, error, &context.memory))?;
+            .map_err(status)?;
         let schema = if prepared.is_dml() { None } else {
             Some(self.parameterized_schema(&prepared, &context, params)?)
         };
@@ -58,7 +58,7 @@ impl Service {
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
-            .map_err(|error| initial_prepare_status(source, error, &context.memory))?;
+            .map_err(status)?;
         execute_prepared_update(native, &prepared, arguments).await
     }
 
@@ -87,7 +87,7 @@ impl Service {
             let prepared = {
                 let context = native.prepare_context(&token).await.map_err(status)?;
                 PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic)
-                    .map_err(|error| initial_prepare_status(source, error, &context.memory))?
+                    .map_err(status)?
             };
             if prepared.is_dml() {
                 let arguments = decode_arguments()?;

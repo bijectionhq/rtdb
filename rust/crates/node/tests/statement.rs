@@ -8,7 +8,7 @@ use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 use rtdb_sql::PrepareOptions;
 use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_tx::{SqlArguments, TxOp};
-use rtdb_types::{Interval, LogicalType, PgType, ScalarType, TableRef, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, Interval, LogicalType, PgType, ScalarType, TableRef, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 fn context(state: Option<&PartitionState>, memory: &Arc<MemoryBudget>) -> Arc<QueryContext> {
@@ -436,6 +436,21 @@ async fn prepared_series_uses_the_nodes_captured_endpoint_policy() {
 }
 
 #[test]
+fn programmatic_preparation_reports_the_direct_grammar_listener_text() {
+    let memory = MemoryBudget::new(64 << 20);
+    let context = context(None, &memory);
+    for (source, report) in [
+        ("SELECT 1 LIMIT ALL", "line 1:15 mismatched input 'ALL' expecting {UNSIGNED_INTEGER, POSTGRES_PARAMETER_SPECIFICATION, '?'}"),
+        ("SELECT 1; SELEC 1", "line 1:10 mismatched input 'SELEC' expecting <EOF>"),
+        ("SELECT 1 +", "line 1:9 extraneous input '+' expecting {<EOF>, ';'}"),
+    ] {
+        let error = PreparedSql::prepare(source, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).err().unwrap();
+        assert_eq!(error, Anomaly::incorrect("xtdb/sql-error", format!("Errors parsing SQL statement:\n  - {report}")), "{source}");
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
 fn programmatic_preparation_admits_syntax_after_source_and_cancellation() {
     let source = format!("SELECT '{}'; SELECT @", "é".repeat(64));
     let source_bytes = source.len() + 256;
@@ -454,9 +469,13 @@ fn programmatic_preparation_admits_syntax_after_source_and_cancellation() {
     let exact = MemoryBudget::new(source_bytes + syntax_bytes);
     let expected = rtdb_sql::parse_in(&source, &exact).unwrap_err();
     assert_eq!(expected.code, "xtdb/sql-error");
-    assert_eq!(prepare(&context(None, &exact)).err().unwrap(), expected);
+    assert_eq!(prepare(&context(None, &exact)).err().unwrap().code, "rtdb/memory-budget-exceeded");
     assert_eq!(exact.peak_bytes(), source_bytes + syntax_bytes);
     assert_eq!(exact.used_bytes(), 0);
+
+    let roomy = MemoryBudget::new(64 << 20);
+    assert_eq!(prepare(&context(None, &roomy)).err().unwrap(), expected);
+    assert_eq!(roomy.used_bytes(), 0);
 }
 
 #[test]
