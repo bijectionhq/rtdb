@@ -17,8 +17,6 @@ Raw lexemes and recognition failures borrow source text without allocating copie
 Comment configuration storage and rendered error text acquire reservations before growth.
 Reservations remain with the supplied scope until it is dropped.
 A recognition failure retains its source span; rendering it requires allocation admission.
-The rendered diagnostic owns its message and borrows that allocation scope through destruction.
-Callers can borrow its anomaly; the diagnostic provides no owned extraction or cloning operation.
 
 == Buffered token demand
 
@@ -49,7 +47,6 @@ The returned text owns its string and borrows the allocation scope through destr
 The stream retains the same scope borrow through destruction of its token buffer.
 
 Admission failure in scanning, buffer growth or text construction aborts the stream.
-A scanned token whose insertion fails remains a borrowed pending lexeme in that terminal state.
 The original allocation anomaly is returned once; renewed demand returns an allocation-free `Aborted` value.
 Cached inspection and buffered seek remain available, while consume, text construction and uncached demand cannot resume after other budget owners release memory.
 Reservations remain with the allocation scope until it is dropped.

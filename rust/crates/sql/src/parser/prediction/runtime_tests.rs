@@ -212,7 +212,7 @@ fn owner_local_committed_closing_prefix_cannot_pop_again() {
 #[test]
 fn borrowed_recognition_fact_outlives_session_and_renders_from_original_sql() {
     let sql=String::from("1 @");let result=fixture(&sql,|s,_|{let mut entry=recursive(s,26,0)?;let result=s.with_prediction(83,|_,_,input|{input.lookahead(2)?;Ok(())});s.unroll_recursion(&mut entry)?;result});
-    let Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(error))))=result else{panic!("original SQL-borrowed recognition fact")};assert_eq!(error.span().start.byte,2);assert_eq!(error.span().end.byte,3);let memory=MemoryBudget::new(8192);let work=AllocationScope::new(&memory).unwrap();let rendered=error.render(&work).unwrap();assert!(rendered.anomaly().message.as_deref().unwrap().contains("'@'"));drop(rendered);drop(work);assert_eq!(memory.used_bytes(),0);
+    let Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(error))))=result else{panic!("original SQL-borrowed recognition fact")};assert_eq!(error.span().start.byte,2);assert_eq!(error.span().end.byte,3);let memory=MemoryBudget::new(8192);let work=AllocationScope::new(&memory).unwrap();let rendered=error.render(&work).unwrap();assert!(rendered.message.as_deref().unwrap().contains("'@'"));drop(rendered);drop(work);assert_eq!(memory.used_bytes(),0);
 }
 
 #[test]

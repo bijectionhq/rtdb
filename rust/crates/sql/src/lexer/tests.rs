@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use rtdb_types::{AllocationScope, AnomalyCategory, MemoryBudget};
-use super::{Delimiter, Kind, Lexer, Lexeme, Position, Punctuation as P, RenderedDiagnostic, ScanError, vocabulary};
+use super::{Delimiter, Kind, Lexer, Lexeme, Position, Punctuation as P, ScanError, vocabulary};
 
 fn tokens<'sql>(source: &'sql str, allocation: &AllocationScope) -> Vec<Lexeme<'sql>> {
     let mut lexer = Lexer::new(source, allocation);
@@ -163,8 +163,7 @@ fn positions_distinguish_utf8_bytes_code_points_and_lf_only_line_changes() {
     assert_eq!(token.span.end, Position { byte: 15, code_point: 12, line: 2, column: 2 });
     let Err(ScanError::Recognition(error)) = lexer.next() else { panic!() };
     assert_eq!(error.span.start, Position { byte: 16, code_point: 13, line: 2, column: 3 });
-    let diagnostic = error.render(&allocation).unwrap();
-    let anomaly = diagnostic.anomaly();
+    let anomaly = error.render(&allocation).unwrap();
     assert_eq!(anomaly.category, AnomalyCategory::Incorrect);
     assert_eq!(anomaly.code, "xtdb/sql-error");
     assert_eq!(anomaly.message.as_deref(), Some("Errors parsing SQL statement:\n  - line 2:3 token recognition error at: '@'"));
@@ -176,8 +175,8 @@ fn lexer_errors_render_the_attempt_through_the_offending_character() {
     let allocation = AllocationScope::new(&memory).unwrap();
     for (source, displayed) in [("'a\nrest", "'a\\n"), ("\"a/b\"", "\"a/"), ("!a", "!a"), ("$tag!", "$tag!"), ("'a\t", "'a\\t")] {
         let Err(ScanError::Recognition(error)) = Lexer::new(source, &allocation).next() else { panic!("{source}") };
-        let diagnostic = error.render(&allocation).unwrap();
-        assert_eq!(diagnostic.anomaly().message, Some(format!("Errors parsing SQL statement:\n  - line 1:0 token recognition error at: '{displayed}'")));
+        let anomaly = error.render(&allocation).unwrap();
+        assert_eq!(anomaly.message, Some(format!("Errors parsing SQL statement:\n  - line 1:0 token recognition error at: '{displayed}'")));
     }
 }
 
@@ -235,30 +234,11 @@ fn recognition_error_rendering_reserves_its_complete_message_before_allocating()
             let allocation = AllocationScope::new(&memory).unwrap();
             let Err(ScanError::Recognition(error)) = Lexer::new("@", &allocation).next() else { panic!() };
             let result = error.render(&allocation);
-            if limit == required { assert_eq!(result.unwrap().anomaly().message.as_deref(), Some(EXPECTED)); }
+            if limit == required { assert_eq!(result.unwrap().message.as_deref(), Some(EXPECTED)); }
             else { assert_eq!(result.unwrap_err().code, "rtdb/memory-budget-exceeded"); }
         }
         assert_eq!(memory.used_bytes(), 0);
     }
-}
-
-#[test]
-fn rendered_diagnostic_owns_text_and_borrows_its_allocation_until_drop() {
-    fn render(allocation: &AllocationScope) -> RenderedDiagnostic<'_> {
-        let source = String::from("'unclosed");
-        let Err(ScanError::Recognition(error)) = Lexer::new(&source, allocation).next() else { panic!() };
-        error.render(allocation).unwrap()
-    }
-    let memory = MemoryBudget::new(1 << 20);
-    let allocation = AllocationScope::new(&memory).unwrap();
-    let diagnostic = render(&allocation);
-    let retained = memory.used_bytes();
-    assert!(retained > 4096);
-    assert_eq!(diagnostic.anomaly().message.as_deref(), Some("Errors parsing SQL statement:\n  - line 1:0 token recognition error at: ''unclosed'"));
-    drop(diagnostic);
-    assert_eq!(memory.used_bytes(), retained);
-    drop(allocation);
-    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]

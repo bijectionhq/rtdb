@@ -22,7 +22,6 @@ mod wildcard;
 mod returning;
 mod lexer;
 mod parser;
-mod literal_text;
 mod batch;
 
 pub use parse::{DeferredStatementSyntax, ParsedStatement, StatementKind, StatementSyntax, StatementSyntaxBatch, parse, parse_in, parse_syntax_in};

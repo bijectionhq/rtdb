@@ -4,10 +4,10 @@ mod vocabulary;
 #[cfg(test)]
 mod tests;
 
-use std::{fmt::{self, Write}, sync::Arc};
+use std::{fmt::Write, sync::Arc};
 use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, Result};
 pub(crate) use vocabulary::{Keyword, Punctuation, keyword};
-pub(crate) use stream::{IndexedLexeme, StreamError, TokenStream, TokenText};
+pub(crate) use stream::{IndexedLexeme, StreamError, TokenStream};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Position {
@@ -96,6 +96,7 @@ impl<'sql> Lexeme<'sql> {
     pub(crate) fn kind(self) -> Kind { self.kind }
     pub(crate) fn span(self) -> Span { self.span }
     pub(crate) fn raw(self) -> &'sql str { &self.source.0[self.span.start.byte..self.span.end.byte] }
+    #[cfg(test)]
     pub(crate) fn body(self) -> Option<&'sql str> {
         let raw = self.raw();
         match self.kind {
@@ -106,6 +107,7 @@ impl<'sql> Lexeme<'sql> {
             _ => None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn tag(self) -> Option<&'sql str> {
         matches!(self.kind, Kind::DollarStart | Kind::DollarEnd).then(|| {
             let raw = self.raw();
@@ -130,25 +132,8 @@ pub(crate) struct RecognitionError<'sql> {
     span: Span,
 }
 
-pub(crate) struct RenderedDiagnostic<'scope> {
-    anomaly: Anomaly,
-    _allocation: &'scope AllocationScope,
-}
-
-impl RenderedDiagnostic<'_> {
-    pub(crate) fn anomaly(&self) -> &Anomaly { &self.anomaly }
-}
-
-impl fmt::Debug for RenderedDiagnostic<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(&self.anomaly, formatter) }
-}
-
-// Drop checking keeps the allocation borrow live through owned anomaly destruction.
-impl Drop for RenderedDiagnostic<'_> {
-    fn drop(&mut self) {}
-}
-
 impl RecognitionError<'_> {
+    #[cfg(test)]
     pub(crate) fn span(self) -> Span { self.span }
     pub(crate) fn for_delimited_identifier(source: &str, start: usize, end: usize) -> Option<RecognitionError<'_>> {
         if !source[start..].starts_with(['"', '`']) { return None; }
@@ -174,9 +159,9 @@ impl RecognitionError<'_> {
         None
     }
 
-    pub(crate) fn render<'scope>(self, allocation: &'scope AllocationScope) -> Result<RenderedDiagnostic<'scope>> {
-        let anomaly = self.render_anomaly(|bytes| allocation.reserve(bytes))?;
-        Ok(RenderedDiagnostic { anomaly, _allocation: allocation })
+    #[cfg(test)]
+    pub(crate) fn render(self, allocation: &AllocationScope) -> Result<Anomaly> {
+        self.render_anomaly(|bytes| allocation.reserve(bytes))
     }
 
     pub(crate) fn compatibility_anomaly(self, memory: Option<&Arc<MemoryBudget>>) -> Anomaly {

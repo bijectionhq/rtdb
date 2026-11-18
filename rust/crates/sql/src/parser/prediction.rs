@@ -15,7 +15,7 @@ use super::grammar::{ArtifactIssue, GrammarError};
 #[cfg(test)]
 use super::grammar::Grammar;
 pub(super) use closure::SourceAssertions;
-pub(super) use runtime::{CapturedClassPolicy, DirectControlError, DirectControlRecognition, ParserEnvironment};
+pub(super) use runtime::{CapturedClassPolicy, ParserEnvironment};
 use context::{ContextKey, MergeMode, MergeRound, PredictionContexts};
 #[cfg(test)]
 use context::ContextShape;

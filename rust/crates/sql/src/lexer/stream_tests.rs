@@ -249,8 +249,7 @@ fn growth_covers_both_buffers_and_is_triggered_by_a_successful_next_token() {
             } else {
                 admission(result);
                 assert_eq!(stream.buffered_len(), INITIAL_CAPACITY);
-                let Tail::PendingAdmission(pending) = stream.tail else { panic!("pending EOF") };
-                assert_eq!(pending.kind(), Kind::Eof);
+                assert!(matches!(stream.tail, Tail::Admission));
                 assert_eq!(memory.used_bytes(), initial_charge());
             }
             assert_eq!(stream.index(), Some(0));
@@ -260,7 +259,7 @@ fn growth_covers_both_buffers_and_is_triggered_by_a_successful_next_token() {
 }
 
 #[test]
-fn failed_growth_retains_a_terminal_pending_token_after_budget_is_released() {
+fn failed_growth_aborts_further_scanning_even_after_budget_is_released() {
     let source = format!("{}@", "a ".repeat(INITIAL_CAPACITY + 1));
     let required = initial_charge() + 256 + 2 * INITIAL_CAPACITY * std::mem::size_of::<Lexeme<'_>>();
     let memory = MemoryBudget::new(required);
@@ -268,9 +267,7 @@ fn failed_growth_retains_a_terminal_pending_token_after_budget_is_released() {
     let mut stream = TokenStream::new(&source, &allocation).unwrap();
     let blocker = memory.reserve(1).unwrap();
     admission(stream.lt(INITIAL_CAPACITY as isize + 1));
-    let Tail::PendingAdmission(pending) = stream.tail else { panic!("pending token") };
-    assert_eq!(pending.raw(), "a");
-    assert_eq!(pending.span().start.byte, 2 * INITIAL_CAPACITY);
+    assert!(matches!(stream.tail, Tail::Admission));
     assert_eq!(stream.buffered_len(), INITIAL_CAPACITY);
     drop(blocker);
     assert!(matches!(stream.lt(INITIAL_CAPACITY as isize + 1), Err(StreamError::Aborted)));

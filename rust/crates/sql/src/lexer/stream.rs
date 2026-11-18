@@ -37,7 +37,6 @@ enum Tail<'sql> {
     Eof { index: usize },
     Recognition(RecognitionError<'sql>),
     Admission,
-    PendingAdmission(Lexeme<'sql>),
 }
 
 pub(crate) struct TokenStream<'sql, 'scope> {
@@ -64,6 +63,7 @@ impl<'sql, 'scope> TokenStream<'sql, 'scope> {
         match self.cursor { Cursor::Uninitialized => None, Cursor::At(index) => Some(index) }
     }
 
+    #[cfg(test)]
     pub(crate) fn buffered_len(&self) -> usize { self.tokens.len() }
 
     pub(crate) fn buffered(&self, index: usize) -> Option<IndexedLexeme<'sql>> {
@@ -139,7 +139,7 @@ impl<'sql, 'scope> TokenStream<'sql, 'scope> {
             match self.tail {
                 Tail::Eof { index: eof } => return Ok(index <= eof),
                 Tail::Recognition(error) => return Err(StreamError::Scan(ScanError::Recognition(error))),
-                Tail::Admission | Tail::PendingAdmission(_) => return Err(StreamError::Aborted),
+                Tail::Admission => return Err(StreamError::Aborted),
                 Tail::Open => (),
             }
             let lexeme = match self.lexer.next() {
@@ -153,7 +153,7 @@ impl<'sql, 'scope> TokenStream<'sql, 'scope> {
                 }
             };
             if let Err(error) = self.grow() {
-                self.tail = Tail::PendingAdmission(lexeme);
+                self.tail = Tail::Admission;
                 return Err(StreamError::Scan(ScanError::Admission(error)));
             }
             let index = self.tokens.len();
@@ -177,7 +177,7 @@ impl<'sql, 'scope> TokenStream<'sql, 'scope> {
         match index.checked_add(1) { Some(index) => Ok(index), None => self.abort(size_error()) }
     }
 
-    fn aborted(&self) -> bool { matches!(self.tail, Tail::Admission | Tail::PendingAdmission(_)) }
+    fn aborted(&self) -> bool { matches!(self.tail, Tail::Admission) }
 
     fn abort<T>(&mut self, error: Anomaly) -> Result<'sql, T> {
         self.tail = Tail::Admission;

@@ -619,13 +619,3 @@ POSITION parses a complete expression on each side of its IN delimiter, retainin
 Nested POSITION delimiter retries share a cumulative work limit that includes token snapshot payloads; exhausting it returns a SQL error before further speculative parsing.
 Delimiter speculation keeps the existing parser's recursion budget and restores its token stream before returning.
 The source regression modules retain full-expression type admission, nested delimiter selection, failed speculation and recursion-limit behavior.
-
-== Private literal text conversion
-
-The private `literal_text` module decodes borrowed standard, C-escape and dollar-string lexer views into retained UTF16 text.
-Standard strings collapse doubled single quotes; C strings retain the pinned Kotlin regex transform order, partial octal behavior and Java code-point conversion.
-Dollar strings concatenate their text tokens without decoding escapes.
-Conversion failures retain the offending unit or signed code point, and their Java messages preserve exact units until an explicit encoding boundary.
-Scratch storage is admitted before conversion and remains charged while the result acquires its own retained lease.
-The private regression source covers isolated units, literal boundaries, first-error order and reservation lifetimes.
-Production literal binding remains on the existing path until the semantic tree, host and format-specific serialization boundaries support exact text.

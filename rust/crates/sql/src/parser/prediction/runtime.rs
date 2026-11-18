@@ -16,7 +16,6 @@ pub(super) use bail_fallback::{PassError, PassResult, with_bail_fallback};
 #[path = "direct_control.rs"]
 mod direct_control;
 pub use direct_control::{ContextualStatementDiagnostic, StatementSyntaxDiagnostic};
-pub(in crate::parser) use direct_control::{DirectControlError, DirectControlRecognition};
 
 #[path = "inline_match.rs"]
 mod inline_match;
