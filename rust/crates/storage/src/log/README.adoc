@@ -29,7 +29,13 @@ The external writer's fsync completion is not independently observable through t
 Poll limits bound retained payload bytes and record count separately.
 `ReadOnlyLocalLog::read_range` uses the same limits and returns `LogReadLimit` when the requested range cannot fit.
 Callers can split large catch-up ranges at known record starts.
-These limits do not yet connect log buffers to the node-wide allocation budget.
+Replication uses caller-reserved single-record delivery for writable local and memory logs.
+An available head identifies the next durable record and its delivery charge.
+Only the selected head acquires a reservation from the execution budget.
+Writable local delivery charges its copied payload and delivery overhead.
+Memory delivery charges the overhead for an alias of the append-owned payload.
+The returned payload and its clones keep the delivery reservation alive.
+Direct tail consumers, read-only local replay and Kafka replay use batch delivery through `LogTail::poll`.
 
 `tests/read_only_log.rs` maps to `ReadOnlyLocalLogTest`'s existing/subsequent external-write polling behavior and adds missing-file, writer-lock coexistence, corruption, truncation, range-bound, and no-write checks.
 Partition path selection and retired-message decoding remain the caller's responsibilities.

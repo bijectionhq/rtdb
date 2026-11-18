@@ -6,7 +6,7 @@ pub use local::{LocalLog, LocalLogDriver, LocalLogOptions};
 pub use memory::MemoryLog;
 pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
 
-use crate::{Error, Result};
+use crate::{Error, Result, object_store::ReadReservation};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
@@ -40,13 +40,19 @@ pub struct LogRecord {
     pub payload: Bytes,
 }
 
+const LOG_RECORD_OVERHEAD_BYTES: usize = 256;
+
 impl LogRecord {
     /// Keeps the caller's pre-read charge alive for every clone of the payload.
-    pub fn retain(self, reservation: crate::object_store::ReadReservation) -> Result<Self> {
-        if reservation.length() < self.payload.len().saturating_add(256) { return Err(Error::Task("log record exceeds its read reservation".into())); }
-        struct Retained { bytes: Bytes, _reservation: crate::object_store::ReadReservation }
+    pub fn retain(self, reservation: ReadReservation) -> Result<Self> {
+        if reservation.length() < self.payload.len().saturating_add(LOG_RECORD_OVERHEAD_BYTES) { return Err(Error::Task("log record exceeds its read reservation".into())); }
+        Ok(self.with_read_reservation(reservation))
+    }
+
+    fn with_read_reservation(self, reservation: ReadReservation) -> Self {
+        struct Retained { bytes: Bytes, _reservation: ReadReservation }
         impl AsRef<[u8]> for Retained { fn as_ref(&self) -> &[u8] { &self.bytes } }
-        Ok(Self { metadata: self.metadata, payload: Bytes::from_owner(Retained { bytes: self.payload, _reservation: reservation }) })
+        Self { metadata: self.metadata, payload: Bytes::from_owner(Retained { bytes: self.payload, _reservation: reservation }) }
     }
 }
 
@@ -88,6 +94,31 @@ impl AppendReceipt {
 pub trait LogTail: Send {
     /// Empty means this cursor reached the durable tip; read errors must be returned as errors.
     async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>>;
+
+    /// Exposes caller-reserved single-record delivery when the backend supports it.
+    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { None }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayHead {
+    pub metadata: LogMetadata,
+    /// Length of the encoded payload, in bytes.
+    pub payload_len: usize,
+    /// Minimum caller reservation, in bytes, for delivery by this backend.
+    pub allocation_bound: usize,
+}
+
+#[async_trait]
+pub trait LogReplayTail: Send {
+    /// Waits up to the timeout for the next durable record without acquiring its payload or advancing the cursor.
+    /// Only a cursor at the durable tip yields None.
+    async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>>;
+
+    /// Reads the prepared head using a reservation of at least its allocation bound in bytes.
+    /// Success advances the cursor and keeps the reservation with the delivered payload through its final clone.
+    /// An insufficient reservation returns an error. Failure or cancellation leaves the cursor at its current position.
+    /// Offloaded work keeps the reservation through the read and disposal of an undelivered result.
+    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord>;
 }
 
 #[async_trait]

@@ -3,16 +3,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope}, keys::CURRENT_STORAGE_VERSION, log::proto::{self, resolved_tx::DbOp}};
+use rtdb_format::{database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceMessage}, keys::CURRENT_STORAGE_VERSION, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::TransactionBuffer;
-use rtdb_storage::{MemoryStore, ObjectStore, cache::BufferPool, log::{Log, LogMetadata, LogOffset, LogRecord, MemoryLog}};
+use rtdb_storage::{MemoryStore, ObjectStore, cache::BufferPool, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, LogRecord, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_trie::TrieConfig;
 use rtdb_tx::{Documents, ResolveContext, SourceTransaction, SubmitOptions, TransactionAuthorization, TxOp};
 use rtdb_types::{Anomaly, BlockIndex, Interval, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
+use super::{TailPoll, read_replay_head, source_decode_bound, start_poll};
 use crate::*;
+use crate::logs::replica_decode_bound;
 
 struct NoEffects;
 #[async_trait]
@@ -48,6 +51,124 @@ fn boundary(index: i64, source: i64) -> ReplicaBody { ReplicaBody::BlockBoundary
 fn resolved(id: i64, source: i64) -> ReplicaBody { ReplicaBody::ResolvedTx(proto::ResolvedTx { tx_id: Some(id), system_time_micros: Some(id * 100 + 100), committed: Some(true), src_msg_id: Some(source), ..Default::default() }) }
 fn upload(index: i64, source: i64) -> ReplicaBody {
     ReplicaBody::BlockUploaded(proto::BlockUploaded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source), tries: Vec::new(), external_source_token: None })
+}
+
+#[tokio::test]
+async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = || LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 2 };
+    let (source, source_driver) = LocalLog::open(directory.path().join("LOG"), options()).unwrap();
+    let (replica, replica_driver) = LocalLog::open(directory.path().join("REPLICA_LOG"), options()).unwrap();
+    let writers = CancellationToken::new();
+    let source_writer = tokio::spawn(source_driver.run(writers.clone()));
+    let replica_writer = tokio::spawn(replica_driver.run(writers.clone()));
+    let source_payload = Bytes::from(vec![0xff; 2048]);
+    let source_payload_len = source_payload.len();
+    let source_metadata = source.enqueue(source_payload, Timestamp(11)).await.unwrap().durable().await.unwrap();
+    let replica_record = raw(0, 1, 0, resolved(0, 0));
+    let replica_payload_len = replica_record.payload.len();
+    let replica_metadata = replica.enqueue(replica_record.payload, Timestamp(12)).await.unwrap().durable().await.unwrap();
+
+    let source_decode_bytes = source_decode_bound(source_payload_len).unwrap();
+    let replica_decode_bytes = replica_decode_bound(replica_payload_len).unwrap();
+    let source_read_bytes = 256 + source_payload_len;
+    let replica_read_bytes = 256 + replica_payload_len;
+    let replica_needed = replica_read_bytes + replica_decode_bytes;
+    let memory = MemoryBudget::new(source_read_bytes + source_decode_bytes);
+    let store = Arc::new(MemoryStore::default());
+    let cache = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+    let logs = PartitionLogs::new(source.clone(), replica.clone(), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION,
+        StorageEpoch(0), store, cache, Arc::clone(&memory)).unwrap();
+    let source_tail = logs.source_tail(logs.source_floor().unwrap()).await.unwrap();
+    let replica_tail = logs.replica_tail(logs.replica_floor().unwrap()).await.unwrap();
+    let ((mut source_tail, source_ready), (mut replica_tail, replica_ready)) =
+        tokio::join!(start_poll(source_tail, Duration::ZERO), start_poll(replica_tail, Duration::ZERO));
+    let TailPoll::Prepared(Some(source_head)) = source_ready.unwrap() else { panic!("expected a prepared source head"); };
+    let TailPoll::Prepared(Some(replica_head)) = replica_ready.unwrap() else { panic!("expected a prepared replica head"); };
+    assert_eq!(source_head.metadata, source_metadata);
+    assert_eq!(source_head.allocation_bound, source_read_bytes);
+    assert_eq!(replica_head.metadata, replica_metadata);
+    assert_eq!(replica_head.allocation_bound, replica_read_bytes);
+    assert_eq!(memory.used_bytes(), 0);
+    assert!(source_read_bytes < replica_needed);
+
+    let running = CancellationToken::new();
+    let blocker_bytes = memory.limit_bytes() - replica_needed;
+    let one_byte_short = memory.reserve(blocker_bytes + 1).unwrap();
+    let refusal = read_replay_head(replica_tail.as_mut(), replica_head, logs.memory(), replica_decode_bound, &running).await
+        .err().expect("expected a replay admission failure");
+    assert_eq!(refusal.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(memory.used_bytes(), blocker_bytes + 1);
+    assert_eq!(replica_tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap(), Some(replica_head));
+    drop(one_byte_short);
+
+    let blocker = memory.reserve(blocker_bytes).unwrap();
+    let record = read_replay_head(replica_tail.as_mut(), replica_head, logs.memory(), replica_decode_bound, &running).await.unwrap().unwrap();
+    assert_eq!(memory.used_bytes(), memory.limit_bytes());
+    let decoded = logs.decode_reserved_replica(record.raw, record.decode_reservation).unwrap().unwrap();
+    assert_eq!(decoded.envelope.term, Term(1));
+    assert_eq!(decoded.envelope.term_sequence, Some(TermSequence(0)));
+    assert!(matches!(&decoded.envelope.message, ReplicaBody::ResolvedTx(message) if message.tx_id == Some(0)));
+    assert_eq!(decoded.metadata.timestamp, Timestamp(12));
+    assert_eq!(memory.used_bytes(), blocker_bytes + replica_decode_bytes);
+    drop(decoded);
+    drop(blocker);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replica_tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap(), None);
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(read_replay_head(source_tail.as_mut(), source_head, &memory, source_decode_bound, &cancelled).await.unwrap().is_none());
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(source_tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap(), Some(source_head));
+    let record = read_replay_head(source_tail.as_mut(), source_head, &memory, source_decode_bound, &running).await.unwrap().unwrap();
+    assert_eq!(record.raw.metadata, source_metadata);
+    assert_eq!(memory.used_bytes(), memory.limit_bytes());
+    let message = SourceMessage::decode(&record.raw.payload).unwrap().unwrap();
+    drop(record.raw);
+    assert!(matches!(message, SourceMessage::LegacyTransaction(bytes) if bytes.len() == source_payload_len));
+    assert_eq!(memory.used_bytes(), source_decode_bytes);
+    drop(record.decode_reservation);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(source_tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap(), None);
+
+    let legacy = ReadOnlyLocalLog::open(directory.path().join("REPLICA_LOG"), ReadOnlyLocalLogOptions::default()).unwrap();
+    let (_, result) = start_poll(legacy.tail(LogOffset(-1)).await.unwrap(), Duration::ZERO).await;
+    let TailPoll::Legacy(batch) = result.unwrap() else { panic!("expected legacy batch delivery"); };
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].metadata, replica_metadata);
+    let message = ReplicaEnvelope::decode(&batch[0].payload).unwrap().unwrap();
+    assert_eq!(message.term_sequence, Some(TermSequence(0)));
+
+    writers.cancel();
+    source_writer.await.unwrap().unwrap();
+    replica_writer.await.unwrap().unwrap();
+    source.close_and_wait().await;
+    replica.close_and_wait().await;
+}
+
+#[tokio::test]
+async fn replay_admission_refusal_keeps_the_read_position_and_reports_the_budget_error() {
+    let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
+    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }));
+    fixture.replica.enqueue(opening.payload.clone(), opening.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    fixture.driver.consume(opening).await.unwrap();
+    let read_position = fixture.handle.status().replica_position;
+    assert_eq!(fixture.handle.status().highest_term, Term(1));
+    let next = raw(1, 1, 1, resolved(0, 0));
+    let needed = 256 + replica_decode_bound(next.payload.len()).unwrap();
+    let next_metadata = fixture.replica.enqueue(next.payload, next.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    let blocker = fixture.memory.reserve(fixture.memory.limit_bytes() - fixture.memory.used_bytes() - needed + 1).unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), fixture.driver.run()).await.unwrap().unwrap_err();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(fixture.handle.progress().fault(), Some(error));
+    assert_eq!(fixture.handle.status().replica_position, read_position);
+    assert_eq!(fixture.handle.status().highest_term, Term(1));
+    assert_eq!(fixture.replica.latest().unwrap(), next_metadata.offset);
+    drop(blocker);
+    let mut retry = fixture.replica.tail(LogOffset(0)).await.unwrap();
+    assert_eq!(retry.poll(Duration::ZERO).await.unwrap()[0].metadata, next_metadata);
 }
 
 #[tokio::test]

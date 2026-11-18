@@ -44,6 +44,7 @@ impl PartitionLogs {
     }
     pub fn source_floor(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, -1) }
     pub fn replica_floor(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, -1) }
+    pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
     pub fn source_position(&self, metadata: LogMetadata) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, metadata.offset.0) }
     pub fn latest_source_position(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, self.source.latest()?.0) }
     pub fn latest_replica_position(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, self.replica.latest()?.0) }
@@ -102,8 +103,10 @@ impl PartitionLogs {
         Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch })
     }
     pub fn decode_replica(&self, record: LogRecord) -> Result<Option<ReplicaRecord>> {
-        let bound = record.payload.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_overflow)?;
-        let reservation = self.memory.reserve(bound)?;
+        let reservation = self.memory.reserve(replica_decode_bound(record.payload.len())?)?;
+        self.decode_reserved_replica(record, reservation)
+    }
+    pub(crate) fn decode_reserved_replica(&self, record: LogRecord, reservation: Arc<MemoryReservation>) -> Result<Option<ReplicaRecord>> {
         let metadata = ReplicaMetadata { position: ReplicaPosition::from_epoch_offset(self.replica_epoch, record.metadata.offset.0)?, timestamp: record.metadata.timestamp };
         Ok(ReplicaEnvelope::decode(&record.payload)?.map(|envelope| ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation }))
     }
@@ -111,8 +114,7 @@ impl PartitionLogs {
     pub async fn resolve_oversized(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let lease = self.cache.get(&ObjectKey::new(key)?).await?;
-        let bound = lease.as_slice().len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_overflow)?;
-        let reservation = self.memory.reserve(bound)?;
+        let reservation = self.memory.reserve(replica_decode_bound(lease.as_slice().len())?)?;
         let envelope = record.envelope.unwrap_payload(lease.as_slice())?;
         Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation })
     }
@@ -134,5 +136,8 @@ fn encoded_allocation(payload: usize) -> Result<usize> {
 }
 pub(crate) fn replica_encoding_bound(envelope: &ReplicaEnvelope) -> Result<usize> {
     encoded_allocation(envelope.encoded_len())
+}
+pub(crate) fn replica_decode_bound(payload_len: usize) -> Result<usize> {
+    payload_len.checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_overflow)
 }
 fn size_overflow() -> Anomaly { Anomaly::fault("rtdb.replication/payload-size", "Replica payload size overflow") }

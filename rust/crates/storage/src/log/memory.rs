@@ -1,5 +1,5 @@
-use super::{AppendReceipt, AppendTimestampSource, Log, LogMetadata, LogOffset, LogRecord, LogTail, Progress, SuppliedTimestamp, await_tip};
-use crate::{Error, Result};
+use super::{AppendReceipt, AppendTimestampSource, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
+use crate::{Error, Result, object_store::ReadReservation};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -23,6 +23,10 @@ impl Records {
         }
         Ok(self.values.iter().skip((from - self.first) as usize)
             .take_while(move |record| record.metadata.offset.0 < to))
+    }
+
+    fn replay_record(&self, offset: i64) -> Result<&LogRecord> {
+        self.range(offset, i64::MAX)?.next().ok_or(Error::UnavailableLogRange { requested: offset, first_retained: self.first })
     }
 }
 
@@ -150,6 +154,38 @@ impl MemoryTail {
 impl LogTail for MemoryTail {
     async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>> {
         self.poll_with_payload_limit(timeout, DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES).await
+    }
+
+    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { Some(self) }
+}
+
+fn replay_head(record: &LogRecord) -> ReplayHead {
+    ReplayHead { metadata: record.metadata, payload_len: record.payload.len(), allocation_bound: LOG_RECORD_OVERHEAD_BYTES }
+}
+
+#[async_trait]
+impl LogReplayTail for MemoryTail {
+    async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>> {
+        let tip = await_tip(&self.shared.progress, self.after, timeout).await?;
+        if tip <= self.after { return Ok(None); }
+        let records = self.shared.records.lock();
+        self.shared.progress.latest()?;
+        Ok(Some(replay_head(records.replay_record(self.after.0 + 1)?)))
+    }
+
+    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord> {
+        let records = self.shared.records.lock();
+        self.shared.progress.latest()?;
+        let record = records.replay_record(self.after.0 + 1)?;
+        if replay_head(record) != head {
+            return Err(Error::Task("log replay head does not match the next record".into()));
+        }
+        if reservation.length() < head.allocation_bound {
+            return Err(Error::Task("log read reservation is too small".into()));
+        }
+        let record = record.clone().with_read_reservation(reservation);
+        self.after = record.metadata.offset;
+        Ok(record)
     }
 }
 

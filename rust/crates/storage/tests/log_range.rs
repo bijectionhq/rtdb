@@ -1,7 +1,9 @@
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::time::Duration;
 use bytes::Bytes;
-use rtdb_storage::{log::{Log, LogOffset, LocalLog, LocalLogOptions, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}, object_store::ReadReservation};
-use rtdb_types::Timestamp;
+use rtdb_storage::{Error, log::{Log, LogMetadata, LogOffset, LogRecord, LocalLog, LocalLogOptions, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}, object_store::ReadReservation};
+use rtdb_types::{MemoryBudget, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 struct Charge(Arc<AtomicUsize>);
@@ -9,6 +11,175 @@ impl Drop for Charge { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel
 fn reserve(size: usize, live: &Arc<AtomicUsize>) -> ReadReservation {
     live.fetch_add(1, Ordering::AcqRel);
     ReadReservation::new(size, Charge(Arc::clone(live)))
+}
+
+#[tokio::test]
+async fn local_replay_charges_the_actual_frame_and_keeps_a_refused_head_available() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("LOG");
+    let (log, driver) = LocalLog::open(&path, LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 4 }).unwrap();
+    let cancellation = CancellationToken::new();
+    let writer = tokio::spawn(driver.run(cancellation.clone()));
+    let first = log.enqueue(Bytes::from_static(b"first"), Timestamp(5)).await.unwrap().durable().await.unwrap();
+    let second = log.enqueue(Bytes::from_static(b""), Timestamp(9)).await.unwrap().durable().await.unwrap();
+    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+    let replay = tail.replay().unwrap();
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata, first);
+    assert_eq!(head.payload_len, 5);
+    assert_eq!(head.allocation_bound, 261);
+
+    let memory = MemoryBudget::new(261);
+    let undersized = ReadReservation::new(260, memory.reserve(260).unwrap());
+    assert!(matches!(replay.read_head(head, undersized).await, Err(Error::Task(_))));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+
+    let exact = ReadReservation::new(261, memory.reserve(261).unwrap());
+    let record = replay.read_head(head, exact).await.unwrap();
+    assert_eq!(record.metadata, first);
+    let clone = record.payload.clone();
+    drop(record);
+    assert_eq!(clone.as_ref(), b"first");
+    assert_eq!(memory.used_bytes(), 261);
+    drop(clone);
+    assert_eq!(memory.used_bytes(), 0);
+
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata, second);
+    assert_eq!(second.offset, LogOffset(26));
+    assert_eq!(head.allocation_bound, 256);
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let trailer = second.offset.0 as u64 + 13;
+    file.seek(SeekFrom::Start(trailer)).unwrap();
+    file.write_all(&0i64.to_be_bytes()).unwrap();
+    let exact = ReadReservation::new(256, memory.reserve(256).unwrap());
+    assert!(matches!(replay.read_head(head, exact).await, Err(Error::CorruptLog { path: log_path, offset: 26, reason })
+        if log_path == path && reason == "record trailer does not name its start offset"));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+    file.seek(SeekFrom::Start(trailer)).unwrap();
+    file.write_all(&second.offset.0.to_be_bytes()).unwrap();
+    drop(file);
+    let exact = ReadReservation::new(256, memory.reserve(256).unwrap());
+    let record = replay.read_head(head, exact).await.unwrap();
+    assert_eq!(record.metadata, second);
+    assert!(record.payload.is_empty());
+    assert_eq!(memory.used_bytes(), 256);
+    drop(record);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), None);
+
+    let third = log.enqueue(Bytes::from_static(b"third"), Timestamp(10)).await.unwrap().durable().await.unwrap();
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata, third);
+    cancellation.cancel();
+    writer.await.unwrap().unwrap();
+    let exact = ReadReservation::new(261, memory.reserve(261).unwrap());
+    assert!(matches!(replay.read_head(head, exact).await, Err(Error::Closed(_))));
+    assert_eq!(memory.used_bytes(), 0);
+    log.close_and_wait().await;
+}
+
+#[test]
+fn cancelled_local_replay_keeps_its_charge_until_the_worker_releases_the_undelivered_record() {
+    use std::{future::{Future, poll_fn}, task::Poll};
+    use rtdb_types::MemoryReservation;
+    use tokio::sync::oneshot;
+
+    struct ReportRelease {
+        reservation: Option<Arc<MemoryReservation>>,
+        released: Option<oneshot::Sender<()>>,
+    }
+    impl Drop for ReportRelease {
+        fn drop(&mut self) {
+            drop(self.reservation.take());
+            let _ = self.released.take().unwrap().send(());
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
+    runtime.block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let (log, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 4 }).unwrap();
+        let cancellation = CancellationToken::new();
+        let writer = tokio::spawn(driver.run(cancellation.clone()));
+        log.enqueue(Bytes::from_static(b"payload"), Timestamp(5)).await.unwrap().durable().await.unwrap();
+        let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+        let replay = tail.replay().unwrap();
+        let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+        let memory = MemoryBudget::new(head.allocation_bound);
+        let (started, waiting) = oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            paused.recv().unwrap();
+        });
+        waiting.await.unwrap();
+        let (released, release) = oneshot::channel();
+        let reservation = ReportRelease { reservation: Some(memory.reserve(head.allocation_bound).unwrap()), released: Some(released) };
+        let mut read = Box::pin(replay.read_head(head, ReadReservation::new(head.allocation_bound, reservation)));
+        poll_fn(|context| {
+            assert!(read.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        }).await;
+        drop(read);
+        assert_eq!(memory.used_bytes(), head.allocation_bound);
+        resume.send(()).unwrap();
+        blocker.await.unwrap();
+        release.await.unwrap();
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+
+        let charge = ReadReservation::new(head.allocation_bound, memory.reserve(head.allocation_bound).unwrap());
+        let record = replay.read_head(head, charge).await.unwrap();
+        assert_eq!(record.payload.as_ref(), b"payload");
+        drop(record);
+        assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), None);
+        cancellation.cancel();
+        writer.await.unwrap().unwrap();
+        log.close_and_wait().await;
+    });
+}
+
+#[tokio::test]
+async fn memory_replay_alias_keeps_the_append_and_delivery_charges_through_truncation() {
+    let log = MemoryLog::new(1 << 20);
+    let memory = MemoryBudget::new(1024);
+    let append_bound = 256 + 7;
+    let append_reservation = ReadReservation::new(append_bound, memory.reserve(append_bound).unwrap());
+    let payload = LogRecord { metadata: LogMetadata { offset: LogOffset(-1), timestamp: Timestamp(0) }, payload: Bytes::from_static(b"payload") }
+        .retain(append_reservation).unwrap().payload;
+    let first = log.enqueue(payload, Timestamp(5)).await.unwrap().durable().await.unwrap();
+    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+    let replay = tail.replay().unwrap();
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata, first);
+    assert_eq!(head.payload_len, 7);
+    assert_eq!(head.allocation_bound, 256);
+    assert_eq!(memory.used_bytes(), append_bound);
+
+    let exact = ReadReservation::new(256, memory.reserve(256).unwrap());
+    let record = replay.read_head(head, exact).await.unwrap();
+    assert_eq!(record.metadata, first);
+    let clone = record.payload.clone();
+    drop(record);
+    log.truncate_before(LogOffset(1)).unwrap();
+    assert_eq!(clone.as_ref(), b"payload");
+    assert_eq!(memory.used_bytes(), append_bound + 256);
+    drop(clone);
+    assert_eq!(memory.used_bytes(), 0);
+
+    let second = log.enqueue(Bytes::from_static(b"second"), Timestamp(6)).await.unwrap().durable().await.unwrap();
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata, second);
+    log.truncate_before(LogOffset(2)).unwrap();
+    let exact = ReadReservation::new(256, memory.reserve(256).unwrap());
+    assert!(matches!(replay.read_head(head, exact).await, Err(Error::UnavailableLogRange { requested: 1, first_retained: 2 })));
+    assert_eq!(memory.used_bytes(), 0);
+    assert!(matches!(replay.poll_head(Duration::ZERO).await, Err(Error::UnavailableLogRange { requested: 1, first_retained: 2 })));
+    log.close();
+    assert!(matches!(replay.poll_head(Duration::ZERO).await, Err(Error::Closed(_))));
 }
 
 #[tokio::test]

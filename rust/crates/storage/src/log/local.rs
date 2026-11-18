@@ -1,5 +1,5 @@
-use super::{AppendReceipt, AppendTimestampSource, Log, LogMetadata, LogOffset, LogRecord, LogTail, Progress, SuppliedTimestamp, await_tip};
-use crate::{Error, IoRegion, Result};
+use super::{AppendReceipt, AppendTimestampSource, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
+use crate::{Error, IoRegion, Result, object_store::ReadReservation};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fs2::FileExt;
@@ -50,6 +50,16 @@ struct RecordHeader {
     payload_size: usize,
 }
 
+impl RecordHeader {
+    fn replay_head(&self) -> ReplayHead {
+        ReplayHead {
+            metadata: self.metadata,
+            payload_len: self.payload_size,
+            allocation_bound: self.payload_size.saturating_add(LOG_RECORD_OVERHEAD_BYTES),
+        }
+    }
+}
+
 fn read_record_header(file: &mut File, path: &Path, maximum: usize) -> Result<RecordHeader> {
     let offset = file.stream_position().map_err(|error| Error::io(path, error))?;
     let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
@@ -78,6 +88,10 @@ fn read_record_trailer(file: &mut File, path: &Path, offset: LogOffset) -> Resul
 
 pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogRecord> {
     let header = read_record_header(file, path, maximum)?;
+    read_record_body(file, path, header)
+}
+
+fn read_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Result<LogRecord> {
     let mut payload = vec![0; header.payload_size];
     file.read_exact(&mut payload).map_err(|error| Error::io(path, error))?;
     read_record_trailer(file, path, header.metadata.offset)?;
@@ -343,6 +357,56 @@ impl LocalTail {
 impl LogTail for LocalTail {
     async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>> {
         self.poll_with_payload_limit(timeout, DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES).await
+    }
+
+    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { Some(self) }
+}
+
+fn open_at(path: &Path, next: u64) -> Result<File> {
+    let mut file = File::open(path).map_err(|error| Error::io(path, error))?;
+    file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
+    Ok(file)
+}
+
+#[async_trait]
+impl LogReplayTail for LocalTail {
+    async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>> {
+        let tip = await_tip(&self.progress, self.after, timeout).await?;
+        if tip <= self.after { return Ok(None); }
+        if self.next > tip.0 as u64 { return Err(corrupt(&self.path, self.next, "durable tip yielded no record")); }
+
+        let (path, maximum, next) = (Arc::clone(&self.path), self.maximum, self.next);
+        self.reads.run(move || {
+            let mut file = open_at(&path, next)?;
+            Ok(Some(read_record_header(&mut file, &path, maximum)?.replay_head()))
+        }).await
+    }
+
+    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord> {
+        let tip = self.progress.latest()?;
+        if head.metadata.offset.0 != self.next as i64 {
+            return Err(Error::Task("log replay head does not match the next position".into()));
+        }
+        if head.metadata.offset > tip {
+            return Err(Error::Task("log replay head exceeds the durable tip".into()));
+        }
+        let (path, maximum, next) = (Arc::clone(&self.path), self.maximum, self.next);
+        let (record, next) = self.reads.run(move || {
+            let mut file = open_at(&path, next)?;
+            let header = read_record_header(&mut file, &path, maximum)?;
+            if header.replay_head() != head {
+                return Err(corrupt(&path, next, "log replay head changed before delivery"));
+            }
+            if reservation.length() < head.allocation_bound {
+                return Err(Error::Task("log read reservation is too small".into()));
+            }
+            let record = read_record_body(&mut file, &path, header)?.retain(reservation)?;
+            let next = file.stream_position().map_err(|error| Error::io(path.as_ref(), error))?;
+            Ok((record, next))
+        }).await?;
+        self.after = record.metadata.offset;
+        self.next = next;
+        Ok(record)
     }
 }
 

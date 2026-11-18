@@ -95,6 +95,11 @@ contract DurableTotalOrder {
         --   Within a term, a record the log lost while later records of that term landed is caught by every reader as a gap in the term's positions, and voids the rest of the term (VoidTermOpenedPastItsStart, VoidTermOnGap).
         --   A loss with nothing later from its own term behind it leaves no gap to catch, and neither does any loss in an unsequenced term.
 
+    @invariant PreparedReadAdvancesOnDelivery
+        -- Preparation identifies the next retained record above the reader's position.
+        -- Delivery advances the reader's position.
+        -- An unavailable delivery reservation is a read error at the current position.
+
     @invariant EmptyReadMeansTheTipWasReached
         -- A read returns empty only when the reader that issued it has reached the log's tip.
         --   This is the observation a claim is made on, and it is the reader's own: it had to ask.

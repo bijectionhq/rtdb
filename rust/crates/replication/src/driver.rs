@@ -5,10 +5,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::{CatalogTrie, PartitionState, TrieCatalog};
-use rtdb_storage::log::{LogRecord, LogTail};
+use rtdb_storage::{log::{LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, Verdict};
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
+use crate::logs::replica_decode_bound;
 use crate::progress::{DriverRestart, stopped, term_ended};
 use crate::state::fail_pending;
 
@@ -154,14 +155,41 @@ impl CompactorReset {
 }
 impl Drop for CompactorReset { fn drop(&mut self) { if let Some(completion) = self.completion.take() { let _ = completion.send(Err(term_ended())); } } }
 
-type Poll = BoxFuture<'static, (Box<dyn LogTail>, Result<Vec<LogRecord>>)>;
+enum TailPoll { Legacy(Vec<LogRecord>), Prepared(Option<ReplayHead>) }
+type Poll = BoxFuture<'static, (Box<dyn LogTail>, Result<TailPoll>)>;
+struct SelectedRecord { raw: LogRecord, decode_reservation: Arc<MemoryReservation> }
 struct ArchivedPayload { bytes: Vec<u8>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl AsRef<[u8]> for ArchivedPayload { fn as_ref(&self) -> &[u8] { &self.bytes } }
 fn start_poll(mut tail: Box<dyn LogTail>, timeout: Duration) -> Poll {
-    Box::pin(async move { let result = tail.poll(timeout).await.map_err(Into::into); (tail, result) })
+    Box::pin(async move {
+        let result = match tail.replay() {
+            Some(replay) => replay.poll_head(timeout).await.map(TailPoll::Prepared),
+            None => tail.poll(timeout).await.map(TailPoll::Legacy),
+        };
+        (tail, result.map_err(Into::into))
+    })
 }
-async fn pending_poll(poll: &mut Option<Poll>) -> (Box<dyn LogTail>, Result<Vec<LogRecord>>) {
+async fn pending_poll(poll: &mut Option<Poll>) -> (Box<dyn LogTail>, Result<TailPoll>) {
     match poll { Some(poll) => poll.await, None => futures::future::pending().await }
+}
+async fn read_replay_head(tail: &mut dyn LogTail, head: ReplayHead, memory: &Arc<MemoryBudget>, decode_bound: fn(usize) -> Result<usize>, cancellation: &CancellationToken) -> Result<Option<SelectedRecord>> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Ok(None),
+        result = async {
+            let replay = tail.replay().ok_or_else(|| invalid("Log tail lost its replay capability"))?;
+            let raw_reservation = memory.reserve(head.allocation_bound)?;
+            let decode_reservation = memory.reserve(decode_bound(head.payload_len)?)?;
+            let raw = replay.read_head(head, ReadReservation::new(head.allocation_bound, raw_reservation)).await?;
+            if raw.metadata != head.metadata || raw.payload.len() != head.payload_len {
+                return Err(invalid("Log tail changed its prepared replay record"));
+            }
+            Ok(SelectedRecord { raw, decode_reservation })
+        } => result.map(Some),
+    }
+}
+fn source_decode_bound(payload_len: usize) -> Result<usize> {
+    payload_len.checked_mul(4).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| invalid("Source decode allocation size overflow"))
 }
 async fn pending_job(job: &mut Option<JoinHandle<Result<()>>>) -> Result<()> {
     match job { Some(job) => job.await.map_err(join_error)?, None => futures::future::pending().await }
@@ -199,7 +227,7 @@ async fn pending_production(production: &mut Option<Production>) -> ProductionRe
 struct LeaderState {
     term: Term, resolver: Option<TxResolver>, resolution: Option<Resolution>, production: Option<Production>, confirmed: bool,
     held: VecDeque<ReplicaRecord>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
-    source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>,
+    source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>, source_head: Option<ReplayHead>,
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
     deferred_commands: VecDeque<Command>,
     compactor_reset: Option<CompactorReset>,
@@ -221,7 +249,7 @@ pub struct ReplicationDriver {
     restart: Option<Arc<DriverRestart>>,
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
-    replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>,
+    replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
     leader: Option<LeaderState>, commands: mpsc::Receiver<Command>, status: watch::Sender<DriverStatus>, flush_timer: FlushTimer,
 }
 impl ReplicationDriver {
@@ -244,7 +272,7 @@ impl ReplicationDriver {
         let flush_timer = FlushTimer::new(now(), persisted_tx, config.flush_timeout)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), leader: None, commands, status, flush_timer }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
         let result = self.run_inner().await;
@@ -272,8 +300,8 @@ impl ReplicationDriver {
         loop {
             if self.cancellation.is_cancelled() { return Ok(()); }
             self.prepare_polls();
-            enum Event { ReplicaBatch(Box<dyn LogTail>, Result<Vec<LogRecord>>), Replica, SourceBatch(Box<dyn LogTail>, Result<Vec<LogRecord>>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>) }
-            let ready_replica = !self.replica_batch.is_empty();
+            enum Event { ReplicaBatch(Box<dyn LogTail>, Result<TailPoll>), Replica, SourceBatch(Box<dyn LogTail>, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>) }
+            let ready_replica = self.replica_head.is_some() || !self.replica_batch.is_empty();
             let accept_commands = self.leader.as_ref().is_none_or(|leader| leader.accepting() || leader.deferred_commands.len() < 128);
             let mut empty_poll = None;
             let mut empty_job = None;
@@ -282,7 +310,8 @@ impl ReplicationDriver {
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
                     let accepting = leader.accepting();
-                    (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, accepting && !leader.source_batch.is_empty(), accepting && !leader.deferred_commands.is_empty())
+                    let ready_source = accepting && (leader.source_head.is_some() || !leader.source_batch.is_empty());
+                    (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, accepting && !leader.deferred_commands.is_empty())
                 }
                 None => (&mut empty_poll, &mut empty_job, &mut empty_resolution, &mut empty_production, false, false),
             };
@@ -302,13 +331,28 @@ impl ReplicationDriver {
             match event {
                 Event::ReplicaBatch(tail, records) => {
                     self.replica_poll = None; self.replica_tail = Some(tail);
-                    let records = records?;
-                    if records.is_empty() { self.start_claim()?; }
-                    else { self.replica_batch.extend(records); }
+                    match records? {
+                        TailPoll::Prepared(Some(head)) => self.replica_head = Some(head),
+                        TailPoll::Legacy(records) if !records.is_empty() => self.replica_batch.extend(records),
+                        TailPoll::Prepared(None) | TailPoll::Legacy(_) => {
+                            if !self.cancellation.is_cancelled() { self.start_claim()?; }
+                        }
+                    }
                 }
-                Event::Replica => if let Some(record) = self.replica_batch.pop_front() { self.consume(record).await?; },
+                Event::Replica => if let Some(head) = self.replica_head {
+                    let tail = self.replica_tail.as_deref_mut().ok_or_else(|| invalid("Prepared replica head has no tail"))?;
+                    let Some(record) = read_replay_head(tail, head, self.logs.memory(), replica_decode_bound, &self.cancellation).await? else { return Ok(()); };
+                    self.replica_head = None;
+                    self.consume_record(record.raw, Some(record.decode_reservation)).await?;
+                } else if let Some(record) = self.replica_batch.pop_front() {
+                    self.consume(record).await?;
+                },
                 Event::SourceBatch(tail, records) => if let Some(leader) = &mut self.leader {
-                    leader.source_poll = None; leader.source_tail = Some(tail); leader.source_batch.extend(records?);
+                    leader.source_poll = None; leader.source_tail = Some(tail);
+                    match records? {
+                        TailPoll::Prepared(head) => leader.source_head = head,
+                        TailPoll::Legacy(records) => leader.source_batch.extend(records),
+                    }
                     self.flush_if_due().await?;
                 },
                 Event::Source => self.resolve_next_source().await?,
@@ -332,7 +376,7 @@ impl ReplicationDriver {
         }
     }
     fn prepare_polls(&mut self) {
-        if self.replica_poll.is_none() && self.replica_batch.is_empty() {
+        if self.replica_poll.is_none() && self.replica_head.is_none() && self.replica_batch.is_empty() {
             if let Some(tail) = self.replica_tail.take() {
                 self.config.election_seed = self.config.election_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let factor = 5 + self.config.election_seed % 6;
@@ -340,7 +384,7 @@ impl ReplicationDriver {
             }
         }
         if let Some(leader) = &mut self.leader {
-            if leader.cycle.accepting() && leader.source_poll.is_none() && leader.source_batch.is_empty() {
+            if leader.cycle.accepting() && leader.source_poll.is_none() && leader.source_head.is_none() && leader.source_batch.is_empty() {
                 if let Some(tail) = leader.source_tail.take() { leader.source_poll = Some(start_poll(tail, self.config.assertion_interval)); }
             }
         }
@@ -386,7 +430,7 @@ impl ReplicationDriver {
         let cycle = if self.pending_block.is_some() { BlockCycle::Cut } else { BlockCycle::Filling { rows: self.partition.value().live().block_row_count() } };
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed: self.pending_block.is_none(), held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail: Some(source_tail), source_poll: None, source_batch: VecDeque::new(), appender, job: Some(tokio::spawn(pump.run())), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
+            pending: VecDeque::new(), source_tail: Some(source_tail), source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(pump.run())), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
         if self.pending_block.is_some() {
             self.produce_pending()?;
         }
@@ -420,9 +464,16 @@ impl ReplicationDriver {
     }
     fn record_block_upload(&self) { self.status.send_modify(|status| status.last_block_upload_epoch_seconds = now().0.div_euclid(1_000_000)); }
     async fn consume(&mut self, raw: LogRecord) -> Result<()> {
+        self.consume_record(raw, None).await
+    }
+    async fn consume_record(&mut self, raw: LogRecord, decode_reservation: Option<Arc<MemoryReservation>>) -> Result<()> {
         let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, raw.metadata.offset.0)?;
         if position <= self.read_position { return Err(invalid("Replica reader did not advance")); }
-        let Some(record) = self.logs.decode_replica(raw)? else { self.read_position = position; return Ok(()); };
+        let decoded = match decode_reservation {
+            Some(reservation) => self.logs.decode_reserved_replica(raw, reservation)?,
+            None => self.logs.decode_replica(raw)?,
+        };
+        let Some(record) = decoded else { self.read_position = position; return Ok(()); };
         let admission = self.fence.admit(record.envelope.term, record.envelope.term_sequence)?;
         let wins = self.claim == Some(position) && admission.opens_term();
         if let Some(claim) = &mut self.claiming {
@@ -662,10 +713,23 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn resolve_next_source(&mut self) -> Result<()> {
-        let Some(raw) = self.leader.as_mut().and_then(|leader| leader.source_batch.pop_front()) else { return Ok(()); };
-        let position = self.logs.source_position(raw.metadata)?;
-        let _decoded_reservation = self.resolve.memory.reserve(raw.payload.len().checked_mul(4).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| invalid("Source decode allocation size overflow"))?)?;
-        let message = SourceMessage::decode(&raw.payload)?;
+        let Some(leader) = &mut self.leader else { return Ok(()); };
+        let (LogRecord { metadata, payload }, decode_reservation) = if let Some(head) = leader.source_head {
+            let tail = leader.source_tail.as_deref_mut().ok_or_else(|| invalid("Prepared source head has no tail"))?;
+            let Some(record) = read_replay_head(tail, head, &self.resolve.memory, source_decode_bound, &self.cancellation).await? else { return Ok(()); };
+            leader.source_head = None;
+            (record.raw, Some(record.decode_reservation))
+        } else {
+            let Some(record) = leader.source_batch.pop_front() else { return Ok(()); };
+            (record, None)
+        };
+        let position = self.logs.source_position(metadata)?;
+        let _decoded_reservation = match decode_reservation {
+            Some(reservation) => reservation,
+            None => self.resolve.memory.reserve(source_decode_bound(payload.len())?)?,
+        };
+        let message = SourceMessage::decode(&payload)?;
+        drop(payload);
         let durable = self.partition.value().snapshot();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         if position <= leader.resolver()?.source_position() { return Err(invalid("Source reader did not advance")); }
@@ -680,14 +744,14 @@ impl ReplicationDriver {
                 leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
                     let _decoded_reservation = _decoded_reservation;
                     let result = match request {
-                        Some(request) => resolver.resolve_source(durable, position, raw.metadata.timestamp, request, &context).await,
+                        Some(request) => resolver.resolve_source(durable, position, metadata.timestamp, request, &context).await,
                         None => async {
                             let digits = position.0.to_string();
                             let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;
                             let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
                             let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
                             context.storage.object_store().put(&key, payload).await?;
-                            resolver.resolve_skipped(durable, position, raw.metadata.timestamp, &context)
+                            resolver.resolve_skipped(durable, position, metadata.timestamp, &context)
                         }.await,
                     };
                     (resolver, result)
@@ -698,13 +762,13 @@ impl ReplicationDriver {
                 if self.config.external_source { return Err(invalid("External-source database received attach operation")); }
                 let operation = DbOp::AttachDatabase(message);
                 let verdict = check_db_op(self.effects.as_ref(), leader.resolver()?, &operation);
-                Some(leader.resolver_mut()?.resolve_db_op(durable, position, raw.metadata.timestamp, operation, verdict, &self.resolve)?)
+                Some(leader.resolver_mut()?.resolve_db_op(durable, position, metadata.timestamp, operation, verdict, &self.resolve)?)
             }
             Some(SourceMessage::Protobuf(SourceBody::DetachDatabase(message))) => {
                 if self.config.external_source { return Err(invalid("External-source database received detach operation")); }
                 let operation = DbOp::DetachDatabase(message);
                 let verdict = check_db_op(self.effects.as_ref(), leader.resolver()?, &operation);
-                Some(leader.resolver_mut()?.resolve_db_op(durable, position, raw.metadata.timestamp, operation, verdict, &self.resolve)?)
+                Some(leader.resolver_mut()?.resolve_db_op(durable, position, metadata.timestamp, operation, verdict, &self.resolve)?)
             }
             Some(SourceMessage::Protobuf(SourceBody::TriesAdded(mut message))) => {
                 message.source_msg_id = Some(position.0);
