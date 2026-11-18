@@ -342,8 +342,17 @@ impl Context<'_> {
 
     pub(crate) fn quantified_subquery(&mut self, needle: &ast::Expr, query: &ast::Query, op: BinaryOp, negate: bool, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
         let needle = self.expr_bound(needle, input, replacements)?;
-        let needle = self.materialize(needle, input)?;
+        let existing = match &needle { Expr::Column { id, .. } => input.relational_schema()?.get(*id).cloned(), _ => None };
+        let needle = match existing { Some(field) => field, None => self.materialize(needle, input)? };
         let (dependent, mut arguments) = self.dependent(query, input)?;
+        if arguments.is_empty() {
+            let [candidate] = dependent.schema().fields() else { return Err(error(format!("Subquery arity error: expected a single column, got {}", dependent.schema().len()))); };
+            let comparison = Expr::binary(op, needle.expression(), candidate.expression());
+            let output = self.hidden_field(LogicalType::Scalar(ScalarType::Bool).maybe())?;
+            let result = output.expression();
+            input.attach(ExpressionAttachment::Mark { dependent, arguments, comparison, output })?;
+            return Ok(if negate { Expr::unary(UnaryOp::Not, result) } else { result });
+        }
         let (needle, capture) = self.parameter_capture(&needle)?;
         arguments.push(capture);
         self.quantified_result(needle, dependent, arguments, op, negate, input)

@@ -181,6 +181,7 @@ Exact failure timing, diagnostic equivalence, and all execution observations rem
 == Subqueries
 
 Scalar subqueries, EXISTS, IN, ANY, SOME and ALL bind through shared subquery scopes.
+An uncorrelated quantified subquery builds its candidate relation once and compares each probe row through a mark join.
 An `ARRAY(query)` expression requires one output column and collects every row in the query's output order.
 The vector aggregate preserves duplicate and null elements and returns an empty list when the query returns no rows.
 Array constructors by query use the same lexical captures as scalar subqueries.

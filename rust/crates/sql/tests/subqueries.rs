@@ -229,8 +229,13 @@ fn subquery_captures_do_not_increase_external_parameter_arity_or_leak_wildcard_c
     let Statement::Query(relation) = prepared.statement else { panic!("expected query") };
     assert_eq!(relation.parameter_count(), 3);
     assert_eq!(relation.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["x", "y"]);
-    fn applies(input: &Relation) -> usize { usize::from(matches!(input.node(), RelationNode::Apply { .. })) + input.children().into_iter().map(|child| applies(child)).sum::<usize>() }
-    assert_eq!(applies(&relation), 2);
+    fn scopes(input: &Relation) -> (usize, usize) {
+        let applies = usize::from(matches!(input.node(), RelationNode::Apply { .. }));
+        let independent_marks = usize::from(matches!(input.node(), RelationNode::Mark { arguments, .. } if arguments.is_empty()));
+        input.children().into_iter().map(|child| scopes(child))
+            .fold((applies, independent_marks), |(applies, marks), (nested_applies, nested_marks)| (applies + nested_applies, marks + nested_marks))
+    }
+    assert_eq!(scopes(&relation), (1, 1));
 }
 
 #[tokio::test]

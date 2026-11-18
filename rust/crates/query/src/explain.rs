@@ -461,6 +461,13 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             if let Some(field) = ordinality { fields.insert("ordinality", text(work.copy_text(&field.name)?)?)?; }
             fields.finish()?
         }
+        RelationNode::Mark { arguments, comparison, .. } if arguments.is_empty() => {
+            let comparison = expression(comparison)?;
+            map(work, [
+                ("condition", text(work.copy_text("[]")?)?),
+                ("mark", text(work.pieces(&[RenderPiece::Text("(and "), RenderPiece::Text(comparison.as_str()), RenderPiece::Text(")")])?)?),
+            ])?
+        }
         RelationNode::Mark { arguments: values, comparison, output, .. } => {
             let arguments = arguments(values, &input_columns, work)?;
             let comparison = expression(comparison)?;

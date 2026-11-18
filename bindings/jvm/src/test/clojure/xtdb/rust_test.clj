@@ -154,6 +154,20 @@
 
 (deftest-original-api original-node/test-array-element-reference-is-one-based-336)
 
+(deftest-original-api original-node/test-explain-plan-shows-a-mark-joins-mark)
+
+(deftest independent-quantified-subqueries-retain-unknown-and-empty-set-semantics
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (is (= [{:n 1, :matched true, :outside true}
+            {:n 2, :outside true}
+            {:outside true}]
+           (xt/q node "SELECT n,
+                             n IN (SELECT v FROM (VALUES (CAST(1 AS DOUBLE PRECISION)), (NULL)) c(v)) AS matched,
+                             n NOT IN (SELECT 1 WHERE FALSE) AS outside
+                       FROM (VALUES (1), (2), (NULL)) x(n)
+                       ORDER BY n NULLS LAST")))))
+
 (deftest-original-api original-node/test-nulling-valid-time-columns-2504)
 
 (deftest-original-api original-node/test-indexer-cleans-up-aborted-transactions-2489)
