@@ -1984,3 +1984,161 @@ fn source_pointer_equality_checks_both_spans_before_length_and_byte_results() {
     drop((blocker, left, equal, longer, out_of_bounds, empty));
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn source_pointer_hash_uses_little_endian_lanes_and_a_signed_byte_tail() {
+    let memory = memory();
+    let bytes = [
+        0xff, 0x80, 0x02, 0xfe, 0x44, 0x00, 0x00, 0x80,
+        0xff, 0x7f, 0x01, 0xff, 0x02, 0x11, 0x80, 0x00,
+        0x80, 0xff, 0x01, 0x41, 0x80, 0xff, 0x7f,
+    ];
+    for (width, expected) in [
+        (1usize, -1), (3, -6_103), (4, -33_390_337), (7, 896_467_655),
+        (8, 2_114_093_243), (12, 895_359_750), (15, 2_097_741_525),
+        (16, 903_744_004), (23, 1_287_533_342),
+    ] {
+        let mut output = writer(SourceScalarDeclaration::FixedBinary(i32::try_from(width).unwrap()), false, &memory);
+        output.write_bytes(&bytes[..width]).unwrap();
+        let captured = output.finish().unwrap();
+        let blocker = block(&memory, 0);
+        let used = memory.used_bytes();
+        let peak = memory.peak_bytes();
+        let mut pointer = SourceScalarReader::new(&captured).unwrap().unwrap()
+            .slice(i32::MIN, 0).get_pointer(i32::MIN);
+        assert_eq!(pointer.cached_hash, None);
+        assert_eq!(pointer.hash_code().unwrap(), expected);
+        assert_eq!(pointer.cached_hash, Some(expected));
+        assert_eq!(pointer.hash_code().unwrap(), expected);
+        assert_eq!(memory.used_bytes(), used);
+        assert_eq!(memory.peak_bytes(), peak);
+        drop((blocker, captured));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn source_pointer_hash_retarget_clears_zero_and_nonzero_cached_results() {
+    let memory = memory();
+    let mut int = ScalarWriter::source_int_arrow19_default("seed", false, 1, Arc::clone(&memory)).unwrap();
+    int.set_int(0, i32::MIN).unwrap();
+    {
+        let blocker = block(&memory, 0);
+        let used = memory.used_bytes();
+        let peak = memory.peak_bytes();
+        let mut pointer = int.source_int_pointer(0).unwrap().unwrap();
+        assert_eq!(pointer.cached_hash, None);
+        assert_eq!(pointer.hash_code().unwrap(), i32::MIN);
+        assert_eq!(pointer.cached_hash, Some(i32::MIN));
+        assert_eq!(memory.used_bytes(), used);
+        assert_eq!(memory.peak_bytes(), peak);
+        drop(blocker);
+    }
+
+    let captured = int.finish().unwrap();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(1), false, &memory);
+    output.write_bytes(&[0x00]).unwrap();
+    output.write_bytes(&[0xff]).unwrap();
+    let empty = writer(SourceScalarDeclaration::FixedBinary(0), false, &memory);
+    let blocker = block(&memory, 0);
+    let used = memory.used_bytes();
+    let peak = memory.peak_bytes();
+
+    let mut pointer = SourceBytePointer::from_int_arrow19_default(&captured, 0).unwrap().unwrap();
+    let address = std::ptr::from_ref(&pointer);
+    let int_bytes = pointer.demand_native().unwrap();
+    assert_eq!(pointer.cached_hash, None);
+    assert_eq!(pointer.hash_code().unwrap(), i32::MIN);
+    let reader = output.source_reader().unwrap().unwrap();
+    let zero = reader.get_pointer_into(0, &mut pointer);
+    assert_eq!(std::ptr::from_ref(zero), address);
+    assert_eq!(zero.cached_hash, None);
+    assert_eq!(zero.hash_code().unwrap(), 0);
+    assert_eq!(zero.cached_hash, Some(0));
+    assert_eq!(zero.hash_code().unwrap(), 0);
+
+    let distinct = reader.get_pointer(0);
+    assert!(zero.equals(&distinct).unwrap());
+    assert_eq!(zero.compare_to(&distinct).unwrap(), Ordering::Equal);
+    assert_eq!(zero.cached_hash, Some(0));
+    assert_eq!(distinct.cached_hash, None);
+
+    let same_facts = reader.get_pointer_into(0, &mut pointer);
+    assert_eq!(std::ptr::from_ref(same_facts), address);
+    assert_eq!(same_facts.cached_hash, None);
+    assert_eq!(same_facts.hash_code().unwrap(), 0);
+    let wrapped = reader.slice(i32::MIN, 0).get_pointer_into(i32::MIN + 1, &mut pointer);
+    assert_eq!(std::ptr::from_ref(wrapped), address);
+    assert_eq!((wrapped.offset(), wrapped.length()), (1, 1));
+    assert_eq!(wrapped.cached_hash, None);
+    assert_eq!(wrapped.hash_code().unwrap(), -1);
+
+    let empty_pointer = empty.source_reader().unwrap().unwrap().get_pointer_into(i32::MAX, &mut pointer);
+    assert_eq!(std::ptr::from_ref(empty_pointer), address);
+    assert_eq!((empty_pointer.offset(), empty_pointer.length()), (0, 0));
+    assert_eq!(empty_pointer.cached_hash, None);
+    assert_eq!(empty_pointer.hash_code().unwrap(), 0);
+    assert_eq!(empty_pointer.cached_hash, Some(0));
+    assert_eq!(int_bytes, &i32::MIN.to_le_bytes());
+    assert_eq!(memory.used_bytes(), used);
+    assert_eq!(memory.peak_bytes(), peak);
+    drop((blocker, captured, output, empty));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn source_pointer_hash_checks_signed_span_before_reading_or_caching() {
+    let memory = memory();
+    let signed = writer(SourceScalarDeclaration::FixedBinary(-1), false, &memory);
+    let width = i32::MAX - 7;
+    let wide = writer(SourceScalarDeclaration::FixedBinary(width), false, &memory);
+    let mut valid = writer(SourceScalarDeclaration::FixedBinary(1), false, &memory);
+    valid.write_bytes(&[0x80]).unwrap();
+    let blocker = block(&memory, 0);
+    let used = memory.used_bytes();
+    let peak = memory.peak_bytes();
+    let reader = valid.source_reader().unwrap().unwrap();
+    let mut pointer = reader.get_pointer(0);
+    let address = std::ptr::from_ref(&pointer);
+    assert_eq!(pointer.hash_code().unwrap(), -128);
+
+    let negative = signed.source_reader().unwrap().unwrap().slice(i32::MAX, 0)
+        .get_pointer_into(1, &mut pointer);
+    assert_eq!(std::ptr::from_ref(negative), address);
+    assert_eq!((negative.offset(), negative.length()), (i64::from(i32::MIN), -1));
+    for _ in 0..2 {
+        read_reference(negative.hash_code(), SourceScalarReadFailure::PointerHashNegativeLength { length: -1 });
+        assert_eq!(negative.cached_hash, None);
+    }
+
+    let oversized = wide.source_reader().unwrap().unwrap().get_pointer_into(0, &mut pointer);
+    assert_eq!(std::ptr::from_ref(oversized), address);
+    assert_eq!(oversized.backing.len(), 0);
+    for _ in 0..2 {
+        read_reference(oversized.hash_code(), SourceScalarReadFailure::PointerHashBounds {
+            offset: 0, length: i64::from(width), capacity: 0,
+        });
+        assert_eq!(oversized.cached_hash, None);
+    }
+
+    let recovered = reader.get_pointer_into(0, &mut pointer);
+    assert_eq!(std::ptr::from_ref(recovered), address);
+    assert_eq!(recovered.hash_code().unwrap(), -128);
+    assert_eq!(recovered.cached_hash, Some(-128));
+    assert_eq!(memory.used_bytes(), used);
+    assert_eq!(memory.peak_bytes(), peak);
+    drop((blocker, signed, wide, valid));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn source_pointer_hash_cursor_refuses_the_first_wrapped_eight_byte_guard() {
+    let last_aligned = i32::MAX as usize - 7;
+    admit_simple_hasher_cursor(last_aligned - 1).unwrap();
+    for length in [last_aligned, i32::MAX as usize] {
+        let Err(SourceScalarReadError::Native(error)) = admit_simple_hasher_cursor(length) else {
+            panic!("expected native cursor refusal");
+        };
+        assert_eq!(error.code, "rtdb/pointer-hash-cursor-overflow");
+    }
+}

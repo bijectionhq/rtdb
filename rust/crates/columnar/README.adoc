@@ -302,7 +302,7 @@ Time getBytes retains its source unsupported-method failure; raw Time primitive,
 `SourceScalarReadError::Reference` preserves unsupported methods, negative view lengths and the first or second UUID long-read underflow producer.
 `demand_native()` separately checks the complete retained span and returns native `rtdb/unretained-byte-view` admission before borrowing payload bytes.
 Facts and admitted slices borrow the actual writer/vector region and may outlive intermediate reader/view variables while that owner borrow remains live.
-Raw addresses, mutable backing aliases, relative ByteBuffer cursors and hash operations remain outside this surface.
+Raw addresses, mutable backing aliases and relative ByteBuffer cursors remain outside this surface.
 Existing checked Cell and ScalarReader logical row gates remain separate, using actual native widths at their native byte-admission boundary.
 The checked UUID `Value` adapter requires exactly 16 bytes.
 
@@ -331,6 +331,12 @@ If the shorter span is a prefix of the longer span, it sorts first.
 `equals` follows Arrow 19 pointer equality for backed pointers under the default hasher and enabled-bounds profile.
 Comparing a pointer object with itself returns true immediately.
 Distinct pointer objects validate the full left and right spans in order before comparing their lengths and bytes.
+
+`SourceBytePointer::hash_code` uses the default `SimpleHasher` for backed pointers under the Arrow 19 little-endian, enabled-bounds profile.
+A dirty pointer rejects negative lengths and validates its full retained span before hashing.
+The hash folds eight-byte lanes, then an optional signed four-byte lane and signed tail bytes, using wrapping 32-bit arithmetic.
+The Java cursor guard wraps at a length of 2,147,483,640 bytes, so admitted spans of that length or longer receive the native `rtdb/pointer-hash-cursor-overflow` error.
+A successful hash, including zero, is cached until the next retarget.
 
 `SourceScalarReader::binary_object0` materializes a FixedBinary or UUID object from its signed byte address.
 The same raw demand applies to null rows and wrapped row offsets.
@@ -369,7 +375,7 @@ A first signed Slice checks its inner class before translating the row, returnin
 These tests are unexecuted source under the Phase 1 gate.
 Existing-inner wrapper adoption and mutable aliases remain required constructor work.
 Custom Java ZoneRulesProvider/rules support remains a mandatory open environment boundary requiring a typed retained rules representation.
-Full Field factories, source primitive/NPE/object/meta/hash and ByteBuffer behavior, remaining indirect-reader semantics, routed writers and promotions, recursive copying, relations, physical transport and production adoption remain required increments.
+Full Field factories, source primitive, NPE, object, metadata, vector hashing and ByteBuffer behavior, remaining indirect-reader semantics, routed writers and promotions, recursive copying, relations, physical transport and production adoption remain required increments.
 
 
 == Source Null and Int initial counts
@@ -419,7 +425,7 @@ All tests remain unexecuted source under the Phase 1 gate.
 Caller custom rounding policies, default page/order overrides, allocator backends, listeners, liveness and callback cleanup remain mandatory environment work.
 Arrow unsafe-memory-access properties and environment initialization can disable source bounds checking and require their own retained behavior or reviewed compatible migration.
 This named default profile does not admit those environments.
-Existing-inner adoption, full Field factories, raw getter/object/hash behavior, custom Java ZoneRulesProvider/rules, independent signed Slice semantics, routed writers and recursive copies, relations, physical transport and production adoption remain required increments.
+Existing-inner adoption, full Field factories, raw getters, object reads and vector hashing, custom Java ZoneRulesProvider/rules, independent signed Slice semantics, routed writers and recursive copies, relations, physical transport and production adoption remain required increments.
 
 == Childless Time factory dispatch
 
@@ -444,4 +450,4 @@ Existing checked primitive and object reader boundaries remain separate.
 These tests remain unexecuted source under the Phase 1 gate.
 Full Field recursion still requires eager child construction and cleanup before parent dispatch, including unused scalar children, null entries and names, duplicate children and Java UTF16 names outside Rust String.
 Other visitor cases, extension type identity and inner adoption, changing type-getter callbacks, custom ZoneRulesProvider/rules and allocator/bounds/listener/liveness environments remain mandatory work.
-Raw Time primitive/NPE/object/metadata/hash and ByteBuffer behavior, mutable aliases, independent signed Slice semantics, routed promotion and copying, Relations, transport and production adoption remain required increments.
+Raw Time primitive, NPE, object, metadata, vector hashing and ByteBuffer behavior, mutable aliases, independent signed Slice semantics, routed promotion and copying, Relations, transport and production adoption remain required increments.

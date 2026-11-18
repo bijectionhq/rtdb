@@ -12,6 +12,8 @@ pub(crate) enum SourceScalarReadFailure {
     LongLongReceiverClass { declaration: SourceScalarDeclaration },
     PointerComparisonNegativeLength { operand: PointerComparisonOperand, length: i64 },
     PointerComparisonBounds { operand: PointerComparisonOperand, offset: i64, length: i64, capacity: usize },
+    PointerHashNegativeLength { length: i64 },
+    PointerHashBounds { offset: i64, length: i64, capacity: usize },
     NegativeViewLength(i64),
     UuidFirstLongUnderflow,
     UuidSecondLongUnderflow,
@@ -55,7 +57,7 @@ impl<'a> SourceScalarReader<'a> {
     }
     pub(crate) fn get_pointer(&self, row: i32) -> SourceBytePointer<'a> {
         let width = self.declaration.fixed_width();
-        SourceBytePointer { backing: self.backing, offset: i64::from(row.wrapping_mul(width)), length: i64::from(width) }
+        SourceBytePointer { backing: self.backing, offset: i64::from(row.wrapping_mul(width)), length: i64::from(width), cached_hash: None }
     }
     pub(crate) fn get_pointer_into<'slot, 'region>(
         &self, row: i32, reuse: &'slot mut SourceBytePointer<'region>,
@@ -174,7 +176,12 @@ impl<'a> SourceScalarSlice<'a> {
     }
 }
 
-pub(crate) struct SourceBytePointer<'a> { backing: &'a [u8], offset: i64, length: i64 }
+pub(crate) struct SourceBytePointer<'a> {
+    backing: &'a [u8],
+    offset: i64,
+    length: i64,
+    cached_hash: Option<i32>,
+}
 impl<'a> SourceBytePointer<'a> {
     pub(crate) fn from_int_arrow19_default(vector: &'a ExecutionVector, row: i32) -> Result<Option<Self>> {
         let (ReaderView::Direct(node), Address::Identity { .. }) = (&vector.view, &vector.address) else { return Ok(None); };
@@ -183,7 +190,7 @@ impl<'a> SourceBytePointer<'a> {
         let native_scalar::NativeScalarData::Fixed(bytes) = &storage.data else { return Err(layout()); };
         Ok(Some(Self::int(bytes.bytes.as_slice(), row)))
     }
-    pub(super) fn int(backing: &'a [u8], row: i32) -> Self { Self { backing, offset: i64::from(row.wrapping_mul(4)), length: 4 } }
+    pub(super) fn int(backing: &'a [u8], row: i32) -> Self { Self { backing, offset: i64::from(row.wrapping_mul(4)), length: 4, cached_hash: None } }
     pub(crate) fn offset(&self) -> i64 { self.offset }
     pub(crate) fn length(&self) -> i64 { self.length }
     pub(crate) fn compare_to(&self, right: &SourceBytePointer<'_>) -> SourceScalarReadResult<Ordering> {
@@ -194,6 +201,21 @@ impl<'a> SourceBytePointer<'a> {
         if std::ptr::eq(self, right) { return Ok(true); }
         let (left, right) = self.comparison_spans(right)?;
         Ok(left == right)
+    }
+    pub(crate) fn hash_code(&mut self) -> SourceScalarReadResult<i32> {
+        if let Some(hash) = self.cached_hash { return Ok(hash); }
+        let length = usize::try_from(self.length)
+            .map_err(|_| SourceScalarReadError::Reference(SourceScalarReadFailure::PointerHashNegativeLength {
+                length: self.length,
+            }))?;
+        let bytes = retained_span(self.backing, self.offset, length)
+            .ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::PointerHashBounds {
+                offset: self.offset, length: self.length, capacity: self.backing.len(),
+            }))?;
+        admit_simple_hasher_cursor(length)?;
+        let hash = simple_hash(bytes);
+        self.cached_hash = Some(hash);
+        Ok(hash)
     }
     fn comparison_spans<'right>(
         &self, right: &SourceBytePointer<'right>,
@@ -216,6 +238,33 @@ impl<'a> SourceBytePointer<'a> {
         let length = usize::try_from(self.length).map_err(|_| unretained())?;
         demand(self.backing, self.offset, length)
     }
+}
+
+fn admit_simple_hasher_cursor(length: usize) -> SourceScalarReadResult<()> {
+    // The last positive multiple of eight makes Arrow's signed `index + 8` guard wrap.
+    if length >= i32::MAX as usize - 7 {
+        return Err(SourceScalarReadError::Native(Anomaly::incorrect(
+            "rtdb/pointer-hash-cursor-overflow", "Source pointer hash length exceeds Arrow's signed cursor range",
+        )));
+    }
+    Ok(())
+}
+
+fn simple_hash(bytes: &[u8]) -> i32 {
+    let (lanes, tail) = bytes.as_chunks::<8>();
+    let mut hash = 0i32;
+    for lane in lanes {
+        let word = u64::from_le_bytes(*lane);
+        hash = hash.wrapping_mul(37).wrapping_add((word ^ (word >> 32)) as i32);
+    }
+    let tail = if let Some((lane, tail)) = tail.split_first_chunk::<4>() {
+        hash = hash.wrapping_mul(37).wrapping_add(i32::from_le_bytes(*lane));
+        tail
+    } else { tail };
+    for &byte in tail {
+        hash = hash.wrapping_mul(37).wrapping_add(i32::from(byte as i8));
+    }
+    hash
 }
 
 pub(crate) struct SourceByteView<'a> { backing: &'a [u8], offset: i64, length: usize }
