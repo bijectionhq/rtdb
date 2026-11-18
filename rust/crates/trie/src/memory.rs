@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::convert::Infallible;
 use std::sync::{Arc, OnceLock};
 
 use rtdb_columnar::IidView;
@@ -70,10 +71,17 @@ pub enum TrieNode {
 
 impl TrieNode {
     pub fn path(&self) -> &Path { match self { Self::Branch { path, .. } => path, Self::Leaf(leaf) => leaf.path() } }
-    fn leaves<'a>(&'a self, leaves: &mut Vec<&'a Leaf>) {
+    fn try_visit_leaves<'a, E>(
+        &'a self, visit: &mut impl FnMut(&'a Leaf) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         match self {
-            Self::Leaf(leaf) => leaves.push(leaf),
-            Self::Branch { children, .. } => for child in children.iter().flatten() { child.leaves(leaves); },
+            Self::Leaf(leaf) => visit(leaf),
+            Self::Branch { children, .. } => {
+                for child in children.iter().flatten() {
+                    child.try_visit_leaves(visit)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -89,7 +97,23 @@ impl MemoryHashTrie {
     }
     pub fn root(&self) -> &Arc<TrieNode> { &self.root }
     pub fn config(&self) -> TrieConfig { self.config }
-    pub fn leaves(&self) -> Vec<&Leaf> { let mut leaves = Vec::new(); self.root.leaves(&mut leaves); leaves }
+
+    /// Visits borrowed leaves in depth-first bucket order and stops at the first visitor error.
+    /// The visitor also receives empty leaf nodes.
+    pub fn try_visit_leaves<'a, E>(
+        &'a self, mut visit: impl FnMut(&'a Leaf) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.root.try_visit_leaves(&mut visit)
+    }
+
+    pub fn leaves(&self) -> Vec<&Leaf> {
+        let mut leaves = Vec::new();
+        self.try_visit_leaves::<Infallible>(|leaf| {
+            leaves.push(leaf);
+            Ok(())
+        }).unwrap();
+        leaves
+    }
 
     pub fn add<R: IidReader + ?Sized>(&self, reader: &R, row: u32) -> Result<Self> { self.add_all(reader, &[row]) }
 

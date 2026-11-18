@@ -75,7 +75,8 @@ impl Snapshot {
         names
     }
 
-    fn iter_segments<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a Arc<LiveTable>> {
+    /// Borrows segments from newest overlay to oldest, followed by the applied segment unless L0 already covers it.
+    pub fn iter_segments<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a Arc<LiveTable>> {
         let overlays = self.layered.get(table).into_iter().flat_map(|layers| layers.iter().rev());
         let applied = self.durable.tables().get(table)
             .filter(|segment| segment.block_index() > self.trie_catalog.l0_max_block_index(table));

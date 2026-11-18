@@ -229,16 +229,18 @@ impl PartitionScan {
         }
         let slug = self.snapshot.table_entry(table).map(|entry| entry.slug.clone());
         let mut pages = PageDescriptors::default();
-        let live = self.snapshot.segments(table);
-        for (priority, segment) in live.iter().enumerate() {
-            for leaf in segment.trie().leaves() {
+        let mut live_segment_count = 0;
+        for segment in self.snapshot.iter_segments(table) {
+            let priority = live_segment_count;
+            live_segment_count += 1;
+            segment.trie().try_visit_leaves(|leaf| {
                 let (lower, upper) = path_range(leaf.path().as_slice())?;
-                if !self.path_matches(lower, upper) { continue; }
+                if !self.path_matches(lower, upper) { return Ok(()); }
                 let rows = leaf.sorted_rows(segment.as_ref())?;
                 let temporal = summarize_rows(rows.iter().map(|row| segment.row(*row)))?;
                 pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true,
-                    summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?;
-            }
+                    summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)
+            })?;
         }
         let live_count = pages.entries.len();
         if live_count != 0 {
@@ -325,7 +327,7 @@ impl PartitionScan {
                     MetadataNode::RecencyBranch(children) => for (upper, node) in children.iter().rev() {
                         pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
                     },
-                    MetadataNode::Leaf { data_page_index, columns } => pages.push(Page { lower, upper, priority: live.len() + index,
+                    MetadataNode::Leaf { data_page_index, columns } => pages.push(Page { lower, upper, priority: live_segment_count + index,
                         content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
                             && may_satisfy_not_null(&self.scan, columns),
                         source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
@@ -566,7 +568,8 @@ fn page_temporal(columns: &[Value]) -> Option<TemporalSummary> {
 mod tests {
     use super::*;
     use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::OuterRows, parameters::BoundParameters};
-    use rtdb_format::{data::{StoredEvent, StoredOperation, build_event_batch}, ipc::write_file, keys::TrieKey, metadata::MetadataBuilder};
+    use rtdb_format::{block::proto as pb, catalog::BlockCatalog, data::{StoredEvent, StoredOperation, build_event_batch},
+        ipc::write_file, keys::{TrieKey, block_key}, metadata::MetadataBuilder};
     use rtdb_index::{PartitionState, TransactionBuffer};
     use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable};
     use rtdb_storage::{MemoryStore, ObjectStore};
@@ -778,8 +781,7 @@ mod tests {
         assert_descriptor_lifetime(snapshot, table, Arc::new(MemoryStore::default()), None).await;
     }
 
-    #[tokio::test]
-    async fn persisted_page_descriptors_admit_growth_before_opening_the_data_file() {
+    async fn persisted_page_fixture() -> (PartitionState, TableRef, Vec<StoredEvent>, Arc<MemoryStore>, (usize, usize)) {
         let (state, table, events) = live_table();
         let captured = state.value();
         let table_entry = captured.table_catalog().entry(&table).unwrap();
@@ -810,12 +812,78 @@ mod tests {
         store.put(&ObjectKey::new(table_entry.slug.metadata_key(&trie)).unwrap(), meta.into()).await.unwrap();
         store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
+        (state, table, events, store, (metadata_size, metadata_charge))
+    }
+
+    #[tokio::test]
+    async fn persisted_page_descriptors_admit_growth_before_opening_the_data_file() {
+        let (state, table, _, store, metadata) = persisted_page_fixture().await;
         let snapshot = state.value().snapshot();
         assert_eq!(snapshot.trie_catalog().iter_tries(&table).count(), 2);
         assert_eq!(snapshot.trie_entries(&table).len(), 1);
         assert!(snapshot.segments(&table).is_empty());
-        assert_descriptor_lifetime(snapshot.clone(), table.clone(), Arc::clone(&store), Some((metadata_size, metadata_charge))).await;
+        assert_descriptor_lifetime(snapshot.clone(), table.clone(), Arc::clone(&store), Some(metadata)).await;
         assert_combined_summary_replacement(snapshot, table, store).await;
+    }
+
+    #[tokio::test]
+    async fn live_segment_priority_counts_pruned_segments_before_persisted_pages() {
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let prepared = state.prepare_block().unwrap();
+        let catalog = prepared.table_catalog().unwrap();
+        let basis = prepared.value().live().latest_completed_tx().unwrap();
+        let block = BlockCatalog::from_proto(pb::Block {
+            block_index: Some(prepared.block_index().0),
+            latest_completed_tx: Some(pb::TxKey { tx_id: Some(basis.tx_id.0), system_time: Some(basis.system_time.0) }),
+            tables: catalog.entries().map(|entry| entry.to_proto()).collect(),
+            ..pb::Block::default()
+        }).unwrap();
+        let additions = BTreeMap::new();
+        for (table, table_block) in prepared.table_blocks(&additions, Timestamp(200)).unwrap() {
+            let key = catalog.entry(&table).unwrap().slug.block_key(prepared.block_index()).unwrap();
+            store.put(&ObjectKey::new(key).unwrap(), table_block.encode().into()).await.unwrap();
+        }
+        let key = block_key(prepared.block_index()).unwrap();
+        store.put(&ObjectKey::new(key).unwrap(), block.encode().into()).await.unwrap();
+        state.adopt_block(prepared, block, &additions, Timestamp(200)).unwrap();
+
+        let memory = MemoryBudget::new(1 << 20);
+        let key = TransactionKey { tx_id: TxId(1), system_time: basis.system_time };
+        let mut applied = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+        for event in [&events[0], &events[2]] { applied.append(table.clone(), event.clone()).unwrap(); }
+        state.apply(&applied.stage().unwrap()).unwrap();
+
+        let put_overlay = |snapshot, tx_id, value| {
+            let key = TransactionKey { tx_id: TxId(tx_id), system_time: basis.system_time };
+            let mut write = TransactionBuffer::new(snapshot, key, Arc::clone(&memory)).unwrap();
+            let mut event = events[1].clone();
+            event.operation = StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(2)), ("v".into(), Value::I64(value))]));
+            write.append(table.clone(), event).unwrap();
+            write.snapshot().unwrap()
+        };
+        let older = put_overlay(state.value().snapshot(), 2, 4);
+        let mixed = put_overlay(older, 3, 5);
+        let segments = mixed.segments(&table);
+        assert_eq!(segments.len(), 3);
+        let paths: Vec<_> = segments[2].trie().leaves().into_iter().map(|leaf| leaf.path().as_slice()).collect();
+        assert_eq!(paths.as_slice(), &[&[0u8][..], &[2u8][..]]);
+
+        let (mut scan, execution, _) = descriptor_scan(mixed, table, Arc::new(BufferPool::new(store, 1 << 20)));
+        scan.iids = Some([events[1].iid].into_iter().collect());
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let partition = cursor.partitions.front_mut().unwrap();
+        partition.initialize().await.unwrap();
+        let pages = &partition.pages.entries;
+        assert_eq!(pages.iter().map(|page| page.priority).collect::<Vec<_>>(), [0, 1, 3]);
+        assert!(matches!(&pages[0].source, PageSource::Live { .. }));
+        assert!(matches!(&pages[1].source, PageSource::Live { .. }));
+        assert!(matches!(&pages[2].source, PageSource::File { file: 0, page: 1 }));
+
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_page().await.unwrap() {
+            rows.extend(page.rows().iter().map(|row| row.values[0].clone()));
+        }
+        assert_eq!(rows, [Value::I64(5)]);
     }
 
     async fn assert_combined_summary_replacement(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>) {

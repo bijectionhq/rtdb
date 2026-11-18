@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use rtdb_trie::{Bucketer, ColumnSummary, Comparison, EventMerge, EventRow, MemoryHashTrie, PageSummary, Path, PersistedNode, PersistedTrie, PruningOptions, ScalarBounds, TemporalSummary, TrieConfig, select_pages};
 use rtdb_types::{EventHeader, EventOp, Iid, Interval, TemporalBounds, Timestamp, Value};
 
@@ -56,6 +58,32 @@ fn rows_sort_by_iid_then_descending_row_index() {
     let iids = vec![iid(2), iid(1), iid(2), iid(1), iid(3)];
     let trie = MemoryHashTrie::default().add_range(&iids, 0, 5).unwrap();
     assert_eq!(trie.sorted_rows(&iids).unwrap(), vec![3, 1, 2, 0, 4]);
+}
+
+#[test]
+fn borrowed_leaves_follow_depth_first_bucket_order_and_stop_on_error() {
+    let iids = vec![iid(0xc000_0000), iid(0x1000_0000), iid(0x4000_0000), iid(0), iid(0x8000_0000)];
+    let trie = MemoryHashTrie::new(TrieConfig::new(1, 1).unwrap()).add_range(&iids, 0, 5).unwrap();
+    let expected: &[&[u8]] = &[&[0, 0], &[0, 1], &[1], &[2], &[3]];
+    let mut visited = Vec::new();
+    trie.try_visit_leaves::<Infallible>(|leaf| {
+        visited.push(leaf);
+        Ok(())
+    }).unwrap();
+    let paths: Vec<_> = visited.iter().map(|leaf| leaf.path().as_slice()).collect();
+    assert_eq!(paths.as_slice(), expected);
+    let collected = trie.leaves();
+    assert_eq!(collected.len(), visited.len());
+    assert!(collected.into_iter().zip(visited).all(|(left, right)| std::ptr::eq(left, right)));
+
+    let mut visited = Vec::new();
+    let result = trie.try_visit_leaves(|leaf| {
+        visited.push(leaf.path().as_slice());
+        if visited.len() == 2 { return Err("stop traversal"); }
+        Ok(())
+    });
+    assert_eq!(result, Err("stop traversal"));
+    assert_eq!(visited.as_slice(), &expected[..2]);
 }
 
 #[test]
