@@ -882,7 +882,7 @@ pub struct Tokenizer<'a> {
     /// If true (the default), the tokenizer will un-escape literal
     /// SQL strings See [`Tokenizer::with_unescape`] for more details.
     unescape: bool,
-    retain_line_comment_text: bool,
+    retain_comment_text: bool,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -907,7 +907,7 @@ impl<'a> Tokenizer<'a> {
             dialect,
             query,
             unescape: true,
-            retain_line_comment_text: true,
+            retain_comment_text: true,
         }
     }
 
@@ -946,11 +946,11 @@ impl<'a> Tokenizer<'a> {
         self
     }
 
-    /// Keep located line-comment tokens with empty prefix and body strings when finding statement boundaries.
-    /// Expanded hint tokens retain their comment text.
+    /// Emit ordinary line and block comments with their original spans and empty text fields.
+    /// Dialect-enabled optimizer hints still expand, preserving text in any comment tokens they emit.
     #[doc(hidden)]
-    pub fn without_line_comment_text(mut self) -> Self {
-        self.retain_line_comment_text = false;
+    pub fn without_comment_text(mut self) -> Self {
+        self.retain_comment_text = false;
         self
     }
 
@@ -2091,11 +2091,11 @@ impl<'a> Tokenizer<'a> {
                 _ => (),
             }
             chars.next();
-            if self.retain_line_comment_text {
+            if self.retain_comment_text {
                 comment.push(ch);
             }
         }
-        let prefix = if self.retain_line_comment_text {
+        let prefix = if self.retain_comment_text {
             prefix.to_owned()
         } else {
             String::new()
@@ -2387,29 +2387,34 @@ impl<'a> Tokenizer<'a> {
         &self,
         chars: &mut State,
     ) -> Result<Option<Token>, TokenizerError> {
-        let mut s = String::new();
+        let retain_text = self.retain_comment_text
+            || (self.dialect.supports_multiline_comment_hints() && chars.peek() == Some(&'!'));
+        let mut comment = String::new();
         let mut nested = 1;
         let supports_nested_comments = self.dialect.supports_nested_comments();
         loop {
             match chars.next() {
                 Some('/') if matches!(chars.peek(), Some('*')) && supports_nested_comments => {
                     chars.next(); // consume the '*'
-                    s.push('/');
-                    s.push('*');
+                    if retain_text {
+                        comment.push_str("/*");
+                    }
                     nested += 1;
                 }
                 Some('*') if matches!(chars.peek(), Some('/')) => {
                     chars.next(); // consume the '/'
                     nested -= 1;
                     if nested == 0 {
-                        break Ok(Some(Token::Whitespace(Whitespace::MultiLineComment(s))));
+                        break Ok(Some(Token::Whitespace(Whitespace::MultiLineComment(
+                            comment,
+                        ))));
                     }
-                    s.push('*');
-                    s.push('/');
+                    if retain_text {
+                        comment.push_str("*/");
+                    }
                 }
-                Some(ch) => {
-                    s.push(ch);
-                }
+                Some(ch) if retain_text => comment.push(ch),
+                Some(_) => (),
                 None => {
                     break self.tokenizer_error(
                         chars.location(),
@@ -4699,7 +4704,7 @@ mod boundary_line_comment_tests {
         for (dialect, source, expected_comments) in cases {
             let full = Tokenizer::new(dialect, source).tokenize_with_location().unwrap();
             let boundary = Tokenizer::new(dialect, source)
-                .without_line_comment_text()
+                .without_comment_text()
                 .tokenize_with_location()
                 .unwrap();
             assert_eq!(boundary.len(), full.len());
@@ -4736,7 +4741,7 @@ mod boundary_line_comment_tests {
         let source = "/*!0 --α\n SELECT 1 */ SELECT 2";
         let full = Tokenizer::new(&dialect, source).tokenize_with_location().unwrap();
         let boundary = Tokenizer::new(&dialect, source)
-            .without_line_comment_text()
+            .without_comment_text()
             .tokenize_with_location()
             .unwrap();
         assert_eq!(boundary, full);
@@ -4760,7 +4765,7 @@ mod boundary_line_comment_tests {
         let prefix = TokenWithSpan::wrap(Token::make_word("table", None));
         let mut tokens = vec![prefix.clone()];
         Tokenizer::new(&dialect, "._column--α")
-            .without_line_comment_text()
+            .without_comment_text()
             .try_tokenize_with_location_into_buf(&mut tokens, |tokens, token| {
                 tokens.push(token);
                 Ok::<(), core::convert::Infallible>(())
@@ -4772,5 +4777,57 @@ mod boundary_line_comment_tests {
         assert_eq!(tokens[2], Token::make_word("_column", None));
         assert!(matches!(&tokens[3].token, Token::Whitespace(Whitespace::SingleLineComment { prefix, comment })
             if prefix.capacity() == 0 && comment.capacity() == 0));
+    }
+}
+
+#[cfg(test)]
+mod boundary_block_comment_tests {
+    use super::{Token, Tokenizer, Whitespace};
+    use crate::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
+
+    #[test]
+    fn boundary_block_comments_keep_locations_and_dialect_nesting_without_text() {
+        let cases: [(&dyn Dialect, &str, &str); 5] = [
+            (&GenericDialect {}, "x/* outer é\r\n/* 😀; */ β */z", " outer é\r\n/* 😀; */ β "),
+            (&GenericDialect {}, "x/**/z", ""),
+            (&GenericDialect {}, "x/* !0 ;*/z", " !0 ;"),
+            (&PostgreSqlDialect {}, "x/*!0 ;*/z", "!0 ;"),
+            (&MySqlDialect {}, "x/* outer /* inner */z", " outer /* inner "),
+        ];
+        for (dialect, source, body) in cases {
+            let full = Tokenizer::new(dialect, source).tokenize_with_location().unwrap();
+            let boundary = Tokenizer::new(dialect, source)
+                .without_comment_text()
+                .tokenize_with_location()
+                .unwrap();
+            assert_eq!((full.len(), boundary.len()), (3, 3));
+            assert_eq!(boundary[0], full[0]);
+            assert_eq!(boundary[2], full[2]);
+            assert_eq!(boundary[1].span, full[1].span);
+            assert_eq!(boundary[1].span.start, full[0].span.end);
+            assert_eq!(boundary[1].span.end, full[2].span.start);
+            assert!(matches!(&full[1].token, Token::Whitespace(Whitespace::MultiLineComment(text))
+                if text == body));
+            assert!(matches!(&boundary[1].token, Token::Whitespace(Whitespace::MultiLineComment(text))
+                if text.capacity() == 0));
+        }
+    }
+
+    #[test]
+    fn boundary_mode_keeps_optimizer_hint_expansion_and_inner_comment_text() {
+        let dialect = GenericDialect {};
+        let source = "x/*!50110 SELECT 1 /* inner ; é */ -- keep β\n */z";
+        let full = Tokenizer::new(&dialect, source).tokenize_with_location().unwrap();
+        let boundary = Tokenizer::new(&dialect, source)
+            .without_comment_text()
+            .tokenize_with_location()
+            .unwrap();
+        assert_eq!(boundary, full);
+        assert!(boundary.iter().any(|token| token.token == Token::make_keyword("SELECT")));
+        assert!(boundary.iter().any(|token| matches!(&token.token,
+            Token::Whitespace(Whitespace::MultiLineComment(text)) if text == " inner ; é ")));
+        assert!(boundary.iter().any(|token| matches!(&token.token,
+            Token::Whitespace(Whitespace::SingleLineComment { prefix, comment })
+                if prefix == "--" && comment == " keep β")));
     }
 }

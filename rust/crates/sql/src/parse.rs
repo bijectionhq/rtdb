@@ -250,7 +250,7 @@ pub(super) fn tokenize_boundaries_into(
     append: impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<()>,
 ) -> Result<()> {
     let dialect = SqlDialect::default();
-    let tokenizer = Tokenizer::new(&dialect, source).without_line_comment_text();
+    let tokenizer = Tokenizer::new(&dialect, source).without_comment_text();
     tokenize_into(source, tokenizer, tokens, append)
 }
 

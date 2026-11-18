@@ -78,7 +78,7 @@ impl SplitTokens {
 fn token_array_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/token-array-size", "SQL token array exceeds addressable memory") }
 
 /// Admits located-token array growth during lexical validation, then admits the returned byte ranges.
-/// Source line comments occupy located slots with empty text fields.
+/// Source line and block comments occupy located slots with empty text fields.
 /// The token array is released before return.
 /// Other tokenizer payloads and scratch need separate admission.
 /// Empty statement groups acquire no span charge.
@@ -432,6 +432,119 @@ mod boundary_line_comment_tests {
         assert_eq!(error.message.as_deref(), Some("Expected an SQL statement between semicolons"));
         assert_eq!(error.context["position"], serde_json::json!(39));
         assert_eq!(error.context["span"], serde_json::json!({"start": 38, "end": 39}));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod boundary_block_comment_tests {
+    use std::alloc::Layout;
+
+    use rtdb_plan::SourceSpan;
+    use rtdb_types::MemoryBudget;
+    use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Whitespace};
+
+    use super::{SplitTokens, split_statements, split_statements_in};
+    use crate::{ExecutableSyntax, parse_statement_batch};
+
+    fn array_charge(capacity: usize) -> usize {
+        Layout::array::<TokenWithSpan>(capacity).unwrap().size() + 256
+    }
+
+    #[test]
+    fn admitted_nested_block_comments_keep_one_located_slot_without_a_body_allocation() {
+        const REPEATS: usize = 32768;
+        let body = format!("{}/* inner; */\r\nβ", "é😀;".repeat(REPEATS));
+        let source = format!("x;/*{body}*/ z");
+        let first = array_charge(4);
+        let next = array_charge(8);
+        let memory = MemoryBudget::new(first + next);
+        let boundary = SplitTokens::tokenize_in(&source, &memory).unwrap();
+        assert_eq!(boundary.values.len(), 5);
+        assert_eq!(memory.used_bytes(), next);
+        assert_eq!(memory.peak_bytes(), first + next);
+
+        let token = &boundary.values[2];
+        assert!(matches!(&token.token, Token::Whitespace(Whitespace::MultiLineComment(text))
+            if text.capacity() == 0));
+        assert_eq!(token.span, Span::new(Location::new(1, 3), Location::new(2, 4)));
+        assert_eq!(crate::parse::source_span(&source, token.span), SourceSpan { start: 2, end: body.len() + 6 });
+        assert_eq!(boundary.values[3], Token::Whitespace(Whitespace::Space));
+        assert_eq!(boundary.values[3].span, Span::new(Location::new(2, 4), Location::new(2, 5)));
+        assert_eq!(boundary.values[4].span, Span::new(Location::new(2, 5), Location::new(2, 6)));
+
+        let full = crate::parse::tokenize(&source).unwrap();
+        assert_eq!((&boundary.values[..2], &boundary.values[3..]), (&full[..2], &full[3..]));
+        assert_eq!(token.span, full[2].span);
+        assert!(matches!(&full[2].token, Token::Whitespace(Whitespace::MultiLineComment(text))
+            if text == &body));
+        drop(boundary);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let memory = MemoryBudget::new(first);
+        assert!(split_statements_in("/**/", &memory).unwrap().is_empty());
+        assert_eq!(memory.peak_bytes(), first);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn nested_block_comment_errors_keep_token_array_and_lexical_precedence() {
+        let capacity = array_charge(4);
+        let source = "x;--😀\r\n/* outer\r\n/* inner */β";
+        let memory = MemoryBudget::new(capacity);
+        let error = split_statements_in(source, &memory).err().expect("unterminated block comment");
+        assert_eq!(error, split_statements(source).unwrap_err());
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert!(error.message.as_deref().unwrap().contains("Unexpected EOF while in a multi-line comment"));
+        assert_eq!(error.context["position"], serde_json::json!(source.len() + 1));
+        assert_eq!(error.context["span"], serde_json::json!({"start": source.len(), "end": source.len()}));
+        assert_eq!(memory.peak_bytes(), capacity);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let prefix = "x;/* é/* inner */\r\n😀 */ ";
+        let source = format!("{prefix}@");
+        let memory = MemoryBudget::new(capacity);
+        let error = split_statements_in(&source, &memory).err().expect("fifth token validation");
+        assert_eq!(error, split_statements(&source).unwrap_err());
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert_eq!(error.context["position"], serde_json::json!(prefix.len() + 1));
+        assert_eq!(error.context["span"], serde_json::json!({"start": prefix.len(), "end": prefix.len() + 1}));
+        assert_eq!(memory.peak_bytes(), capacity);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let source = format!("{prefix}y 'unterminated");
+        let memory = MemoryBudget::new(capacity);
+        let error = split_statements_in(&source, &memory).err().expect("fifth token admission");
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(split_statements(&source).unwrap_err().code, "xtdb/sql-error");
+        assert_eq!(memory.peak_bytes(), capacity);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn admitted_statement_ranges_and_simple_query_syntax_keep_original_block_comment_bytes() {
+        let first = "SELECT 'é' /* outer;\r\n /* 😀; */ β */, 2";
+        let second = "SELECT 3 /*!50110 ; SELECT 99; */ , 4";
+        let source = format!("{first}; {second};");
+        let memory = MemoryBudget::new(1 << 20);
+        let ranges = split_statements_in(&source, &memory).unwrap();
+        let full = split_statements(&source).unwrap();
+        assert_eq!(ranges.as_slice(), full.as_slice());
+        assert_eq!(ranges.as_slice(), [
+            SourceSpan { start: 0, end: first.len() },
+            SourceSpan { start: first.len() + 2, end: source.len() - 1 },
+        ]);
+        drop(ranges);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let mut batch = parse_statement_batch(&source, &memory).unwrap();
+        for text in [first, second] {
+            let statement = batch.next().unwrap();
+            assert!(matches!(&statement.command, ExecutableSyntax::Sql(_)));
+            assert_eq!(statement.command.source(), text);
+        }
+        assert!(batch.next().is_none());
+        drop(batch);
         assert_eq!(memory.used_bytes(), 0);
     }
 }
