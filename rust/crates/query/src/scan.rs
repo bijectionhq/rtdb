@@ -8,7 +8,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_format::{ipc::{ArrowFile, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
-use rtdb_index::{IndexBatch, LiveTable, RowSource, Snapshot};
+use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
@@ -169,8 +169,18 @@ impl PartitionScan {
             return Ok(());
         }
         let table = &self.scan.table.name.table;
-        let mut tries: Vec<_> = self.snapshot.trie_entries(table).into_iter().cloned().collect();
-        tries.sort_by(|left, right| right.key.block_index().cmp(&left.key.block_index()).then_with(|| left.key.cmp(&right.key)));
+        let catalog = self.snapshot.trie_catalog();
+        let current_tries = || catalog.iter_tries(table).filter(|trie| trie.state == TrieState::Live);
+        let trie_count = current_tries().count();
+        let candidate_reservation = if trie_count == 0 { None } else {
+            let bytes = trie_count.checked_mul(std::mem::size_of::<&CatalogTrie>()).and_then(|bytes| bytes.checked_add(256))
+                .ok_or_else(|| invalid("scan-candidate-size", "Scan trie candidate capacity exceeds addressable memory"))?;
+            Some(self.execution.context.memory.reserve(bytes)?)
+        };
+        let mut tries = Vec::new();
+        tries.try_reserve_exact(trie_count).map_err(|error| invalid("scan-candidate-size", error))?;
+        tries.extend(current_tries());
+        tries.sort_unstable_by(|left, right| right.key.block_index().cmp(&left.key.block_index()).then_with(|| left.key.cmp(&right.key)));
         let summaries: Vec<_> = tries.iter().enumerate().map(|(index, trie)| {
             let temporal = trie.metadata.as_ref().and_then(|metadata| metadata.temporal_metadata.as_ref()).map(|metadata| TemporalSummary {
                 min_valid_from: Timestamp(metadata.min_valid_from.unwrap_or(i64::MIN)), max_valid_to: Timestamp(metadata.max_valid_to.unwrap_or(i64::MAX)),
@@ -237,6 +247,8 @@ impl PartitionScan {
                 }
             }
         }
+        drop(tries);
+        drop(candidate_reservation);
         for (index, page) in pages.entries.iter_mut().enumerate() { page.summary.page_index = u32::try_from(index).map_err(|error| invalid("page-count", error))?; }
         self.tasks = Some(ScanTaskPlan::new(pages.entries.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),&self.execution.context.memory)?);
         self.files = files;
@@ -467,7 +479,7 @@ mod tests {
     use super::*;
     use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::OuterRows, parameters::BoundParameters};
     use rtdb_format::{data::{StoredEvent, StoredOperation, build_event_batch}, ipc::write_file, keys::TrieKey, metadata::MetadataBuilder};
-    use rtdb_index::{CatalogTrie, PartitionState, TransactionBuffer};
+    use rtdb_index::{PartitionState, TransactionBuffer};
     use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable};
     use rtdb_storage::{MemoryStore, ObjectStore};
     use rtdb_trie::TrieConfig;
@@ -518,11 +530,30 @@ mod tests {
         let before_cursor = memory.used_bytes();
         let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
         let cursor_open = memory.used_bytes();
+        let candidate_extent = if files_used == 0 { 0 } else { std::mem::size_of::<&CatalogTrie>() + 256 };
         let file_extent = if files_used == 0 { 0 } else { std::mem::size_of::<DataFile>() + 256 };
         if files_used != 0 {
-            let headroom = metadata_charge + file_extent - 1;
+            let pressure = memory.reserve(memory.limit_bytes() - cursor_open - (candidate_extent - 1)).unwrap();
+            let retained = cursor_open + pressure.bytes();
+            let error = cursor.next_page().await.err().unwrap();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            let expected = format!("Cannot reserve {candidate_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
+            assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+            let partition = cursor.partitions.front().unwrap();
+            assert!(!partition.initialized);
+            assert!(partition.files.entries.is_empty());
+            assert!(partition.pages.entries.is_empty());
+            assert!(partition.tasks.is_none());
+            assert!(partition.loaded.is_empty());
+            assert!(partition.output.is_empty());
+            assert_eq!(storage.retained_bytes(), 0);
+            assert_eq!(memory.used_bytes(), retained);
+            drop(pressure);
+            assert_eq!(memory.used_bytes(), cursor_open);
+
+            let headroom = candidate_extent + metadata_charge + file_extent - 1;
             let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
-            let retained = cursor_open + pressure.bytes() + metadata_charge;
+            let retained = cursor_open + pressure.bytes() + candidate_extent + metadata_charge;
             let error = cursor.next_page().await.err().unwrap();
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             let expected = format!("Cannot reserve {file_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
@@ -541,9 +572,9 @@ mod tests {
         }
         let old_extent = 2 * std::mem::size_of::<Page>() + 256;
         let replacement_extent = 4 * std::mem::size_of::<Page>() + 256;
-        let headroom = metadata_charge + file_extent + old_extent + replacement_extent - 1;
+        let headroom = candidate_extent + metadata_charge + file_extent + old_extent + replacement_extent - 1;
         let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
-        let retained_at_growth = cursor_open + pressure.bytes() + metadata_charge + file_extent + old_extent;
+        let retained_at_growth = cursor_open + pressure.bytes() + candidate_extent + metadata_charge + file_extent + old_extent;
         let error = cursor.next_page().await.err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let expected = format!("Cannot reserve {replacement_extent} bytes from budget {} with {retained_at_growth} retained", memory.limit_bytes());
@@ -559,6 +590,16 @@ mod tests {
         assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
         drop((cursor, pressure));
         assert_eq!(memory.used_bytes(), before_cursor);
+
+        if files_used != 0 {
+            let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
+            let partition = cursor.partitions.front_mut().unwrap();
+            partition.initialize().await.unwrap();
+            drop(partition.tasks.take().unwrap());
+            assert_eq!(memory.used_bytes(), cursor_open + file_extent + replacement_extent);
+            drop(cursor);
+            assert_eq!(memory.used_bytes(), before_cursor);
+        }
 
         let mut cursor = ScanCursor::new(scan, execution.clone(), None).await.unwrap();
         assert_eq!(memory.used_bytes(), cursor_open);
@@ -623,10 +664,12 @@ mod tests {
 
         let store = MemoryStore::default();
         let addition = CatalogTrie::notification(trie.clone(), data.len() as i64, Some(statistics)).unwrap();
+        let nascent = CatalogTrie::notification("l01-r20200101-b00".parse().unwrap(), 0, None).unwrap();
         store.put(&ObjectKey::new(table_entry.slug.metadata_key(&trie)).unwrap(), meta.into()).await.unwrap();
         store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
-        state.add_tries(&BTreeMap::from([(table.clone(), vec![addition])]), Timestamp(200)).unwrap();
+        state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
         let snapshot = state.value().snapshot();
+        assert_eq!(snapshot.trie_catalog().iter_tries(&table).count(), 2);
         assert_eq!(snapshot.trie_entries(&table).len(), 1);
         assert!(snapshot.segments(&table).is_empty());
         assert_descriptor_lifetime(snapshot, table, store, Some((metadata_size, metadata_charge))).await;
