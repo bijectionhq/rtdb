@@ -130,6 +130,7 @@ impl Context<'_> {
                 self.admit_table_temporal_literals(name)?;
             }
             ast::TableFactor::Derived { subquery, .. } => self.admit_query_literals(subquery)?,
+            ast::TableFactor::ExpressionDerived { expr, .. } => self.admit_expression_literals(expr)?,
             ast::TableFactor::NestedJoin { table_with_joins, .. } => self.admit_joined_table_literals(table_with_joins)?,
             ast::TableFactor::UNNEST { array_exprs, .. } => for expression in array_exprs { self.admit_expression_literals(expression)?; },
             _ => (),

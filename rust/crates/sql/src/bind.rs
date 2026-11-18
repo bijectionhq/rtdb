@@ -323,6 +323,7 @@ impl Context<'_> {
     }
 
     fn values(&mut self, rows: &[ast::Parens<Vec<ast::Expr>>]) -> Result<Arc<Relation>> {
+        let prefix = self.symbol("xt.values")?;
         let mut bound = Vec::new();
         for row in rows {
             let mut input = Arc::new(Relation::unit());
@@ -337,7 +338,8 @@ impl Context<'_> {
         }).collect::<Result<Vec<_>>>()?;
         let schema = Schema::new(fields.clone())?;
         if bound.iter().all(|(input, _)| input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]])) {
-            return Ok(Arc::new(Relation::new(schema, RelationNode::Values { rows: bound.into_iter().map(|(_, row)| row).collect() })?));
+            let rows = bound.into_iter().map(|(_, row)| row).collect();
+            return rename_source(Arc::new(Relation::new(schema, RelationNode::Values { rows })?), prefix);
         }
         let mut result = None;
         for (input, row) in bound {
@@ -347,7 +349,7 @@ impl Context<'_> {
                 Some(left) => Arc::new(Relation::new(schema.clone(), RelationNode::Set { left, right: projected, operator: SetOperator::Union, all: true })?),
             });
         }
-        Ok(result.unwrap_or_else(|| Arc::new(Relation::empty(schema))))
+        rename_source(result.unwrap_or_else(|| Arc::new(Relation::empty(schema))), prefix)
     }
 
     fn set_expr(&mut self, set: &ast::SetExpr) -> Result<Arc<Relation>> {
@@ -743,18 +745,7 @@ impl Context<'_> {
         match table {
             ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, with_ordinality, json_path, index_hints } => {
                 if version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() || json_path.is_some() || !index_hints.is_empty() { return Err(unsupported("Table sample or dialect-specific modifier")); }
-                if let Some(arguments) = args {
-                    if purpose != TablePurpose::Query || arguments.settings.is_some() { return Err(unsupported("Table function modifier")); }
-                    let names = identifiers(name)?;
-                    let function = names.last().filter(|name| !name.quoted).map(Identifier::normalized).ok_or_else(|| error("Expected series function"))?;
-                    if names.len() > 2 || !matches!(function.as_str(), "generate_series" | "range") { return Err(unsupported("Table function")); }
-                    let args = self.lateral_scope(lateral_start, |context| arguments.args.iter().map(|argument| match argument {
-                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => context.expr(expr, &Schema::default(), &BTreeMap::new()),
-                        _ => Err(error("Series arguments must be expressions")),
-                    }).collect::<Result<Vec<_>>>())?;
-                    let expression = self.series(&function, args)?;
-                    return self.list_table(expression, alias.as_ref(), *with_ordinality, ListTableKind::Series);
-                }
+                if args.is_some() { return Err(unsupported("Table function modifier")); }
                 if *with_ordinality { return Err(unsupported("WITH ORDINALITY requires a list table")); }
                 if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)).cloned() {
                     let arguments = inline.parameters.iter().map(|index| (*index,self.options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Nothing))).collect::<Vec<_>>();
@@ -812,8 +803,7 @@ impl Context<'_> {
                 let relation = Arc::new(Relation::scan(Scan { table: binding, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates: Vec::new() })?);
                 let relation = if purpose == TablePurpose::Query {
                     let prefix = self.symbol(&qualifier)?;
-                    let expressions = relation.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
-                    Arc::new(Relation::new(relation.schema().clone(), RelationNode::Rename { input: relation, prefix, expressions })?)
+                    rename_source(relation, prefix)?
                 } else { relation };
                 if periods.is_empty() { return Ok(relation); }
                 let expressions = output.into_iter().map(|field| {
@@ -830,6 +820,19 @@ impl Context<'_> {
                 if *lateral && alias.is_none() { return Err(error("LATERAL derived tables require an alias")); }
                 let relation = if *lateral { self.lateral_scope(lateral_start, |context| context.query(subquery))? } else { self.query(subquery)? };
                 match alias { Some(alias) => self.alias(relation, alias), None => Ok(relation) }
+            }
+            ast::TableFactor::ExpressionDerived { expr, alias, with_ordinality } => {
+                if purpose != TablePurpose::Query { return Err(error("Mutation target must be a base table")); }
+                let expression = self.lateral_scope(lateral_start, |context| context.expr(expr, &Schema::default(), &BTreeMap::new()))?;
+                let series = alias.is_some() && matches!(expr, ast::Expr::Function(function)
+                    if function.name.0.last().and_then(ast::ObjectNamePart::as_ident)
+                        .is_some_and(|name| name.quote_style.is_none()
+                            && matches!(name.value.to_ascii_lowercase().as_str(), "generate_series" | "range")));
+                if series {
+                    self.list_table(expression, alias.as_ref(), *with_ordinality, ListTableKind::Series)
+                } else {
+                    self.scalar_table(expression, alias.as_ref(), *with_ordinality)
+                }
             }
             ast::TableFactor::NestedJoin { table_with_joins, alias } => {
                 let relation = self.joined_table(table_with_joins, lateral_start)?;
@@ -850,6 +853,39 @@ impl Context<'_> {
         let extents = clauses.clone().filter(|clause| !clause.system).chain(clauses.filter(|clause| clause.system)).map(|clause| clause.extent.clone()).collect::<Vec<_>>();
         for extent in &extents { self.admit_extent_literals(extent)?; }
         Ok(())
+    }
+
+    fn scalar_table(&mut self, expression: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool) -> Result<Arc<Relation>> {
+        let name = match alias {
+            Some(alias) => identifier(&alias.name).normalized(),
+            None => self.symbol("_expr")?,
+        };
+        let prefix = self.symbol(&name)?;
+        let columns = alias.map_or(&[][..], |alias| alias.columns.as_slice());
+        let width = usize::from(with_ordinality) + 1;
+        if !columns.is_empty() && columns.len() != width {
+            let names = columns.iter().map(|column| identifier(&column.name).normalized()).collect::<Vec<_>>();
+            return Err(error(format!("Table projection mismatch for {name} ({})", names.join(","))));
+        }
+        if columns.iter().any(|column| column.data_type.is_some()) {
+            return Err(error("Table projections specify column names"));
+        }
+        let value_name = match columns.first() {
+            Some(column) => identifier(&column.name).normalized(),
+            None => format!("_column_{}", self.allocate_symbol()?),
+        };
+        let mut fields = vec![self.binder.field(value_name, Some(name.clone()), expression.data_type())?];
+        let mut row = vec![expression];
+        if with_ordinality {
+            let ordinal_name = match columns.get(1) {
+                Some(column) => identifier(&column.name).normalized(),
+                None => self.symbol("_ordinal")?,
+            };
+            fields.push(self.binder.field(ordinal_name, Some(name), LogicalType::Scalar(ScalarType::I64))?);
+            row.push(Expr::Literal(Value::I64(1)));
+        }
+        let input = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows: vec![row] })?);
+        rename_source(input, prefix)
     }
 
     fn list_table(&mut self, expr: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool, kind: ListTableKind) -> Result<Arc<Relation>> {
@@ -940,6 +976,15 @@ impl Context<'_> {
 
     fn rename(&mut self, input: Arc<Relation>, qualifier: Option<String>, columns: Option<Vec<String>>) -> Result<Arc<Relation>> {
         let prefix = self.symbol(qualifier.as_deref().unwrap_or("_table"))?;
+        let input = match input.node() {
+            RelationNode::Rename { input: previous, expressions, .. }
+                if input.schema() == previous.schema() && expressions.iter().all(|named|
+                    matches!(&named.expr, Expr::Column { id, .. } if *id == named.field.id)) =>
+            {
+                Arc::clone(previous)
+            }
+            _ => input,
+        };
         let visible = input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id)).count();
         if columns.as_ref().is_some_and(|columns| columns.len() != visible) { return Err(error("Alias column count differs from relation")); }
         let mut index = 0;
@@ -960,8 +1005,12 @@ impl Context<'_> {
     }
 
     fn symbol(&mut self, name: &str) -> Result<String> {
+        Ok(format!("{name}.{}", self.allocate_symbol()?))
+    }
+
+    fn allocate_symbol(&mut self) -> Result<u64> {
         self.next_symbol = self.next_symbol.checked_add(1).ok_or_else(|| error("SQL symbol counter overflow"))?;
-        Ok(format!("{name}.{}", self.next_symbol))
+        Ok(self.next_symbol)
     }
 
     pub(crate) fn relational_sort_expr(&mut self, order: &ast::OrderByExpr, input: &mut Arc<Relation>, replacements: &Replacements) -> Result<SortExpr> {
@@ -1003,6 +1052,12 @@ fn join(left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Op
     Ok(Arc::new(Relation::new(schema, RelationNode::Join { left, right, kind, condition })?))
 }
 
+
+fn rename_source(input: Arc<Relation>, prefix: String) -> Result<Arc<Relation>> {
+    let schema = input.schema().clone();
+    let expressions = schema.fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
+    Ok(Arc::new(Relation::new(schema, RelationNode::Rename { input, prefix, expressions })?))
+}
 
 pub(crate) fn aggregate_relation(input: Arc<Relation>, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>) -> Result<Arc<Relation>> {
     let schema = Schema::new(groups.iter().map(|group| group.field.clone())

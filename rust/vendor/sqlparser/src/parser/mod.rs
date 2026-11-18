@@ -16530,6 +16530,12 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn finish_expression_derived_table(&mut self, expr: Expr) -> Result<TableFactor, ParserError> {
+        let with_ordinality = self.parse_keywords(&[Keyword::WITH, Keyword::ORDINALITY]);
+        let alias = self.maybe_parse_table_alias()?;
+        Ok(TableFactor::ExpressionDerived { expr, with_ordinality, alias })
+    }
+
     /// A table name or a parenthesized subquery, followed by optional `[AS] alias`
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     pub fn parse_table_factor(&mut self) -> Result<TableFactor, ParserError> {
@@ -16559,7 +16565,9 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::RParen)?;
             let alias = self.maybe_parse_table_alias()?;
             Ok(TableFactor::TableFunction { expr, alias })
-        } else if self.consume_token(&Token::LParen) {
+        } else if self.peek_token_ref().token == Token::LParen {
+            let expression_start = self.index;
+            self.next_token();
             // A left paren introduces either a derived table (i.e., a subquery)
             // or a nested join. It's nearly impossible to determine ahead of
             // time which it is... so we just try to parse both.
@@ -16601,7 +16609,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             };
-            if let Some(mut table) = derived {
+            let expression_tables = self.dialect.supports_expression_derived_tables();
+            if let Some(mut table) = derived.filter(|table| {
+                !expression_tables || !matches!(table, TableFactor::Derived { alias: None, .. })
+            }) {
                 while let Some(kw) = self.parse_one_of_keywords(&[Keyword::PIVOT, Keyword::UNPIVOT])
                 {
                     table = match kw {
@@ -16613,6 +16624,14 @@ impl<'a> Parser<'a> {
                     }
                 }
                 return Ok(table);
+            }
+
+            if expression_tables {
+                self.index = expression_start;
+                if let Some(expr) = self.maybe_parse(|parser| parser.parse_expr())? {
+                    return self.finish_expression_derived_table(expr);
+                }
+                self.index = derived_pos;
             }
 
             // A parsing error from `parse_derived_table_factor` indicates that the '(' we've
@@ -16665,6 +16684,7 @@ impl<'a> Parser<'a> {
                         | TableFactor::XmlTable { alias, .. }
                         | TableFactor::OpenJsonTable { alias, .. }
                         | TableFactor::TableFunction { alias, .. }
+                        | TableFactor::ExpressionDerived { alias, .. }
                         | TableFactor::Pivot { alias, .. }
                         | TableFactor::Unpivot { alias, .. }
                         | TableFactor::MatchRecognize { alias, .. }
@@ -16800,7 +16820,16 @@ impl<'a> Parser<'a> {
             // Stage reference: @mystage or @namespace.stage (e.g. Snowflake)
             self.parse_snowflake_stage_table_factor()
         } else {
-            let name = self.parse_object_name(true)?;
+            let name = if self.dialect.supports_expression_derived_tables() {
+                match self.maybe_parse(|parser| parser.parse_expr())? {
+                    Some(Expr::Identifier(name)) => ObjectName::from(vec![name]),
+                    Some(Expr::CompoundIdentifier(names)) => ObjectName::from(names),
+                    Some(expr) => return self.finish_expression_derived_table(expr),
+                    None => self.parse_object_name(true)?,
+                }
+            } else {
+                self.parse_object_name(true)?
+            };
 
             let json_path = match &self.peek_token_ref().token {
                 Token::LBracket if self.dialect.supports_partiql() => Some(self.parse_json_path()?),

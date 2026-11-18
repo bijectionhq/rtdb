@@ -68,6 +68,7 @@ impl Dialect for SqlDialect {
     fn supports_from_pipeline(&self) -> bool { true }
     fn supports_values_in_subqueries(&self) -> bool { true }
     fn supports_user_as_identifier(&self) -> bool { true }
+    fn supports_expression_derived_tables(&self) -> bool { true }
     fn is_column_alias(&self, keyword: &Keyword, parser: &mut Parser) -> bool {
         *keyword != Keyword::WINDOW && GenericDialect {}.is_column_alias(keyword, parser)
     }

@@ -703,9 +703,9 @@ async fn later_keyword_text_in_a_simple_batch_reaches_ordinary_table_binding() {
     assert_eq!(tags(&frames), b"TDCEZ");
     assert_eq!(rows(&frames), vec![vec![Some(b"42".to_vec())]]);
     let fields = frames[3].1.split(|&byte| byte == 0).filter_map(|field| field.split_first()).collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(fields[&b'M'], b"Table function");
+    assert_eq!(fields[&b'M'], b"Unknown function: pg_get_keywords");
     let detail: serde_json::Value = serde_json::from_slice(fields[&b'D']).unwrap();
-    assert_eq!(detail["code"], "xtdb/sql-unsupported");
+    assert_eq!(detail["code"], "xtdb/sql-error");
     assert_eq!(frames[4].1, b"I");
     drop(client); running.stop().await;
 }
@@ -880,7 +880,7 @@ async fn extended_client_probes_keep_emulation_and_sql_prepare_children_use_ordi
     let keywords = "SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()";
     let namespace = "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
     let cases = [
-        (keywords, b"1TZ".as_slice(), ["col1"].as_slice(), "xtdb/sql-unsupported", "Table function"),
+        (keywords, b"1TZ".as_slice(), ["col1"].as_slice(), "xtdb/sql-error", "Unknown function: pg_get_keywords"),
         (namespace, b"1tTZ".as_slice(), ["oid", "nspname", "nspowner", "nspacl", "description"].as_slice(), "xtdb/sql-error", "Duplicate column projection: oid"),
     ];
     let assert_prepare_error = |frames: &[(u8, Vec<u8>)], expected_tags: &[u8], code: &str, message: &str| {

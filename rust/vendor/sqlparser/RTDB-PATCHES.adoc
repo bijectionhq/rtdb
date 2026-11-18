@@ -14,6 +14,9 @@ The parsed scalar and quantified subqueries retain the original VALUES body and 
 RTDB's dialect parses USER through the ordinary identifier expression grammar.
 The binder resolves its column reference and session value using the active scope.
 
+RTDB's dialect retains expressions used as table sources in expression-derived table nodes.
+These nodes retain the expression, optional ordinality, and alias.
+
 RTDB's admitted SQL batch parser and statement splitter use the tokenizer's boundary mode to emit comment tokens with empty text fields.
 Each ordinary line or block comment occupies one token with its original location and participates in the same buffer growth.
 Block comments retain their dialect-specific nesting and end-of-input diagnostics.

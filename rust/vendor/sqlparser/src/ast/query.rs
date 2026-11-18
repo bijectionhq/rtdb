@@ -1589,6 +1589,15 @@ pub enum TableFactor {
         /// Optional alias for the table function result.
         alias: Option<TableAlias>,
     },
+    /// An expression used as a table source, with optional ordinality and alias.
+    ExpressionDerived {
+        /// Expression producing the table's value.
+        expr: Expr,
+        /// Whether to include an ordinal column.
+        with_ordinality: bool,
+        /// Optional table and column alias.
+        alias: Option<TableAlias>,
+    },
     /// `e.g. LATERAL FLATTEN(<args>)[ AS <alias> ]`
     Function {
         /// Whether the function is LATERAL.
@@ -2387,6 +2396,16 @@ impl fmt::Display for TableFactor {
             }
             TableFactor::TableFunction { expr, alias } => {
                 write!(f, "TABLE({expr})")?;
+                if let Some(alias) = alias {
+                    write!(f, " {alias}")?;
+                }
+                Ok(())
+            }
+            TableFactor::ExpressionDerived { expr, with_ordinality, alias } => {
+                write!(f, "{expr}")?;
+                if *with_ordinality {
+                    write!(f, " WITH ORDINALITY")?;
+                }
                 if let Some(alias) = alias {
                     write!(f, " {alias}")?;
                 }

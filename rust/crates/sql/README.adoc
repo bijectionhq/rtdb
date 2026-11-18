@@ -190,6 +190,11 @@ A correlated scalar subquery keeps its captures and evaluates its dependent rela
 Full outer join conditions, temporal scan clauses, RECORDS expressions and standalone control values still reject relational subqueries.
 
 LATERAL derived tables and implicitly lateral UNNEST capture preceding FROM columns in the binding scope.
+A scalar expression used as a table source yields one row containing its value.
+An array-valued expression occupies one cell.
+WITH ORDINALITY adds a signed 64-bit column whose value is one.
+Table aliases can give these columns explicit names.
+When the alias omits column names, the value and ordinal use the statement's generated source symbols.
 An eager column table serves standalone UNNEST and dependent UNNEST outside the direct cross-Apply rewrite.
 Its optional ordinality is a signed 64-bit sequence for the materialized page.
 A direct captured UNNEST under a cross Apply stages the collection expression for the full independent page before expansion.
@@ -390,7 +395,8 @@ The prepared plan captures that choice, so subsequent execution does not consult
 `tests/series.rs` retains the range result and compatibility-flag planner cases from `generate_series_test.clj`, plus name, qualification and internal-argument admission checks.
 The regression source has not executed.
 
-Series table forms require a table alias and accept an optional single column name, or two names with `WITH ORDINALITY`.
+An unparenthesized series call followed by an alias expands to one row per element and accepts an optional single column name, or two names with `WITH ORDINALITY`.
+A series call without an alias and a parenthesized series call each return one row containing the list.
 Their arguments bind against the preceding FROM scope, permitting correlated series for each preceding row.
 Unnamed table fields retain internal binding identities; wildcard projections assign `_column_1`, `_column_2` and subsequent labels within that wildcard expansion.
 UNNEST uses the same table-column naming contract.

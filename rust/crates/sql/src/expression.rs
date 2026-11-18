@@ -181,7 +181,7 @@ impl Context<'_> {
                 match operand { Some(operand) => Expr::SimpleCase { operand: Box::new(operand),branches,otherwise }, None => Expr::Case { branches,otherwise } }
             }
             ast::Expr::Function(function) => {
-                if aggregate_function(&function.name.to_string()).is_some() || percentile_kind(&function.name.to_string()).is_some() { return Err(error("Aggregate is not valid in this expression scope")); }
+                if aggregate_function(&function.name.to_string()).is_some() || percentile_kind(&function.name.to_string()).is_some() { return Err(error("Aggregates are not allowed in this context")); }
                 if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(unsupported("Window function or scalar function modifiers")); }
                 if let Some(query) = array_query(function) {
                     return self.query_value(query, input, SubqueryValue::Array);
@@ -440,7 +440,10 @@ pub(crate) fn bare_scalar_name(name: &rtdb_plan::Identifier, parts: usize) -> Op
 
 pub(crate) fn scalar_name(function: &ast::Function) -> Result<String> {
     let names = identifiers(&function.name)?;
-    let unknown = || error(format!("Unknown function: {}", function.name));
+    let unknown = || {
+        let name = names.last().map(|name| name.normalized()).unwrap_or_else(|| function.name.to_string());
+        error(format!("Unknown function: {name}"))
+    };
     if names.is_empty() || names.len() > 2 { return Err(unknown()); }
     let last = names.last().unwrap();
     let name = last.normalized();

@@ -64,6 +64,15 @@
 (deftest test-empty-array-3818
   (run-original-api-case #'original-sql/test-empty-array-3818))
 
+(deftest test-function-as-from-source
+  (run-original-api-case #'original-sql/test-function-as-from-source))
+
+(deftest test-range-3212
+  (run-original-api-case #'original-sql/test-range-3212))
+
+(deftest test-generate-series-3212
+  (run-original-api-case #'original-sql/test-generate-series-3212))
+
 (deftest test-xt-version
   (run-original-api-case #'original-sql/test-xt-version))
 

@@ -1127,6 +1127,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if the dialect admits expression-derived tables in FROM.
+    fn supports_expression_derived_tables(&self) -> bool {
+        false
+    }
+
     /// Returns true if this dialect allows dollar placeholders
     /// e.g. `SELECT $var` (SQLite)
     fn supports_dollar_placeholder(&self) -> bool {

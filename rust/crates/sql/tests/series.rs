@@ -74,6 +74,82 @@ fn labels(source: &str) -> Vec<String> {
     relation.schema().fields().iter().map(|field| field.name.clone()).collect()
 }
 
+#[test]
+fn expression_derived_tables_label_the_value_and_the_ordinal() {
+    for (source, expected) in [
+        ("SELECT * FROM ABS(-1) AS t", vec!["_column_2"]),
+        ("SELECT * FROM ABS(-1)", vec!["_column_3"]),
+        ("SELECT * FROM ABS(-1) WITH ORDINALITY AS t", vec!["_column_2", "_ordinal.3"]),
+        ("SELECT * FROM ABS(-1) WITH ORDINALITY", vec!["_column_3", "_ordinal.4"]),
+        ("SELECT * FROM ABS(-1) AS t, ABS(-2) AS u", vec!["_column_2", "_column_4"]),
+        ("SELECT * FROM (VALUES (45)) q(n), ABS(-1) AS t", vec!["n", "_column_4"]),
+        ("SELECT * FROM RANGE(1,3)", vec!["_column_3"]),
+        ("SELECT * FROM GENERATE_SERIES(1,3) WITH ORDINALITY", vec!["_column_3", "_ordinal.4"]),
+        ("SELECT * FROM (RANGE(1,3)) AS t", vec!["_column_2"]),
+        ("SELECT * FROM ABS(-1) AS t, (VALUES (45)) q(n)", vec!["_column_2", "n"]),
+        ("SELECT * FROM (SELECT ABS(3) AS n) q, ABS(-1) AS t", vec!["n", "_column_3"]),
+        ("SELECT * FROM ABS(-1) WITH ORDINALITY AS t(v,n)", vec!["v", "n"]),
+    ] {
+        assert_eq!(labels(source), expected, "{source}");
+    }
+}
+
+#[tokio::test]
+async fn expression_derived_tables_keep_a_single_value_and_capture_visible_sources() {
+    for source in [
+        "SELECT * FROM 42 AS t(v)",
+        "SELECT * FROM (42) AS t(v)",
+        "SELECT * FROM (41) + 1 AS t(v)",
+    ] {
+        assert_eq!(query(source, false).await.unwrap(), [vec![V::I64(42)]], "{source}");
+    }
+    assert_eq!(query("SELECT * FROM 'hello' AS t(v)", false).await.unwrap(),
+        [vec![V::Utf8("hello".into())]]);
+    assert_eq!(query("SELECT * FROM TRUE AS t(v)", false).await.unwrap(), [vec![V::Bool(true)]]);
+    assert_eq!(query("SELECT CAST(v AS TEXT) FROM DATE '2020-01-01' AS t(v)", false).await.unwrap(),
+        [vec![V::Utf8("2020-01-01".into())]]);
+    assert_eq!(query("SELECT * FROM (ARRAY[4,5]) WITH ORDINALITY AS t(v,n)", false).await.unwrap(),
+        [vec![integers(&[4, 5]), V::I64(1)]]);
+    for source in [
+        "SELECT * FROM (VALUES (1)) q(n), ABS(q.n) AS t(v)",
+        "SELECT * FROM (VALUES (1)) q(n) JOIN ABS(q.n) AS t(v) ON TRUE",
+    ] {
+        assert_eq!(query(source, false).await.unwrap(), [vec![V::I64(1), V::I64(1)]], "{source}");
+    }
+    for source in [
+        "SELECT * FROM (VALUES (1)) q(n), (q.n + 1) AS t(v)",
+        "SELECT * FROM (VALUES (1)) q(n), (q.n) + 1 AS t(v)",
+        "SELECT * FROM (VALUES (1)) q(n), q.n + 1 AS t(v)",
+    ] {
+        assert_eq!(query(source, false).await.unwrap(), [vec![V::I64(1), V::I64(2)]], "{source}");
+    }
+    assert_eq!(query("SELECT * FROM (VALUES (5)) q(n), (q.n) AS t(v)", false).await.unwrap(),
+        [vec![V::I64(5), V::I64(5)]]);
+    assert_eq!(query("SELECT * FROM ((SELECT 5) AS q)", false).await.unwrap(), [vec![V::I64(5)]]);
+    for (source, expected) in [
+        ("SELECT * FROM ABS(1) AS t(a,b)", "Table projection mismatch for t (a,b)"),
+        ("SELECT * FROM SUM(42) AS t(x)", "Aggregates are not allowed in this context"),
+        ("SELECT * FROM (SELECT 5)", "Subqueries are not allowed in this context"),
+    ] {
+        assert_eq!(query(source, false).await.unwrap_err().message.as_deref(), Some(expected), "{source}");
+    }
+}
+
+#[tokio::test]
+async fn series_sources_expand_only_with_an_alias_on_the_unwrapped_call() {
+    for source in [
+        "SELECT * FROM RANGE(1,3)",
+        "SELECT * FROM custom.RANGE(1,3)",
+        "SELECT * FROM (RANGE(1,3)) AS g",
+    ] {
+        assert_eq!(query(source, false).await.unwrap(), [vec![integers(&[1, 2])]], "{source}");
+    }
+    assert_eq!(query("SELECT * FROM GENERATE_SERIES(1,3) WITH ORDINALITY", false).await.unwrap(),
+        [vec![integers(&[1, 2, 3]), V::I64(1)]]);
+    assert_eq!(query("SELECT * FROM RANGE(1,3), RANGE(1,3) AS g(x)", false).await.unwrap(),
+        [vec![integers(&[1, 2]), V::I64(1)], vec![integers(&[1, 2]), V::I64(2)]]);
+}
+
 #[tokio::test]
 async fn series_tables_bind_aliases_lateral_arguments_and_ordinality() {
     assert_eq!(query("SELECT * FROM GENERATE_SERIES(1,3) AS g", false).await.unwrap(), [vec![V::I64(1)],vec![V::I64(2)],vec![V::I64(3)]]);
@@ -99,7 +175,7 @@ fn series_and_unnest_wildcards_assign_labels_within_each_wildcard() {
     let context = context();
     let Statement::Query(plan) = prepare("SELECT * FROM RANGE(1,3) WITH ORDINALITY AS g(value,position)", &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("query") };
     assert_eq!(plan.schema().fields()[1].data_type, rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::I64));
-    for source in ["SELECT _column_1 FROM RANGE(1,3) AS g", "SELECT * FROM RANGE(1,3)", "SELECT * FROM RANGE(1,3) AS g(x,y)", "SELECT * FROM RANGE(1,3) WITH ORDINALITY AS g(x)", "SELECT * FROM unknown(1,3) AS g", r#"SELECT * FROM "range"(1,3) AS g"#, "SELECT * FROM a.b.RANGE(1,3) AS g", "SELECT * FROM RANGE(1,3,1,TRUE) AS g"] {
+    for source in ["SELECT _column_1 FROM RANGE(1,3) AS g", "SELECT * FROM RANGE(1,3) AS g(x,y)", "SELECT * FROM RANGE(1,3) WITH ORDINALITY AS g(x)", "SELECT * FROM unknown(1,3) AS g", r#"SELECT * FROM "range"(1,3) AS g"#, "SELECT * FROM a.b.RANGE(1,3) AS g", "SELECT * FROM RANGE(1,3,1,TRUE) AS g"] {
         assert!(prepare(source, &context.catalog, &PrepareOptions::default()).is_err(), "{source}");
     }
 }
