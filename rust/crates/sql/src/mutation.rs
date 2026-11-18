@@ -105,7 +105,11 @@ fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
             }
             let mut differences = Vec::new();
             for (name, expression) in assignments {
-                differences.push(Expr::unary(UnaryOp::Not, Expr::Call { name: "null_eq".into(), args: vec![expression.clone(), old.get(&name).cloned().unwrap_or(Expr::Literal(Value::Null))], return_type: LogicalType::Scalar(ScalarType::Bool) }));
+                differences.push(Expr::unary(UnaryOp::Not, Expr::Call {
+                    name: "===".into(),
+                    args: vec![expression.clone(), old.get(&name).cloned().unwrap_or(Expr::Literal(Value::Null))],
+                    return_type: LogicalType::Scalar(ScalarType::Bool),
+                }));
                 expressions.push(NamedExpr { field: allocator.field(name, None, expression.data_type())?, expr: expression });
             }
             let differs = differences.into_iter().reduce(|left, right| Expr::binary(BinaryOp::Or, left, right)).unwrap_or(Expr::Literal(Value::Bool(false)));

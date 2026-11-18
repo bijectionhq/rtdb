@@ -31,6 +31,7 @@ SQL mutations that read live data or depend on transaction context report forbid
 Replica event decoding and durable page copying retain their physical representations.
 
 Canonical SQL mutations emit IID, valid bounds, and a document for puts, or IID and bounds for deletes.
+UPDATE compares old and assigned values with type-sensitive equality before writing a new version.
 UPDATE keeps unassigned columns and evaluates assignments simultaneously.
 DELETE and UPDATE default to the window from transaction time through end-of-time.
 ERASE can select historical versions.

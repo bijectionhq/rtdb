@@ -12,6 +12,7 @@
             [xtdb.sql.identifier-test :as original-identifiers]
             [xtdb.sql.with-test :as original-with]
             [xtdb.node-test :as original-node]
+            [xtdb.update-test :as original-update]
             [xtdb.sql-test :as original-sql]
             [xtdb.update-test :as original-update]
             [xtdb.operator.patch-test :as original-patch]
@@ -294,6 +295,12 @@
 (deftest-original-api original-sql/select-with-lots-of-commas)
 (deftest-original-api original-sql/null-valid-time-insertion-behaves-as-if-non-specified)
 (deftest-original-api original-sql/forbid-invalid-columns-update)
+
+(deftest-original-api original-update/update-changes-types-if-requested-5030)
+
+(deftest-original-api original-update/update-doesnt-put-unchanged-versions-5030)
+
+(deftest-original-api original-update/update-for-portion-of-idempotency-5030)
 (deftest-original-api original-sql/joins-across-polymorphic-data-4061+4078)
 (deftest-original-api original-sql/test-hashcode-for-tstzrange-4263)
 (deftest-original-api original-sql/patch-uuid-literal-id-4284)

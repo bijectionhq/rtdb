@@ -772,6 +772,7 @@ rule LeaderProcessesTx {
         -- Resolve and stage on the resolver's queue, advancing the RESOLVED head.
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
+    -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.
     -- For concrete document writes, forbidden columns abort with the table reference and offending column names in source schema order.
