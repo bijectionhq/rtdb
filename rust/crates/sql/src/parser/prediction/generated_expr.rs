@@ -76,6 +76,17 @@ const NUMERIC_TERM: NumericTail = NumericTail {
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
     pub(in crate::parser::prediction) fn numeric_expression(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         let mode = self.generated_mode()?;
+        self.numeric_expr_zero(mode)
+    }
+
+    pub(super) fn derived_column_expression(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_call(CallAction {
+            state: 2405, rule: 120, called: EXPR, start: 66, follow: 2407, precedence: 0,
+        })?;
+        self.numeric_expr_zero(mode)
+    }
+
+    fn numeric_expr_zero(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         self.generated_numeric_recursion(EXPR, 0, |session, entry, local| {
             if session.predict_numeric(EXPR_BASE, mode)?.number() != 3 {
                 return session.decline_numeric_site();
@@ -184,7 +195,8 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
     ) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         let state = self.state;
         let site = match (rule, state, precedence) {
-            (EXPR, _, 0) => self.current.is_none() && self.precedence() == 0,
+            (EXPR, _, 0) if self.current.is_none() => self.precedence() == 0,
+            (EXPR, ParserState::State(2405), 0) => self.precedence() == 0,
             (COMMON_VALUE, ParserState::State(1000), 0) => self.precedence() == 0,
             (COMMON_VALUE, ParserState::State(1644), 61) => self.precedence() <= TERM_PREDICATE.minimum,
             (COMMON_VALUE, ParserState::State(1641), 62) => self.precedence() <= FACTOR_PREDICATE.minimum,

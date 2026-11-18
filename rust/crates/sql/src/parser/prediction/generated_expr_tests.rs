@@ -295,7 +295,7 @@ fn generated_expr_error_retry_distinguishes_ll_deletion_mismatch_and_lexer_deman
 }
 
 #[test]
-fn unadopted_recursive_base_choices_and_select_leave_their_private_scope() {
+fn unadopted_recursive_base_choices_and_delete_leave_their_private_scope() {
     let ((), memory) = environment(|environment, work, _| {
         for (sql, state) in [("NOT 42", 1001), ("((42))", 1634), ("- - 42", 1634)] {
             let mut calls = 0;
@@ -312,7 +312,7 @@ fn unadopted_recursive_base_choices_and_select_leave_their_private_scope() {
             assert!(matches!(result, Err(RuntimeError::Control(RuntimeProblem::PredictionSite))));
             assert_eq!(calls, 1);
         }
-        let result = with_bail_fallback(environment, "SELECT 42", work, |session, mode| {
+        let result = with_bail_fallback(environment, "DELETE FROM foo", work, |session, mode| {
             assert_eq!(mode, PredictionMode::Sll);
             let action = session.direct_sql_statement();
             assert!(matches!(action, Err(PassError::Runtime(RuntimeError::Control(RuntimeProblem::PredictionSite)))));

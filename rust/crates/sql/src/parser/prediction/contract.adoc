@@ -876,6 +876,36 @@ The guard binds that residue to the failed integer entry and its original call.
 A denial of outer attachment leaves the recursive precedence popped and saved caller restored.
 Both failure paths keep the original admission error category and execute the entered ancestor finally.
 
+== Generated SELECT statement shell
+
+Decision 34 selects the primary QueryExpr record for the adopted query branch.
+Its EXPLAIN and ANALYZE options use their original first-token tests, and the query child enters at state 380.
+The actual queryExpression and queryExpressionNoWith rules lead to recursive queryExpressionBody at 2422.
+The SELECT base installs the QuerySpecification label and calls selectClause at 2455.
+Its optional query clauses and recursive combination decisions retain the original prediction and sync boundaries.
+Unadopted query clauses reach their private scope exits at the selected source sites.
+
+The selectClause records the SELECT terminal and its optional ALL or DISTINCT set match.
+The list predicts its optional first sublist separately from the repeated comma and optional subsequent sublist.
+The nullable list entry and backedge use d250 with current states 2322 and 2324.
+The trailing asterisk decision d251 reaches its own comma match before the unadopted asterisk call.
+The adopted sublist alternative invokes derivedColumn and enters the existing numeric `expr(0)` action at call state 2405.
+Explicit AS, an implicit label, and AS DEFAULT follow the generated switch schedule.
+The column label uses the existing identifier family or the source CURRENT_USER atom, preserving primary records and indexed terminals.
+
+LL uses nullable sync for the list and query loops and required sync for the reached alias switches.
+For a malformed explicit label, SLL assigns the alias switch's no-viable cause before cancellation.
+LL reaches sync at 2412 and either reports deletion with a null cause, assigns its current-state mismatch, or preserves the lexer failure from the second lookahead.
+The direct and multi roots own the actual EOF match after completed statements.
+
+Query-body unroll uses the actual active precedence frame and saved caller.
+A denied SelectClause entry leaves that child current for unroll.
+A denied nested ordinary entry can leave the already-entered SelectClause current after the intervening finally operations.
+The residue check follows the original failed entry's primary parent chain to the active clause within the nine edges of the adopted longest path.
+The actual return record is reparented to the saved query caller before the attempted outer attachment.
+An outer attachment failure leaves the caller restored and the recursive precedence popped.
+Public parser entry adoption and the remaining generated query and expression bodies remain open.
+
 == Finishing-alternative selection
 
 The adaptive caller constructs the candidate no-viable error and seeks the prediction origin before asking the current Local or Full facade for a finishing alternative.

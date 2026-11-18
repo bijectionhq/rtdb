@@ -1,6 +1,6 @@
 use rtdb_types::Anomaly;
 use crate::lexer::{IndexedLexeme, Kind};
-use crate::parser::grammar::{ExpectedSymbol, TokenSet};
+use crate::parser::grammar::{ExpectedSymbol, TokenSet, TokenType};
 use super::no_viable_report::{ListenerDiagnostic, listener_diagnostic, message_buffer, message_size, quoted_len, write_quoted};
 use super::{
     InputMismatch, InvocationCause, InvocationException, InvocationKey, InvocationView, MismatchExpectation, NextTokensCapture,
@@ -72,6 +72,11 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
     pub(super) fn sync_action(&mut self, action: SyncAction) -> RuntimeResult<'sql, ()> {
         self.generated_action_state(action.state, action.rule)?;
         self.sync_generated(|_| Some((action.state, action.rule, action.shape)))
+    }
+
+    pub(super) fn lookahead_action(&mut self, action: SyncAction) -> RuntimeResult<'sql, TokenType> {
+        self.sync_action(action)?;
+        Ok(self.lookahead_token(1)?.1)
     }
 
     fn sync_generated(

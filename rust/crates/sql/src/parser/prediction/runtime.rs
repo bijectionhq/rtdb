@@ -39,6 +39,9 @@ mod generated_expr;
 #[path = "generated_names.rs"]
 mod generated_names;
 
+#[path = "generated_select.rs"]
+mod generated_select;
+
 #[path = "generated_statement.rs"]
 mod generated_statement;
 
@@ -148,14 +151,16 @@ enum InvocationException<'parse, 'sql> {
 pub(super) enum ContextClass {
     ReadUncommittedIsolation, ReadCommittedIsolation, RepeatableReadIsolation, SerializableIsolation, IsolationLevelTxMode,
     DateType, ArrayType, RegularIdentifier, DelimitedIdentifier,
-    CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
+    QueryExpr, CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
+    QuerySpecification,
     DiscardAll, DiscardPlans, DiscardTemp, DiscardSequences,
     IntegerLiteral0, FloatLiteral, CommonValueExpr0, LiteralExpr, NumericFactorExpr, NumericTermExpr,
 }
 impl ContextClass {
     fn rule(self) -> u16 {
         match self {
-            Self::CommitStatement | Self::RollbackStatement | Self::DiscardStatement | Self::SetRoleStatement => 2,
+            Self::QueryExpr | Self::CommitStatement | Self::RollbackStatement | Self::DiscardStatement | Self::SetRoleStatement => 2,
+            Self::QuerySpecification => 126,
             Self::DiscardAll | Self::DiscardPlans | Self::DiscardTemp | Self::DiscardSequences => 3,
             Self::DateType | Self::ArrayType => 26,
             Self::IntegerLiteral0 | Self::FloatLiteral => 14,

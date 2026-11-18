@@ -65,6 +65,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             session.sync_required_block()?;
             let alt = session.adaptive_predict(34, mode)?.number();
             let class = match alt {
+                1 => ContextClass::QueryExpr,
                 13 => ContextClass::CommitStatement,
                 14 => ContextClass::RollbackStatement,
                 16 => ContextClass::DiscardStatement,
@@ -74,6 +75,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             *local = session.labelled_context(*local, class)?;
             session.enter_outer_alt(*local)?;
             match class {
+                ContextClass::QueryExpr => session.generated_query(*local, mode),
                 ContextClass::CommitStatement => session.commit_statement(*local),
                 ContextClass::RollbackStatement => session.match_statement_terminal(*local, 488),
                 ContextClass::DiscardStatement => {

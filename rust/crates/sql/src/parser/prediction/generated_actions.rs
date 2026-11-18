@@ -28,6 +28,7 @@ pub(super) enum SyncShape {
     RequiredBlock,
     NullableBlock,
     LoopEntry,
+    NullableLoopEntry,
     Loopback,
     RequiredStarBlock,
     NullablePrecedenceEntry,
@@ -38,14 +39,14 @@ impl SyncShape {
     pub(super) fn agrees(self, kind: StateKindView<'_, '_>) -> bool {
         matches!((self, kind),
             (Self::RequiredBlock | Self::NullableBlock, StateKindView::BlockStart { .. })
-            | (Self::LoopEntry, StateKindView::StarLoopEntry { precedence: false, .. })
+            | (Self::LoopEntry | Self::NullableLoopEntry, StateKindView::StarLoopEntry { precedence: false, .. })
             | (Self::Loopback | Self::NullableLoopback, StateKindView::StarLoopback)
             | (Self::RequiredStarBlock, StateKindView::StarBlockStart { .. })
             | (Self::NullablePrecedenceEntry, StateKindView::StarLoopEntry { precedence: true, .. }))
     }
 
     pub(super) fn nullable(self) -> bool {
-        matches!(self, Self::NullableBlock | Self::NullablePrecedenceEntry | Self::NullableLoopback)
+        matches!(self, Self::NullableBlock | Self::NullableLoopEntry | Self::NullablePrecedenceEntry | Self::NullableLoopback)
     }
 }
 

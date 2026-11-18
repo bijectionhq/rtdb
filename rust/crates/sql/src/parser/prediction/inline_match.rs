@@ -1,6 +1,6 @@
 use crate::lexer::IndexedLexeme;
 use crate::parser::grammar::{ExpectedSymbol, StateKindView, TransitionView};
-use super::{MismatchExpectation, ParserControl, ParserProfile, ParserSession, ParserState, PassError, PassResult, RuntimeError, RuntimeProblem, RuntimeResult};
+use super::{ContextChild, InvocationKey, MismatchExpectation, ParserControl, ParserProfile, ParserSession, ParserState, PassError, PassResult, RuntimeError, RuntimeProblem, RuntimeResult};
 use super::generated_actions::{TerminalAction, TerminalExpectation};
 use super::required_block_sync::TokenReport;
 
@@ -86,6 +86,12 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             .ok_or(RuntimeError::Control(RuntimeProblem::PredictionSite));
         let expected = self.finish(expected)?;
         self.match_validated_terminal(action.state, expected)
+    }
+
+    pub(super) fn match_tree_action(&mut self, local: InvocationKey<'parse>, action: TerminalAction) -> PassResult<'parse, 'sql, ()> {
+        let matched = self.match_terminal_action(action)?;
+        self.append_child(local, ContextChild::Terminal(matched))?;
+        Ok(())
     }
 
     fn match_validated_terminal(
