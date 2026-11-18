@@ -97,6 +97,22 @@ async fn interval_sql_qualifiers_keep_source_dependent_output_types() {
 }
 
 #[tokio::test]
+async fn interval_casts_validate_the_bound_qualifier() {
+    for (start, end, message) in [
+        ("MINUTE", "HOUR", "Interval end field must have less significance than the start field."),
+        ("YEAR", "DAY", "If YEAR specified as the interval start field, MONTH must be the end field."),
+        ("MONTH", "SECOND", "MONTH is not permitted as the interval start field."),
+    ] {
+        let sql = format!("SELECT CAST('11:10' AS INTERVAL {start} TO {end})");
+        let error = query(&sql, "UTC").await.unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/invalid-interval-units", "{sql}");
+        assert_eq!(error.message.as_deref(), Some(message), "{sql}");
+        assert_eq!(error.context["start-unit"], start);
+        assert_eq!(error.context["end-unit"], end);
+    }
+}
+
+#[tokio::test]
 async fn unqualified_interval_literals_keep_their_prepared_and_vector_types() {
     for (text, expected) in [
         ("P",V::IntervalYearMonth(0)),

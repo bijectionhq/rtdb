@@ -1591,6 +1591,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Parses both interval range fields for semantic validation during binding.
+    fn supports_interval_field_ranges(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports specifying which table to copy
     /// the schema from inside parenthesis.
     ///

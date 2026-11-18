@@ -14105,6 +14105,9 @@ impl<'a> Parser<'a> {
     fn maybe_parse_optional_interval_fields(
         &mut self,
     ) -> Result<Option<IntervalFields>, ParserError> {
+        if self.dialect.supports_interval_field_ranges() {
+            return self.parse_interval_field_range();
+        }
         match self.parse_one_of_keywords(&[
             // Can be followed by `TO` option
             Keyword::YEAR,
@@ -14179,6 +14182,38 @@ impl<'a> Parser<'a> {
             }
             None => Ok(None),
         }
+    }
+
+    fn parse_interval_field_range(&mut self) -> Result<Option<IntervalFields>, ParserError> {
+        const FIELDS: &[Keyword] = &[
+            Keyword::YEAR, Keyword::MONTH, Keyword::DAY,
+            Keyword::HOUR, Keyword::MINUTE, Keyword::SECOND,
+        ];
+        fn bound(keyword: Keyword) -> IntervalBound {
+            match keyword {
+                Keyword::YEAR => IntervalBound::Year,
+                Keyword::MONTH => IntervalBound::Month,
+                Keyword::DAY => IntervalBound::Day,
+                Keyword::HOUR => IntervalBound::Hour,
+                Keyword::MINUTE => IntervalBound::Minute,
+                Keyword::SECOND => IntervalBound::Second,
+                _ => unreachable!("interval field keyword"),
+            }
+        }
+        let Some(keyword) = self.parse_one_of_keywords(FIELDS) else { return Ok(None); };
+        let start = bound(keyword);
+        if start != IntervalBound::Second && self.parse_keyword(Keyword::TO) {
+            let end = bound(self.expect_one_of_keywords(FIELDS)?);
+            return Ok(Some(IntervalFields::Range { start, end }));
+        }
+        Ok(Some(match start {
+            IntervalBound::Year => IntervalFields::Year,
+            IntervalBound::Month => IntervalFields::Month,
+            IntervalBound::Day => IntervalFields::Day,
+            IntervalBound::Hour => IntervalFields::Hour,
+            IntervalBound::Minute => IntervalFields::Minute,
+            IntervalBound::Second => IntervalFields::Second,
+        }))
     }
 
     /// Parse datetime64 [1]

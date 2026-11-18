@@ -29,7 +29,15 @@ pub(crate) fn cast_target(data_type: &ast::DataType, timezone: Option<&str>) -> 
             use ast::IntervalFields as A;
             use rtdb_plan::{IntervalField as F, IntervalQualifier};
             let Some(fields) = fields else { return Ok(rtdb_plan::CastTarget::IntervalDefault); };
-            let (start, end) = match fields { A::Year => (F::Year,None), A::Month => (F::Month,None), A::Day => (F::Day,None), A::Hour => (F::Hour,None), A::Minute => (F::Minute,None), A::Second => (F::Second,None), A::YearToMonth => (F::Year,Some(F::Month)), A::DayToHour => (F::Day,Some(F::Hour)), A::DayToMinute => (F::Day,Some(F::Minute)), A::DayToSecond => (F::Day,Some(F::Second)), A::HourToMinute => (F::Hour,Some(F::Minute)), A::HourToSecond => (F::Hour,Some(F::Second)), A::MinuteToSecond => (F::Minute,Some(F::Second)) };
+            let bound = |bound| match bound {
+                ast::IntervalBound::Year => F::Year,
+                ast::IntervalBound::Month => F::Month,
+                ast::IntervalBound::Day => F::Day,
+                ast::IntervalBound::Hour => F::Hour,
+                ast::IntervalBound::Minute => F::Minute,
+                ast::IntervalBound::Second => F::Second,
+            };
+            let (start, end) = match fields { A::Year => (F::Year,None), A::Month => (F::Month,None), A::Day => (F::Day,None), A::Hour => (F::Hour,None), A::Minute => (F::Minute,None), A::Second => (F::Second,None), A::YearToMonth => (F::Year,Some(F::Month)), A::DayToHour => (F::Day,Some(F::Hour)), A::DayToMinute => (F::Day,Some(F::Minute)), A::DayToSecond => (F::Day,Some(F::Second)), A::HourToMinute => (F::Hour,Some(F::Minute)), A::HourToSecond => (F::Hour,Some(F::Second)), A::MinuteToSecond => (F::Minute,Some(F::Second)), A::Range { start, end } => (bound(*start), Some(bound(*end))) };
             if precision.is_some() && start != F::Second && end != Some(F::Second) { return Err(error("Interval precision requires a SECOND field")); }
             Ok(rtdb_plan::CastTarget::Interval(IntervalQualifier { start, end, leading_precision: Some(2), fractional_precision: Some(precision.map(|precision| i64::try_from(precision).map_err(error)).transpose()?.unwrap_or(6)) }))
         }

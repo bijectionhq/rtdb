@@ -971,7 +971,39 @@ impl fmt::Display for TimezoneInfo {
     }
 }
 
-/// Fields for [Postgres] `INTERVAL` type.
+/// A field token in an interval qualifier.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum IntervalBound {
+    /// Year field.
+    Year,
+    /// Month field.
+    Month,
+    /// Day field.
+    Day,
+    /// Hour field.
+    Hour,
+    /// Minute field.
+    Minute,
+    /// Second field.
+    Second,
+}
+
+impl fmt::Display for IntervalBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Year => "YEAR",
+            Self::Month => "MONTH",
+            Self::Day => "DAY",
+            Self::Hour => "HOUR",
+            Self::Minute => "MINUTE",
+            Self::Second => "SECOND",
+        })
+    }
+}
+
+/// Fields for the `INTERVAL` type.
 ///
 /// [Postgres]: https://www.postgresql.org/docs/17/datatype-datetime.html
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -1004,6 +1036,13 @@ pub enum IntervalFields {
     HourToSecond,
     /// `MINUTE TO SECOND` field
     MinuteToSecond,
+    /// Source fields whose compatibility is checked when the type is bound.
+    Range {
+        /// Leading field.
+        start: IntervalBound,
+        /// Trailing field.
+        end: IntervalBound,
+    },
 }
 
 impl fmt::Display for IntervalFields {
@@ -1022,6 +1061,7 @@ impl fmt::Display for IntervalFields {
             IntervalFields::HourToMinute => write!(f, "HOUR TO MINUTE"),
             IntervalFields::HourToSecond => write!(f, "HOUR TO SECOND"),
             IntervalFields::MinuteToSecond => write!(f, "MINUTE TO SECOND"),
+            IntervalFields::Range { start, end } => write!(f, "{start} TO {end}"),
         }
     }
 }

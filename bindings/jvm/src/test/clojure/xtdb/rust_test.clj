@@ -285,6 +285,7 @@
 (deftest-original-api original-expr/timestamptz-literals-and-casts-3612)
 
 (deftest-original-api original-expr/test-cast-string-to-temporal)
+(deftest-original-api original-expr/test-cast-string-to-interval-with-qualifier)
 (deftest-original-api original-expr/test-timezone-single-word-syntax)
 (deftest-original-api original-expr/variadic-overlaps-3441)
 
