@@ -2338,6 +2338,83 @@ fn source_selection_reports_lookup_and_receiver_failures_in_source_order() {
 }
 
 #[test]
+fn selected_binary_object_reads_the_array_then_the_signed_validity_byte() {
+    let source = memory();
+    let destination = MemoryBudget::new(0);
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(-1), true, &source);
+    output.ensure_capacity(1).unwrap();
+    let captured = output.finish().unwrap();
+    let capacity = storage(&captured).validity.as_ref().unwrap().bytes.as_slice().len();
+    let outside_bitmap = i32::try_from(capacity).unwrap() * 8;
+    let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+    let indices = [0, -1, outside_bitmap];
+    let selected = reader.select(&indices).unwrap();
+
+    read_reference(selected.binary_object(-1, &destination).unwrap(),
+        SourceScalarReadFailure::SelectionIndexBounds { index: -1, length: 3 });
+    assert!(selected.binary_object(0, &destination).unwrap().unwrap().is_none());
+    read_reference(selected.binary_object(1, &destination).unwrap(),
+        SourceScalarReadFailure::ValidityByteBounds { offset: -1, capacity });
+    read_reference(selected.binary_object(2, &destination).unwrap(),
+        SourceScalarReadFailure::ValidityByteBounds { offset: outside_bitmap >> 3, capacity });
+    assert_eq!(destination.peak_bytes(), 0);
+
+    let time = writer(SourceScalarDeclaration::Time32(TimeUnit::Second), false, &source);
+    let reader = time.source_reader().unwrap().unwrap();
+    let selected = reader.select(&[0]).unwrap();
+    read_reference(selected.binary_object(1, &destination).unwrap(),
+        SourceScalarReadFailure::SelectionIndexBounds { index: 1, length: 1 });
+    assert!(selected.binary_object(0, &destination).is_none());
+    drop((captured, time));
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn selected_binary_object_owns_the_result_after_its_captured_source_drops() {
+    let source = memory();
+    let destination = MemoryBudget::new(4096 + 4 * 4);
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(4), true, &source);
+    output.write_null().unwrap();
+    output.write_bytes(&[3, 1, 4, 1]).unwrap();
+    let captured = output.finish().unwrap();
+    let value = {
+        let indices = [1, 0, 1];
+        let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+        let selected = reader.select(&indices).unwrap();
+        let value = selected.binary_object(2, &destination).unwrap().unwrap().unwrap();
+        assert!(selected.binary_object(1, &destination).unwrap().unwrap().is_none());
+        let Some(Err(SourceScalarReadError::Native(error))) = selected.binary_object(0, &destination) else {
+            panic!("expected destination admission failure");
+        };
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        value
+    };
+    drop(captured);
+    assert_eq!(source.used_bytes(), 0);
+    assert_eq!(value.value(), &Value::FixedSizeBinary(vec![3, 1, 4, 1]));
+    assert_eq!(destination.used_bytes(), destination.limit_bytes());
+    drop(value);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
+fn selected_uuid_checks_validity_before_its_second_relative_read() {
+    let source = memory();
+    let destination = memory();
+    let mut output = writer(SourceScalarDeclaration::Uuid { inner_width: 12 }, true, &source);
+    output.write_null().unwrap();
+    output.write_bytes(&[42; 12]).unwrap();
+    let captured = output.finish().unwrap();
+    let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+    let selected = reader.select(&[0, 1]).unwrap();
+    assert!(selected.binary_object(0, &destination).unwrap().unwrap().is_none());
+    assert_eq!(destination.peak_bytes(), 0);
+    read_reference(selected.binary_object(1, &destination).unwrap(), SourceScalarReadFailure::UuidSecondLongUnderflow);
+    assert_eq!(destination.peak_bytes(), 4096 + 4 * 12);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
 fn source_selection_pointer_reuse_keeps_both_owners_and_outlives_the_selector() {
     let memory = memory();
     let mut int = ScalarWriter::source_int_arrow19_default("seed", false, 1, Arc::clone(&memory)).unwrap();

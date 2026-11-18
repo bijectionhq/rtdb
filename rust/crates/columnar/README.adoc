@@ -375,6 +375,9 @@ Copy denial, underflow and result denial release their admitted temporary owners
 
 `binary_object` checks the retained validity bitmap before calling the raw FixedBinary or UUID materialization.
 A first signed Slice translates the row before that same check.
+A first explicit selection reads its array slot before forwarding the stored signed row.
+An invalid slot reports a selection bounds failure before the inner reader is reached.
+A valid slot can yield a null, an owned binary value, an inner read error or binary capability absence.
 The Arrow 19 enabled-bounds profile reads the signed byte index `row >> 3` before selecting bit `row & 7`.
 If that byte lies outside the retained bitmap, the reader returns its typed validity-byte bounds failure.
 A zero bit returns null without payload demand or destination admission.

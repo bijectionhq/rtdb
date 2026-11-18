@@ -224,6 +224,14 @@ impl<'a> SourceScalarSelection<'a, '_> {
         self.inner.get_bytes(self.index(row)?)
     }
 
+    pub(crate) fn binary_object(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> Option<SourceScalarReadResult<Option<OwnedValue>>> {
+        let index = match self.index(row) {
+            Ok(index) => index,
+            Err(error) => return Some(Err(error)),
+        };
+        self.inner.binary_object(index, memory)
+    }
+
     pub(crate) fn get_pointer(&self, row: i32) -> SourceScalarReadResult<SourceBytePointer<'a>> {
         Ok(self.inner.get_pointer(self.index(row)?))
     }
