@@ -335,6 +335,7 @@ impl<C: ConsumerContext> RetainedConsumerMessage<C> {
         })
     }
 
+    /// Borrows the message for the lifetime of this retained owner.
     pub fn as_borrowed(&self) -> &BorrowedMessage<'_> {
         &self.message
     }
