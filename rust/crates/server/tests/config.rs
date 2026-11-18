@@ -115,3 +115,12 @@ fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
     assert!(options.read_only);
     assert!(config.node_options(1024).is_err());
 }
+
+#[test]
+fn an_out_of_range_listener_port_is_the_reference_illegal_argument() {
+    for (yaml, port) in [("server: {port: 99999}", 99999), ("flightSql: {port: -2}", -2), ("healthz: {port: 65536}", 65536)] {
+        let error = decode(yaml).unwrap_err();
+        assert_eq!((error.code.as_str(), error.message), ("xtdb.error/illegal-arg", Some(format!("Port value out of range: {port}"))), "{yaml}");
+    }
+    assert!(decode("server: {port: -1}").is_ok());
+}

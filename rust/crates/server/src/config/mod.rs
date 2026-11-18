@@ -252,7 +252,7 @@ fn bind_host(fields: &mut YamlFields) -> Result<String> {
 fn env_boolean(environment: &impl Fn(&str) -> Option<String>, key: &str) -> bool { environment(key).is_some_and(|value| value.eq_ignore_ascii_case("true")) }
 fn decode_port(fields: &mut YamlFields, key: &str, default: i32) -> Result<i32> {
     let port = fields.integer(key)?.unwrap_or(default);
-    if !(-1..=65535).contains(&port) { return Err(invalid(format!("{key} must be between -1 and 65535"))); }
+    if !(-1..=65535).contains(&port) { return Err(Anomaly::incorrect("xtdb.error/illegal-arg", format!("Port value out of range: {port}")).with_context("key", key.into())); }
     Ok(port)
 }
 fn positive(value: i64, key: &str) -> Result<usize> { usize::try_from(value).ok().filter(|value| *value > 0).ok_or_else(|| invalid(format!("{key} must be positive"))) }
