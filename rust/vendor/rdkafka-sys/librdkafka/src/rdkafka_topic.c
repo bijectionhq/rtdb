@@ -2122,6 +2122,7 @@ void rd_ut_kafka_topic_set_topic_exists(rd_kafka_topic_t *rkt,
                                                   (char *)rkt->rkt_topic->str,
                                               .partition_cnt = partition_cnt};
         rd_kafka_metadata_topic_internal_t mdit = {.partitions = partitions};
+        rd_kafka_metadata_cache_update_result_t cache_result;
         int i;
 
         mdt.partitions = rd_alloca(sizeof(*mdt.partitions) * partition_cnt);
@@ -2133,8 +2134,10 @@ void rd_ut_kafka_topic_set_topic_exists(rd_kafka_topic_t *rkt,
         }
 
         rd_kafka_wrlock(rkt->rkt_rk);
-        rd_kafka_metadata_cache_topic_update(rkt->rkt_rk, &mdt, &mdit, rd_true,
-                                             rd_false, rd_true);
+        cache_result = rd_kafka_metadata_cache_topic_update(
+            rkt->rkt_rk, &mdt, &mdit, rd_true, rd_false, rd_true);
+        rd_kafka_assert(rkt->rkt_rk,
+                         cache_result == RD_KAFKA_METADATA_CACHE_CHANGED);
         rd_kafka_topic_metadata_update(rkt, &mdt, &mdit, rd_clock());
         rd_kafka_wrunlock(rkt->rkt_rk);
         rd_free(partitions);

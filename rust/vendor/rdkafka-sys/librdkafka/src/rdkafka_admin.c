@@ -9810,3 +9810,5 @@ void rd_kafka_ElectLeaders(rd_kafka_t *rk,
 /**@}*/
 
 #include "rdkafka_metadata_admin_account_test.h"
+
+#include "rdkafka_metadata_cache_admission_admin_test.h"

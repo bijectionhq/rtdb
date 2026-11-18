@@ -953,6 +953,7 @@ rd_kafka_parse_Metadata0(rd_kafka_broker_t *rkb,
         rd_kafka_metadata_decommission_unavailable_brokers(rk, md, rkb);
 
         for (i = 0; i < md->topic_cnt; i++) {
+                rd_kafka_metadata_cache_update_result_t cache_result;
 
                 /* Ignore topics in blacklist */
                 if (rkb->rkb_rk->rk_conf.topic_blacklist &&
@@ -996,7 +997,7 @@ rd_kafka_parse_Metadata0(rd_kafka_broker_t *rkb,
                  * for all topics or cache entry
                  * already exists. */
                 rd_kafka_wrlock(rk);
-                cache_changes += rd_kafka_metadata_cache_topic_update(
+                cache_result = rd_kafka_metadata_cache_topic_update(
                     rk, &md->topics[i], &mdi->topics[i],
                     rd_false /*propagate later*/,
                     /* use has_client_rack rather than
@@ -1006,6 +1007,12 @@ rd_kafka_parse_Metadata0(rd_kafka_broker_t *rkb,
                     (KIP-881). */
                     has_client_rack, rd_kafka_has_reliable_leader_epochs(rkb));
                 rd_kafka_wrunlock(rk);
+                if (cache_result == RD_KAFKA_METADATA_CACHE_DENIED) {
+                        err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+                        goto err;
+                }
+                cache_changes +=
+                    cache_result == RD_KAFKA_METADATA_CACHE_CHANGED;
         }
 
         /* Requested topics not seen in metadata? Propogate to topic code. */
@@ -1202,6 +1209,13 @@ err:
                 rd_kafka_metadata_cache_purge_hints_by_id(rk,
                                                           requested_topic_ids);
                 rd_kafka_wrunlock(rkb->rkb_rk);
+        }
+
+        if (cache_changes) {
+                rd_kafka_wrlock(rk);
+                rd_kafka_metadata_cache_propagate_changes(rk);
+                rd_kafka_metadata_cache_expiry_start(rk);
+                rd_kafka_wrunlock(rk);
         }
 
         if (missing_topics)

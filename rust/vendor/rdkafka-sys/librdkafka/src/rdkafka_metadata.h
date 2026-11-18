@@ -223,6 +223,8 @@ rd_kafka_metadata_new_topic_with_partition_replicas_mock(int replication_factor,
  */
 
 struct rd_kafka_metadata_cache_entry {
+        rd_kafka_byte_account_t *rkmce_byte_account;
+        size_t rkmce_byte_charge;
         rd_avl_node_t rkmce_avlnode;       /* rkmc_avl */
         rd_avl_node_t rkmce_avlnode_by_id; /* rkmc_avl_by_id */
         TAILQ_ENTRY(rd_kafka_metadata_cache_entry) rkmce_link; /* rkmc_expiry */
@@ -279,12 +281,18 @@ int rd_kafka_metadata_cache_delete_by_topic_id(rd_kafka_t *rk,
                                                const rd_kafka_Uuid_t topic_id);
 void rd_kafka_metadata_cache_expiry_start(rd_kafka_t *rk);
 int rd_kafka_metadata_cache_purge_all_hints(rd_kafka_t *rk);
-int rd_kafka_metadata_cache_topic_update(
+typedef enum {
+        RD_KAFKA_METADATA_CACHE_UNCHANGED = 0,
+        RD_KAFKA_METADATA_CACHE_CHANGED = 1,
+        RD_KAFKA_METADATA_CACHE_DENIED = 2
+} rd_kafka_metadata_cache_update_result_t;
+
+rd_kafka_metadata_cache_update_result_t rd_kafka_metadata_cache_topic_update(
     rd_kafka_t *rk,
     const rd_kafka_metadata_topic_t *mdt,
     const rd_kafka_metadata_topic_internal_t *mdit,
     rd_bool_t propagate,
-    rd_bool_t include_metadata,
+    rd_bool_t include_racks,
     rd_bool_t has_reliable_leader_epochs);
 void rd_kafka_metadata_cache_propagate_changes(rd_kafka_t *rk);
 struct rd_kafka_metadata_cache_entry *

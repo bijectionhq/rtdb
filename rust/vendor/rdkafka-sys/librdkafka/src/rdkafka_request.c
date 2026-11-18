@@ -6999,3 +6999,5 @@ int unittest_request(void) {
 }
 
 /**@}*/
+
+#include "rdkafka_metadata_cache_admission_response_test.h"

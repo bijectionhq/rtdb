@@ -98,7 +98,8 @@ The caller owns the topic-input array, any application result, and runtime timer
 
 The attached account also tracks ApiVersions handshake request buffers and the broker's decoded and fallback array payloads through their respective final release.
 The ordinary Metadata parser admits its contiguous response arena before allocation and keeps that charge with the arena after transfer.
-Native client construction, bootstrap and discovered broker growth, broker threads and stacks, Metadata cache entries, independent clones, rack scratch, admin output copies, ApiVersions sort storage, TLS/SASL, ordinary outbound requests, allocator overhead and the monitor require separate bounds.
+Retained native topic-cache arenas also acquire the actual client account before allocation and release it at their common final free.
+Native client construction, bootstrap and discovered broker growth, broker threads and stacks, independent clones, rack scratch, admin output copies, ApiVersions sort storage, TLS/SASL, ordinary outbound requests, allocator overhead and the monitor require separate bounds.
 A whole-producer bound still requires a separately pre-admitted construction/background domain or admission interception for every reachable owner in that domain.
 Neither the completion cap nor borrowed validation establishes that bound.
 Java snapshot retention and partial/full merge, UUID/leader-epoch state, HashMap encounter order, metadata refresh/throttle scheduling, per-topic signed RoundRobin counters and once-per-send explicit partition binding remain separate integration work.
@@ -168,7 +169,7 @@ Snapshots from different broker actors are not one serialized NetworkClient scan
 The pinned NetworkClient/ClusterConnectionStates/InFlightRequests/Selector sources require Java random, throttle, channel, send-completion and reconnect chronology observations that these native facts alone do not establish.
 This transport does not implement ConnectionObservations or replace any missing Java observation with a guessed false, zero, native jitter or native count.
 The producer updater owns their qualification and remains a separate activation boundary.
-Client/broker construction and background memory, other controls, DNS/TLS/SASL machinery, native caches and allocator overhead still require their own admission proof.
+Client/broker construction and background memory, other controls, DNS/TLS/SASL machinery, native cache scratch and independent clones, and allocator overhead still require their own admission proof.
 The fixed observation/control charges do not close whole-native, source-completeness or Phase2 gates.
 
 Additive native sources cover serial exhaustion, half-allocation cleanup, cancellation/publication, exact-owner/epoch/socket fences and a real broker decommission while its ready observation remains retained.
@@ -189,8 +190,42 @@ Rack-aware topic-info copies initialize a zero rack count for every partition wi
 Those fixtures use existing native actor queues and client teardown rather than fabricated actor identities or abandoned thread handles.
 The source fixtures have not been compiled or executed.
 
-Cache entry arenas still have no automatic byte admission.
-Retained payloads and source padding/slack must be admitted together, including old/new replacement overlap, in a later source slice.
+Each cache entry is one passive client-owned arena with its own account pointer and exact allocation charge.
+Full and reliable-merge sizing checks multiplication, eight-byte rounding and total addition before admission or allocation.
+The charge covers the entry, copied topic name, physical public/internal partition arrays and every retained rack, replica and ISR extent with its individual padding.
+The reliable merge retains its original extra root seed and maximum physical extent even when the new logical partition count is smaller.
+Zero-count pointer presence retains its source geometry without adding a payload extent.
+An accounted allocation uses fallible malloc and releases admission on failure.
+The builder borrows the allocator for one call.
+
+A replacement admits all new storage while the old arena is still live and charged.
+Admission or allocation denial returns the typed DENIED outcome before changing the old name/UUID indexes, expiry links, timestamps or payload.
+Successful construction assigns the new arena to the actual client account rather than copying a lease from its source entry.
+Replacement, explicit deletion, expiry, hint purge and client teardown all free the arena before releasing its charge through the common destructor.
+Cache purge and final destruction precede the client's account detach.
+The account guard's final drain covers these retained arenas.
+
+The shared ordinary/admin parser maps cache denial to CRIT_SYS_RESOURCE and returns no parsed Metadata owner.
+Broker inventory changes and earlier topic/cache updates have already happened.
+The denied topic's live-topic update precedes its failed cache construction, so that topic may have new live state beside its previous valid cache entry.
+Live topics copy timestamps, errors, states, UUIDs and leader/epoch integers, allocate their own partition owners and retain broker references explicitly.
+The error path purges requested hints, wakes observers and schedules expiry for any earlier accepted cache writes, then releases the parsed arena.
+It skips later successful-response freshness, controller, cluster and group stages.
+The ordinary response handler reports the original permanent resource error to its requesting op, and both admin parsers return it before output projection.
+Independent admin/assignor/topic-info clones and live-topic growth still need their own admission.
+
+Hint storage is optional suppression state.
+A denied eligible topic still enters a nonnull query destination, and the returned hint count includes only installed arenas.
+Denied upgrades preserve the existing NOENT or WAIT_CACHE value and expiry facts.
+Callers without a query destination rely on their retained topic or subscription interest for a later attempt.
+Accepted hints in a mixed batch remain installed when a later hint is denied.
+
+Seven additive direct source fixtures cover checked layout, exact and one-byte-short bounds, fallible allocation rollback, account provenance, old/new overlap, zero-length geometry, mixed hint denial and final disposal routes.
+Two ordinary-handler cases and four actual admin-parser cases exercise denial on the first or second topic after the response arena has been admitted.
+They check the original error, empty output, requested-hint cleanup, earlier cache retention, observer delivery, expiry scheduling, skipped freshness and final account balance.
+The deterministic fixtures own their caller-thread identity, native locks, timers, queues and account directly.
+A Rust source dispatcher registers this native slice.
+Cache scratch, independent clones and other native owners require separate admission.
 
 The lightweight topic conversion acquires the client write lock before looking up or creating a proper topic.
 The constructor holds it through local topic publication, cache lookup and initialization from the cached entry.

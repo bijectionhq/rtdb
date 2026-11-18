@@ -20,7 +20,10 @@ Initial and downgraded ApiVersions requests admit their contiguous frame and buf
 Their charge persists to final buffer release, including overlap with an earlier request during a downgrade.
 It does not establish a complete producer allocation bound.
 Ordinary Metadata responses admit the contiguous parsed arena and keep its charge through the last native or Rust result owner.
-Client and broker construction, overlapping broker threads and stacks, Metadata cache entries, independent clones, rack scratch, admin output copies, ApiVersions sort internals, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require separate admission bounds.
+Retained ordinary Metadata cache arenas admit their complete root, copied payloads, padding and reliable-merge slack on that same account before allocation.
+Replacement admits the new arena while the old one remains charged, and common final destruction frees each arena before releasing its charge.
+A denied cache replacement preserves its old entry and propagates the native resource error after any broker and live-topic updates already completed.
+Client and broker construction, overlapping broker threads and stacks, live-topic storage, independent clones, rack scratch, admin output copies, ApiVersions sort internals, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require separate admission bounds.
 The Settings method names the native byte capacity rather than claiming that the formula bounds those excluded owners.
 Java partitioner class validation and actual partition-selection integration retain their existing boundaries.
 

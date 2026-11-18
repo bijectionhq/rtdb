@@ -70,6 +70,14 @@
 
 
 
+static void rd_kafka_metadata_cache_entry_destroy(
+    struct rd_kafka_metadata_cache_entry *entry) {
+        rd_kafka_byte_account_t *account = entry->rkmce_byte_account;
+        size_t charge = entry->rkmce_byte_charge;
+        rd_free(entry);
+        rd_kafka_byte_account_release(account, charge);
+}
+
 /**
  * @brief Remove and free cache entry.
  *
@@ -92,7 +100,7 @@ rd_kafka_metadata_cache_delete(rd_kafka_t *rk,
         rd_kafka_assert(NULL, rk->rk_metadata_cache.rkmc_cnt > 0);
         rk->rk_metadata_cache.rkmc_cnt--;
 
-        rd_free(rkmce);
+        rd_kafka_metadata_cache_entry_destroy(rkmce);
 }
 
 /**
@@ -252,19 +260,95 @@ int rd_kafka_metadata_partition_id_cmp(const void *_a, const void *_b) {
         return RD_CMP(a->id, b->id);
 }
 
-/**
- * @brief Creates a new metadata cache entry.
- *
- * @param mdt Topic to insert in the cache entry.
- * @param mdti Topic to insert in the cache entry (internal structure).
- *
- * @return The new metadata cache entry, to free with `rd_free`.
- */
-static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_entry_new(
+static rd_bool_t rd_kafka_metadata_cache_size_add(size_t *total,
+                                                   size_t width,
+                                                   size_t count) {
+        size_t bytes, aligned;
+        if (width && count > SIZE_MAX / width)
+                return rd_false;
+        bytes = width * count;
+        if (bytes > SIZE_MAX - 7)
+                return rd_false;
+        aligned = RD_ROUNDUP(bytes, 8);
+        if (*total > SIZE_MAX - aligned)
+                return rd_false;
+        *total += aligned;
+        return rd_true;
+}
+
+static rd_bool_t rd_kafka_metadata_cache_string_size_add(size_t *total,
+                                                          const char *value) {
+        size_t length = strlen(value);
+        return length != SIZE_MAX &&
+               rd_kafka_metadata_cache_size_add(total, 1, length + 1);
+}
+
+static rd_bool_t rd_kafka_metadata_cache_full_size(
+    const rd_kafka_metadata_topic_t *topic,
+    const rd_kafka_metadata_topic_internal_t *internal,
+    size_t *size) {
+        size_t total = 0;
+        int i;
+        if (!topic->topic || topic->partition_cnt < 0 ||
+            (topic->partition_cnt &&
+             (!topic->partitions || !internal->partitions)) ||
+            !rd_kafka_metadata_cache_size_add(
+                &total, sizeof(struct rd_kafka_metadata_cache_entry), 1) ||
+            !rd_kafka_metadata_cache_string_size_add(&total, topic->topic) ||
+            !rd_kafka_metadata_cache_size_add(
+                &total, sizeof(*topic->partitions), topic->partition_cnt) ||
+            !rd_kafka_metadata_cache_size_add(
+                &total, sizeof(*internal->partitions), topic->partition_cnt))
+                return rd_false;
+        for (i = 0; i < topic->partition_cnt; i++) {
+                size_t j;
+                const rd_kafka_metadata_partition_internal_t *part =
+                    &internal->partitions[i];
+                if (!part->racks) {
+                        if (part->racks_cnt)
+                                return rd_false;
+                        continue;
+                }
+                if (!rd_kafka_metadata_cache_size_add(
+                        &total, sizeof(*part->racks), part->racks_cnt))
+                        return rd_false;
+                for (j = 0; j < part->racks_cnt; j++)
+                        if (!rd_kafka_metadata_cache_string_size_add(
+                                &total, part->racks[j]))
+                                return rd_false;
+        }
+        *size = total;
+        return rd_true;
+}
+
+static rd_bool_t rd_kafka_metadata_cache_arena_allocate(
+    rd_tmpabuf_t *buffer,
+    rd_kafka_byte_account_t *account,
+    size_t size,
+    void *(*allocate)(size_t)) {
+        rd_tmpabuf_new(buffer, 0, rd_true);
+        if (size < sizeof(struct rd_kafka_metadata_cache_entry) || (size & 7))
+                return rd_false;
+        buffer->size = size;
+        if (!rd_kafka_byte_account_acquire(account, size))
+                return rd_false;
+        buffer->buf = account ? allocate(size) : rd_malloc(size);
+        if (!buffer->buf) {
+                rd_kafka_byte_account_release(account, size);
+                return rd_false;
+        }
+        return rd_true;
+}
+
+static struct rd_kafka_metadata_cache_entry *
+rd_kafka_metadata_cache_entry_new_accounted(
+    rd_kafka_byte_account_t *account,
     const rd_kafka_metadata_topic_t *mtopic,
-    const rd_kafka_metadata_topic_internal_t *metadata_internal_topic) {
+    const rd_kafka_metadata_topic_internal_t *metadata_internal_topic,
+    void *(*allocate)(size_t)) {
         struct rd_kafka_metadata_cache_entry *rkmce;
         rd_tmpabuf_t tbuf;
+        size_t size;
         int i;
 
         /* Metadata is stored in one contigious buffer where structs and
@@ -274,36 +358,14 @@ static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_entry_new(
          * any pointer fields needs to be copied explicitly to update
          * the pointer address.
          * See also rd_kafka_metadata_cache_delete which frees this. */
-        rd_tmpabuf_new(&tbuf, 0, rd_true /*assert on fail*/);
-
-        rd_tmpabuf_add_alloc(&tbuf, sizeof(*rkmce));
-        rd_tmpabuf_add_alloc(&tbuf, strlen(mtopic->topic) + 1);
-        rd_tmpabuf_add_alloc(&tbuf, mtopic->partition_cnt *
-                                        sizeof(*mtopic->partitions));
-        rd_tmpabuf_add_alloc(&tbuf,
-                             mtopic->partition_cnt *
-                                 sizeof(*metadata_internal_topic->partitions));
-
-        for (i = 0; i < mtopic->partition_cnt; i++) {
-                size_t j;
-                if (!metadata_internal_topic->partitions[i].racks)
-                        continue;
-                rd_tmpabuf_add_alloc(
-                    &tbuf, metadata_internal_topic->partitions[i].racks_cnt *
-                               sizeof(char *));
-                for (j = 0;
-                     j < metadata_internal_topic->partitions[i].racks_cnt;
-                     j++) {
-                        rd_tmpabuf_add_alloc(
-                            &tbuf, strlen(metadata_internal_topic->partitions[i]
-                                              .racks[j]) +
-                                       1);
-                }
-        }
-
-        rd_tmpabuf_finalize(&tbuf);
+        if (!rd_kafka_metadata_cache_full_size(
+                mtopic, metadata_internal_topic, &size) ||
+            !rd_kafka_metadata_cache_arena_allocate(&tbuf, account, size, allocate))
+                return NULL;
 
         rkmce = rd_tmpabuf_alloc(&tbuf, sizeof(*rkmce));
+        rkmce->rkmce_byte_account = account;
+        rkmce->rkmce_byte_charge = account ? size : 0;
 
         rkmce->rkmce_mtopic = *mtopic;
 
@@ -354,6 +416,13 @@ static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_entry_new(
         }
 
         return rkmce;
+}
+
+static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_entry_new(
+    const rd_kafka_metadata_topic_t *topic,
+    const rd_kafka_metadata_topic_internal_t *internal) {
+        return rd_kafka_metadata_cache_entry_new_accounted(NULL, topic, internal,
+                                                            malloc);
 }
 
 /**
@@ -419,7 +488,10 @@ static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_insert_new(
     rd_ts_t now,
     rd_ts_t ts_expires) {
         struct rd_kafka_metadata_cache_entry *rkmce =
-            rd_kafka_metadata_cache_entry_new(mtopic, metadata_internal_topic);
+            rd_kafka_metadata_cache_entry_new_accounted(
+                rk->rk_byte_account, mtopic, metadata_internal_topic, malloc);
+        if (!rkmce)
+                return NULL;
         return rd_kafka_metadata_cache_insert(rk, rkmce, now, ts_expires);
 }
 
@@ -476,35 +548,32 @@ void rd_kafka_metadata_cache_expiry_start(rd_kafka_t *rk) {
                              (current_partition.leader_epoch));
 
 
-static struct rd_kafka_metadata_cache_entry *
-rd_kafka_metadata_cache_topic_update_merge_partitions(
-    rd_kafka_t *rk,
+static rd_bool_t rd_kafka_metadata_cache_merge_size(
     struct rd_kafka_metadata_cache_entry *rkmce_current,
     const rd_kafka_metadata_topic_t *mdt,
     const rd_kafka_metadata_topic_internal_t *mdti,
     rd_bool_t include_racks,
-    rd_bool_t has_reliable_epochs) {
-        rd_tmpabuf_t tbuf;
-        struct rd_kafka_metadata_cache_entry *rkmce;
+    size_t *size) {
+        size_t total = 0;
         size_t i, current_partition_cnt, new_partition_cnt, partition_cnt;
-
-        if (!has_reliable_epochs || !rkmce_current ||
-            rd_kafka_Uuid_cmp(
-                mdti->topic_id,
-                rkmce_current->rkmce_metadata_internal_topic.topic_id) != 0) {
-                return rd_kafka_metadata_cache_entry_new(mdt, mdti);
-        }
-
+        if (!mdt->topic || mdt->partition_cnt < 0 ||
+            rkmce_current->rkmce_mtopic.partition_cnt < 0)
+                return rd_false;
         current_partition_cnt = rkmce_current->rkmce_mtopic.partition_cnt;
         new_partition_cnt     = mdt->partition_cnt;
         partition_cnt = RD_MAX(current_partition_cnt, new_partition_cnt);
-
-        rd_tmpabuf_new(&tbuf, sizeof(*rkmce), rd_true /*assert on fail*/);
-        rd_tmpabuf_add_alloc(&tbuf, sizeof(*rkmce));
-        rd_tmpabuf_add_alloc(&tbuf, strlen(mdt->topic) + 1);
-        rd_tmpabuf_add_alloc(&tbuf, partition_cnt * sizeof(*mdt->partitions));
-        rd_tmpabuf_add_alloc(&tbuf, partition_cnt * sizeof(*mdti->partitions));
-
+        if ((current_partition_cnt &&
+             (!rkmce_current->rkmce_mtopic.partitions ||
+              !rkmce_current->rkmce_metadata_internal_topic.partitions)) ||
+            (new_partition_cnt && (!mdt->partitions || !mdti->partitions)) ||
+            !rd_kafka_metadata_cache_size_add(&total, sizeof(*rkmce_current), 1) ||
+            !rd_kafka_metadata_cache_size_add(&total, sizeof(*rkmce_current), 1) ||
+            !rd_kafka_metadata_cache_string_size_add(&total, mdt->topic) ||
+            !rd_kafka_metadata_cache_size_add(
+                &total, sizeof(*mdt->partitions), partition_cnt) ||
+            !rd_kafka_metadata_cache_size_add(
+                &total, sizeof(*mdti->partitions), partition_cnt))
+                return rd_false;
         for (i = 0; i < partition_cnt; i++) {
                 size_t j;
                 const rd_kafka_metadata_partition_t *partition;
@@ -524,25 +593,64 @@ rd_kafka_metadata_cache_topic_update_merge_partitions(
                 partition = replace_partition
                                 ? &mdt->partitions[i]
                                 : &rkmce_current->rkmce_mtopic.partitions[i];
-                if (partition->replicas)
-                        rd_tmpabuf_add_alloc(
-                            &tbuf, partition->replica_cnt * sizeof(*partition->replicas));
-                if (partition->isrs)
-                        rd_tmpabuf_add_alloc(
-                            &tbuf, partition->isr_cnt * sizeof(*partition->isrs));
+                if (partition->replica_cnt < 0 || partition->isr_cnt < 0 ||
+                    (partition->replica_cnt && !partition->replicas) ||
+                    (partition->isr_cnt && !partition->isrs))
+                        return rd_false;
+                if (partition->replicas &&
+                    !rd_kafka_metadata_cache_size_add(
+                        &total, sizeof(*partition->replicas),
+                        partition->replica_cnt))
+                        return rd_false;
+                if (partition->isrs &&
+                    !rd_kafka_metadata_cache_size_add(
+                        &total, sizeof(*partition->isrs), partition->isr_cnt))
+                        return rd_false;
                 if (!include_racks)
                         continue;
-                rd_tmpabuf_add_alloc(&tbuf, partition_internal->racks_cnt *
-                                                sizeof(char *));
+                if ((partition_internal->racks_cnt && !partition_internal->racks) ||
+                    !rd_kafka_metadata_cache_size_add(
+                        &total, sizeof(char *), partition_internal->racks_cnt))
+                        return rd_false;
                 for (j = 0; j < partition_internal->racks_cnt; j++) {
-                        rd_tmpabuf_add_alloc(
-                            &tbuf, strlen(partition_internal->racks[j]) + 1);
+                        if (!rd_kafka_metadata_cache_string_size_add(
+                                &total, partition_internal->racks[j]))
+                                return rd_false;
                 }
         }
+        *size = total;
+        return rd_true;
+}
 
-        rd_tmpabuf_finalize(&tbuf);
+static struct rd_kafka_metadata_cache_entry *
+rd_kafka_metadata_cache_topic_update_merge_partitions0(
+    rd_kafka_t *rk,
+    struct rd_kafka_metadata_cache_entry *rkmce_current,
+    const rd_kafka_metadata_topic_t *mdt,
+    const rd_kafka_metadata_topic_internal_t *mdti,
+    rd_bool_t include_racks,
+    rd_bool_t has_reliable_epochs,
+    void *(*allocate)(size_t)) {
+        rd_tmpabuf_t tbuf;
+        struct rd_kafka_metadata_cache_entry *rkmce;
+        size_t size, i, current_partition_cnt, new_partition_cnt, partition_cnt;
+        if (!has_reliable_epochs || !rkmce_current ||
+            rd_kafka_Uuid_cmp(mdti->topic_id,
+                rkmce_current->rkmce_metadata_internal_topic.topic_id) != 0)
+                return rd_kafka_metadata_cache_entry_new_accounted(
+                    rk->rk_byte_account, mdt, mdti, allocate);
+        if (!rd_kafka_metadata_cache_merge_size(rkmce_current, mdt, mdti,
+                                                include_racks, &size) ||
+            !rd_kafka_metadata_cache_arena_allocate(&tbuf, rk->rk_byte_account,
+                                                     size, allocate))
+                return NULL;
+        current_partition_cnt = rkmce_current->rkmce_mtopic.partition_cnt;
+        new_partition_cnt = mdt->partition_cnt;
+        partition_cnt = RD_MAX(current_partition_cnt, new_partition_cnt);
 
         rkmce = rd_tmpabuf_alloc(&tbuf, sizeof(*rkmce));
+        rkmce->rkmce_byte_account = rk->rk_byte_account;
+        rkmce->rkmce_byte_charge = rk->rk_byte_account ? size : 0;
 
         rkmce->rkmce_mtopic = *mdt;
 
@@ -613,6 +721,18 @@ rd_kafka_metadata_cache_topic_update_merge_partitions(
         return rkmce;
 }
 
+static struct rd_kafka_metadata_cache_entry *
+rd_kafka_metadata_cache_topic_update_merge_partitions(
+    rd_kafka_t *rk,
+    struct rd_kafka_metadata_cache_entry *current,
+    const rd_kafka_metadata_topic_t *topic,
+    const rd_kafka_metadata_topic_internal_t *internal,
+    rd_bool_t include_racks,
+    rd_bool_t reliable_epochs) {
+        return rd_kafka_metadata_cache_topic_update_merge_partitions0(
+            rk, current, topic, internal, include_racks, reliable_epochs, malloc);
+}
+
 /**
  * @brief Update the metadata cache for a single topic
  *        with the provided metadata.
@@ -636,14 +756,16 @@ rd_kafka_metadata_cache_topic_update_merge_partitions(
  * @param has_reliable_leader_epochs Comes from a broker with reliable leader
  * epochs.
  *
- * @return 1 on metadata change, 0 when no change was applied
+ * @return CHANGED after an update/removal, UNCHANGED when no update applies,
+ *         or DENIED if the proposed arena cannot be admitted or allocated.
+ *         DENIED leaves any existing entry unchanged.
  *
  * @remark The cache expiry timer will not be updated/started,
  *         call rd_kafka_metadata_cache_expiry_start() instead.
  *
  * @locks rd_kafka_wrlock()
  */
-int rd_kafka_metadata_cache_topic_update(
+rd_kafka_metadata_cache_update_result_t rd_kafka_metadata_cache_topic_update(
     rd_kafka_t *rk,
     const rd_kafka_metadata_topic_t *mdt,
     const rd_kafka_metadata_topic_internal_t *mdti,
@@ -691,6 +813,8 @@ int rd_kafka_metadata_cache_topic_update(
                             rd_kafka_metadata_cache_topic_update_merge_partitions(
                                 rk, rkmce_current, mdt, &mdti_copy,
                                 include_racks, has_reliable_leader_epochs);
+                        if (!rkmce)
+                                return RD_KAFKA_METADATA_CACHE_DENIED;
                         /* Insert/replace entry */
                         rd_kafka_metadata_cache_insert(rk, rkmce, now,
                                                        ts_expires);
@@ -709,7 +833,8 @@ int rd_kafka_metadata_cache_topic_update(
         if (changed && propagate)
                 rd_kafka_metadata_cache_propagate_changes(rk);
 
-        return changed;
+        return changed ? RD_KAFKA_METADATA_CACHE_CHANGED
+                       : RD_KAFKA_METADATA_CACHE_UNCHANGED;
 }
 
 
@@ -792,13 +917,13 @@ void rd_kafka_metadata_cache_purge_hints_by_id(rd_kafka_t *rk,
  * @remark These non-valid cache entries' expire time is set to the
  *         MetadataRequest timeout.
  *
- * @param dst rd_list_t(char *topicname): if not NULL: populated with
- *        topics that were added as hints to cache, e.q., topics to query.
- * @param dst rd_list_t(char *topicname)
+ * @param dst Optional rd_list_t(char *) receiving owned eligible query names,
+ *            including names whose hint admission is denied.
+ *            The caller frees the appended strings.
  * @param err is the error to set on hint cache entries,
  *            typically ERR__WAIT_CACHE.
  *
- * @returns the number of topic hints inserted.
+ * @returns the number of hint arenas installed.
  *
  * @locks_required rd_kafka_wrlock()
  */
@@ -825,14 +950,12 @@ int rd_kafka_metadata_cache_hint(rd_kafka_t *rk,
                             (dst && rkmce->rkmce_mtopic.err !=
                                         RD_KAFKA_RESP_ERR__NOENT))
                                 continue;
-                        rkmce->rkmce_mtopic.err = err;
-                        /* FALLTHRU */
                 }
 
-                rd_kafka_metadata_cache_insert_new(rk, &mtopic,
+                if (rd_kafka_metadata_cache_insert_new(rk, &mtopic,
                                                    &metadata_internal_topic,
-                                                   now, ts_expires);
-                cnt++;
+                                                   now, ts_expires))
+                        cnt++;
 
                 if (dst)
                         rd_list_add(dst, rd_strdup(topic));
@@ -1185,3 +1308,5 @@ void rd_kafka_metadata_cache_dump(FILE *fp, rd_kafka_t *rk) {
 /**@}*/
 
 #include "rdkafka_metadata_cache_ownership_test.h"
+
+#include "rdkafka_metadata_cache_admission_test.h"
