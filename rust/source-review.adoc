@@ -1370,6 +1370,8 @@ The static expansion uses the referenced prefix and leaves a statement with miss
 A VALUES insert without a column list is also left for resolution and receives the planning diagnostics there.
 Submission admits the temporary SQL syntax estimate before lexing and holds it until the static plan has been consumed or discarded.
 The resolver attaches the original SQL to preparation and execution failures.
+The resolving transaction also admits an estimate before lowering each SQL mutation against its own snapshot.
+For a query-backed mutation, the plan receives its own charge before the temporary allowance releases for query execution.
 Invalid valid-time intervals retain typed instant bounds in the durable transaction error.
 Local and zoned timestamp casts from strings retain syntax diagnostics for a rejected field or parse position.
 Transaction resolution reports the typed table reference when it rejects a SQL mutation targeting a reserved table.
@@ -1394,7 +1396,10 @@ An unproved segment or a serving persisted trie disables logical IID pruning.
 Logical-key Bloom filtering remains available for persisted pages.
 Physical IID joins still use the stored bytes.
 A real source log fixture covers an explicit noncanonical IID, a later put under that same physical IID and both current and historical results before flush, after flush and after restart.
-Ordinary IID narrowing, broader metadata predicates and retained scan descriptor allocation remain open.
+Live and persisted scan page descriptors reserve capacity before allocation and retain that lease until the partition closes.
+The regression source checks refusal at replacement capacity before a data page is read, then closes a successful scan with the descriptor allowance released.
+Retained trie candidates and file descriptors, sorted live-leaf storage, temporal resolver scratch, and buffer-pool entry metadata still require admission work.
+Ordinary IID narrowing and broader metadata predicates remain open.
 
 Each reference control receipt binds the exact JVM runtime manifest, the verified runtime files and the artifact verifier source.
 Release comparison uses the ledger submitted to inventory reconciliation and retains the comparator process, input snapshots and report for each platform and native variant.
@@ -1420,11 +1425,12 @@ Flight SQL reserves memory before classifying the full SQL input and retains a c
 The embedded statement owns an admitted control or reserves its retained SQL text and bulk names before copying them.
 Its old source, plan and arguments survive a failed replacement.
 Pgwire Extended Parse retains an admitted direct control through its prepared statement owner, including a bound portal that outlives registration replacement.
+When the DBeaver namespace replacement increases the temporary syntax estimate, the extra reservation lasts through ordinary preparation.
 The first Extended lexical pass keeps full-input coordinates and the control grammar keeps bounded-range coordinates.
 Pgwire Simple Query admits token payloads and tokenizer scratch before scanning the full batch, while each parsed statement keeps its grammar reservation through preparation.
 Programmatic SQL preparation and query rebinding hold temporary lexer, grammar and binding admission through their prepared statement or plan ownership handoff.
 Native session SQL, stored transaction-result and role-membership reads keep that estimate through plan admission and release it before execution.
-Parser growth beyond the estimates, native mutation resolution and remaining execution ownership still require source work.
+Parser growth beyond the estimates and remaining execution ownership still require source work.
 Other adapter-specific receipt closures and complete assertion mappings still require source work.
 The full ledger and release matrix have no execution receipts from this source checkpoint.
 
