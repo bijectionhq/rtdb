@@ -43,7 +43,8 @@ fn decimal_vector_all_widths_retain_full_scale_across_buffered_and_streaming_ipc
             let mut sink = sink.finish().unwrap(); sink.seek(SeekFrom::Start(0)).unwrap();
             let mut actual = Vec::new(); sink.read_to_end(&mut actual).unwrap(); assert_eq!(actual, bytes);
             let bytes = ipc::write_stream(&schema, &pages).unwrap();
-            assert_eq!(ipc::write_stream_to(&schema, &pages, Vec::new()).unwrap(), bytes);
+            let mut streamed = ipc::ArrowStream::open(ipc::write_stream_to(&schema, &pages, Vec::new()).unwrap().into(), None).unwrap();
+            check(&streamed.next().unwrap().unwrap(), &ty, &values); check(&streamed.next().unwrap().unwrap(), &ty, &values); assert!(streamed.next().is_none());
             assert!(ipc::stream_allocation_bound(&bytes).unwrap() > bytes.len());
             let mut stream = ipc::ArrowStream::open(bytes.into(), None).unwrap();
             check(&stream.next().unwrap().unwrap(), &ty, &values); check(&stream.next().unwrap().unwrap(), &ty, &values); assert!(stream.next().is_none());

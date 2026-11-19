@@ -14,6 +14,7 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
 arrow-ipc.workspace = true
+flatbuffers = "=25.12.19"
 base64.workspace = true
 chrono.workspace = true
 half.workspace = true

@@ -59,16 +59,17 @@ impl DecodedDocumentLayout {
 }
 
 impl Documents {
+    /// Columns take the order the rows first name them, as the reference's relation builds its vectors.
     pub fn new(rows: Vec<StructFields<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut reservations = Vec::new();
         let mut names = BTreeSet::new();
+        let mut columns = Vec::new();
         for name in rows.iter().flat_map(|row| row.keys()) {
-            if !names.contains(name) {
+            if names.insert(name) {
                 reservations.push(memory.reserve(name.len().checked_add(128).ok_or_else(overflow)?)?);
-                names.insert(name);
+                columns.push(name.clone());
             }
         }
-        let columns = names.into_iter().cloned().collect();
         Self::with_column_order(rows, columns, memory)
     }
 

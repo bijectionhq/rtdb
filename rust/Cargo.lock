@@ -3947,6 +3947,7 @@ dependencies = [
  "arrow-schema",
  "base64 0.22.1",
  "chrono",
+ "flatbuffers",
  "half",
  "lz4_flex",
  "num-bigint",

@@ -255,20 +255,29 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) ->
         }
     }
     if let Some(ty) = types.get_mut("iids") { *ty = LogicalType::list(LogicalType::Scalar(ScalarType::FixedSizeBinary(16))); }
-    if let Some(ty) = types.get_mut("args") { *ty = LogicalType::Scalar(ScalarType::Binary).maybe(); }
+    // The reference's argument vector is non-nullable until an operation without arguments writes it a null.
+    if let Some(ty) = types.get_mut("args") {
+        let binary = LogicalType::Scalar(ScalarType::Binary);
+        *ty = if *ty == binary { binary } else { binary.maybe() };
+    }
     let mut fields = Vec::new();
     let mut columns = Vec::new();
+    // The reference's document writers declare `documents` straight after `iids`, ahead of the valid-time columns.
+    let mut documents = documents.iter().any(Option::is_some).then_some(documents);
     for (name, ty) in types {
         let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
         let bound = estimate_builder_bytes_refs(&ty, cells())?;
         columns.push(arrays.column(bound, || copy_array(&ty, &cells().cloned().collect::<Vec<_>>()))?);
         fields.push(Arc::new(to_field(&name, &ty)?));
+        if name == "iids" {
+            if let Some(documents) = documents.take() {
+                let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
+                fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
+                columns.push(documents);
+            }
+        }
     }
-    if documents.iter().any(Option::is_some) {
-        let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
-        fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
-        columns.push(documents);
-    }
+    if documents.is_some() { return Err(invalid("Document operation has no iids")); }
     rtdb_columnar::build_struct_array(fields.into(), &columns, values.len(), None).map_err(|error| invalid(error.to_string()))
 }
 
@@ -397,7 +406,7 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
     for (index, ty) in arguments.types().iter().enumerate() {
-        fields.push(to_field(&format!("${}", index + 1), ty)?);
+        fields.push(to_field(&format!("?_{index}"), ty)?);
         arrays.push(copy_array(ty, &arguments.rows().map(|row| row[index].clone()).collect::<Vec<_>>())?);
     }
     let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(arguments.row_count()));

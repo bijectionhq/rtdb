@@ -35,7 +35,8 @@ fn column_meta_and_arrow_preserve_signed_precision_and_raw_coefficients() {
                     let header = ipc::write_schema_message(&schema).unwrap();
                     let wire = arrow_ipc::root_as_message(&header[8..]).unwrap().header_as_schema().unwrap().fields().unwrap().get(0).type_as_decimal().unwrap();
                     assert_eq!((wire.precision(), wire.scale(), wire.bitWidth()), (precision, scale, i32::from(width)));
-                    assert_eq!(ipc::write_stream_to(&schema, [&page], Vec::new()).unwrap(), bytes);
+                    let streamed = ipc::write_stream_to(&schema, [&page], Vec::new()).unwrap();
+                    check(&ipc::ArrowStream::open(streamed.into(), None).unwrap().next().unwrap().unwrap(), &logical, &values);
                     check(&ipc::ArrowStream::open(bytes.into(), None).unwrap().next().unwrap().unwrap(), &logical, &values);
                     let bytes = ipc::write_file(&schema, std::slice::from_ref(&page)).unwrap();
                     let mut file = ipc::ArrowFile::open(bytes.clone().into(), None).unwrap();

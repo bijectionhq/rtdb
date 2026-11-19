@@ -105,7 +105,11 @@ fn incremental_sinks_match_buffered_jvm_end_markers() {
     let mut actual = Vec::new();
     file.read_to_end(&mut actual).unwrap();
     assert_eq!(actual, expected);
-    assert_eq!(write_stream_to(&batch.schema(), [&batch], Vec::new()).unwrap(), write_stream(&batch.schema(), &[batch]).unwrap());
+    let streamed = write_stream_to(&batch.schema(), [&batch], Vec::new()).unwrap();
+    assert_eq!(&streamed[streamed.len() - 4..], [0; 4], "the stream ends with the reference's single zero word");
+    let mut decoded = rtdb_format::ipc::ArrowStream::open(streamed.into(), None).unwrap();
+    assert_eq!(decoded.next().unwrap().unwrap(), batch);
+    assert!(decoded.next().is_none());
 }
 
 #[test]

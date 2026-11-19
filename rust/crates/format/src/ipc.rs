@@ -12,6 +12,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, Result};
 
 mod decoded_schema;
+mod java_layout;
 mod nulls;
 
 pub struct ArrowFile {
@@ -615,12 +616,12 @@ pub fn write_arrow_stream(schema: &Schema, pages: &[RecordBatch], options: IpcWr
     Ok(bytes)
 }
 
-/// Writes pages without buffering the complete stream; the sink owns and enforces its allocation bound.
+/// Writes pages without buffering the complete stream, with metadata in the reference's Java layout; the sink owns and enforces its allocation bound.
 /// The caller reserves the schema translation and initial encoded schema frame through this call.
 /// A page with different native field metadata is rejected before encoding; the sink may already contain a valid prefix.
 pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
     let decimal_schema = crate::ipc_decimal::DecimalSchema::new(schema)?;
-    let sink = FirstSchemaWriter { inner: sink, schema: &decimal_schema, pending: Vec::new(), expected: None, complete: false };
+    let sink = FirstSchemaWriter { inner: java_layout::JavaLayout::new(sink), schema: &decimal_schema, pending: Vec::new(), expected: None, complete: false };
     let mut writer = StreamWriter::try_new_with_options(TailWriter { inner: sink, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
     for page in pages { decimal_schema.validate_batch(page)?; writer.write(page).map_err(invalid)?; }
     writer.finish().map_err(invalid)?;
@@ -629,7 +630,7 @@ pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<I
     sink.inner.write_all(&[0; 4]).map_err(invalid)?;
     sink.inner.flush().map_err(invalid)?;
     if !sink.inner.complete { return Err(invalid("Arrow stream ended before its schema")); }
-    Ok(sink.inner.inner)
+    Ok(sink.inner.inner.inner)
 }
 
 struct TailWriter<W> { inner: W, pending: Vec<u8> }
