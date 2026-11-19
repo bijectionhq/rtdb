@@ -45,6 +45,7 @@ A background lane builds a search file for every settled trie of an indexed tabl
 Results are the same with or without search files, so `search: {enabled: false}` in the node configuration turns the lane and the narrowing off without changing any answer.
 `search: {threads: N}` sizes the lane per database.
 Scores are relative to the search files a query read, and may change as compaction rewrites them.
+`ORDER BY SEARCH_SCORE(body, ...) DESC LIMIT n` over a `MATCH` on the same column resolves only the rows that can rank among the first `n`.
 See link:../../rust/crates/search/README.adoc[the search reference] and link:fts.allium[the specification].
 
 == Operations

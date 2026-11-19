@@ -200,7 +200,7 @@ impl Importer<'_, '_, '_> {
             _ => return Err(invalid("Scan clamp flag must be boolean")),
         };
         if missing { return Ok(Relation::empty(Schema::new(columns)?)); }
-        Relation::scan(Scan { table, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates })
+        Relation::scan(Scan { table, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates, top_k: None })
     }
 
     fn scan_time(&mut self, form: Option<&Edn>) -> Result<PTemporal> {

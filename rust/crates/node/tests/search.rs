@@ -289,3 +289,53 @@ async fn live_rows_written_between_queries_are_found_as_the_live_index_grows() {
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_the_first() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let words = ["invoice", "overdue", "paid", "book", "late", "red"];
+    let mut seed = 11u64;
+    let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
+    let mut systems = Vec::new();
+    for round in 0..3 {
+        let mut operations = Vec::new();
+        for id in 0..120 {
+            let length = 1 + next() % 8;
+            let body: Vec<_> = (0..length).map(|_| words[next() % words.len()]).collect();
+            let year = 2020 + next() % 3;
+            operations.push(sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{}', _valid_from: TIMESTAMP '{year}-01-01Z'}}", body.join(" "))));
+        }
+        systems.push(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().tx_key().system_time);
+        if round < 2 {
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+            database.compaction().unwrap().compact_all().await.unwrap();
+            if round == 0 { database.build_artefacts().await.unwrap(); }
+        }
+    }
+    let ranked = |rows: Vec<Vec<Value>>| rows.into_iter().map(|row| (row[0].clone(), row[1].clone())).collect::<Vec<_>>();
+    for (matching, scoring) in [("invoice", "invoice overdue"), ("overdue late", "late"), ("book", "book red paid")] {
+        for valid in ["2020-06-01Z", "2022-06-01Z"] {
+            for system in [None, Some(systems[0]), Some(systems[1])] {
+                let system_clause = system.map_or(String::new(), |time| format!(" FOR SYSTEM_TIME AS OF TIMESTAMP '{}'", chrono::DateTime::from_timestamp_micros(time.0).unwrap().to_rfc3339()));
+                let query = format!("SELECT _id, SEARCH_SCORE(body, '{scoring}') AS score FROM docs FOR VALID_TIME AS OF TIMESTAMP '{valid}'{system_clause} WHERE MATCH(body, '{matching}') ORDER BY score DESC, _id");
+                let everything = ranked(rows(session.query_sql(&query, vec![]).await.unwrap()).await);
+                for k in [1, 5, 20] {
+                    let limited = ranked(rows(session.query_sql(&format!("{query} LIMIT {k}"), vec![]).await.unwrap()).await);
+                    assert_eq!(limited, everything.iter().take(k).cloned().collect::<Vec<_>>(), "{query} LIMIT {k}");
+                }
+                let offset = ranked(rows(session.query_sql(&format!("{query} LIMIT 3 OFFSET 4"), vec![]).await.unwrap()).await);
+                assert_eq!(offset, everything.iter().skip(4).take(3).cloned().collect::<Vec<_>>(), "{query} LIMIT 3 OFFSET 4");
+            }
+        }
+    }
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

@@ -64,6 +64,10 @@ impl ScanAccelerator for SearchAccelerator {
         }
         let Some((column, query, definition)) = chosen else { return Ok(None) };
         if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
+        if let Some(top_k) = &scan.top_k {
+            let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
+            if ranked { if let Some(candidates) = self.top_k(request, top_k, &column, &query, definition).await? { return Ok(Some(candidates)); } }
+        }
         let bounds = request.bounds;
         let Some(entry) = request.snapshot.table_entry(table) else { return Ok(Some(self.live_candidates(request, &column, &query)?)) };
         let artefact_id = definition.artefact_id();
@@ -113,6 +117,106 @@ impl ScanAccelerator for SearchAccelerator {
         }
         candidates.extend(self.live_candidates(request, &column, &query)?);
         Ok((candidates.len() <= self.max_candidates).then_some(candidates))
+    }
+}
+
+/// A row's ranking key: its score, then its IID, so that ties sort deterministically.
+fn descending(left: &(f64, Iid), right: &(f64, Iid)) -> std::cmp::Ordering { right.0.total_cmp(&left.0).then_with(|| left.1.cmp(&right.1)) }
+
+impl SearchAccelerator {
+    /// The IIDs that can hold one of the `limit` best-scoring visible rows, or `None` to narrow as an unranked MATCH does.
+    /// Every matching event is scored exactly from the index, and an IID's best event bounds every row it can resolve to.
+    /// IIDs are verified best bound first, in batches, until `limit` verified rows outscore every bound still unverified.
+    async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition) -> Result<Option<BTreeSet<Iid>>> {
+        let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { return Ok(None) };
+        let limit = match request.constants.constant(&top_k.limit).await? {
+            Some(Value::I64(limit)) => limit, Some(Value::I32(limit)) => i64::from(limit), Some(Value::I16(limit)) => i64::from(limit), _ => return Ok(None),
+        };
+        let Ok(limit) = usize::try_from(limit) else { return Ok(None) };
+        if limit == 0 { return Ok(Some(BTreeSet::new())); }
+        let table = &request.scan.table.name.table;
+        let Some(entry) = request.snapshot.table_entry(table) else { return Ok(None) };
+        let scoring = Query::parse(&text);
+        let artefact_id = definition.artefact_id();
+        let mut files = Vec::new();
+        let mut unindexed = Vec::new();
+        let mut unindexed_bytes = 0i64;
+        for trie in request.snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live) {
+            let file = match trie.artefact(KIND, &artefact_id, definition.version) {
+                Some(_) => {
+                    let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
+                    match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
+                        Ok(file) => Some((key, file)),
+                        Err(_) => {
+                            self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version });
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            match file {
+                Some((key, file)) => {
+                    if trie.key.recency().is_none() { request.corpora.register(format!("{key}#{column}"), std::sync::Arc::new(FileCorpus { file: std::sync::Arc::clone(&file), column: column.to_string() })); }
+                    files.push(file);
+                }
+                None => {
+                    let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < request.snapshot.trie_catalog().file_size_target());
+                    if !by_policy { unindexed_bytes = unindexed_bytes.saturating_add(trie.data_file_size); }
+                    if unindexed_bytes > self.max_unindexed_bytes { return Ok(None); }
+                    unindexed.push(trie.key.clone());
+                }
+            }
+        }
+        let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
+        let mut bounds: std::collections::BTreeMap<Iid, f64> = std::collections::BTreeMap::new();
+        let mut bound = |iid: Iid, score: f64| { let best = bounds.entry(iid).or_insert(f64::NEG_INFINITY); *best = best.max(score); };
+        for file in &files {
+            for (doc, score) in file.scored(column, matching, &scoring, corpus.as_ref())? {
+                if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, request.bounds) { bound(Iid(doc.iid), score); }
+            }
+        }
+        for key in unindexed {
+            let lease = request.storage.get(&ObjectKey::new(entry.slug.data_key(&key))?).await?;
+            for row in search_rows(lease.as_slice(), std::slice::from_ref(&column.to_string()))? {
+                if matching.matches(&row.tokens[0]) && may_be_visible(row.valid_from, row.valid_to, row.system_from, row.recency.unwrap_or(i64::MAX), request.bounds) {
+                    bound(Iid(row.iid), rtdb_text::bm25(&scoring, &row.tokens[0], corpus.as_ref()));
+                }
+            }
+        }
+        for segment in request.snapshot.iter_segments(table) {
+            for row in self.runtime.live_rows(request.database, segment, column, matching)? {
+                let event = segment.row(row)?.event()?;
+                if !may_be_visible(event.valid_time.lower().0, event.valid_time.upper().0, event.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
+                let StoredOperation::Put(document) = &event.operation else { continue };
+                let Some(Value::Utf8(value)) = document.get(column) else { continue };
+                let tokens = rtdb_text::tokens(value);
+                if matching.matches(&tokens) { bound(event.iid, rtdb_text::bm25(&scoring, &tokens, corpus.as_ref())); }
+            }
+        }
+        let mut order: Vec<(f64, Iid)> = bounds.into_iter().map(|(iid, score)| (score, iid)).collect();
+        order.sort_by(descending);
+        let mut verified: Vec<(f64, Iid)> = Vec::new();
+        let mut next = 0;
+        let batch = (limit * 2).max(64);
+        loop {
+            if verified.len() >= limit {
+                verified.sort_by(descending);
+                let kth = verified[limit - 1].0;
+                if order.get(next).is_none_or(|(upper, _)| kth > *upper) { break; }
+            }
+            if next == order.len() { break; }
+            let end = (next + batch).min(order.len());
+            let iids = order[next..end].iter().map(|(_, iid)| *iid).collect();
+            next = end;
+            for (iid, value) in request.verifier.visible(iids, top_k.column).await? {
+                let Value::Utf8(value) = value else { continue };
+                verified.push((rtdb_text::bm25(&scoring, &rtdb_text::tokens(&value), corpus.as_ref()), iid));
+            }
+        }
+        verified.sort_by(descending);
+        let kth = verified.get(limit - 1).map_or(f64::NEG_INFINITY, |(score, _)| *score);
+        Ok(Some(verified.into_iter().filter(|(score, _)| *score >= kth).map(|(_, iid)| iid).collect()))
     }
 }
 

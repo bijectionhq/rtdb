@@ -100,6 +100,6 @@ Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 
 == Deferred
 
-* Block-max WAND top-k over search files, which needs the scan to verify candidates in batches.
+* Block-max WAND over search files: ranked queries score every matching posting today, and verify only the best.
 * Indexing the historical side, and search files spanning a completed partition group.
 * `DiskCachedStore::delete` leaves a local cached copy (`storage/src/disk_cache.rs`), for data files as for search files; an erase reaches the local cache only when it trims.

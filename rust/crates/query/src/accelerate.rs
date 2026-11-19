@@ -30,6 +30,15 @@ pub struct ScanRequest<'a> {
     pub constants: &'a dyn ConstantEvaluator,
     /// Where an accelerator records the corpus statistics `search_score` ranks against in this query.
     pub corpora: &'a CorpusRegistry,
+    /// Resolves candidates exactly as the scan will, for an accelerator that must know which are visible before it can narrow.
+    pub verifier: &'a dyn CandidateVerifier,
+}
+
+/// The rows the scan would return for a set of IIDs, after resolution and the scan's own predicates.
+#[async_trait]
+pub trait CandidateVerifier: Send + Sync {
+    /// Each visible row's IID with its value of `column`.
+    async fn visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>>;
 }
 
 /// Something that can count, for any terms, the documents and tokens of the corpus a score is relative to.
@@ -38,6 +47,7 @@ pub trait CorpusSource: Send + Sync {
 }
 
 /// The corpus sources the scans of one query opened, once each however often a scan reopens; a score sums them all, whatever column or table each came from.
+/// A query text's corpus is fixed at its first use, so every score in one query, and any ranking an accelerator pruned by, is relative to the same corpus.
 #[derive(Default)]
 pub struct CorpusRegistry(parking_lot::Mutex<Corpora>);
 
@@ -48,7 +58,7 @@ impl CorpusRegistry {
     /// `key` names the source, such as its object key; a source already registered under it is kept.
     pub fn register(&self, key: String, source: Arc<dyn CorpusSource>) {
         let mut corpora = self.0.lock();
-        if !corpora.sources.contains_key(&key) { corpora.sources.insert(key, source); corpora.computed.clear(); }
+        corpora.sources.entry(key).or_insert(source);
     }
     pub fn holds(&self, key: &str) -> bool { self.0.lock().sources.contains_key(key) }
 }

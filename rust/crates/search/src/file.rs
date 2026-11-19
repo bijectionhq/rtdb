@@ -262,6 +262,31 @@ impl SearchFile {
         Ok(matches)
     }
 
+    /// Every document matching `matching`, with its score for `scoring`'s terms, from the postings' frequencies and the stored length.
+    /// It equals `rtdb_text::bm25` of the row's tokens, which is what SEARCH_SCORE computes on a resolved row.
+    pub fn scored(&self, column: &str, matching: &Query, scoring: &Query, corpus: Option<&Corpus>) -> Result<Vec<(DocMatch, f64)>> {
+        let Some(field) = self.field(column) else { return Ok(Vec::new()) };
+        let docs = self.matches(column, matching)?;
+        if docs.is_empty() { return Ok(Vec::new()); }
+        let reader = self.index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
+        let searcher = reader.searcher();
+        let [segment] = searcher.segment_readers() else { return Err(corrupt("A search file holds exactly one segment")) };
+        let lengths = segment.get_fieldnorms_reader(field).map_err(fault)?;
+        let inverted = segment.inverted_index(field).map_err(fault)?;
+        let mut postings = Vec::with_capacity(scoring.terms().len());
+        for term in scoring.terms() { postings.push(inverted.read_postings(&Term::from_field_text(field, term), IndexRecordOption::WithFreqs).map_err(fault)?); }
+        let mut scored = Vec::with_capacity(docs.len());
+        for doc in docs {
+            use tantivy::{DocSet, postings::Postings};
+            let frequencies: Vec<u32> = postings.iter_mut().map(|postings| match postings {
+                Some(postings) => if postings.doc() <= doc.doc && postings.seek(doc.doc) == doc.doc { postings.term_freq() } else { 0 },
+                None => 0,
+            }).collect();
+            scored.push((doc, rtdb_text::score(scoring, &frequencies, lengths.fieldnorm(doc.doc), corpus)));
+        }
+        Ok(scored)
+    }
+
     /// The column's corpus statistics for the query's terms: documents, tokens, and each term's document frequency.
     pub fn corpus(&self, column: &str, query: &Query) -> Result<Corpus> {
         let Some(field) = self.field(column) else { return Ok(Corpus::default()) };
@@ -321,6 +346,22 @@ mod tests {
         assert!(file.matches("body", &Query::parse("!!")).unwrap().is_empty());
         assert_eq!(file.matches("body", &Query::parse(r#""invoice is overdue""#)).unwrap().iter().map(|doc| doc.doc).collect::<Vec<_>>(), [0]);
         assert!(file.matches("body", &Query::parse(r#""overdue invoice""#)).unwrap().is_empty(), "the terms are there, but not side by side");
+    }
+
+    #[test]
+    fn a_documents_score_from_the_index_is_its_rows_score() {
+        let rows = rows();
+        let file = SearchFile::open(build_search_file(&columns(), &rows, "job").unwrap(), &columns()).unwrap();
+        let scoring = Query::parse("invoice overdue paid absent");
+        let corpus = file.corpus("body", &scoring).unwrap();
+        for (doc, score) in file.scored("body", &Query::parse("invoice"), &scoring, Some(&corpus)).unwrap() {
+            assert_eq!(score, rtdb_text::bm25(&scoring, &rows[doc.doc as usize].tokens[1], Some(&corpus)), "doc {}", doc.doc);
+        }
+        let long: Vec<String> = (0..500).map(|index| if index % 7 == 0 { "invoice".into() } else { format!("w{index}") }).collect();
+        let rows = vec![SearchRow { iid: [9; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, recency: None, tokens: vec![Vec::new(), long.clone()] }];
+        let file = SearchFile::open(build_search_file(&columns(), &rows, "job").unwrap(), &columns()).unwrap();
+        let [(_, score)] = file.scored("body", &Query::parse("invoice"), &Query::parse("invoice"), None).unwrap()[..] else { panic!() };
+        assert_eq!(score, rtdb_text::bm25(&Query::parse("invoice"), &long, None), "a long document's stored length is rounded the same way");
     }
 
     #[test]

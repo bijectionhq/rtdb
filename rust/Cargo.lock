@@ -4510,6 +4510,7 @@ dependencies = [
  "bytes",
  "parking_lot",
  "rtdb-columnar",
+ "rtdb-expr",
  "rtdb-format",
  "rtdb-index",
  "rtdb-maintenance",

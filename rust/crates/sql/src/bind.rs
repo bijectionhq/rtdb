@@ -1068,7 +1068,7 @@ impl Context<'_> {
                     else { columns.push(field.clone()); }
                     output.push(field);
                 }
-                let relation = Arc::new(Relation::scan(Scan { table: binding, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates: Vec::new() })?);
+                let relation = Arc::new(Relation::scan(Scan { table: binding, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates: Vec::new(), top_k: None })?);
                 let relation = if purpose == TablePurpose::Query {
                     let prefix = self.symbol(&qualifier)?;
                     rename_source(relation, prefix)?

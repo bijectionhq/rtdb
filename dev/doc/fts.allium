@@ -163,6 +163,18 @@ rule RepairUnreadableSearchFile {
 -- Past max_candidates candidates, or max_unindexed_bytes of tries without a search file, the scan runs unnarrowed instead.
 --
 -- Each current-side search file the narrowing opens is registered with the query as a corpus source, once however often the scan reopens.
+-- A query text's corpus is fixed at its first use, so every score in one query is relative to the same corpus.
+--
+-- A score from the index equals SEARCH_SCORE on the resolved row: both take each term's frequency and the document's length rounded to the index's stored lengths.
+--
+-- A scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, is ranked before it opens:
+--
+--   1. Every matching event that may be visible is scored, from the index where its trie has a search file and from its row otherwise, and each IID is bounded above by its best event.
+--   2. IIDs are verified best bound first, in batches, by running the scan itself restricted to them, with its own predicates.
+--   3. Verification stops once n verified rows score strictly above every bound not yet verified.
+--   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
+--
+-- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every source the query registered; with none, each term's inverse document frequency is 1.
 
 rule MatchIsAResidualPredicate {
@@ -199,6 +211,9 @@ contract SearchFileLayout {
 
 contract SearchCorrectness {
     -- What narrowing may and may not change about a query.
+
+    @invariant RankedLimitKeepsTheFirstRows
+        -- Under a ranked LIMIT, the rows the scan hands on include every row among the first n by SEARCH_SCORE, ties at the n-th included.
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.
@@ -252,7 +267,7 @@ surface FullTextSearch {
 
 open question "A node that uploads a search file and fails before appending ArtefactsAdded leaves a file no record names until its trie is collected. Is that bounded enough, or does the lane sweep its own unrecorded keys?"
 
-open question "Ranking verifies candidates by resolving them all; does a block-max WAND top-k, verifying candidates in batches, earn its complexity?"
+open question "Ranking scores every matching posting before verifying the best; does block-max WAND, skipping postings that cannot reach the bound, earn its complexity?"
 
 open question "Is the historical side indexed by default, or only on request? As-of-now queries read the current side and recent historical partitions only."
 

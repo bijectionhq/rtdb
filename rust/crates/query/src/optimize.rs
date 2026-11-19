@@ -4,7 +4,66 @@ use rtdb_types::Result;
 
 pub(crate) fn prepare(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     let required = relation.schema().ids();
-    prune(relation, &required)
+    annotate_top_k(prune(relation, &required)?)
+}
+
+/// Marks the scan under `ORDER BY search_score(column, query) DESC ... LIMIT n` with that ranking, when only projections stand between them and the scan has a MATCH on the same column.
+/// The scan may then hand on only the rows that can be among the first n, which is what the sort above would keep.
+fn annotate_top_k(relation: Arc<Relation>) -> Result<Arc<Relation>> {
+    let rebuilt = match relation.node() {
+        RelationNode::Project { input, expressions } => RelationNode::Project { input: annotate_top_k(Arc::clone(input))?, expressions: expressions.clone() },
+        RelationNode::Rename { input, prefix, expressions } => RelationNode::Rename { input: annotate_top_k(Arc::clone(input))?, prefix: prefix.clone(), expressions: expressions.clone() },
+        RelationNode::SortLimit { input, order_by, offset, fetch: Some(fetch) } => {
+            let Some(first) = order_by.first().filter(|order| order.descending) else { return Ok(relation) };
+            let limit = match offset { Some(offset) => Expr::binary(BinaryOp::Add, offset.clone(), fetch.clone()), None => fetch.clone() };
+            let Some(input) = push_top_k(input, first.expr.clone(), &limit)? else { return Ok(relation) };
+            RelationNode::SortLimit { input, order_by: order_by.clone(), offset: offset.clone(), fetch: Some(fetch.clone()) }
+        }
+        _ => return Ok(relation),
+    };
+    Ok(Arc::new(Relation::new(relation.schema().clone(), rebuilt)?))
+}
+
+fn push_top_k(relation: &Arc<Relation>, order: Expr, limit: &Expr) -> Result<Option<Arc<Relation>>> {
+    let through = |expressions: &[NamedExpr]| {
+        let defined: BTreeMap<ColumnId, Expr> = expressions.iter().map(|named| (named.field.id, named.expr.clone())).collect();
+        let mut order = order.clone();
+        order.rewrite(&mut |expression| if let Expr::Column { id, .. } = expression { if let Some(definition) = defined.get(id) { *expression = definition.clone(); } });
+        order
+    };
+    let node = match relation.node() {
+        RelationNode::Project { input, expressions } => {
+            let Some(input) = push_top_k(input, through(expressions), limit)? else { return Ok(None) };
+            RelationNode::Project { input, expressions: expressions.clone() }
+        }
+        RelationNode::Rename { input, prefix, expressions } => {
+            let Some(input) = push_top_k(input, through(expressions), limit)? else { return Ok(None) };
+            RelationNode::Rename { input, prefix: prefix.clone(), expressions: expressions.clone() }
+        }
+        RelationNode::Extend { input, expressions } => {
+            let Some(input) = push_top_k(input, through(expressions), limit)? else { return Ok(None) };
+            return Ok(Some(Arc::new(input.extend(expressions.clone())?)));
+        }
+        RelationNode::Scan(scan) => {
+            let Expr::Call { name, args, .. } = &order else { return Ok(None) };
+            let ([Expr::Column { id, .. }, query], true) = (args.as_slice(), name.eq_ignore_ascii_case("search_score")) else { return Ok(None) };
+            if !matches!(query, Expr::Literal(_) | Expr::Parameter { .. }) || !scan.columns.iter().any(|field| field.id == *id) { return Ok(None); }
+            if !scan.predicates.iter().any(|predicate| has_match_on(predicate, *id)) { return Ok(None); }
+            let mut scan = scan.clone();
+            scan.top_k = Some(rtdb_plan::ScanTopK { column: *id, query: query.clone(), limit: limit.clone() });
+            return Ok(Some(Arc::new(Relation::scan(scan)?)));
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(Arc::new(Relation::new(relation.schema().clone(), node)?)))
+}
+
+fn has_match_on(predicate: &Expr, column: ColumnId) -> bool {
+    match predicate {
+        Expr::Binary { op: BinaryOp::And, left, right } => has_match_on(left, column) || has_match_on(right, column),
+        Expr::Call { name, args, .. } => name.eq_ignore_ascii_case("match") && matches!(args.first(), Some(Expr::Column { id, .. }) if *id == column),
+        _ => false,
+    }
 }
 
 fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<Relation>> {
@@ -252,7 +311,7 @@ mod tests {
         };
         Arc::new(Relation::scan(Scan {
             table, columns, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(),
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None,
         }).unwrap())
     }
 

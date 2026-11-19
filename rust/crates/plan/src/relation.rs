@@ -29,7 +29,13 @@ pub struct Scan {
     pub iids: Option<BTreeSet<Iid>>,
     #[serde(default)]
     pub predicates: Vec<Expr>,
+    /// Set when the scan's rows feed a sort taking only the `limit` best by `search_score(column, query)`; see fts.allium.
+    #[serde(default)]
+    pub top_k: Option<ScanTopK>,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScanTopK { pub column: ColumnId, pub query: Expr, pub limit: Expr }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NamedExpr { pub field: Field, pub expr: Expr }
