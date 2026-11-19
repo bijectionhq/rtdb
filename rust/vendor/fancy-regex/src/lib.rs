@@ -207,6 +207,8 @@ mod parse_flags;
 mod replacer;
 mod vm;
 mod unicode_case;
+/// Whether two characters match under Java's `CASE_INSENSITIVE | UNICODE_CASE` comparison of single characters.
+pub fn java_case_equivalent(left: char, right: char) -> bool { unicode_case::equivalent(left, right) }
 mod grapheme;
 mod java;
 mod canonical;

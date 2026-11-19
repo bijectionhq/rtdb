@@ -51,11 +51,14 @@ async fn like_selects_controls_before_payloads_and_demands_dynamic_patterns_befo
 }
 
 #[test]
-fn like_matcher_reserves_its_translation_and_matching_state_before_use() {
+fn like_matcher_charges_its_scope_and_releases_with_it() {
     let memory = MemoryBudget::new(1 << 20);
     let scope = EvaluationScope::new(&memory).unwrap();
     let context = EvalContext { allocation: Some(&scope),..Default::default() };
-    assert!(scalar_call("like",&[text("a"),text("%")],&context).is_err());
+    assert_eq!(scalar_call("like",&[text("a"),text("%")],&context).unwrap(),V::Bool(true));
+    let pattern = "%_".repeat(2000);
+    assert_eq!(scalar_call("like",&[text(&"x".repeat(1999)),text(&pattern)],&context).unwrap(),V::Bool(false));
+    assert_eq!(scalar_call("like",&[text(&"x".repeat(2000)),text(&pattern)],&context).unwrap(),V::Bool(true));
     drop(scope);assert_eq!(memory.used_bytes(),0);
 }
 
@@ -70,4 +73,22 @@ fn repeated_like_calls_in_one_scope_release_each_patterns_charges() {
         assert_eq!(scalar_call("like",&[value,text(&pattern)],&context).unwrap(),V::Bool(false));
     }
     assert!(memory.used_bytes() < 1 << 20, "retained {} bytes", memory.used_bytes());
+}
+
+#[tokio::test]
+async fn repeated_like_expressions_in_one_scope_release_each_patterns_charges() {
+    let memory = MemoryBudget::new(256 << 20);
+    let scope = EvaluationScope::new(&memory).unwrap();
+    let context = EvalContext { allocation: Some(&scope), ..EvalContext::default() };
+    let pattern = "x%_".repeat(20);
+    for row in 0..32 {
+        let value = Expr::Literal(text(&format!("{row}")));
+        for expression in [
+            Expr::Like { expr: Box::new(value.clone()), pattern: Box::new(Expr::Literal(text(&pattern))), escape: None, case_insensitive: false, negated: false },
+            call("like", vec![value, Expr::Literal(text(&pattern))]),
+        ] {
+            assert_eq!(evaluate_async(&expression,&Schema::default(),&[],&context).await.unwrap(),V::Bool(false));
+        }
+    }
+    assert!(memory.used_bytes() < 16 << 20, "retained {} bytes", memory.used_bytes());
 }
