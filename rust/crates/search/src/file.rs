@@ -19,7 +19,7 @@ use tantivy::{Directory, Index, IndexSettings, TantivyDocument, Term};
 
 const MAGIC: &[u8; 8] = b"RTSRCH01";
 /// Bumped with the bundle layout or the tantivy version, either of which changes a search file's bytes.
-pub const FORMAT_VERSION: i32 = 1;
+pub const FORMAT_VERSION: i32 = 2;
 const WRITER_MEMORY: usize = 32 << 20;
 
 /// One data-file row as the search file sees it: its own temporal columns and the tokens of each indexed column.
@@ -42,7 +42,7 @@ struct Fields { columns: Vec<Field>, iid_high: Field, iid_low: Field, system_fro
 
 fn schema(columns: &[String]) -> (Schema, Fields) {
     let mut builder = Schema::builder();
-    let text = TextOptions::default().set_indexing_options(TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs).set_fieldnorms(true));
+    let text = TextOptions::default().set_indexing_options(TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqsAndPositions).set_fieldnorms(true));
     let columns = columns.iter().map(|column| builder.add_text_field(&format!("c_{column}"), text.clone())).collect();
     let fields = Fields {
         columns,
@@ -240,7 +240,10 @@ impl SearchFile {
         if query.terms().is_empty() { return Ok(Vec::new()); }
         let reader = self.index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
         let searcher = reader.searcher();
-        let clauses = query.terms().iter().map(|term| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)).collect();
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = query.terms().iter().map(|term| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)).collect();
+        for phrase in query.phrases() {
+            clauses.push((Occur::Must, Box::new(tantivy::query::PhraseQuery::new(phrase.iter().map(|term| Term::from_field_text(field, term)).collect()))));
+        }
         let found = searcher.search(&BooleanQuery::new(clauses), &DocSetCollector).map_err(fault)?;
         let mut docs: Vec<_> = found.into_iter().collect();
         docs.sort();
@@ -316,6 +319,8 @@ mod tests {
         assert_eq!(file.matches("title", &Query::parse("invoice")).unwrap().len(), 2);
         assert!(file.matches("absent", &Query::parse("invoice")).unwrap().is_empty());
         assert!(file.matches("body", &Query::parse("!!")).unwrap().is_empty());
+        assert_eq!(file.matches("body", &Query::parse(r#""invoice is overdue""#)).unwrap().iter().map(|doc| doc.doc).collect::<Vec<_>>(), [0]);
+        assert!(file.matches("body", &Query::parse(r#""overdue invoice""#)).unwrap().is_empty(), "the terms are there, but not side by side");
     }
 
     #[test]

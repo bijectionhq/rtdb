@@ -146,7 +146,7 @@ rule RepairUnreadableSearchFile {
 -- Rules: Query
 ------------------------------------------------------------
 
--- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer.
+-- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer, and every phrase of it (terms between double quotes) as consecutive tokens.
 -- SEARCH_SCORE(column, query) is the BM25 of that value for the query's terms.
 --
 -- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
@@ -193,7 +193,7 @@ contract SearchFileLayout {
         -- A document's iid, system_from, valid_from, valid_to and recency are those its row was written with, unaffected by any later event.
 
     @invariant TokensAreTheResidualsTokens
-        -- A search file's terms are the analyzer's tokens of each row's UTF-8 value, the same tokens MATCH evaluates on a resolved row.
+        -- A search file's terms are the analyzer's tokens of each row's UTF-8 value, the same tokens MATCH evaluates on a resolved row, with their positions, so a phrase matches in the file exactly when it matches the row.
 }
 
 contract SearchCorrectness {
@@ -252,8 +252,6 @@ surface FullTextSearch {
 open question "A node that uploads a search file and fails before appending ArtefactsAdded leaves a file no record names until its trie is collected. Is that bounded enough, or does the lane sweep its own unrecorded keys?"
 
 open question "Ranking verifies candidates by resolving them all; does a block-max WAND top-k, verifying candidates in batches, earn its complexity?"
-
-open question "Do definitions record positions? Phrase queries need them, at roughly double the search file size."
 
 open question "Is the historical side indexed by default, or only on request? As-of-now queries read the current side and recent historical partitions only."
 

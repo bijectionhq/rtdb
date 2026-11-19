@@ -12,20 +12,28 @@ pub fn tokens(text: &str) -> Vec<String> {
     text.split(|character: char| !character.is_alphanumeric()).filter(|token| !token.is_empty()).map(str::to_lowercase).collect()
 }
 
-/// The distinct terms of a query, in their first-occurrence order; a document matches when it holds every one.
+/// A query's distinct terms, in first-occurrence order, and its phrases: runs of terms written between double quotes.
+/// A document matches when it holds every term, and every phrase as consecutive tokens; an unclosed quote runs to the end.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Query { terms: Vec<String> }
+pub struct Query { terms: Vec<String>, phrases: Vec<Vec<String>> }
 
 impl Query {
     pub fn parse(text: &str) -> Self {
         let mut terms = Vec::new();
-        for token in tokens(text) { if !terms.contains(&token) { terms.push(token); } }
-        Self { terms }
+        let mut phrases = Vec::new();
+        for (index, part) in text.split('"').enumerate() {
+            let words = tokens(part);
+            for word in &words { if !terms.contains(word) { terms.push(word.clone()); } }
+            if index % 2 == 1 && words.len() > 1 { phrases.push(words); }
+        }
+        Self { terms, phrases }
     }
     pub fn terms(&self) -> &[String] { &self.terms }
+    pub fn phrases(&self) -> &[Vec<String>] { &self.phrases }
     /// A query with no terms matches nothing.
     pub fn matches(&self, document: &[String]) -> bool {
         !self.terms.is_empty() && self.terms.iter().all(|term| document.contains(term))
+            && self.phrases.iter().all(|phrase| document.windows(phrase.len()).any(|window| window == phrase.as_slice()))
     }
 }
 
@@ -76,6 +84,18 @@ mod tests {
         assert!(query.matches(&tokens("The invoice is overdue")));
         assert!(!query.matches(&tokens("The invoice is paid")));
         assert!(!Query::parse("!!").matches(&tokens("anything")));
+    }
+
+    #[test]
+    fn a_phrase_matches_only_its_terms_in_order_and_side_by_side() {
+        let query = Query::parse(r#"paid "overdue invoice""#);
+        assert_eq!(query.terms(), ["paid", "overdue", "invoice"]);
+        assert_eq!(query.phrases(), [vec!["overdue".to_string(), "invoice".to_string()]]);
+        assert!(query.matches(&tokens("The overdue invoice was paid")));
+        assert!(!query.matches(&tokens("The invoice was overdue and paid")));
+        assert!(!query.matches(&tokens("An overdue, unpaid invoice")));
+        assert!(Query::parse(r#""overdue""#).phrases().is_empty(), "a one-word phrase is a term");
+        assert_eq!(Query::parse(r#"a "b c"#).phrases(), [vec!["b".to_string(), "c".to_string()]]);
     }
 
     #[test]

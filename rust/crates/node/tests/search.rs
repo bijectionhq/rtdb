@@ -187,7 +187,7 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
     let ids = |rows: Vec<Vec<Value>>| { let mut ids: Vec<_> = rows.into_iter().map(|row| row[0].clone()).map(|value| match value { Value::I64(id) => id, other => panic!("{other:?}") }).collect(); ids.sort_unstable(); ids };
     let mut compared = 0;
     let mut answers = std::collections::BTreeMap::<&str, std::collections::BTreeSet<Vec<i64>>>::new();
-    for query in ["overdue", "invoice overdue", "red blue", "paid book", "absent"] {
+    for query in ["overdue", "invoice overdue", "red blue", "paid book", "absent", "\"red blue\"", "overdue \"late book\""] {
         for valid in ["2020-03-01Z", "2021-07-01Z", "2023-02-01Z"] {
             for system in [None, Some(systems[1]), Some(systems[3])] {
                 let system_clause = system.map_or(String::new(), |time| format!(" FOR SYSTEM_TIME AS OF TIMESTAMP '{}'", chrono::DateTime::from_timestamp_micros(time.0).unwrap().to_rfc3339()));
@@ -200,7 +200,7 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
             }
         }
     }
-    assert_eq!(compared, 45);
+    assert_eq!(compared, 63);
     assert!(answers["overdue"].len() > 2 && answers["overdue"].iter().any(|ids| !ids.is_empty()), "the bases disagree, so the test can tell versions apart: {answers:?}");
     assert_eq!(answers["absent"], std::collections::BTreeSet::from([Vec::new()]));
     assert!(counting.narrowed.load(Ordering::Relaxed) >= compared, "every MATCH scan was narrowed");
