@@ -314,6 +314,8 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
     for name in order {
         let (ty, present) = fields.remove(name).expect("ordered document column has a type");
         let ty = if present < length || present == 0 { ty.maybe() } else { ty };
+        let cells = lists.iter().flat_map(|list| list.rows()).map(|document| document.get(name).map_or(WriterCell::Null, WriterCell::of)).collect::<Vec<_>>();
+        let ty = backfilled_nullability(ty, &cells);
         let values = || lists.iter().flat_map(|list| list.rows()).map(|document| struct_field_cell(document, name, &ty));
         let estimate = estimate_builder_bytes_refs(&ty, values())?;
         let array = arrays.column(estimate, || copy_array(&ty, &values().cloned().collect::<Vec<_>>()))?;
@@ -323,6 +325,49 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
     let structs = rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))?;
     let field = Arc::new(Field::new("$data$", structs.data_type().clone(), false));
     Ok(Arc::new(ListArray::try_new(field, OffsetBuffer::new(ScalarBuffer::from(offsets)), structs, None).map_err(|error| invalid(error.to_string()))?))
+}
+
+/// One row of a document column as the reference's struct writers see it.
+#[derive(Clone, Copy)]
+enum WriterCell<'a> { Undefined, Null, Value(&'a Value) }
+
+impl<'a> WriterCell<'a> {
+    fn of(value: &'a Value) -> Self { match value { Value::Null => Self::Null, Value::Undefined => Self::Undefined, value => Self::Value(value) } }
+    fn fields(&self) -> Option<&'a StructFields<Value>> { match self { Self::Value(Value::Struct(fields)) => Some(fields), _ => None } }
+}
+
+/// The reference's writer backfills a struct key first written at row `r` into the struct's earlier rows: undefined where
+/// `isNull` holds, null otherwise, and a null makes the field nullable. A non-nullable struct's undefined rows - written
+/// because its own parent was null there - do not report `isNull`, so a key first seen after them becomes nullable although
+/// its rows only lacked it (xtdb #4988). Union legs start empty and so have nothing to backfill; only single-typed struct
+/// chains are adjusted, and only ever towards nullable.
+fn backfilled_nullability(ty: LogicalType, cells: &[WriterCell<'_>]) -> LogicalType {
+    let (nullable, inner) = match ty { LogicalType::Maybe(inner) => (true, *inner), other => (false, other) };
+    let LogicalType::Struct(children) = inner else { return if nullable { inner.maybe() } else { inner }; };
+    if !cells.iter().all(|cell| !matches!(cell, WriterCell::Value(value) if !matches!(value, Value::Struct(_)))) {
+        let inner = LogicalType::Struct(children);
+        return if nullable { inner.maybe() } else { inner };
+    }
+    let adjusted = children.into_iter().map(|(name, child)| {
+        let first = cells.iter().position(|cell| cell.fields().is_some_and(|fields| fields.contains_key(&name)));
+        let child_cells = match first {
+            None => return (name, child),
+            Some(first) => {
+                let parent_nullable = cells[..first].iter().any(|cell| matches!(cell, WriterCell::Null));
+                cells.iter().enumerate().map(|(row, cell)| match (row < first, cell) {
+                    (_, WriterCell::Value(Value::Struct(fields))) => fields.get(&name).map_or(WriterCell::Null, WriterCell::of),
+                    (true, WriterCell::Undefined) if !parent_nullable => WriterCell::Null,
+                    (_, WriterCell::Undefined | WriterCell::Null) => WriterCell::Undefined,
+                    (_, WriterCell::Value(_)) => WriterCell::Undefined,
+                }).collect::<Vec<_>>()
+            }
+        };
+        let child = backfilled_nullability(child, &child_cells);
+        let child = if child_cells.iter().any(|cell| matches!(cell, WriterCell::Null)) && !matches!(child, LogicalType::Maybe(_)) { child.maybe() } else { child };
+        (name, child)
+    }).collect();
+    let inner = LogicalType::Struct(adjusted);
+    if nullable { inner.maybe() } else { inner }
 }
 
 struct SourceOperationReader<'a> {
@@ -513,6 +558,25 @@ mod tests {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         SourceTransaction::decode(&message, &source.memory).unwrap()
+    }
+
+    #[test]
+    fn a_nested_struct_key_first_written_after_its_struct_was_undefined_is_nullable() {
+        let memory = budget();
+        let put = |row: StructFields<Value>| TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![row], &memory).unwrap(), valid_from: None, valid_to: None };
+        let quux = StructFields::from([("_id".to_owned(), Value::I64(2)), ("struct".to_owned(), Value::Struct(StructFields::from([
+            ("a".to_owned(), Value::Bool(true)),
+            ("b".to_owned(), Value::Struct(StructFields::from([("c".to_owned(), Value::Utf8("c".into())), ("d".to_owned(), Value::Utf8("d".into()))]))),
+        ])))]);
+        let source = SourceTransaction::new(vec![put(StructFields::from([("_id".to_owned(), Value::I64(1))])), put(quux)], SubmitOptions::default(), &memory).unwrap();
+        let decoded = roundtrip(&source);
+        let Operation::PutIids { documents, .. } = &decoded.operations[0] else { panic!("put"); };
+        let utf8 = LogicalType::Scalar(ScalarType::Utf8);
+        let expected = LogicalType::Struct(StructFields::from([
+            ("a".to_owned(), LogicalType::Scalar(ScalarType::Bool)),
+            ("b".to_owned(), LogicalType::Struct(StructFields::from([("c".to_owned(), utf8.clone().maybe()), ("d".to_owned(), utf8.maybe())]))),
+        ])).maybe();
+        assert_eq!(documents.declared_types().unwrap()["struct"], expected);
     }
 
     #[test]
