@@ -80,7 +80,10 @@ impl SpillReader {
         let mut bytes = vec![0; length];
         self.file.read_exact(&mut bytes).map_err(io_error)?;
         let values = serde_json::from_slice::<Vec<Value>>(&bytes).map_err(io_error)?;
-        OwnedRow::with_reservation(values, reservation).map(Some)
+        drop(bytes);
+        let row = OwnedRow::new(values, &self.memory)?;
+        drop(reservation);
+        Ok(Some(row))
     }
 }
 
