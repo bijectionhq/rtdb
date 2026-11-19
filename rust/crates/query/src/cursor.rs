@@ -74,6 +74,7 @@ impl PreparedQuery {
 
     pub fn with_settings(relation: Arc<Relation>, settings: rtdb_plan::QuerySettings) -> Result<Self> {
         relation.validate()?;
+        let relation = crate::optimize::prepare(relation)?;
         let required_parameter_count = relation.parameter_count().max(settings.parameter_count());
         Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None })
     }

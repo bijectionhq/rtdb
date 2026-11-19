@@ -479,6 +479,14 @@ mod tests {
     }
 
     #[test]
+    fn a_query_prepared_from_a_relation_is_optimised_as_a_prepared_statement_is() {
+        let a = field(0);
+        let filtered = base_scan(vec![a.clone()]).filter(equals(&a, 1)).unwrap();
+        let query = crate::PreparedQuery::new(Arc::new(filtered)).unwrap();
+        assert_eq!(scan_predicates(query.relation()), [equals(&a, 1)], "a mutation's input reaches its scan's IID and predicate pruning");
+    }
+
+    #[test]
     fn single_column_conjunct_reaches_the_scan_before_multi_column_selection() {
         let [a, b] = [0, 1].map(field);
         let projection = base_scan(vec![a.clone(), b.clone()]);
