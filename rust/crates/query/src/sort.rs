@@ -94,7 +94,7 @@ impl SortPlan {
     }
     fn indices(&self, store: &RecordStore, keys: &KeyTypes) -> Result<Indices> {
         keys.validate()?;
-        let mut indices = sort_records(store,&self.execution.context,|left,right|self.compare(left,right))?;
+        let mut indices = sort_records(store,&self.execution.context,self.order.len(),|left,right|self.compare(left,right))?;
         indices.values.truncate(usize::try_from(self.limit).unwrap_or(usize::MAX));
         Ok(indices)
     }
@@ -166,7 +166,9 @@ impl SortPlan {
     }
 }
 pub(crate) struct Indices { pub(crate) values: Vec<usize>, _reservation: Arc<MemoryReservation> }
-pub(crate) fn sort_records(store: &RecordStore,context: &Arc<crate::QueryContext>,mut compare: impl FnMut(&[Value],&[Value]) -> Result<Ordering>) -> Result<Indices> {
+/// Sorts record indices by `compare` over each record's first `key_width` values.
+/// A disk-backed store's keys are read in one sequential pass and held for the sort, so a comparison never reads the spill.
+pub(crate) fn sort_records(store: &RecordStore,context: &Arc<crate::QueryContext>,key_width: usize,mut compare: impl FnMut(&[Value],&[Value]) -> Result<Ordering>) -> Result<Indices> {
     let scratch = match context.options.object_sort {
         rtdb_types::ObjectSort::TimSort => timsort::scratch_bytes(store.len())?,
         rtdb_types::ObjectSort::LegacyMergeSort => legacy::scratch_bytes(store.len())?,
@@ -174,11 +176,10 @@ pub(crate) fn sort_records(store: &RecordStore,context: &Arc<crate::QueryContext
     let bytes = store.len().checked_mul(std::mem::size_of::<usize>()).and_then(|size|size.checked_add(scratch)).and_then(|size|size.checked_add(256)).ok_or_else(size_error)?;
     let reservation = context.memory.reserve(bytes)?;
     let mut indices: Vec<_> = (0..store.len()).collect();
-    let mut access = store.access()?;
-    let compare = |left,right| {
+    let keys = store.key_prefixes(key_width)?;
+    let compare = |left: usize,right: usize| {
         context.check_cancelled()?;
-        let left = access.get(left)?;let right = access.get(right)?;
-        compare(left.values(),right.values())
+        compare(keys.get(left)?,keys.get(right)?)
     };
     match context.options.object_sort {
         rtdb_types::ObjectSort::TimSort => timsort::sort(&mut indices,compare)?,

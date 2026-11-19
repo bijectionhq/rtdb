@@ -29,7 +29,7 @@ fn configured_sorter_preserves_its_comparison_schedule_across_physical_spills() 
             let context = context(algorithm,threshold);let baseline = context.memory.used_bytes();
             let records = records(&context,&[0,1,2,3,4,5,6]);let mut trace = Vec::new();
             assert_eq!(context.spill_bytes() > 0,threshold == 1);
-            let indices = sort_records(&records,&context,|left,right| { trace.push((key(left),key(right)));Ok(key(left).cmp(&key(right))) }).unwrap();
+            let indices = sort_records(&records,&context,1,|left,right| { trace.push((key(left),key(right)));Ok(key(left).cmp(&key(right))) }).unwrap();
             assert_eq!(indices.values,[0,1,2,3,4,5,6]);assert_eq!(trace,expected);
             drop(indices);drop(records);
             assert_eq!(context.memory.used_bytes(),baseline);assert_eq!(context.spill_bytes(),0);
@@ -43,7 +43,7 @@ fn configured_sorter_propagates_first_failure_and_releases_scratch() {
         for threshold in [1,usize::MAX] {
             let context = context(algorithm,threshold);let baseline = context.memory.used_bytes();
             let records = records(&context,&[4,1,3,2]);let retained = context.memory.used_bytes();let mut comparisons = 0;
-            let error = sort_records(&records,&context,|_,_| { comparisons += 1;Err(Anomaly::fault("test/first-comparison","original failure")) }).err().unwrap();
+            let error = sort_records(&records,&context,1,|_,_| { comparisons += 1;Err(Anomaly::fault("test/first-comparison","original failure")) }).err().unwrap();
             assert_eq!((comparisons,error.code.as_str(),error.message.as_deref()),(1,"test/first-comparison",Some("original failure")));
             assert_eq!(context.memory.used_bytes(),retained);drop(records);
             assert_eq!(context.memory.used_bytes(),baseline);assert_eq!(context.spill_bytes(),0);
@@ -58,7 +58,7 @@ fn auxiliary_array_is_reserved_before_the_first_comparison() {
         let records = records(&context,&[3,1,2]);let retained = context.memory.used_bytes();
         let remaining = context.memory.limit_bytes() - retained;
         let blocker = context.memory.reserve(remaining).unwrap();let mut comparisons = 0;
-        assert!(sort_records(&records,&context,|_,_| { comparisons += 1;Ok(Ordering::Equal) }).is_err());
+        assert!(sort_records(&records,&context,1,|_,_| { comparisons += 1;Ok(Ordering::Equal) }).is_err());
         assert_eq!(comparisons,0);drop(blocker);assert_eq!(context.memory.used_bytes(),retained);drop(records);
         assert_eq!(context.memory.used_bytes(),baseline);
     }

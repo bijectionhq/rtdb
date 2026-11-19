@@ -454,7 +454,7 @@ async fn percentile(selected: BoxCursor, kind: PercentileKind, fraction: f64, de
     let values = values.finish()?;
     let count = i32::try_from(values.len()).map_err(|_|invalid("percentile-size","Percentile input exceeds the reference vector row limit"))?;
     if count == 0 { return Ok(Value::Null); }
-    let indices = crate::sort::sort_records(&values,&execution.context,|left,right| {
+    let indices = crate::sort::sort_records(&values,&execution.context,1,|left,right| {
         let (left,right) = if descending { (right,left) } else { (left,right) };
         rtdb_expr::ordered_compare_in_timezone(&left[0],&right[0],false,&execution.context.timezone)
     })?;

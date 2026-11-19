@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use rtdb_columnar::MemoryBudget;
@@ -21,7 +21,7 @@ impl SpillRegion {
     }
     pub fn create(self: &Arc<Self>) -> Result<SpillWriter> {
         let (file, path) = NamedTempFile::new_in(self.directory.path()).map_err(io_error)?.into_parts();
-        Ok(SpillWriter { file, retained: Arc::new(SpillFile { path, region: Arc::clone(self), bytes: AtomicU64::new(0) }) })
+        Ok(SpillWriter { file: BufWriter::new(file), position: 0, retained: Arc::new(SpillFile { path, region: Arc::clone(self), bytes: AtomicU64::new(0) }) })
     }
 }
 
@@ -32,13 +32,13 @@ impl Drop for SpillFile {
 impl SpillFile {
     pub fn reader(self: &Arc<Self>, memory: Arc<MemoryBudget>) -> Result<SpillReader> {
         let file = File::open(&self.path).map_err(io_error)?;
-        Ok(SpillReader { file, retained: Arc::clone(self), memory })
+        Ok(SpillReader { file: BufReader::new(file), retained: Arc::clone(self), memory })
     }
 }
 
-pub(crate) struct SpillWriter { file: File, retained: Arc<SpillFile> }
+pub(crate) struct SpillWriter { file: BufWriter<File>, position: u64, retained: Arc<SpillFile> }
 impl SpillWriter {
-    pub fn position(&mut self) -> Result<u64> { self.file.stream_position().map_err(io_error) }
+    pub fn position(&mut self) -> Result<u64> { Ok(self.position) }
     pub fn reader(&mut self, memory: Arc<MemoryBudget>) -> Result<SpillReader> {
         self.file.flush().map_err(io_error)?;
         self.retained.reader(memory)
@@ -51,7 +51,9 @@ impl SpillWriter {
         self.retained.region.reserve(count)?;
         self.retained.bytes.fetch_add(count, Ordering::Relaxed);
         self.file.write_all(&(bytes.len() as u64).to_le_bytes()).map_err(io_error)?;
-        self.file.write_all(&bytes).map_err(io_error)
+        self.file.write_all(&bytes).map_err(io_error)?;
+        self.position += count;
+        Ok(())
     }
     pub fn finish(mut self) -> Result<Arc<SpillFile>> {
         self.file.flush().map_err(io_error)?;
@@ -59,7 +61,7 @@ impl SpillWriter {
     }
 }
 
-pub(crate) struct SpillReader { file: File, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
+pub(crate) struct SpillReader { file: BufReader<File>, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
 impl SpillReader {
     pub fn seek(&mut self, offset: u64) -> Result<()> {
         if offset > self.retained.bytes.load(Ordering::Relaxed) { return Err(invalid("invalid-spill","Spill offset exceeds its file")); }
