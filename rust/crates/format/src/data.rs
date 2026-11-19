@@ -133,17 +133,22 @@ impl EventBatch {
 
 /// All rows must either carry recency or omit it; the caller supplies the put schema captured with the rows.
 pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
-    event_batch(events, put_fields, iid_encoding, false, None)
+    event_batch(events, put_fields, iid_encoding, false, None, PutLeg::First)
 }
 
 /// Reconstructs stored cells under their captured put schema, preserving raw decimal coefficients.
 /// Every value must belong to that schema; no decimal parameter or coefficient is converted.
 /// The caller admits column construction and event-array overhead before calling.
 pub fn copy_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
-    event_batch(events, put_fields, iid_encoding, true, None)
+    event_batch(events, put_fields, iid_encoding, true, None, PutLeg::First)
 }
 
-/// Builds an owned index batch with scratch for one document column at a time.
+/// Where the `put` leg sits in the operation union.
+/// The reference's live relation starts with `delete` and `erase` and gains `put` with its first document, so live and L0 pages carry it last; compaction declares it first.
+#[derive(Clone, Copy)]
+enum PutLeg { First, Last }
+
+/// Builds an owned index batch with scratch for one document column at a time, laid out as a live page.
 /// `copy` selects the stored-cell writer, which preserves existing decimal coefficients.
 pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let metadata = put_fields.as_ref().map_or(Ok(4096), |fields| {
@@ -154,26 +159,27 @@ pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<StructFields
     })?;
     let headers = events.len().checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(event_size)?;
     let mut builder = BatchBuilder::new(metadata.checked_add(headers).ok_or_else(event_size)?, memory)?;
-    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder))?;
+    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder), PutLeg::Last)?;
     builder.finish_with_metadata(batch, metadata)
 }
 
-fn event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>) -> Result<RecordBatch> {
+/// A batch has a `put` leg when it holds a put or declares document columns, as the reference's relation gains one.
+fn event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>, put_leg: PutLeg) -> Result<RecordBatch> {
     let mut puts = Vec::new();
     let mut deletes = 0usize;
     let mut erases = 0usize;
     let mut ids = Vec::with_capacity(events.len());
     let mut offsets = Vec::with_capacity(events.len());
+    let put_fields = put_fields.filter(|fields| !fields.is_empty() || events.iter().any(|event| matches!(event.operation, StoredOperation::Put(_))));
     let has_put = put_fields.is_some();
-    let delete_id = i8::from(has_put);
-    let erase_id = delete_id + 1;
+    let (put_id, delete_id, erase_id) = match (has_put, put_leg) { (true, PutLeg::First) => (0, 1, 2), (true, PutLeg::Last) => (2, 0, 1), (false, _) => (0, 0, 1) };
     for event in events {
         let (id, offset) = match &event.operation {
             StoredOperation::Put(document) => {
                 if !has_put { return Err(invalid("Put event has no declared put schema")); }
                 let offset = puts.len();
                 puts.push(document);
-                (0, offset)
+                (put_id, offset)
             }
             StoredOperation::Delete => { let offset = deletes; deletes += 1; (delete_id, offset) }
             StoredOperation::Erase => { let offset = erases; erases += 1; (erase_id, offset) }
@@ -181,15 +187,14 @@ fn event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalTy
         ids.push(id);
         offsets.push(i32::try_from(offset).map_err(invalid)?);
     }
-    let mut op_fields = Vec::new();
-    let mut children: Vec<ArrayRef> = Vec::new();
+    let mut op_fields = vec![Arc::new(Field::new("delete", DataType::Null, true)), Arc::new(Field::new("erase", DataType::Null, true))];
+    let mut children: Vec<ArrayRef> = vec![Arc::new(NullArray::new(deletes)), Arc::new(NullArray::new(erases))];
     if let Some(fields) = put_fields {
         let documents = put_columns(&puts, fields, copy, builder)?;
-        op_fields.push(Arc::new(Field::new("put", documents.data_type().clone(), false)));
-        children.push(documents);
+        let index = usize::try_from(put_id).map_err(invalid)?;
+        op_fields.insert(index, Arc::new(Field::new("put", documents.data_type().clone(), false)));
+        children.insert(index, documents);
     }
-    op_fields.extend([Arc::new(Field::new("delete", DataType::Null, true)), Arc::new(Field::new("erase", DataType::Null, true))]);
-    children.extend([Arc::new(NullArray::new(deletes)) as ArrayRef, Arc::new(NullArray::new(erases)) as ArrayRef]);
     let op_fields = UnionFields::new(0..op_fields.len() as i8, op_fields);
     let op: ArrayRef = Arc::new(UnionArray::try_new(op_fields.clone(), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
     let iids: Vec<_> = events.iter().map(|event| event.iid).collect();
@@ -252,7 +257,7 @@ pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<
 
 fn event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
     if events.iter().any(|event| event.recency.is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
-    let batch = event_batch(events, put_fields, iid_encoding, copy, None)?;
+    let batch = event_batch(events, put_fields, iid_encoding, copy, None, PutLeg::First)?;
     if recency && events.is_empty() {
         let mut fields = batch.schema().fields().to_vec();
         fields.push(Arc::new(Field::new("_recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false)));

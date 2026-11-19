@@ -228,7 +228,7 @@ impl BlockStore {
             if live.row_count() == 0 { continue; }
             let entry = table_catalog.entry(table).ok_or_else(|| invalid("Live table has no recorded storage slug"))?;
             let trie = TrieKey::l0(index)?;
-            let mut metadata = MetadataBuilder::new(false, true);
+            let mut metadata = MetadataBuilder::new(false, false);
             let mut reservations = Vec::new();
             let temporary = tempfile::NamedTempFile::new().map_err(io_error)?;
             let mut writer = None;

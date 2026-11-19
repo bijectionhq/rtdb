@@ -236,6 +236,27 @@ fn uuid_put_documents_are_read_back_through_the_event_schema() {
     for (row, event) in events.iter().enumerate() { assert_eq!(&decoded.read_event(row).unwrap(), event); }
 }
 
+fn operation_legs(batch: &arrow_array::RecordBatch) -> Vec<String> {
+    let arrow_schema::DataType::Union(legs, _) = batch.schema().field_with_name("op").unwrap().data_type().clone() else { panic!("op is a union") };
+    legs.iter().map(|(_, leg)| leg.name().clone()).collect()
+}
+
+#[test]
+fn live_pages_carry_the_put_leg_last_and_only_once_a_document_is_written() {
+    let memory = rtdb_types::MemoryBudget::new(1 << 24);
+    let fields = || Some(StructFields::from([("price".into(), LogicalType::Scalar(ScalarType::I64))]));
+    let live = rtdb_format::data::owned_event_batch(&events(), fields(), false, &memory).unwrap();
+    assert_eq!(operation_legs(live.batch()), ["delete", "erase", "put"]);
+    let decoded = EventBatch::new(live.batch().clone()).unwrap();
+    for (row, event) in events().iter().enumerate() { assert_eq!(&decoded.read_event(row).unwrap(), event); }
+
+    let deletes: Vec<_> = events().into_iter().filter(|event| !matches!(event.operation, StoredOperation::Put(_))).collect();
+    let without_puts = rtdb_format::data::owned_event_batch(&deletes, Some(StructFields::new()), false, &memory).unwrap();
+    assert_eq!(operation_legs(without_puts.batch()), ["delete", "erase"]);
+
+    assert_eq!(operation_legs(&build_event_batch(&events(), fields(), None).unwrap()), ["put", "delete", "erase"], "compacted pages declare put first");
+}
+
 #[test]
 fn put_columns_keep_the_order_their_fields_were_first_seen() {
     let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("system_time".into(), LogicalType::Scalar(ScalarType::I64)), ("committed".into(), LogicalType::Scalar(ScalarType::Bool))]);
