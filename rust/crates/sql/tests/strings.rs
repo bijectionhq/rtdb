@@ -338,3 +338,12 @@ async fn contiguous_x_quote_is_a_binary_literal_and_a_spaced_one_is_a_call() {
         assert!(query(call).await.unwrap_err().message.unwrap().starts_with("Unknown function: "), "{call}");
     }
 }
+
+#[tokio::test]
+async fn struct_literal_keys_named_like_odbc_escapes_stay_struct_keys() {
+    let rows = query("SELECT {d: 1} AS a, [{t: 1, v: 2}] AS b, {ts: TIMESTAMP '2020-01-01Z'} AS c").await.unwrap();
+    let [a, b, c] = rows[0].as_slice() else { panic!("{rows:?}") };
+    assert_eq!(a, &V::Struct(std::collections::BTreeMap::from([("d".into(), V::I64(1))])));
+    assert_eq!(b, &V::List(vec![V::Struct(std::collections::BTreeMap::from([("t".into(), V::I64(1)), ("v".into(), V::I64(2))]))]));
+    assert!(matches!(c, V::Struct(fields) if matches!(fields.get("ts"), Some(V::Timestamp { .. }))), "{c:?}");
+}

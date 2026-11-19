@@ -2539,6 +2539,11 @@ impl<'a> Parser<'a> {
                 "ts" => DataType::Timestamp(None, TimezoneInfo::None),
                 _ => return p.expected("ODBC datetime keyword (t, d, or ts)", token),
             };
+            // RTDB: the escape takes a quoted literal, so `{t: 1}` and `{ts: TIMESTAMP '…'}` stay struct literals
+            // rather than an escape around a `:1` or `:TIMESTAMP` placeholder.
+            if !matches!(p.peek_token_ref().token, Token::SingleQuotedString(_)) {
+                return p.expected("a quoted ODBC datetime literal", p.peek_token());
+            }
             let value = p.parse_value()?;
             Ok(Expr::TypedString(TypedString {
                 data_type,
