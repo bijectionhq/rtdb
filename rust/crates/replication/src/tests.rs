@@ -71,7 +71,7 @@ fn upload(index: i64, source: i64) -> ReplicaBody {
 }
 
 #[tokio::test]
-async fn log_records_retain_encoded_bytes_after_releasing_codec_scratch() {
+async fn appended_log_records_release_their_encoding_charges() {
     let memory = MemoryBudget::new(1 << 20);
     let source = Arc::new(MemoryLog::new(1 << 20));
     let replica = Arc::new(MemoryLog::new(1 << 20));
@@ -88,11 +88,10 @@ async fn log_records_retain_encoded_bytes_after_releasing_codec_scratch() {
     assert!(memory.used_bytes() < 1 << 18);
     assert_eq!(source.latest().unwrap(), LogOffset(255));
     assert_eq!(replica.latest().unwrap(), LogOffset(255));
+    assert_eq!(memory.used_bytes(), 0, "the in-memory logs own their records outside the execution budget");
     drop(logs);
-    assert_ne!(memory.used_bytes(), 0);
     drop(source);
     drop(replica);
-    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[tokio::test]

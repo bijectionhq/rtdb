@@ -86,7 +86,8 @@ impl Log for MemoryLog {
         let timestamp = self.shared.timestamps.timestamp(&payload, timestamp)?;
         let metadata = LogMetadata { offset: LogOffset(records.next), timestamp };
         records.next = next;
-        records.values.push_back(LogRecord { metadata, payload });
+        // The log owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
+        records.values.push_back(LogRecord { metadata, payload: Bytes::copy_from_slice(&payload) });
         self.shared.progress.advance(metadata.offset);
         let (sender, durable) = oneshot::channel();
         let _ = sender.send(Ok(metadata));
@@ -192,6 +193,18 @@ impl LogReplayTail for MemoryTail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_appended_payload_releases_its_producers_charge() {
+        let memory = rtdb_types::MemoryBudget::new(1 << 20);
+        struct Charged(Vec<u8>, std::sync::Arc<rtdb_types::MemoryReservation>);
+        impl AsRef<[u8]> for Charged { fn as_ref(&self) -> &[u8] { &self.0 } }
+        let log = MemoryLog::new(1 << 20);
+        let payload = Bytes::from_owner(Charged(vec![7; 4096], memory.reserve(8192).unwrap()));
+        log.enqueue(payload, Timestamp(1)).await.unwrap().durable().await.unwrap();
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(log.read_range(LogOffset(0), LogOffset(1)).await.unwrap()[0].payload.as_ref(), &[7; 4096][..]);
+    }
 
     #[tokio::test]
     async fn tail_payload_limit_preserves_the_prefix_and_admits_a_maximum_size_record() {

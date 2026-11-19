@@ -143,7 +143,7 @@ fn cancelled_local_replay_keeps_its_charge_until_the_worker_releases_the_undeliv
 }
 
 #[tokio::test]
-async fn memory_replay_alias_keeps_the_append_and_delivery_charges_through_truncation() {
+async fn memory_replay_delivery_keeps_its_charge_through_truncation_and_the_append_charge_ends_at_append() {
     let log = MemoryLog::new(1 << 20);
     let memory = MemoryBudget::new(1024);
     let append_bound = 256 + 7;
@@ -157,7 +157,7 @@ async fn memory_replay_alias_keeps_the_append_and_delivery_charges_through_trunc
     assert_eq!(head.metadata, first);
     assert_eq!(head.payload_len, 7);
     assert_eq!(head.allocation_bound, 256);
-    assert_eq!(memory.used_bytes(), append_bound);
+    assert_eq!(memory.used_bytes(), 0);
 
     let exact = ReadReservation::new(256, memory.reserve(256).unwrap());
     let record = replay.read_head(head, exact).await.unwrap();
@@ -166,7 +166,7 @@ async fn memory_replay_alias_keeps_the_append_and_delivery_charges_through_trunc
     drop(record);
     log.truncate_before(LogOffset(1)).unwrap();
     assert_eq!(clone.as_ref(), b"payload");
-    assert_eq!(memory.used_bytes(), append_bound + 256);
+    assert_eq!(memory.used_bytes(), 256);
     drop(clone);
     assert_eq!(memory.used_bytes(), 0);
 
