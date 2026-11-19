@@ -11,4 +11,4 @@ pub use file::{DocMatch, FORMAT_VERSION, SearchFile, SearchRow, Source, build_se
 pub use definitions::{SearchDefinition, definitions_in};
 pub use lane::{KIND, SearchArtefacts, SearchBuilder, search_rows};
 pub use accelerate::SearchAccelerator;
-pub use runtime::SearchRuntime;
+pub use runtime::{SearchRuntime, Suspect};

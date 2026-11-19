@@ -25,6 +25,10 @@ pub trait ArtefactBuilder: Send + Sync {
     async fn definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<ArtefactDefinition>>;
     /// Uploads the artefact under its key and returns its record; an existing identical object is not an error.
     async fn build(&self, job: &ArtefactJob, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord>;
+    /// Jobs for artefacts already recorded whose files need building again, taken ahead of the snapshot's ordinary jobs.
+    async fn repairs(&self, _snapshot: &Arc<PartitionValue>, _cancellation: &CancellationToken) -> Result<Vec<ArtefactJob>> { Ok(Vec::new()) }
+    /// Completes when the builder has work the lane would otherwise wait for a block to find.
+    async fn wait_for_work(&self) { std::future::pending::<()>().await }
 }
 
 /// What a kind of artefact is handed to build one database's artefacts.
@@ -106,8 +110,10 @@ impl ArtefactDriver {
 
     async fn available(&self, cancellation: &CancellationToken) -> Result<Vec<ArtefactJob>> {
         let snapshot = self.snapshots.snapshot();
+        let mut jobs = self.builder.repairs(&snapshot, cancellation).await?;
         let definitions = self.builder.definitions(&snapshot, cancellation).await?;
-        Ok(available_artefact_jobs(snapshot.trie_catalog(), &definitions))
+        jobs.extend(available_artefact_jobs(snapshot.trie_catalog(), &definitions));
+        Ok(jobs)
     }
 
     /// The owner must cancel and join this run before releasing its storage or publication capabilities.
@@ -117,6 +123,7 @@ impl ArtefactDriver {
         let mut active = BTreeSet::new();
         let mut failed: BTreeMap<ArtefactJob, Anomaly> = BTreeMap::new();
         let mut pending: Vec<Completion> = Vec::new();
+        let builder = Arc::clone(&self.builder);
         let outcome = loop {
             if cancellation.is_cancelled() { break Ok(()); }
             let jobs = if self.automatic || !pending.is_empty() {
@@ -164,6 +171,7 @@ impl ArtefactDriver {
                 Some(request) = self.requests.recv() => pending.push(request),
                 // A new block may have healed whatever failed, so failed jobs become eligible again.
                 Some(()) = self.signals.recv() => failed.clear(),
+                () = builder.wait_for_work(), if self.automatic => (),
                 else => break Ok(()),
             }
         };

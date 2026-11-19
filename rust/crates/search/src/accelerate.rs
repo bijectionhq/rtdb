@@ -83,7 +83,10 @@ impl ScanAccelerator for SearchAccelerator {
                                 }
                                 true
                             }
-                            Err(_) => false,
+                            Err(_) => {
+                                self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version });
+                                false
+                            }
                     }
                 }
                 None => false,

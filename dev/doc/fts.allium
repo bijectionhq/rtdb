@@ -131,6 +131,17 @@ rule SearchJobRuns {
         db/ArtefactsAdded(table: job.table, trie_key: job.trie_key, record: search_record(job)) appended to database.source_log
 }
 
+rule RepairUnreadableSearchFile {
+    -- A scan that cannot read a recorded search file evaluates that trie from its data file and reports the file to its node's lane, which wakes for it.
+    -- The lane drops its cached copies and reads the object afresh; if it is still unreadable, it deletes the object and builds it again.
+    -- Search files are deterministic, so the rebuilt object has the bytes the record was made for, and the record stands.
+    -- A report whose trie is no longer live, or whose definition is no longer in force, is dropped.
+    when: SearchFileUnreadable(table, trie_key, definition)
+
+    ensures:
+        SearchJob.created(table: table, trie_key: trie_key, definition: definition)
+}
+
 ------------------------------------------------------------
 -- Rules: Query
 ------------------------------------------------------------
@@ -239,8 +250,6 @@ surface FullTextSearch {
 ------------------------------------------------------------
 
 open question "A node that uploads a search file and fails before appending ArtefactsAdded leaves a file no record names until its trie is collected. Is that bounded enough, or does the lane sweep its own unrecorded keys?"
-
-open question "A recorded search file that cannot be read is never rebuilt, so its trie is evaluated from its data file for the trie's life. Does the lane need a way to retire a bad record?"
 
 open question "Ranking verifies candidates by resolving them all; does a block-max WAND top-k, verifying candidates in batches, earn its complexity?"
 

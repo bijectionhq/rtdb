@@ -36,15 +36,21 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
 
 type DefinitionKey = (String, Option<(i64, i64)>, Option<i64>);
 
+/// A recorded search file a scan could not read, awaiting the lane's check.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Suspect { pub database: String, pub table: rtdb_types::TableRef, pub trie: rtdb_format::keys::TrieKey, pub artefact_id: String, pub version: i64 }
+
 pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     files: Mutex<Bounded<(String, String), Arc<SearchFile>>>,
+    suspects: Mutex<std::collections::BTreeSet<Suspect>>,
+    reported: tokio::sync::Notify,
 }
 
 impl SearchRuntime {
     /// `file_bytes` bounds the opened search files kept across queries; each keeps its buffer-pool lease, so its bytes stay charged to the pool.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), files: Mutex::new(Bounded::new(file_bytes)) })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), files: Mutex::new(Bounded::new(file_bytes)), suspects: Default::default(), reported: tokio::sync::Notify::new() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -71,6 +77,13 @@ impl SearchRuntime {
     }
 
     pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) { self.files.lock().remove(&(database.to_string(), key.as_str().to_string())); }
+
+    /// Hands a recorded file a scan could not read to the database's lane.
+    pub fn report(&self, suspect: Suspect) { if self.suspects.lock().insert(suspect) { self.reported.notify_one(); } }
+    pub fn suspects(&self, database: &str) -> Vec<Suspect> { self.suspects.lock().iter().filter(|suspect| suspect.database == database).cloned().collect() }
+    pub fn is_suspect(&self, suspect: &Suspect) -> bool { self.suspects.lock().contains(suspect) }
+    pub fn clear(&self, suspect: &Suspect) { self.suspects.lock().remove(suspect); }
+    pub async fn reported(&self) { self.reported.notified().await }
 }
 
 #[cfg(test)]

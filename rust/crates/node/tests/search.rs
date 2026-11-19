@@ -234,3 +234,36 @@ async fn search_score_ranks_rarer_terms_above_common_ones_once_the_corpus_is_ind
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_search_file_a_scan_cannot_read_is_rebuilt_to_its_original_bytes() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    for id in 0..10 {
+        assert!(session.state_mut().execute_tx(vec![sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'note {}'}}", if id % 2 == 0 { "overdue" } else { "paid" }))], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let store = Arc::clone(database.object_store());
+    let artefacts: Vec<_> = store.list(Some(&rtdb_storage::ObjectKey::new("tables").unwrap())).await.unwrap().into_iter().filter(|object| object.key.as_str().contains("/artefacts/")).collect();
+    assert!(!artefacts.is_empty());
+    let key = artefacts[0].key.clone();
+    let original = store.get(&key).await.unwrap();
+    store.delete(&key).await.unwrap();
+    store.put(&key, b"not a search file".to_vec().into()).await.unwrap();
+    let query = "SELECT _id FROM docs WHERE MATCH(body, 'overdue')";
+    assert_eq!(ids(rows(session.query_sql(query, vec![]).await.unwrap()).await), [0, 2, 4, 6, 8], "an unreadable search file costs time, not rows");
+    database.build_artefacts().await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap(), original, "the lane rebuilt the file it was told about, to the same bytes");
+    assert_eq!(ids(rows(session.query_sql(query, vec![]).await.unwrap()).await), [0, 2, 4, 6, 8]);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

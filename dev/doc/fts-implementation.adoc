@@ -101,7 +101,6 @@ Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 == Deferred
 
 * Block-max WAND top-k over search files, which needs the scan to verify candidates in batches.
-* Retiring a recorded search file that cannot be read, so the lane rebuilds it.
 * In-memory postings for live segments.
 * Phrase queries, which need positions.
 * Indexing the historical side, and search files spanning a completed partition group.

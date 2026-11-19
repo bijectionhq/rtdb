@@ -63,8 +63,30 @@ impl ArtefactBuilder for SearchBuilder {
         }).collect())
     }
 
+    async fn repairs(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<ArtefactJob>> {
+        let suspects = self.runtime.suspects(&self.database);
+        if suspects.is_empty() { return Ok(Vec::new()); }
+        let definitions = self.definitions(snapshot, cancellation).await?;
+        let mut jobs = Vec::new();
+        for suspect in suspects {
+            let definition = definitions.iter().find(|definition| definition.table == suspect.table && definition.id == suspect.artefact_id && definition.version == suspect.version);
+            let recorded = snapshot.trie_catalog().iter_tries(&suspect.table)
+                .any(|trie| trie.key == suspect.trie && trie.state == rtdb_index::TrieState::Live && trie.artefact(KIND, &suspect.artefact_id, suspect.version).is_some());
+            match definition {
+                Some(definition) if recorded => jobs.push(ArtefactJob { definition: definition.clone(), trie: suspect.trie.clone() }),
+                _ => self.runtime.clear(&suspect),
+            }
+        }
+        Ok(jobs)
+    }
+
+    async fn wait_for_work(&self) { self.runtime.reported().await }
+
     async fn build(&self, job: &ArtefactJob, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         let definition = &job.definition;
+        let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), trie: job.trie.clone(), artefact_id: definition.id.clone(), version: definition.version };
+        let repairing = self.runtime.is_suspect(&suspect);
+        let record = || ArtefactRecord { kind: Some(KIND.into()), definition_id: Some(definition.id.clone()), definition_version: Some(definition.version), stats: None };
         let known = self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned();
         let columns = match known { Some(columns) => columns, None => {
             self.definitions(snapshot, cancellation).await?;
@@ -74,6 +96,16 @@ impl ArtefactBuilder for SearchBuilder {
         let trie_size = snapshot.trie_catalog().iter_tries(&definition.table).find(|trie| trie.key == job.trie).map_or(0, |trie| trie.data_file_size);
         let identity = format!("{}/{}/{}-v{}", entry.slug.as_str(), job.trie, definition.id, definition.version);
         let key = ObjectKey::new(entry.slug.artefact_key(&job.trie, KIND, &definition.id, definition.version)?)?;
+        if repairing {
+            // Often only this node's cached copy was bad, so the object is read afresh before it is rebuilt.
+            self.runtime.forget_file(&self.database, &key);
+            self.storage.invalidate(&key).await?;
+            if self.runtime.file(&self.database, &self.storage, &key, &columns).await.is_ok() { self.runtime.clear(&suspect); return Ok(record()); }
+            self.runtime.forget_file(&self.database, &key);
+            self.storage.invalidate(&key).await?;
+            // The store refuses different bytes under an existing key; a reader treats the missing file as absent meanwhile.
+            self.store.delete(&key).await?;
+        }
         let workdir = tempfile::Builder::new().prefix("rtdb-search-").tempdir().map_err(fault)?;
         let input = download(self.store.as_ref(), &self.memory, &ObjectKey::new(entry.slug.data_key(&job.trie))?, &workdir.path().join("input.arrow"), cancellation).await?;
         let indexing = self.memory.reserve(indexing_allowance(trie_size))?;
@@ -89,7 +121,8 @@ impl ArtefactBuilder for SearchBuilder {
         }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
         self.store.put_file(&key, &bundle).await?;
-        Ok(ArtefactRecord { kind: Some(KIND.into()), definition_id: Some(definition.id.clone()), definition_version: Some(definition.version), stats: None })
+        if repairing { self.runtime.clear(&suspect); }
+        Ok(record())
     }
 }
 

@@ -49,6 +49,7 @@ impl Database {
     pub fn status(&self) -> rtdb_replication::DriverStatus { self.replication.status() }
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
     pub fn trie_catalog(&self) -> Arc<rtdb_index::TrieCatalog> { Arc::clone(self.partition.value().trie_catalog()) }
+    pub fn object_store(&self) -> &Arc<dyn ObjectStore> { self.storage.object_store() }
     /// Builds every artefact the lanes can currently build, returning once each is published or with the first failure.
     pub async fn build_artefacts(&self) -> Result<()> {
         for lane in &self.artefacts { lane.build_all().await?; }
