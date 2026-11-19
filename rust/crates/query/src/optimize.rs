@@ -73,7 +73,13 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Apply { input, dependent, arguments: arguments.clone(), kind: *kind, output: output.clone() })?))
         }
         RelationNode::Aggregate { input, groups, aggregates } => {
-            let input = prepare(Arc::clone(input))?;
+            let mut columns: BTreeSet<ColumnId> = groups.iter().flat_map(|group| group.expr.referenced_columns()).collect();
+            for aggregate in aggregates {
+                columns.extend(aggregate.argument.iter().chain(&aggregate.filter).flat_map(Expr::referenced_columns));
+                columns.extend(aggregate.order_by.iter().flat_map(|order| order.expr.referenced_columns()));
+            }
+            if columns.is_empty() { columns.extend(input.schema().fields().first().map(|field| field.id)); }
+            let input = prune(Arc::clone(input), &columns)?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Aggregate { input, groups: groups.clone(), aggregates: aggregates.clone() })?))
         }
         RelationNode::Window { input, partition_by, order_by, expressions } => {
@@ -456,6 +462,20 @@ mod tests {
         let RelationNode::Join { left, right, kind: JoinKind::Cross, .. } = input.node() else { panic!("Expected the unconnected table crossed last") };
         assert_eq!(right.schema().ids(), BTreeSet::from([b.id]));
         assert!(matches!(left.node(), RelationNode::Join { kind: JoinKind::Inner, condition: Some(condition), .. } if *condition == a_c));
+    }
+
+    #[test]
+    fn an_aggregate_reads_only_the_columns_its_groups_and_arguments_need() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction};
+        let [group, argument, unused, count, total] = [0, 1, 2, 3, 4].map(field);
+        let scan = base_scan(vec![group.clone(), argument.clone(), unused]);
+        let aggregate = |field: Field, function, argument| AggregateExpr { field, function, argument, distinct: false, filter: None, order_by: Vec::new() };
+        let schema = Schema::new(vec![group.clone(), count.clone(), total.clone()]).unwrap();
+        let grouped = Relation::new(schema, RelationNode::Aggregate { input: scan, groups: vec![NamedExpr { field: group.clone(), expr: group.expression() }],
+            aggregates: vec![aggregate(count, AggregateFunction::CountStar, None), aggregate(total, AggregateFunction::Sum, Some(argument.expression()))] }).unwrap();
+        let prepared = prepare(Arc::new(grouped)).unwrap();
+        let RelationNode::Aggregate { input, .. } = prepared.node() else { panic!("Expected the aggregate") };
+        assert_eq!(input.schema().ids(), BTreeSet::from([group.id, argument.id]));
     }
 
     #[test]
