@@ -137,9 +137,36 @@ struct PartitionScan {
 }
 
 use crate::analysis::ScanCounts;
+
+/// The IIDs an `_id` predicate selects, as the reference's scan narrows to them: `_id = v`, or an OR of such, with every
+/// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name one IID — `_id = 7.0` still
+/// matches the integer ID 7 — so the scan reads every IID; the predicate itself is applied either way.
+fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::BTreeSet<Iid>> {
+    let id = scan.columns.iter().find(|field| field.name == "_id")?.id;
+    let eid = |expr: &Expr| -> Option<Iid> {
+        let value = match expr { Expr::Literal(value) => value, Expr::Parameter { index, .. } => parameters.get(*index)?, _ => return None };
+        value.entity_id().ok().map(|entity| entity.iid())
+    };
+    let equality = |expr: &Expr| -> Option<Iid> {
+        let Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } = expr else { return None };
+        match (left.as_ref(), right.as_ref()) {
+            (Expr::Column { id: column, .. }, value) | (value, Expr::Column { id: column, .. }) if *column == id => eid(value),
+            _ => None,
+        }
+    };
+    fn disjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr { Expr::Binary { op: rtdb_plan::BinaryOp::Or, left, right } => { disjuncts(left, out); disjuncts(right, out); } other => out.push(other) }
+    }
+    scan.predicates.iter().filter(|predicate| predicate.referenced_columns() == std::collections::BTreeSet::from([id])).find_map(|predicate| {
+        let mut clauses = Vec::new();
+        disjuncts(predicate, &mut clauses);
+        clauses.into_iter().map(equality).collect::<Option<std::collections::BTreeSet<_>>>()
+    })
+}
 pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, _reservation: Arc<MemoryReservation> }
 impl ScanCursor {
-    pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
+    pub async fn new(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
+        if scan.iids.is_none() { scan.iids = id_selection(&scan, execution.parameters.values()); }
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
         let database = execution.context.catalog.database(&scan.table.name.database)?;
@@ -597,6 +624,24 @@ mod tests {
     use rtdb_trie::TrieConfig;
     use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TransactionKey, TxId};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn an_id_equality_or_disjunction_narrows_the_scan_only_when_every_value_names_one_iid() {
+        let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+        let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
+        let scan = |predicate: Expr| Scan { table: table.clone(), columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates: vec![predicate] };
+        let equals = |value: Expr| Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), value);
+        let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) };
+        let iid = |value: Value| value.entity_id().unwrap().iid();
+        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::I64(7)))), &[]), Some([iid(Value::I64(7))].into()));
+        let either = Expr::binary(rtdb_plan::BinaryOp::Or, equals(Expr::Literal(Value::I64(7))), Expr::binary(rtdb_plan::BinaryOp::Eq, parameter.clone(), id.expression()));
+        assert_eq!(id_selection(&scan(either.clone()), &[Value::Utf8("seven".into())]), Some([iid(Value::I64(7)), iid(Value::Utf8("seven".into()))].into()));
+        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::F64(7.0)))), &[]), None, "7.0 still matches the integer ID 7");
+        assert_eq!(id_selection(&scan(either), &[Value::Null]), None);
+        let range = Expr::binary(rtdb_plan::BinaryOp::Lt, id.expression(), Expr::Literal(Value::I64(7)));
+        assert_eq!(id_selection(&scan(range), &[]), None);
+    }
 
     fn live_table() -> (PartitionState, TableRef, Vec<StoredEvent>) {
         let state = PartitionState::empty(TrieConfig::new(1, 1).unwrap()).unwrap();
