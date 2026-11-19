@@ -165,6 +165,10 @@ impl TxResolver {
                     break;
                 }
                 if let Err(error) = tx.apply(operation).await {
+                    let error = match document_table(operation) {
+                        Some(table) if !error.context.contains_key("table") => error.with_transit_context("table", &T::table_ref(table))?,
+                        _ => error,
+                    };
                     outcome = Err(error.with_context("tx-op-idx", index.into()).with_context("tx-key", tx_key_context(key)?));
                     break;
                 }
@@ -471,6 +475,15 @@ fn validate_document_operation(operation: &Operation) -> Result<()> {
     Err(Anomaly::incorrect("xtdb/forbidden-columns", format!("Cannot {verb} documents with columns: [{}]", forbidden.join(", ")))
         .with_transit_context("table", &T::table_ref(table))?
         .with_context("forbidden-cols", serde_json::json!(forbidden)))
+}
+
+/// The table a document operation writes; the reference adds it to the context of any error the operation raises.
+fn document_table(operation: &Operation) -> Option<&TableRef> {
+    match operation {
+        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::PutIids { table, .. } | Operation::PatchIids { table, .. } => Some(table),
+        _ => None,
+    }
 }
 
 fn check_table(table: &TableRef) -> Result<()> {

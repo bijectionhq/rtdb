@@ -1637,3 +1637,16 @@ async fn executing_a_transaction_without_an_indexer_fails_and_queries_still_run(
     assert_eq!(rows(session.query_sql("SELECT 1 AS v", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
     drop(session); stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_document_operation_error_names_its_table() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let TxOp::PutDocs { table, documents, .. } = put(&node, 1, 10) else { unreachable!() };
+    let inverted = TxOp::PutDocs { table: table.clone(), documents, valid_from: Some(rtdb_types::Timestamp(2_000)), valid_to: Some(rtdb_types::Timestamp(1_000)) };
+    let result = session.state_mut().execute_tx(vec![inverted], AutonomousTxOptions::default()).await.unwrap();
+    let error = result.error().expect("the inverted valid time aborts the transaction");
+    assert_eq!(error.code, "xtdb.indexer/invalid-valid-times");
+    assert_eq!(rtdb_format::transit::from_json_value(&error.context["table"]).unwrap(), rtdb_format::transit::TransitValue::table_ref(&table));
+    drop(session); stop(&node, driver).await;
+}
