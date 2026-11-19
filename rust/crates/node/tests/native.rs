@@ -1569,3 +1569,17 @@ async fn a_left_join_through_an_argument_subquery_takes_the_dependent_binding() 
     assert_eq!(rows(session.query_xtql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1), Value::Null], vec![Value::I64(2), Value::I64(3)], vec![Value::I64(3), Value::Null]]);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn xtql_projections_keep_their_written_column_order() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    for (query, expected) in [
+        ("(-> (rel [{:x 1 :y 2}] [x y]) (return y x))", vec!["y", "x"]),
+        ("(-> (rel [{:x 1 :y 2}] [x y]) (with {:b 3} {:a 4}))", vec!["x", "y", "b", "a"]),
+    ] {
+        let cursor = session.query_xtql(query, vec![]).await.unwrap();
+        assert_eq!(cursor.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), expected, "{query}");
+    }
+    stop(&node, driver).await;
+}

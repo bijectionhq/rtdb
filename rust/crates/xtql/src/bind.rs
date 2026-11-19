@@ -361,7 +361,8 @@ impl Compiler<'_, '_> {
 
     fn projection(&mut self, mut bound: Bound, bindings: &[Binding], keep: bool, unify: bool, parameters: &Parameters) -> Result<Bound> {
         let old = bound.variables.clone();
-        let mut projections: BTreeMap<_, _> = if keep { pass_through(&bound).into_iter().map(|projection| (projection.field.name.clone(), projection)).collect() } else { BTreeMap::new() };
+        // In the reference's projection order: passed-through variables, then each new binding as written.
+        let mut projections: Vec<(String, NamedExpr)> = if keep { pass_through(&bound).into_iter().map(|projection| (projection.field.name.clone(), projection)).collect() } else { Vec::new() };
         let mut predicates = Vec::new();
         for binding in bindings {
             let name = normal(&binding.name);
@@ -370,10 +371,13 @@ impl Compiler<'_, '_> {
                 if let Some(existing) = old.get(&name) { predicates.push(PExpr::binary(BinaryOp::Eq, existing.expression(), expr)); continue; }
             }
             let field = self.binder.field(&name, None, expr.data_type())?;
-            projections.insert(name, NamedExpr { field, expr });
+            match projections.iter_mut().find(|(existing, _)| *existing == name) {
+                Some((_, projection)) => *projection = NamedExpr { field, expr },
+                None => projections.push((name, NamedExpr { field, expr })),
+            }
         }
         for predicate in predicates { bound.relation = Arc::new(bound.relation.filter(predicate)?); }
-        Ok(Bound::from_relation(bound.relation.project(projections.into_values().collect())?))
+        Ok(Bound::from_relation(bound.relation.project(projections.into_iter().map(|(_, projection)| projection).collect())?))
     }
 
     fn unnest(&mut self, mut bound: Bound, binding: &Binding, unify: bool, parameters: &Parameters) -> Result<Bound> {
