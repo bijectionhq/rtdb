@@ -575,7 +575,7 @@ fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>>
         | "asin" | "acos" | "atan" | "lower_inf" | "lower" | "upper" | "upper_inf"
         | "namespace" | "local_name" | "reverse" | "quote_ident" | "parse_ident" => 1..=1,
         "array_upper" | "array_lower" | "array_length" | "mod" | "log" | "power" | "age"
-        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" => 2..=2,
+        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" | "match" | "search_score" => 2..=2,
         "round" => 1..=2,
         "least" | "greatest" | "str" | "format" | "concat" => 1..=usize::MAX,
         _ => return None,

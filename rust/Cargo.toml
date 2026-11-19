@@ -47,6 +47,7 @@ rtdb-metrics = { path = "crates/metrics" }
 rtdb-flight-sql = { path = "crates/flight-sql" }
 rtdb-ffi = { path = "crates/ffi" }
 rtdb-tls = { path = "crates/tls" }
+rtdb-text = { path = "crates/text" }
 sqlparser = { path = "vendor/sqlparser", version = "=0.63.0" }
 arrow-array = { version = "=58.4.1", features = ["ffi"] }
 arrow-buffer = "=58.4.1"

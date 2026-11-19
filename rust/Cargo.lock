@@ -3845,6 +3845,7 @@ dependencies = [
  "rtdb-format",
  "rtdb-java-date",
  "rtdb-plan",
+ "rtdb-text",
  "rtdb-types",
  "serde_json",
  "stacker",
@@ -4393,6 +4394,10 @@ dependencies = [
  "rtdb-types",
  "serde",
 ]
+
+[[package]]
+name = "rtdb-text"
+version = "0.1.0"
 
 [[package]]
 name = "rtdb-tls"
