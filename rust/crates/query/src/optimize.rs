@@ -125,10 +125,12 @@ fn superseded(outer: &[NamedExpr], input: &Arc<Relation>) -> Option<(Arc<Relatio
     Some((Arc::clone(inner_input), expressions))
 }
 
-/// Selects beneath an existing selection by extending its conjunction rather than stacking another.
+/// Selects over a scan's selection by extending its conjunction, as the reference merges selections around a scan.
+/// Elsewhere the selections stay stacked, so the lower one drops its rows before the upper one evaluates them.
 fn filter(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
     match input.node() {
-        RelationNode::Filter { input: child, predicate: existing } => Ok(Arc::new(Arc::clone(child).filter(Expr::binary(BinaryOp::And, existing.clone(), predicate))?)),
+        RelationNode::Filter { input: child, predicate: existing } if matches!(child.node(), RelationNode::Scan(_)) =>
+            Ok(Arc::new(Arc::clone(child).filter(Expr::binary(BinaryOp::And, existing.clone(), predicate))?)),
         _ => Ok(Arc::new(input.filter(predicate)?)),
     }
 }

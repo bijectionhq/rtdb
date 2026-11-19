@@ -783,3 +783,14 @@ async fn a_top_k_over_unorderable_keys_rejects_them_only_when_it_has_rows() {
     };
     assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.expression/function-type-mismatch", Some("compare is not applicable to these vector types")));
 }
+
+#[tokio::test]
+async fn a_selection_pushed_beneath_another_drops_its_rows_before_the_other_reads_them() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    let sql = "SELECT s.c FROM (SELECT t.c, t.a FROM (VALUES (0, CAST(NULL AS BIGINT))) t(c, a) WHERE 1 / t.c > 0) s WHERE s.a > 1";
+    let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = statement.open_query(Arc::clone(&context), vec![]).await.unwrap();
+    let mut rows = 0;
+    while let Some(batch) = cursor.next_batch().await.unwrap() { rows += batch.batch().num_rows(); }
+    assert_eq!(rows, 0);
+}
