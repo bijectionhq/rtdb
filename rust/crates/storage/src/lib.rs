@@ -4,6 +4,8 @@ pub mod error;
 pub mod io_region;
 pub mod log;
 pub mod object_store;
+mod durability;
+pub use durability::sync_file;
 #[cfg(feature = "remote")]
 pub mod remote;
 

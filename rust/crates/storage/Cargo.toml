@@ -25,5 +25,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

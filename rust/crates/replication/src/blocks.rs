@@ -235,7 +235,7 @@ impl BlockStore {
             let pages = live.block_pages(&self.memory)?;
             write_node(live.trie().root(), &pages, &self.memory, &temporary, &mut writer, &mut metadata, &mut reservations, cancellation).await?;
             let file = writer.ok_or_else(|| invalid("Nonempty live table produced no pages"))?.finish()?;
-            file.sync_all().map_err(io_error)?;
+            rtdb_storage::sync_file(&file).map_err(io_error)?;
             let size = i64::try_from(file.metadata().map_err(io_error)?.len()).map_err(io_error)?;
             self.store.put_file(&ObjectKey::new(entry.slug.data_key(&trie))?, temporary.path()).await?;
             check_cancelled(cancellation)?;
