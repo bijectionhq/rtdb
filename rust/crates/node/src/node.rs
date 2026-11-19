@@ -35,7 +35,6 @@ pub struct NodeServices {
     /// Consulted by every scan before it opens, unless `NodeOptions::scan_acceleration` is off.
     pub scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>>,
 }
-/// The search kind and accelerator share one runtime, so a node's lane and scans share its caches.
 fn default_search() -> SearchServices {
     #[cfg(feature = "search")] {
         let runtime = rtdb_search::SearchRuntime::new(256 << 20);

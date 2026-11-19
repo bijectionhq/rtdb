@@ -62,9 +62,9 @@ value SearchDoc {
 ------------------------------------------------------------
 
 entity SearchDefinitions {
-    -- The definitions in force: `xt.search_indexes` read at a basis, as of the reader's current time in valid time.
-    -- They are documents the indexer writes, so every node reading at the same basis holds the same set.
-    -- A node reads them once per committed basis and reuses them across scans and jobs; a snapshot carrying a transaction's own writes reads them afresh.
+    -- The definitions in force: `xt.search_indexes` read at a committed basis, as of the basis's own system time in valid time too.
+    -- They are documents the indexer writes, so every node reading at the same basis holds the same set, and a node reads them once per basis.
+    -- A snapshot carrying a transaction's own writes reads them afresh, as of the reader's current time.
     definitions: List<SearchIndexDefinition>
 }
 
@@ -132,8 +132,9 @@ rule SearchJobRuns {
 }
 
 rule RepairUnreadableSearchFile {
-    -- A scan that cannot read a recorded search file evaluates that trie from its data file and reports the file to its node's lane, which wakes for it.
-    -- The lane drops its cached copies and reads the object afresh; if it is still unreadable, it deletes the object and builds it again.
+    -- A scan that finds a recorded search file missing, or its bytes unreadable as a search file, evaluates that trie from its data file and reports the file to its database's lane, which wakes for it.
+    -- A file that could not be fetched at all is not reported: the store may be briefly unavailable, and the file sound.
+    -- The lane drops its cached copies and reads the object afresh. If the object is missing it builds it; if its bytes are still unreadable it deletes it and builds it again; if it cannot be fetched the job fails and is retried.
     -- Search files are deterministic, so the rebuilt object has the bytes the record was made for, and the record stands.
     -- A report whose trie is no longer live, or whose definition is no longer in force, is dropped.
     when: SearchFileUnreadable(table, trie_key, definition)
@@ -175,6 +176,7 @@ rule RepairUnreadableSearchFile {
 --   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
+-- The scan is left to the unranked narrowing when the database reads several partitions, when the matching IIDs exceed max_candidates, or when verification runs past sixteen batches.
 -- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every source the query registered; with none, each term's inverse document frequency is 1.
 
 rule MatchIsAResidualPredicate {

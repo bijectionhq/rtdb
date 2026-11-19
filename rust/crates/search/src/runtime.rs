@@ -41,7 +41,7 @@ type DefinitionKey = (String, Option<(i64, i64)>, Option<i64>);
 pub struct Suspect { pub database: String, pub table: rtdb_types::TableRef, pub trie: rtdb_format::keys::TrieKey, pub artefact_id: String, pub version: i64 }
 
 /// Postings over a live segment's rows for one column, valid for every segment that starts with the same batches.
-struct LivePostings { batches: Vec<std::sync::Weak<rtdb_index::IndexBatch>>, rows: u32, postings: std::collections::HashMap<String, Vec<u32>> }
+struct LivePostings { batches: Vec<std::sync::Weak<rtdb_index::IndexBatch>>, rows: u32, bytes: usize, postings: std::collections::HashMap<String, Vec<u32>> }
 
 impl LivePostings {
     /// How many leading batches `segment` shares with these postings.
@@ -54,7 +54,9 @@ impl LivePostings {
             let rtdb_format::data::StoredOperation::Put(document) = &event.operation else { continue };
             let Some(rtdb_types::Value::Utf8(text)) = document.get(column) else { continue };
             let mut seen = std::collections::BTreeSet::new();
-            for token in rtdb_text::tokens(text) { if seen.insert(token.clone()) { self.postings.entry(token).or_default().push(row); } }
+            for token in rtdb_text::tokens(text) {
+                if seen.insert(token.clone()) { self.bytes += token.len() + 4; self.postings.entry(token).or_default().push(row); }
+            }
         }
         self.batches = segment.batches().map(Arc::downgrade).collect();
         self.rows = segment.row_count();
@@ -64,40 +66,60 @@ impl LivePostings {
 
 type LiveKey = (String, rtdb_types::TableRef, String, usize);
 
+/// Why a recorded search file could not be used; only a file that is gone or whose bytes are wrong is worth rebuilding.
+#[derive(Debug)]
+pub enum FileError { Missing, Corrupt(rtdb_types::Anomaly), Unavailable(rtdb_types::Anomaly) }
+
+impl FileError {
+    pub fn needs_repair(&self) -> bool { !matches!(self, Self::Unavailable(_)) }
+}
+
+/// An opened file, and the buffer pool it was read through: a pool is one database's storage for as long as it is open.
+type OpenedFile = (std::sync::Weak<BufferPool>, Arc<SearchFile>);
+
 pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
-    files: Mutex<Bounded<(String, String), Arc<SearchFile>>>,
+    files: Mutex<Bounded<(String, String), OpenedFile>>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
-    reported: tokio::sync::Notify,
+    reported: Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 impl SearchRuntime {
     /// `file_bytes` bounds the opened search files kept across queries; each keeps its buffer-pool lease, so its bytes stay charged to the pool.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(4 << 20)), files: Mutex::new(Bounded::new(file_bytes)), suspects: Default::default(), reported: tokio::sync::Notify::new() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), suspects: Default::default(), reported: Default::default() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
 
     /// The definitions in force at a snapshot, read once per committed basis.
-    /// Definitions are documents valid from their transaction onwards, so the basis alone decides them; a snapshot carrying a transaction's own writes is read afresh.
+    /// They are read as of the basis's own system time in valid time, as well as in system time, so the basis alone decides them; a snapshot carrying a transaction's own writes is read afresh, at `now`.
     pub async fn definitions(&self, database: &str, snapshot: &Snapshot, storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, now: Instant, cancellation: &CancellationToken) -> Result<Arc<Vec<SearchDefinition>>> {
-        let key = (!snapshot.has_overlays()).then(|| (database.to_string(), snapshot.tx_basis().map(|basis| (basis.tx_id.0, basis.system_time.0)), snapshot.system_time_cap().map(|cap| cap.0)));
+        let committed = !snapshot.has_overlays();
+        let key = committed.then(|| (database.to_string(), snapshot.tx_basis().map(|basis| (basis.tx_id.0, basis.system_time.0)), snapshot.system_time_cap().map(|cap| cap.0)));
         if let Some(definitions) = key.as_ref().and_then(|key| self.definitions.lock().get(key)) { return Ok(definitions); }
-        let definitions = Arc::new(definitions_in(database, vec![snapshot.clone()], Arc::clone(storage), Arc::clone(memory), now, cancellation).await?);
+        let at = match (committed, snapshot.system_time_cap()) { (true, Some(cap)) => cap.into(), _ => now };
+        let definitions = Arc::new(definitions_in(database, vec![snapshot.clone()], Arc::clone(storage), Arc::clone(memory), at, cancellation).await?);
         if let Some(key) = key { self.definitions.lock().insert(key, Arc::clone(&definitions), 1); }
         Ok(definitions)
     }
 
     /// An opened search file, from this node's cache or freshly read; an object key names immutable bytes, so a cached file is never stale.
-    pub async fn file(&self, database: &str, storage: &BufferPool, key: &rtdb_storage::ObjectKey, columns: &[String]) -> Result<Arc<SearchFile>> {
+    /// A kept file is used only while the pool it was read through is the database's pool, so a database detached and attached anew starts afresh.
+    pub async fn file(&self, database: &str, storage: &Arc<BufferPool>, key: &rtdb_storage::ObjectKey, columns: &[String]) -> std::result::Result<Arc<SearchFile>, FileError> {
         let cache_key = (database.to_string(), key.as_str().to_string());
-        if let Some(file) = self.files.lock().get(&cache_key) { return Ok(file); }
-        let lease = storage.get(key).await?;
+        if let Some((pool, file)) = self.files.lock().get(&cache_key) {
+            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(file); }
+        }
+        let lease = match storage.get(key).await {
+            Ok(lease) => lease,
+            Err(rtdb_storage::Error::MissingObject(_)) => return Err(FileError::Missing),
+            Err(error) => return Err(FileError::Unavailable(error.into())),
+        };
         let size = lease.as_slice().len();
-        let file = Arc::new(SearchFile::open(lease, columns)?);
-        self.files.lock().insert(cache_key, Arc::clone(&file), size);
+        let file = Arc::new(SearchFile::open(lease, columns).map_err(FileError::Corrupt)?);
+        self.files.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), size);
         Ok(file)
     }
 
@@ -113,20 +135,23 @@ impl SearchRuntime {
             match live.get(&key) {
                 Some(entry) => entry,
                 None => {
-                    let entry = Arc::new(Mutex::new(LivePostings { batches: Vec::new(), rows: 0, postings: Default::default() }));
-                    live.insert(key.clone(), Arc::clone(&entry), segment.row_count().max(1) as usize);
+                    let entry = Arc::new(Mutex::new(LivePostings { batches: Vec::new(), rows: 0, bytes: 0, postings: Default::default() }));
+                    live.insert(key.clone(), Arc::clone(&entry), 1);
                     entry
                 }
             }
         };
         let mut postings = entry.lock();
-        let shared = postings.shared_prefix(segment);
-        let batches = segment.batches().count();
-        // A segment ending inside the cached batches is an older snapshot of the same rows, answered by filtering; anything else that diverges is rebuilt.
-        if shared < batches.min(postings.batches.len()) { *postings = LivePostings { batches: Vec::new(), rows: 0, postings: Default::default() }; }
+        let mut shared = postings.shared_prefix(segment);
+        // A segment ending inside the cached batches is an older snapshot of the same rows, answered by filtering; one that diverges from them is indexed afresh.
+        if shared < segment.batches().count().min(postings.batches.len()) {
+            *postings = LivePostings { batches: Vec::new(), rows: 0, bytes: 0, postings: Default::default() };
+            shared = 0;
+        }
         if shared == postings.batches.len() && postings.rows < segment.row_count() {
             postings.extend(segment, column)?;
-            self.live.lock().insert(key, Arc::clone(&entry), segment.row_count().max(1) as usize);
+            let bytes = postings.bytes;
+            self.live.lock().insert(key, Arc::clone(&entry), bytes.max(1));
         }
         let visible = segment.row_count();
         let mut lists: Vec<&Vec<u32>> = Vec::with_capacity(query.terms().len());
@@ -137,11 +162,15 @@ impl SearchRuntime {
     }
 
     /// Hands a recorded file a scan could not read to the database's lane.
-    pub fn report(&self, suspect: Suspect) { if self.suspects.lock().insert(suspect) { self.reported.notify_one(); } }
+    pub fn report(&self, suspect: Suspect) {
+        let database = suspect.database.clone();
+        if self.suspects.lock().insert(suspect) { self.notifier(&database).notify_one(); }
+    }
+    fn notifier(&self, database: &str) -> Arc<tokio::sync::Notify> { Arc::clone(self.reported.lock().entry(database.to_string()).or_default()) }
     pub fn suspects(&self, database: &str) -> Vec<Suspect> { self.suspects.lock().iter().filter(|suspect| suspect.database == database).cloned().collect() }
     pub fn is_suspect(&self, suspect: &Suspect) -> bool { self.suspects.lock().contains(suspect) }
     pub fn clear(&self, suspect: &Suspect) { self.suspects.lock().remove(suspect); }
-    pub async fn reported(&self) { self.reported.notified().await }
+    pub async fn reported(&self, database: &str) { self.notifier(database).notified().await }
 }
 
 #[cfg(test)]
@@ -166,7 +195,7 @@ mod tests {
     async fn an_opened_search_file_is_read_once_and_reopened_only_after_it_is_forgotten() {
         use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
         let store = Arc::new(MemoryStore::default());
-        let pool = BufferPool::new(store.clone(), 1 << 24);
+        let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
         let columns = vec!["body".to_string()];
         let key = ObjectKey::new("tables/docs/artefacts/l01-rc-b00/search/docs~a1f1-v1.bin").unwrap();
         store.put(&key, crate::build_search_file(&columns, &[], "job").unwrap().into()).await.unwrap();
@@ -177,6 +206,9 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &runtime.file("xtdb", &pool, &key, &columns).await.unwrap()), "a cached file needs no read");
         assert!(runtime.file("other", &pool, &key, &columns).await.is_err(), "databases do not share entries");
         runtime.forget_file("xtdb", &key);
-        assert!(runtime.file("xtdb", &pool, &key, &columns).await.is_err());
+        assert!(matches!(runtime.file("xtdb", &pool, &key, &columns).await, Err(FileError::Missing)));
+        let reattached = Arc::new(BufferPool::new(store.clone(), 1 << 24));
+        store.put(&key, b"garbage".to_vec().into()).await.unwrap();
+        assert!(matches!(runtime.file("xtdb", &reattached, &key, &columns).await, Err(FileError::Corrupt(_))), "a pool the entry was not read through starts afresh");
     }
 }

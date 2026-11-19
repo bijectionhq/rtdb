@@ -30,6 +30,8 @@ pub struct ScanRequest<'a> {
     pub constants: &'a dyn ConstantEvaluator,
     /// Where an accelerator records the corpus statistics `search_score` ranks against in this query.
     pub corpora: &'a CorpusRegistry,
+    /// How many partitions the database's scan reads; this request is for one of them.
+    pub partitions: usize,
     /// Resolves candidates exactly as the scan will, for an accelerator that must know which are visible before it can narrow.
     pub verifier: &'a dyn CandidateVerifier,
 }

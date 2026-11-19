@@ -331,6 +331,10 @@ async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_
                     let limited = ranked(rows(session.query_sql(&format!("{query} LIMIT {k}"), vec![]).await.unwrap()).await);
                     assert_eq!(limited, everything.iter().take(k).cloned().collect::<Vec<_>>(), "{query} LIMIT {k}");
                 }
+                for unbounded in [format!("{query} LIMIT 9223372036854775807"), format!("{query} LIMIT 9223372036854775807 OFFSET 1")] {
+                    let skip = usize::from(unbounded.ends_with("OFFSET 1"));
+                    assert_eq!(ranked(rows(session.query_sql(&unbounded, vec![]).await.unwrap()).await), everything.iter().skip(skip).cloned().collect::<Vec<_>>(), "{unbounded}");
+                }
                 let offset = ranked(rows(session.query_sql(&format!("{query} LIMIT 3 OFFSET 4"), vec![]).await.unwrap()).await);
                 assert_eq!(offset, everything.iter().skip(4).take(3).cloned().collect::<Vec<_>>(), "{query} LIMIT 3 OFFSET 4");
             }

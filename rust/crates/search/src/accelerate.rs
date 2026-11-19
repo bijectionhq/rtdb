@@ -87,8 +87,8 @@ impl ScanAccelerator for SearchAccelerator {
                                 }
                                 true
                             }
-                            Err(_) => {
-                                self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version });
+                            Err(error) => {
+                                if error.needs_repair() { self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version }); }
                                 false
                             }
                     }
@@ -128,8 +128,10 @@ impl SearchAccelerator {
     /// Every matching event is scored exactly from the index, and an IID's best event bounds every row it can resolve to.
     /// IIDs are verified best bound first, in batches, until `limit` verified rows outscore every bound still unverified.
     async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition) -> Result<Option<BTreeSet<Iid>>> {
+        // Every partition's files must be registered before a score fixes the corpus, so ranking is left to the sort when there are several.
+        if request.partitions > 1 { return Ok(None); }
         let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { return Ok(None) };
-        let limit = match request.constants.constant(&top_k.limit).await? {
+        let limit = match request.constants.constant(&top_k.limit).await.ok().flatten() {
             Some(Value::I64(limit)) => limit, Some(Value::I32(limit)) => i64::from(limit), Some(Value::I16(limit)) => i64::from(limit), _ => return Ok(None),
         };
         let Ok(limit) = usize::try_from(limit) else { return Ok(None) };
@@ -147,8 +149,8 @@ impl SearchAccelerator {
                     let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
                     match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
                         Ok(file) => Some((key, file)),
-                        Err(_) => {
-                            self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version });
+                        Err(error) => {
+                            if error.needs_repair() { self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version }); }
                             None
                         }
                     }
@@ -194,11 +196,13 @@ impl SearchAccelerator {
                 if matching.matches(&tokens) { bound(event.iid, rtdb_text::bm25(&scoring, &tokens, corpus.as_ref())); }
             }
         }
+        if bounds.len() > self.max_candidates { return Ok(None); }
         let mut order: Vec<(f64, Iid)> = bounds.into_iter().map(|(iid, score)| (score, iid)).collect();
         order.sort_by(descending);
         let mut verified: Vec<(f64, Iid)> = Vec::new();
         let mut next = 0;
-        let batch = (limit * 2).max(64);
+        let batch = limit.saturating_mul(2).max(64);
+        let mut rounds = 0;
         loop {
             if verified.len() >= limit {
                 verified.sort_by(descending);
@@ -206,7 +210,9 @@ impl SearchAccelerator {
                 if order.get(next).is_none_or(|(upper, _)| kth > *upper) { break; }
             }
             if next == order.len() { break; }
-            let end = (next + batch).min(order.len());
+            rounds += 1;
+            if rounds > 16 { return Ok(None); }
+            let end = next.saturating_add(batch).min(order.len());
             let iids = order[next..end].iter().map(|(_, iid)| *iid).collect();
             next = end;
             for (iid, value) in request.verifier.visible(iids, top_k.column).await? {

@@ -80,7 +80,7 @@ impl ArtefactBuilder for SearchBuilder {
         Ok(jobs)
     }
 
-    async fn wait_for_work(&self) { self.runtime.reported().await }
+    async fn wait_for_work(&self) { self.runtime.reported(&self.database).await }
 
     async fn build(&self, job: &ArtefactJob, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         let definition = &job.definition;
@@ -97,14 +97,20 @@ impl ArtefactBuilder for SearchBuilder {
         let identity = format!("{}/{}/{}-v{}", entry.slug.as_str(), job.trie, definition.id, definition.version);
         let key = ObjectKey::new(entry.slug.artefact_key(&job.trie, KIND, &definition.id, definition.version)?)?;
         if repairing {
-            // Often only this node's cached copy was bad, so the object is read afresh before it is rebuilt.
+            // Often only this node's cached copy was bad, so the object is read afresh before anything is rebuilt.
             self.runtime.forget_file(&self.database, &key);
             self.storage.invalidate(&key).await?;
-            if self.runtime.file(&self.database, &self.storage, &key, &columns).await.is_ok() { self.runtime.clear(&suspect); return Ok(record()); }
-            self.runtime.forget_file(&self.database, &key);
-            self.storage.invalidate(&key).await?;
-            // The store refuses different bytes under an existing key; a reader treats the missing file as absent meanwhile.
-            self.store.delete(&key).await?;
+            match self.runtime.file(&self.database, &self.storage, &key, &columns).await {
+                Ok(_) => { self.runtime.clear(&suspect); return Ok(record()); }
+                Err(crate::runtime::FileError::Unavailable(error)) => return Err(error),
+                Err(crate::runtime::FileError::Missing) => {}
+                Err(crate::runtime::FileError::Corrupt(_)) => {
+                    self.runtime.forget_file(&self.database, &key);
+                    self.storage.invalidate(&key).await?;
+                    // The store refuses different bytes under an existing key; a reader treats the missing file as absent meanwhile.
+                    self.store.delete(&key).await?;
+                }
+            }
         }
         let workdir = tempfile::Builder::new().prefix("rtdb-search-").tempdir().map_err(fault)?;
         let input = download(self.store.as_ref(), &self.memory, &ObjectKey::new(entry.slug.data_key(&job.trie))?, &workdir.path().join("input.arrow"), cancellation).await?;
