@@ -117,6 +117,19 @@ fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
 }
 
 #[test]
+fn search_is_on_by_default_and_switches_off_without_touching_other_settings() {
+    let defaults = decode("{}").unwrap().node_options(8192).unwrap();
+    assert_eq!(defaults.artefact_threads, 1);
+    let configured = decode("search: {threads: 3}").unwrap().node_options(8192).unwrap();
+    assert_eq!(configured.artefact_threads, 3);
+    let off = decode("search: {enabled: false}").unwrap().node_options(8192).unwrap();
+    assert_eq!(off.artefact_threads, 0);
+    assert_eq!(off.compaction_threads, defaults.compaction_threads);
+    assert!(decode("search: {threads: 0}").is_err());
+    assert!(decode("search: {unknown: 1}").is_err());
+}
+
+#[test]
 fn an_out_of_range_listener_port_is_the_reference_illegal_argument() {
     for (yaml, port) in [("server: {port: 99999}", 99999), ("flightSql: {port: -2}", -2), ("healthz: {port: 65536}", 65536)] {
         let error = decode(yaml).unwrap_err();

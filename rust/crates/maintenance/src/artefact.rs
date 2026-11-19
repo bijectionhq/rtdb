@@ -27,6 +27,21 @@ pub trait ArtefactBuilder: Send + Sync {
     async fn build(&self, job: &ArtefactJob, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord>;
 }
 
+/// What a kind of artefact is handed to build one database's artefacts.
+pub struct ArtefactDatabase {
+    pub name: String,
+    pub store: Arc<dyn rtdb_storage::ObjectStore>,
+    pub storage: Arc<rtdb_storage::cache::BufferPool>,
+    pub memory: Arc<rtdb_columnar::MemoryBudget>,
+    pub clock: Arc<dyn Fn() -> rtdb_types::Timestamp + Send + Sync>,
+}
+
+/// A kind of artefact a node can build, such as search files; it opens one builder per database.
+pub trait ArtefactKind: Send + Sync {
+    fn name(&self) -> &str;
+    fn builder(&self, database: ArtefactDatabase) -> Result<Arc<dyn ArtefactBuilder>>;
+}
+
 #[async_trait]
 pub trait ArtefactPublisher: Send + Sync {
     /// Completes after the source record is durably appended and admitted processing has applied it.

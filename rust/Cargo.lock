@@ -4313,6 +4313,7 @@ dependencies = [
  "rtdb-query",
  "rtdb-replication",
  "rtdb-s3",
+ "rtdb-search",
  "rtdb-sql",
  "rtdb-storage",
  "rtdb-trie",
@@ -4484,7 +4485,17 @@ dependencies = [
 name = "rtdb-search"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
+ "parking_lot",
+ "rtdb-columnar",
+ "rtdb-format",
+ "rtdb-index",
+ "rtdb-maintenance",
+ "rtdb-plan",
+ "rtdb-query",
+ "rtdb-sql",
+ "rtdb-storage",
  "rtdb-text",
  "rtdb-types",
  "serde",
@@ -4492,6 +4503,8 @@ dependencies = [
  "sha2 0.10.9",
  "stable_deref_trait",
  "tantivy",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

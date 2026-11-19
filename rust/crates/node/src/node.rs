@@ -30,10 +30,16 @@ pub struct NodeServices {
     pub catalog_metrics: Arc<dyn CatalogMetrics>,
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
+    /// The kinds of derived artefact this node builds; empty disables the artefact lane.
+    pub artefact_kinds: Vec<Arc<dyn rtdb_maintenance::ArtefactKind>>,
+}
+fn default_artefact_kinds() -> Vec<Arc<dyn rtdb_maintenance::ArtefactKind>> {
+    #[cfg(feature = "search")] { vec![Arc::new(rtdb_search::SearchArtefacts)] }
+    #[cfg(not(feature = "search"))] { Vec::new() }
 }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None }
+        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, artefact_kinds: default_artefact_kinds() }
     }
 }
 
@@ -100,7 +106,7 @@ impl Node {
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
-            external_sources: services.external_sources, clock: services.clock, options });
+            external_sources: services.external_sources, clock: services.clock, artefact_kinds: services.artefact_kinds, options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime };
         let mut initial = Vec::new();

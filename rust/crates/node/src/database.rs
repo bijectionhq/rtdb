@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{database::proto::DatabaseConfig, keys::TrieKey, log::proto::TriesAdded};
+use rtdb_format::{database::proto::DatabaseConfig, keys::TrieKey, log::proto::{ArtefactsAdded, TriesAdded}};
 use rtdb_index::PartitionState;
-use rtdb_maintenance::{BlockCollector, CollectionObserver, CompactionDriver, CompactionHandle, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
+use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionHandle, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
@@ -25,6 +25,7 @@ pub struct Database {
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
     compaction: Option<CompactionHandle>,
+    artefacts: Vec<ArtefactHandle>,
     cancellation: CancellationToken,
     io: Arc<IoRegion>,
 }
@@ -47,6 +48,13 @@ impl Database {
     pub fn progress(&self) -> &Arc<ProgressMonitor> { self.replication.progress() }
     pub fn status(&self) -> rtdb_replication::DriverStatus { self.replication.status() }
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
+    /// The trie catalog this node has applied.
+    pub fn trie_catalog(&self) -> Arc<rtdb_index::TrieCatalog> { Arc::clone(self.partition.value().trie_catalog()) }
+    /// Builds every artefact the lanes can currently build, returning once each is published or with the first failure.
+    pub async fn build_artefacts(&self) -> Result<()> {
+        for lane in &self.artefacts { lane.build_all().await?; }
+        Ok(())
+    }
     pub async fn flush(&self) -> Result<SourcePosition> {
         self.require_writable()?;
         self.replication.flush().await
@@ -74,6 +82,7 @@ pub(crate) struct DatabaseFactory {
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     pub external_sources: ExternalSources,
+    pub artefact_kinds: Vec<Arc<dyn ArtefactKind>>,
 }
 
 pub(crate) struct OpenedDatabase {
@@ -127,13 +136,26 @@ impl DatabaseFactory {
                 let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
                 (Some(driver), Some(handle))
             };
+            let mut artefact_drivers = Vec::new();
+            let mut artefacts = Vec::new();
+            if !read_only && self.options.artefact_threads > 0 {
+                for kind in &self.artefact_kinds {
+                    let clock = Arc::clone(&self.clock);
+                    let builder = kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), clock: Arc::new(move || clock.now()) })?;
+                    let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
+                    let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch),
+                        self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
+                    artefact_drivers.push(driver);
+                    artefacts.push(handle);
+                }
+            }
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
                 match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }
             } else { None };
-            let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(),
+            let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source };
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, cancellation: cancellation.clone(), io: Arc::clone(&io) });
-            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, supervisor, logs: opened_logs.drivers, log_cancellation };
+            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, artefacts, cancellation: cancellation.clone(), io: Arc::clone(&io) });
+            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
@@ -145,6 +167,7 @@ pub(crate) struct DatabaseDriver {
     database: Arc<Database>,
     replication: ReplicationDriver,
     compactor: Option<CompactionDriver>,
+    artefacts: Vec<ArtefactDriver>,
     supervisor: MaintenanceSupervisor,
     logs: Vec<ResourceDriver>,
     log_cancellation: CancellationToken,
@@ -157,6 +180,7 @@ impl DatabaseDriver {
         let mut tasks = JoinSet::new();
         tasks.spawn(self.replication.run());
         if let Some(compactor) = self.compactor { tasks.spawn(compactor.run(self.database.cancellation.clone())); }
+        for lane in self.artefacts { tasks.spawn(lane.run(self.database.cancellation.clone())); }
         tasks.spawn(self.supervisor.run(self.database.cancellation.clone()));
         let failure = tokio::select! {
             biased;
@@ -185,6 +209,11 @@ struct PublishCompaction { replication: ReplicationHandle, cancellation: Cancell
 impl CompactionPublisher for PublishCompaction {
     async fn publish(&self, notification: TriesAdded) -> Result<SourcePosition> { self.replication.publish_compaction(notification, &self.cancellation).await }
 }
+struct PublishArtefacts { replication: ReplicationHandle, cancellation: CancellationToken }
+#[async_trait]
+impl ArtefactPublisher for PublishArtefacts {
+    async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> { self.replication.publish_artefacts(message, &self.cancellation).await }
+}
 struct PublishDeletions(TermHandle);
 #[async_trait]
 impl TrieDeletionPublisher for PublishDeletions {
@@ -206,6 +235,7 @@ struct MaintenanceSupervisor {
     snapshots: Arc<dyn SnapshotSource>,
     replication: ReplicationHandle,
     compaction: Option<CompactionHandle>,
+    artefacts: Vec<ArtefactHandle>,
     observer: Arc<dyn CollectionObserver>,
     options: NodeOptions,
     source: Option<Box<dyn ExternalSource>>,
@@ -257,6 +287,7 @@ impl MaintenanceSupervisor {
             if next != adopted {
                 adopted = next;
                 if let Some(compaction) = &self.compaction { compaction.signal_block(); }
+                for lane in &self.artefacts { lane.signal_block(); }
                 if let Some(region) = &region { region.trie.signal(); region.blocks.signal(); }
             }
             tokio::select! {
