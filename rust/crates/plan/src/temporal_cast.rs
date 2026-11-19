@@ -34,6 +34,9 @@ impl TemporalCast {
     /// Null and unknown source legs defer validation; unsupported interval duration families return `invalid-cast`.
     pub fn validate_source(&self, source: &LogicalType) -> Result<()> {
         for leg in source.legs() {
+            if matches!(self.kind, TemporalKind::Time) && matches!(leg, LogicalType::Scalar(ScalarType::DateDay | ScalarType::DateMilli)) {
+                return Err(Anomaly::incorrect("xtdb.expression/cast-error", format!("Unsupported cast: {leg:?} -> {:?}", self.data_type("UTC"))));
+            }
             if matches!(self.kind, TemporalKind::Duration) {
                 if let LogicalType::Scalar(ScalarType::Interval(unit @ (IntervalUnit::YearMonth | IntervalUnit::DayTime))) = leg {
                     let unit = if unit == IntervalUnit::YearMonth { "year-month" } else { "day-time" };
