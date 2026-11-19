@@ -61,6 +61,14 @@ pub(crate) async fn extend<'a>(page: &OwnedPage, schema: &Schema, expressions: i
 
 async fn evaluate_columns<'a>(page: &OwnedPage, output: &mut PageBuilder, first: usize, schema: &Schema, expressions: impl Iterator<Item = &'a Expr> + Send, execution: &crate::context::Execution) -> Result<()> {
     for (column,expression) in (first..).zip(expressions) {
+        if let Expr::Column { id, .. } = expression && let Some(position) = schema.position(*id) {
+            for (input,row) in page.rows().iter().zip(output.rows_mut()) {
+                let mut value = input.values.get(position).cloned().ok_or_else(|| invalid("row-width", "Projected column is outside its row"))?;
+                value.admit_expression_dates()?;
+                row.replace_value(column,value,&execution.context.memory)?;
+            }
+            continue;
+        }
         let metadata_scope = execution.scope()?;
         let invocation = execution.prepare_expression(expression,schema,&metadata_scope)?;
         let scope = execution.scope()?;

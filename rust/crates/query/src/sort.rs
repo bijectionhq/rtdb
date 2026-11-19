@@ -16,15 +16,16 @@ const BLOCK_ROWS: usize = 102_400;
 const MERGE_FAN_IN: usize = 4;
 
 struct SortPlan { schema: Schema, order: Vec<SortExpr>, limit: u64, execution: Execution }
+const TOP_ROWS: u64 = 10_000;
 pub(crate) struct SortCursor { plan: SortPlan, phase: SortPhase }
 enum SortPhase { Input(BoxPageCursor), Output(SortOutput), Done }
-enum OutputRows { Records(RecordCursor), Spill(SpillReader) }
+enum OutputRows { Records(RecordCursor), Spill(SpillReader), Retained(std::vec::IntoIter<OwnedRow>) }
 struct SortOutput { rows: OutputRows, remaining: u64, page_rows: usize, empty_callback: bool }
 impl SortOutput {
     fn row(&mut self, plan: &SortPlan) -> Result<Option<OwnedRow>> {
         if self.remaining == 0 { return Ok(None); }
         plan.execution.context.check_cancelled()?;
-        let row = match &mut self.rows { OutputRows::Records(rows) => rows.next()?, OutputRows::Spill(rows) => rows.next()? };
+        let row = match &mut self.rows { OutputRows::Records(rows) => rows.next()?, OutputRows::Spill(rows) => rows.next()?, OutputRows::Retained(rows) => rows.next() };
         let mut row = row.ok_or_else(|| invalid("sort-state", "Sorted records ended before their row count"))?;
         if row.values.len() != plan.order.len() + plan.schema.len() { return Err(invalid("invalid-spill", "Sorted record has an invalid width")); }
         row.values.drain(..plan.order.len());
@@ -132,7 +133,47 @@ impl SortPlan {
         }
         Ok(SortedRun { file: writer.finish()?, rows: indices.values.len() as u64, page_rows: indices.values.len(), keys })
     }
+    /// Keeps the `limit` first rows in key order as a stable sort would, rejecting most rows after one comparison with the worst kept.
+    async fn top(&self, mut input: BoxPageCursor) -> Result<Option<SortOutput>> {
+        let limit = usize::try_from(self.limit).map_err(|_| invalid("sort-limit", "Sort limit exceeds addressable memory"))?;
+        let mut keys = KeyTypes::declared(self)?;
+        let positions: Option<Vec<usize>> = self.order.iter().map(|order| match &order.expr { rtdb_plan::Expr::Column { id, .. } => self.schema.position(*id), _ => None }).collect();
+        let _kept = self.execution.context.memory.reserve(limit.saturating_add(1).saturating_mul(std::mem::size_of::<OwnedRow>()))?;
+        let mut kept: Vec<OwnedRow> = Vec::with_capacity(limit.saturating_add(1));
+        let mut seen = false;
+        while let Some(mut page) = input.next_page().await? {
+            seen |= page.len() > 0;
+            let mut projected = match &positions { Some(_) => None, None => Some(crate::pages::project(&page, &self.schema, self.order.iter().map(|order| &order.expr), &self.execution).await?) };
+            while let Some(row) = page.next() {
+                self.execution.context.check_cancelled()?;
+                let key: Vec<Value> = match (&positions, &mut projected) {
+                    (Some(positions), _) => positions.iter().map(|position| row.values[*position].clone()).collect(),
+                    (None, Some(projected)) => projected.next().ok_or_else(|| invalid("sort-state", "Projected sort keys ended before their input page"))?.values,
+                    (None, None) => unreachable!(),
+                };
+                keys.observe(&key, self)?;
+                if kept.len() == limit {
+                    match kept.last() { Some(worst) if self.compare(&key, &worst.values[..key.len()])? != Ordering::Less => continue, _ => {} }
+                }
+                let mut low = 0;
+                let mut high = kept.len();
+                while low < high {
+                    let middle = (low + high) / 2;
+                    if self.compare(&key, &kept[middle].values[..key.len()])? == Ordering::Less { high = middle; } else { low = middle + 1; }
+                }
+                if low < limit {
+                    kept.insert(low, OwnedRow::copy_parts(&[&key, &row.values], 0, 0, &self.execution.context.memory)?);
+                    kept.truncate(limit);
+                }
+            }
+        }
+        keys.validate()?;
+        if !seen { return Ok(None); }
+        let rows = kept.len();
+        Ok(Some(SortOutput { rows: OutputRows::Retained(kept.into_iter()), remaining: rows as u64, page_rows: rows, empty_callback: rows == 0 }))
+    }
     async fn initialize(&self, mut input: BoxPageCursor) -> Result<Option<SortOutput>> {
+        if self.limit <= TOP_ROWS { return self.top(input).await; }
         let mut accumulator = self.accumulator()?;
         while accumulator.records.len() <= BLOCK_ROWS {
             let Some(page) = input.next_page().await? else { break; };
@@ -190,7 +231,7 @@ pub(crate) fn sort_records(store: &RecordStore,context: &Arc<crate::QueryContext
 }
 fn size_error() -> rtdb_types::Anomaly { invalid("sort-size", "Sort state exceeds addressable memory") }
 
-struct KeyTypes { values: Vec<LogicalType>, _reservation: Arc<MemoryReservation> }
+struct KeyTypes { values: Vec<LogicalType>, seen: Vec<LogicalType>, _reservation: Arc<MemoryReservation> }
 impl KeyTypes {
     fn declared(plan: &SortPlan) -> Result<Self> {
         let mut bound = crate::runtime_schema::schema_bound(&plan.schema)?;
@@ -203,15 +244,18 @@ impl KeyTypes {
         Self::new(values, plan)
     }
     fn new(values: Vec<LogicalType>, plan: &SortPlan) -> Result<Self> {
-        let reservation = plan.execution.context.memory.reserve(type_bytes(&values)?)?;
-        Ok(Self { values, _reservation: reservation })
+        let reservation = plan.execution.context.memory.reserve(type_bytes(&values)?.saturating_mul(2))?;
+        Ok(Self { values, seen: Vec::new(), _reservation: reservation })
     }
     fn observe(&mut self, values: &[Value], plan: &SortPlan) -> Result<()> {
         if values.len() != self.values.len() { return Err(invalid("sort-state", "Sort key metadata width changed")); }
+        let types: Vec<LogicalType> = values.iter().map(Value::logical_type).collect();
+        if types == self.seen { return Ok(()); }
         let bound = values.iter().try_fold(type_bytes(&self.values)?, |sum, value| sum.checked_add(value.retained_bytes()?).ok_or_else(size_error))?;
         let _temporary = plan.execution.context.memory.reserve(bound.checked_mul(16).and_then(|n| n.checked_add(4096)).ok_or_else(size_error)?)?;
-        let values = self.values.iter().zip(values).map(|(ty, value)| ty.join(&value.logical_type())).collect();
+        let values = self.values.iter().zip(&types).map(|(ty, value)| ty.join(value)).collect();
         *self = Self::new(values, plan)?;
+        self.seen = types;
         Ok(())
     }
     fn join(&self, other: &Self, plan: &SortPlan) -> Result<Self> {
