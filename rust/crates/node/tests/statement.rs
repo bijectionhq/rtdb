@@ -49,6 +49,14 @@ async fn prepared_temporal_cast_schema_rebinds_to_execution_timezone() {
     let exact = PreparedSql::prepare("SELECT CAST('1970-01-01Z' AS TIMESTAMPTZ) AS value",&initial,PrepareOptions::default(),ResultSignaturePolicy::Exact).unwrap();
     assert_eq!(exact.open_query(later,vec![]).await.err().unwrap().code,"xtdb/prepared-query-out-of-date");
 }
+#[tokio::test]
+async fn an_xtql_query_of_a_table_absent_when_prepared_and_executed_returns_no_rows() {
+    let memory = MemoryBudget::new(1 << 26);
+    let context = context(None, &memory);
+    let prepared = PreparedSql::prepare("XTQL $$(from :users [first-name])$$", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = prepared.open_query(context, vec![]).await.unwrap();
+    while let Some(page) = cursor.next_batch().await.unwrap() { assert_eq!(page.batch().num_rows(), 0); }
+}
 fn write(state: &PartitionState, tx: i64, value: Value, memory: &Arc<MemoryBudget>) {
     let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(memory)).unwrap();
     buffer.put(TableRef::new("public", "docs"), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), value)]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();

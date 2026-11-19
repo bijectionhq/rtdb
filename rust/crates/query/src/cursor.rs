@@ -128,7 +128,10 @@ impl PreparedQuery {
     async fn open(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, preserve_pages: bool) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
         for dependency in self.relation.dependencies() {
-            let current = context.catalog.table(&dependency.name)?.ok_or_else(|| invalid("stale-plan", "Prepared table is no longer present"))?;
+            let Some(current) = context.catalog.table(&dependency.name)? else {
+                if dependency.oid.is_none() && dependency.columns.is_empty() { continue; }
+                return Err(invalid("stale-plan", "Prepared table is no longer present"));
+            };
             if current.oid != dependency.oid || current.columns != dependency.columns {
                 return Err(invalid("stale-plan", "Prepared table OID or column types changed; prepare against the execution snapshot"));
             }
