@@ -60,15 +60,11 @@ fn list_comparison_checks_sizes_then_short_circuits_definite_inequality() {
 }
 
 #[test]
-fn list_cast_and_concatenation_keep_unread_cells_deferred() {
+fn list_cast_keeps_unread_cells_deferred() {
     let cast = Expr::Cast { expr: Box::new(Expr::List(vec![literal(Value::Utf8("7".into())),literal(Value::Utf8("bad".into()))])),target: CastTarget::List(Box::new(CastTarget::Fixed(LogicalType::Scalar(ScalarType::I64)))) };
     assert_eq!(run(&call("cardinality",vec![cast.clone()])).unwrap(),Value::I32(2));
     assert_eq!(run(&nth(cast.clone(),0)).unwrap(),Value::I64(7));
     assert!(run(&nth(cast,1)).is_err());
-    let concat = Expr::binary(BinaryOp::Concat,Expr::List(vec![literal(Value::I64(9))]),Expr::List(vec![wide(DateUnit::Day)]));
-    assert_eq!(run(&call("cardinality",vec![concat.clone()])).unwrap(),Value::I32(2));
-    assert_eq!(run(&nth(concat.clone(),0)).unwrap(),Value::I64(9));
-    assert!(run(&nth(concat,1)).is_err());
 }
 
 #[test]

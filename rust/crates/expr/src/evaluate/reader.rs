@@ -23,7 +23,6 @@ enum ListReader<'a> {
     Expressions(&'a [Expr]),
     Values(Vec<Value>),
     Cast { input: EvalValue<'a>, element: Target<'a> },
-    Concat(EvalValue<'a>,EvalValue<'a>),
     Trim { input: EvalValue<'a>, size: i64 },
     IntegerSeries(crate::series::IntegerSeries),
     RangeBins(crate::temporal_functions::RangeBins),
@@ -128,12 +127,6 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
                         Target::Cast(target) => { frame.context.reserve(target_bound(target)?.checked_add(source.retained_bytes()?).and_then(|n|n.checked_mul(8)).ok_or_else(overflow)?)?;target.result_type(&source) }
                         Target::Fixed(ty) => { frame.context.reserve(ty.retained_bytes()?)?;(*ty).clone() }
                     }
-                }
-                ListReader::Concat(left,right) => {
-                    let LogicalType::List { element: a,.. } = value_type(left,frame)? else { return Err(invalid("concat type")); };
-                    let LogicalType::List { element: b,.. } = value_type(right,frame)? else { return Err(invalid("concat type")); };
-                    frame.context.reserve(a.retained_bytes()?.checked_add(b.retained_bytes()?).and_then(|n|n.checked_mul(8)).ok_or_else(overflow)?)?;
-                    LogicalType::join_all(&[*a,*b])
                 }
                 ListReader::Trim { input,.. } => {
                     let LogicalType::List { element,.. } = value_type(input,frame)? else { return Err(invalid("trim type")); };
@@ -311,7 +304,6 @@ fn len(value: &EvalValue<'_>) -> Result<usize> {
     match reader.as_ref() {
         ListReader::Expressions(items) => Ok(items.len()), ListReader::Values(items) => Ok(items.len()),
         ListReader::Cast { input, .. } => len(input),
-        ListReader::Concat(left,right) => len(left)?.checked_add(len(right)?).ok_or_else(overflow),
         ListReader::Trim { size,.. } => crate::collection::view_size(*size),
         ListReader::IntegerSeries(series) => Ok(series.len()),
         ListReader::RangeBins(bins) => bins.len(),
@@ -330,10 +322,6 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
                     if !target.legs().contains(&value_type(&value,frame)?) { return Err(invalid("list union")); }
                     value
                 } else { cast_value(value,*element,frame)?.await? }
-            }
-            ListReader::Concat(left,right) => {
-                let left_len = len(left)?;
-                if index < left_len { nth(clone_value(left,frame)?,index,frame)?.await? } else { nth(clone_value(right,frame)?,index - left_len,frame)?.await? }
             }
             ListReader::Trim { input,.. } => nth(clone_value(input,frame)?,index,frame)?.await?,
             ListReader::IntegerSeries(series) => scalar(series.nth(index)),

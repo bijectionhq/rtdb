@@ -252,7 +252,7 @@ fn binary_value(op: BinaryOp, left: Value, right: Value, context: &EvalContext<'
             match (left,right) {
                 (Value::Utf8(mut a),Value::Utf8(b)) => { a.push_str(&b);Ok(Value::Utf8(a)) },
                 (Value::Binary(mut a),Value::Binary(b)) => { a.extend(b);Ok(Value::Binary(a)) },
-                (Value::List(mut a),Value::List(b)) => { a.extend(b);Ok(Value::List(a)) },
+                (a @ Value::List(_),b @ Value::List(_)) => Err(rtdb_types::Anomaly::incorrect("xtdb.error/illegal-arg", format!("No matching clause: {}", vector_type_text(&a.logical_type().join(&b.logical_type()))))),
                 (a,b) => Err(inapplicable("concat",&[&a,&b])),
             }
         }
@@ -499,4 +499,22 @@ pub fn evaluate_batch(expr: &CompiledExpr, batch: &RecordBatch, context: &EvalCo
     let schema = Arc::new(arrow_schema::Schema::new(vec![to_field("result", &logical)?]));
     let batch = RecordBatch::try_new(schema, vec![array]).map_err(|error| Anomaly::fault("rtdb.expr/output-schema", error.to_string()))?;
     OwnedBatch::with_reservation(batch, reservation)
+}
+
+/// The reference's `VectorType` spelling, which its concat reports for an operand type it doesn't concatenate.
+pub(crate) fn vector_type_text(data_type: &rtdb_types::LogicalType) -> String {
+    use rtdb_types::{LogicalType as L, ScalarType as S};
+    match data_type {
+        L::Null => "<Null>".into(),
+        L::Maybe(inner) => format!("[:? {}]", vector_type_text(inner)),
+        L::List { element, .. } => format!("[<List> {}]", vector_type_text(element)),
+        L::Struct(fields) => format!("{{{}}}", fields.iter().map(|(name, field)| format!("{name}: {}", vector_type_text(field))).collect::<Vec<_>>().join(", ")),
+        L::Scalar(scalar) => format!("<{}>", match scalar {
+            S::Bool => "Bool".into(), S::Utf8 => "Utf8".into(), S::Binary => "Binary".into(),
+            S::I8 => "Int(8, true)".into(), S::I16 => "Int(16, true)".into(), S::I32 => "Int(32, true)".into(), S::I64 => "Int(64, true)".into(),
+            S::F32 => "FloatingPoint(SINGLE)".into(), S::F64 => "FloatingPoint(DOUBLE)".into(),
+            other => format!("{other:?}"),
+        }),
+        other => format!("{other:?}"),
+    }
 }
