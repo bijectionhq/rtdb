@@ -194,7 +194,8 @@ impl ProtocolSession {
             PreparedShape { kind: PreparedKind::Empty, columns: None, parameter_count: 0 }
         } else if legacy_keyword_probe(source) {
             keyword_shape()
-        } else if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.node.memory())? {
+        } else if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.node.memory())
+            .map_err(|error| extended_syntax_error(source, original, error, self.node.memory()))? {
             self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?)
         } else {
             let context = self.session.prepare_context(&self.token()).await?;

@@ -149,6 +149,28 @@ async fn sql_parse_failures_return_anomaly_details_and_an_idle_connection() {
 }
 
 #[tokio::test]
+async fn begin_syntax_errors_report_the_grammar_diagnostic() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for (sql, expected) in [
+        ("BEGIN not valid sql!", "line 1:6 mismatched input 'not'"),
+        ("BEGIN SERIALIZABLE", "line 1:6 extraneous input 'SERIALIZABLE'"),
+    ] {
+        let frames = client.query(sql).await;
+        assert_eq!(tags(&frames), b"EZ", "{sql}");
+        let (_, message, _) = error_fields(&frames[0].1);
+        assert!(message.contains(expected), "{sql}: {message}");
+        client.parse("", sql, &[]).await; client.send(b'S', &[]).await;
+        let frames = client.through(b'Z').await;
+        assert_eq!(tags(&frames), b"EZ", "extended {sql}");
+        let (_, message, _) = error_fields(&frames[0].1);
+        assert!(message.contains(expected), "extended {sql}: {message}");
+    }
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn first_simple_query_report_preserves_an_open_transaction_and_json_ld_detail() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

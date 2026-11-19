@@ -66,6 +66,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             let alt = session.adaptive_predict(34, mode)?.number();
             let class = match alt {
                 1 => ContextClass::QueryExpr,
+                11 => ContextClass::StartTransactionStatement,
                 13 => ContextClass::CommitStatement,
                 14 => ContextClass::RollbackStatement,
                 16 => ContextClass::DiscardStatement,
@@ -76,6 +77,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             session.enter_outer_alt(*local)?;
             match class {
                 ContextClass::QueryExpr => session.generated_query(*local, mode),
+                ContextClass::StartTransactionStatement => session.start_transaction_statement(*local, mode),
                 ContextClass::CommitStatement => session.commit_statement(*local),
                 ContextClass::RollbackStatement => session.match_statement_terminal(*local, 488),
                 ContextClass::DiscardStatement => {
@@ -88,6 +90,34 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 _ => unreachable!("selected statement class"),
             }
         })
+    }
+
+    /// `(START TRANSACTION | BEGIN TRANSACTION?) (transactionCharacteristics | beginWithCharacteristics)?`.
+    /// The characteristics rules are not ported, so a prediction that enters either leaves the vendor error in place.
+    fn start_transaction_statement(&mut self, local: InvocationKey<'parse>, mode: PredictionMode) -> PassResult<'parse, 'sql, ()> {
+        self.set_state(475)?;
+        self.sync_statement()?;
+        let (_, token) = self.lookahead_token(1)?;
+        match token.number() {
+            298 => {
+                self.match_statement_terminal(local, 469)?;
+                self.match_statement_terminal(local, 470)?;
+            }
+            64 => {
+                self.match_statement_terminal(local, 471)?;
+                self.set_state(473)?;
+                self.sync_statement()?;
+                let (_, token) = self.lookahead_token(1)?;
+                if token.number() == 323 { self.match_statement_terminal(local, 472)?; }
+            }
+            _ => return self.generated_no_viable().map_err(PassError::from),
+        }
+        self.set_state(479)?;
+        self.sync_statement()?;
+        match self.adaptive_predict(24, mode)?.number() {
+            1 | 2 => self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite))).map_err(PassError::from),
+            _ => Ok(()),
+        }
     }
 
     fn commit_statement(&mut self, local: InvocationKey<'parse>) -> PassResult<'parse, 'sql, ()> {

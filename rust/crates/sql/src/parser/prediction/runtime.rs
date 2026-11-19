@@ -155,7 +155,7 @@ enum InvocationException<'parse, 'sql> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContextClass {
     RegularIdentifier, DelimitedIdentifier,
-    QueryExpr, CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
+    QueryExpr, StartTransactionStatement, CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
     QuerySpecification,
     DiscardAll, DiscardPlans, DiscardTemp, DiscardSequences,
     IntegerLiteral0, FloatLiteral, BooleanLiteral, NullLiteral, CharacterStringLiteral, SqlStandardString, CEscapesString, DollarString,
@@ -168,7 +168,7 @@ pub(super) enum ContextClass {
 impl ContextClass {
     fn rule(self) -> u16 {
         match self {
-            Self::QueryExpr | Self::CommitStatement | Self::RollbackStatement | Self::DiscardStatement | Self::SetRoleStatement => 2,
+            Self::QueryExpr | Self::StartTransactionStatement | Self::CommitStatement | Self::RollbackStatement | Self::DiscardStatement | Self::SetRoleStatement => 2,
             Self::QuerySpecification => 126,
             Self::DiscardAll | Self::DiscardPlans | Self::DiscardTemp | Self::DiscardSequences => 3,
             Self::DateLiteral | Self::TimestampLiteral => 12,

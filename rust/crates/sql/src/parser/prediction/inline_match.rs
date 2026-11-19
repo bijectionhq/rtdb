@@ -21,7 +21,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         self.match_generated_terminal(TerminalMatch::Atom, |state| match state {
             ParserState::State(number @ (353 | 356)) => Some((number, 0)),
             ParserState::State(number @ (359 | 366 | 369)) => Some((number, 1)),
-            ParserState::State(number @ (484 | 488 | 501 | 503 | 504 | 506)) => Some((number, 2)),
+            ParserState::State(number @ (469..=472 | 484 | 488 | 501 | 503 | 504 | 506)) => Some((number, 2)),
             ParserState::State(number @ (576 | 577 | 579)) => Some((number, 3)),
             ParserState::State(number @ (754 | 758)) => Some((number, 22)),
             ParserState::State(number @ (761..=796 | 801..=847)) => Some((number, 23)),
