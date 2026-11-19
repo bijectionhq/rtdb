@@ -33,9 +33,23 @@ impl MemoryBudget {
     /// Reserves bytes without waiting; release occurs when the last reservation handle drops.
     /// Exceeding this budget or an ancestor limit, including size overflow, returns an error.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
-        let parent = self.parent.as_ref().map(|parent| parent.reserve(bytes)).transpose()?;
-        self.acquire(bytes)?;
-        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, parent }))
+        self.acquire_chain(bytes)?;
+        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes }))
+    }
+
+    /// Admits bytes at the root first and at this budget last, releasing the ancestors' admission if this one refuses.
+    fn acquire_chain(&self, bytes: usize) -> Result<()> {
+        if let Some(parent) = &self.parent { parent.acquire_chain(bytes)?; }
+        if let Err(error) = self.acquire(bytes) {
+            if let Some(parent) = &self.parent { parent.release_chain(bytes); }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn release_chain(&self, bytes: usize) {
+        self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        if let Some(parent) = &self.parent { parent.release_chain(bytes); }
     }
 
     /// Counts the reservation controls created by a successful `reserve`, including this budget and every ancestor.
@@ -72,12 +86,11 @@ impl MemoryBudget {
     pub fn limit_bytes(&self) -> usize { self.limit_bytes }
 }
 
-/// Retained byte charge keeping its budget and ancestor leases alive.
+/// Retained byte charge on its budget and every ancestor, keeping the budget chain alive.
 #[derive(Debug)]
 pub struct MemoryReservation {
     budget: Arc<MemoryBudget>,
     bytes: usize,
-    parent: Option<Arc<MemoryReservation>>,
 }
 
 impl MemoryReservation {
@@ -90,15 +103,7 @@ impl MemoryReservation {
     pub fn grow_to(&mut self, bytes: usize) -> Result<()> {
         let additional = bytes.checked_sub(self.bytes)
             .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-shrink", "Reservation growth requires at least the held bytes"))?;
-        if let Some(parent) = &mut self.parent {
-            Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").grow_to(bytes)?;
-        }
-        if let Err(error) = self.budget.acquire(additional) {
-            if let Some(parent) = &mut self.parent {
-                Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").release_to(self.bytes);
-            }
-            return Err(error);
-        }
+        self.budget.acquire_chain(additional)?;
         self.bytes = bytes;
         Ok(())
     }
@@ -115,13 +120,12 @@ impl MemoryReservation {
     }
 
     fn release_to(&mut self, bytes: usize) {
-        if let Some(parent) = &mut self.parent { Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").release_to(bytes); }
         let released = self.bytes - bytes;
         self.bytes = bytes;
-        self.budget.used_bytes.fetch_sub(released, Ordering::AcqRel);
+        self.budget.release_chain(released);
     }
 }
 
 impl Drop for MemoryReservation {
-    fn drop(&mut self) { self.budget.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel); }
+    fn drop(&mut self) { self.budget.release_chain(self.bytes); }
 }

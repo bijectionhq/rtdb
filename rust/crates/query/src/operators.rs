@@ -313,9 +313,10 @@ impl PageCursor for PageFilter {
             let metadata_scope = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(&self.predicate,&self.schema,&metadata_scope)?;
             let mut output = PageBuilder::new(page.len(),&self.execution.context.memory)?;
+            let scope = self.execution.scope()?;
             while let Some(row) = page.next() {
-                let scope = self.execution.scope()?;
                 if is_true(&self.execution.evaluate_invocation(&scope,&invocation,&row.values).await?)? { output.push(row)?; }
+                scope.reset()?;
             }
             if output.len() > 0 { return Ok(Some(output.finish())); }
         }

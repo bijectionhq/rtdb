@@ -63,10 +63,11 @@ async fn evaluate_columns<'a>(page: &OwnedPage, output: &mut PageBuilder, first:
     for (column,expression) in (first..).zip(expressions) {
         let metadata_scope = execution.scope()?;
         let invocation = execution.prepare_expression(expression,schema,&metadata_scope)?;
+        let scope = execution.scope()?;
         for (input,row) in page.rows().iter().zip(output.rows_mut()) {
-            let scope = execution.scope()?;
             let value = execution.evaluate_invocation(&scope,&invocation,&input.values).await?;
             row.replace_value(column,value,&execution.context.memory)?;
+            scope.reset()?;
         }
     }
     Ok(())

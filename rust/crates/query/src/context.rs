@@ -234,7 +234,7 @@ impl Execution {
     }
     pub async fn evaluate_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &[Value]) -> Result<Value> {
         self.context.check_cancelled()?;
-        let _decimal_validation = self.context.memory.reserve(4096)?;
+        scope.reserve(4096)?;
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
         let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
         let context = rtdb_expr::EvalContext { parameters: self.parameters.values(), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
@@ -268,7 +268,7 @@ impl Execution {
     }
     pub async fn evaluate_list_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &[Value]) -> Result<rtdb_expr::EvaluatedList> {
         self.context.check_cancelled()?;
-        let _decimal_validation = self.context.memory.reserve(4096)?;
+        scope.reserve(4096)?;
         scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
         let outer_rows: Vec<_> = self.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
         let context = rtdb_expr::EvalContext { parameters: self.parameters.values(), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };

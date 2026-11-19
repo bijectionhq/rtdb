@@ -5,7 +5,7 @@ use crate::{Anomaly, MemoryBudget, MemoryReservation, Result};
 /// Keep the scope alive until returned values have been dropped or transferred to another charged owner.
 pub struct AllocationScope {
     memory: Arc<MemoryBudget>,
-    reservations: Mutex<Vec<Arc<MemoryReservation>>>,
+    lease: Mutex<Option<Arc<MemoryReservation>>>,
 }
 
 impl AllocationScope {
@@ -16,20 +16,33 @@ impl AllocationScope {
     /// Acquires the scope's bookkeeping reservation from the supplied finite budget.
     pub fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
         let initial = memory.reserve(4096)?;
-        Ok(Self { memory: Arc::clone(memory), reservations: Mutex::new(vec![initial]) })
+        Ok(Self { memory: Arc::clone(memory), lease: Mutex::new(Some(initial)) })
     }
 
     /// Opens an empty child scope that charges the same budget and releases its reservations independently.
     pub fn scratch(&self) -> Self {
-        Self { memory: Arc::clone(&self.memory), reservations: Mutex::new(Vec::new()) }
+        Self { memory: Arc::clone(&self.memory), lease: Mutex::new(None) }
+    }
+
+    /// Releases every charge but the scope's bookkeeping, as dropping it and opening another would, keeping its lease.
+    /// Callers must have charged elsewhere anything still alive that this scope admitted.
+    pub fn reset(&self) -> Result<()> {
+        let mut lease = self.lease.lock().map_err(|_| Anomaly::fault("rtdb.expr/allocation-scope", "Expression allocation scope was poisoned"))?;
+        match lease.as_mut().and_then(Arc::get_mut) {
+            Some(held) if held.bytes() > 4096 => held.shrink_to(4096),
+            Some(_) => Ok(()),
+            None => { *lease = Some(self.memory.reserve(4096)?); Ok(()) }
+        }
     }
 
     /// Reserves bytes plus bookkeeping before allocation; charges last until the scope is dropped.
     /// Calls may share the scope across threads; budget exhaustion returns without granting a reservation.
     pub fn reserve(&self, bytes: usize) -> Result<()> {
         let bytes = bytes.checked_add(256).ok_or_else(|| Anomaly::incorrect("rtdb.expr/allocation-size", "Expression allocation exceeds addressable memory"))?;
-        let reservation = self.memory.reserve(bytes)?;
-        self.reservations.lock().map_err(|_| Anomaly::fault("rtdb.expr/allocation-scope", "Expression allocation scope was poisoned"))?.push(reservation);
-        Ok(())
+        let mut lease = self.lease.lock().map_err(|_| Anomaly::fault("rtdb.expr/allocation-scope", "Expression allocation scope was poisoned"))?;
+        match lease.as_mut().and_then(Arc::get_mut) {
+            Some(held) => held.grow_to(held.bytes().checked_add(bytes).ok_or_else(|| Anomaly::incorrect("rtdb.expr/allocation-size", "Expression allocation exceeds addressable memory"))?),
+            None => { *lease = Some(self.memory.reserve(bytes)?); Ok(()) }
+        }
     }
 }
