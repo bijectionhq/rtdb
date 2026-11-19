@@ -157,10 +157,11 @@ impl SortPlan {
                 self.append(&mut accumulator, page).await?;
             }
             if accumulator.records.len() == 0 { break; }
+            tokio::task::yield_now().await;
             runs.push(self.write_run(accumulator)?, self)?;
         }
         drop(input);
-        while runs.values.len() > 1 { runs = self.merge_pass(runs)?; }
+        while runs.values.len() > 1 { runs = self.merge_pass(runs).await?; }
         let run = runs.values.pop().ok_or_else(|| invalid("sort-state", "External sort produced no run"))?;
         Ok(Some(SortOutput { rows: OutputRows::Spill(run.file.reader(Arc::clone(&self.execution.context.memory))?), remaining: run.rows, page_rows: run.page_rows, empty_callback: false }))
     }
@@ -299,11 +300,13 @@ impl SortPlan {
         if left < right { self.compare(&at(left)?.values, &at(right)?.values) }
         else { self.compare(&at(right)?.values, &at(left)?.values).map(Ordering::reverse) }
     }
-    fn merge_pass(&self, runs: RunList) -> Result<RunList> {
+    async fn merge_pass(&self, runs: RunList) -> Result<RunList> {
         let RunList { values, _reservation } = runs;
         let mut source = values.into_iter();
         let mut next = RunList::new(self)?;
         while source.len() > 0 {
+            tokio::task::yield_now().await;
+            self.execution.context.check_cancelled()?;
             let count = source.len().min(MERGE_FAN_IN);
             let merged = self.merge(&source.as_slice()[..count])?;
             for _ in 0..count { drop(source.next()); }

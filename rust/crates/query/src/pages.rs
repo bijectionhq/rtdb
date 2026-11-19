@@ -125,7 +125,12 @@ pub(crate) fn retain_page_state(input: BoxPageCursor, reservation: Arc<MemoryRes
 struct RetainedPageState { input: BoxPageCursor, _reservation: Arc<MemoryReservation> }
 #[async_trait]
 impl PageCursor for RetainedPageState {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> { self.input.next_page().await }
+    /// Each page spends cooperative budget, so a pipeline whose operators never wait on I/O still returns to the
+    /// scheduler, which only then polls the I/O driver - a cancel request's connection included.
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        tokio::task::consume_budget().await;
+        self.input.next_page().await
+    }
     fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> { self.input.skip_complete_pages(rows) }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }

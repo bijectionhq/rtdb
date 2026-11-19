@@ -152,8 +152,10 @@ async fn sql_parse_failures_return_anomaly_details_and_an_idle_connection() {
 async fn a_cancel_request_stops_a_large_sorted_query() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
-    client.parse("", "FROM GENERATE_SERIES(1,4000000) AS system(_id) ORDER BY _id", &[]).await;
-    client.bind("", "").await; client.execute("", 0).await; client.send(b'S', &[]).await;
+    client.parse("", "FROM GENERATE_SERIES(1,10000000) AS system(_id) ORDER BY _id", &[]).await;
+    client.bind("", "").await;
+    let mut describe = vec![b'P']; describe.extend_from_slice(&cstring("")); client.send(b'D', &describe).await;
+    client.execute("", 0).await; client.send(b'S', &[]).await;
     let (address, process) = (running.server.address(), client.process);
     let canceller = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(2000)).await;
@@ -165,7 +167,7 @@ async fn a_cancel_request_stops_a_large_sorted_query() {
     canceller.await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(10), "cancellation took {:?}", started.elapsed());
     let error = frames.iter().find(|frame| frame.0 == b'E').expect("an error");
-    assert_eq!(error_fields(&error.1).0, "57014");
+    assert!(error.1.split(|&byte| byte == 0).any(|field| field == b"C57014"), "{}", String::from_utf8_lossy(&error.1));
     drop(client); running.stop().await;
 }
 

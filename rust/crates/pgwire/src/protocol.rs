@@ -265,7 +265,8 @@ impl ProtocolSession {
                 let _active = self.cancellations.enter(&token);
                 let checked = !self.session.state().is_read_write();
                 let context = self.session.query_context_with(&token, checked).await?;
-                Some(token.run_until_cancelled(query.open_query(context, std::mem::take(&mut portal.arguments))).await.ok_or_else(cancelled)??)
+                Some(token.run_until_cancelled(query.open_query(context, std::mem::take(&mut portal.arguments))).await.ok_or_else(cancelled)?
+                    .map_err(|error| if token.is_cancelled() { cancelled() } else { error })?)
             },
             (_, Some(statement @ ControlStatement::Show { .. })) => match self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? { ControlResult::Rows(cursor) => Some(cursor), _ => return Err(protocol("SHOW did not produce rows")) },
             (_, Some(statement @ ControlStatement::Execute { .. })) => {
@@ -316,6 +317,7 @@ impl ProtocolSession {
                 }
                 let token = portal.cancellation.clone(); let _active = self.cancellations.enter(&token);
                 token.run_until_cancelled(self.stream(portal, source, limit, writer)).await.ok_or_else(cancelled)?
+                    .map_err(|error| if token.is_cancelled() { cancelled() } else { error })
             }
             (PreparedKind::Dml(statement), _) => {
                 if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "DML is not allowed on the READ ONLY server")); }
