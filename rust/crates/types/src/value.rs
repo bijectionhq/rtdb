@@ -160,10 +160,10 @@ impl Value {
     }
 
     pub fn document_retained_bytes(fields: &StructFields<Self>) -> Result<usize> {
-        let per_node = std::mem::size_of::<(String, Self)>().checked_mul(16).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_overflow)?;
-        fields.iter().try_fold(std::mem::size_of::<StructFields<Self>>(), |bytes, (name, value)| {
+        let table = fields.table_bytes_bound().and_then(|bytes| bytes.checked_add(std::mem::size_of::<StructFields<Self>>())).ok_or_else(size_overflow)?;
+        fields.iter().try_fold(table, |bytes, (name, value)| {
             let heap = value.heap_bytes()?;
-            bytes.checked_add(per_node).and_then(|bytes| bytes.checked_add(name.capacity())).and_then(|bytes| bytes.checked_add(heap)).ok_or_else(size_overflow)
+            bytes.checked_add(name.capacity()).and_then(|bytes| bytes.checked_add(heap)).ok_or_else(size_overflow)
         })
     }
 

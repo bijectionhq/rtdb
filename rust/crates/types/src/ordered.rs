@@ -22,6 +22,14 @@ type Fixed = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHa
 fn stable_hash<T: Hash + ?Sized>(value: &T) -> u64 { Fixed::default().hash_one(value) }
 
 impl<V> StructFields<V> {
+    /// An upper bound on the map's own allocations - its boxed header, entry vector and hash index - excluding keys' and values' heap data.
+    pub fn table_bytes_bound(&self) -> Option<usize> {
+        let capacity = self.0.capacity();
+        let entries = capacity.checked_mul(std::mem::size_of::<(String, V)>() + std::mem::size_of::<u64>())?;
+        let buckets = capacity.checked_mul(8)?.checked_div(7)?.checked_add(1)?.checked_next_power_of_two()?;
+        let index = buckets.checked_mul(std::mem::size_of::<usize>() + 1)?.checked_add(16)?;
+        entries.checked_add(index)?.checked_add(std::mem::size_of::<IndexMap<String, V, Fixed>>())
+    }
     pub fn new() -> Self { Self(Box::default()) }
     pub fn with_capacity(capacity: usize) -> Self { Self(Box::new(IndexMap::with_capacity_and_hasher(capacity, Fixed::default()))) }
     pub fn insert(&mut self, key: String, value: V) -> Option<V> { self.0.insert(key, value) }
