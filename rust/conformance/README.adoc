@@ -453,3 +453,28 @@ It uses the original C84 helpers for the continuation, internal queries, pgwire,
 3. The runner compares the typed observations with the retained original JVM case.
 `comparison.json` records the reached predicates and their C84 source lines.
 `result.json` gives the scoped match summary, and the original JUnit receipt identifies the independent reference invocation.
+
+== Corpus-backed assertion ledger
+
+`corpus_ledger.py` derives the assertion ledger, the `--invocations` bindings and the native inventory that `runtime_inventory.py` reconciles, from the source inventory, a recorded reference runtime inventory and a native corpus run.
+A reference Clojure test under `src/test/clojure` has the same Var, run through the native corpus, as its counterpart `corpus:<ns>/<var>`.
+The native inventory records each corpus Var's outcome, the native library configuration that ran it, and the revision of the test sources the corpus ran.
+A test the corpus cannot run natively, or one that exercises JVM implementation classes, carries a `classification` in place of counterparts: `engine-internal`, `jvm-api-boundary`, `jvm-internal` or `environment-unavailable`, each with a reason.
+Corpus outcomes of the last three kinds become those classifications; JUnit tests and Clojure tests outside the corpus root are `engine-internal`.
+A ledger case with neither counterparts nor a classification is an error, and a classified case never names counterparts.
+Classified cases are reconciled without a bound invocation and reported apart, as `classified_case_count` and `classified_by_kind`; they are excluded from `assertion_denominator` and never count as passed native assertions.
+A counterpart whose corpus outcome is not `pass`, `pass-wire` or `no-assertions` is a reconciliation error, so a failing or unexecuted native Var keeps the inventory incomplete.
+Runtime cases bind to candidates through aliases for namespaces declared with metadata, whose candidates the source inventory names `^:meta/...`, and for JUnit methods a subclass inherits, resolved through the superclass declarations in the reference checkout's test sources.
+A Var defined twice in one file is one ledger case and one candidate.
+Language-client candidates, Vars the corpus no longer contains, and macro-generated Vars without a source candidate stay unmapped.
+
+[source,shell]
+----
+python3 rust/conformance/corpus_ledger.py --source rust/conformance/source-inventory.json \
+  --runtime build/conformance/reference-001 --corpus CORPUS_RESULTS --reference-checkout C84_CHECKOUT \
+  --native-configuration NATIVE_CONFIGURATION --corpus-source-revision REVISION --output build/conformance/ledger-001
+python3 rust/conformance/runtime_inventory.py --source rust/conformance/source-inventory.json \
+  --ledger build/conformance/ledger-001/ledger.json --runtime build/conformance/reference-001 \
+  --native build/conformance/ledger-001/native.json --aliases build/conformance/ledger-001/aliases.json \
+  --invocations build/conformance/ledger-001/invocations.json --output build/conformance/ledger-001/reconciliation.json
+----
