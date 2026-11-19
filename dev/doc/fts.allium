@@ -156,6 +156,7 @@ rule RepairUnreadableSearchFile {
 --      A doc whose own valid interval misses the query's, whose system-from is at or after the query's system upper bound, or whose recency is at or before the earlier of the query's valid and system lower bounds, contributes nothing.
 --   3. A selected trie with no such record, or whose file cannot be read, contributes the IIDs of its matching rows, read from its data file, under the same rule.
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
+--      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
 --   6. MATCH is evaluated on each resolved row.
 --
@@ -258,5 +259,3 @@ open question "Is the historical side indexed by default, or only on request? As
 open question "How does fan-out scale? Every current-side search file is a candidate for every query, one per ~100MB trie; term blooms on the artefact record, and search files spanning a completed partition group, are the levers."
 
 open question "NOT MATCH, and count(*) over MATCH, gain little from narrowing: the first has no candidate superset, the second must resolve every candidate. Both are answered by scanning today."
-
-open question "Do live segments keep in-memory postings, rather than being tokenised by every query that narrows a scan?"

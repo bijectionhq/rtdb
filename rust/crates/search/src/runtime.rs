@@ -40,8 +40,33 @@ type DefinitionKey = (String, Option<(i64, i64)>, Option<i64>);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Suspect { pub database: String, pub table: rtdb_types::TableRef, pub trie: rtdb_format::keys::TrieKey, pub artefact_id: String, pub version: i64 }
 
+/// Postings over a live segment's rows for one column, valid for every segment that starts with the same batches.
+struct LivePostings { batches: Vec<std::sync::Weak<rtdb_index::IndexBatch>>, rows: u32, postings: std::collections::HashMap<String, Vec<u32>> }
+
+impl LivePostings {
+    /// How many leading batches `segment` shares with these postings.
+    fn shared_prefix(&self, segment: &rtdb_index::LiveTable) -> usize {
+        self.batches.iter().zip(segment.batches()).take_while(|(cached, batch)| cached.upgrade().is_some_and(|cached| Arc::ptr_eq(&cached, batch))).count()
+    }
+    fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str) -> Result<()> {
+        for row in self.rows..segment.row_count() {
+            let event = segment.row(row)?.event()?;
+            let rtdb_format::data::StoredOperation::Put(document) = &event.operation else { continue };
+            let Some(rtdb_types::Value::Utf8(text)) = document.get(column) else { continue };
+            let mut seen = std::collections::BTreeSet::new();
+            for token in rtdb_text::tokens(text) { if seen.insert(token.clone()) { self.postings.entry(token).or_default().push(row); } }
+        }
+        self.batches = segment.batches().map(Arc::downgrade).collect();
+        self.rows = segment.row_count();
+        Ok(())
+    }
+}
+
+type LiveKey = (String, rtdb_types::TableRef, String, usize);
+
 pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
+    live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
     files: Mutex<Bounded<(String, String), Arc<SearchFile>>>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
     reported: tokio::sync::Notify,
@@ -50,7 +75,7 @@ pub struct SearchRuntime {
 impl SearchRuntime {
     /// `file_bytes` bounds the opened search files kept across queries; each keeps its buffer-pool lease, so its bytes stay charged to the pool.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), files: Mutex::new(Bounded::new(file_bytes)), suspects: Default::default(), reported: tokio::sync::Notify::new() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(4 << 20)), files: Mutex::new(Bounded::new(file_bytes)), suspects: Default::default(), reported: tokio::sync::Notify::new() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -77,6 +102,39 @@ impl SearchRuntime {
     }
 
     pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) { self.files.lock().remove(&(database.to_string(), key.as_str().to_string())); }
+
+    /// The rows of a live segment whose column holds every term of the query; phrases are left to the caller.
+    /// Postings are kept per segment and extended by the rows appended since, so a growing live index is tokenised once.
+    pub fn live_rows(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str, query: &rtdb_text::Query) -> Result<Vec<u32>> {
+        let Some(first) = segment.batches().next() else { return Ok(Vec::new()) };
+        let key = (database.to_string(), segment.table().clone(), column.to_string(), Arc::as_ptr(first) as usize);
+        let entry = {
+            let mut live = self.live.lock();
+            match live.get(&key) {
+                Some(entry) => entry,
+                None => {
+                    let entry = Arc::new(Mutex::new(LivePostings { batches: Vec::new(), rows: 0, postings: Default::default() }));
+                    live.insert(key.clone(), Arc::clone(&entry), segment.row_count().max(1) as usize);
+                    entry
+                }
+            }
+        };
+        let mut postings = entry.lock();
+        let shared = postings.shared_prefix(segment);
+        let batches = segment.batches().count();
+        // A segment ending inside the cached batches is an older snapshot of the same rows, answered by filtering; anything else that diverges is rebuilt.
+        if shared < batches.min(postings.batches.len()) { *postings = LivePostings { batches: Vec::new(), rows: 0, postings: Default::default() }; }
+        if shared == postings.batches.len() && postings.rows < segment.row_count() {
+            postings.extend(segment, column)?;
+            self.live.lock().insert(key, Arc::clone(&entry), segment.row_count().max(1) as usize);
+        }
+        let visible = segment.row_count();
+        let mut lists: Vec<&Vec<u32>> = Vec::with_capacity(query.terms().len());
+        for term in query.terms() { match postings.postings.get(term) { Some(rows) => lists.push(rows), None => return Ok(Vec::new()) } }
+        lists.sort_by_key(|rows| rows.len());
+        let Some((shortest, rest)) = lists.split_first() else { return Ok(Vec::new()) };
+        Ok(shortest.iter().copied().filter(|row| *row < visible && rest.iter().all(|rows| rows.binary_search(row).is_ok())).collect())
+    }
 
     /// Hands a recorded file a scan could not read to the database's lane.
     pub fn report(&self, suspect: Suspect) { if self.suspects.lock().insert(suspect) { self.reported.notify_one(); } }

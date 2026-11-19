@@ -267,3 +267,25 @@ async fn a_search_file_a_scan_cannot_read_is_rebuilt_to_its_original_bytes() {
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn live_rows_written_between_queries_are_found_as_the_live_index_grows() {
+    let (node, driver) = Node::open(options(), services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let accelerated = "SELECT _id FROM docs WHERE MATCH(body, 'overdue')";
+    let oracle = "SELECT _id FROM docs WHERE MATCH(body, 'overdue') OR _id < -1";
+    let mut expected = Vec::new();
+    for id in 0..6 {
+        let body = if id % 2 == 0 { "an overdue note" } else { "a paid note" };
+        assert!(session.state_mut().execute_tx(vec![sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{body}'}}"))], AutonomousTxOptions::default()).await.unwrap().committed());
+        if id % 2 == 0 { expected.push(id); }
+        assert_eq!(ids(rows(session.query_sql(accelerated, vec![]).await.unwrap()).await), expected, "after row {id}");
+        assert_eq!(ids(rows(session.query_sql(oracle, vec![]).await.unwrap()).await), expected);
+    }
+    assert!(session.state_mut().execute_tx(vec![sql("INSERT INTO docs RECORDS {_id: 0, body: 'now paid'}")], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert_eq!(ids(rows(session.query_sql(accelerated, vec![]).await.unwrap()).await), [2, 4], "a later version that no longer matches hides the earlier one");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

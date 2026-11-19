@@ -127,14 +127,17 @@ impl SearchAccelerator {
     fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
         let mut candidates = BTreeSet::new();
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
-            for row in 0..segment.row_count() {
-                let event = segment.row(row)?.event()?;
-                let StoredOperation::Put(document) = &event.operation else { continue };
-                let Some(Value::Utf8(text)) = document.get(column) else { continue };
-                if query.matches(&rtdb_text::tokens(text))
-                    && may_be_visible(event.valid_time.lower().0, event.valid_time.upper().0, event.system_from.0, Timestamp::MAX.0, request.bounds) {
-                    candidates.insert(event.iid);
+            for row in self.runtime.live_rows(request.database, segment, column, query)? {
+                let source = segment.row(row)?;
+                let header = source.header()?;
+                if !may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
+                if !query.phrases().is_empty() {
+                    let event = source.event()?;
+                    let StoredOperation::Put(document) = &event.operation else { continue };
+                    let Some(Value::Utf8(text)) = document.get(column) else { continue };
+                    if !query.matches(&rtdb_text::tokens(text)) { continue; }
                 }
+                candidates.insert(header.iid);
             }
         }
         Ok(candidates)
