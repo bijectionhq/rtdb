@@ -41,8 +41,23 @@ impl PageBuilder {
     pub fn finish(self) -> OwnedPage { OwnedPage { rows: self.rows.into_iter(), _reservation: self.reservation } }
 }
 
-pub(crate) async fn project<'a>(page: &OwnedPage,schema: &Schema,expressions: impl ExactSizeIterator<Item=&'a Expr> + Send,execution: &crate::context::Execution) -> Result<OwnedPage> {
+pub(crate) async fn project<'a>(page: &OwnedPage,schema: &Schema,expressions: impl ExactSizeIterator<Item=&'a Expr> + Clone + Send,execution: &crate::context::Execution) -> Result<OwnedPage> {
     let mut output = PageBuilder::new(page.len(),&execution.context.memory)?;
+    let positions: Option<Vec<usize>> = expressions.clone().map(|expression| match expression { Expr::Column { id, .. } => schema.position(*id), _ => None }).collect();
+    if let Some(positions) = positions {
+        let mut slab = crate::cursor::RowSlab::new(&execution.context.memory);
+        for row in page.rows() {
+            execution.context.check_cancelled()?;
+            let mut values = Vec::with_capacity(positions.len());
+            for &position in &positions {
+                let mut value = row.values.get(position).cloned().ok_or_else(|| invalid("row-width", "Projected column is outside its row"))?;
+                value.admit_expression_dates()?;
+                values.push(value);
+            }
+            output.push(OwnedRow::in_slab(values, &mut slab)?)?;
+        }
+        return Ok(output.finish());
+    }
     for _ in 0..page.len() { output.push(OwnedRow::copy_parts(&[],0,expressions.len(),&execution.context.memory)?)?; }
     evaluate_columns(page, &mut output, 0, schema, expressions, execution).await?;
     Ok(output.finish())

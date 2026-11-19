@@ -35,6 +35,27 @@ impl OwnedRow {
         self.bytes = bytes;
         Ok(())
     }
+    /// As `copy_parts`, charged from a slab.
+    pub fn copy_parts_in(parts: &[&[Value]], prefix_nulls: usize, suffix_nulls: usize, slab: &mut RowSlab) -> Result<Self> {
+        let nulls = prefix_nulls.checked_add(suffix_nulls).ok_or_else(|| invalid("row-size", "Row copy width overflow"))?;
+        let width = parts.iter().try_fold(nulls, |width, part| width.checked_add(part.len()).ok_or_else(|| invalid("row-size", "Row copy width overflow")))?;
+        let base = nulls.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| invalid("row-size", "Row copy allocation overflow"))?;
+        let bound = parts.iter().flat_map(|part| part.iter()).try_fold(base, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(|| invalid("row-size", "Row copy allocation overflow")))?;
+        let reservation = slab.charge(bound)?;
+        let mut values = Vec::with_capacity(width);
+        values.extend((0..prefix_nulls).map(|_| Value::Null));
+        for part in parts { values.extend(part.iter().cloned()); }
+        values.extend((0..suffix_nulls).map(|_| Value::Null));
+        let bytes = row_bytes(&values, values.capacity())?;
+        if bytes > bound { return Err(invalid("row-reservation", "Copied row exceeds its memory reservation")); }
+        Ok(Self { values, reservation, bytes })
+    }
+    /// A row of owned values, charged from a slab for the size `row_bytes` reports, as `replace_value` charges a computed cell.
+    pub fn in_slab(values: Vec<Value>, slab: &mut RowSlab) -> Result<Self> {
+        let bytes = row_bytes(&values, values.capacity())?;
+        let reservation = slab.charge(bytes)?;
+        Ok(Self { values, reservation, bytes })
+    }
     pub fn copy_parts(parts: &[&[Value]], prefix_nulls: usize, suffix_nulls: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let nulls = prefix_nulls.checked_add(suffix_nulls).ok_or_else(|| invalid("row-size", "Row copy width overflow"))?;
         let width = parts.iter().try_fold(nulls, |width, part| width.checked_add(part.len()).ok_or_else(|| invalid("row-size", "Row copy width overflow")))?;
@@ -48,6 +69,26 @@ impl OwnedRow {
         Self::with_reservation(values, reservation)
     }
 }
+/// Charges rows from chunks of the budget, so building many rows admits memory once per chunk rather than once per row.
+/// Each row keeps the chunk it was charged from; a chunk is released when its last row drops.
+pub(crate) struct RowSlab { memory: Arc<MemoryBudget>, current: Option<Arc<MemoryReservation>>, remaining: usize }
+impl RowSlab {
+    const CHUNK: usize = 256 * 1024;
+    pub fn new(memory: &Arc<MemoryBudget>) -> Self { Self { memory: Arc::clone(memory), current: None, remaining: 0 } }
+    pub fn charge(&mut self, bytes: usize) -> Result<Arc<MemoryReservation>> {
+        match &self.current {
+            Some(current) if bytes <= self.remaining => { self.remaining -= bytes; Ok(Arc::clone(current)) }
+            _ => {
+                let chunk = bytes.max(Self::CHUNK);
+                let reservation = self.memory.reserve(chunk)?;
+                self.remaining = chunk - bytes;
+                self.current = Some(Arc::clone(&reservation));
+                Ok(reservation)
+            }
+        }
+    }
+}
+
 fn row_bytes(values: &[Value], capacity: usize) -> Result<usize> {
     let spare = capacity.saturating_sub(values.len()).checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| invalid("row-size", "Retained row capacity overflow"))?;
     values.iter().try_fold(spare, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(|| invalid("row-size", "Retained row size overflow")))

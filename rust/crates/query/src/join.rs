@@ -36,9 +36,9 @@ impl JoinPlan {
         let input = if left { &self.layout.left } else { &self.layout.right };
         OwnedRow::copy_parts(&[input.output(row)],if left { 0 } else { self.layout.left.original.len() },if left { self.layout.right.original.len() } else { 0 },&self.execution.context.memory)
     }
-    fn output(&self,build: &OwnedRow,probe: &OwnedRow) -> Result<OwnedRow> {
+    fn output(&self,build: &OwnedRow,probe: &OwnedRow,slab: &mut crate::cursor::RowSlab) -> Result<OwnedRow> {
         let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
-        OwnedRow::copy_parts(&[self.layout.left.output(left),self.layout.right.output(right)],0,0,&self.execution.context.memory)
+        OwnedRow::copy_parts_in(&[self.layout.left.output(left),self.layout.right.output(right)],0,0,slab)
     }
     fn probe_output(&self,probe: &OwnedRow) -> Result<OwnedRow> {
         OwnedRow::copy_parts(&[self.probe_layout().output(probe)],0,0,&self.execution.context.memory)
@@ -61,7 +61,7 @@ impl JoinPlan {
         if position < left.values.len() { Ok(&left.values[position]) }
         else { right.values.get(position - left.values.len()).ok_or_else(|| invalid("join-row","Joined column is outside both rows")) }
     }
-    async fn accepted(&self,comparisons: &[ExpressionInvocation<'_>],direct: &[Option<(usize,usize)>],build: &OwnedRow,probe: &OwnedRow) -> Result<bool> {
+    async fn accepted(&self,comparisons: &[ExpressionInvocation<'_>],direct: &[Option<(usize,usize)>],equality: &rtdb_expr::EvaluationScope,build: &OwnedRow,probe: &OwnedRow) -> Result<bool> {
         if comparisons.is_empty() { return Ok(true); }
         let joined = if direct.iter().all(Option::is_some) { None } else { Some(self.joined(build,probe)?) };
         let mut unknown = false;
@@ -74,15 +74,17 @@ impl JoinPlan {
                     continue;
                 }
             }
-            let scope = self.execution.scope()?;
             if let Some((left,right)) = direct[index] {
-                match rtdb_expr::sql_eq_in_timezone(self.cell(build,probe,left)?,self.cell(build,probe,right)?,&self.execution.context.timezone,&scope)? {
+                let equal = rtdb_expr::sql_eq_in_timezone(self.cell(build,probe,left)?,self.cell(build,probe,right)?,&self.execution.context.timezone,equality)?;
+                equality.reset()?;
+                match equal {
                     None => unknown = true,
                     Some(false) => return Ok(false),
                     Some(true) => {}
                 }
                 continue;
             }
+            let scope = self.execution.scope()?;
             let joined = joined.as_ref().ok_or_else(|| invalid("join-row","Joined row was not built for an evaluated comparison"))?;
             let value = self.execution.evaluate_invocation(&scope,comparison,&joined.values).await?;
             if matches!(value,Value::Null | Value::Undefined) { unknown = true; }
@@ -99,6 +101,8 @@ impl JoinPlan {
             comparisons.push(self.execution.prepare_expression(expression,schema,&metadata)?);
         }
         let direct = self.direct_equalities();
+        let equality = self.execution.scope()?;
+        let mut slab = crate::cursor::RowSlab::new(&self.execution.context.memory);
         let mut output = PageBuilder::new(0,&self.execution.context.memory)?;
         let _hash_scratch = self.execution.context.memory.reserve(4096)?;
         let BuildTable { rows,index,unmatched,.. } = table;
@@ -107,17 +111,17 @@ impl JoinPlan {
             let mut matched = false;
             if self.kind == JoinKind::Anti {
                 for build in rows.page.rows() {
-                    if self.accepted(&comparisons,&direct,build,probe).await? { matched = true;break; }
+                    if self.accepted(&comparisons,&direct,&equality,build,probe).await? { matched = true;break; }
                 }
             } else {
                 for build_index in index.candidates(self.probe_layout().hash(probe)?) {
                     let build = &rows.page.rows()[build_index];
-                    if !self.accepted(&comparisons,&direct,build,probe).await? { continue; }
+                    if !self.accepted(&comparisons,&direct,&equality,build,probe).await? { continue; }
                     if matched && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
                     matched = true;
                     if let Some(unmatched) = unmatched { unmatched[build_index] = 0; }
                     if self.kind == JoinKind::Semi { break; }
-                    append(&mut output,self.output(build,probe)?,&self.execution)?;
+                    append(&mut output,self.output(build,probe,&mut slab)?,&self.execution)?;
                 }
             }
             if self.kind == JoinKind::Semi && matched || self.kind == JoinKind::Anti && !matched {

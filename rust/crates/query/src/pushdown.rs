@@ -171,7 +171,8 @@ impl Pushdowns {
     }
 }
 
-struct Key { expression: Expr, probe: ColumnId, filter: ColumnFilter }
+/// A build key's filter, with the keys it has already admitted: a repeated key admits nothing new, so its IID is not rehashed.
+struct Key { expression: Expr, probe: ColumnId, filter: ColumnFilter, seen: std::collections::HashSet<rtdb_types::EntityId>, seen_reservation: Option<Arc<MemoryReservation>> }
 pub(crate) struct PushdownBuilder { keys: Vec<Key>, _reservation: Arc<MemoryReservation> }
 impl PushdownBuilder {
     pub fn new(condition: Option<&Expr>, build: &Schema, probe: &Schema, rows: i64, blooms: bool, execution: &Execution) -> Result<Self> {
@@ -187,9 +188,25 @@ impl PushdownBuilder {
         let scope = execution.scope()?;
         for key in &mut self.keys {
             let Some(bloom) = &mut key.filter.bloom else { continue; };
-            let value = execution.evaluate(&scope, &key.expression, schema, row).await?;
+            let value = match &key.expression {
+                Expr::Column { id, .. } => {
+                    let mut value = schema.position(*id).and_then(|position| row.get(position)).cloned().ok_or_else(|| invalid("pushdown-key", "Build key column is outside its row"))?;
+                    value.admit_expression_dates()?;
+                    value
+                }
+                expression => execution.evaluate(&scope, expression, schema, row).await?,
+            };
             bloom.insert_value(&value)?;
             if matches!(value, Value::Null | Value::Undefined) { continue; }
+            if key.filter.iids.is_some() && let Ok(entity) = value.entity_id() {
+                if key.seen.contains(&entity) { continue; }
+                let bytes = key.seen.len().saturating_add(1).saturating_mul(value.retained_bytes()?.saturating_add(64)).saturating_add(256);
+                match &mut key.seen_reservation {
+                    Some(reservation) if reservation.bytes() >= bytes => {}
+                    slot => *slot = Some(execution.context.memory.reserve(bytes.saturating_mul(2))?),
+                }
+                key.seen.insert(entity);
+            }
             if let Some(iids) = &mut key.filter.iids {
                 if !iids.insert(&value, &scope, &execution.context.memory)? {
                     key.filter.iids = None;
@@ -222,7 +239,7 @@ fn collect_keys(expr: &Expr, build: &Schema, probe: &Schema, bitmap_bound: usize
                 let columns = expression.referenced_columns();
                 if columns.is_empty() || columns.iter().any(|id| !build.fields().iter().any(|field| field.id == *id)) { continue; }
                 let reservation = execution.context.memory.reserve(if blooms { bitmap_bound } else { 256 })?;
-                keys.push(Key { expression: expression.clone(), probe: *id, filter: ColumnFilter { bloom: blooms.then(BloomFilter::default), iids, _reservation: reservation } });
+                keys.push(Key { expression: expression.clone(), probe: *id, filter: ColumnFilter { bloom: blooms.then(BloomFilter::default), iids, _reservation: reservation }, seen: Default::default(), seen_reservation: None });
                 break;
             }
         }
