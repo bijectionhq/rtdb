@@ -1583,3 +1583,30 @@ async fn xtql_projections_keep_their_written_column_order() {
     }
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn wide_heterogeneous_documents_flush_and_delete_across_blocks() {
+    let mut options = options();
+    options.execution_memory_bytes = 128 * 1024 * 1024;
+    let (node, driver) = running(options, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let leaf = |i: i64| match i % 5 {
+        0 => Value::I64(i), 1 => Value::Utf8(format!("s{i}")), 2 => Value::F64(i as f64 / 3.0), 3 => Value::Bool(i % 4 == 0),
+        _ => Value::Timestamp { value: i * 1_000_000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some(format!("+{:02}:00", i % 12)) },
+    };
+    let nested = |i: i64| (0..3).fold(leaf(i), |inner, depth| Value::Struct(BTreeMap::from([(format!("f{i}_{depth}"), inner), (format!("g{i}_{depth}"), Value::List(vec![leaf(i + depth), leaf(i + depth + 1)]))])));
+    let documents = (0..80).map(|i| BTreeMap::from([
+        ("_id".into(), Value::I64(i)),
+        (format!("c{i}"), Value::List(vec![nested(i), leaf(i + 1)])),
+    ])).collect::<Vec<_>>();
+    let flush = || async { node.catalog().database("xtdb").unwrap().flush().await.unwrap(); node.sync_all(Duration::from_secs(30), &CancellationToken::new()).await.unwrap(); };
+    let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(documents, node.memory()).unwrap(), valid_from: None, valid_to: None };
+    assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
+    flush().await;
+    let delete = TxOp::DeleteDocs { table: TableRef::new("public", "docs"), ids: rtdb_tx::EntityIds::new((0..80).map(|id| Value::I64(id).entity_id().unwrap()).collect(), node.memory()).unwrap(), valid_from: None, valid_to: None };
+    assert!(session.state_mut().execute_tx(vec![delete], AutonomousTxOptions::default()).await.unwrap().committed());
+    flush().await;
+    assert!(rows(session.query_sql("SELECT * FROM docs", vec![]).await.unwrap()).await.is_empty());
+    assert_eq!(rows(session.query_sql("SELECT * FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await.len(), 80);
+    stop(&node, driver).await;
+}

@@ -240,11 +240,17 @@ impl BlockPages<'_> {
             }
         }
         let mut bound = rows.len().checked_mul(256).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Page row allocation overflow"))?;
+        let mut schema_charged = Vec::new();
         for &row in rows {
             let source = self.table.row(row)?;
             let schema = source.batch.arrow().schema();
             let index = schema.index_of("op").map_err(invalid)?;
-            bound = bound.checked_add(estimate_read_value_bytes(schema.field(index), source.batch.arrow().column(index).as_ref(), source.row)?).ok_or_else(|| invalid("Page allocation size overflow"))?;
+            let (field, column) = (schema.field(index), source.batch.arrow().column(index).as_ref());
+            // Each batch derives its put type once, so only its first row is charged the schema.
+            let first = !schema_charged.iter().any(|batch| Arc::ptr_eq(batch, &source.batch));
+            let cell = if first { schema_charged.push(Arc::clone(&source.batch)); estimate_read_value_bytes(field, column, source.row)? }
+                else { rtdb_columnar::estimate_read_cell_bytes(field, column, source.row)? };
+            bound = bound.checked_add(cell).ok_or_else(|| invalid("Page allocation size overflow"))?;
         }
         let _scratch = self.memory.reserve(bound)?;
         let events = rows.iter().map(|&row| self.table.row(row)?.event()).collect::<Result<Vec<_>>>()?;

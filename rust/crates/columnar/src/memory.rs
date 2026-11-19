@@ -89,7 +89,9 @@ impl OwnedBatch {
         let batches = sources.iter().map(|source| &source.batch).collect::<Vec<_>>();
         let batch = arrow_select::interleave::interleave_record_batch(&batches, rows).map_err(super::arrow_error)?;
         let size = batch.get_array_memory_size().checked_add(4096).ok_or_else(allocation_overflow)?;
-        Arc::get_mut(&mut reservation).expect("row copying owns its reservation").shrink_to(size)?;
+        // Interleaving a dense union can retain more than its sources' selected rows; charge what the copy holds.
+        let reserved = Arc::get_mut(&mut reservation).expect("row copying owns its reservation");
+        if size > reserved.bytes() { reserved.grow_to(size)?; } else { reserved.shrink_to(size)?; }
         Self::with_reservation(batch, reservation)
     }
 

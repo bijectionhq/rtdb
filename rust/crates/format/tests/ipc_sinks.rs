@@ -213,8 +213,8 @@ fn file_bounds_include_padding_between_the_message_header_and_body() {
     block.set_metaDataLength(block.metaDataLength() + padding as i32);
     bytes[block_position + padding..block_position + padding + block.0.len()].copy_from_slice(&block.0);
     let padded = inspect_file_reserved(&mut std::io::Cursor::new(&bytes), |_| Ok(())).unwrap();
-    assert_eq!(padded.page_decoding_bounds[0] - original.page_decoding_bounds[0], padding * 64);
-    assert_eq!(rtdb_format::ipc::file_allocation_bound(&bytes).unwrap() - original_total, padding * 64);
+    assert_eq!(padded.page_decoding_bounds[0] - original.page_decoding_bounds[0], padding * 16);
+    assert_eq!(rtdb_format::ipc::file_allocation_bound(&bytes).unwrap() - original_total, padding * 16);
     let mut reader = rtdb_format::ipc::ArrowFile::open(bytes.into(), None).unwrap();
     assert_eq!(reader.read_page(0).unwrap(), batch);
 }

@@ -38,9 +38,10 @@ pub struct MetadataBuilder {
 fn page_metadata_reservation(page: &RecordBatch) -> Result<usize> {
     let mut bytes = page.get_array_memory_size().checked_mul(4).and_then(|size| size.checked_add(65_536)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
     let mut arrays: Vec<_> = page.columns().iter().map(|array| array.to_data()).collect();
+    // Each array node yields one statistics entry and at most one Bloom bitmap; cells are read in place, not cloned per row.
     while let Some(array) = arrays.pop() {
-        bytes = bytes.checked_add(array.len().checked_mul(256).ok_or_else(|| invalid("Page metadata reservation overflow"))?)
-            .and_then(|size| size.checked_add(65_536)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
+        bytes = bytes.checked_add(array.len().checked_mul(32).ok_or_else(|| invalid("Page metadata reservation overflow"))?)
+            .and_then(|size| size.checked_add(4096)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
         arrays.extend(array.child_data().iter().cloned());
     }
     Ok(bytes)
@@ -129,7 +130,8 @@ impl MetadataBuilder {
         let mut reservation = memory.reserve(page_metadata_reservation(batch)?)?;
         let index = self.write_leaf(batch)?;
         let retained = retained_node_bytes(&self.nodes[index])?;
-        Arc::get_mut(&mut reservation).expect("metadata construction owns its reservation").shrink_to(retained)?;
+        let reserved = Arc::get_mut(&mut reservation).expect("metadata construction owns its reservation");
+        if retained > reserved.bytes() { reserved.grow_to(retained)?; } else { reserved.shrink_to(retained)?; }
         Ok((index, reservation))
     }
 

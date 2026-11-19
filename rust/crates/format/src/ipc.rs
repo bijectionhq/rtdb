@@ -38,7 +38,7 @@ pub struct FileLayout {
 impl FileLayout {
     /// Reserve this bound while the reader, its dictionaries or its schema remain reachable.
     pub fn opening_allocation_bound(&self) -> Result<usize> {
-        allocation_add(allocation_add(allocation_mul(self.footer_encoded_bytes, 64)?, 65_536)?, self.dictionary_decoding_bound)
+        allocation_add(allocation_add(allocation_mul(self.footer_encoded_bytes, 16)?, 65_536)?, self.dictionary_decoding_bound)
     }
 
     /// Reserve this bound while retaining every decoded batch, dictionary and schema from the file.
@@ -181,7 +181,7 @@ pub fn inspect_file_reserved<R: Read + Seek + ?Sized, G>(reader: &mut R, mut res
         let body_length = usize::try_from(block.bodyLength()).map_err(invalid)?;
         if usize::try_from(message.bodyLength()).map_err(invalid)? != body_length { return Err(invalid("Arrow block and message body lengths differ")); }
         let body_start = offset.checked_add(metadata_length as u64).ok_or_else(|| invalid("Arrow body offset overflow"))?;
-        let bound = message_bound(&message, metadata_length, body_length, row_descriptors, |start| {
+        let bound = message_bound(&message, metadata_length, body_length, arrow_descriptors, |start| {
             reader.seek(SeekFrom::Start(body_start.checked_add(start as u64).ok_or_else(|| invalid("Arrow buffer offset overflow"))?)).map_err(invalid)?;
             let mut bytes = [0; 8]; reader.read_exact(&mut bytes).map_err(invalid)?;
             Ok(i64::from_le_bytes(bytes))
@@ -317,7 +317,7 @@ fn framed_message_bound(header: &[u8], body: &[u8], metadata_length: usize, fiel
 }
 
 fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_length: usize, field_bound: fn(usize) -> Result<usize>, mut compressed_length: impl FnMut(usize) -> Result<i64>) -> Result<usize> {
-    let mut bound = allocation_add(8192, allocation_add(allocation_mul(header_length, 64)?, allocation_mul(body_length, 4)?)?)?;
+    let mut bound = allocation_add(8192, allocation_add(allocation_mul(header_length, 16)?, allocation_mul(body_length, 4)?)?)?;
     if usize::try_from(message.bodyLength()).map_err(invalid)? > body_length { return Err(invalid("Arrow message body is truncated")); }
     if let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) {
         if let Some(compression) = batch.compression() {
