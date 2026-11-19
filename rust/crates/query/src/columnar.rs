@@ -309,12 +309,14 @@ mod kernel {
     fn order(left: Cell<'_>, right: Cell<'_>, equality_only: bool) -> Result<std::cmp::Ordering, ()> {
         use std::cmp::Ordering;
         let float = |value: f64| if value.is_nan() { Err(()) } else { Ok(value) };
+        // Equality is IEEE (`-0.0 = 0.0`), ordering is total (`-0.0 < 0.0`), as in the scalar evaluator.
+        let floats = |a: f64, b: f64| if equality_only { a.partial_cmp(&b).ok_or(()) } else { Ok(a.total_cmp(&b)) };
         match (left, right) {
             (Cell::Int(a), Cell::Int(b)) => Ok(a.cmp(&b)),
             (Cell::Micros(a, zoned), Cell::Micros(b, other)) if zoned == other => Ok(a.cmp(&b)),
-            (Cell::Float(a), Cell::Float(b)) => float(a)?.partial_cmp(&float(b)?).ok_or(()),
-            (Cell::Int(a), Cell::Float(b)) if a.abs() < EXACT => (a as f64).partial_cmp(&float(b)?).ok_or(()),
-            (Cell::Float(a), Cell::Int(b)) if b.abs() < EXACT => float(a)?.partial_cmp(&(b as f64)).ok_or(()),
+            (Cell::Float(a), Cell::Float(b)) => floats(float(a)?, float(b)?),
+            (Cell::Int(a), Cell::Float(b)) if a.unsigned_abs() < EXACT as u64 => floats(a as f64, float(b)?),
+            (Cell::Float(a), Cell::Int(b)) if b.unsigned_abs() < EXACT as u64 => floats(float(a)?, b as f64),
             (Cell::Text(a), Cell::Text(b)) if equality_only || (a.is_ascii() && b.is_ascii()) => Ok(a.cmp(b)),
             (Cell::Bool(a), Cell::Bool(b)) if equality_only => Ok(if a == b { Ordering::Equal } else { Ordering::Less }),
             _ => Err(()),
@@ -433,7 +435,7 @@ mod tests {
     fn batch(random: &mut Random, rows: usize, memory: &Arc<MemoryBudget>) -> ColumnBatch {
         let null = |random: &mut Random| random.below(5) == 0;
         let ints: Int64Array = (0..rows).map(|_| (!null(random)).then(|| random.below(21) as i64 - 10)).collect();
-        let floats: Float64Array = (0..rows).map(|_| (!null(random)).then(|| (random.below(41) as f64 - 20.0) / 2.0)).collect();
+        let floats: Float64Array = (0..rows).map(|_| (!null(random)).then(|| float_cell(random))).collect();
         let texts: StringArray = (0..rows).map(|_| (!null(random)).then(|| ["a", "b", "ab", "B", ""][random.below(5) as usize])).collect();
         let bools: BooleanArray = (0..rows).map(|_| (!null(random)).then(|| random.below(2) == 0)).collect();
         let values = (0..rows).map(|_| if null(random) { Value::Null } else { Value::I64(random.below(21) as i64 - 10) }).collect();
@@ -446,7 +448,7 @@ mod tests {
         match random.below(3) {
             0 => schema.fields()[numeric].expression(),
             1 => Expr::Literal([Value::I64(random.below(21) as i64 - 10), Value::I16(random.below(21) as i16 - 10), Value::I32(random.below(21) as i32 - 10)][random.below(3) as usize].clone()),
-            _ => Expr::Literal(Value::F64((random.below(41) as f64 - 20.0) / 2.0)),
+            _ => Expr::Literal(Value::F64(float_cell(random))),
         }
     }
     fn predicate(random: &mut Random, schema: &Schema, depth: u32) -> Expr {
@@ -501,6 +503,24 @@ mod tests {
             }
         }
         assert!(computed > 150, "the kernel should compute most generated projections, computed {computed}");
+    }
+
+    fn float_cell(random: &mut Random) -> f64 {
+        let value = (random.below(41) as f64 - 20.0) / 2.0;
+        if value == 0.0 && random.below(2) == 0 { -0.0 } else { value }
+    }
+
+    #[test]
+    fn the_column_kernel_orders_negative_zero_below_zero_but_equal_to_it() {
+        use rtdb_plan::BinaryOp::{Eq, GtEq, Lt};
+        let memory = MemoryBudget::new(1 << 24);
+        let schema = Schema::new(vec![field(1, ScalarType::F64)]).unwrap();
+        let batch = ColumnBatch::new(vec![arrow(Arc::new(Float64Array::from(vec![-0.0, 0.0])), ScalarType::F64)], 2, &memory).unwrap();
+        let column = Expr::Column { id: rtdb_plan::ColumnId(1), data_type: LogicalType::Scalar(ScalarType::F64) };
+        for (op, literal, expected) in [(Lt, Value::F64(0.0), [true, false]), (Lt, Value::I64(0), [true, false]), (GtEq, Value::F64(0.0), [false, true]), (Eq, Value::F64(0.0), [true, true])] {
+            let predicate = Expr::binary(op, column.clone(), Expr::Literal(literal));
+            assert_eq!(kernel::truth(&predicate, &schema, &batch, &[]), Some(expected.map(Some).to_vec()), "{predicate:?}");
+        }
     }
 
     #[test]
