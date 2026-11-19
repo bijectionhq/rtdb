@@ -14,7 +14,7 @@ use crate::driver::Completion;
 
 /// One version of one definition of an artefact kind over one table.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ArtefactDefinition { pub table: TableRef, pub kind: String, pub id: String, pub version: i32 }
+pub struct ArtefactDefinition { pub table: TableRef, pub kind: String, pub id: String, pub version: i64 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ArtefactJob { pub definition: ArtefactDefinition, pub trie: TrieKey }

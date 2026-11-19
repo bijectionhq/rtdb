@@ -4442,6 +4442,7 @@ dependencies = [
  "rtdb-query",
  "rtdb-sql",
  "rtdb-storage",
+ "rtdb-text",
  "rtdb-trie",
  "rtdb-types",
  "serde",

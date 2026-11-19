@@ -87,7 +87,7 @@ impl TableSlug {
     /// Every artefact derived from one trie lives under this prefix, so collecting the trie can list and delete them all.
     pub fn artefact_prefix(&self, trie: &TrieKey) -> String { format!("{}/artefacts/{trie}", self.table_prefix()) }
 
-    pub fn artefact_key(&self, trie: &TrieKey, kind: &str, definition_id: &str, definition_version: i32) -> Result<String> {
+    pub fn artefact_key(&self, trie: &TrieKey, kind: &str, definition_id: &str, definition_version: i64) -> Result<String> {
         for component in [kind, definition_id] {
             if component.is_empty() || matches!(component, "." | "..") || component.contains(['/', '\\', '\0']) { return Err(invalid_key(component)); }
         }

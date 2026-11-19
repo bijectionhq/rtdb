@@ -89,7 +89,7 @@ message TrieDetails {
 message ArtefactRecord {
     string kind = 1;
     string definition_id = 2;
-    int32 definition_version = 3;
+    int64 definition_version = 3;
     // Opaque to the core: the artefact kind owns its encoding.
     bytes stats = 4;
 }

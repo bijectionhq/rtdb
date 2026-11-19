@@ -49,7 +49,7 @@ impl CatalogTrie {
         }
     }
 
-    pub fn artefact(&self, kind: &str, definition_id: &str, definition_version: i32) -> Option<&log_pb::ArtefactRecord> {
+    pub fn artefact(&self, kind: &str, definition_id: &str, definition_version: i64) -> Option<&log_pb::ArtefactRecord> {
         self.artefacts.iter().find(|record| same_artefact(record, kind, definition_id, definition_version))
     }
 
@@ -306,7 +306,7 @@ impl TrieCatalog {
     }
 }
 
-fn same_artefact(record: &log_pb::ArtefactRecord, kind: &str, definition_id: &str, definition_version: i32) -> bool {
+fn same_artefact(record: &log_pb::ArtefactRecord, kind: &str, definition_id: &str, definition_version: i64) -> bool {
     record.kind() == kind && record.definition_id() == definition_id && record.definition_version() == definition_version
 }
 

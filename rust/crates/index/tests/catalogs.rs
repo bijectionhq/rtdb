@@ -132,7 +132,7 @@ fn table_oid_allocation_is_sorted_and_recorded_slugs_stay_frozen() {
     assert_eq!(next.entry(&zeta).unwrap().oid, 20_002);
 }
 
-fn artefact(definition_id: &str, version: i32, stats: u8) -> rtdb_format::log::proto::ArtefactRecord {
+fn artefact(definition_id: &str, version: i64, stats: u8) -> rtdb_format::log::proto::ArtefactRecord {
     rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]) }
 }
 

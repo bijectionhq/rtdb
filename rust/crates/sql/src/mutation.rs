@@ -12,6 +12,8 @@ pub enum Mutation {
     Assert { input: Arc<Relation>, message: Option<String> },
     CreateTable { table: QualifiedTable, columns: Vec<String> },
     GrantRole { user: String, role: String, revoke: bool },
+    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String> },
+    DropSearchIndex { name: String },
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +135,8 @@ fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
         }
         Dml::CreateTable { table, columns } => Mutation::CreateTable { table, columns },
         Dml::GrantRole { user, role, revoke } => Mutation::GrantRole { user, role, revoke },
+        Dml::CreateSearchIndex { name, table, columns } => Mutation::CreateSearchIndex { name, table, columns },
+        Dml::DropSearchIndex { name } => Mutation::DropSearchIndex { name },
     })
 }
 

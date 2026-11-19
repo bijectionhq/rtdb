@@ -17,6 +17,8 @@ pub enum Dml {
     Assert { input: Arc<Relation>, message: Option<String> },
     CreateTable { table: QualifiedTable, columns: Vec<String> },
     GrantRole { user: String, role: String, revoke: bool },
+    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String> },
+    DropSearchIndex { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

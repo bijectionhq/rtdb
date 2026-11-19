@@ -176,7 +176,7 @@ fn bind_parsed<T>(
     let forms = parsed.forms;
     let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
     let scoped_catalog = TransactionCatalog(catalog);
-    let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
+    let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
@@ -302,6 +302,13 @@ impl Context<'_> {
                 Ok(Statement::Dml(Dml::CreateTable { table: self.target(table)?, columns }))
             }
             Syntax::GrantRole { user, role, revoke } => Ok(Statement::Dml(Dml::GrantRole { user: user.normalized(), role: role.normalized(), revoke: *revoke })),
+            Syntax::CreateSearchIndex { name, table, columns } => {
+                let columns: Vec<_> = columns.iter().map(Identifier::normalized).collect();
+                if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("CREATE SEARCH INDEX repeats a column")); }
+                if columns.iter().any(|name| name.starts_with('_')) { return Err(error("CREATE SEARCH INDEX cannot index internal columns")); }
+                Ok(Statement::Dml(Dml::CreateSearchIndex { name: name.normalized(), table: self.target(table)?, columns }))
+            }
+            Syntax::DropSearchIndex { name } => Ok(Statement::Dml(Dml::DropSearchIndex { name: name.normalized() })),
             Syntax::Records { patch, table, records } => {
                 use crate::{StaticMutation, StaticMutationKind};
                 let StaticMutation { table, input, kind } = self.record_rows(*patch, table, records)?;
