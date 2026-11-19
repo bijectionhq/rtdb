@@ -101,7 +101,6 @@ Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 == Deferred
 
 * Block-max WAND top-k over search files, which needs the scan to verify candidates in batches.
-* Streaming search builds within the memory budget; a job holds its data file, tokens and segment in memory today.
 * Retiring a recorded search file that cannot be read, so the lane rebuilds it.
 * Caching definitions and opened search files per query, rather than per scan opening.
 * In-memory postings for live segments.

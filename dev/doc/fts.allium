@@ -120,6 +120,9 @@ rule DropSearchIndex {
 -- Jobs run current side first, then higher levels first.
 
 rule SearchJobRuns {
+    -- The job downloads the data file to a temporary file and reads it a page at a time, each page under its memory reservation.
+    -- It reserves the segment's indexing heap up front, in proportion to the trie's size, builds the segment on disk, and streams the bundle to the object store.
+    -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     when: job: SearchJob.created
 
     ensures:
@@ -236,8 +239,6 @@ surface FullTextSearch {
 open question "A node that uploads a search file and fails before appending ArtefactsAdded leaves a file no record names until its trie is collected. Is that bounded enough, or does the lane sweep its own unrecorded keys?"
 
 open question "A recorded search file that cannot be read is never rebuilt, so its trie is evaluated from its data file for the trie's life. Does the lane need a way to retire a bad record?"
-
-open question "A search job holds its data file, its rows' tokens and the built segment in memory, outside the memory budget. Does the lane stream pages into the writer and reserve against the budget?"
 
 open question "Ranking verifies candidates by resolving them all; does a block-max WAND top-k, verifying candidates in batches, earn its complexity?"
 

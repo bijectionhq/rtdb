@@ -114,7 +114,7 @@ fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> R
     writer.set_byte_limit(allowance)
 }
 
-async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
+pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
     let object = store.head(key).await.map_err(crate::invalid)?;
     let mut file = create_file(path)?;
     let mut position = 0;
@@ -130,14 +130,14 @@ async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &Obj
     Ok(file)
 }
 
-fn open_input(mut file: File, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
+pub fn open_input(mut file: File, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
     let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
     let reservation = memory.reserve(layout.opening_allocation_bound()?)?;
     let reader = ArrowFile::from_inspected_reader(file, None, layout)?;
     Ok((reader, reservation))
 }
 
-fn read_page(reader: &mut ArrowFile, index: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+pub fn read_page(reader: &mut ArrowFile, index: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let bound = reader.page_allocation_bound(index)?;
     let reservation = memory.reserve(bound)?;
     OwnedBatch::with_reservation(reader.read_page(index)?, reservation)

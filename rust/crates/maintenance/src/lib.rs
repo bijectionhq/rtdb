@@ -14,6 +14,9 @@ pub use job::{CompactionJob, RecencyMode, available_jobs};
 pub use merge::{MergeConfig, RecencyPartition, SegmentCompactor, recency_partition};
 pub use publication::{CompactionPublisher, SnapshotSource, TrieDeletionPublisher};
 
+/// Reading a stored file within the memory budget, as compaction reads its inputs.
+pub mod input { pub use crate::merge::{download, open_input, read_page}; }
+
 fn invalid(message: impl std::fmt::Display) -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect("rtdb.maintenance/invalid-state", message.to_string())
 }

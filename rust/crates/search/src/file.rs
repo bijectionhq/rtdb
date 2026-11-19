@@ -56,14 +56,22 @@ fn schema(columns: &[String]) -> (Schema, Fields) {
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/file", error.to_string()) }
 fn corrupt(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/corrupt-file", message.to_string()) }
 
-/// Builds the bundled search file over rows in data-file order.
-/// The bytes are a function of the rows, the columns and `identity` alone, so every builder of one job writes the same object.
+/// Builds the bundled search file over rows in data-file order, in memory.
 pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str) -> Result<Vec<u8>> {
+    let mut bundle = Vec::new();
+    write_search_file(columns, rows.iter().cloned().map(Ok), identity, RamDirectory::create(), &mut bundle)?;
+    Ok(bundle)
+}
+
+/// Builds the search file over rows in data-file order, building its segment in `directory` and writing the bundle to `output`.
+/// The bytes are a function of the rows, the columns and `identity` alone, wherever the segment is built, so every builder of one job writes the same object.
+pub fn write_search_file<D: Directory + Clone + 'static, W: std::io::Write>(columns: &[String], rows: impl IntoIterator<Item = Result<SearchRow>>, identity: &str, directory: D, output: W) -> Result<()> {
     let (schema, fields) = schema(columns);
-    let directory = RamDirectory::create();
     let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
     let mut writer = Index::builder().schema(schema).settings(settings).single_segment_index_writer(directory.clone(), WRITER_MEMORY).map_err(fault)?;
     for row in rows {
+        let row = row?;
+        let row = &row;
         if row.tokens.len() != columns.len() { return Err(fault("Search row tokens do not cover the file's columns")); }
         let mut document = TantivyDocument::new();
         for (field, tokens) in fields.columns.iter().zip(&row.tokens) {
@@ -86,7 +94,7 @@ pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str)
         writer.add_document(document).map_err(fault)?;
     }
     writer.finalize().map_err(fault)?;
-    bundle(&directory, &segment_uuid(identity))
+    bundle(&directory, &segment_uuid(identity), output)
 }
 
 /// A uuid-shaped name derived from the job's identity, standing in for tantivy's random segment id.
@@ -96,7 +104,7 @@ fn segment_uuid(identity: &str) -> String {
     digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn bundle(directory: &RamDirectory, uuid: &str) -> Result<Vec<u8>> {
+fn bundle(directory: &dyn Directory, uuid: &str, mut output: impl std::io::Write) -> Result<()> {
     let meta = String::from_utf8(directory.atomic_read(Path::new("meta.json")).map_err(fault)?).map_err(fault)?;
     let parsed: serde_json::Value = serde_json::from_str(&meta).map_err(fault)?;
     let segments = parsed.get("segments").and_then(serde_json::Value::as_array).ok_or_else(|| fault("Search index meta has no segments"))?;
@@ -106,37 +114,45 @@ fn bundle(directory: &RamDirectory, uuid: &str) -> Result<Vec<u8>> {
         _ => return Err(fault("A search file holds exactly one segment")),
     };
     let rename = |name: &str| original.as_ref().map_or(name.to_string(), |original| name.replace(original, uuid));
-    let mut files = BTreeMap::new();
-    files.insert("meta.json".to_string(), original.as_ref().map_or(meta.clone(), |original| {
+    let meta = original.as_ref().map_or(meta.clone(), |original| {
         let dashed = |id: &str| format!("{}-{}-{}-{}-{}", &id[..8], &id[8..12], &id[12..16], &id[16..20], &id[20..]);
         meta.replace(&dashed(original), &dashed(uuid)).replace(original, uuid)
-    }).into_bytes());
+    });
+    let mut files: BTreeMap<String, Option<PathBuf>> = BTreeMap::from([("meta.json".to_string(), None)]);
     if let Some(original) = &original {
         for extension in ["idx", "term", "fieldnorm", "fast", "store", "pos"] {
             let path = PathBuf::from(format!("{original}.{extension}"));
-            if directory.exists(&path).map_err(fault)? {
-                let bytes = directory.open_read(&path).map_err(fault)?.read_bytes().map_err(fault)?;
-                files.insert(rename(&path.to_string_lossy()), bytes.as_slice().to_vec());
-            }
+            if directory.exists(&path).map_err(fault)? { files.insert(rename(&path.to_string_lossy()), Some(path)); }
         }
     }
-    let mut output = MAGIC.to_vec();
+    let write = |output: &mut dyn std::io::Write, bytes: &[u8]| output.write_all(bytes).map_err(fault);
+    write(&mut output, MAGIC)?;
+    let mut position = MAGIC.len() as u64;
     let mut index = Vec::new();
-    for (name, bytes) in &files {
-        index.push((name.clone(), output.len() as u64, bytes.len() as u64));
-        output.extend_from_slice(bytes);
+    for (name, source) in &files {
+        let length = match source {
+            None => { write(&mut output, meta.as_bytes())?; meta.len() }
+            Some(path) => {
+                let bytes = directory.open_read(path).map_err(fault)?.read_bytes().map_err(fault)?;
+                write(&mut output, bytes.as_slice())?;
+                bytes.len()
+            }
+        } as u64;
+        index.push((name.clone(), position, length));
+        position += length;
     }
-    let footer_start = output.len() as u64;
-    output.extend_from_slice(&(index.len() as u32).to_le_bytes());
+    let mut footer = Vec::new();
+    footer.extend_from_slice(&(index.len() as u32).to_le_bytes());
     for (name, offset, length) in index {
-        output.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        output.extend_from_slice(name.as_bytes());
-        output.extend_from_slice(&offset.to_le_bytes());
-        output.extend_from_slice(&length.to_le_bytes());
+        footer.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        footer.extend_from_slice(name.as_bytes());
+        footer.extend_from_slice(&offset.to_le_bytes());
+        footer.extend_from_slice(&length.to_le_bytes());
     }
-    output.extend_from_slice(&footer_start.to_le_bytes());
-    output.extend_from_slice(MAGIC);
-    Ok(output)
+    footer.extend_from_slice(&position.to_le_bytes());
+    footer.extend_from_slice(MAGIC);
+    write(&mut output, &footer)?;
+    output.flush().map_err(fault)
 }
 
 /// The bytes a search file is read from: the object as read, or a lease on the buffer pool's copy of it.
@@ -280,6 +296,14 @@ mod tests {
         let second = build_search_file(&columns(), &rows(), "public$docs/l01-rc-b00/docs_text").unwrap();
         assert_eq!(first, second);
         assert_ne!(first, build_search_file(&columns(), &rows(), "public$docs/l01-rc-b01/docs_text").unwrap());
+    }
+
+    #[test]
+    fn a_segment_built_on_disk_bundles_to_the_same_bytes_as_one_built_in_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut streamed = Vec::new();
+        write_search_file(&columns(), rows().into_iter().map(Ok), "job", tantivy::directory::MmapDirectory::open(directory.path()).unwrap(), &mut streamed).unwrap();
+        assert_eq!(streamed, build_search_file(&columns(), &rows(), "job").unwrap());
     }
 
     #[test]
