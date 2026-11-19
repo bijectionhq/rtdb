@@ -542,7 +542,11 @@ impl Compiler<'_, '_> {
             let expression = self.rewrite_aggregates(&binding.expression, &mut bound, parameters, &mut aggregates)?;
             let mut required = BTreeSet::new();
             required_expr(&expression, parameters, &mut required);
-            if required.iter().any(|name| !name.starts_with("xt$aggregate$") && !groups.contains_key(name)) {
+            let ungrouped = || required.iter().filter(|name| !name.starts_with("xt$aggregate$") && !groups.contains_key(*name));
+            if ungrouped().any(|name| !bound.variables.contains_key(name)) {
+                return Err(error("xtql/invalid-expression", "Not all variables in expression are in scope"));
+            }
+            if ungrouped().next().is_some() {
                 return Err(error("xtql/invalid-expression", "Variables outside of aggregate expressions must be grouping columns"));
             }
             outputs.push(Binding { name: binding.name.clone(), expression });

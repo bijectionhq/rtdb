@@ -68,6 +68,8 @@ fn aggregate_outputs_may_only_reference_grouping_variables_outside_aggregates() 
     assert_eq!(error.message.as_deref(), Some("Variables outside of aggregate expressions must be grouping columns"));
     let error = compiled("(-> (rel [{:v 2}] [v]) (aggregate y))").unwrap_err();
     assert_eq!(error.message.as_deref(), Some("Not all variables in expression are in scope"));
+    let error = compiled("(-> (rel [{:v 2}] [v]) (aggregate {:s (+ y (sum v))}))").unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Not all variables in expression are in scope"));
     assert!(compiled("(-> (rel [{:c 1 :v 2}] [c v]) (aggregate c {:s (+ c (sum v))}))").is_ok());
 }
 
