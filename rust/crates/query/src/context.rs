@@ -132,12 +132,13 @@ impl QueryContext {
         Self::with_owner(catalog, memory, current_time, timezone, options, parent_cancellation, parent_cancellation)
     }
     /// Both cancellation sources end active pulls; cancelling a cursor leaves either parent unchanged.
+    /// The query holds a child of each, so its per-row checks never contend on a token every query shares.
     pub fn with_owner(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: impl Into<rtdb_types::Instant>, timezone: impl Into<String>, options: QueryOptions, parent_cancellation: &CancellationToken, owner_cancellation: &CancellationToken) -> Result<Arc<Self>> {
         if options.batch_rows == 0 || options.list_batch_rows == 0 || options.sort_memory_bytes == 0 {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.clone(), spill, execution_observer: None, tracer: None, trace_parent: None, read_basis: None }))
+        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, read_basis: None }))
     }
     /// Applies only to cursors opened from this context; existing cursors retain their original observer.
     pub fn with_observer(self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
