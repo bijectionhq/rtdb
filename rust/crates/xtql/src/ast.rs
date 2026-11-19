@@ -300,16 +300,23 @@ fn parse_temporal(&self, form: &Edn) -> Result<TemporalFilter> {
     if form.keyword() == Some("all-time") { return Ok(TemporalFilter::All); }
     let (op, args) = form_list(form, "xtql/malformed-temporal-filter")?;
     Ok(match (op, args) {
-        ("at", [at]) => TemporalFilter::At(self.parse_expr(at)?),
-        ("in", [from, to]) => TemporalFilter::In { from: self.optional_expr(from)?, to: self.optional_expr(to)? },
-        ("from", [from]) => TemporalFilter::In { from: self.optional_expr(from)?, to: None },
-        ("to", [to]) => TemporalFilter::In { from: None, to: self.optional_expr(to)? },
+        ("at", [at]) => TemporalFilter::At(self.temporal_time(at)?.unwrap_or_else(current_time)),
+        ("in", [from, to]) => TemporalFilter::In { from: self.temporal_time(from)?, to: self.temporal_time(to)? },
+        ("from", [from]) => TemporalFilter::In { from: self.temporal_time(from)?, to: None },
+        ("to", [to]) => TemporalFilter::In { from: None, to: self.temporal_time(to)? },
         _ => return Err(error("xtql/malformed-temporal-filter", "Malformed temporal filter")),
     })
 }
 
+/// A temporal filter bound; `:now` is the query's current time, as the reference scan reads it.
+fn temporal_time(&self, form: &Edn) -> Result<Option<Expr>> {
+    if form.keyword() == Some("now") { return Ok(Some(current_time())); }
+    self.optional_expr(form)
+}
+
 fn optional_expr(&self, form: &Edn) -> Result<Option<Expr>> { if matches!(form.kind, EdnKind::Nil) { Ok(None) } else { self.parse_expr(form).map(Some) } }
 }
+fn current_time() -> Expr { Expr::Call { function: "current-timestamp".into(), arguments: Vec::new() } }
 fn keyword<'a>(form: &'a Edn, code: &str) -> Result<&'a str> { form.keyword().ok_or_else(|| error(code, "Expected a keyword")) }
 fn check_options(form: &Edn, allowed: &[&str]) -> Result<()> {
     for (key, _) in form.map().unwrap_or_default() {

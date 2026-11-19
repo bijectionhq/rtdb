@@ -346,7 +346,8 @@ impl Compiler<'_, '_> {
             Tail::Limit(expr) | Tail::Offset(expr) => {
                 let expression = self.expr(expr, &mut bound, parameters)?;
                 if !matches!(&expression, PExpr::Literal(Value::I64(value)) if *value >= 0) && !matches!(&expression, PExpr::Parameter { .. }) {
-                    return Err(error(if matches!(tail, Tail::Limit(_)) { "xtql/invalid-limit" } else { "xtql/invalid-offset" }, "Limit and offset require a non-negative integer literal or parameter"));
+                    return Err(if matches!(tail, Tail::Limit(_)) { error("xtql/invalid-limit", "Limit must be a non-negative integer literal or parameter") }
+                        else { error("xtql/invalid-offset", "Offset must be a non-negative integer literal or parameter") });
                 }
                 bound.relation = Arc::new(if matches!(tail, Tail::Limit(_)) { bound.relation.limit(None, Some(expression))? } else { bound.relation.limit(Some(expression), None)? });
                 Ok(bound)

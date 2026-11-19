@@ -1543,3 +1543,15 @@ async fn a_table_of_wide_heterogeneous_documents_stays_queryable_within_its_budg
     assert_eq!(rows(session.query_sql("SELECT * FROM docs FOR VALID_TIME ALL", vec![]).await.unwrap()).await.len(), 60);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn now_in_an_xtql_temporal_filter_is_the_query_time() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![put(&node, 1, 7)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let current = "(from :docs {:bind [value] :for-valid-time (in :now nil)})";
+    assert_eq!(rows(session.query_xtql(current, vec![]).await.unwrap()).await, [vec![Value::I64(7)]]);
+    let at_now = "(from :docs {:bind [value] :for-valid-time (at :now)})";
+    assert_eq!(rows(session.query_xtql(at_now, vec![]).await.unwrap()).await, [vec![Value::I64(7)]]);
+    stop(&node, driver).await;
+}

@@ -70,3 +70,13 @@ fn aggregate_outputs_may_only_reference_grouping_variables_outside_aggregates() 
     assert_eq!(error.message.as_deref(), Some("Not all variables in expression are in scope"));
     assert!(compiled("(-> (rel [{:c 1 :v 2}] [c v]) (aggregate c {:s (+ c (sum v))}))").is_ok());
 }
+
+#[test]
+fn now_in_a_temporal_filter_is_the_current_time_and_limits_take_literals() {
+    let compiled = |source: &str| compile(source, &EmptyCatalog, &CompileOptions::default());
+    assert!(compiled("(-> (rel [{:x 1}] [x]) (limit 1))").is_ok());
+    let error = compiled("(-> (rel [{:x 1}] [x]) (limit (+ 1 1)))").unwrap_err();
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtql/invalid-limit", Some("Limit must be a non-negative integer literal or parameter")));
+    let error = compiled("(-> (rel [{:x 1}] [x]) (offset x))").unwrap_err();
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtql/invalid-offset", Some("Offset must be a non-negative integer literal or parameter")));
+}
