@@ -716,3 +716,23 @@ async fn an_inverted_temporal_range_matches_nothing() {
         assert_eq!(collect(scan(&context, &["v"], valid_time, TemporalFilter::All, None), Arc::clone(&context)).await.unwrap(), Vec::<Vec<Value>>::new());
     }
 }
+
+#[tokio::test]
+async fn a_nonmatching_page_overlapping_no_emitted_version_in_valid_time_is_pruned() {
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let budget = MemoryBudget::new(1 << 27); let store = Arc::new(MemoryStore::default());
+    for (index, (system, v, from, to)) in [(100, 1, 100, 200), (200, 2, 300, 400), (300, 1, 500, 700), (400, 3, 600, 800)].into_iter().enumerate() {
+        let mut transaction = tx(&state, &budget, index as i64, system);
+        transaction.put(table(), document(1, Value::I64(v)), Interval::from_micros(from, to).unwrap()).unwrap();
+        state.apply(&transaction.stage().unwrap()).unwrap();
+        persist_with_blooms(&state, &store, true).await;
+    }
+    let context = query_context(state.value().snapshot(), store, false);
+    let source = scan(&context, &["v", "_valid_from", "_valid_to"], TemporalFilter::All, at(1_000), None);
+    let v = source.schema().fields()[0].clone();
+    let filter = Arc::new(source.filter(Expr::binary(BinaryOp::Eq, v.expression(), Expr::Literal(Value::I64(1)))).unwrap());
+    let (mut rows, (_, pruned, _)) = collect_with_scan_counts(filter, context).await;
+    rows.sort_by_key(|row| match row[1] { Value::Timestamp { value, .. } => value, _ => 0 });
+    assert_eq!(rows, [vec![Value::I64(1), timestamp(100), timestamp(200)], vec![Value::I64(1), timestamp(500), timestamp(600)]]);
+    assert_eq!(pruned, 1);
+}

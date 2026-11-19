@@ -53,6 +53,12 @@ impl BloomFilter {
         Ok(self.contains_hashes(first, second))
     }
 
+    /// Whether a byte-backed value's persisted-column hashes are all present.
+    pub fn contains_value(&self, value: &Value) -> Result<bool> {
+        let (first, second) = byte_hashes(value)?;
+        Ok(self.contains_hashes(first, second))
+    }
+
     pub fn intersects(&self, other: &Self) -> bool { !self.bitmap.is_disjoint(&other.bitmap) }
     pub fn cardinality(&self) -> u64 { self.bitmap.len() }
 }

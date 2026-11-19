@@ -202,6 +202,7 @@ impl PartitionScan {
             self.initialized = true;
             return Ok(());
         }
+        let page_test = crate::page_metadata::PageTest::for_scan(&self.scan, &self.execution).await?;
         let table = &self.scan.table.name.table;
         let catalog = self.snapshot.trie_catalog();
         let current_tries = || catalog.iter_tries(table).filter(|trie| trie.state == TrieState::Live);
@@ -329,7 +330,7 @@ impl PartitionScan {
                     },
                     MetadataNode::Leaf { data_page_index, columns } => pages.push(Page { lower, upper, priority: live_segment_count + index,
                         content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
-                            && may_satisfy_not_null(&self.scan, columns),
+                            && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?,
                         source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
                             recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?,
                 }

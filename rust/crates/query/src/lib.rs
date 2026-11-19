@@ -16,6 +16,7 @@ mod pushdown;
 mod sort;
 mod window;
 mod scan;
+mod page_metadata;
 mod scan_tasks;
 mod spill;
 mod patch;
