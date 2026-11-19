@@ -1,3 +1,4 @@
+mod artefact;
 mod driver;
 mod failure;
 mod gc;
@@ -5,6 +6,7 @@ mod job;
 mod merge;
 mod publication;
 
+pub use artefact::{ArtefactBuilder, ArtefactDefinition, ArtefactDriver, ArtefactHandle, ArtefactJob, ArtefactPublisher, available_artefact_jobs};
 pub use driver::{CompactionDriver, CompactionHandle, CompactionExecutor, CycleDriver, CycleHandle, CycleWorker};
 pub use failure::{CompactionFailure, CompactionObserver, StderrCompactionObserver};
 pub use gc::{BlockCollector, CollectionObserver, GarbageConfig, TrieCollector, block_is_garbage};
