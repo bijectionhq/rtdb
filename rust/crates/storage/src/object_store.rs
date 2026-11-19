@@ -103,6 +103,8 @@ pub trait ObjectStore: Send + Sync {
     /// Returns a lexicographically ordered snapshot of object names under a directory.
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
+    /// Drops any copy of the object held on this node, leaving the remote object untouched.
+    async fn forget(&self, _key: &ObjectKey) -> Result<()> { Ok(()) }
 
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
         self.put(destination, self.get(source).await?).await

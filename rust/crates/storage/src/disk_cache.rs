@@ -8,12 +8,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 
-struct CachedFile { path: PathBuf, size: u64 }
+/// The path moves when a leased file is invalidated; readers hold the lock while they open it.
+struct CachedFile { path: parking_lot::RwLock<PathBuf>, size: u64 }
 struct Entry {
     file: OnceLock<CachedFile>,
     loading: Arc<tokio::sync::Mutex<()>>,
     accessed: AtomicU64,
+    /// Set once the entry has left the cache, so its file goes with the last lease.
+    retired: std::sync::atomic::AtomicBool,
     _reservation: Arc<MemoryReservation>,
+}
+impl Drop for Entry {
+    fn drop(&mut self) {
+        if self.retired.load(Ordering::Acquire) { if let Some(file) = self.file.get() { let _ = fs::remove_file(&*file.path.read()); } }
+    }
 }
 struct State { entries: BTreeMap<ObjectKey, Arc<Entry>>, clock: u64 }
 
@@ -31,7 +39,8 @@ pub struct DiskCacheStats { pub maximum_bytes: u64, pub pinned_bytes: u64, pub e
 
 pub struct DiskLease { cache: Arc<DiskCache>, entry: Arc<Entry> }
 impl DiskLease {
-    pub fn path(&self) -> &Path { &self.entry.file.get().expect("published disk lease").path }
+    pub fn path(&self) -> PathBuf { self.entry.file.get().expect("published disk lease").path.read().clone() }
+    fn open(&self) -> std::io::Result<File> { File::open(&*self.entry.file.get().expect("published disk lease").path.read()) }
     pub fn size(&self) -> u64 { self.entry.file.get().expect("published disk lease").size }
 }
 impl Drop for DiskLease { fn drop(&mut self) { self.cache.trim(Some(&self.entry)); } }
@@ -99,7 +108,7 @@ impl DiskCache {
             let accessed = metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH).max(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH))
                 .duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_micros().min(u64::MAX as u128) as u64;
             entry.accessed.store(accessed, Ordering::Relaxed);
-            let _ = entry.file.set(CachedFile { path, size: metadata.len() });
+            let _ = entry.file.set(CachedFile { path: parking_lot::RwLock::new(path), size: metadata.len() });
             let mut state = self.state.lock();
             state.clock = state.clock.max(accessed);
             state.entries.insert(key, Arc::new(entry));
@@ -111,7 +120,7 @@ impl DiskCache {
     }
     fn new_entry(&self, key: &ObjectKey) -> Result<Entry> {
         let bytes = key.as_str().len().checked_mul(3).and_then(|bytes| bytes.checked_add(self.root.as_os_str().len())).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| Error::Task("Disk cache metadata allocation exceeds range".into()))?;
-        Ok(Entry { file: OnceLock::new(), loading: Arc::new(tokio::sync::Mutex::new(())), accessed: AtomicU64::new(0), _reservation: self.reserve(bytes)? })
+        Ok(Entry { file: OnceLock::new(), loading: Arc::new(tokio::sync::Mutex::new(())), accessed: AtomicU64::new(0), retired: Default::default(), _reservation: self.reserve(bytes)? })
     }
     fn entry(&self, key: &ObjectKey) -> Result<Arc<Entry>> {
         let mut state = self.state.lock();
@@ -140,10 +149,11 @@ impl DiskCache {
             let Some(key) = candidate else { break; };
             let Some(entry) = state.entries.remove(&key) else { break; };
             if let Some(file) = entry.file.get() {
-                match fs::remove_file(&file.path) {
+                let path = file.path.read().clone();
+                match fs::remove_file(&path) {
                     Ok(()) => bytes = bytes.saturating_sub(file.size),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => bytes = bytes.saturating_sub(file.size),
-                    Err(error) => { eprintln!("RTDB disk cache eviction failed at {}: {error}", file.path.display()); state.entries.insert(key, entry); break; }
+                    Err(error) => { eprintln!("RTDB disk cache eviction failed at {}: {error}", path.display()); state.entries.insert(key, entry); break; }
                 }
             }
         }
@@ -173,11 +183,30 @@ impl DiskCache {
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(cache_key.to_string()))?;
             fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
             temporary.persist(&path).map_err(|error| Error::io(&path, error.error))?;
-            lease.entry.file.set(CachedFile { path, size: object.size }).map_err(|_| Error::Task("Disk cache load published twice".into()))?;
+            lease.entry.file.set(CachedFile { path: parking_lot::RwLock::new(path), size: object.size }).map_err(|_| Error::Task("Disk cache load published twice".into()))?;
         }
         drop(guard);
         self.trim(None);
         Ok(lease)
+    }
+    /// Drops the cached copy of a key, so the next read goes to the remote store.
+    /// An idle file is removed now. A leased one moves into the staging directory, where its readers keep it until the last lease ends and a restart clears it.
+    pub fn invalidate(&self, cache_key: &ObjectKey) -> Result<()> {
+        let removed = self.state.lock().entries.remove(cache_key);
+        let Some(entry) = removed else { return Ok(()) };
+        if let Some(file) = entry.file.get() {
+            let staging = self.root.join(".tmp");
+            let retired = tempfile::Builder::new().prefix("retired-").tempfile_in(&staging).map_err(|error| Error::io(&staging, error))?
+                .into_temp_path().keep().map_err(|error| Error::io(&staging, error.error))?;
+            let mut path = file.path.write();
+            match fs::rename(&*path, &retired) {
+                Ok(()) => *path = retired,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => { let _ = fs::remove_file(&retired); },
+                Err(error) => return Err(Error::io(&*path, error)),
+            }
+        }
+        entry.retired.store(true, Ordering::Release);
+        Ok(())
     }
     pub fn scope(self: &Arc<Self>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
         self.scope_in(namespace, remote, Arc::clone(&self.operations))
@@ -222,7 +251,7 @@ impl DiskCache {
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
             fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
             temporary.persist(&path).map_err(|error| Error::io(&path, error.error))?;
-            lease.entry.file.set(CachedFile { path, size }).map_err(|_| Error::Task("Disk cache upload published twice".into()))?;
+            lease.entry.file.set(CachedFile { path: parking_lot::RwLock::new(path), size }).map_err(|_| Error::Task("Disk cache upload published twice".into()))?;
             Ok(())
         }).await
     }
@@ -270,7 +299,7 @@ impl ObjectStore for DiskCachedStore {
         let operation = self.cache.begin_operation()?.and(scope);
         IoRegion::run_admitted(operation, move || {
             let lease = lease;
-            let mut file = File::open(lease.path()).map_err(|error| Error::io(lease.path(), error))?;
+            let mut file = lease.open().map_err(|error| Error::io(lease.path(), error))?;
             file.seek(SeekFrom::Start(range.start)).map_err(|error| Error::io(lease.path(), error))?;
             let mut bytes = vec![0; reservation.length()];
             file.read_exact(&mut bytes).map_err(|error| Error::io(lease.path(), error))?;
@@ -285,6 +314,12 @@ impl ObjectStore for DiskCachedStore {
         self.cache.put_file_admitted(&self.key(key)?, source, Some(scope)).await
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.cache.cancellation.run_until_cancelled(self.remote.list(directory)).await.ok_or_else(cache_closed)? }
-    async fn delete(&self, key: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.delete(key).await }
+    async fn delete(&self, key: &ObjectKey) -> Result<()> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.remote.delete(key).await?;
+        self.cache.invalidate(&self.key(key)?)
+    }
+    async fn forget(&self, key: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; self.cache.invalidate(&self.key(key)?) }
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.copy(source, destination).await }
 }

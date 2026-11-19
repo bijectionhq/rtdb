@@ -125,6 +125,12 @@ impl BufferPool {
     pub fn retained_bytes(&self) -> usize { self.budget.retained.load(Ordering::Acquire) }
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { &self.store }
 
+    /// Drops this pool's entry and any copy the store holds on this node, even while leased; a lease keeps its bytes, and the next read goes to the store.
+    pub async fn invalidate(&self, key: &ObjectKey) -> Result<()> {
+        remove_entry(&mut self.entries.lock(), key);
+        self.store.forget(key).await
+    }
+
     /// An evicted object remains charged while a caller retains any slice of its lease.
     pub fn evict(&self, key: &ObjectKey) -> bool {
         let mut entries = self.entries.lock();

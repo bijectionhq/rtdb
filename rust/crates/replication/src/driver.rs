@@ -816,7 +816,10 @@ impl ReplicationDriver {
                 ReplicaBody::TriesDeleted(message) => {
                     let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
                     let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
+                    let cached = cached_objects(&self.partition.value(), &table, &keys);
                     self.partition.delete_tries(&BTreeMap::from([(table, keys)]));
+                    // Every node holds its own cached copies, and the leader's delete reached only the remote store.
+                    for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
                     self.complete_control(&record);
                 }
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("Unresolved oversized body reached apply")),
@@ -1095,6 +1098,17 @@ fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::S
         }
     }
     rejected
+}
+
+/// The objects of collected tries this node may hold copies of: data, meta, and the artefacts their entries record.
+fn cached_objects(value: &rtdb_index::PartitionValue, table: &TableRef, keys: &BTreeSet<TrieKey>) -> Vec<rtdb_storage::ObjectKey> {
+    let Some(entry) = value.table_catalog().entry(table) else { return Vec::new() };
+    let tries = value.trie_catalog();
+    keys.iter().flat_map(|key| {
+        let artefacts = tries.iter_tries(table).filter(|trie| &trie.key == key).flat_map(|trie| trie.artefacts.iter())
+            .filter_map(|record| entry.slug.artefact_key(key, record.kind(), record.definition_id(), record.definition_version()).ok());
+        [entry.slug.data_key(key), entry.slug.metadata_key(key)].into_iter().chain(artefacts).collect::<Vec<_>>()
+    }).filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect()
 }
 
 fn artefact_entries(message: &proto::ArtefactsAdded) -> Vec<(TrieKey, proto::ArtefactRecord)> {

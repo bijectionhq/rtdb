@@ -363,6 +363,34 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
 }
 
 #[tokio::test]
+async fn applying_a_deletion_drops_this_nodes_cached_copies_of_the_collected_files() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    let state = &fixture.driver.partition;
+    let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
+    let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&fixture.memory)).unwrap();
+    let table = TableRef::new("public", "docs");
+    write.put(table.clone(), BTreeMap::from([("_id".into(), Value::I64(1))]), Interval::ALL).unwrap();
+    state.apply(&write.stage().unwrap()).unwrap();
+    fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key })), None).unwrap();
+    fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
+    let pending = fixture.driver.pending_block.as_ref().unwrap();
+    let produced = fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let mut uploaded = match upload(0, 0) { ReplicaBody::BlockUploaded(message) => message, _ => unreachable!() };
+    uploaded.tries = produced.tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect();
+    fixture.driver.consume(raw(1, 1, 1, ReplicaBody::BlockUploaded(uploaded))).await.unwrap();
+    let slug = fixture.driver.partition.value().table_catalog().entry(&table).unwrap().slug.clone();
+    let collected: rtdb_format::keys::TrieKey = "l01-rc-b07".parse().unwrap();
+    let data = rtdb_storage::ObjectKey::new(slug.data_key(&collected)).unwrap();
+    fixture.store.put(&data, Bytes::from_static(b"collected")).await.unwrap();
+    assert_eq!(fixture.driver.resolve.storage.get(&data).await.unwrap().as_slice(), b"collected");
+    fixture.store.delete(&data).await.unwrap();
+    assert!(fixture.driver.resolve.storage.get(&data).await.is_ok(), "until the deletion is applied, the cached copy is served");
+    let deleted = ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some(table.schema_and_table()), trie_keys: vec![collected.to_string()] });
+    fixture.driver.consume(raw(2, 1, 2, deleted)).await.unwrap();
+    assert!(fixture.driver.resolve.storage.get(&data).await.is_err());
+}
+
+#[tokio::test]
 async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persisted_boundary() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
     fixture.driver.consume(raw(0, 1, 0, resolved(7, 3))).await.unwrap();
