@@ -30,7 +30,11 @@ ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|working dir should b
                          r'error occurred while loading credentials|POST https://oauth\d*\.googleapis\.com/token|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
 JVM_INTERNAL = re.compile(r"\(clojure\.core/deref !spills\)")
 # Vars whose assertions hold only through a with-redefs of a JVM implementation var, which the native engine never reads.
-JVM_INTERNAL_VARS = {"xtdb.pgwire-test/canned-response-test": "redefines xtdb.pgwire/canned-responses"}
+JVM_INTERNAL_VARS = {
+    "xtdb.pgwire-test/canned-response-test": "redefines xtdb.pgwire/canned-responses",
+    "xtdb.pgwire-test/close-drains-active-extended-queries-before-stopping-test": "counts its latch down from a redefined xtdb.pgwire/parse-sql",
+    "xtdb.pgwire-test/psql-interactive-test": "redefines xtdb.pgwire/cmd-exec-query; later reads see the native results of those statements",
+}
 # Gauges of the JVM runtime and of Arrow Java's child-allocator tree; a metric assertion missing only these is jvm-internal.
 JVM_ONLY_METRICS = {"jvm.memory.used", "xtdb.allocator.memory.allocated"}
 MISSING_METRICS = re.compile(r'actual: \(not \(empty\? #\{([^}]*)\}\)\)')
