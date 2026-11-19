@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{database::proto::DatabaseConfig, keys::TrieKey, log::proto::TriesAdded};
 use rtdb_index::PartitionState;
-use rtdb_maintenance::{BlockCollector, CollectionObserver, CompactionDriver, CompactionHandle, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
+use rtdb_maintenance::{BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionJob, CompactionHandle, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
@@ -122,7 +122,7 @@ impl DatabaseFactory {
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
             let (compactor, compaction) = if read_only || self.options.compaction_threads == 0 { (None, None) } else {
-                let executor = Arc::new(SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?);
+                let executor = Arc::new(TimedCompaction { executor: SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?, observer: self.execution_observer.clone() });
                 let publisher = Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() });
                 let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
                 (Some(driver), Some(handle))
@@ -181,6 +181,18 @@ impl DatabaseDriver {
 }
 
 struct PublishCompaction { replication: ReplicationHandle, cancellation: CancellationToken }
+/// Times each completed compaction job into `compactor.job.timer`; the reference stops its job timer only once the job returns.
+struct TimedCompaction { executor: SegmentCompactor, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>> }
+#[async_trait]
+impl CompactionExecutor for TimedCompaction {
+    async fn execute(&self, job: &CompactionJob, cancellation: &CancellationToken) -> Result<TriesAdded> {
+        let started = std::time::Instant::now();
+        let added = self.executor.execute(job, cancellation).await?;
+        if let Some(observer) = &self.observer { observer.record_duration(rtdb_plan::ExecutionTimer::CompactorJob, started.elapsed()); }
+        Ok(added)
+    }
+}
+
 #[async_trait]
 impl CompactionPublisher for PublishCompaction {
     async fn publish(&self, notification: TriesAdded) -> Result<SourcePosition> { self.replication.publish_compaction(notification, &self.cancellation).await }
