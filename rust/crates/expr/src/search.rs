@@ -12,7 +12,11 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
         context.reserve(tokens.iter().map(|token| token.len() + 32).sum::<usize>().saturating_add(256))?;
         Ok(match name {
             "match" => Value::Bool(query.matches(&tokens)),
-            _ => Value::F64(rtdb_text::bm25(&query, &tokens, None)),
+            _ => {
+                let Value::Utf8(text) = &args[1] else { return Ok(Value::Null) };
+                let corpus = context.corpora.and_then(|corpora| corpora.corpus(text));
+                Value::F64(rtdb_text::bm25(&query, &tokens, corpus.as_ref()))
+            }
         })
     })())
 }

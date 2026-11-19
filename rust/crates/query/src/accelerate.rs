@@ -28,6 +28,32 @@ pub struct ScanRequest<'a> {
     pub current_time: rtdb_types::Instant,
     pub cancellation: &'a CancellationToken,
     pub constants: &'a dyn ConstantEvaluator,
+    /// Where an accelerator records the corpus statistics `search_score` ranks against in this query.
+    pub corpora: &'a CorpusRegistry,
+}
+
+/// Something that can count, for any terms, the documents and tokens of the corpus a score is relative to.
+pub trait CorpusSource: Send + Sync {
+    fn corpus(&self, query: &rtdb_text::Query) -> Result<rtdb_text::Corpus>;
+}
+
+/// The corpus sources the scans of one query opened; a score sums them all, whatever column or table each came from.
+#[derive(Default)]
+pub struct CorpusRegistry(parking_lot::Mutex<Vec<Arc<dyn CorpusSource>>>);
+
+impl CorpusRegistry {
+    pub fn register(&self, source: Arc<dyn CorpusSource>) { self.0.lock().push(source); }
+}
+
+impl rtdb_expr::CorpusLookup for CorpusRegistry {
+    fn corpus(&self, query: &str) -> Option<rtdb_text::Corpus> {
+        let sources = self.0.lock().clone();
+        if sources.is_empty() { return None; }
+        let query = rtdb_text::Query::parse(query);
+        let mut total = rtdb_text::Corpus::default();
+        for source in sources { total.add(&source.corpus(&query).ok()?); }
+        (total.documents > 0).then_some(total)
+    }
 }
 
 /// Narrows a scan before it opens.

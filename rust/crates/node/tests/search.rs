@@ -209,3 +209,30 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn search_score_ranks_rarer_terms_above_common_ones_once_the_corpus_is_indexed() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let mut operations = Vec::new();
+    for id in 0..40 { operations.push(sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'common words here'}}"))); }
+    operations.push(sql("INSERT INTO docs RECORDS {_id: 100, body: 'common rare words'}"));
+    operations.push(sql("INSERT INTO docs RECORDS {_id: 101, body: 'common common words'}"));
+    assert!(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().committed());
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let ranked = rows(session.query_sql("SELECT _id, SEARCH_SCORE(body, 'common rare') AS score FROM docs WHERE MATCH(body, 'common') ORDER BY score DESC, _id LIMIT 3", vec![]).await.unwrap()).await;
+    assert_eq!(ranked.iter().map(|row| row[0].clone()).collect::<Vec<_>>(), [Value::I64(100), Value::I64(101), Value::I64(0)], "{ranked:?}");
+    let scores: Vec<f64> = ranked.iter().map(|row| match row[1] { Value::F64(score) => score, ref other => panic!("{other:?}") }).collect();
+    assert!(scores[0] > 2.0 * scores[1], "the rare term carries more weight than a repeated common one: {scores:?}");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

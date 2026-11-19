@@ -74,6 +74,8 @@ impl ScanAccelerator for SearchAccelerator {
                     match request.storage.get(&key).await {
                         Ok(lease) => match SearchFile::open(bytes::Bytes::copy_from_slice(lease.as_slice()), &definition.columns) {
                             Ok(file) => {
+                                let file = std::sync::Arc::new(file);
+                                if trie.key.recency().is_none() { request.corpora.register(std::sync::Arc::new(FileCorpus { file: std::sync::Arc::clone(&file), column: column.clone() })); }
                                 for doc in file.matches(&column, &query)? {
                                     if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, bounds) { candidates.insert(Iid(doc.iid)); }
                                 }
@@ -105,6 +107,13 @@ impl ScanAccelerator for SearchAccelerator {
         candidates.extend(self.live_candidates(request, &column, &query)?);
         Ok((candidates.len() <= self.max_candidates).then_some(candidates))
     }
+}
+
+/// A current-side search file a scan opened, counting its column's corpus for whatever terms a score asks about.
+struct FileCorpus { file: std::sync::Arc<SearchFile>, column: String }
+
+impl rtdb_query::CorpusSource for FileCorpus {
+    fn corpus(&self, query: &Query) -> Result<rtdb_text::Corpus> { self.file.corpus(&self.column, query) }
 }
 
 impl SearchAccelerator {
