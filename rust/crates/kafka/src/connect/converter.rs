@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rtdb_types::{DecimalValue, Result, TimeUnit, Value};
+use rtdb_types::{DecimalValue, Result, StructFields, TimeUnit, Value};
 use super::json_value::JsonValue as Json;
 use super::{ConnectData, ConnectField, ConnectSchema, ConversionContext, Converter, PluginSpec, SchemaKind, error};
 mod charset;
@@ -232,7 +232,7 @@ fn registry_value(schema: &Arc<ConnectSchema>, json: Option<&Json>, depth: usize
             }
             let selected = selected.ok_or_else(|| error("conversion-error", "No Connect union member matches the JSON value"))?;
             budget.claim(fields.len().saturating_mul(4096))?;
-            let mut values = fields.iter().map(|field| (field.name.clone(), Value::Null)).collect::<BTreeMap<_, _>>();
+            let mut values = fields.iter().map(|field| (field.name.clone(), Value::Null)).collect::<StructFields<_>>();
             values.insert(selected.name.clone(), registry_value(&selected.schema, Some(json), depth + 1, budget)?); Ok(Value::Struct(values))
         }
         SchemaKind::Struct(fields) => {

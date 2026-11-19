@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeSet;
 use rtdb_columnar::MemoryBudget;
 use rtdb_pg_source::{ConfirmationState, Decoder, Lsn, ReconnectPolicy, ResumeToken, RowKind, read_text};
@@ -89,7 +90,7 @@ fn json_retains_large_integers_and_decodes_json_ld_values() {
     assert_eq!(decimal.precision, 32);
     assert_eq!(read_text(114, r#"{"@type":"xt:uuid","@value":"550e8400-e29b-41d4-a716-446655440000"}"#).unwrap(), Value::Uuid(*uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap().as_bytes()));
     assert_eq!(read_text(114, r#"{"@type":"xt:set","@value":[1,1,2]}"#).unwrap(), Value::Set(vec![Value::I64(1), Value::I64(2)]));
-    assert_eq!(read_text(16384, r#"["^ ","~:xt/id",1,"~:Some/Field-Name",2]"#).unwrap(), Value::Struct(std::collections::BTreeMap::from([("_id".into(), Value::I64(1)), ("some$field_name".into(), Value::I64(2))])));
+    assert_eq!(read_text(16384, r#"["^ ","~:xt/id",1,"~:Some/Field-Name",2]"#).unwrap(), Value::Struct(StructFields::from([("_id".into(), Value::I64(1)), ("some$field_name".into(), Value::I64(2))])));
 }
 
 #[test]

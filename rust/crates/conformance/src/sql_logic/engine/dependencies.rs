@@ -188,6 +188,7 @@ fn occurrence_error() -> Anomaly { gap("Typed dependency restoration lost its sc
 
 #[cfg(test)]
 mod tests {
+    use rtdb_types::StructFields;
     use super::*;
     use std::{cell::RefCell, collections::{BTreeMap, BTreeSet, VecDeque}};
     use rtdb_plan::{AggregateExpr, AggregateFunction, AggregateName, ApplyKind, BinaryOp, CastOption, CastTarget,
@@ -240,7 +241,7 @@ mod tests {
     }
     fn table(name: &str) -> TableBinding {
         TableBinding { name: QualifiedTable { database: "db".into(), table: TableRef::new("public", name) }, oid: Some(99),
-            columns: BTreeMap::from([("x".into(), L::Scalar(S::I64)), ("_id".into(), L::Scalar(S::Uuid))]) }
+            columns: StructFields::from([("x".into(), L::Scalar(S::I64)), ("_id".into(), L::Scalar(S::Uuid))]) }
     }
     fn scan(name: &str, id: u32) -> Arc<Relation> {
         let mut binding = table(name);
@@ -317,7 +318,7 @@ mod tests {
         let patch_fields = vec![field(0, "iid", L::Scalar(S::FixedSizeBinary(16))),
             field(1, "from", L::Scalar(S::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })),
             field(2, "to", L::Scalar(S::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })),
-            field(3, "doc", L::Struct(BTreeMap::new()))];
+            field(3, "doc", L::Struct(StructFields::new()))];
         let patch = Arc::new(Relation::empty(Schema::new(patch_fields.clone()).unwrap()));
         let mut patch_output = patch_fields;
         patch_output[3].data_type = patch_output[3].data_type.clone().maybe();
@@ -599,7 +600,7 @@ mod tests {
         }) };
         let restored = assert_projection(&values(cast.clone(), 0));
         assert_eq!(first_expression(&restored), &cast);
-        let physical = V::Struct(BTreeMap::from([("z".into(), V::Set(vec![V::I64(2), V::I64(1), V::I64(2)])),
+        let physical = V::Struct(StructFields::from([("z".into(), V::Set(vec![V::I64(2), V::I64(1), V::I64(2)])),
             ("a".into(), V::Map { entries: vec![(V::Utf8("z".into()), V::I64(1)), (V::Utf8("z".into()), V::I64(2))], sorted: true })]));
         let restored = assert_projection(&recipe_form(raw_literal(physical), 0));
         assert_eq!(serde_json::to_string(&recipe(&restored).pattern).unwrap(), r#"{"Literal":{"Struct":{"a":{"Map":{"entries":[[{"Utf8":"z"},{"I64":1}],[{"Utf8":"z"},{"I64":2}]],"sorted":true}},"z":{"Set":[{"I64":2},{"I64":1},{"I64":2}]}}}}"#);
@@ -710,7 +711,7 @@ mod tests {
             (V::List(vec![V::I64(1)]), r#"{"List":[{"I64":1}]}"#), (V::Set(vec![V::Null, V::Null]), r#"{"Set":["Null","Null"]}"#),
             (V::Map { entries: vec![(V::Null, V::Bool(true)), (V::Null, V::Bool(false))], sorted: true }, r#"{"Map":{"entries":[["Null",{"Bool":true}],["Null",{"Bool":false}]],"sorted":true}}"#),
             (V::FixedSizeList(vec![V::Bool(false)]), r#"{"FixedSizeList":[{"Bool":false}]}"#), (V::TimestampTzRange { lower: -1, upper: 2 }, r#"{"TimestampTzRange":{"lower":-1,"upper":2}}"#),
-            (V::Struct(BTreeMap::from([("z".into(), V::Null), ("a".into(), V::Bool(true))])), r#"{"Struct":{"a":{"Bool":true},"z":"Null"}}"#),
+            (V::Struct(StructFields::from([("z".into(), V::Null), ("a".into(), V::Bool(true))])), r#"{"Struct":{"a":{"Bool":true},"z":"Null"}}"#),
         ];
         assert_eq!(physical.len(), 41);
         for (value, expected) in physical { assert_form_projection(raw_literal(value), &format!(r#"{{"Literal":{expected}}}"#)); }

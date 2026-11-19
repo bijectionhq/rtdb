@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -57,7 +58,7 @@ impl Snapshot {
     pub fn schema_allocation_bound(&self, database: &str) -> Result<usize> {
         let overflow = || Anomaly::incorrect("rtdb.index/schema-size", "Schema allocation bound exceeds addressable memory");
         let mut bytes = 4096usize;
-        let mut include = |table: &TableRef, types: &BTreeMap<String, LogicalType>| -> Result<()> {
+        let mut include = |table: &TableRef, types: &StructFields<LogicalType>| -> Result<()> {
             bytes = bytes.checked_add(database.len()).and_then(|n| n.checked_add(table.schema.len())).and_then(|n| n.checked_add(table.table.len())).and_then(|n| n.checked_add(1024)).ok_or_else(overflow)?;
             for (name, ty) in types { let retained = ty.retained_bytes()?; bytes = bytes.checked_add(name.len()).and_then(|n| n.checked_add(512)).and_then(|n| n.checked_add(retained)).ok_or_else(overflow)?; }
             Ok(())
@@ -93,8 +94,8 @@ impl Snapshot {
             && self.iter_segments(table).all(|segment| segment.has_canonical_entity_iids())
     }
 
-    pub fn column_types(&self, table: &TableRef) -> BTreeMap<String, LogicalType> { self.column_types_for(table, self.column_names(table)) }
-    pub fn column_types_for(&self, table: &TableRef, columns: impl IntoIterator<Item = String>) -> BTreeMap<String, LogicalType> {
+    pub fn column_types(&self, table: &TableRef) -> StructFields<LogicalType> { self.column_types_for(table, self.column_names(table)) }
+    pub fn column_types_for(&self, table: &TableRef, columns: impl IntoIterator<Item = String>) -> StructFields<LogicalType> {
         let sources: Vec<_> = self.durable.tables().get(table).into_iter().chain(self.layered.get(table).into_iter().flatten()).map(|segment| segment.column_types()).collect();
         let absent: Vec<_> = sources.iter().map(|types| absent_type(types)).collect();
         columns.into_iter().map(|name| {

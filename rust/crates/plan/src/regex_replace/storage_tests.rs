@@ -1,6 +1,6 @@
+use rtdb_types::StructFields;
 use super::*;
 use rtdb_types::{CalendarDate, CivilDate, DateUnit, DecimalValue, Keyword, TimeUnit};
-use std::collections::BTreeMap;
 
 fn literal(value: &Value) -> RegexForm { let mut builder = RegexFormBuilder::new_untracked(); builder.literal(value).unwrap(); builder.finish().unwrap() }
 
@@ -103,7 +103,7 @@ fn struct_last_value_and_first_key_backing_survive_sorted_completion_with_charge
     builder.field("a").unwrap(); builder.value_leaf(&Value::Bool(true)).unwrap();
     builder.end().unwrap(); builder.end().unwrap();
     let value = builder.finish().unwrap();
-    let expected = literal(&Value::Struct(BTreeMap::from([("a".into(), Value::Bool(true)), ("x".into(), Value::I64(7))])));
+    let expected = literal(&Value::Struct(StructFields::from([("a".into(), Value::Bool(true)), ("x".into(), Value::I64(7))])));
     assert_eq!(value, expected);
     assert_eq!(value.work_bound().unwrap(), expected.work_bound().unwrap());
     assert!(value.retained_bytes().unwrap() > expected.retained_bytes().unwrap());
@@ -138,7 +138,7 @@ fn physical_values() -> Vec<Value> {
         Value::Keyword(Keyword::from_name(":x")), Value::Uuid([17;16]), Value::Uri("unvalidated:%%".into()), Value::Transit(vec![0,128,255]),
         Value::Oid(1), Value::RegClass(2), Value::RegProc(3), Value::List(vec![Value::I64(1)]), Value::Set(vec![Value::Null,Value::Null]),
         Value::Map { entries: vec![(Value::I64(1),Value::Bool(true))], sorted: false }, Value::FixedSizeList(vec![Value::Bool(false)]),
-        Value::TimestampTzRange { lower: -1, upper: 2 }, Value::Struct(BTreeMap::from([("a".into(), Value::I64(1))]))]
+        Value::TimestampTzRange { lower: -1, upper: 2 }, Value::Struct(StructFields::from([("a".into(), Value::I64(1))]))]
 }
 struct LegacyLiteral<'a>(&'a Value);
 impl fmt::Debug for LegacyLiteral<'_> { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_tuple("Literal").field(self.0).finish() } }
@@ -204,7 +204,7 @@ fn deep_duplicate_struct_loser_drops_payloads_iteratively_before_flat_publicatio
     builder.end().unwrap(); builder.end().unwrap();
     let value = builder.finish().unwrap();
     assert_eq!(format!("{value:?}"), "Literal(Struct({\"same\": I64(7)}))");
-    assert_eq!(value, literal(&Value::Struct(BTreeMap::from([("same".into(), Value::I64(7))]))));
+    assert_eq!(value, literal(&Value::Struct(StructFields::from([("same".into(), Value::I64(7))]))));
     let texts = &value.storage().unwrap().texts;
     assert_eq!(texts.iter().filter(|text| !text.is_empty()).count(), 1);
     assert!(texts.iter().all(|text| text == "same" || text.capacity() == 0));

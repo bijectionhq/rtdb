@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_format::{block::proto as pb, catalog::{BlockCatalog, TableBlock, TableEntry}, keys::TableSlug};
@@ -108,13 +109,13 @@ fn reset_rebuilds_l0_from_supplied_objects_and_clears_compaction() {
 
 #[test]
 fn absent_columns_widen_only_when_the_other_side_has_put_data_5911() {
-    let old = BTreeMap::from([("a".into(), LogicalType::Scalar(ScalarType::I64))]);
-    let declared = BTreeMap::from([("b".into(), LogicalType::Nothing)]);
+    let old = StructFields::from([("a".into(), LogicalType::Scalar(ScalarType::I64))]);
+    let declared = StructFields::from([("b".into(), LogicalType::Nothing)]);
     let merged = merge_column_types(&old, &declared);
     assert_eq!(merged["a"], LogicalType::Scalar(ScalarType::I64));
     assert_eq!(merged["b"], LogicalType::Null);
-    assert_eq!(merge_column_types(&old, &BTreeMap::new()), old);
-    let rows = BTreeMap::from([("b".into(), LogicalType::Scalar(ScalarType::Utf8))]);
+    assert_eq!(merge_column_types(&old, &StructFields::new()), old);
+    let rows = StructFields::from([("b".into(), LogicalType::Scalar(ScalarType::Utf8))]);
     assert_eq!(merge_column_types(&old, &rows)["a"], LogicalType::Scalar(ScalarType::I64).maybe());
 }
 

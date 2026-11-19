@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use rtdb_expr::*;
 use rtdb_plan::{BinaryOp as B, Expr, Schema};
 use rtdb_types::{DecimalValue, LogicalType as T, ScalarType as S, TimeUnit, Timestamp, Value as V};
@@ -40,12 +40,12 @@ fn patch_keeps_upstream_test_patch_observations() {
 
 #[test]
 fn patch_replaces_nested_values_and_preserves_nullable_field_types() {
-    let left = V::Struct(BTreeMap::from([("nested".into(), V::Struct(BTreeMap::from([("a".into(), V::I64(1))])))]));
-    let right = V::Struct(BTreeMap::from([("nested".into(), V::Struct(BTreeMap::from([("b".into(), V::I64(2))])))]));
+    let left = V::Struct(StructFields::from([("nested".into(), V::Struct(StructFields::from([("a".into(), V::I64(1))])))]));
+    let right = V::Struct(StructFields::from([("nested".into(), V::Struct(StructFields::from([("b".into(), V::I64(2))])))]));
     assert_eq!(scalar_call("_patch", &[left, right.clone()], &EvalContext::default()).unwrap(), right);
-    let left = T::Struct(BTreeMap::from([("a".into(), T::Scalar(S::I64)), ("keep".into(), T::Scalar(S::Bool))]));
-    let right = T::Struct(BTreeMap::from([("a".into(), T::Scalar(S::Utf8).maybe()), ("new".into(), T::Null)]));
-    let expected = T::Struct(BTreeMap::from([("a".into(), T::Scalar(S::I64).join(&T::Scalar(S::Utf8))), ("keep".into(), T::Scalar(S::Bool)), ("new".into(), T::Null)]));
+    let left = T::Struct(StructFields::from([("a".into(), T::Scalar(S::I64)), ("keep".into(), T::Scalar(S::Bool))]));
+    let right = T::Struct(StructFields::from([("a".into(), T::Scalar(S::Utf8).maybe()), ("new".into(), T::Null)]));
+    let expected = T::Struct(StructFields::from([("a".into(), T::Scalar(S::I64).join(&T::Scalar(S::Utf8))), ("keep".into(), T::Scalar(S::Bool)), ("new".into(), T::Null)]));
     assert_eq!(function_type("_patch", &[left, right]).unwrap(), expected);
     assert!(function_type("_patch", &[T::Null, T::Null]).is_err());
 }
@@ -167,8 +167,8 @@ fn character_length_counts_code_points_and_like_does_not_match_newline() {
 
 #[test]
 fn missing_members_and_nulls_do_not_become_boolean_false() {
-    let a = V::Struct(BTreeMap::from([("a".into(), V::I64(1))]));
-    let b = V::Struct(BTreeMap::from([("a".into(), V::I64(1)), ("b".into(), V::Null)]));
+    let a = V::Struct(StructFields::from([("a".into(), V::I64(1))]));
+    let b = V::Struct(StructFields::from([("a".into(), V::I64(1)), ("b".into(), V::Null)]));
     assert_eq!(sql_eq(&a, &b, &equality_scope()).unwrap(), Some(false));
     assert_eq!(sql_eq(&b, &b, &equality_scope()).unwrap(), None);
     assert!(!is_true(&V::Null).unwrap());
@@ -227,7 +227,7 @@ fn period_constructor_truncates_zoned_timestamp_units_and_floors_local_conversio
 fn distinct_from_handles_outer_nulls_and_retains_compound_unknown_comparisons() {
     assert_eq!(run(&expr(B::IsDistinctFrom, V::Null, V::Null)), V::Bool(false));
     assert_eq!(run(&expr(B::IsDistinctFrom, V::Null, V::I64(1))), V::Bool(true));
-    let compound = V::Struct(BTreeMap::from([("a".into(), V::Null)]));
+    let compound = V::Struct(StructFields::from([("a".into(), V::Null)]));
     let comparison = expr(B::IsDistinctFrom, compound.clone(), compound);
     assert_eq!(run(&comparison), V::Null);
     assert!(comparison.data_type().nullable());
@@ -235,7 +235,7 @@ fn distinct_from_handles_outer_nulls_and_retains_compound_unknown_comparisons() 
 
 #[test]
 fn null_eq_keeps_reference_nonreflexive_nested_null_comparison() {
-    let value = V::Struct(BTreeMap::from([("nested".into(), V::List(vec![V::Null, V::I64(4)]))]));
+    let value = V::Struct(StructFields::from([("nested".into(), V::List(vec![V::Null, V::I64(4)]))]));
     assert_eq!(sql_eq(&value, &value, &equality_scope()).unwrap(), None);
     assert!(!null_eq(&value, &value, &equality_scope()).unwrap());
 }

@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, sync::Arc};
+use rtdb_types::StructFields;
+use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::transit::{TransitValue as T, encode_json};
 use rtdb_node::AutonomousTxOptions;
@@ -46,7 +47,7 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
     let TransactionInput { value, reservation: _reservation } = input;
     let mut request = fields(value)?;
     let asynchronous = match request.remove("asynchronous").unwrap_or(Value::Bool(false)) { Value::Bool(value) => value, _ => return Err(crate::invalid("asynchronous must be boolean")) };
-    let mut options = fields(request.remove("options").unwrap_or_else(|| Value::Struct(BTreeMap::new())))?;
+    let mut options = fields(request.remove("options").unwrap_or_else(|| Value::Struct(StructFields::new())))?;
     let timezone = optional_string(options.remove("default_timezone"))?;
     let database = optional_string(options.remove("database"))?;
     let system_time = optional_time(options.remove("system_time"), timezone.as_deref().unwrap_or("UTC"))?;
@@ -59,7 +60,7 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
         let mut state = session.state.lock();
         let options = AutonomousTxOptions { database, default_timezone: timezone, system_time, user_metadata };
         token.run_until_cancelled(async {
-            let mut values = BTreeMap::new();
+            let mut values = StructFields::new();
             if asynchronous {
                 let submitted = state.state_mut().submit_tx(operations, options).await?;
                 values.insert("tx_id".into(), Value::I64(submitted.tx_id.0));
@@ -119,7 +120,7 @@ fn operation_value(value: Value, memory: &Arc<MemoryBudget>) -> Result<Option<Tx
     Ok(Some(operation))
 }
 fn quoted(identifier: &str) -> String { format!("\"{}\"", identifier.replace('"', "\"\"")) }
-fn fields(value: Value) -> Result<BTreeMap<String, Value>> { match value { Value::Struct(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit map")) } }
+fn fields(value: Value) -> Result<StructFields<Value>> { match value { Value::Struct(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit map")) } }
 fn list(value: Value) -> Result<Vec<Value>> { match value { Value::List(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit array")) } }
 fn string(value: Value) -> Result<String> { match value { Value::Utf8(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit string")) } }
 fn optional_string(value: Option<Value>) -> Result<Option<String>> { value.filter(|value| !matches!(value, Value::Null)).map(string).transpose() }
@@ -135,7 +136,7 @@ fn transaction_input_releases_transit_scratch_before_submission() {
     let input = TransactionInput::decode(&payload, &memory).unwrap();
     assert_eq!(memory.used_bytes(), input.value.retained_bytes().unwrap() + 8192);
     assert!(memory.used_bytes() < memory.peak_bytes());
-    assert_eq!(input.value, Value::Struct(BTreeMap::from([("operations".into(), Value::List(vec![Value::Utf8("SELECT 1".into())]))])));
+    assert_eq!(input.value, Value::Struct(StructFields::from([("operations".into(), Value::List(vec![Value::Utf8("SELECT 1".into())]))])));
     drop(input);
     assert_eq!(memory.used_bytes(), 0);
 }
@@ -145,7 +146,7 @@ fn deletes_and_erases_are_submitted_as_sql_dml() {
     let memory = MemoryBudget::new(1 << 20);
     let time = Value::Timestamp { value: 1_000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
     let op = |kind: &str, ids: Vec<Value>, bounds: bool| {
-        let mut fields = BTreeMap::from([("op".into(), Value::Utf8(kind.into())), ("table".into(), Value::Utf8("docs".into())), ("ids".into(), Value::List(ids))]);
+        let mut fields = StructFields::from([("op".into(), Value::Utf8(kind.into())), ("table".into(), Value::Utf8("docs".into())), ("ids".into(), Value::List(ids))]);
         if bounds { fields.insert("valid_from".into(), time.clone()); }
         operation_value(Value::Struct(fields), &memory).unwrap()
     };

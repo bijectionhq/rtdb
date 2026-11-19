@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, read_value};
@@ -17,10 +18,10 @@ fn context(transaction_scoped: bool) -> Arc<QueryContext> {
         let state = PartitionState::empty(Default::default()).unwrap();
         let mut tx = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) }, Arc::clone(&memory)).unwrap();
         for (schema, table, value) in [("public", "foo", number), ("other", "foo", number + 20)] {
-            let payload = Value::Struct(BTreeMap::from([("leaf".into(), Value::I64(7)), ("child".into(), Value::Struct(BTreeMap::from([("leaf".into(), Value::I64(8))])))]));
-            tx.put(TableRef::new(schema, table), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("payload".into(), payload)]), Interval::ALL).unwrap();
+            let payload = Value::Struct(StructFields::from([("leaf".into(), Value::I64(7)), ("child".into(), Value::Struct(StructFields::from([("leaf".into(), Value::I64(8))])))]));
+            tx.put(TableRef::new(schema, table), StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("payload".into(), payload)]), Interval::ALL).unwrap();
         }
-        tx.put(TableRef::new("CaseSchema", "CaseTable"), BTreeMap::from([("_id".into(), Value::I64(1)), ("CaseColumn".into(), Value::I64(40))]), Interval::ALL).unwrap();
+        tx.put(TableRef::new("CaseSchema", "CaseTable"), StructFields::from([("_id".into(), Value::I64(1)), ("CaseColumn".into(), Value::I64(40))]), Interval::ALL).unwrap();
         state.apply(&tx.stage().unwrap()).unwrap();
         databases.insert(database.into(), DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) });
     }

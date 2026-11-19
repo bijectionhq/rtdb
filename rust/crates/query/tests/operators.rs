@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -150,7 +151,7 @@ async fn metered_cursor_records_lifetime_once_and_counts_pull_and_consumer_error
 async fn patch_operator_preserves_a_values_page_across_output_batches() {
     let instant = scalar(ScalarType::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) });
     let timestamp = |value| Value::Timestamp { value, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
-    let document = Value::Struct(BTreeMap::from([("v".into(), Value::I64(7))]));
+    let document = Value::Struct(StructFields::from([("v".into(), Value::I64(7))]));
     let fields = vec![field(0, "_iid", scalar(ScalarType::FixedSizeBinary(16))), field(1, "_valid_from", instant.clone()), field(2, "_valid_to", instant.clone().maybe()), field(3, "doc", document.logical_type())];
     let rows = [(1, 10, 20), (1, 30, 40), (2, 0, 50)].into_iter().map(|(iid, from, to)| vec![Value::FixedSizeBinary(vec![iid; 16]), timestamp(from), timestamp(to), document.clone()].into_iter().map(Expr::Literal).collect()).collect();
     let input = Arc::new(Relation::new(Schema::new(fields.clone()).unwrap(), RelationNode::Values { rows }).unwrap());
@@ -280,7 +281,7 @@ async fn spill_quota_failure_releases_partial_runs() {
 
 #[tokio::test]
 async fn distinct_groups_top_level_nulls_and_keeps_nonreflexive_compound_keys() {
-    let compound = Value::Struct(BTreeMap::from([("x".into(), Value::Null)]));
+    let compound = Value::Struct(StructFields::from([("x".into(), Value::Null)]));
     let rows = vec![Value::Null, Value::Null, compound.clone(), compound.clone(), Value::F64(f64::NAN), Value::F64(f64::NAN)];
     let ty = LogicalType::join_all(&rows.iter().map(Value::logical_type).collect::<Vec<_>>());
     let input = values(0, "key", ty, rows);
@@ -543,8 +544,8 @@ async fn scalar_apply_rejects_multiple_rows_and_pull_many_distinguishes_empty_do
     let output = field(2, "answer", scalar(ScalarType::I64).maybe());
     let plan = Arc::new(Relation::new(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Apply { input: Arc::clone(&input), dependent, arguments: vec![], kind: ApplyKind::Scalar, output: Some(output) }).unwrap());
     assert_eq!(collect(plan, query_context(QueryOptions::default())).await.unwrap_err().code, "xtdb.single-join/cardinality-violation");
-    for (dependent, expected) in [(Arc::new(Relation::empty(Schema::default())), Value::Null), (Arc::new(Relation::unit()), Value::List(vec![Value::Struct(BTreeMap::new())]))] {
-        let output = field(2, "answer", LogicalType::list(LogicalType::Struct(BTreeMap::new())).maybe());
+    for (dependent, expected) in [(Arc::new(Relation::empty(Schema::default())), Value::Null), (Arc::new(Relation::unit()), Value::List(vec![Value::Struct(StructFields::new())]))] {
+        let output = field(2, "answer", LogicalType::list(LogicalType::Struct(StructFields::new())).maybe());
         let plan = Arc::new(Relation::new(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Apply { input: Arc::clone(&input), dependent, arguments: vec![], kind: ApplyKind::PullMany, output: Some(output) }).unwrap());
         assert_eq!(collect(plan, query_context(QueryOptions::default())).await.unwrap(), vec![vec![expected]]);
     }

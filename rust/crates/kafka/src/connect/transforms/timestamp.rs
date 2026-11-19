@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::{BTreeMap,VecDeque}, sync::Arc};
 use rtdb_types::{Result, TimeUnit, Value};
 use super::{ConnectData, ConnectSchema, SchemaKind, SinkRecord, Transform, error, fields_with_defaults, required, string_map};
@@ -108,7 +109,7 @@ impl TimestampConverter {
         let mut values = fields_with_defaults(&data, self.replace)?;
         let SchemaKind::Struct(fields) = &schema.kind else { return Err(error("transform-error","Field TimestampConverter requires a Struct")); };
         let SchemaKind::Struct(output_fields) = &output.kind else { unreachable!() };
-        let mut result = BTreeMap::new();
+        let mut result = StructFields::new();
         for (field, output_field) in fields.iter().zip(output_fields) {
             let value = values.remove(&field.name).unwrap_or(Value::Null);
             let value = if field.name == self.field { self.convert(&value, Some(&field.schema))? } else { value };
@@ -193,17 +194,17 @@ mod tests {
         let environment = super::super::super::date_environment::test_environment("en","US","UTC");
         let field = super::super::super::ConnectField { name: "when".into(),schema: Arc::new(ConnectSchema::new(SchemaKind::String)) };
         let mut source = ConnectSchema::new(SchemaKind::Struct(vec![field]));
-        source.default = Some(Value::Struct(BTreeMap::from([("when".into(),Value::Utf8("PST 1970".into()))])));
+        source.default = Some(Value::Struct(StructFields::from([("when".into(),Value::Utf8("PST 1970".into()))])));
         let source = Arc::new(source);
         let mut converter = TimestampConverter { key: false,field: "when".into(),target: Target::Timestamp,precision: Precision::Millis,
             format: Some(DatePattern::compile("z yyyy",Arc::clone(&environment),true).unwrap()),replace: true,environment,schemas: VecDeque::new() };
         let record = |value: &str| {
-            let data = ConnectData { schema: Some(Arc::clone(&source)),value: Value::Struct(BTreeMap::from([("when".into(),Value::Utf8(value.into()))])) };
+            let data = ConnectData { schema: Some(Arc::clone(&source)),value: Value::Struct(StructFields::from([("when".into(),Value::Utf8(value.into()))])) };
             SinkRecord::new("topic".into(),0,0,ConnectData::null(),data)
         };
         let first = converter.apply(record("China Standard Time 1970")).unwrap().unwrap();
         let default = first.value.schema.as_ref().unwrap().default.as_ref().unwrap();
-        assert_eq!(default,&Value::Struct(BTreeMap::from([("when".into(),super::super::super::data::date_value(8 * 3_600_000))])));
+        assert_eq!(default,&Value::Struct(StructFields::from([("when".into(),super::super::super::data::date_value(8 * 3_600_000))])));
         let cached = converter.updated_schema(&source).unwrap();
         assert!(Arc::ptr_eq(&cached.0,first.value.schema.as_ref().unwrap()));
         assert!(first.reservations.iter().any(|charge|Arc::ptr_eq(charge,&cached.1)));

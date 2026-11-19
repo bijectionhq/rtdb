@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use crate::{ColumnId, Expr};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TableRef, TimeUnit};
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ pub struct QualifiedTable { pub database: String, pub table: TableRef }
 pub struct TableBinding {
     pub name: QualifiedTable,
     pub oid: Option<i32>,
-    pub columns: BTreeMap<String, LogicalType>,
+    pub columns: StructFields<LogicalType>,
 }
 
 impl TableBinding {

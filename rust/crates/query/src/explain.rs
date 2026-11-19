@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{alloc::Layout, cell::RefCell, collections::{BTreeMap, BTreeSet}, mem::size_of, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{AggregateFunction, BinaryOp, ColumnId, Expr, Field, JoinKind, Relation, RelationNode, Schema, UnaryOp,
@@ -185,19 +186,25 @@ impl<'work, K: Ord, V> ScratchMap<'work, K, V> {
         Ok(())
     }
 }
-struct WorkMap<'work> { fields: ScratchMap<'work, String, WorkValue<'work>>, work: &'work ExplainWork }
+/// Keeps fields in insertion order: each operator's explanation lists its keys in the reference's map-literal order.
+struct WorkMap<'work> { fields: ScratchMap<'work, usize, (String, WorkValue<'work>)>, work: &'work ExplainWork }
 impl<'work> WorkMap<'work> {
     fn new(work: &'work ExplainWork) -> Self { Self { fields: ScratchMap::new(work), work } }
     fn insert(&mut self, key: &str, value: WorkValue<'work>) -> Result<()> {
         self.work.check(value.work)?;
+        if let Some((_, existing)) = self.fields.values.values_mut().find(|(name, _)| name == key) {
+            *existing = value;
+            return Ok(());
+        }
         let key = self.work.copy_text(key)?;
         self.work.admit(map_node_bytes::<String, Value>()?)?;
-        self.fields.insert(key.text, value)
+        let position = self.fields.values.len();
+        self.fields.insert(position, (key.text, value))
     }
     fn finish(mut self) -> Result<WorkValue<'work>> {
-        let mut fields = BTreeMap::new();
+        let mut fields = StructFields::new();
         let mut final_buffers = 0;
-        while let Some((key, value)) = self.fields.values.pop_first() {
+        while let Some((_, (key, value))) = self.fields.values.pop_first() {
             self.work.check(value.work)?;
             final_buffers = add(final_buffers, add(map_node_bytes::<String, Value>()?, add(key.capacity(), value.final_buffers)?)?)?;
             fields.insert(key, value.value);
@@ -398,7 +405,7 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
                 let expression = expression(&named.expr)?;
                 values.push(work.pieces(&[RenderPiece::Text("{"), RenderPiece::Text(&named.field.name), RenderPiece::Text(" "), RenderPiece::Text(expression.as_str()), RenderPiece::Text("}")])?)?;
             }
-            map(work, [("append?", work.boolean(matches!(relation.node(), RelationNode::Extend { .. }))), ("project", text(joined(work, "[", &values, " ", "]")?)?)])?
+            map(work, [("project", text(joined(work, "[", &values, " ", "]")?)?), ("append?", work.boolean(matches!(relation.node(), RelationNode::Extend { .. })))])?
         }
         RelationNode::Rename { prefix, expressions, .. } => {
             let mut fields = WorkMap::new(work);
@@ -410,6 +417,8 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
                     values.push(work.pieces(&[RenderPiece::Text(&named.field.name), RenderPiece::Text(" "), RenderPiece::Text(expression.as_str())])?)?;
                 }
                 fields.insert("columns", text(joined(work, "{", &values, ", ", "}")?)?)?;
+            } else {
+                fields.insert("columns", work.null())?;
             }
             fields.finish()?
         }
@@ -492,8 +501,8 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
                 rtdb_plan::OrdinalityScope::Relation => " (row-number)}]",
             };
             map(work, [
-                ("append?", work.boolean(true)),
                 ("project", text(work.pieces(&[RenderPiece::Text(prefix.as_str()), RenderPiece::Text(&field.name), RenderPiece::Text(row_number)])?)?),
+                ("append?", work.boolean(true)),
             ])?
         }
         RelationNode::Unnest { expr, element, ordinality, .. } => {
@@ -938,7 +947,7 @@ mod rendering_tests {
             (Value::Map { entries: vec![(Value::Keyword(Keyword::from_name("k")), Value::Bool(true))], sorted: true }, "{:k true}"),
             (Value::FixedSizeList(vec![Value::Bool(false)]), "[false]"),
             (Value::TimestampTzRange { lower: 0, upper: 0 }, r#"#xt/tstz-range "[#time/zoned-date-time \"1970-01-01T00:00Z[UTC]\" #time/zoned-date-time \"1970-01-01T00:00Z[UTC]\"]""#),
-            (Value::Struct(BTreeMap::from([("z".into(), Value::Bool(false)), ("a".into(), Value::I64(1))])), "{:a 1, :z false}"),
+            (Value::Struct(StructFields::from([("z".into(), Value::Bool(false)), ("a".into(), Value::I64(1))])), "{:z false, :a 1}"),
         ];
         assert_eq!(cases.len(), 41);
         for (value, expected) in cases { assert_eq!(output(&value), expected); }
@@ -1137,7 +1146,7 @@ mod rendering_tests {
         fields.insert("field", work.text(work.copy_text("discarded").unwrap()).unwrap()).unwrap();
         fields.insert("field", work.text(work.copy_text("ok").unwrap()).unwrap()).unwrap();
         let output = fields.finish().unwrap();
-        assert_eq!(output.value, Value::Struct(BTreeMap::from([("field".into(), Value::Utf8("ok".into()))])));
+        assert_eq!(output.value, Value::Struct(StructFields::from([("field".into(), Value::Utf8("ok".into()))])));
         let state = work.state.borrow();
         let WorkState::Building { cumulative_buffers, .. } = &*state else { panic!() };
         assert!(output.final_buffers < *cumulative_buffers);
@@ -1146,7 +1155,7 @@ mod rendering_tests {
     #[test]
     fn raw_and_physical_map_keys_keep_container_shapes_order_and_duplicates() {
         let value = Value::Map { entries: vec![
-            (Value::List(vec![Value::Keyword(Keyword::from_name("x"))]), Value::Struct(BTreeMap::from([("nested".into(), Value::Set(vec![Value::I64(1), Value::I64(2)]))]))),
+            (Value::List(vec![Value::Keyword(Keyword::from_name("x"))]), Value::Struct(StructFields::from([("nested".into(), Value::Set(vec![Value::I64(1), Value::I64(2)]))]))),
             (Value::List(vec![Value::Keyword(Keyword::from_name("x"))]), Value::I64(3)),
         ], sorted: true };
         assert_eq!(output(&value), "{[:x] {:nested #{1 2}}, [:x] 3}");

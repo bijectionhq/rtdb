@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch};
@@ -42,12 +43,12 @@ fn file_and_stream_decoding_admit_logical_nulls_in_nested_dense_unions() {
             iid: EntityId::Integer(index as i64).iid(),
             system_from: Timestamp(100),
             valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("v".into(), value)])),
+            operation: StoredOperation::Put(StructFields::from([("v".into(), value)])),
             recency: None,
         }).collect::<Vec<_>>();
     let field_type = LogicalType::from_legs([LogicalType::Null, LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)]);
     let fields = BTreeMap::from([("v".into(), field_type)]);
-    let batch = build_event_batch(&events, Some(fields), None).unwrap();
+    let batch = build_event_batch(&events, Some(fields.into()), None).unwrap();
     let schema = batch.schema();
     let DataType::Union(operations, _) = schema.field_with_name("op").unwrap().data_type() else { panic!("event operations") };
     let put = operations.iter().find(|(_, field)| field.name() == "put").unwrap().1;

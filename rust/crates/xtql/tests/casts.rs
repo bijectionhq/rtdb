@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeSet;
 use rtdb_expr::{EvalContext, evaluate};
 use rtdb_plan::{Catalog, QualifiedTable, RelationNode, Statement, TableBinding};
@@ -194,7 +195,7 @@ fn expression_test_cast_list_elementwise_and_pg_array_text() {
 #[test]
 fn composite_type_casts_accept_nested_tags_and_preserve_identical_values() {
     assert_eq!(project("(cast {:x 1} #xt/type [:struct {\"x\" #xt/type :i64}])"),
-        (T::Struct(std::collections::BTreeMap::from([("x".into(), T::Scalar(S::I64))])), V::Struct(std::collections::BTreeMap::from([("x".into(), V::I64(1))]))));
+        (T::Struct(StructFields::from([("x".into(), T::Scalar(S::I64))])), V::Struct(StructFields::from([("x".into(), V::I64(1))]))));
     assert_eq!(project("(cast #xt/tstz-range [nil nil] #xt/type :tstz-range)").1,
         V::TimestampTzRange { lower: i64::MIN, upper: i64::MAX });
     assert_eq!(project("(cast [1 2] #xt/type [:list #xt/type :i64])").1,

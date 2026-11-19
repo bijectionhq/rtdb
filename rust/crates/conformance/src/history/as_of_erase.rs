@@ -6,7 +6,8 @@ use rtdb_tx::{Documents, EntityIds, TxOp};
 use rtdb_types::{BlockIndex, EntityId, Keyword, TableRef, Timestamp, TransactionKey, Value};
 use serde::Deserialize;
 use serde_json::json;
-use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
+use rtdb_types::StructFields;
+use std::{collections::BTreeSet, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 
 #[derive(Deserialize)]
 pub(crate) struct Fixture {
@@ -76,7 +77,7 @@ async fn observe_node(node: &Node, clock: &FixtureClock, fixture: &Fixture, put_
 
     let table = TableRef::new("public", "docs");
     let documents = fixture.put_keyword_ids.iter().map(|id| {
-        Ok(BTreeMap::from([("_id".into(), Value::Keyword(Keyword::parse(id)?))]))
+        Ok(StructFields::from([("_id".into(), Value::Keyword(Keyword::parse(id)?))]))
     }).collect::<Result<Vec<_>, Error>>()?;
     let erased = EntityId::Keyword(Keyword::parse(&fixture.erase_keyword_id)?);
     let mut session = node.session("xtdb", Arc::new(Identity))?;

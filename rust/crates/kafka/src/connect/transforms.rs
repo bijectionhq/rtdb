@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_types::{Result, Value};
 use regex::Regex;
@@ -146,7 +147,7 @@ impl Transform for BuiltinTransform {
             }
             Action::ValueToKey(names) => {
                 let fields = fields(&record.value)?;
-                let value = names.iter().map(|name| Ok((name.clone(), fields.get(name).cloned().unwrap_or(Value::Null)))).collect::<Result<BTreeMap<_, _>>>()?;
+                let value = names.iter().map(|name| Ok((name.clone(), fields.get(name).cloned().unwrap_or(Value::Null)))).collect::<Result<StructFields<_>>>()?;
                 let schema = record.value.schema.as_ref().map(|schema| {
                     let selected = names.iter().map(|name| schema.field(name).ok_or_else(|| error("transform-error", format!("Unknown field '{name}'")))).collect::<Result<_>>()?;
                     Ok::<_, rtdb_types::Anomaly>(Arc::new(ConnectSchema::new(SchemaKind::Struct(selected))))
@@ -215,12 +216,12 @@ impl Transform for BuiltinTransform {
             Action::Hoist(name) => {
                 let old = std::mem::replace(data, ConnectData::null());
                 let schema = old.schema.map(|schema| Arc::new(ConnectSchema::new(SchemaKind::Struct(vec![ConnectField { name: name.clone(), schema }]))));
-                let fields = BTreeMap::from([(name.clone(), old.value)]);
+                let fields = StructFields::from([(name.clone(), old.value)]);
                 *data = ConnectData { value: if schema.is_some() { Value::Struct(fields) } else { string_map(fields) }, schema };
             }
             Action::Replace { include, exclude, renames } if data.value != Value::Null => {
                 let keep = |name: &str| !exclude.contains(name) && (include.is_empty() || include.contains(name));
-                let values = fields(data)?.into_iter().filter(|(name, _)| keep(name)).map(|(name, value)| (renames.get(&name).cloned().unwrap_or(name), value)).collect::<BTreeMap<_, _>>();
+                let values = fields(data)?.into_iter().filter(|(name, _)| keep(name)).map(|(name, value)| (renames.get(&name).cloned().unwrap_or(name), value)).collect::<StructFields<_>>();
                 let schema = data.schema.as_ref().map(|schema| {
                     let SchemaKind::Struct(fields) = &schema.kind else { return Err(error("transform-error", "ReplaceField requires a Struct schema")); };
                     let mut result = schema.as_ref().clone(); result.kind = SchemaKind::Struct(fields.iter().filter(|field| keep(&field.name)).map(|field| ConnectField { name: renames.get(&field.name).cloned().unwrap_or_else(|| field.name.clone()), schema: Arc::clone(&field.schema) }).collect()); result.default = None;
@@ -238,14 +239,14 @@ impl Transform for BuiltinTransform {
         Ok(Some(record))
     }
 }
-fn fields(data: &ConnectData) -> Result<BTreeMap<String, Value>> {
+fn fields(data: &ConnectData) -> Result<StructFields<Value>> {
     match &data.value {
         Value::Struct(fields) => Ok(fields.clone()),
         Value::Map { entries, .. } => entries.iter().map(|(key, value)| match key { Value::Utf8(key) => Ok((key.clone(), value.clone())), _ => Err(error("transform-error", "Transform requires string map keys")) }).collect(),
         _ => Err(error("transform-error", "Transform requires a Struct or Map")),
     }
 }
-fn fields_with_defaults(data: &ConnectData, replace: bool) -> Result<BTreeMap<String, Value>> {
+fn fields_with_defaults(data: &ConnectData, replace: bool) -> Result<StructFields<Value>> {
     let mut values = fields(data)?;
     if replace { if let Some(schema) = &data.schema { if let SchemaKind::Struct(fields) = &schema.resolved().kind {
         for field in fields { if values.get(&field.name).is_none_or(|value| *value == Value::Null) { if let Some(default) = &field.schema.default { values.insert(field.name.clone(), default.clone()); } } }
@@ -255,7 +256,7 @@ fn fields_with_defaults(data: &ConnectData, replace: bool) -> Result<BTreeMap<St
 fn resolve_record_schema(data: &mut ConnectData) {
     if let Some(schema) = &data.schema { if matches!(schema.kind, SchemaKind::Reference(_)) { data.schema = Some(Arc::new(schema.resolved().into_owned())); } }
 }
-fn string_map(fields: BTreeMap<String, Value>) -> Value { Value::Map { entries: fields.into_iter().map(|(key, value)| (Value::Utf8(key), value)).collect(), sorted: false } }
+fn string_map(fields: StructFields<Value>) -> Value { Value::Map { entries: fields.into_iter().map(|(key, value)| (Value::Utf8(key), value)).collect(), sorted: false } }
 
 fn java_replacement(pattern: &Regex, captures: &regex::Captures<'_>, replacement: &str) -> Result<String> {
     let mut output = String::new(); let mut characters = replacement.chars().peekable();

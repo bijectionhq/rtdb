@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use rtdb_types::{BlockIndex, EntityId, Interval, LogicalType, ScalarType, TableR
 
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn key(id: i64) -> TransactionKey { TransactionKey { tx_id: TxId(id), system_time: Timestamp(100 + id) } }
-fn document(id: i64, value: i64) -> BTreeMap<String, Value> { BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(value))]) }
+fn document(id: i64, value: i64) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(value))]) }
 fn rows(snapshot: &Snapshot) -> u32 { snapshot.segments(&table()).iter().map(|segment| segment.row_count()).sum() }
 
 fn stage(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64) -> StagedWrite {
@@ -26,9 +27,9 @@ fn stored_event_copy_preserves_raw_decimal_and_retains_charge_after_index_releas
     let memory = MemoryBudget::new(16 << 20);
     for precision in [i32::MIN, 0, 1, 256, i32::MAX] {
         let value = Value::Decimal(DecimalValue::new(123i128.to_be_bytes().to_vec(), precision, i32::MAX, 128).unwrap());
-        let declared = BTreeMap::from([("v".into(), value.logical_type())]);
+        let declared = StructFields::from([("v".into(), value.logical_type())]);
         let events = [StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("v".into(), value)])), recency: None }];
+            operation: StoredOperation::Put(StructFields::from([("v".into(), value)])), recency: None }];
         if precision < 3 { assert!(IndexBatch::from_events(&events, &declared, &memory).is_err()); }
         let copied = IndexBatch::copy_events_with_put_schema(&events, &declared, &memory).unwrap();
         assert_eq!(copied.put_types(), &declared);
@@ -38,13 +39,13 @@ fn stored_event_copy_preserves_raw_decimal_and_retains_charge_after_index_releas
         assert!(memory.used_bytes() > 0);
         drop(held);
         assert_eq!(memory.used_bytes(), 0);
-        assert!(IndexBatch::copy_events_with_put_schema(&events, &BTreeMap::new(), &memory).is_err());
-        let changed = BTreeMap::from([("v".into(), LogicalType::Scalar(ScalarType::Decimal { precision: precision.wrapping_add(1), scale: i32::MAX, bit_width: 128 }))]);
+        assert!(IndexBatch::copy_events_with_put_schema(&events, &StructFields::new(), &memory).is_err());
+        let changed = StructFields::from([("v".into(), LogicalType::Scalar(ScalarType::Decimal { precision: precision.wrapping_add(1), scale: i32::MAX, bit_width: 128 }))]);
         assert!(IndexBatch::copy_events_with_put_schema(&events, &changed, &memory).is_err());
         assert_eq!(memory.used_bytes(), 0);
     }
     let exhausted = MemoryBudget::new(1);
-    assert!(IndexBatch::copy_events_with_put_schema(&[], &BTreeMap::new(), &exhausted).is_err());
+    assert!(IndexBatch::copy_events_with_put_schema(&[], &StructFields::new(), &exhausted).is_err());
     assert_eq!(exhausted.used_bytes(), 0);
 }
 
@@ -207,14 +208,14 @@ fn put_omitting_a_declared_column_preserves_its_null_field() {
     let budget = MemoryBudget::new(1 << 24);
     let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
     tx.declare_table(table(), ["v".into()]).unwrap();
-    tx.put(table(), BTreeMap::from([("_id".into(), Value::I64(1))]), Interval::ALL).unwrap();
+    tx.put(table(), StructFields::from([("_id".into(), Value::I64(1))]), Interval::ALL).unwrap();
 
     let staged = tx.stage().unwrap();
     state.apply(&staged).unwrap();
     let snapshot = state.open_snapshot(Some(key(0).system_time));
     assert_eq!(snapshot.column_types(&table())["v"], LogicalType::Null);
     let events = snapshot.segments(&table())[0].ordered_events().unwrap();
-    assert_eq!(events[0].source.event().unwrap().operation, StoredOperation::Put(BTreeMap::from([
+    assert_eq!(events[0].source.event().unwrap().operation, StoredOperation::Put(StructFields::from([
         ("_id".into(), Value::I64(1)), ("v".into(), Value::Null),
     ])));
 }
@@ -224,12 +225,12 @@ fn declared_document_types_do_not_make_written_columns_nullable() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);
     let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
-    tx.put(table(), BTreeMap::from([("_id".into(), Value::I64(1)), ("error".into(), Value::Null)]), Interval::ALL).unwrap();
+    tx.put(table(), StructFields::from([("_id".into(), Value::I64(1)), ("error".into(), Value::Null)]), Interval::ALL).unwrap();
     let error = "error".to_owned();
     tx.declare_document_types(&table(), [(&error, &LogicalType::Scalar(ScalarType::Transit).maybe())]).unwrap();
     state.apply(&tx.stage().unwrap()).unwrap();
     let types = state.open_snapshot(Some(key(0).system_time)).segments(&table())[0].column_types().clone();
-    assert_eq!(types, BTreeMap::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("error".into(), LogicalType::Scalar(ScalarType::Transit).maybe())]));
+    assert_eq!(types, StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("error".into(), LogicalType::Scalar(ScalarType::Transit).maybe())]));
 }
 
 #[test]

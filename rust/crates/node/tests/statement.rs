@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -74,7 +75,7 @@ async fn cancelling_a_large_sorted_series_stops_it_promptly() {
 }
 fn write(state: &PartitionState, tx: i64, value: Value, memory: &Arc<MemoryBudget>) {
     let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(memory)).unwrap();
-    buffer.put(TableRef::new("public", "docs"), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), value)]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+    buffer.put(TableRef::new("public", "docs"), StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), value)]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
     state.apply(&buffer.stage().unwrap()).unwrap();
 }
 

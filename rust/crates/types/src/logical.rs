@@ -1,6 +1,6 @@
 use crate::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::{StructFields, OrderedSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TimeUnit { Second, Millisecond, Microsecond, Nanosecond }
@@ -49,9 +49,9 @@ pub enum LogicalType {
     Null,
     Scalar(ScalarType),
     List { kind: ListKind, element: Box<LogicalType> },
-    Struct(BTreeMap<String, LogicalType>),
+    Struct(StructFields<LogicalType>),
     Maybe(Box<LogicalType>),
-    Union(BTreeSet<LogicalType>),
+    Union(OrderedSet<LogicalType>),
     RunEndEncoded { width: RunEndWidth, value: Box<LogicalType> },
 }
 
@@ -75,14 +75,14 @@ impl LogicalType {
 
     pub fn list(element: Self) -> Self { Self::List { kind: ListKind::List, element: Box::new(element) } }
 
-    /// Returns value kinds with physical encodings removed at every depth.
-    pub fn legs(&self) -> BTreeSet<Self> {
+    /// Returns value kinds with physical encodings removed at every depth, in the order they were first seen.
+    pub fn legs(&self) -> OrderedSet<Self> {
         match self {
-            Self::Nothing => BTreeSet::new(),
+            Self::Nothing => OrderedSet::new(),
             Self::Maybe(value) => { let mut legs = value.legs(); legs.insert(Self::Null); legs }
             Self::Union(values) => values.iter().flat_map(Self::legs).collect(),
             Self::RunEndEncoded { value, .. } => value.legs(),
-            value => BTreeSet::from([value.unencoded()]),
+            value => OrderedSet::from([value.unencoded()]),
         }
     }
 
@@ -94,7 +94,7 @@ impl LogicalType {
 
     /// `from_legs` for inputs whose leaves are already unencoded, so nested types are not rebuilt again.
     fn from_unencoded_legs(legs: impl IntoIterator<Item = Self>) -> Self {
-        fn flatten(leg: LogicalType, out: &mut BTreeSet<LogicalType>) {
+        fn flatten(leg: LogicalType, out: &mut OrderedSet<LogicalType>) {
             match leg {
                 LogicalType::Nothing => {}
                 LogicalType::Maybe(value) => { flatten(*value, out); out.insert(LogicalType::Null); }
@@ -102,19 +102,20 @@ impl LogicalType {
                 value => { out.insert(value); }
             }
         }
-        let mut flat = BTreeSet::new();
+        let mut flat = OrderedSet::new();
         for leg in legs { flatten(leg, &mut flat); }
         Self::from_legs_set(flat)
     }
 
-    fn from_legs_set(mut legs: BTreeSet<Self>) -> Self {
-        let nullable = legs.remove(&Self::Null);
-        if legs.is_empty() { return Self::Null; }
-        if legs.len() == 1 {
-            let value = legs.into_iter().next().unwrap_or(Self::Nothing);
+    /// A union keeps its null leg where it was first seen.
+    fn from_legs_set(legs: OrderedSet<Self>) -> Self {
+        let nullable = legs.contains(&Self::Null);
+        let values = legs.len() - usize::from(nullable);
+        if values == 0 { return Self::Null; }
+        if values == 1 {
+            let value = legs.into_iter().find(|leg| *leg != Self::Null).unwrap_or(Self::Nothing);
             return if nullable { Self::Maybe(Box::new(value)) } else { value };
         }
-        if nullable { legs.insert(Self::Null); }
         Self::Union(legs)
     }
 
@@ -164,34 +165,36 @@ impl LogicalType {
         Self::join_iter(&mut types.into_iter())
     }
 
+    /// Legs keep the order they were first seen in; lists of one kind, and all structs, merge into the slot of the first.
     fn join_iter<'a>(types: &mut dyn Iterator<Item = &'a Self>) -> Self {
-        let mut scalar_legs = BTreeSet::new();
-        let mut list_legs: BTreeMap<ListKind, Self> = BTreeMap::new();
-        let mut structs: Vec<BTreeMap<String, Self>> = Vec::new();
+        enum Slot { Leg(LogicalType), List(ListKind, LogicalType), Struct }
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut structs: Vec<StructFields<Self>> = Vec::new();
         for ty in types {
             for leg in ty.legs() {
                 match leg {
-                    Self::List { kind, element } => {
-                        list_legs.entry(kind).and_modify(|old| *old = old.join(&element)).or_insert(*element);
+                    Self::List { kind, element } => match slots.iter_mut().find_map(|slot| match slot { Slot::List(existing, old) if *existing == kind => Some(old), _ => None }) {
+                        Some(old) => *old = old.join(&element),
+                        None => slots.push(Slot::List(kind, *element)),
+                    },
+                    Self::Struct(children) => {
+                        if structs.is_empty() { slots.push(Slot::Struct); }
+                        structs.push(children);
                     }
-                    Self::Struct(children) => structs.push(children),
-                    other => { scalar_legs.insert(other); }
+                    other => if !slots.iter().any(|slot| matches!(slot, Slot::Leg(existing) if *existing == other)) { slots.push(Slot::Leg(other)); },
                 }
             }
         }
-        for (kind, element) in list_legs {
-            scalar_legs.insert(Self::List { kind, element: Box::new(element) });
-        }
-        if !structs.is_empty() {
-            let names: BTreeSet<_> = structs.iter().flat_map(|fields| fields.keys().cloned()).collect();
-            let mut merged = BTreeMap::new();
-            for name in names {
-                let ty = Self::join_iter(&mut structs.iter().map(|fields| fields.get(&name).unwrap_or(&Self::Null)));
-                merged.insert(name, ty);
-            }
-            scalar_legs.insert(Self::Struct(merged));
-        }
-        if scalar_legs.is_empty() { Self::Nothing } else { Self::from_legs(scalar_legs) }
+        if slots.is_empty() { return Self::Nothing; }
+        let mut merged_struct = (!structs.is_empty()).then(|| {
+            let names: OrderedSet<&String> = structs.iter().flat_map(|fields| fields.keys()).collect();
+            names.into_iter().map(|name| (name.clone(), Self::join_iter(&mut structs.iter().map(|fields| fields.get(name).unwrap_or(&Self::Null))))).collect::<StructFields<_>>()
+        });
+        Self::from_legs(slots.into_iter().map(|slot| match slot {
+            Slot::Leg(leg) => leg,
+            Slot::List(kind, element) => Self::List { kind, element: Box::new(element) },
+            Slot::Struct => Self::Struct(merged_struct.take().unwrap_or_default()),
+        }).collect::<Vec<_>>())
     }
 
     /// Returns the computation type in the numeric/temporal promotion order.

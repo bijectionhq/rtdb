@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -20,11 +21,11 @@ fn bloom_matches_portable_roaring_without_run_containers() {
 }
 
 fn columns() -> Vec<Value> {
-    vec![Value::Struct(BTreeMap::from([
+    vec![Value::Struct(StructFields::from([
         ("col-name".into(), Value::Utf8("_iid".into())),
         ("root-col?".into(), Value::Bool(true)),
         ("count".into(), Value::I64(2)),
-        ("bytes".into(), Value::Struct(BTreeMap::from([("bloom".into(), Value::Binary(BloomFilter::default().to_bytes().unwrap()))]))),
+        ("bytes".into(), Value::Struct(StructFields::from([("bloom".into(), Value::Binary(BloomFilter::default().to_bytes().unwrap()))]))),
     ]))]
 }
 
@@ -76,8 +77,8 @@ fn single_entity_pages_may_share_the_same_recency_ceiling() {
 
 #[test]
 fn metadata_counts_masked_struct_children_and_keeps_numeric_bounds() {
-    let ty = LogicalType::Struct(BTreeMap::from([("n".into(), LogicalType::Scalar(ScalarType::I64).maybe())])).maybe();
-    let values = [Value::Null, Value::Struct(BTreeMap::from([("n".into(), Value::I64(-4))])), Value::Struct(BTreeMap::from([("n".into(), Value::I64(7))]))];
+    let ty = LogicalType::Struct(StructFields::from([("n".into(), LogicalType::Scalar(ScalarType::I64).maybe())])).maybe();
+    let values = [Value::Null, Value::Struct(StructFields::from([("n".into(), Value::I64(-4))])), Value::Struct(StructFields::from([("n".into(), Value::I64(7))]))];
     let field = rtdb_columnar::to_field("doc", &ty).unwrap();
     let array = rtdb_columnar::build_array(&ty, &values).unwrap();
     let mut columns = Vec::new();
@@ -114,10 +115,10 @@ fn metadata_pages_keep_their_summaries_after_releasing_page_scratch() {
 
     let events = (0..1024).map(|id| StoredEvent {
         iid: EntityId::Integer(id).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
-        operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(id))])), recency: None,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])), recency: None,
     }).collect::<Vec<_>>();
     let fields = BTreeMap::from([("_id".into(), LogicalType::Scalar(ScalarType::I64))]);
-    let page = build_event_batch(&events, Some(fields), None).unwrap();
+    let page = build_event_batch(&events, Some(fields.into()), None).unwrap();
     let memory = MemoryBudget::new(64 << 20);
     let mut builder = MetadataBuilder::new(false, true);
     let leaves = (0..64).map(|_| builder.write_leaf_reserved(&page, &memory).unwrap().1).collect::<Vec<_>>();
@@ -139,8 +140,8 @@ fn metadata_builder_rebases_nested_column_indices_across_data_pages() {
     use rtdb_format::metadata::MetadataBuilder;
     use rtdb_types::{Iid, Interval};
 
-    let document = BTreeMap::from([("nested".into(), Value::Struct(BTreeMap::from([("n".into(), Value::I64(5))])))]);
-    let event = StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(document.clone()), recency: None };
+    let document = BTreeMap::from([("nested".into(), Value::Struct(StructFields::from([("n".into(), Value::I64(5))])))]);
+    let event = StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(document.clone().into()), recency: None };
     let fields = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
     let batch = build_event_batch(&[event], Some(fields), None).unwrap();
     let mut writer = MetadataBuilder::new(false, false);

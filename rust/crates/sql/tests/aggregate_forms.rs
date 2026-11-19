@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_index::{PartitionState, TransactionBuffer};
@@ -25,7 +26,7 @@ fn multiple_query_tails_context() -> Arc<QueryContext> {
     for (id, v) in [(1, 1), (2, 1), (3, 2), (4, 3), (5, 4)] {
         transaction.put(
             TableRef::new("public", "foo"),
-            BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(v))]),
+            StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(v))]),
             Interval::ALL,
         ).unwrap();
     }

@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use rtdb_types::StructFields;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeBinaryArray, Int64Array, RecordBatch, RunArray, types::Int32Type};
@@ -45,18 +46,18 @@ fn union_nullability_is_a_null_leg() {
 
 #[test]
 fn absent_struct_children_read_as_null_without_losing_bottom_fields() {
-    let ty = LogicalType::Struct(BTreeMap::from([
+    let ty = LogicalType::Struct(StructFields::from([
         ("declared".into(), LogicalType::Nothing),
         ("maybe".into(), scalar(ScalarType::I64).maybe()),
     ]));
-    let values = vec![Value::Struct(BTreeMap::from([("declared".into(), Value::Undefined), ("maybe".into(), Value::I64(1))])), Value::Struct(BTreeMap::from([("declared".into(), Value::Undefined)]))];
+    let values = vec![Value::Struct(StructFields::from([("declared".into(), Value::Undefined), ("maybe".into(), Value::I64(1))])), Value::Struct(StructFields::from([("declared".into(), Value::Undefined)]))];
     let array = build_array(&ty, &values).unwrap();
     let field = to_field("x", &ty).unwrap();
     array.to_data().validate_full().unwrap();
-    assert_eq!(read_value(&field, array.as_ref(), 0).unwrap(), Value::Struct(BTreeMap::from([
+    assert_eq!(read_value(&field, array.as_ref(), 0).unwrap(), Value::Struct(StructFields::from([
         ("declared".into(), Value::Undefined), ("maybe".into(), Value::I64(1)),
     ])));
-    assert_eq!(read_value(&field, array.as_ref(), 1).unwrap(), Value::Struct(BTreeMap::from([
+    assert_eq!(read_value(&field, array.as_ref(), 1).unwrap(), Value::Struct(StructFields::from([
         ("declared".into(), Value::Undefined), ("maybe".into(), Value::Null),
     ])));
 }
@@ -219,7 +220,7 @@ fn nested_lists_sets_maps_and_ranges_round_trip() {
     let union = LogicalType::from_legs([scalar(ScalarType::Utf8), scalar(ScalarType::I64), LogicalType::Null]);
     round_trip(LogicalType::List { kind: ListKind::List, element: Box::new(union) }, vec![Value::List(vec![Value::I64(1), Value::Null, Value::Utf8("x".into())]), Value::List(vec![])]);
     round_trip(LogicalType::List { kind: ListKind::Set, element: Box::new(scalar(ScalarType::I64)) }, vec![Value::Set(vec![Value::I64(1), Value::I64(2)])]);
-    let entries = LogicalType::Struct(BTreeMap::from([("key".into(), scalar(ScalarType::Utf8)), ("value".into(), scalar(ScalarType::I64).maybe())]));
+    let entries = LogicalType::Struct(StructFields::from([("key".into(), scalar(ScalarType::Utf8)), ("value".into(), scalar(ScalarType::I64).maybe())]));
     round_trip(LogicalType::List { kind: ListKind::Map { sorted: false }, element: Box::new(entries) }, vec![Value::Map { entries: vec![(Value::Utf8("one".into()), Value::I64(1)), (Value::Utf8("null".into()), Value::Null)], sorted: false }]);
     round_trip(LogicalType::List { kind: ListKind::FixedSizeList(2), element: Box::new(scalar(ScalarType::I64)) }.maybe(), vec![Value::Null, Value::FixedSizeList(vec![Value::I64(1), Value::I64(2)])]);
     round_trip(LogicalType::List { kind: ListKind::TimestampTzRange, element: Box::new(scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })) }, vec![Value::TimestampTzRange { lower: i64::MIN, upper: i64::MAX }]);
@@ -227,8 +228,8 @@ fn nested_lists_sets_maps_and_ranges_round_trip() {
 
 #[test]
 fn null_struct_masks_non_nullable_children() {
-    let ty = LogicalType::Struct(BTreeMap::from([("x".into(), scalar(ScalarType::I64))])).maybe();
-    round_trip(ty, vec![Value::Null, Value::Struct(BTreeMap::from([("x".into(), Value::I64(7))]))]);
+    let ty = LogicalType::Struct(StructFields::from([("x".into(), scalar(ScalarType::I64))])).maybe();
+    round_trip(ty, vec![Value::Null, Value::Struct(StructFields::from([("x".into(), Value::I64(7))]))]);
 }
 
 #[test]
@@ -351,7 +352,7 @@ fn deeply_nested_union_cells_round_trip_promptly() {
     let mut ty = scalar(ScalarType::I64);
     let mut value = Value::I64(7);
     for depth in 0..40 {
-        let other = if depth % 2 == 0 { scalar(ScalarType::Utf8) } else { LogicalType::Struct(BTreeMap::from([("v".into(), scalar(ScalarType::Bool))])) };
+        let other = if depth % 2 == 0 { scalar(ScalarType::Utf8) } else { LogicalType::Struct(StructFields::from([("v".into(), scalar(ScalarType::Bool))])) };
         ty = LogicalType::list(LogicalType::from_legs([ty, other, LogicalType::Null]));
         value = Value::List(vec![value, Value::Null]);
     }

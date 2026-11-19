@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use super::super::super::test_support as support;
 use crate::connect::registry::reader_symbols::SymbolName;
@@ -407,7 +408,7 @@ fn reader_datum_entry_decodes_after_input_factory_recycler_and_context_drop() {
     assert!(budget.used_bytes()>0);
     let mut next = ConversionContext::new(Arc::clone(&budget));
     let converted = connect.decode(&[14], &mut next).unwrap();
-    assert_eq!(converted.value, rtdb_types::Value::Struct(BTreeMap::from([("x".into(), rtdb_types::Value::I32(7))])));
+    assert_eq!(converted.value, rtdb_types::Value::Struct(StructFields::from([("x".into(), rtdb_types::Value::I32(7))])));
     drop(converted);
     drop(datum);
     drop(connect);

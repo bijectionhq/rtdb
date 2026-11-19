@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use std::sync::Arc;
 use rtdb_columnar::MemoryBudget;
@@ -88,7 +89,7 @@ fn reader_union_reordering_does_not_relabel_writer_connect_union_values() {
     let datum = writer.decode_datum(&[0, 14], &mut context).unwrap();
     let datum = super::super::AvroResolution::compile(&writer, &reader, &mut context).unwrap().resolve(datum, &mut context).unwrap();
     let output = writer.connect_plan(None, None, &mut 0, &mut context).unwrap();
-    assert_eq!(output.convert(datum, &mut 0, &mut context).unwrap().value, Value::Struct(BTreeMap::from([("int".into(), Value::I32(7)), ("long".into(), Value::Null)])));
+    assert_eq!(output.convert(datum, &mut 0, &mut context).unwrap().value, Value::Struct(StructFields::from([("int".into(), Value::I32(7)), ("long".into(), Value::Null)])));
 }
 
 #[test]

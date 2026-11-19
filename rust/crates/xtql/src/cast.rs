@@ -258,19 +258,20 @@ fn decimal_field_text(text: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use rtdb_types::StructFields;
     use super::*;
-    use std::collections::BTreeMap;
+    
 
     fn parse(source: &str) -> LogicalType { data_type(&crate::read(source).unwrap()).unwrap() }
 
     #[test]
     fn nested_tagged_struct_and_map_types_preserve_names_nullability_and_sort_metadata() {
-        let element = LogicalType::Struct(BTreeMap::from([
+        let element = LogicalType::Struct(StructFields::from([
             ("key".into(), LogicalType::Scalar(S::Utf8)), ("value".into(), LogicalType::Scalar(S::I64).maybe()),
         ]));
         assert_eq!(parse("[:map [:struct {key :utf8 \"value\" [:? :i64]}]]"), LogicalType::List { kind: ListKind::Map { sorted: false }, element: Box::new(element.clone()) });
         assert_eq!(parse("[:map {:sorted? :truthy} #xt/type [:struct {\"key\" #xt/type :utf8 \"value\" [:? :i64]}]]"), LogicalType::List { kind: ListKind::Map { sorted: true }, element: Box::new(element) });
-        assert_eq!(parse("[:struct {:named :bool nil :null 12 :i32}]"), LogicalType::Struct(BTreeMap::from([
+        assert_eq!(parse("[:struct {:named :bool nil :null 12 :i32}]"), LogicalType::Struct(StructFields::from([
             (":named".into(), LogicalType::Scalar(S::Bool)), ("".into(), LogicalType::Null), ("12".into(), LogicalType::Scalar(S::I32)),
         ])));
     }
@@ -304,7 +305,7 @@ mod tests {
             ("012N", "10"), ("0xFFN", "255"), ("-16rFFN", "-255"), ("+2R101N", "5"),
             ("[012N 0xFFN -16rFFN]", "[10N 255N -255N]"),
         ] { assert_eq!(field_name(&crate::read(source).unwrap()).unwrap(), expected, "{source}"); }
-        assert_eq!(parse("[:struct {012N :i64 [0xFFN] :bool}]"), LogicalType::Struct(BTreeMap::from([
+        assert_eq!(parse("[:struct {012N :i64 [0xFFN] :bool}]"), LogicalType::Struct(StructFields::from([
             ("10".into(), LogicalType::Scalar(S::I64)), ("[255N]".into(), LogicalType::Scalar(S::Bool)),
         ])));
     }

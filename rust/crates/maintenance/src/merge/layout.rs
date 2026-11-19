@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
@@ -212,7 +213,7 @@ impl StreamingTrie {
     }
 }
 
-pub(super) fn normalize(input: &MergeFile, put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>,
+pub(super) fn normalize(input: &MergeFile, put: &Option<StructFields<LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>,
     data_path: &Path, meta_path: &Path, cancellation: &CancellationToken) -> Result<(u64, rtdb_format::log::proto::TrieMetadata)> {
     let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
     let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency };

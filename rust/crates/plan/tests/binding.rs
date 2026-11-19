@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use rtdb_types::StructFields;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use rtdb_plan::*;
 use rtdb_types::{LogicalType, Result, ScalarType, TableRef, Value};
@@ -9,7 +10,7 @@ impl Catalog for CatalogFixture {
     fn databases(&self) -> BTreeSet<String> { BTreeSet::from([self.database.clone()]) }
     fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> {
         Ok((name.database == self.database && name.table == TableRef::new("public", "prices")).then(|| TableBinding {
-            name: name.clone(), oid: Some(self.oid), columns: BTreeMap::from([("price".into(), self.ty.clone())]),
+            name: name.clone(), oid: Some(self.oid), columns: StructFields::from([("price".into(), self.ty.clone())]),
         }))
     }
     fn tables(&self, database: &str) -> Result<Vec<TableBinding>> {
@@ -38,7 +39,7 @@ fn two_part_names_consider_database_and_schema_and_reject_ambiguity() {
         fn default_database(&self) -> &str { "xtdb" }
         fn databases(&self) -> BTreeSet<String> { BTreeSet::from(["xtdb".into(), "public".into()]) }
         fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> {
-            Ok((name.table == TableRef::new("public", "prices")).then(|| TableBinding { name: name.clone(), oid: Some(1), columns: BTreeMap::new() }))
+            Ok((name.table == TableRef::new("public", "prices")).then(|| TableBinding { name: name.clone(), oid: Some(1), columns: StructFields::new() }))
         }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Ok(Vec::new()) }
     }
@@ -112,7 +113,7 @@ fn raw_record_packing_requires_existing_columns_and_unique_output_names() {
     let expression = Expr::RowCopy(vec![field.clone()]);
     assert_eq!(expression.referenced_columns(), BTreeSet::from([field.id]));
     assert_eq!(expression.validate_columns(&BTreeSet::new()).unwrap_err().code, "rtdb.plan/unbound-column");
-    assert_eq!(expression.data_type(), LogicalType::Struct(BTreeMap::from([("x".into(), LogicalType::Null)])));
+    assert_eq!(expression.data_type(), LogicalType::Struct(StructFields::from([("x".into(), LogicalType::Null)])));
     expression.validate_columns(&BTreeSet::from([field.id])).unwrap();
     let duplicate = Expr::RowCopy(vec![field.clone(), field.clone()]);
     assert_eq!(duplicate.validate_columns(&BTreeSet::from([field.id])).unwrap_err().code, "rtdb.plan/duplicate-record-field");

@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use rtdb_types::StructFields;
+use std::collections::BTreeSet;
 use rtdb_plan::{Catalog, QualifiedTable, Statement, TableBinding};
 use rtdb_sql::{PrepareOptions, parse, prepare, prepare_static};
 use rtdb_types::{LogicalType, Result, ScalarType};
@@ -8,7 +9,7 @@ impl Catalog for Fixture {
     fn default_database(&self) -> &str { "xtdb" }
     fn databases(&self) -> BTreeSet<String> { BTreeSet::from(["xtdb".into()]) }
     fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> {
-        Ok(Some(TableBinding { name: name.clone(), oid: Some(16384), columns: BTreeMap::from([
+        Ok(Some(TableBinding { name: name.clone(), oid: Some(16384), columns: StructFields::from([
             ("_id".into(), LogicalType::Scalar(ScalarType::I64)),
             ("foo".into(), LogicalType::Scalar(ScalarType::Utf8)),
         ]) }))

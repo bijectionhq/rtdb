@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, io::{Read, Seek, SeekFrom}, sync::Arc};
+use rtdb_types::StructFields;
+use std::{io::{Read, Seek, SeekFrom}, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use rtdb_columnar::{build_array, from_field, read_value, to_field};
@@ -55,8 +56,8 @@ fn decimal_vector_all_widths_retain_full_scale_across_buffered_and_streaming_ipc
 fn nested_union_list_and_struct_decimals_retain_independent_scales() {
     let (first_type, first) = decimal(128, i32::MIN); let (second_type, second) = decimal(128, i32::MAX);
     let union = LogicalType::from_legs([first_type, second_type, LogicalType::Null]);
-    let ty = LogicalType::Struct(BTreeMap::from([("items".into(), LogicalType::List { kind: ListKind::List, element: Box::new(union) })]));
-    let values = vec![Value::Struct(BTreeMap::from([("items".into(), Value::List(vec![first, Value::Null, second]))]))];
+    let ty = LogicalType::Struct(StructFields::from([("items".into(), LogicalType::List { kind: ListKind::List, element: Box::new(union) })]));
+    let values = vec![Value::Struct(StructFields::from([("items".into(), Value::List(vec![first, Value::Null, second]))]))];
     let page = batch(&ty, &values);
     let bytes = ipc::write_stream(&page.schema(), &[page]).unwrap();
     check(&ipc::ArrowStream::open(bytes.into(), None).unwrap().next().unwrap().unwrap(), &ty, &values);
@@ -88,8 +89,8 @@ fn zero_precision_wide_scale_empty_and_null_pages_preserve_metadata() {
 fn nested_wide_scale_pages_cannot_be_reinterpreted_under_another_schema() {
     let nested = |scale| {
         let (ty, value) = decimal(128, scale);
-        let ty = LogicalType::Struct(BTreeMap::from([("value".into(), ty)]));
-        batch(&ty, &[Value::Struct(BTreeMap::from([("value".into(), value)]))])
+        let ty = LogicalType::Struct(StructFields::from([("value".into(), ty)]));
+        batch(&ty, &[Value::Struct(StructFields::from([("value".into(), value)]))])
     };
     let declared = nested(129); let different = nested(130);
     let schema = declared.schema();

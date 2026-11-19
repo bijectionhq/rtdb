@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_plan::*;
@@ -171,7 +172,7 @@ impl Catalog for Fixture {
     fn default_database(&self) -> &str { "xtdb" }
     fn databases(&self) -> BTreeSet<String> { BTreeSet::from(["xtdb".into(), "archive".into()]) }
     fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> {
-        Ok((name.table.schema == "public").then(|| TableBinding { name: name.clone(), oid: Some(if name.database == "xtdb" { 16384 } else { 20000 }), columns: BTreeMap::from([
+        Ok((name.table.schema == "public").then(|| TableBinding { name: name.clone(), oid: Some(if name.database == "xtdb" { 16384 } else { 20000 }), columns: StructFields::from([
             ("_id".into(), LogicalType::Scalar(ScalarType::I64)),
             ("region".into(), LogicalType::Scalar(ScalarType::Utf8)),
             ("price".into(), LogicalType::Scalar(ScalarType::I64)),

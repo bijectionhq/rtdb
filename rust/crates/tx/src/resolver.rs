@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -314,7 +315,7 @@ impl<'a> OpenTransaction<'a> {
                 hash.update(role.as_bytes());
                 let digest = hash.finalize();
                 let iid = Iid::from_slice(&digest[..16])?;
-                let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(BTreeMap::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
+                let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(StructFields::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
                 return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
             }
         };
@@ -379,7 +380,7 @@ impl<'a> OpenTransaction<'a> {
             Operation::Removed(name) => Err(Anomaly::unsupported(if name == "xtql" { "xtdb/xtql-dml-removed" } else { "xtdb/tx-fns-removed" }, if name == "xtql" { "XTQL DML is no longer supported, as of 2.0.0-beta7. Please use SQL DML statements instead - see the release notes for more information." } else { "tx-fns are no longer supported, as of 2.0.0-beta7. Please use ASSERTs and SQL DML statements instead - see the release notes for more information." })),
         }
     }
-    async fn patch_documents(&mut self, table: &TableRef, documents: &[BTreeMap<String, Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+    async fn patch_documents(&mut self, table: &TableRef, documents: &[StructFields<Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         use rtdb_plan::{Binder, Expr, Relation, RelationNode, Schema, QualifiedTable, TemporalFilter};
         use rtdb_types::{LogicalType, ScalarType};
         if iids.is_some_and(|iids| iids.len() != documents.len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
@@ -387,7 +388,7 @@ impl<'a> OpenTransaction<'a> {
         let bytes = documents.iter().try_fold(65_536usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?.checked_mul(8).ok_or_else(overflow)?).ok_or_else(overflow))?;
         let _reservation = self.context.memory.reserve(bytes)?;
         let mut rows = Vec::with_capacity(documents.len());
-        let mut document_type = LogicalType::Struct(BTreeMap::new());
+        let mut document_type = LogicalType::Struct(StructFields::new());
         for (index, document) in documents.iter().enumerate() {
             let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
             let document = Value::Struct(document.clone());
@@ -426,14 +427,14 @@ impl<'a> OpenTransaction<'a> {
         let table = TableRef::new("xt", "txs");
         let error_column = "error".to_owned();
         let metadata_column = "user_metadata".to_owned();
-        let document = BTreeMap::from([
+        let document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
             ("committed".into(), Value::Bool(result.committed())),
             (metadata_column.clone(), metadata.map(|metadata| metadata.value().clone()).unwrap_or(Value::Null)),
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
-        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &LogicalType::Struct(BTreeMap::new()).maybe())])
+        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &LogicalType::Struct(StructFields::new()).maybe())])
     }
 }
 

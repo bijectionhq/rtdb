@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 
 use rtdb_format::transit::TransitValue;
 use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
@@ -9,7 +9,7 @@ pub(crate) fn map(fields: impl IntoIterator<Item = (&'static str, String)>) -> S
 }
 pub(crate) fn vector(values: impl IntoIterator<Item = String>) -> String { format!("[{}]", values.into_iter().collect::<Vec<_>>().join(" ")) }
 pub(crate) fn instant(micros: i64) -> String { format!("#time/instant {}", quoted(&datetime(i128::from(micros) * 1000, true))) }
-pub(crate) fn document(fields: &BTreeMap<String, Value>) -> Result<String> {
+pub(crate) fn document(fields: &StructFields<Value>) -> Result<String> {
     Ok(format!("{{{}}}", fields.iter().filter(|(_, value)| !matches!(value, Value::Null | Value::Undefined)).map(|(key, value)| Ok(format!("{} {}", key_name(key), render(value)?))).collect::<Result<Vec<_>>>()?.join(", ")))
 }
 pub(crate) fn operation_allocation_bound(value: &rtdb_tx::OperationValue) -> Result<usize> {

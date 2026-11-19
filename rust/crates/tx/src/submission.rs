@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use rtdb_types::StructFields;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rtdb_columnar::MemoryBudget;
@@ -59,7 +60,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     }).max().unwrap_or(0));
     if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
     let parameter_rows: Box<dyn Iterator<Item = &[Value]> + '_> = match args { Some(args) => Box::new(args.rows()), None => Box::new(std::iter::once(&[][..])) };
-    let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<BTreeMap<String, Value>>)> = Vec::new();
+    let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<StructFields<Value>>)> = Vec::new();
     let mut document_charges = Vec::new();
     for parameters in parameter_rows {
         let row_scope = scope.scratch();
@@ -80,7 +81,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
             _ => return Err(Anomaly::incorrect("xtdb/sql-error", "Static PATCH requires ALL or FROM/TO valid time")),
         };
         for row in materialize(&plan.input, &context)? {
-            let mut document: BTreeMap<_, _> = plan.input.schema().fields().iter().zip(row).map(|(field, value)| (field.name.clone(), value)).collect();
+            let mut document: StructFields<_> = plan.input.schema().fields().iter().zip(row).map(|(field, value)| (field.name.clone(), value)).collect();
             let bounds = if matches!(&plan.kind, StaticMutationKind::Patch(_)) { temporal } else {
                 let from = document.remove("_valid_from").filter(|value| !matches!(value, Value::Null | Value::Undefined)).map(|value| rtdb_expr::timestamp_micros(&value, &options.default_tz)).transpose()?;
                 let to = document.remove("_valid_to").filter(|value| !matches!(value, Value::Null | Value::Undefined)).map(|value| rtdb_expr::timestamp_micros(&value, &options.default_tz)).transpose()?;
@@ -147,7 +148,7 @@ mod tests {
         prepare_submission(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (1, ?)".into(), args: Some(args) }], SubmitOptions::default(), "xtdb", memory).unwrap()
     }
 
-    fn document(source: &SourceTransaction) -> &BTreeMap<String, Value> {
+    fn document(source: &SourceTransaction) -> &StructFields<Value> {
         let crate::source::Operation::Public(TxOp::PutDocs { documents, .. }) = &source.operations[0] else { panic!("Expected static documents") };
         &documents.rows()[0]
     }
@@ -190,12 +191,12 @@ mod tests {
     #[test]
     fn static_document_inference_visits_every_nested_decimal_cell() {
         let memory = MemoryBudget::new(1 << 24);
-        let nested = |value: Value| Value::Struct(BTreeMap::from([
+        let nested = |value: Value| Value::Struct(StructFields::from([
             ("list".into(), Value::List(vec![value.clone(), Value::Null])),
             ("set".into(), Value::Set(vec![value.clone()])),
             ("fixed".into(), Value::FixedSizeList(vec![value.clone()])),
             ("map".into(), Value::Map { entries: vec![(value.clone(), value.clone())], sorted: false }),
-            ("struct".into(), Value::Struct(BTreeMap::from([("child".into(), value)]))),
+            ("struct".into(), Value::Struct(StructFields::from([("child".into(), value)]))),
         ]));
         let source = expanded(nested(decimal(18, -1, 129)), &memory);
         assert_eq!(document(&source)["v"], nested(decimal(18, 32, 129)));
@@ -232,7 +233,7 @@ mod argument_tests {
         }
         let source = submit(Some(batch(vec![Value::I64(3), Value::I64(4), Value::I64(5)])));
         let [Operation::Public(TxOp::PutDocs { documents, .. })] = &source.operations[..] else { panic!("expanded documents") };
-        assert_eq!(documents.rows(), &[BTreeMap::from([("_id".into(), Value::I64(3)), ("v".into(), Value::I64(4))])]);
+        assert_eq!(documents.rows(), &[StructFields::from([("_id".into(), Value::I64(3)), ("v".into(), Value::I64(4))])]);
     }
 }
 

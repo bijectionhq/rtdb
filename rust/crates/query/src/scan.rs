@@ -586,6 +586,7 @@ fn page_temporal(columns: &[Value]) -> Option<TemporalSummary> {
 
 #[cfg(test)]
 mod tests {
+    use rtdb_types::StructFields;
     use super::*;
     use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::OuterRows, parameters::BoundParameters};
     use rtdb_format::{block::proto as pb, catalog::BlockCatalog, data::{StoredEvent, StoredOperation, build_event_batch},
@@ -609,7 +610,7 @@ mod tests {
                 iid: Iid([prefix; 16]),
                 system_from: key.system_time,
                 valid_time: Interval::ALL,
-                operation: StoredOperation::Put(BTreeMap::from([("_id".into(), value.clone()), ("v".into(), value)])),
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), value.clone()), ("v".into(), value)])),
                 recency: None,
             }
         }).collect::<Vec<_>>();
@@ -877,7 +878,7 @@ mod tests {
             let key = TransactionKey { tx_id: TxId(tx_id), system_time: basis.system_time };
             let mut write = TransactionBuffer::new(snapshot, key, Arc::clone(&memory)).unwrap();
             let mut event = events[1].clone();
-            event.operation = StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(2)), ("v".into(), Value::I64(value))]));
+            event.operation = StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(2)), ("v".into(), Value::I64(value))]));
             write.append(table.clone(), event).unwrap();
             write.snapshot().unwrap()
         };
@@ -913,7 +914,7 @@ mod tests {
             iid: Iid([0xc0; 16]),
             system_from: key.system_time,
             valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(4)), ("v".into(), Value::I64(4))])),
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(4)), ("v".into(), Value::I64(4))])),
             recency: None,
         }).unwrap();
         let mixed = write.snapshot().unwrap();
@@ -961,7 +962,7 @@ mod tests {
         let write_memory = MemoryBudget::new(1 << 20);
         let put = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
         let mut write = TransactionBuffer::new(state.value().snapshot(), put, Arc::clone(&write_memory)).unwrap();
-        write.put(table.clone(), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(9))]), Interval::from_micros(0, 30).unwrap()).unwrap();
+        write.put(table.clone(), StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(9))]), Interval::from_micros(0, 30).unwrap()).unwrap();
         state.apply(&write.stage().unwrap()).unwrap();
         let delete = TransactionKey { tx_id: TxId(1), system_time: Timestamp(200) };
         let mut write = TransactionBuffer::new(state.value().snapshot(), delete, write_memory).unwrap();

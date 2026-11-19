@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 
 use arrow_array::{Array, FixedSizeListArray, ListArray, RecordBatch, RunArray, StructArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
@@ -15,7 +16,7 @@ impl Mask {
 
 #[derive(Default)]
 struct Statistics {
-    fields: BTreeMap<String, Value>,
+    fields: StructFields<Value>,
     numeric: BTreeMap<&'static str, (f64, f64)>,
     bytes_seen: bool,
     bloom: Option<BloomFilter>,
@@ -60,7 +61,7 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     statistics.fields.insert("root-col?".into(), Value::Bool(root));
     statistics.fields.insert("count".into(), Value::I64(count));
     for (name, (min, max)) in statistics.numeric {
-        let fields = BTreeMap::from([
+        let fields = StructFields::from([
             ("min".into(), if min == f64::INFINITY { Value::Null } else { Value::F64(min) }),
             ("max".into(), if max == f64::NEG_INFINITY { Value::Null } else { Value::F64(max) }),
         ]);
@@ -68,7 +69,7 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     }
     if statistics.bytes_seen {
         let bloom = match statistics.bloom { Some(bloom) => Value::Binary(bloom.to_bytes()?), None => Value::Null };
-        statistics.fields.insert("bytes".into(), Value::Struct(BTreeMap::from([("bloom".into(), bloom)])));
+        statistics.fields.insert("bytes".into(), Value::Struct(StructFields::from([("bloom".into(), bloom)])));
     }
     let index = output.len();
     i32::try_from(index).map_err(invalid)?;

@@ -1,6 +1,7 @@
 mod tape;
 mod transport;
 
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::{Read, Write}, path::Path, sync::{Arc, OnceLock}, time::Duration};
 
 use async_trait::async_trait;
@@ -61,7 +62,7 @@ impl TransactionWriter for AuthoredWriter {
                     iid: EntityId::Uuid(id).iid(),
                     system_from: actual.system_time,
                     valid_time,
-                    operation: StoredOperation::Put(BTreeMap::from([
+                    operation: StoredOperation::Put(StructFields::from([
                         ("_id".into(), Value::Uuid(id)), ("tx_id".into(), Value::I64(actual.tx_id.0)),
                     ])),
                     recency: None,

@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use rtdb_types::{LogicalType as L, PgType as P, RunEndWidth, ScalarType as S};
 
 #[test]
@@ -53,5 +54,5 @@ fn information_schema_type_edn_preserves_nullable_and_nested_layouts() {
     assert_eq!(L::list(L::Scalar(S::I64)).maybe().to_edn().unwrap(), "[:? :list :i64]");
     assert_eq!(L::Scalar(S::I32).run_end_encoded(RunEndWidth::I16).unwrap().to_edn().unwrap(), "[:ree-i16 :i32]");
     assert_eq!(L::Nothing.to_edn().unwrap(), ":nothing");
-    assert_eq!(L::Struct(std::collections::BTreeMap::from([("a".into(), L::Scalar(S::Utf8))])).to_edn().unwrap(), "[:struct {\"a\" :utf8}]");
+    assert_eq!(L::Struct(StructFields::from([("a".into(), L::Scalar(S::Utf8))])).to_edn().unwrap(), "[:struct {\"a\" :utf8}]");
 }

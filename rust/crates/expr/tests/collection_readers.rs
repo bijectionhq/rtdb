@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap,time::Duration};
+use rtdb_types::StructFields;
+use std::time::Duration;
 use rtdb_columnar::MemoryBudget;
 use rtdb_expr::{EvalContext,EvaluationScope,evaluate,evaluate_async,function_type};
 use rtdb_plan::{BinaryOp,CastTarget,Expr,Schema,UnaryOp};
@@ -89,7 +90,7 @@ fn millisecond_date_boxes_preserve_full_days_until_vector_output() {
     let record = Expr::Struct(vec![("date".into(),wide(DateUnit::Millisecond))]);
     assert_eq!(run(&text(field(record.clone(),"date"))).unwrap(),Value::Utf8(CivilDate::MAX.to_string()));
     assert_eq!(run(&text(nth(Expr::List(vec![wide(DateUnit::Millisecond)]),0))).unwrap(),Value::Utf8(CivilDate::MAX.to_string()));
-    assert_eq!(run(&record).unwrap(),Value::Struct(BTreeMap::from([("date".into(),Value::DateMilli(CivilDate::MAX.epoch_day().wrapping_mul(86_400_000)))])));
+    assert_eq!(run(&record).unwrap(),Value::Struct(StructFields::from([("date".into(),Value::DateMilli(CivilDate::MAX.epoch_day().wrapping_mul(86_400_000)))])));
 }
 
 #[test]
@@ -118,7 +119,7 @@ async fn struct_scalar_cells_are_eager_and_not_reevaluated_after_comparison() {
     let other = Expr::Struct(vec![("sleep".into(),literal(Value::Null)),("value".into(),literal(Value::I64(2)))]);
     let expression = call("nullif",vec![record,other]);
     let start = tokio::time::Instant::now();
-    assert_eq!(evaluate_async(&expression,&Schema::default(),&[],&EvalContext::default()).await.unwrap(),Value::Struct(BTreeMap::from([("sleep".into(),Value::Null),("value".into(),Value::I64(1))])));
+    assert_eq!(evaluate_async(&expression,&Schema::default(),&[],&EvalContext::default()).await.unwrap(),Value::Struct(StructFields::from([("sleep".into(),Value::Null),("value".into(),Value::I64(1))])));
     assert_eq!(tokio::time::Instant::now() - start,Duration::from_millis(5));
 }
 

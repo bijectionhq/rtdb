@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -428,7 +429,7 @@ impl NativeSession {
 
     /// Opens a logical relation against the same transaction read basis as SQL and XTQL.
     /// The operation token belongs to this session's cancellation tree.
-    pub async fn query_ra(&mut self, source: &str, arguments: BTreeMap<String, Value>, cancellation: &CancellationToken) -> Result<QueryCursor> {
+    pub async fn query_ra(&mut self, source: &str, arguments: StructFields<Value>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let database = self.state.database().to_owned();
         let context = self.query_context_for(&database, cancellation).await?;
         let overflow = || Anomaly::incorrect("rtdb.query/parameter-size", "Logical relation parameter metadata exceeds addressable memory");

@@ -1,4 +1,5 @@
-use std::{cmp::Ordering, collections::BTreeMap};
+use rtdb_types::StructFields;
+use std::cmp::Ordering;
 use rtdb_expr::{compare, ordered_compare_in_timezone, validate_order_type};
 use rtdb_types::{DecimalValue, IntervalUnit, LogicalType as T, ScalarType as S, Value as V};
 
@@ -34,7 +35,7 @@ fn unsigned_physical_vectors_compare_their_signed_integer_reads() {
 
 #[test]
 fn comparator_type_factory_checks_every_union_pair_and_rejects_nested_values() {
-    for ty in [T::list(T::Null), T::Struct(BTreeMap::new()), V::TimestampTzRange { lower: 0, upper: 1 }.logical_type(), T::Scalar(S::Transit), T::Scalar(S::Oid), T::Scalar(S::F16), T::Scalar(S::I64).join(&T::Scalar(S::Utf8)), T::Scalar(S::Utf8).join(&T::Scalar(S::Uri))] {
+    for ty in [T::list(T::Null), T::Struct(StructFields::new()), V::TimestampTzRange { lower: 0, upper: 1 }.logical_type(), T::Scalar(S::Transit), T::Scalar(S::Oid), T::Scalar(S::F16), T::Scalar(S::I64).join(&T::Scalar(S::Utf8)), T::Scalar(S::Utf8).join(&T::Scalar(S::Uri))] {
         assert_eq!(validate_order_type(&ty).unwrap_err().code, "xtdb.expression/function-type-mismatch");
     }
     for ty in [T::Null, T::Scalar(S::Bool).maybe(), T::Scalar(S::I64).join(&T::Scalar(S::Decimal { precision: 20, scale: 0, bit_width: 128 })).maybe(), T::Scalar(S::Binary).join(&T::Scalar(S::FixedSizeBinary(8)))] {

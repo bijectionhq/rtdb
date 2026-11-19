@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -53,7 +54,7 @@ impl CatalogSnapshot {
         let snapshots = &self.database(database)?.partitions;
         if let Some(definition) = crate::system_schema::definition(table) { return Ok(Some(definition.binding(database))); }
         if !snapshots.iter().any(|snapshot| snapshot.contains_table(table)) { return Ok(None); }
-        let mut columns: Option<BTreeMap<String, LogicalType>> = None;
+        let mut columns: Option<StructFields<LogicalType>> = None;
         let mut oid = None;
         for snapshot in snapshots {
             if !snapshot.contains_table(table) { continue; }

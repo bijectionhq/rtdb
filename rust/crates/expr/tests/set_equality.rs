@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use rtdb_expr::{CompiledExpr, EvalContext, evaluate, evaluate_async, scalar_call, sql_eq, sql_not_eq_in_timezone, strict_eq};
 use rtdb_plan::{BinaryOp as B, Expr, Schema};
 use rtdb_types::{ListKind, LogicalType as L, ScalarType as S, Value as V};
@@ -12,7 +12,7 @@ fn direct_sql_equality_rejects_sets_and_union_child_pairs_before_length_or_value
         (set(),set()),
         (V::List(vec![set()]),V::List(vec![set(),V::I64(1)])),
         (V::List(vec![V::I64(1),set()]),V::List(vec![set(),V::I64(2)])),
-        (V::Struct(BTreeMap::from([("a".into(),set())])),V::Struct(BTreeMap::from([("a".into(),set())]))),
+        (V::Struct(StructFields::from([("a".into(),set())])),V::Struct(StructFields::from([("a".into(),set())]))),
     ] {
         assert_eq!(sql_eq(&left,&right, &equality_scope()).unwrap_err().code,"xtdb.expression/set-equality");
         assert!(sql_not_eq_in_timezone(&left,&right,"UTC", &equality_scope()).is_err());
@@ -20,7 +20,7 @@ fn direct_sql_equality_rejects_sets_and_union_child_pairs_before_length_or_value
     }
     assert_eq!(sql_eq(&V::Null,&set(), &equality_scope()).unwrap(),None);
     assert_eq!(sql_eq(&set(),&V::I64(1), &equality_scope()).unwrap(),Some(false));
-    assert_eq!(sql_eq(&V::Struct(BTreeMap::from([("a".into(),set())])),&V::Struct(BTreeMap::from([("b".into(),set())])), &equality_scope()).unwrap(),Some(false));
+    assert_eq!(sql_eq(&V::Struct(StructFields::from([("a".into(),set())])),&V::Struct(StructFields::from([("b".into(),set())])), &equality_scope()).unwrap(),Some(false));
     assert!(strict_eq(&set(),&set(), &equality_scope()).unwrap());
 }
 

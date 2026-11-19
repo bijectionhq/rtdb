@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use rtdb_columnar::MemoryBudget;
 use serde_json::json;
@@ -92,7 +93,7 @@ fn connect_reader_bridge_only_converts_the_surviving_duplicate_value() {
     let datum = writer.decode_datum(&[4, 2, 0x80, 0, 2, 2, 0x80, 2, 2, b'x', 0], &mut context).unwrap();
     let datum = AvroResolution::compile(&writer, &reader, &mut context).unwrap().resolve(datum, &mut context).unwrap();
     let output = writer.connect_plan(None, None, &mut 0, &mut context).unwrap().convert(datum, &mut 0, &mut context).unwrap();
-    assert_eq!(output.value, Value::Map { entries: vec![(Value::Utf8("�".into()), Value::Struct(BTreeMap::from([("int".into(), Value::Null), ("string".into(), Value::Utf8("x".into()))])))], sorted: false });
+    assert_eq!(output.value, Value::Map { entries: vec![(Value::Utf8("�".into()), Value::Struct(StructFields::from([("int".into(), Value::Null), ("string".into(), Value::Utf8("x".into()))])))], sorted: false });
 }
 
 #[test]
@@ -120,7 +121,7 @@ fn nested_record_array_union_maps_keep_raw_key_identity() {
     assert_eq!(schema.to_json_datum(datum, &mut context).unwrap(), json!({"maps":[{"map":{"�":1}}]}));
     let datum = schema.decode_datum(&bytes, &mut context).unwrap();
     let output = schema.connect_plan(None, None, &mut 0, &mut context).unwrap().convert(datum, &mut 0, &mut context).unwrap();
-    assert_eq!(output.value, Value::Struct(BTreeMap::from([("maps".into(), Value::List(vec![Value::Map { entries: vec![(Value::Utf8("�".into()), Value::I64(1))], sorted: false }]))])));
+    assert_eq!(output.value, Value::Struct(StructFields::from([("maps".into(), Value::List(vec![Value::Map { entries: vec![(Value::Utf8("�".into()), Value::I64(1))], sorted: false }]))])));
 }
 
 #[test]

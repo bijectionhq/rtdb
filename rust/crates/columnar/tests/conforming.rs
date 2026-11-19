@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, NullArray, RecordBatch, StringArray, StructArray, UnionArray};
@@ -78,7 +79,7 @@ fn adapting_struct_order_preserves_declared_metadata_and_values() {
     let memory = MemoryBudget::new(1 << 22);
     let fields = vec![Field::new("z", DataType::Int64, false), Field::new("a", DataType::Utf8, false)].into();
     let target = Schema::new(vec![Field::new("v", DataType::Struct(fields), false).with_metadata(std::collections::HashMap::from([("caller".into(), "retained".into())]))]);
-    let value = Value::Struct(std::collections::BTreeMap::from([("z".into(), Value::I64(7)), ("a".into(), Value::Utf8("text".into()))]));
+    let value = Value::Struct(StructFields::from([("z".into(), Value::I64(7)), ("a".into(), Value::Utf8("text".into()))]));
     let logical = value.logical_type();
     let source = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("v", &logical).unwrap()])), vec![copy_array(&logical, &[value.clone()]).unwrap()]).unwrap();
     let page = conform_batch(OwnedBatch::new(source, &memory).unwrap(), &target, &memory).unwrap();
@@ -163,7 +164,7 @@ fn nullable_scalar_wrapping_selects_the_declared_null_leg() {
 #[test]
 fn nested_list_layout_keeps_child_names_metadata_and_retained_buffers() {
     let memory = MemoryBudget::new(1 << 23);
-    let value = Value::List(vec![Value::Struct(std::collections::BTreeMap::from([("a".into(), Value::I64(5)), ("z".into(), Value::Utf8("nested".into()))]))]);
+    let value = Value::List(vec![Value::Struct(StructFields::from([("a".into(), Value::I64(5)), ("z".into(), Value::Utf8("nested".into()))]))]);
     let logical = value.logical_type();
     let source = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("v", &logical).unwrap()])), vec![copy_array(&logical, &[value.clone()]).unwrap()]).unwrap();
     let child = Field::new("items", DataType::Struct(vec![Field::new("z", DataType::Utf8, false), Field::new("a", DataType::Int64, false)].into()), false)

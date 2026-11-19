@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use rtdb_columnar::MemoryBudget;
 use rtdb_pg_codec::{Format, SessionEnvironment, decode, encode, encode_value, read_text};
 use rtdb_types::{PgType, TimeUnit, Value};
@@ -232,12 +232,12 @@ fn text_arrays_keep_quoted_null_distinct_and_binary_null_read_is_unsupported() {
 #[test]
 fn json_keeps_large_integer_and_decimal_digits_and_jsonb_requires_version_one() {
     let decimal = read_text(1700, "123456789012345678901234567890.1234").unwrap();
-    let value = Value::Struct(BTreeMap::from([("n".into(), decimal)]));
+    let value = Value::Struct(StructFields::from([("n".into(), decimal)]));
     let json = output(PgType::Json, Format::Text, &value);
     assert_eq!(json, br#"{"n":123456789012345678901234567890.1234}"#);
     let memory = MemoryBudget::new(1 << 20);
     let mut binary = vec![1]; binary.extend_from_slice(&json);
-    assert_eq!(decode(PgType::Jsonb, Format::Binary, &binary, &memory).unwrap().value(), &Value::Struct(BTreeMap::from([("n".into(), Value::F64(123456789012345678901234567890.1234))])));
+    assert_eq!(decode(PgType::Jsonb, Format::Binary, &binary, &memory).unwrap().value(), &Value::Struct(StructFields::from([("n".into(), Value::F64(123456789012345678901234567890.1234))])));
     binary[0] = 2;
     assert_eq!(decode(PgType::Jsonb, Format::Binary, &binary, &memory).err().unwrap().code, "xtdb.pgwire/unsupported-jsonb-version");
 }
@@ -349,7 +349,7 @@ fn fixed_size_binary_columns_are_bytea_with_lowercase_hex_text_and_raw_binary() 
 
 #[test]
 fn rendered_structs_omit_their_null_fields_as_the_reference_reads_them() {
-    let value = Value::Struct(BTreeMap::from([("a".into(), Value::I64(1)), ("b".into(), Value::Null), ("c".into(), Value::List(vec![Value::Struct(BTreeMap::from([("d".into(), Value::Null)]))]))]));
+    let value = Value::Struct(StructFields::from([("a".into(), Value::I64(1)), ("b".into(), Value::Null), ("c".into(), Value::List(vec![Value::Struct(StructFields::from([("d".into(), Value::Null)]))]))]));
     for format in [Format::Text, Format::Binary] {
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&output(PgType::Json, format, &value)).unwrap(), serde_json::json!({"a": 1, "c": [{}]}));
     }

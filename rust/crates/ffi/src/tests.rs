@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::sync::{Arc, Barrier};
 use arrow_array::{Array, Int64Array, RecordBatch, StructArray, ffi::from_ffi};
 use arrow_schema::{DataType, Field, Schema};
@@ -801,7 +802,7 @@ fn metadata_schema_keeps_adbc_field_order_and_nullability() {
 
 #[test]
 fn clojure_result_transit_omits_null_struct_fields_and_keeps_narrow_numbers() {
-    let value = rtdb_types::Value::Struct(std::collections::BTreeMap::from([("missing".into(), rtdb_types::Value::Null), ("small".into(), rtdb_types::Value::I8(5))]));
+    let value = rtdb_types::Value::Struct(StructFields::from([("missing".into(), rtdb_types::Value::Null), ("small".into(), rtdb_types::Value::I8(5))]));
     let wire = transit::encode(&value).unwrap();
     let decoded = rtdb_pg_codec::from_transit(rtdb_format::transit::decode_json(&wire).unwrap()).unwrap();
     let rtdb_types::Value::Struct(fields) = decoded else { panic!() };

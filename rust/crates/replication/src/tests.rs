@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
 use std::time::Duration;
@@ -341,7 +342,7 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
     let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&fixture.memory)).unwrap();
     let table = TableRef::new("public", "docs");
-    for id in 0..8 { write.put(table.clone(), BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(id))]), Interval::ALL).unwrap(); }
+    for id in 0..8 { write.put(table.clone(), StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(id))]), Interval::ALL).unwrap(); }
     state.apply(&write.stage().unwrap()).unwrap();
     fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key })), None).unwrap();
     fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
@@ -403,7 +404,7 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     let handle = fixture.handle.clone();
     let blocks = Arc::clone(&fixture.blocks);
     let writer = tokio::spawn(fixture.driver.run());
-    let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("value".into()))])], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
+    let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("value".into()))])], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
     let position = handle.submit_source_encoded(transaction.encode().unwrap().into_bytes(), Timestamp(100)).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), handle.await_tx(TxId(position.0), &CancellationToken::new())).await.unwrap().unwrap();
     let mut status = handle.watch_status();
@@ -443,7 +444,7 @@ async fn next_local_record(tail: &mut dyn rtdb_storage::log::LogTail) -> LogReco
 }
 
 async fn submit_recovery_row(handle: &ReplicationHandle, memory: &Arc<MemoryBudget>, id: i64, time: i64) -> SourcePosition {
-    let documents = Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(id))])], memory).unwrap();
+    let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::I64(id))])], memory).unwrap();
     let tx = SourceTransaction::new(vec![TxOp::PutDocs {
         table: TableRef::new("public", "docs"), documents, valid_from: Some(Timestamp(0)), valid_to: None,
     }], SubmitOptions::default(), memory).unwrap();

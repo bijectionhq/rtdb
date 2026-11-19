@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
@@ -322,11 +322,11 @@ fn node_value(node: &MetadataNode) -> Result<(&'static str, Value)> {
     Ok(match node {
         MetadataNode::Nil => ("nil", Value::Null),
         MetadataNode::IidBranch(children) => ("branch-iid", Value::List(children.iter().map(|child| child.map(|child| i32::try_from(child).map(Value::I32).map_err(invalid)).unwrap_or(Ok(Value::Null))).collect::<Result<_>>()?)),
-        MetadataNode::RecencyBranch(children) => ("branch-recency", Value::List(children.iter().map(|(upper, child)| Ok(Value::Struct(BTreeMap::from([
+        MetadataNode::RecencyBranch(children) => ("branch-recency", Value::List(children.iter().map(|(upper, child)| Ok(Value::Struct(StructFields::from([
             ("max-recency".into(), Value::Timestamp { value: upper.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }),
             ("idx".into(), Value::I32(i32::try_from(*child).map_err(invalid)?)),
         ])))).collect::<Result<_>>()?)),
-        MetadataNode::Leaf { data_page_index, columns } => ("leaf", Value::Struct(BTreeMap::from([
+        MetadataNode::Leaf { data_page_index, columns } => ("leaf", Value::Struct(StructFields::from([
             ("data-page-idx".into(), Value::I32(i32::try_from(*data_page_index).map_err(invalid)?)),
             ("columns".into(), Value::List(columns.clone())),
         ]))),
@@ -372,7 +372,7 @@ fn child_index(value: i32, parent: usize) -> Result<usize> {
     Ok(child)
 }
 
-fn required<'a>(fields: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a Value> {
+fn required<'a>(fields: &'a StructFields<Value>, key: &str) -> Result<&'a Value> {
     fields.get(key).ok_or_else(|| invalid(format!("Missing metadata field: {key}")))
 }
 

@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use crate::{arithmetic_in_timezone, compare::predicate_order, functions::scalar_call};
 use crate::compare::{nullish,sql_eq_scoped,sql_not_eq_scoped};
 use crate::numeric::{inapplicable, integer, integer_value, number, overflow};
@@ -360,7 +361,7 @@ macro_rules! expression_body {
             Ok(Value::List(values))
         }
         Expr::Struct(fields) => {
-            let mut values = std::collections::BTreeMap::new();
+            let mut values = StructFields::new();
             for (name, expr) in fields {
                 context.reserve(name.len().checked_add(4096).ok_or_else(overflow)?)?;
                 let mut value = $eval!(expr)?;

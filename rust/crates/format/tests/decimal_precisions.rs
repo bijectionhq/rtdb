@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, io::{Read, Seek, SeekFrom}, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
@@ -56,9 +57,9 @@ fn nested_unions_and_run_ends_preserve_independent_precision_carriers() {
     let (first_type, first) = decimal(256, i32::MIN, 128);
     let (second_type, second) = decimal(i32::MAX, i32::MAX, 128);
     let union = LogicalType::from_legs([first_type, second_type, LogicalType::Null]);
-    let structure = LogicalType::Struct(BTreeMap::from([("items".into(), LogicalType::list(union))]));
+    let structure = LogicalType::Struct(StructFields::from([("items".into(), LogicalType::list(union))]));
     let logical = LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(structure) };
-    let value = Value::Struct(BTreeMap::from([("items".into(), Value::List(vec![first, Value::Null, second]))]));
+    let value = Value::Struct(StructFields::from([("items".into(), Value::List(vec![first, Value::Null, second]))]));
     let values = [value.clone(), value]; let page = batch(&logical, &values);
     let bytes = ipc::write_stream(&page.schema(), &[page]).unwrap();
     check(&ipc::ArrowStream::open(bytes.into(), None).unwrap().next().unwrap().unwrap(), &logical, &values);
@@ -68,7 +69,7 @@ fn nested_unions_and_run_ends_preserve_independent_precision_carriers() {
 fn differing_full_precisions_are_rejected_before_incremental_writer_effects() {
     let nested = |precision| {
         let (logical, value) = decimal(precision, 129, 128);
-        batch(&LogicalType::Struct(BTreeMap::from([("decimal".into(), logical)])), &[Value::Struct(BTreeMap::from([("decimal".into(), value)]))])
+        batch(&LogicalType::Struct(StructFields::from([("decimal".into(), logical)])), &[Value::Struct(StructFields::from([("decimal".into(), value)]))])
     };
     let declared = nested(256); let different = nested(257); let schema = declared.schema();
     assert!(ipc::write_file(&schema, std::slice::from_ref(&different)).is_err());
@@ -100,15 +101,15 @@ fn stored_event_copy_keeps_decimal_metadata_and_rejects_relabeling() {
         let (logical, value) = decimal(precision, i32::MIN, 128);
         let fields = BTreeMap::from([("value".into(), logical.clone())]);
         let events = [StoredEvent { iid: Iid([42; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("value".into(), value)])), recency: None }];
-        if precision < 3 { assert!(build_event_batch(&events, Some(fields.clone()), None).is_err()); }
-        let page = copy_event_batch(&events, Some(fields.clone()), Some(RunEndWidth::I32)).unwrap();
+            operation: StoredOperation::Put(StructFields::from([("value".into(), value)])), recency: None }];
+        if precision < 3 { assert!(build_event_batch(&events, Some(fields.clone().into()), None).is_err()); }
+        let page = copy_event_batch(&events, Some(fields.clone().into()), Some(RunEndWidth::I32)).unwrap();
         assert_eq!(EventBatch::new(page).unwrap().read_event(0).unwrap(), events[0]);
-        let empty = copy_event_batch_with_recency(&[], Some(fields.clone()), None, true).unwrap();
+        let empty = copy_event_batch_with_recency(&[], Some(fields.clone().into()), None, true).unwrap();
         assert_eq!(empty.num_rows(), 0);
         assert!(empty.schema().index_of("_recency").is_ok());
         let wrong = BTreeMap::from([("value".into(), LogicalType::Scalar(ScalarType::Decimal { precision: precision.wrapping_add(1), scale: i32::MIN, bit_width: 128 }))]);
-        assert!(copy_event_batch(&events, Some(wrong), None).is_err());
-        assert!(copy_event_batch(&events, Some(BTreeMap::new()), None).is_err());
+        assert!(copy_event_batch(&events, Some(wrong.into()), None).is_err());
+        assert!(copy_event_batch(&events, Some(StructFields::new()), None).is_err());
     }
 }

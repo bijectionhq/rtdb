@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_format::basis::{decode_time_basis, encode_time_basis};
@@ -18,7 +19,7 @@ fn context() -> Arc<QueryContext> {
     let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
     for (id, at, value) in [(0, 100, "old"), (1, 200, "new")] {
         let mut tx = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(id), system_time: Timestamp(at) }, Arc::clone(&memory)).unwrap();
-        tx.put(TableRef::new("public", "foo"), BTreeMap::from([("_id".into(), V::I64(1)), ("v".into(), V::Utf8(value.into()))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
+        tx.put(TableRef::new("public", "foo"), StructFields::from([("_id".into(), V::I64(1)), ("v".into(), V::Utf8(value.into()))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
         state.apply(&tx.stage().unwrap()).unwrap();
     }
     let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };

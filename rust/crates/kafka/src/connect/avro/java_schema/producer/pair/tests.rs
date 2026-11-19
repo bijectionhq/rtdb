@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use super::super::super::test_support as support;
 
@@ -212,7 +213,7 @@ fn admitted_datum_assembly_runs_through_the_real_connect_plan_and_decode_owner()
     let physical = datum.decode_datum(&[14], &mut next).unwrap();
     assert_eq!(physical.value, Avro::Record(vec![("x".into(), Avro::Int(7))]));
     let converted = connect.convert(physical, &mut 0, &mut next).unwrap();
-    assert_eq!(converted.value, rtdb_types::Value::Struct(BTreeMap::from([("x".into(), rtdb_types::Value::I32(7))])));
+    assert_eq!(converted.value, rtdb_types::Value::Struct(StructFields::from([("x".into(), rtdb_types::Value::I32(7))])));
     assert_eq!(converted.schema.as_ref().unwrap().version, Some(3));
     assert!(next.retains(&datum.source.as_ref().unwrap().completion));
     drop(datum);
@@ -358,7 +359,7 @@ fn cross_plan_output_keeps_both_admitted_source_families_in_the_conversion_scope
     let (selected, datum) = actual.prepare_output(&target, datum, &mut next).unwrap();
     assert_eq!(selected, AvroOutput::Reader { branch: None });
     let output = connect.convert(datum, &mut 0, &mut next).unwrap();
-    assert_eq!(output.value, rtdb_types::Value::Struct(BTreeMap::from([("x".into(), rtdb_types::Value::I32(7))])));
+    assert_eq!(output.value, rtdb_types::Value::Struct(StructFields::from([("x".into(), rtdb_types::Value::I32(7))])));
     assert!(next.retains(&actual.source.as_ref().unwrap().completion));
     assert!(next.retains(&target.source.as_ref().unwrap().completion));
     assert_eq!(Arc::strong_count(&actual.source.as_ref().unwrap().completion), 2);

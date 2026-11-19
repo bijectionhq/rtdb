@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path, sync::{Arc, atomic::AtomicI64}, time::Duration};
+use std::{path::Path, sync::{Arc, atomic::AtomicI64}, time::Duration};
 
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_format::{envelope::{SourceBody, SourceMessage}, ipc::read_stream, transit::{TransitValue, decode_msgpack}};
@@ -9,6 +9,7 @@ use rtdb_tx::{Documents, SourceTransaction, SubmitOptions, TxOp};
 use rtdb_types::{BlockIndex, SourcePosition, TableRef, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
+use rtdb_types::StructFields;
 use super::{Error, FixtureClock, Identity, Reads, RunningNode, combine, flush};
 
 const FIRST_TIME: Timestamp = Timestamp(1_000_000);
@@ -64,7 +65,7 @@ fn replace_first_put_iids(message: &mut SourceMessage, iids: &[[u8; 16]]) -> Res
 }
 
 fn put(memory: &Arc<MemoryBudget>, table: &str, rows: &[([u8; 16], &str)]) -> Result<TxOp, Error> {
-    let documents = rows.iter().map(|(id, label)| BTreeMap::from([
+    let documents = rows.iter().map(|(id, label)| StructFields::from([
         ("_id".into(), Value::Uuid(*id)),
         ("label".into(), Value::Utf8((*label).into())),
     ])).collect();

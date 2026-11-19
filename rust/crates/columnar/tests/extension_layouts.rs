@@ -1,4 +1,5 @@
-use std::{collections::{BTreeMap, HashMap}, sync::Arc};
+use rtdb_types::StructFields;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, ListArray, RecordBatch, UnionArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
@@ -17,7 +18,7 @@ fn source(value: &Value) -> RecordBatch {
 #[test]
 fn set_children_keep_declared_struct_order_names_and_metadata() {
     let memory = MemoryBudget::new(1 << 23);
-    let value = Value::Set(vec![Value::Struct(BTreeMap::from([("a".into(), Value::I64(7)), ("z".into(), Value::Utf8("last".into()))]))]);
+    let value = Value::Set(vec![Value::Struct(StructFields::from([("a".into(), Value::I64(7)), ("z".into(), Value::Utf8("last".into()))]))]);
     let child = Field::new("members", DataType::Struct(vec![Field::new("z", DataType::Utf8, false), Field::new("a", DataType::Int64, false)].into()), false)
         .with_metadata(HashMap::from([("child-origin".into(), "declared".into())]));
     let target = Schema::new(vec![extension("v", DataType::List(Arc::new(child)), "set")]);

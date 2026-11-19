@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 use parking_lot::Mutex;
 use arrow_schema::Schema as ArrowSchema;
 use rtdb_columnar::{DeclaredBatch, MemoryReservation, OwnedBatch, conform_batch};
@@ -9,6 +9,7 @@ use rtdb_sql::{AdmittedControl, parse_admitted_control_in};
 use rtdb_tx::{Documents, SqlArguments, TxOp};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
+use rtdb_types::StructFields;
 use crate::{arrow::ImportedRows, region::EmbeddedRegion};
 
 pub(crate) struct SessionHandle {
@@ -209,7 +210,7 @@ impl StatementHandle {
                     let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;
                     let bytes = bound.arguments.rows().try_fold(4096, |bytes, row| bound.names.iter().zip(row).try_fold(bytes, |bytes, (name, value)| super::add(bytes, super::add(super::add(value.retained_bytes()?, name.len())?, node)?)))?;
                     let _scratch = self.session.region.memory().reserve(super::mul(bytes, 2)?)?;
-                    let rows = bound.arguments.rows().map(|row| bound.names.iter().cloned().zip(row.iter().cloned().map(|mut value| { rtdb_columnar::admit_execution_value(&mut value); value })).collect::<BTreeMap<_, _>>()).collect();
+                    let rows = bound.arguments.rows().map(|row| bound.names.iter().cloned().zip(row.iter().cloned().map(|mut value| { rtdb_columnar::admit_execution_value(&mut value); value })).collect::<StructFields<_>>()).collect();
                     let operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, self.session.region.memory())?, valid_from: None, valid_to: None };
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(count)

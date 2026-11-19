@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap,sync::Arc};
 use rtdb_columnar::{MemoryBudget,read_value};
 use rtdb_plan::{BinaryOp,Expr,RelationNode,Statement,UnaryOp};
@@ -24,10 +25,10 @@ async fn query(source: &str,arguments: Vec<V>) -> Result<Vec<Vec<V>>> {
     drop(cursor);assert_eq!(context.memory.used_bytes(),0);Ok(rows)
 }
 fn object() -> V {
-    V::Struct(BTreeMap::from([
+    V::Struct(StructFields::from([
         ("age".into(),V::I64(25)),("name".into(),V::Utf8("Alice".into())),("Camel".into(),V::I64(7)),
-        ("nested".into(),V::Struct(BTreeMap::from([("inner".into(),V::I64(42))]))),
-        ("items".into(),V::List(vec![V::I64(10),V::Struct(BTreeMap::from([("answer".into(),V::I64(42))]))])),
+        ("nested".into(),V::Struct(StructFields::from([("inner".into(),V::I64(42))]))),
+        ("items".into(),V::List(vec![V::I64(10),V::Struct(StructFields::from([("answer".into(),V::I64(42))]))])),
     ]))
 }
 

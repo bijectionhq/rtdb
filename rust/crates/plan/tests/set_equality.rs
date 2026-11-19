@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use rtdb_plan::{BinaryOp, Expr, function_type, validate_equality_types};
 use rtdb_types::{ListKind, LogicalType as L, ScalarType as S};
 
 fn set() -> L { L::List { kind: ListKind::Set, element: Box::new(L::Scalar(S::I64)) } }
-fn record(name: &str, value: L) -> L { L::Struct(BTreeMap::from([(name.into(),value)])) }
+fn record(name: &str, value: L) -> L { L::Struct(StructFields::from([(name.into(),value)])) }
 
 #[test]
 fn set_equality_admits_all_nested_declared_pairs_before_values_are_available() {

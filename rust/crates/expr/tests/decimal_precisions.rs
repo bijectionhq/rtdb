@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use rtdb_expr::{arithmetic, decimal_rescale, decimal_sum, decimal_text};
 use rtdb_plan::BinaryOp;
 use rtdb_types::{DecimalValue, Value};
@@ -105,7 +106,7 @@ fn computed_projections_write_selected_decimal_results_but_identity_copies_raw_c
     let row = [value.clone()];
     assert_eq!(evaluate_projection(&column, &schema, &row, &context).unwrap(), value);
     let packed = Expr::RowCopy(schema.fields().to_vec());
-    assert_eq!(evaluate_projection(&packed, &schema, &row, &context).unwrap(), Value::Struct(std::collections::BTreeMap::from([("v".into(), value.clone())])));
+    assert_eq!(evaluate_projection(&packed, &schema, &row, &context).unwrap(), Value::Struct(StructFields::from([("v".into(), value.clone())])));
     assert!(evaluate_projection(&Expr::Coalesce(vec![packed, Expr::Literal(Value::Null)]), &schema, &row, &context).is_err());
     let default_cast = Expr::Cast { expr: Box::new(column.clone()), target: CastTarget::DecimalDefault };
     let fixed_cast = Expr::Cast { expr: Box::new(column.clone()), target: CastTarget::fixed(ty.clone()) };
@@ -162,7 +163,7 @@ fn projection_rejects_nonpositive_precision_and_checks_nested_cells_only_when_wr
         let cast = Expr::Cast { expr: Box::new(parameter), target: CastTarget::fixed(ty.clone()) };
         assert!(evaluate_projection(&cast, &Schema::default(), &[], &EvalContext { parameters: &[value.clone()], ..Default::default() }).is_err());
         assert_eq!(evaluate_projection(&cast, &Schema::default(), &[], &EvalContext { parameters: &[Value::Null], ..Default::default() }).unwrap(), Value::Null);
-        let nested = Value::List(vec![Value::Struct(std::collections::BTreeMap::from([("v".into(), value)]))]);
+        let nested = Value::List(vec![Value::Struct(StructFields::from([("v".into(), value)]))]);
         let schema = Schema::new(vec![Field { id: ColumnId(0), name: "nested".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: nested.logical_type() }]).unwrap();
         let column = schema.fields()[0].expression();
         assert_eq!(evaluate_projection(&column, &schema, &[nested.clone()], &EvalContext::default()).unwrap(), nested);

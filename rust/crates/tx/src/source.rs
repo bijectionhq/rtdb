@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -153,12 +154,12 @@ impl SourceTransaction {
 }
 
 struct SourceOperation<'a> {
-    body: BTreeMap<String, Value>,
+    body: StructFields<Value>,
     documents: Option<(String, &'a Documents)>,
 }
 
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
-    let mut body = BTreeMap::new();
+    let mut body = StructFields::new();
     let mut docs = None;
     let tag = match operation {
         Operation::Public(TxOp::Sql { sql, args }) => {
@@ -202,7 +203,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
     Ok((tag.into(), SourceOperation { body, documents: docs }))
 }
 
-pub(crate) fn document_id(document: &BTreeMap<String, Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
+pub(crate) fn document_id(document: &StructFields<Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
     if let Some(id) = document.get("_id").filter(|id| !matches!(id, Value::Null | Value::Undefined)) {
         return id.entity_id();
     }
@@ -465,7 +466,7 @@ fn iids(value: Value) -> Result<Vec<Iid>> {
     let Value::List(values) = value else { return Err(invalid("IIDs must be a list")); };
     values.into_iter().map(|value| match value { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes), _ => Err(invalid("IID must be fixed-size binary")) }).collect()
 }
-fn time_fields(body: &mut BTreeMap<String, Value>, from: Option<Timestamp>, to: Option<Timestamp>) {
+fn time_fields(body: &mut StructFields<Value>, from: Option<Timestamp>, to: Option<Timestamp>) {
     let time = |time: Option<Timestamp>| time.map(|time| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).unwrap_or(Value::Null);
     body.insert("_valid_from".into(), time(from)); body.insert("_valid_to".into(), time(to));
 }
@@ -509,12 +510,12 @@ mod tests {
     fn document_union_keeps_first_seen_column_order_per_table_through_replay() {
         let memory = budget();
         let operation = |table, id, names: &[&str], cells: &[(&str, Value)]| {
-            let mut row = BTreeMap::from([("_id".to_owned(), Value::I64(id))]);
+            let mut row = StructFields::from([("_id".to_owned(), Value::I64(id))]);
             row.extend(cells.iter().map(|(name, value)| ((*name).to_owned(), value.clone())));
             let columns = names.iter().map(|name| (*name).to_owned()).collect();
             TxOp::PutDocs {
                 table: TableRef::new("public", table),
-                documents: Documents::with_column_order(vec![row], columns, &memory).unwrap(),
+                documents: Documents::with_column_order(vec![row.into()], columns, &memory).unwrap(),
                 valid_from: None,
                 valid_to: None,
             }
@@ -548,7 +549,7 @@ mod tests {
     fn source_writes_sparse_document_columns_with_one_column_of_builder_scratch() {
         let memory = MemoryBudget::new(1 << 27);
         let rows = (0..100).map(|id| {
-            let mut row = BTreeMap::from([("_id".into(), Value::I64(id))]);
+            let mut row = StructFields::from([("_id".into(), Value::I64(id))]);
             for index in 0..10 {
                 row.insert(format!("field_{id}_{index}"), Value::Utf8("value".into()));
             }
@@ -569,13 +570,13 @@ mod tests {
     fn source_reads_sparse_documents_with_one_row_of_decode_scratch() {
         let memory = MemoryBudget::new(1 << 25);
         let operations = (0..100).map(|id| {
-            let mut row = BTreeMap::from([("_id".into(), Value::I64(id))]);
+            let mut row = StructFields::from([("_id".into(), Value::I64(id))]);
             for index in 0..10 {
                 row.insert(format!("field_{id}_{index}"), Value::Utf8(format!("value_{id}_{index}")));
             }
             TxOp::PutDocs {
                 table: TableRef::new("public", "wide_docs"),
-                documents: Documents::new(vec![row], &memory).unwrap(),
+                documents: Documents::new(vec![row.into()], &memory).unwrap(),
                 valid_from: None,
                 valid_to: None,
             }
@@ -597,7 +598,7 @@ mod tests {
     fn ordered_documents_reject_duplicate_columns_and_unrepresented_fields() {
         let memory = budget();
         for names in [vec!["a", "a"], vec!["b"]] {
-            let rows = vec![BTreeMap::from([("a".into(), Value::I64(1))])];
+            let rows = vec![StructFields::from([("a".into(), Value::I64(1))])];
             let columns = names.into_iter().map(str::to_owned).collect();
             let error = Documents::with_column_order(rows, columns, &memory).unwrap_err();
             assert_eq!(error.code, "rtdb.tx/document-schema");
@@ -608,7 +609,7 @@ mod tests {
     #[test]
     fn replay_keeps_explicit_put_and_patch_iids_even_when_the_document_id_hash_differs() {
         let memory = budget();
-        let documents = Documents::new(vec![BTreeMap::from([("_id".into(), Value::Utf8("different-id".into()))])], &memory).unwrap();
+        let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::Utf8("different-id".into()))])], &memory).unwrap();
         let table = TableRef::new("public", "docs");
         let iid = Iid([42; 16]);
         assert_ne!(iid, EntityId::String("different-id".into()).iid());
@@ -669,7 +670,7 @@ mod tests {
     #[test]
     fn empty_metadata_bytes_are_absent_and_present_metadata_keeps_its_types() {
         let memory = budget();
-        let value = Value::Struct(BTreeMap::from([("source".into(), Value::Utf8("client".into())), ("attempt".into(), Value::I64(2))]));
+        let value = Value::Struct(StructFields::from([("source".into(), Value::Utf8("client".into())), ("attempt".into(), Value::I64(2))]));
         let source = SourceTransaction::new(vec![], SubmitOptions { user_metadata: Some(UserMetadata::new(value.clone(), &memory).unwrap()), ..SubmitOptions::default() }, &memory).unwrap();
         assert_eq!(roundtrip(&source).options.user_metadata.unwrap().value(), &value);
         let mut message = SourceMessage::decode(source.encode().unwrap().as_slice()).unwrap().unwrap();

@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_index::{PartitionState, TransactionBuffer};
@@ -13,13 +14,13 @@ fn context() -> Arc<QueryContext> {
     let memory = MemoryBudget::new(1 << 27);
     let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
     let mut first = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) }, Arc::clone(&memory)).unwrap();
-    first.put(TableRef::new("public", "foo"), BTreeMap::from([("_id".into(), V::I64(1)), ("v".into(), V::Utf8("old".into()))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
-    first.put(TableRef::new("public", "bar"), BTreeMap::from([("_id".into(), V::I64(2)), ("v".into(), V::Utf8("bar".into()))]), Interval::new(Timestamp(20), Timestamp::MAX).unwrap()).unwrap();
-    first.put(TableRef::new("xt", "txs"), BTreeMap::from([("_id".into(), V::I64(3))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
-    first.put(TableRef::new("xt", "events"), BTreeMap::from([("_id".into(), V::I64(4))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
+    first.put(TableRef::new("public", "foo"), StructFields::from([("_id".into(), V::I64(1)), ("v".into(), V::Utf8("old".into()))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
+    first.put(TableRef::new("public", "bar"), StructFields::from([("_id".into(), V::I64(2)), ("v".into(), V::Utf8("bar".into()))]), Interval::new(Timestamp(20), Timestamp::MAX).unwrap()).unwrap();
+    first.put(TableRef::new("xt", "txs"), StructFields::from([("_id".into(), V::I64(3))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
+    first.put(TableRef::new("xt", "events"), StructFields::from([("_id".into(), V::I64(4))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
     state.apply(&first.stage().unwrap()).unwrap();
     let mut second = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(1), system_time: Timestamp(200) }, Arc::clone(&memory)).unwrap();
-    second.put(TableRef::new("public", "foo"), BTreeMap::from([("_id".into(), V::I64(1)), ("v".into(), V::Utf8("new".into()))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
+    second.put(TableRef::new("public", "foo"), StructFields::from([("_id".into(), V::I64(1)), ("v".into(), V::Utf8("new".into()))]), Interval::new(Timestamp(10), Timestamp(30)).unwrap()).unwrap();
     state.apply(&second.stage().unwrap()).unwrap();
     let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();

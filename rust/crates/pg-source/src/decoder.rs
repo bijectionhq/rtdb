@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Result, TableRef, Timestamp, Value};
@@ -7,7 +8,7 @@ pub const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind { Put, Delete }
 #[derive(Debug)]
-pub struct RowOperation { pub kind: RowKind, pub table: TableRef, pub row: BTreeMap<String, Value>, _charge: Arc<MemoryReservation> }
+pub struct RowOperation { pub kind: RowKind, pub table: TableRef, pub row: StructFields<Value>, _charge: Arc<MemoryReservation> }
 #[derive(Debug)]
 pub struct PgTransaction { pub lsn: Lsn, pub commit_time: Option<Timestamp>, pub operations: Vec<RowOperation> }
 impl PgTransaction { pub fn empty(lsn: Lsn) -> Self { Self { lsn, commit_time: None, operations: Vec::new() } } }
@@ -63,11 +64,11 @@ impl Decoder {
                     bound = bound.checked_add(4096 + name.len()).and_then(|bytes| bytes.checked_add(value_bytes)).ok_or_else(|| protocol("Row allocation overflow"))?;
                 }
                 let charge = self.memory.reserve(bound)?;
-                let mut row = BTreeMap::new();
+                let mut row = StructFields::new();
                 for (index, ((name, oid), cell)) in relation.columns.iter().zip(&values).enumerate() {
                     row.insert(name.clone(), recover(*cell, old.as_deref(), index, name, &relation.table)?.map_or(Ok(Value::Null), |text| read_text(*oid, text))?);
                 }
-                self.operations.push(RowOperation { kind: if tag == b'D' { RowKind::Delete } else { RowKind::Put }, table: relation.table.clone(), row, _charge: charge });
+                self.operations.push(RowOperation { kind: if tag == b'D' { RowKind::Delete } else { RowKind::Put }, table: relation.table.clone(), row: row, _charge: charge });
             }
             _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-pgoutput-message", format!("Unsupported pgoutput message tag {tag}"))),
         }

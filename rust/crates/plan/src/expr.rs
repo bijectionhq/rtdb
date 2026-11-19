@@ -1,6 +1,7 @@
+use rtdb_types::{OrderedSet, StructFields};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ColumnId(pub u32);
@@ -65,7 +66,7 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         let numeric = |ty: &LogicalType| matches!(ty, LogicalType::Scalar(S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 | S::F32 | S::F64 | S::Decimal { .. }));
         let mut output = LogicalType::Nothing;
         for first in arguments[0].legs() {
-            for second in if arity == 2 { arguments[1].legs() } else { BTreeSet::from([LogicalType::Scalar(S::I64)]) } {
+            for second in if arity == 2 { arguments[1].legs() } else { OrderedSet::from([LogicalType::Scalar(S::I64)]) } {
                 let ty = if first == LogicalType::Null || second == LogicalType::Null { LogicalType::Null }
                     else if numeric(&first) && numeric(&second) {
                         if name == "mod" { LogicalType::least_upper_bound(&[first.clone(), second]).ok_or_else(|| Anomaly::incorrect("xtdb.expression/function-type-mismatch", "Incomparable MOD types"))? }
@@ -129,7 +130,7 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         "period" => (LogicalType::List { kind: rtdb_types::ListKind::TimestampTzRange, element: Box::new(LogicalType::Scalar(S::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) })) }, 2..=2, false),
         "lower_inf" | "upper_inf" => (LogicalType::Scalar(S::Bool), 1..=1, true),
         _ => return if arguments.iter().any(|ty| ty.legs().is_empty()) { Ok(LogicalType::Nothing) }
-            else if arguments.iter().any(|ty| ty.legs() == BTreeSet::from([LogicalType::Null])) { Ok(LogicalType::Null) }
+            else if arguments.iter().any(|ty| ty.legs() == OrderedSet::from([LogicalType::Null])) { Ok(LogicalType::Null) }
             else { Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to argument types"))) },
     };
     if !arity.contains(&arguments.len()) {
@@ -183,7 +184,7 @@ fn patch_type(arguments: &[LogicalType]) -> Result<LogicalType> {
                 return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", "_patch requires a struct on the right"));
             };
             let mut fields = match &left {
-                LogicalType::Null => BTreeMap::new(),
+                LogicalType::Null => StructFields::new(),
                 LogicalType::Struct(fields) => fields.clone(),
                 _ => return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", "_patch requires a struct or null on the left")),
             };

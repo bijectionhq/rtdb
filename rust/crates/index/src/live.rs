@@ -1,3 +1,4 @@
+use rtdb_types::{OrderedSet, StructFields};
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
@@ -13,7 +14,7 @@ use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column
 pub struct IndexBatch {
     owned: OwnedBatch,
     events: EventBatch,
-    put_types: BTreeMap<String, LogicalType>,
+    put_types: StructFields<LogicalType>,
     /// The exact logical type of each put struct child, in field order, for reading cells without re-deriving it.
     put_field_types: Vec<LogicalType>,
     system_times: Option<(Timestamp, Timestamp)>,
@@ -47,20 +48,20 @@ impl IndexBatch {
         }
         Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new() }))
     }
-    pub fn from_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    pub fn from_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::Write, budget)
     }
     /// Copies typed event cells, joining their exact types with declarations without numeric coercion.
     /// Raw decimal coefficients retain their parameters; returned arrays retain their reservation independently.
-    pub fn copy_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    pub fn copy_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::CopyInferred, budget)
     }
     /// Reconstructs stored event rows with the captured put schema and unchanged decimal parameters and coefficients.
     /// The returned arrays retain their reservation independently of this index batch.
-    pub fn copy_events_with_put_schema(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    pub fn copy_events_with_put_schema(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::CopyCaptured, budget)
     }
-    fn build_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    fn build_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let mut schema_bytes = 4096usize;
         for (name, ty) in declared {
             schema_bytes = schema_bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(ty.retained_bytes().ok()?)).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
@@ -76,7 +77,7 @@ impl IndexBatch {
         for event in events {
             if let StoredOperation::Put(document) = &event.operation {
                 if !matches!(mode, EventBuild::CopyCaptured) {
-                    documents.push(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect::<BTreeMap<_, _>>());
+                    documents.push(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect::<StructFields<_>>());
                 }
                 has_put = true;
             }
@@ -117,7 +118,7 @@ impl IndexBatch {
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
     pub fn len(&self) -> usize { self.events.len() }
     pub fn is_empty(&self) -> bool { self.events.is_empty() }
-    pub fn put_types(&self) -> &BTreeMap<String, LogicalType> { &self.put_types }
+    pub fn put_types(&self) -> &StructFields<LogicalType> { &self.put_types }
     /// The logical type of the put struct's `index`th child field, as `from_field` derives it.
     pub fn put_field_type(&self, index: usize) -> Option<&LogicalType> { self.put_field_types.get(index) }
 }
@@ -135,7 +136,7 @@ pub struct LiveTable {
     block_index: BlockIndex,
     chunks: Vec<(u32, Arc<IndexBatch>)>,
     row_count: u32,
-    column_types: BTreeMap<String, LogicalType>,
+    column_types: StructFields<LogicalType>,
     trie: MemoryHashTrie,
     last_system_time: Option<Timestamp>,
     canonical_entity_iids: bool,
@@ -143,12 +144,12 @@ pub struct LiveTable {
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: BTreeMap::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn row_count(&self) -> u32 { self.row_count }
-    pub fn column_types(&self) -> &BTreeMap<String, LogicalType> { &self.column_types }
+    pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
@@ -259,13 +260,13 @@ impl BlockPages<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub struct TableWrite { column_types: BTreeMap<String, LogicalType>, batch: Option<Arc<IndexBatch>> }
+pub struct TableWrite { column_types: StructFields<LogicalType>, batch: Option<Arc<IndexBatch>> }
 impl TableWrite {
-    pub fn new(column_types: BTreeMap<String, LogicalType>, batch: Option<Arc<IndexBatch>>) -> Self {
+    pub fn new(column_types: StructFields<LogicalType>, batch: Option<Arc<IndexBatch>>) -> Self {
         let column_types = match &batch { Some(batch) => declare_column_types(batch.put_types(), &column_types), None => column_types };
         Self { column_types, batch }
     }
-    pub fn column_types(&self) -> &BTreeMap<String, LogicalType> { &self.column_types }
+    pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
     pub fn batch(&self) -> Option<&Arc<IndexBatch>> { self.batch.as_ref() }
     pub fn row_count(&self) -> usize { self.batch.as_ref().map_or(0, |batch| batch.len()) }
 }
@@ -332,7 +333,7 @@ impl LiveIndex {
 }
 
 #[derive(Default)]
-struct PendingTable { declared: BTreeMap<String, LogicalType>, events: Vec<StoredEvent>, reservations: Vec<Arc<MemoryReservation>> }
+struct PendingTable { declared: StructFields<LogicalType>, events: Vec<StoredEvent>, reservations: Vec<Arc<MemoryReservation>> }
 
 pub struct TransactionBuffer {
     base: Snapshot,
@@ -372,7 +373,7 @@ impl TransactionBuffer {
         }
         Ok(())
     }
-    pub fn put(&mut self, table: TableRef, document: BTreeMap<String, Value>, valid_time: Interval) -> Result<()> {
+    pub fn put(&mut self, table: TableRef, document: StructFields<Value>, valid_time: Interval) -> Result<()> {
         let id = document.get("_id").ok_or_else(|| invalid("Put document has no _id"))?.entity_id()?;
         self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Put(document), recency: None })
     }
@@ -416,7 +417,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
         iid: EntityId::Integer(id).iid(),
         system_from: Timestamp(time),
         valid_time: Interval::ALL,
-        operation: StoredOperation::Put(BTreeMap::from([
+        operation: StoredOperation::Put(StructFields::from([
             ("_id".into(), Value::I64(id)),
             ("value".into(), if text { Value::Utf8(id.to_string()) } else { Value::I64(id) }),
         ])),
@@ -425,7 +426,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
     let first = rows(0, 1, false);
     for layout_changes in [false, true] {
         let second = rows(2, 2, layout_changes);
-        let write = |events: &[StoredEvent]| TableWrite::new(BTreeMap::new(), Some(IndexBatch::copy_events(events, &BTreeMap::new(), &memory).unwrap()));
+        let write = |events: &[StoredEvent]| TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(events, &StructFields::new(), &memory).unwrap()));
         let live = LiveTable::new(table.clone(), BlockIndex(0), TrieConfig::default())
             .append(&write(&first), Timestamp(1)).unwrap()
             .append(&write(&second), Timestamp(2)).unwrap();
@@ -443,7 +444,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
 fn event_batches_build_wide_document_columns_with_bounded_scratch() {
     let memory = MemoryBudget::new(128 << 20);
     let events = (0..100).map(|id| {
-        let mut doc = BTreeMap::from([("_id".into(), Value::I64(id))]);
+        let mut doc = StructFields::from([("_id".into(), Value::I64(id))]);
         for key in 0..10 { doc.insert(format!("field_{id}_{key}"), Value::I64(id + key)); }
         StoredEvent {
             iid: EntityId::Integer(id).iid(),
@@ -453,7 +454,7 @@ fn event_batches_build_wide_document_columns_with_bounded_scratch() {
             recency: None,
         }
     }).collect::<Vec<_>>();
-    let batch = IndexBatch::copy_events(&events, &BTreeMap::new(), &memory).unwrap();
+    let batch = IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
     assert_eq!(batch.len(), 100);
     assert_eq!(batch.put_types().len(), 1001);
     let StoredOperation::Put(doc) = batch.view().read_event(99).unwrap().operation else { panic!("Expected put"); };
@@ -469,10 +470,10 @@ fn staged_batches_release_event_builder_scratch_before_they_enter_the_live_index
         iid: EntityId::Integer(id).iid(),
         system_from: Timestamp(1),
         valid_time: Interval::ALL,
-        operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(id))])),
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])),
         recency: None,
     }).collect::<Vec<_>>();
-    let batches = (0..32).map(|_| IndexBatch::copy_events(&events, &BTreeMap::new(), &memory).unwrap()).collect::<Vec<_>>();
+    let batches = (0..32).map(|_| IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap()).collect::<Vec<_>>();
     assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 32_768);
     assert!(memory.used_bytes() < 4 << 20);
     let arrow = batches[0].arrow().clone();
@@ -492,10 +493,10 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
             iid: EntityId::Uuid(id).iid(),
             system_from,
             valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::Uuid(id))])),
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Uuid(id))])),
             recency: None,
         };
-        TableWrite::new(BTreeMap::new(), Some(IndexBatch::from_events(&[event], &BTreeMap::new(), &memory).unwrap()))
+        TableWrite::new(StructFields::new(), Some(IndexBatch::from_events(&[event], &StructFields::new(), &memory).unwrap()))
     };
     let first_time = Timestamp(1);
     let second_time = Timestamp(2);
@@ -519,11 +520,11 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
 
 /// Joins every document's column types once per column, which equals folding `merge_column_types` over the documents
 /// in order: each document lacking a column contributes its own absence.
-fn row_column_types(documents: &[BTreeMap<String, LogicalType>]) -> Option<BTreeMap<String, LogicalType>> {
+fn row_column_types(documents: &[StructFields<LogicalType>]) -> Option<StructFields<LogicalType>> {
     let (first, rest) = documents.split_first()?;
     if rest.iter().all(|document| document == first) { return Some(first.clone()); }
     let absences: Vec<_> = documents.iter().map(absent_type).collect();
-    let names: std::collections::BTreeSet<&String> = documents.iter().flat_map(BTreeMap::keys).collect();
+    let names: OrderedSet<&String> = documents.iter().flat_map(|document| document.keys()).collect();
     Some(names.into_iter().map(|name| {
         let joined = LogicalType::join_all(documents.iter().zip(&absences).map(|(document, absent)| document.get(name).unwrap_or(absent)));
         (name.clone(), joined)
@@ -540,7 +541,7 @@ mod row_column_type_tests {
         let scalar = |scalar| LogicalType::Scalar(scalar);
         let list = |element| LogicalType::List { kind: ListKind::List, element: Box::new(element) };
         let structure = |fields: &[(&str, LogicalType)]| LogicalType::Struct(fields.iter().map(|(name, ty)| ((*name).into(), ty.clone())).collect());
-        let document = |fields: &[(&str, LogicalType)]| fields.iter().map(|(name, ty)| ((*name).to_owned(), ty.clone())).collect::<BTreeMap<_, _>>();
+        let document = |fields: &[(&str, LogicalType)]| fields.iter().map(|(name, ty)| ((*name).to_owned(), ty.clone())).collect::<StructFields<_>>();
         let documents = vec![
             document(&[("_id", scalar(ScalarType::I64)), ("a", list(scalar(ScalarType::Utf8)))]),
             document(&[("_id", scalar(ScalarType::I64)), ("b", structure(&[("x", scalar(ScalarType::Bool))]))]),
@@ -550,6 +551,9 @@ mod row_column_type_tests {
         ];
         let folded = documents.iter().cloned().reduce(|left, right| if left == right { left } else { merge_column_types(&left, &right) });
         assert_eq!(row_column_types(&documents), folded);
+        assert_eq!(row_column_types(&documents).unwrap().keys().map(String::as_str).collect::<Vec<_>>(), ["_id", "a", "b", "c"], "columns keep the order they were first seen");
+        let LogicalType::Union(ids) = &row_column_types(&documents).unwrap()["_id"] else { panic!("_id joins two types") };
+        assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), [scalar(ScalarType::I64), scalar(ScalarType::Utf8)]);
         assert_eq!(row_column_types(&documents[..1]), Some(documents[0].clone()));
         assert_eq!(row_column_types(&[]), None);
     }

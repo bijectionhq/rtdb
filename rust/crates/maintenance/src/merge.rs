@@ -1,6 +1,7 @@
 mod layout;
 mod planner;
 
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -64,7 +65,7 @@ struct MergeFile {
     leaves: Vec<layout::Leaf>,
 }
 
-struct OutputSchema { put: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool }
+struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool }
 
 impl OutputSchema {
     fn batch(&self, events: &[StoredEvent]) -> Result<arrow_array::RecordBatch> {
@@ -153,7 +154,7 @@ fn decoded_bound(batch: &arrow_array::RecordBatch) -> Result<usize> {
     Ok(bytes)
 }
 
-fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<BTreeMap<String, LogicalType>>> {
+fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<LogicalType>>> {
     let mut puts = Vec::new();
     for input in inputs {
         let schema = input.reader.schema();
@@ -318,13 +319,13 @@ impl CompactionExecutor for SegmentCompactor {
 }
 
 impl MergeFile {
-    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<StructFields<LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency };
         let directory = path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
         Ok(Self { path, part: part.to_vec(), recency, carries_recency, writer: Some(writer), leaves: Vec::new() })
     }
-    fn write(&mut self, events: &[StoredEvent], path: Vec<u8>, put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig) -> Result<()> {
+    fn write(&mut self, events: &[StoredEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig) -> Result<()> {
         if events.is_empty() { return Ok(()); }
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency };
         let writer = self.writer.as_mut().ok_or_else(|| crate::invalid("Merge file already ended"))?;

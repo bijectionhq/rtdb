@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -119,7 +120,7 @@ fn basis_tokens_keep_partition_order_and_nanoseconds() {
 
 #[test]
 fn nested_column_types_keep_bottom_null_and_missing_distinct() {
-    let ty = LogicalType::Struct(BTreeMap::from([
+    let ty = LogicalType::Struct(StructFields::from([
         ("bottom".into(), LogicalType::Nothing),
         ("nullable".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
         ("null".into(), LogicalType::Null),
@@ -139,8 +140,8 @@ fn events() -> Vec<StoredEvent> {
     vec![
         StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(3), valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None },
         StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(2), valid_time: Interval::from_micros(10, 20).unwrap(), operation: StoredOperation::Delete, recency: None },
-        StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(BTreeMap::from([("price".into(), Value::I64(12))])), recency: None },
-        StoredEvent { iid: Iid([2; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(BTreeMap::from([("price".into(), Value::I64(7))])), recency: None },
+        StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(12))])), recency: None },
+        StoredEvent { iid: Iid([2; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(7))])), recency: None },
     ]
 }
 
@@ -148,7 +149,7 @@ fn events() -> Vec<StoredEvent> {
 fn every_iid_run_row_survives_arrow_file_and_stream_roundtrips() {
     let events = events();
     for encoding in [None, Some(RunEndWidth::I16), Some(RunEndWidth::I32), Some(RunEndWidth::I64)] {
-        let batch = build_event_batch(&events, Some(BTreeMap::from([("price".into(), LogicalType::Scalar(ScalarType::I64))])), encoding).unwrap();
+        let batch = build_event_batch(&events, Some(StructFields::from([("price".into(), LogicalType::Scalar(ScalarType::I64))])), encoding).unwrap();
         let bytes = ipc::write_file(batch.schema().as_ref(), &[batch.clone()]).unwrap();
         let mut file = ipc::ArrowFile::open(bytes.into(), None).unwrap();
         let decoded = EventBatch::new(file.read_page(0).unwrap()).unwrap();
@@ -222,10 +223,10 @@ fn uuid_columns_round_trip_through_arrow_file_and_stream() {
 #[test]
 fn uuid_put_documents_are_read_back_through_the_event_schema() {
     let uuid = Value::Uuid(std::array::from_fn(|index| 0xa0 | index as u8));
-    let put = |iid: u8, id: Value| StoredEvent { iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(BTreeMap::from([("ref".into(), id)])), recency: None };
+    let put = |iid: u8, id: Value| StoredEvent { iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("ref".into(), id)])), recency: None };
     let events = vec![put(1, uuid), put(2, Value::Null), put(3, Value::Uuid([0; 16]))];
     let fields = BTreeMap::from([("ref".into(), LogicalType::Scalar(ScalarType::Uuid).maybe())]);
-    let batch = build_event_batch(&events, Some(fields), None).unwrap();
+    let batch = build_event_batch(&events, Some(fields.into()), None).unwrap();
     let bytes = ipc::write_file(batch.schema().as_ref(), &[batch]).unwrap();
     let mut file = ipc::ArrowFile::open(bytes.into(), None).unwrap();
     let uuids: Vec<_> = file.schema().fields().iter().flat_map(|field| uuid_fields(field)).collect();
@@ -233,4 +234,16 @@ fn uuid_put_documents_are_read_back_through_the_event_schema() {
     assert_jvm_uuid_field(&uuids[0]);
     let decoded = EventBatch::new(file.read_page(0).unwrap()).unwrap();
     for (row, event) in events.iter().enumerate() { assert_eq!(&decoded.read_event(row).unwrap(), event); }
+}
+
+#[test]
+fn put_columns_keep_the_order_their_fields_were_first_seen() {
+    let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("system_time".into(), LogicalType::Scalar(ScalarType::I64)), ("committed".into(), LogicalType::Scalar(ScalarType::Bool))]);
+    let put = StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1)), ("system_time".into(), Value::I64(2)), ("committed".into(), Value::Bool(true))])) };
+    let batch = build_event_batch(&[put], Some(fields), None).unwrap();
+    let arrow_schema::DataType::Union(legs, _) = batch.schema().field_with_name("op").unwrap().data_type().clone() else { panic!("op is a union") };
+    let (_, put) = legs.iter().find(|(_, leg)| leg.name() == "put").unwrap();
+    let arrow_schema::DataType::Struct(columns) = put.data_type() else { panic!("put is a struct") };
+    assert_eq!(columns.iter().map(|column| column.name().as_str()).collect::<Vec<_>>(), ["_id", "system_time", "committed"]);
 }

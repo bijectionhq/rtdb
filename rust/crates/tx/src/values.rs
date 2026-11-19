@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use rtdb_types::StructFields;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow_array::{Array, StructArray};
@@ -28,7 +29,7 @@ pub struct Documents(Arc<DocumentBatch>);
 
 #[derive(Debug)]
 struct DocumentBatch {
-    rows: Vec<BTreeMap<String, Value>>,
+    rows: Vec<StructFields<Value>>,
     layout: DocumentLayout,
     _reservation: Arc<MemoryReservation>,
 }
@@ -40,7 +41,7 @@ enum DocumentLayout { Submitted(Vec<String>), Decoded(Arc<DecodedDocumentLayout>
 pub(crate) struct DecodedDocumentLayout {
     physical: Fields,
     columns: Vec<String>,
-    types: BTreeMap<String, LogicalType>,
+    types: StructFields<LogicalType>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -49,7 +50,7 @@ impl DecodedDocumentLayout {
         let schema = Schema::new(fields.clone());
         let reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
         let columns = fields.iter().map(|field| field.name().clone()).collect();
-        let types = fields.iter().map(|field| Ok((field.name().clone(), from_field(field)?))).collect::<Result<BTreeMap<_, _>>>()?;
+        let types = fields.iter().map(|field| Ok((field.name().clone(), from_field(field)?))).collect::<Result<StructFields<_>>>()?;
         if types.len() != fields.len() {
             return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document columns must be unique"));
         }
@@ -58,7 +59,7 @@ impl DecodedDocumentLayout {
 }
 
 impl Documents {
-    pub fn new(rows: Vec<BTreeMap<String, Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn new(rows: Vec<StructFields<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut reservations = Vec::new();
         let mut names = BTreeSet::new();
         for name in rows.iter().flat_map(|row| row.keys()) {
@@ -73,11 +74,11 @@ impl Documents {
 
     /// Adopts row values and their declared column order, including all-null or empty columns.
     pub fn with_column_order(
-        mut rows: Vec<BTreeMap<String, Value>>,
+        mut rows: Vec<StructFields<Value>>,
         columns: Vec<String>,
         memory: &Arc<MemoryBudget>,
     ) -> Result<Self> {
-        let row_bytes = rows.iter().try_fold(rows.capacity().checked_mul(std::mem::size_of::<BTreeMap<String, Value>>()).ok_or_else(overflow)?, |bytes, row| {
+        let row_bytes = rows.iter().try_fold(rows.capacity().checked_mul(std::mem::size_of::<StructFields<Value>>()).ok_or_else(overflow)?, |bytes, row| {
             bytes.checked_add(Value::document_retained_bytes(row)?).ok_or_else(overflow)
         })?;
         let column_bytes = columns.iter().try_fold(columns.capacity().checked_mul(std::mem::size_of::<String>()).ok_or_else(overflow)?, |bytes, name| {
@@ -94,14 +95,14 @@ impl Documents {
         Ok(Self(Arc::new(DocumentBatch { rows, layout: DocumentLayout::Submitted(columns), _reservation: reservation })))
     }
 
-    pub fn rows(&self) -> &[BTreeMap<String, Value>] { &self.0.rows }
+    pub fn rows(&self) -> &[StructFields<Value>] { &self.0.rows }
 
     /// Returns the source column order for this document batch.
     pub fn columns(&self) -> &[String] {
         match &self.0.layout { DocumentLayout::Submitted(columns) => columns, DocumentLayout::Decoded(layout) => &layout.columns }
     }
 
-    pub(crate) fn declared_types(&self) -> Option<&BTreeMap<String, LogicalType>> {
+    pub(crate) fn declared_types(&self) -> Option<&StructFields<LogicalType>> {
         match &self.0.layout { DocumentLayout::Submitted(_) => None, DocumentLayout::Decoded(layout) => Some(&layout.types) }
     }
 
@@ -109,7 +110,7 @@ impl Documents {
         if array.fields() != &layout.physical {
             return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document arrays and their column layout differ"));
         }
-        let mut retained = array.len().checked_mul(std::mem::size_of::<BTreeMap<String, Value>>())
+        let mut retained = array.len().checked_mul(std::mem::size_of::<StructFields<Value>>())
             .and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)?;
         let mut reservation = memory.reserve(retained)?;
         let entry = std::mem::size_of::<(String, Value)>() * 16 + 256;
@@ -129,7 +130,7 @@ impl Documents {
             })?;
             let reservation = Arc::get_mut(&mut reservation).expect("document decoding owns its reservation");
             reservation.grow_to(retained.checked_add(temporary).ok_or_else(overflow)?)?;
-            let mut document = BTreeMap::new();
+            let mut document = StructFields::new();
             for ((field, column), reader) in children() {
                 let mut value = if bottom(field) { Value::Undefined } else { reader.read(column.as_ref(), row)? };
                 if preserve_null(field) || !matches!(value, Value::Null) {

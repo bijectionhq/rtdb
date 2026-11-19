@@ -1,14 +1,15 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, TableEntry, FIRST_TABLE_OID}, columns::column_from_type};
 use rtdb_types::{Anomaly, BlockIndex, LogicalType, Result, TableRef};
 
-pub fn absent_type(types: &BTreeMap<String, LogicalType>) -> LogicalType {
+pub fn absent_type(types: &StructFields<LogicalType>) -> LogicalType {
     LogicalType::absent_contribution(types.values().any(|ty| *ty != LogicalType::Nothing))
 }
 
-pub fn merge_column_types(left: &BTreeMap<String, LogicalType>, right: &BTreeMap<String, LogicalType>) -> BTreeMap<String, LogicalType> {
+pub fn merge_column_types(left: &StructFields<LogicalType>, right: &StructFields<LogicalType>) -> StructFields<LogicalType> {
     let left_absent = absent_type(left);
     let right_absent = absent_type(right);
     left.keys().chain(right.keys()).map(|name| {
@@ -17,7 +18,7 @@ pub fn merge_column_types(left: &BTreeMap<String, LogicalType>, right: &BTreeMap
 }
 
 /// Joins declared column types into row-derived types; a declaration is not a row, so it adds no absence.
-pub fn declare_column_types(rows: &BTreeMap<String, LogicalType>, declared: &BTreeMap<String, LogicalType>) -> BTreeMap<String, LogicalType> {
+pub fn declare_column_types(rows: &StructFields<LogicalType>, declared: &StructFields<LogicalType>) -> StructFields<LogicalType> {
     let absent = absent_type(rows);
     let mut types = rows.clone();
     for (name, ty) in declared {
@@ -29,7 +30,7 @@ pub fn declare_column_types(rows: &BTreeMap<String, LogicalType>, declared: &BTr
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableMeta {
-    pub column_types: BTreeMap<String, LogicalType>,
+    pub column_types: StructFields<LogicalType>,
     pub row_count: i64,
     pub hlls: BTreeMap<String, Vec<u8>>,
 }

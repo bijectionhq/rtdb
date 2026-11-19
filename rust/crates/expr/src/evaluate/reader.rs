@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, Value};
@@ -102,7 +103,7 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
     Ok(match value {
         EvalValue::Scalar(value) => { frame.context.reserve(value.retained_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;value.logical_type() }
         EvalValue::Struct(fields) => {
-            let mut types = BTreeMap::new();
+            let mut types = StructFields::new();
             for (name,value) in fields.iter() { frame.context.reserve(name.len().checked_add(4096).ok_or_else(overflow)?)?;types.insert(name.clone(),value_type(value,frame)?); }
             LogicalType::Struct(types)
         }
@@ -336,7 +337,7 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
         match value {
             EvalValue::Scalar(value) => Ok(value),
             EvalValue::Struct(fields) => {
-                let mut result = BTreeMap::new();
+                let mut result = StructFields::new();
                 for (name,value) in fields.iter() {
                     frame.context.reserve(name.len().checked_add(4096).ok_or_else(overflow)?)?;
                     result.insert(name.clone(),materialize(clone_value(value,frame)?,frame)?.await?);

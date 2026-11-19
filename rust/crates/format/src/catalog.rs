@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -153,7 +154,7 @@ impl TableBlock {
     pub fn row_count(&self) -> i64 { self.wire.row_count.unwrap_or_default() }
     pub fn partitions(&self) -> &[pb::Partition] { &self.wire.partitions }
 
-    pub fn column_types(&self) -> Result<BTreeMap<String, LogicalType>> {
+    pub fn column_types(&self) -> Result<StructFields<LogicalType>> {
         if !self.wire.columns.is_empty() {
             self.wire.columns.iter().map(|(name, column)| Ok((name.clone(), crate::columns::logical_type(column)?))).collect()
         } else {

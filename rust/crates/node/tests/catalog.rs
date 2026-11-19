@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_types::{Interval, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
-fn context(with_runtime: bool, document: Option<BTreeMap<String, Value>>) -> Arc<QueryContext> {
+fn context(with_runtime: bool, document: Option<StructFields<Value>>) -> Arc<QueryContext> {
     let memory = MemoryBudget::new(1 << 28);
     let state = PartitionState::empty(Default::default()).unwrap();
     if let Some(document) = document {
@@ -64,7 +65,7 @@ async fn information_schema_test_pg_namespace_has_reference_oids() {
 
 #[tokio::test]
 async fn information_schema_npgsql_get_schema_columns_query_joins_type_descriptors() {
-    let context = context(false, Some(BTreeMap::from([("_id".into(), Value::I64(1)), ("s".into(), Value::Utf8("a".into())), ("ints".into(), Value::List(vec![Value::I64(1), Value::I64(2)]))])));
+    let context = context(false, Some(StructFields::from([("_id".into(), Value::I64(1)), ("s".into(), Value::Utf8("a".into())), ("ints".into(), Value::List(vec![Value::I64(1), Value::I64(2)]))])));
     assert_eq!(query(&context, "SELECT column_name, format_type(typ.oid, NULL) AS data_type FROM information_schema.columns JOIN pg_namespace AS ns ON ns.nspname = udt_schema JOIN pg_type AS typ ON typ.typnamespace = ns.oid AND typname = udt_name WHERE table_name = 'docs' AND column_name NOT IN ('_system_from', '_system_to', '_valid_from', '_valid_to') ORDER BY column_name").await,
         vec![vec![Value::Utf8("_id".into()), Value::Utf8("bigint".into())], vec![Value::Utf8("ints".into()), Value::Utf8("bigint[]".into())], vec![Value::Utf8("s".into()), Value::Utf8("text".into())]]);
     assert_eq!(query(&context, "SELECT character_set_catalog, character_set_schema, collation_catalog FROM information_schema.columns WHERE table_name = 'docs' AND column_name = 's'").await, vec![vec![Value::Null, Value::Null, Value::Null]]);
@@ -97,7 +98,7 @@ async fn metrics_tags_stream_as_arrow_and_declared_empty_catalogs_keep_their_sch
 
 #[tokio::test]
 async fn hidden_temporal_fields_bind_explicitly_and_stay_out_of_aliased_wildcards() {
-    let context = context(false, Some(BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(2))])));
+    let context = context(false, Some(StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(2))])));
     assert_eq!(query(&context, "SELECT d.* FROM docs AS d(_id, v)").await, vec![vec![Value::I64(1), Value::I64(2)]]);
     assert_eq!(query(&context, "SELECT _system_from FROM docs FOR ALL SYSTEM_TIME").await, vec![vec![Value::Timestamp { value: 1, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }]]);
     assert_eq!(query(&context, "SELECT _system_from, _valid_to FROM docs FOR ALL SYSTEM_TIME").await, vec![vec![Value::Timestamp { value: 1, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }, Value::Null]]);

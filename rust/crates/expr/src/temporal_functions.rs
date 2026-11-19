@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use crate::{EvalContext, cast, numeric::{division_by_zero, inapplicable, integer}, temporal::{IntervalParts, timestamp_units}};
 use rtdb_plan::{BinaryOp, TemporalField as F};
 use rtdb_types::{CivilDate, DateUnit, LogicalType as L, Result, ScalarType as S, TimeUnit as U, Value, ZoneId};
@@ -208,7 +209,7 @@ impl RangeBins {
         let from = self.base.wrapping_add((index as i64).wrapping_mul(self.stride));
         let to = self.base.wrapping_add((index as i64).wrapping_add(1).wrapping_mul(self.stride));
         let weight = (to.min(self.to).wrapping_sub(from.max(self.from))) as f64 / self.to.wrapping_sub(self.from) as f64;
-        Value::Struct(std::collections::BTreeMap::from([("_from".into(),timestamp(from,U::Microsecond,Some("UTC".into()))),("_to".into(),timestamp(to,U::Microsecond,Some("UTC".into()))),("_weight".into(),Value::F64(weight))]))
+        Value::Struct(StructFields::from([("_from".into(),timestamp(from,U::Microsecond,Some("UTC".into()))),("_to".into(),timestamp(to,U::Microsecond,Some("UTC".into()))),("_weight".into(),Value::F64(weight))]))
     }
     pub(crate) fn reserve(self,context: &EvalContext<'_>) -> Result<Vec<Value>> {
         let length = self.len()?;

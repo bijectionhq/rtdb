@@ -15,6 +15,7 @@ use sqlparser::{ast, dialect::GenericDialect, parser::Parser};
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+use rtdb_types::StructFields;
 use super::{Error, Options, Record, format};
 
 mod dependencies;
@@ -158,7 +159,7 @@ impl Engine {
         for row in &values.rows {
             let expressions = row.expressions();
             if expressions.len() == 1 && columns.len() != 1 { return Err(Anomaly::incorrect("rtdb.conformance/slt-assertion", "Single-expression insert requires exactly one synthetic column")); }
-            let mut document = BTreeMap::from([("_id".into(), Value::Uuid(*uuid::Uuid::new_v4().as_bytes()))]);
+            let mut document = StructFields::from([("_id".into(), Value::Uuid(*uuid::Uuid::new_v4().as_bytes()))]);
             for (column, expression) in columns.iter().zip(expressions) { document.insert(Identifier::unquoted(column).normalized(), literal(expression)?); }
             documents.push(document);
         }
@@ -256,7 +257,7 @@ fn literal(expression: &ast::Expr) -> Result<Value> {
             match literal(expr)? { Value::I64(value) => value.checked_neg().map(Value::I64).ok_or_else(|| gap("Synthetic negation overflow")), Value::F64(value) => Ok(Value::F64(-value)), _ => Err(expression_data_error()) }
         }
         ast::Expr::Array(array) => array.elem.iter().map(literal).collect::<Result<Vec<_>>>().map(Value::List),
-        ast::Expr::Dictionary(fields) => fields.iter().map(|field| Ok((Identifier { text: field.key.value.clone(), quoted: field.key.quote_style.is_some() }.normalized(), literal(&field.value)?))).collect::<Result<BTreeMap<_, _>>>().map(Value::Struct),
+        ast::Expr::Dictionary(fields) => fields.iter().map(|field| Ok((Identifier { text: field.key.value.clone(), quoted: field.key.quote_style.is_some() }.normalized(), literal(&field.value)?))).collect::<Result<StructFields<_>>>().map(Value::Struct),
         ast::Expr::TypedString(value) => {
             let data_type = match value.data_type.to_string().to_uppercase().as_str() {
                 "DATE" => ScalarType::DateDay,

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, TimestampMicrosecondArray, UnionArray};
@@ -9,7 +9,7 @@ use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Resu
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoredOperation {
-    Put(BTreeMap<String, Value>),
+    Put(StructFields<Value>),
     Delete,
     Erase,
 }
@@ -132,20 +132,20 @@ impl EventBatch {
 }
 
 /// All rows must either carry recency or omit it; the caller supplies the put schema captured with the rows.
-pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
+pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
     event_batch(events, put_fields, iid_encoding, false, None)
 }
 
 /// Reconstructs stored cells under their captured put schema, preserving raw decimal coefficients.
 /// Every value must belong to that schema; no decimal parameter or coefficient is converted.
 /// The caller admits column construction and event-array overhead before calling.
-pub fn copy_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
+pub fn copy_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
     event_batch(events, put_fields, iid_encoding, true, None)
 }
 
 /// Builds an owned index batch with scratch for one document column at a time.
 /// `copy` selects the stored-cell writer, which preserves existing decimal coefficients.
-pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let metadata = put_fields.as_ref().map_or(Ok(4096), |fields| {
         fields.iter().try_fold(4096usize, |bytes, (name, ty)| {
             ty.retained_bytes()?.checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
@@ -158,7 +158,7 @@ pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<Str
     builder.finish_with_metadata(batch, metadata)
 }
 
-fn event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>) -> Result<RecordBatch> {
+fn event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>) -> Result<RecordBatch> {
     let mut puts = Vec::new();
     let mut deletes = 0usize;
     let mut erases = 0usize;
@@ -214,8 +214,8 @@ fn event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, Logic
 }
 
 fn put_columns(
-    documents: &[&BTreeMap<String, Value>],
-    fields: BTreeMap<String, LogicalType>,
+    documents: &[&StructFields<Value>],
+    fields: StructFields<LogicalType>,
     copy: bool,
     mut builder: Option<&mut BatchBuilder>,
 ) -> Result<ArrayRef> {
@@ -241,16 +241,16 @@ fn put_columns(
 }
 
 /// Keeps the declared recency column even when a page is empty.
-pub fn build_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
+pub fn build_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
     event_batch_with_recency(events, put_fields, iid_encoding, recency, false)
 }
 
 /// Copies stored cells with the same ownership obligations as `copy_event_batch`, retaining empty-page recency metadata.
-pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
+pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
     event_batch_with_recency(events, put_fields, iid_encoding, recency, true)
 }
 
-fn event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
+fn event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
     if events.iter().any(|event| event.recency.is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
     let batch = event_batch(events, put_fields, iid_encoding, copy, None)?;
     if recency && events.is_empty() {

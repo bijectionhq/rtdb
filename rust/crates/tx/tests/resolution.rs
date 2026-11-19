@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use std::sync::Arc;
 
 use rtdb_columnar::MemoryBudget;
@@ -18,7 +18,7 @@ fn context() -> ResolveContext {
     ResolveContext { database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
 }
 fn table() -> TableRef { TableRef::new("public", "docs") }
-fn document(value: i64) -> BTreeMap<String, Value> { BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
+fn document(value: i64) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
 fn request(ops: Vec<TxOp>, context: &ResolveContext) -> SourceTransaction { SourceTransaction::new(ops, SubmitOptions::default(), &context.memory).unwrap() }
 fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp::PutDocs { table: table(), documents: Documents::new(vec![document(value)], &context.memory).unwrap(), valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)) } }
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
@@ -214,7 +214,7 @@ async fn patch_operator_3879_fills_both_gaps_and_preserves_null_rhs_fields() {
     let context = context();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![put(&context, 7, 10, 20)], &context), &context).await.unwrap();
-    let patch = TxOp::PatchDocs { table: table(), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Null), ("added".into(), Value::Bool(true))])], &context.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: Some(Timestamp(30)) };
+    let patch = TxOp::PatchDocs { table: table(), documents: Documents::new(vec![StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Null), ("added".into(), Value::Bool(true))])], &context.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: Some(Timestamp(30)) };
     let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), request(vec![patch], &context), &context).await.unwrap();
     assert!(resolved.result().committed(), "{:?}", resolved.result());
     let batch = resolved.writes().tables()[&table()].batch().unwrap();
@@ -277,7 +277,7 @@ async fn raw_decimal_cells_survive_source_replay_resolution_sum_and_replica_stag
         let state = PartitionState::empty(Default::default()).unwrap();
         let context = context();
         let value = Value::Decimal(DecimalValue::new(18i128.to_be_bytes().to_vec(), precision, 129, 128).unwrap());
-        let documents = Documents::new([1, 2].into_iter().map(|id| BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), value.clone())])).collect(), &context.memory).unwrap();
+        let documents = Documents::new([1, 2].into_iter().map(|id| StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), value.clone())])).collect(), &context.memory).unwrap();
         let source = request(vec![
             TxOp::PutDocs { table: table(), documents, valid_from: None, valid_to: None },
             sql("INSERT INTO sums (_id, v) SELECT 1, SUM(v) FROM docs"),
