@@ -1,5 +1,5 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use rtdb_plan::{BinaryOp, ColumnId, Expr, NamedExpr, Relation, RelationNode, Schema, WindowFunction};
+use rtdb_plan::{BinaryOp, ColumnId, Expr, JoinKind, NamedExpr, Relation, RelationNode, Schema, WindowFunction};
 use rtdb_types::Result;
 
 pub(crate) fn prepare(relation: Arc<Relation>) -> Result<Arc<Relation>> {
@@ -32,7 +32,7 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
         RelationNode::Filter { input, predicate } => {
             let mut columns = required.clone(); columns.extend(predicate.referenced_columns());
             let input = prune(Arc::clone(input), &columns)?;
-            select(input, predicate.clone())
+            reorder_selected(select(input, predicate.clone())?)
         }
         RelationNode::Scan(scan) => {
             let mut columns = required.clone(); for predicate in &scan.predicates { columns.extend(predicate.referenced_columns()); }
@@ -63,10 +63,7 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             let body = prune(Arc::clone(body), required)?;
             Ok(Arc::new(Relation::new(body.schema().clone(), RelationNode::Let { binding: Arc::clone(binding), body })?))
         }
-        RelationNode::Join { left, right, kind, condition } => {
-            let left = prepare(Arc::clone(left))?; let right = prepare(Arc::clone(right))?;
-            Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Join { left, right, kind: *kind, condition: condition.clone() })?))
-        }
+        RelationNode::Join { .. } => join_tree(&relation, required, true),
         RelationNode::Mark { input, dependent, arguments, condition, comparison, output } => {
             let input = prepare(Arc::clone(input))?; let dependent = prepare(Arc::clone(dependent))?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Mark { input, dependent, arguments: arguments.clone(), condition: condition.clone(), comparison: comparison.clone(), output: output.clone() })?))
@@ -163,6 +160,28 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
             };
             Ok(Arc::new(Relation::new(input.schema().clone(), node)?))
         }
+        RelationNode::Filter { input: child, predicate: existing } => {
+            let child = select(Arc::clone(child), predicate)?;
+            Ok(Arc::new(Relation::new(input.schema().clone(), RelationNode::Filter { input: child, predicate: existing.clone() })?))
+        }
+        RelationNode::Join { left, right, kind, condition } => {
+            let within = |side: &Relation| columns.iter().all(|id| side.schema().get(*id).is_some());
+            let (in_left, in_right) = (within(left), within(right));
+            if in_left && matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left | JoinKind::Semi | JoinKind::Anti | JoinKind::Single) {
+                let left = select(Arc::clone(left), predicate)?;
+                return Ok(Arc::new(Relation::new(input.schema().clone(), RelationNode::Join { left, right: Arc::clone(right), kind: *kind, condition: condition.clone() })?));
+            }
+            if in_right && matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Right) {
+                let right = select(Arc::clone(right), predicate)?;
+                return Ok(Arc::new(Relation::new(input.schema().clone(), RelationNode::Join { left: Arc::clone(left), right, kind: *kind, condition: condition.clone() })?));
+            }
+            let spans = columns.iter().all(|id| left.schema().get(*id).is_some() || right.schema().get(*id).is_some());
+            if spans && matches!(kind, JoinKind::Inner | JoinKind::Cross) {
+                let condition = Some(match condition { Some(existing) => Expr::binary(BinaryOp::And, existing.clone(), predicate), None => predicate });
+                return join(Arc::clone(left), Arc::clone(right), JoinKind::Inner, condition);
+            }
+            Ok(Arc::new(input.filter(predicate)?))
+        }
         RelationNode::Unnest { input: child, expr, element, ordinality, outer }
             if columns.iter().all(|id| child.schema().get(*id).is_some()) => {
             let child = select(Arc::clone(child), predicate)?;
@@ -181,6 +200,120 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
         }
         _ => Ok(Arc::new(input.filter(predicate)?)),
     }
+}
+
+fn inner(relation: &Relation) -> bool { matches!(relation.node(), RelationNode::Join { kind: JoinKind::Inner | JoinKind::Cross, .. }) }
+
+/// Prunes a join's inputs to the columns its parent and condition read; the outermost of a run of inner and cross joins
+/// then reorders that run, as the reference's mega-join does.
+fn join_tree(relation: &Arc<Relation>, required: &BTreeSet<ColumnId>, outermost: bool) -> Result<Arc<Relation>> {
+    let RelationNode::Join { left, right, kind, condition } = relation.node() else { return prune(Arc::clone(relation), required) };
+    let mut columns = required.clone();
+    if let Some(condition) = condition { columns.extend(condition.referenced_columns()); }
+    let side = |input: &Arc<Relation>| -> Result<Arc<Relation>> {
+        let mut needed: BTreeSet<ColumnId> = input.schema().ids().intersection(&columns).copied().collect();
+        if needed.is_empty() { needed.extend(input.schema().fields().first().map(|field| field.id)); }
+        if inner(relation) && inner(input) { join_tree(input, &needed, false) } else { prune(Arc::clone(input), &needed) }
+    };
+    let joined = join(side(left)?, side(right)?, *kind, condition.clone())?;
+    if outermost && inner(&joined) { reorder(joined) } else { Ok(joined) }
+}
+
+/// Reorders the join run a selection was promoted into, beneath at most one column-preserving wrapper.
+fn reorder_selected(relation: Arc<Relation>) -> Result<Arc<Relation>> {
+    if inner(&relation) { return reorder(relation); }
+    let node = match relation.node() {
+        RelationNode::Project { input, expressions } if inner(input) => RelationNode::Project { input: reorder(Arc::clone(input))?, expressions: expressions.clone() },
+        RelationNode::Extend { input, expressions } if inner(input) => RelationNode::Extend { input: reorder(Arc::clone(input))?, expressions: expressions.clone() },
+        RelationNode::Rename { input, prefix, expressions } if inner(input) => RelationNode::Rename { input: reorder(Arc::clone(input))?, prefix: prefix.clone(), expressions: expressions.clone() },
+        _ => return Ok(relation),
+    };
+    Ok(Arc::new(Relation::new(relation.schema().clone(), node)?))
+}
+
+/// Joins each relation to the plan built so far as soon as a condition connects them, rather than in FROM order.
+/// Relations keep their written order otherwise, which is the reference's order when no relation has row-count statistics.
+/// Disconnected groups are crossed last, the final join taking the conditions none of them could.
+fn reorder(relation: Arc<Relation>) -> Result<Arc<Relation>> {
+    fn flatten(relation: &Arc<Relation>, leaves: &mut Vec<Arc<Relation>>, conditions: &mut Vec<Expr>) {
+        match relation.node() {
+            RelationNode::Join { left, right, kind: JoinKind::Inner | JoinKind::Cross, condition } => {
+                flatten(left, leaves, conditions);
+                flatten(right, leaves, conditions);
+                let mut remaining: Vec<Expr> = condition.iter().cloned().collect();
+                while let Some(expression) = remaining.pop() {
+                    if let Expr::Binary { op: BinaryOp::And, left, right } = expression { remaining.push(*right); remaining.push(*left); }
+                    else { conditions.push(expression); }
+                }
+            }
+            _ => leaves.push(Arc::clone(relation)),
+        }
+    }
+    let (mut leaves, mut conditions) = (Vec::new(), Vec::new());
+    flatten(&relation, &mut leaves, &mut conditions);
+    if leaves.len() < 3 { return Ok(relation); }
+    let ids = |relation: &Relation| relation.schema().ids();
+    let mut conditions: Vec<(BTreeSet<ColumnId>, Expr)> = conditions.into_iter().map(|condition| (condition.referenced_columns(), condition)).collect();
+    let mut remaining: std::collections::VecDeque<Arc<Relation>> = leaves.into();
+    let mut groups = Vec::new();
+    while let Some(first) = remaining.pop_front() {
+        let mut plan = first;
+        loop {
+            let planned = ids(&plan);
+            let connects = |candidate: &Relation, columns: &BTreeSet<ColumnId>| {
+                let candidate = ids(candidate);
+                columns.iter().any(|id| planned.contains(id)) && columns.iter().any(|id| candidate.contains(id))
+                    && columns.iter().all(|id| planned.contains(id) || candidate.contains(id))
+            };
+            let Some(index) = remaining.iter().position(|candidate| conditions.iter().any(|(columns, _)| connects(candidate, columns))) else { break };
+            let candidate = remaining.remove(index).expect("candidate index is in range");
+            let joined = planned.union(&ids(&candidate)).copied().collect::<BTreeSet<_>>();
+            let (used, kept): (Vec<_>, Vec<_>) = conditions.into_iter().partition(|(columns, _)| !columns.is_empty() && columns.is_subset(&joined));
+            conditions = kept;
+            let condition = used.into_iter().map(|(_, condition)| condition).reduce(|first, second| Expr::binary(BinaryOp::And, first, second));
+            plan = Arc::new(Relation::join(plan, candidate, JoinKind::Inner, condition)?);
+        }
+        groups.push(plan);
+    }
+    let last = groups.pop().expect("a join has relations");
+    let mut groups = groups.into_iter();
+    let crossed = match groups.next() {
+        Some(first) => Some(groups.try_fold(first, |left, right| Relation::join(left, right, JoinKind::Cross, None).map(Arc::new))?),
+        None => None,
+    };
+    let condition = conditions.into_iter().map(|(_, condition)| condition).reduce(|first, second| Expr::binary(BinaryOp::And, first, second));
+    let reordered = match crossed {
+        Some(crossed) => Arc::new(Relation::join(crossed, last, if condition.is_some() { JoinKind::Inner } else { JoinKind::Cross }, condition)?),
+        None => match condition { Some(condition) => Arc::new(last.filter(condition)?), None => last },
+    };
+    if reordered.schema().fields().iter().map(|field| field.id).eq(relation.schema().fields().iter().map(|field| field.id)) { return Ok(reordered); }
+    let expressions = relation.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
+    Ok(Arc::new(reordered.project(expressions)?))
+}
+
+/// Rebuilds a join, moving each condition conjunct that reads only one input into that input where the join kind
+/// preserves its meaning: a preserved side's rows are emitted whether or not they satisfy the condition.
+fn join(left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Option<Expr>) -> Result<Arc<Relation>> {
+    let (push_left, push_right) = match kind {
+        JoinKind::Inner | JoinKind::Semi => (true, true),
+        JoinKind::Left | JoinKind::Anti | JoinKind::Single => (false, true),
+        JoinKind::Right => (true, false),
+        JoinKind::Full | JoinKind::Cross => (false, false),
+    };
+    let (mut left, mut right) = (left, right);
+    let mut kept = Vec::new();
+    let mut remaining: Vec<Expr> = condition.into_iter().collect();
+    while let Some(expression) = remaining.pop() {
+        if let Expr::Binary { op: BinaryOp::And, left, right } = expression { remaining.push(*right); remaining.push(*left); continue; }
+        let columns = expression.referenced_columns();
+        let within = |side: &Relation| !columns.is_empty() && columns.iter().all(|id| side.schema().get(*id).is_some());
+        if push_left && within(&left) { left = select(left, expression)?; }
+        else if push_right && within(&right) { right = select(right, expression)?; }
+        else { kept.push(expression); }
+    }
+    let condition = kept.into_iter().reduce(|first, second| Expr::binary(BinaryOp::And, first, second));
+    let kind = if kind == JoinKind::Inner && condition.is_none() { JoinKind::Cross } else { kind };
+    Ok(Arc::new(Relation::join(left, right, kind, condition)?))
 }
 
 fn fusable(relation: &Relation, offset: &Option<Expr>) -> bool {
@@ -254,6 +387,75 @@ mod tests {
             table, columns, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
             clamp_valid_time: false, iids: None, predicates: Vec::new(),
         }).unwrap())
+    }
+
+    fn equals(field: &Field, value: i64) -> Expr { Expr::binary(BinaryOp::Eq, field.expression(), Expr::Literal(Value::I64(value))) }
+    fn conjunction(predicates: Vec<Expr>) -> Expr { predicates.into_iter().reduce(|left, right| Expr::binary(BinaryOp::And, left, right)).unwrap() }
+    fn scan_predicates(relation: &Relation) -> &[Expr] {
+        match relation.node() { RelationNode::Scan(scan) => &scan.predicates, other => panic!("Expected a scan, found {other:?}") }
+    }
+
+    #[test]
+    fn single_table_conjuncts_over_a_cross_join_reach_each_table() {
+        let [a, b, c] = [0, 1, 2].map(field);
+        let joined = Relation::join(Arc::new(Relation::join(base_scan(vec![a.clone()]), base_scan(vec![b.clone()]), JoinKind::Cross, None).unwrap()), base_scan(vec![c.clone()]), JoinKind::Cross, None).unwrap();
+        let filtered = Arc::new(joined).filter(conjunction(vec![equals(&a, 1), equals(&b, 2), equals(&c, 3)])).unwrap();
+        let prepared = prepare(Arc::new(filtered)).unwrap();
+        let RelationNode::Join { left, right, kind: JoinKind::Cross, condition: None } = prepared.node() else { panic!("Expected the cross join on top: {prepared:?}") };
+        let RelationNode::Join { left: first, right: second, kind: JoinKind::Cross, .. } = left.node() else { panic!("Expected a nested cross join") };
+        assert_eq!(scan_predicates(first), [equals(&a, 1)]);
+        assert_eq!(scan_predicates(second), [equals(&b, 2)]);
+        assert_eq!(scan_predicates(right), [equals(&c, 3)]);
+    }
+
+    #[test]
+    fn a_conjunct_reading_both_sides_of_a_cross_join_becomes_its_inner_join_condition() {
+        let [a, b] = [0, 1].map(field);
+        let both = Expr::binary(BinaryOp::Eq, a.expression(), b.expression());
+        let joined = Relation::join(base_scan(vec![a.clone()]), base_scan(vec![b.clone()]), JoinKind::Cross, None).unwrap();
+        let prepared = prepare(Arc::new(Arc::new(joined).filter(both.clone()).unwrap())).unwrap();
+        assert!(matches!(prepared.node(), RelationNode::Join { kind: JoinKind::Inner, condition: Some(condition), .. } if *condition == both), "{prepared:?}");
+    }
+
+    #[test]
+    fn outer_join_conjuncts_move_only_into_the_side_whose_rows_they_can_drop() {
+        let [a, b] = [0, 1].map(field);
+        let on = conjunction(vec![Expr::binary(BinaryOp::Eq, a.expression(), b.expression()), equals(&a, 1), equals(&b, 2)]);
+        let joined = Arc::new(Relation::join(base_scan(vec![a.clone()]), base_scan(vec![b.clone()]), JoinKind::Left, Some(on)).unwrap());
+        let filtered = joined.filter(conjunction(vec![equals(&a, 3), Expr::binary(BinaryOp::IsDistinctFrom, b.expression(), Expr::Literal(Value::I64(4)))])).unwrap();
+        let prepared = prepare(Arc::new(filtered)).unwrap();
+        let RelationNode::Filter { input, predicate } = prepared.node() else { panic!("A WHERE conjunct on the null-supplying side stays above the join: {prepared:?}") };
+        assert_eq!(predicate.referenced_columns(), BTreeSet::from([b.id]));
+        let RelationNode::Join { left, right, kind: JoinKind::Left, condition: Some(condition) } = input.node() else { panic!("Expected the left join") };
+        assert_eq!(scan_predicates(left), [equals(&a, 3)], "the preserved side takes the WHERE conjunct but not the ON one");
+        assert_eq!(scan_predicates(right), [equals(&b, 2)]);
+        assert_eq!(condition, &conjunction(vec![Expr::binary(BinaryOp::Eq, a.expression(), b.expression()), equals(&a, 1)]));
+    }
+
+    #[test]
+    fn a_join_reads_only_the_columns_its_parent_and_condition_need() {
+        let [a, unused_a, b, unused_b] = [0, 1, 2, 3].map(field);
+        let joined = Arc::new(Relation::join(base_scan(vec![a.clone(), unused_a]), base_scan(vec![b.clone(), unused_b]), JoinKind::Inner,
+            Some(Expr::binary(BinaryOp::Eq, a.expression(), b.expression()))).unwrap());
+        let output = joined.project(vec![NamedExpr { field: a.clone(), expr: a.expression() }]).unwrap();
+        let prepared = prepare(Arc::new(output)).unwrap();
+        let RelationNode::Project { input, .. } = prepared.node() else { panic!("Expected the projection") };
+        let RelationNode::Join { left, right, .. } = input.node() else { panic!("Expected the join") };
+        assert_eq!(left.schema().ids(), BTreeSet::from([a.id]));
+        assert_eq!(right.schema().ids(), BTreeSet::from([b.id]));
+    }
+
+    #[test]
+    fn a_relation_joins_the_plan_once_a_condition_connects_it_and_the_written_column_order_is_kept() {
+        let [a, b, c] = [0, 1, 2].map(field);
+        let crossed = Relation::join(Arc::new(Relation::join(base_scan(vec![a.clone()]), base_scan(vec![b.clone()]), JoinKind::Cross, None).unwrap()), base_scan(vec![c.clone()]), JoinKind::Cross, None).unwrap();
+        let a_c = Expr::binary(BinaryOp::Eq, a.expression(), c.expression());
+        let prepared = prepare(Arc::new(Arc::new(crossed).filter(a_c.clone()).unwrap())).unwrap();
+        let RelationNode::Project { input, expressions } = prepared.node() else { panic!("Expected the column order restored: {prepared:?}") };
+        assert_eq!(expressions.iter().map(|named| named.field.id).collect::<Vec<_>>(), [a.id, b.id, c.id]);
+        let RelationNode::Join { left, right, kind: JoinKind::Cross, .. } = input.node() else { panic!("Expected the unconnected table crossed last") };
+        assert_eq!(right.schema().ids(), BTreeSet::from([b.id]));
+        assert!(matches!(left.node(), RelationNode::Join { kind: JoinKind::Inner, condition: Some(condition), .. } if *condition == a_c));
     }
 
     #[test]
