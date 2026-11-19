@@ -1,0 +1,80 @@
+= Bitemporal full-text search: implementation plan
+
+Full-text search over a table's documents, answered at any valid time and system time.
+The behavioural specification is link:fts.allium[fts.allium]; this file is the implementation plan and the map of where the code lives.
+
+== Shape
+
+Search is a plugin behind generic extension points in the core.
+The core knows only that a trie may carry *derived artefacts*: extra files built from the trie's data file, recorded on its catalog entry, persisted with it, and deleted with it.
+It does not know what a search index is.
+
+[cols="1,3"]
+|===
+| Core extension point | What search plugs into it
+
+| Artefact records on `TrieDetails` (`format`, `index`)
+| A record per search file: kind `search`, the index definition's id and version, and opaque statistics.
+
+| `ArtefactsAdded` source and replica messages (`replication`)
+| The index lane publishes a built search file; the leader accepts it while its trie is live and every node records it.
+
+| Artefact deletion in trie GC (`maintenance`)
+| A garbage trie's artefacts are deleted, by listing its artefact prefix, before its data and meta files.
+
+| The artefact lane (`maintenance`)
+| A deterministic job per (live trie, definition) lacking an artefact, run like compaction jobs.
+
+| The scan accelerator (`query`)
+| Before a scan opens, an accelerator may narrow `Scan.iids` to a candidate superset; the scan's resolution and `PageFilter` decide the result.
+
+| Scalar functions (`plan`, `expr`, `sql`)
+| `MATCH(column, query)` and `SEARCH_SCORE(column, query)`, evaluated on resolved rows with the analyzer in `rtdb-text`.
+
+| Mutations (`sql`, `tx`)
+| `CREATE SEARCH INDEX` and `DROP SEARCH INDEX` write documents to `xt.search_indexes` at their log position.
+|===
+
+Switching search off is a node option (`search.enabled`) and a Cargo feature (`search` on `rtdb-node`).
+With either off, nothing builds search files and `MATCH` is evaluated by scanning, with identical results.
+Trie GC deletes artefacts whatever the setting, so turning search off leaves nothing behind.
+
+== Decisions
+
+* *Index events, not resolved entities.*
+  A search file covers exactly one trie data file; a document is one row, and its id is the row's ordinal.
+* *A search file only nominates candidates.*
+  `MATCH` is an ordinary scan predicate; the scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
+* *A missing search file is never an error.*
+  The accelerator treats it as absent and brute-forces that trie, which is what makes deleting one always safe.
+* *Tokens are ours, postings are tantivy's.*
+  `rtdb-text` analyses text (Unicode word split, lowercasing); the search file feeds tantivy pre-tokenized strings, so the residual check and the index agree token for token.
+* *Byte-deterministic search files.*
+  Segment ids derive from the trie key and definition, the writer is single-threaded with no merges, and the bundle orders its files by name.
+  Two builders of one job write identical bytes to one key.
+* *Definitions are documents.*
+  `xt.search_indexes` is written by the indexer, so the definitions in force are a function of log position and readable as of any basis.
+
+== Phases
+
+Each phase lands as its own commit on `docs/fts-spec`, with its tests.
+
+. *Artefact records.* Proto fields, `CatalogTrie.artefacts`, persistence through block files, `TableSlug::artefact_key`.
+. *Artefact messages.* `ArtefactsAdded` through the source log, the leader's acceptance, apply on every node, staleness.
+. *Artefact GC.* Garbage tries' artefact prefixes deleted before their data files.
+. *Artefact lane.* A driver selecting deterministic jobs, with a builder trait and a publisher.
+. *Analyzer and `MATCH`.* `rtdb-text`, the scalar functions, brute-force evaluation — correct with no index, and the oracle for everything after.
+. *Definitions.* `CREATE SEARCH INDEX` / `DROP SEARCH INDEX` and `xt.search_indexes`.
+. *Search files.* The tantivy bundle format, its builder and reader, determinism tests.
+. *Lane wiring.* The search builder in the artefact lane, node options and the Cargo feature.
+. *Acceleration.* The scan accelerator: candidate IIDs from search files, brute force for uncovered tries and live segments, a candidate cap above which the scan runs unnarrowed.
+. *Ranking.* `SEARCH_SCORE` as BM25 over corpus statistics summed from the current-side artefact records.
+. *Specs and docs.* `fts.allium` and the core specs brought in line with the implementation.
+
+== Deferred
+
+* Block-max WAND top-k over search files, which needs the scan to verify candidates in batches.
+* In-memory postings for live segments.
+* Phrase queries, which need positions.
+* Indexing the historical side, and search files spanning a completed partition group.
+* `DiskCachedStore::delete` leaves a local cached copy (`storage/src/disk_cache.rs`), for data files as for search files; an erase reaches the local cache only when it trims.
