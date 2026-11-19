@@ -127,6 +127,8 @@ impl Registry {
         drop(state);
         rows.push(self.gauge("xtdb.allocator.root.memory.allocated", allocated as f64));
         rows.push(self.gauge("xtdb.allocator.root.memory.limit", self.memory.limit_bytes() as f64));
+        let processors = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        rows.push(CatalogMetric::Gauge { name: "system.cpu.count".into(), tags: self.tags(), unit: None, value: processors as f64 });
         #[cfg(feature = "kafka")]
         sources.append_rows(&mut rows, &self.node_id, step);
         for metric in provided.iter().flat_map(|rows| rows.rows()) {
@@ -183,6 +185,11 @@ mod tests {
             drop(registry);
             assert_eq!(memory.used_bytes(), 0);
         }).unwrap().join().unwrap();
+    }
+    #[test]
+    fn the_processor_count_is_a_gauge() {
+        let registry = Registry::new("node-1", MemoryBudget::new(1 << 22)).unwrap();
+        assert!(registry.metrics().unwrap().rows().iter().any(|row| matches!(row, CatalogMetric::Gauge { name, value, .. } if name == "system.cpu.count" && *value >= 1.0)));
     }
     #[test]
     fn reference_timers_are_listed_before_their_first_observation() {
