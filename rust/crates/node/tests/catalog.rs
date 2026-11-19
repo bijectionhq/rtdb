@@ -103,3 +103,11 @@ async fn hidden_temporal_fields_bind_explicitly_and_stay_out_of_aliased_wildcard
     assert_eq!(query(&context, "SELECT _system_from FROM docs FOR ALL SYSTEM_TIME").await, vec![vec![Value::Timestamp { value: 1, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }]]);
     assert_eq!(query(&context, "SELECT _system_from, _valid_to FROM docs FOR ALL SYSTEM_TIME").await, vec![vec![Value::Timestamp { value: 1, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }, Value::Null]]);
 }
+
+#[tokio::test]
+async fn information_schema_columns_are_numbered_temporal_first_then_by_name() {
+    let context = context(false, Some(StructFields::from([("_id".into(), Value::I64(1)), ("zeta".into(), Value::I64(2)), ("alpha".into(), Value::I64(3))])));
+    let names: Vec<_> = query(&context, "SELECT column_name FROM information_schema.columns WHERE table_name = 'docs' ORDER BY ordinal_position").await.into_iter().map(|row| row[0].clone()).collect();
+    let expected = ["_id", "_system_from", "_system_to", "_valid_from", "_valid_to", "alpha", "zeta"].map(|name| Value::Utf8(name.into()));
+    assert_eq!(names, expected);
+}
