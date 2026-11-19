@@ -393,14 +393,18 @@ impl PartitionScan {
         let page = &self.pages.entries[index];
         let mut charge = None;
         let mut cached = false;
-        let rows = match &page.source {
-            PageSource::Live { table, rows } => ActiveRows::Live { table: Arc::clone(table),rows: Arc::clone(rows) },
-            PageSource::File { file, page: page_index } if let Some((batch, bound)) = metadata_cache::page(&self.files.entries[*file].storage, &self.files.entries[*file].key, *page_index) => {
+        let hit = match &page.source {
+            PageSource::File { file, page: page_index } => metadata_cache::page(&self.files.entries[*file].storage, &self.files.entries[*file].key, *page_index),
+            PageSource::Live { .. } => None,
+        };
+        let rows = match (&page.source, hit) {
+            (PageSource::Live { table, rows }, _) => ActiveRows::Live { table: Arc::clone(table),rows: Arc::clone(rows) },
+            (PageSource::File { .. }, Some((batch, bound))) => {
                 charge = Some(self.execution.context.memory.reserve(bound)?);
                 cached = true;
                 ActiveRows::File(batch)
             }
-            PageSource::File { file, page: page_index } => {
+            (PageSource::File { file, page: page_index }, None) => {
                 let data = &mut self.files.entries[*file];
                 if matches!(&data.state, DataState::Unopened) {
                     let lease = data.storage.get(&data.key).await?;
