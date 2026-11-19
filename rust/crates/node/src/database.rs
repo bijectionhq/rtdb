@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{database::proto::DatabaseConfig, keys::TrieKey, log::proto::TriesAdded};
+use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::TrieKey, log::proto::TriesAdded};
 use rtdb_index::PartitionState;
 use rtdb_maintenance::{BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionJob, CompactionHandle, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
@@ -119,6 +119,7 @@ impl DatabaseFactory {
             let mut replication_options = self.options.replication.clone();
             replication_options.may_lead &= !read_only;
             replication_options.external_source = configuration.external_source.is_some();
+            replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
             let (compactor, compaction) = if read_only || self.options.compaction_threads == 0 { (None, None) } else {
@@ -288,3 +289,26 @@ fn component_exit(result: Option<std::result::Result<Result<()>, tokio::task::Jo
     match result { Some(result) => joined(result).err().unwrap_or_else(|| Anomaly::fault("rtdb.node/driver-ended", "A database driver ended before shutdown")), None => Anomaly::fault("rtdb.node/driver-missing", "A database has no running drivers") }
 }
 fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/database-closed", "Database is closed") }
+
+/// As the reference's election driver times assertions off the log: a remote log's append-to-visibility time
+/// needs ten times an in-process log's interval.
+fn assertion_interval(log: Option<&database_config::Log>, in_process: std::time::Duration) -> std::time::Duration {
+    match log {
+        None | Some(database_config::Log::InMemoryLog(_) | database_config::Log::LocalLog(_)) => in_process,
+        Some(_) => in_process.saturating_mul(10),
+    }
+}
+
+#[cfg(test)]
+mod assertion_interval_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn remote_logs_assert_ten_times_less_often_than_in_process_logs() {
+        let base = Duration::from_millis(100);
+        assert_eq!(assertion_interval(None, base), base);
+        assert_eq!(assertion_interval(Some(&database_config::Log::InMemoryLog(Default::default())), base), base);
+        assert_eq!(assertion_interval(Some(&database_config::Log::LocalLog(Default::default())), base), base);
+        assert_eq!(assertion_interval(Some(&database_config::Log::OtherLog(Default::default())), base), Duration::from_secs(1));
+    }
+}
