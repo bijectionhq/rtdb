@@ -82,3 +82,12 @@ fn now_in_a_temporal_filter_is_the_current_time_and_limits_take_literals() {
     let error = compiled("(-> (rel [{:x 1}] [x]) (offset x))").unwrap_err();
     assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtql/invalid-offset", Some("Offset must be a non-negative integer literal or parameter")));
 }
+
+#[test]
+fn a_logical_plan_get_accepts_a_keyword_field() {
+    let memory = MemoryBudget::new(1 << 20);
+    let plan = "[:project {:projections [{bar (. foo :bar)}]} [:table {:rows [{foo {:bar 42}}]}]]";
+    assert!(compile_ra_in(plan, &EmptyCatalog, &CompileOptions::default(), &memory).is_ok());
+    let error = compile("(-> (rel [{:foo {:bar 42}}] [foo]) (return {:bar (. foo :bar)}))", &EmptyCatalog, &CompileOptions::default()).unwrap_err();
+    assert_eq!(error.code, "xtql/malformed-get");
+}
