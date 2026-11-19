@@ -7,21 +7,23 @@ pub(crate) trait Leased: Send + Sync { fn close(&self); }
 struct Live<V> { value: Arc<V>, since: Timestamp, limit: Duration, idle: Duration, users: usize, _reservation: Arc<MemoryReservation> }
 enum Entry<V> { Live(Live<V>), Expired { at: Timestamp, after: Duration, _reservation: Arc<MemoryReservation> } }
 pub(crate) enum Lookup<V> { Found(Arc<V>), Expired(Duration), Unknown }
-pub(crate) struct Registry<K, V> { entries: Mutex<BTreeMap<K, Entry<V>>>, clock: Arc<dyn Clock>, memory: Arc<MemoryBudget> }
+/// Leased handles by key; `live` counts the live entries, kept with every transition so the status count is not a scan.
+pub(crate) struct Registry<K, V> { entries: Mutex<BTreeMap<K, Entry<V>>>, live: std::sync::atomic::AtomicUsize, clock: Arc<dyn Clock>, memory: Arc<MemoryBudget> }
 impl<K: Ord + Clone, V: Leased> Registry<K, V> {
-    pub fn new(clock: Arc<dyn Clock>, memory: Arc<MemoryBudget>) -> Self { Self { entries: Mutex::new(BTreeMap::new()), clock, memory } }
+    pub fn new(clock: Arc<dyn Clock>, memory: Arc<MemoryBudget>) -> Self { Self { entries: Mutex::new(BTreeMap::new()), live: Default::default(), clock, memory } }
     pub fn insert(&self, key: K, value: Arc<V>, idle: Duration, first: Duration, acquired: bool, key_bytes: usize) -> Result<()> {
         let reservation = self.memory.reserve(key_bytes.checked_add(256).ok_or_else(|| Anomaly::incorrect("rtdb.flight-sql/lease-size", "Lease identity exceeds addressable memory"))?)?;
         let mut entries = self.entries.lock().expect("lease lock");
         if entries.contains_key(&key) { return Err(Anomaly::fault("rtdb.flight-sql/duplicate-handle", "Generated Flight handle already exists")); }
         entries.insert(key, Entry::Live(Live { value, since: self.clock.now(), limit: first, idle, users: usize::from(acquired), _reservation: reservation }));
+        self.live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
     pub fn lookup(&self, key: &K, acquire: bool) -> Lookup<V> {
         let now = self.clock.now();
         let mut entries = self.entries.lock().expect("lease lock");
         let Some(entry) = entries.get_mut(key) else { return Lookup::Unknown; };
-        expire(entry, now);
+        self.expire(entry, now);
         match entry {
             Entry::Live(live) => { live.since = now; live.limit = live.idle; live.users += usize::from(acquire); Lookup::Found(Arc::clone(&live.value)) }
             Entry::Expired { after, .. } => Lookup::Expired(*after),
@@ -35,33 +37,43 @@ impl<K: Ord + Clone, V: Leased> Registry<K, V> {
     pub fn take(&self, key: &K) -> Lookup<V> {
         let mut entries = self.entries.lock().expect("lease lock");
         let Some(entry) = entries.get_mut(key) else { return Lookup::Unknown; };
-        expire(entry, self.clock.now());
+        self.expire(entry, self.clock.now());
         match entry {
             Entry::Expired { after, .. } => Lookup::Expired(*after),
-            Entry::Live(_) => match entries.remove(key).expect("present lease") { Entry::Live(live) => Lookup::Found(live.value), Entry::Expired { .. } => unreachable!() },
+            Entry::Live(_) => {
+                self.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                match entries.remove(key).expect("present lease") { Entry::Live(live) => Lookup::Found(live.value), Entry::Expired { .. } => unreachable!() }
+            }
         }
     }
     pub fn sweep(&self) {
         let now = self.clock.now();
         self.entries.lock().expect("lease lock").retain(|_, entry| {
             let remove = matches!(entry, Entry::Expired { at, after, .. } if elapsed(*at, now) >= *after);
-            if !remove { expire(entry, now); } !remove
+            if !remove { self.expire(entry, now); } !remove
         });
     }
     pub fn close(&self) {
         let entries = std::mem::take(&mut *self.entries.lock().expect("lease lock"));
+        self.live.store(0, std::sync::atomic::Ordering::Release);
         for entry in entries.into_values() { if let Entry::Live(live) = entry { live.value.close(); } }
     }
-    pub fn len(&self) -> usize { self.entries.lock().expect("lease lock").values().filter(|entry| matches!(entry, Entry::Live(_))).count() }
+    pub fn len(&self) -> usize { self.live.load(std::sync::atomic::Ordering::Acquire) }
+    fn expire(&self, entry: &mut Entry<V>, now: Timestamp) {
+        if expire(entry, now) { self.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+    }
 }
 fn elapsed(since: Timestamp, now: Timestamp) -> Duration { Duration::from_micros(now.0.saturating_sub(since.0).max(0) as u64) }
-fn expire<V: Leased>(entry: &mut Entry<V>, now: Timestamp) {
+/// Expires an idle live entry past its limit, reporting whether it did.
+fn expire<V: Leased>(entry: &mut Entry<V>, now: Timestamp) -> bool {
     if let Entry::Live(live) = entry {
         if live.users == 0 && elapsed(live.since, now) >= live.limit {
             live.value.close();
             *entry = Entry::Expired { at: now, after: live.limit, _reservation: Arc::clone(&live._reservation) };
+            return true;
         }
     }
+    false
 }
 
 pub(crate) fn duration(value: Duration) -> String {
