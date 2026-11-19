@@ -477,11 +477,12 @@ fn validate_document_operation(operation: &Operation) -> Result<()> {
         .with_context("forbidden-cols", serde_json::json!(forbidden)))
 }
 
-/// The table a document operation writes; the reference adds it to the context of any error the operation raises.
+/// The table a put, delete or erase writes; the reference's crash-log wrapper around those adds it to any error they raise.
+/// Its patch path has no such wrapper.
 fn document_table(operation: &Operation) -> Option<&TableRef> {
     match operation {
-        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::PutIids { table, .. } | Operation::PatchIids { table, .. } => Some(table),
+        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::PutIids { table, .. } => Some(table),
         _ => None,
     }
 }

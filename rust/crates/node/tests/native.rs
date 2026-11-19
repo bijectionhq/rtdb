@@ -1639,7 +1639,7 @@ async fn executing_a_transaction_without_an_indexer_fails_and_queries_still_run(
 }
 
 #[tokio::test]
-async fn a_document_operation_error_names_its_table() {
+async fn a_put_error_names_its_table_and_a_patch_error_does_not() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let TxOp::PutDocs { table, documents, .. } = put(&node, 1, 10) else { unreachable!() };
@@ -1648,5 +1648,11 @@ async fn a_document_operation_error_names_its_table() {
     let error = result.error().expect("the inverted valid time aborts the transaction");
     assert_eq!(error.code, "xtdb.indexer/invalid-valid-times");
     assert_eq!(rtdb_format::transit::from_json_value(&error.context["table"]).unwrap(), rtdb_format::transit::TransitValue::table_ref(&table));
+    let TxOp::PutDocs { table, documents, .. } = put(&node, 1, 10) else { unreachable!() };
+    let patch = TxOp::PatchDocs { table, documents, valid_from: Some(rtdb_types::Timestamp(2_000)), valid_to: Some(rtdb_types::Timestamp(1_000)) };
+    let result = session.state_mut().execute_tx(vec![patch], AutonomousTxOptions::default()).await.unwrap();
+    let error = result.error().expect("the inverted valid time aborts the patch");
+    assert_eq!(error.code, "xtdb.indexer/invalid-valid-times");
+    assert!(!error.context.contains_key("table"), "the reference's patch path adds no table: {:?}", error.context);
     drop(session); stop(&node, driver).await;
 }
