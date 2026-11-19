@@ -452,7 +452,9 @@ fn project_bound(row: &ResolvedRow<RowSource>,name: &str) -> Result<usize> {
     let put = op.child(op.type_id(row.source.row)).as_any().downcast_ref::<StructArray>().ok_or_else(||invalid("event-schema","Visible event is not a put struct"))?;
     let DataType::Struct(fields) = put.data_type() else { return Err(invalid("event-schema","Put has no struct fields")); };
     let Some(index) = fields.iter().position(|field|field.name() == name) else { return Ok(std::mem::size_of::<Value>()); };
-    rtdb_columnar::estimate_read_value_bytes(&fields[index],put.column(index).as_ref(),op.value_offset(row.source.row))
+    let (field, column, offset) = (&fields[index], put.column(index).as_ref(), op.value_offset(row.source.row));
+    if row.source.batch.put_field_type(index).is_some() { rtdb_columnar::estimate_read_cell_bytes(field, column, offset) }
+    else { rtdb_columnar::estimate_read_value_bytes(field, column, offset) }
 }
 
 async fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Result<TemporalBounds> {

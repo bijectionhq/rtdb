@@ -90,7 +90,7 @@ impl EmittedRelation {
     }
 
     pub fn emit(relation: Arc<Relation>, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>, mode: EmissionMode) -> Result<Arc<Self>> {
-        let bound = parameters.iter().try_fold(allocation_bound(&relation)?, |bytes, ty| add(bytes, add(multiply(ty.retained_bytes()?, 32)?, 512)?))?;
+        let bound = parameters.iter().try_fold(allocation_bound(&relation)?, |bytes, ty| add(bytes, add(multiply(ty.retained_bytes()?, 4)?, 512)?))?;
         let reservation = memory.reserve(bound)?;
         let parameters = parameters.iter().enumerate().map(|(index, ty)| (index, ty.clone())).collect();
         relation_types(&relation, &Emitter { catalog, mode, parameters: &parameters, outer: &[], reservation: &reservation })
@@ -109,7 +109,7 @@ fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_
 fn multiply(value: usize, factor: usize) -> Result<usize> { value.checked_mul(factor).ok_or_else(|| invalid("runtime-schema-size", "Runtime schema allocation exceeds addressable memory")) }
 fn field_bound(field: &Field) -> Result<usize> {
     let qualifier = field.qualifier.as_ref().map(|qualifier| qualifier.retained_bytes()).transpose()?.unwrap_or(0);
-    add(multiply(field.data_type.retained_bytes()?, 32)?, add(multiply(add(field.name.len(), qualifier)?, 8)?, 2048)?)
+    add(multiply(field.data_type.retained_bytes()?, 4)?, add(multiply(add(field.name.len(), qualifier)?, 8)?, 2048)?)
 }
 pub(crate) fn schema_bound(schema: &Schema) -> Result<usize> {
     schema.fields().iter().try_fold(4096, |bytes, field| add(bytes, field_bound(field)?))
@@ -117,20 +117,20 @@ pub(crate) fn schema_bound(schema: &Schema) -> Result<usize> {
 pub(crate) fn expression_bound(expr: &Expr) -> Result<usize> {
     let mut bytes = 2048;
     match expr {
-        Expr::Literal(value) => bytes = add(bytes, multiply(value.retained_bytes()?, 32)?)?,
+        Expr::Literal(value) => bytes = add(bytes, multiply(value.retained_bytes()?, 4)?)?,
         Expr::DurationLiteral(_) => {},
-        Expr::Column { data_type, .. } | Expr::Parameter { data_type, .. } | Expr::Correlated { data_type, .. } => bytes = add(bytes, multiply(data_type.retained_bytes()?, 32)?)?,
+        Expr::Column { data_type, .. } | Expr::Parameter { data_type, .. } | Expr::Correlated { data_type, .. } => bytes = add(bytes, multiply(data_type.retained_bytes()?, 4)?)?,
         Expr::Unary { expr, .. } => bytes = add(bytes, expression_bound(expr)?)?,
         Expr::Cast { expr, target } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, cast_bound(target)?)?; }
-        Expr::Field { expr, name, data_type } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, add(multiply(name.len(), 8)?, multiply(data_type.retained_bytes()?, 32)?)?)?; }
+        Expr::Field { expr, name, data_type } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, add(multiply(name.len(), 8)?, multiply(data_type.retained_bytes()?, 4)?)?)?; }
         Expr::Binary { left, right, .. } => { bytes = add(bytes, expression_bound(left)?)?; bytes = add(bytes, expression_bound(right)?)?; }
-        Expr::Call { name, args, return_type } => { bytes = add(bytes, add(multiply(name.len(), 8)?, multiply(return_type.retained_bytes()?, 32)?)?)?; for arg in args { bytes = add(bytes, expression_bound(arg)?)?; } }
+        Expr::Call { name, args, return_type } => { bytes = add(bytes, add(multiply(name.len(), 8)?, multiply(return_type.retained_bytes()?, 4)?)?)?; for arg in args { bytes = add(bytes, expression_bound(arg)?)?; } }
         Expr::RegexReplace { source,recipe,return_type } => { bytes = add(bytes,add(multiply(recipe.work_bound()?,8)?,multiply(return_type.retained_bytes()?,32)?)?)?;bytes = add(bytes,expression_bound(source)?)?; }
         Expr::Coalesce(args) | Expr::List(args) => for arg in args { bytes = add(bytes, expression_bound(arg)?)?; },
         Expr::Between { operand,low,high,.. } => { bytes = add(bytes,add(expression_bound(operand)?,add(expression_bound(low)?,expression_bound(high)?)?)?)?; }
         Expr::SimpleCase { operand, branches, otherwise } => { bytes = add(bytes, expression_bound(operand)?)?; for (candidate, value) in branches { bytes = add(bytes, add(expression_bound(candidate)?, expression_bound(value)?)?)?; } bytes = add(bytes, expression_bound(otherwise)?)?; }
         Expr::Case { branches, otherwise } => { for (condition, value) in branches { bytes = add(bytes, add(expression_bound(condition)?, expression_bound(value)?)?)?; } bytes = add(bytes, expression_bound(otherwise)?)?; }
-        Expr::Subscript { expr, index, data_type } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, expression_bound(index)?)?; bytes = add(bytes, multiply(data_type.retained_bytes()?, 32)?)?; }
+        Expr::Subscript { expr, index, data_type } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, expression_bound(index)?)?; bytes = add(bytes, multiply(data_type.retained_bytes()?, 4)?)?; }
         Expr::Struct(fields) => for (name, expr) in fields { bytes = add(bytes, add(multiply(name.len(), 8)?, expression_bound(expr)?)?)?; },
         Expr::RowCopy(fields) => for field in fields { bytes = add(bytes, field_bound(field)?)?; },
         Expr::In { expr, values, .. } => { bytes = add(bytes, expression_bound(expr)?)?; for value in values { bytes = add(bytes, expression_bound(value)?)?; } }
@@ -140,11 +140,11 @@ pub(crate) fn expression_bound(expr: &Expr) -> Result<usize> {
 }
 fn cast_bound(target: &rtdb_plan::CastTarget) -> Result<usize> {
     Ok(match target {
-        rtdb_plan::CastTarget::Fixed(ty) => multiply(ty.retained_bytes()?, 32)?,
+        rtdb_plan::CastTarget::Fixed(ty) => multiply(ty.retained_bytes()?, 4)?,
         rtdb_plan::CastTarget::List(element) => add(2048, cast_bound(element)?)?,
-        rtdb_plan::CastTarget::Checked { requested, target } => add(multiply(requested.retained_bytes()?, 32)?, cast_bound(target)?)?,
+        rtdb_plan::CastTarget::Checked { requested, target } => add(multiply(requested.retained_bytes()?, 4)?, cast_bound(target)?)?,
         rtdb_plan::CastTarget::Temporal(target) => add(2048, match &target.kind { rtdb_plan::TemporalKind::TimestampZone(rtdb_plan::CastTimezone::Explicit(zone)) => multiply(zone.capacity(), 32)?, _ => 0 })?,
-        rtdb_plan::CastTarget::Deferred(target) => add(2048, multiply(target.retained_bytes()?, 32)?)?,
+        rtdb_plan::CastTarget::Deferred(target) => add(2048, multiply(target.retained_bytes()?, 4)?)?,
         _ => 2048,
     })
 }
@@ -169,7 +169,7 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
             }
             for predicate in &scan.predicates { expression(predicate)?; }
             for name in [&scan.table.name.database, &scan.table.name.table.schema, &scan.table.name.table.table] { bytes = add(bytes, multiply(name.len(), 8)?)?; }
-            for (name, ty) in &scan.table.columns { bytes = add(bytes, add(add(1024, multiply(name.len(), 8)?)?, multiply(ty.retained_bytes()?, 32)?)?)?; }
+            for (name, ty) in &scan.table.columns { bytes = add(bytes, add(add(1024, multiply(name.len(), 8)?)?, multiply(ty.retained_bytes()?, 4)?)?)?; }
             if let Some(iids) = &scan.iids { bytes = add(bytes, multiply(iids.len(), 64)?)?; }
         }
         RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } | RelationNode::Rename { expressions, .. } => for named in expressions { expression(&named.expr)?; },

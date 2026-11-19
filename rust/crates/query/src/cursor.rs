@@ -185,7 +185,7 @@ impl PreparedQuery {
 
 fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {
     let settings_bytes = settings.retained_bytes()?;
-    let bytes = crate::runtime_schema::allocation_bound(relation)?.checked_mul(8).and_then(|bytes| bytes.checked_add(settings_bytes))
+    let bytes = crate::runtime_schema::allocation_bound(relation)?.checked_mul(2).and_then(|bytes| bytes.checked_add(settings_bytes))
         .ok_or_else(|| invalid("plan-size", "Prepared plan allocation overflow"))?;
     memory.reserve(bytes)
 }
