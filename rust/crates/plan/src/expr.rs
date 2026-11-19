@@ -556,6 +556,10 @@ pub fn arithmetic_type(op: BinaryOp, left: &LogicalType, right: &LogicalType) ->
     let mut results = Vec::new();
     for left in left.legs() {
         for right in right.legs() {
+            if left == LogicalType::Null || right == LogicalType::Null {
+                results.push(LogicalType::Null);
+                continue;
+            }
             if op == BinaryOp::Multiply && crate::period::is_range(&left) && crate::period::is_range(&right) {
                 results.push(left.clone().maybe());
                 continue;

@@ -375,6 +375,25 @@ async fn binary_bind_parameters_and_result_formats_use_declared_oids() {
 }
 
 #[tokio::test]
+async fn numeric_parameters_keep_numeric_result_types_through_integer_arithmetic() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("numeric", "SELECT $1 AS d, $2 + 1 AS e, 1 AS i", &[1700, 1700]).await;
+    let mut description = vec![b'S']; description.extend_from_slice(&cstring("numeric"));
+    client.send(b'D', &description).await; client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), vec![b'1', b't', b'T', b'Z']);
+    let fields = &frames[2].1;
+    let mut offset = 2; let mut oids = Vec::new();
+    for _ in 0..u16::from_be_bytes(fields[..2].try_into().unwrap()) {
+        offset += fields[offset..].iter().position(|&byte| byte == 0).unwrap() + 1 + 6;
+        oids.push(i32::from_be_bytes(fields[offset..offset + 4].try_into().unwrap())); offset += 12;
+    }
+    assert_eq!(oids, [1700, 1700, 20]);
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
 async fn parameter_descriptions_keep_dml_and_control_oids_and_resize_query_oids() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
