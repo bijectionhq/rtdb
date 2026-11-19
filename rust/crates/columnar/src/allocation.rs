@@ -99,17 +99,19 @@ fn cell_cost(logical: &LogicalType, value: &Value) -> Result<usize> {
 }
 
 /// An absent or null cell occupies one null slot in every descendant array and clones no value.
+/// A slot is its value width (at most a 16-byte scalar), a validity bit, and an offset or type ID where the layout has one;
+/// a wide struct type pays this for every field a document lacks.
 fn absent_cost(logical: &LogicalType) -> Result<usize> {
     Ok(match logical {
-        LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => add(16, absent_cost(inner)?)?,
-        LogicalType::Nothing | LogicalType::Null => 16,
-        LogicalType::Scalar(ScalarType::FixedSizeBinary(width)) => add(16, *width as usize)?,
-        LogicalType::Scalar(_) => 48,
-        LogicalType::Struct(fields) => fields.values().try_fold(16, |bytes, field| add(bytes, absent_cost(field)?))?,
-        LogicalType::Union(legs) => add(16, legs.first().map(absent_cost).transpose()?.unwrap_or(0))?,
+        LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => add(2, absent_cost(inner)?)?,
+        LogicalType::Nothing | LogicalType::Null => 2,
+        LogicalType::Scalar(ScalarType::FixedSizeBinary(width)) => add(2, *width as usize)?,
+        LogicalType::Scalar(_) => 16,
+        LogicalType::Struct(fields) => fields.values().try_fold(4, |bytes, field| add(bytes, absent_cost(field)?))?,
+        LogicalType::Union(legs) => add(8, legs.first().map(absent_cost).transpose()?.unwrap_or(0))?,
         LogicalType::List { kind, element } => {
             let count = match kind { ListKind::FixedSizeList(width) => *width as usize, ListKind::TimestampTzRange => 2, _ => 0 };
-            add(16, multiply(absent_cost(element)?, count)?)?
+            add(8, multiply(absent_cost(element)?, count)?)?
         }
     })
 }
@@ -133,7 +135,7 @@ fn clone_cost(value: &Value) -> Result<usize> {
         Value::Decimal(value) => bytes = add(bytes, value.unscaled.len())?,
         Value::Timestamp { timezone: Some(timezone), .. } => bytes = add(bytes, timezone.len())?,
         Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => {
-            for value in values { bytes = add(bytes, multiply(clone_cost(value)?, 2)?)?; }
+            for value in values { bytes = add(bytes, clone_cost(value)?)?; }
         }
         Value::Map { entries, .. } => for (key, value) in entries {
             bytes = add(bytes, map_node_cost()?)?;
@@ -148,7 +150,8 @@ fn clone_cost(value: &Value) -> Result<usize> {
     Ok(bytes)
 }
 
-fn map_node_cost() -> Result<usize> { add(multiply(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 16)?, 512) }
+/// One map or struct entry: its key and value, doubled for B-tree node slack, plus node overhead.
+fn map_node_cost() -> Result<usize> { add(multiply(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 2)?, 64) }
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(overflow) }
 fn multiply(left: usize, right: usize) -> Result<usize> { left.checked_mul(right).ok_or_else(overflow) }
 fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Array builder allocation bound cannot be represented") }

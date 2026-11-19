@@ -182,3 +182,13 @@ fn a_cell_estimate_charges_the_column_schema_once_not_per_nested_value() {
     assert!(with_schema > cell);
     assert!(with_schema - cell < cell, "schema charged once: cell {cell}, with schema {with_schema}");
 }
+
+#[test]
+fn a_builder_estimate_grows_linearly_with_value_nesting() {
+    use rtdb_columnar::estimate_builder_bytes;
+    use rtdb_types::Value;
+    let nested = |depth: usize| (0..depth).fold(Value::I64(1), |inner, _| Value::List(vec![inner]));
+    let estimate = |depth: usize| { let value = nested(depth); estimate_builder_bytes(&value.logical_type(), &[value]).unwrap() };
+    let (shallow, deep) = (estimate(8), estimate(16));
+    assert!(deep < shallow * 8, "doubling the depth grew the estimate from {shallow} to {deep}");
+}

@@ -26,7 +26,7 @@ impl DeclaredBatch {
 /// Exact-schema pages retain their existing physical layout without rebuilding.
 pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBudget>) -> Result<DeclaredBatch> {
     let metadata_bound = declared.metadata().iter().try_fold(multiply(declared.metadata().capacity(), std::mem::size_of::<(String, String)>())?, |bytes, (key, value)| add(bytes, add(key.capacity(), value.capacity())?))?;
-    let schema_bound = declared.fields().iter().chain(batch.batch().schema().fields()).try_fold(add(8192, multiply(metadata_bound, 64)?)?, |bytes, field| add(bytes, multiply(field.size(), 64)?))?;
+    let schema_bound = declared.fields().iter().chain(batch.batch().schema().fields()).try_fold(add(8192, multiply(metadata_bound, 64)?)?, |bytes, field| add(bytes, multiply(field.size(), 4)?))?;
     let reservation = memory.reserve(schema_bound)?;
     let declared = Arc::new(declared.clone());
     if batch.batch().schema().as_ref() == declared.as_ref() { return Ok(DeclaredBatch { batch, declared, _reservation: reservation }); }

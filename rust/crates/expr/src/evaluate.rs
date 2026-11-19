@@ -465,7 +465,7 @@ fn validate_projection_value(value: &Value) -> Result<()> {
 /// Bare columns retain raw coefficients; computed outputs follow ordinary decimal vector-write validation.
 pub fn evaluate_batch(expr: &CompiledExpr, batch: &RecordBatch, context: &EvalContext<'_>, budget: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     if batch.num_columns() != expr.schema.len() { return Err(Anomaly::fault("rtdb.expr/input-schema", "Batch width differs from bound expression input")); }
-    let schema_bytes = batch.schema().fields().iter().try_fold(0usize, |bytes, field| bytes.checked_add(field.size().checked_mul(64).ok_or_else(overflow)?).ok_or_else(overflow))?;
+    let schema_bytes = batch.schema().fields().iter().try_fold(0usize, |bytes, field| bytes.checked_add(field.size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow))?;
     let _schema = budget.reserve(schema_bytes)?;
     for (actual, expected) in batch.schema().fields().iter().zip(expr.schema.fields()) {
         if rtdb_columnar::execution_field_type(actual)?.unencoded() != expected.data_type.unencoded() {
