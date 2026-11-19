@@ -1,7 +1,9 @@
 //! Re-encodes Arrow stream messages in the byte layout the reference's Java `MessageSerializer` writes.
-//! Log offsets are message identities, so a message must occupy exactly the bytes the reference gives it.
-//! Schema and record-batch flatbuffers are rebuilt in the reference's call order; batch bodies keep a validity
-//! bitmap only for nullable fields, always present there, with every buffer padded to eight bytes.
+//! Log offsets are message identities, so a message must occupy exactly the bytes the reference gives it,
+//! and block catalogs record file sizes, so a persisted file must too.
+//! Schema, record-batch and file-footer flatbuffers are rebuilt in the reference's call order; batch bodies keep a validity
+//! bitmap only for nullable fields, always present there, write no offsets for an offset-bearing field with no values,
+//! and pad every buffer to eight bytes.
 
 use std::io::{self, Write};
 
@@ -12,13 +14,25 @@ use flatbuffers::{FlatBufferBuilder, WIPOffset};
 #[derive(Clone, Copy)]
 enum NullCount { Zero, Unknown, Length }
 
-/// One field's place in a record batch: its node's null rule, its buffer count, and whether the first buffer is validity.
+/// One field's place in a record batch: its node's null rule, its buffer count, whether the first buffer is validity,
+/// and whether the second holds offsets - which the reference writes empty, rather than as one zero offset, for a field with no values.
 #[derive(Clone, Copy)]
-struct FieldLayout { nulls: NullCount, buffers: usize, validity: bool, nullable: bool }
+struct FieldLayout { nulls: NullCount, buffers: usize, validity: bool, nullable: bool, offsets: bool }
 
 /// A `Write` adapter that rewrites each framed stream message as it passes.
 /// The end marker and any message it doesn't recognise pass through as written.
-pub(crate) struct JavaLayout<W> { pub(crate) inner: W, pending: Vec<u8>, state: State, layouts: Option<Vec<FieldLayout>> }
+/// It also records each record batch's file block, positioned from the first byte it writes plus `start`, and the Java-layout schema.
+pub(crate) struct JavaLayout<W> {
+    pub(crate) inner: W, pending: Vec<u8>, state: State, layouts: Option<Vec<FieldLayout>>,
+    position: u64, pub(crate) blocks: Vec<arrow_ipc::Block>, pub(crate) schema: Option<Vec<u8>>,
+}
+
+/// Counts the bytes written through it into the adapter's output position.
+struct Counted<'a, W> { inner: &'a mut W, position: &'a mut u64 }
+impl<W: Write> Write for Counted<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { let count = self.inner.write(bytes)?; *self.position += count as u64; Ok(count) }
+    fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+}
 
 enum State { Prefix, Metadata { length: usize, continuation: bool }, Body { remaining: usize }, Planned(BodyPlan), Ended }
 
@@ -28,25 +42,28 @@ struct Segment { start: usize, length: usize, emit: Emit, padding: usize }
 enum Emit { Copy, Drop, Fill(Vec<u8>) }
 
 impl<W> JavaLayout<W> {
-    pub(crate) fn new(inner: W) -> Self { Self { inner, pending: Vec::new(), state: State::Prefix, layouts: None } }
+    pub(crate) fn new(inner: W) -> Self { Self::starting_at(inner, 0) }
+    /// As `new`, for output that begins `start` bytes into its file.
+    pub(crate) fn starting_at(inner: W, start: u64) -> Self { Self { inner, pending: Vec::new(), state: State::Prefix, layouts: None, position: start, blocks: Vec::new(), schema: None } }
 }
 
 impl<W: Write> Write for JavaLayout<W> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let written = bytes.len();
         while !bytes.is_empty() {
+            let mut out = Counted { inner: &mut self.inner, position: &mut self.position };
             match &mut self.state {
-                State::Ended => { self.inner.write_all(bytes)?; break; }
+                State::Ended => { out.write_all(bytes)?; break; }
                 State::Body { remaining } => {
                     let remaining = *remaining;
                     let count = remaining.min(bytes.len());
-                    self.inner.write_all(&bytes[..count])?; bytes = &bytes[count..];
+                    out.write_all(&bytes[..count])?; bytes = &bytes[count..];
                     self.state = if remaining == count { State::Prefix } else { State::Body { remaining: remaining - count } };
                 }
                 State::Planned(plan) => {
-                    let consumed = plan.write(bytes, &mut self.inner)?;
+                    let consumed = plan.write(bytes, &mut out)?;
                     bytes = &bytes[consumed..];
-                    if plan.position == plan.length { plan.finish(&mut self.inner)?; self.state = State::Prefix; }
+                    if plan.position == plan.length { plan.finish(&mut out)?; self.state = State::Prefix; }
                 }
                 State::Prefix => {
                     let target = if self.pending.len() >= 4 && self.pending[..4] == [0xff; 4] { 8 } else { 4 };
@@ -57,7 +74,7 @@ impl<W: Write> Write for JavaLayout<W> {
                     let length = i32::from_le_bytes(self.pending[target - 4..target].try_into().expect("four prefix bytes"));
                     let continuation = target == 8;
                     if length == 0 {
-                        self.inner.write_all(&self.pending)?; self.pending.clear(); self.state = State::Ended;
+                        out.write_all(&self.pending)?; self.pending.clear(); self.state = State::Ended;
                     } else {
                         let length = usize::try_from(length).map_err(|_| io::Error::other("Negative Arrow metadata length"))?;
                         self.pending.clear(); self.state = State::Metadata { length, continuation };
@@ -69,14 +86,22 @@ impl<W: Write> Write for JavaLayout<W> {
                     self.pending.extend_from_slice(&bytes[..count]); bytes = &bytes[count..];
                     if self.pending.len() < length { continue; }
                     let metadata = std::mem::take(&mut self.pending);
-                    let (encoded, plan, body) = self.rewrite(&metadata).map_err(io::Error::other)?;
-                    let encoded = encoded.unwrap_or(metadata);
-                    frame(&mut self.inner, &encoded, continuation)?;
-                    self.state = match plan {
-                        Some(mut plan) if plan.length == 0 => { plan.finish(&mut self.inner)?; State::Prefix }
+                    let rewritten = rewrite(&mut self.layouts, &metadata).map_err(io::Error::other)?;
+                    let encoded = rewritten.metadata.unwrap_or(metadata);
+                    let offset = *out.position;
+                    frame(&mut out, &encoded, continuation)?;
+                    let framed = *out.position - offset;
+                    let body = rewritten.plan.as_ref().map_or(rewritten.body as i64, BodyPlan::output_length);
+                    match rewritten.header {
+                        MessageHeader::Schema => self.schema = Some(encoded),
+                        MessageHeader::RecordBatch => self.blocks.push(arrow_ipc::Block::new(offset as i64, framed as i32, body)),
+                        _ => {}
+                    }
+                    self.state = match rewritten.plan {
+                        Some(mut plan) if plan.length == 0 => { plan.finish(&mut out)?; State::Prefix }
                         Some(plan) => State::Planned(plan),
-                        None if body == 0 => State::Prefix,
-                        None => State::Body { remaining: body },
+                        None if rewritten.body == 0 => State::Prefix,
+                        None => State::Body { remaining: rewritten.body },
                     };
                 }
             }
@@ -86,31 +111,34 @@ impl<W: Write> Write for JavaLayout<W> {
     fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
 }
 
-impl<W> JavaLayout<W> {
-    /// Returns the Java-layout metadata (none passes the message through), the plan for its body, and the input body length.
-    fn rewrite(&mut self, metadata: &[u8]) -> Result<(Option<Vec<u8>>, Option<BodyPlan>, usize), String> {
-        let message = arrow_ipc::root_as_message(metadata).map_err(|error| error.to_string())?;
-        let body = usize::try_from(message.bodyLength()).map_err(|_| "Negative Arrow body length".to_owned())?;
-        Ok(match message.header_type() {
-            MessageHeader::Schema => {
-                let schema = message.header_as_schema().ok_or("Arrow schema message has no schema")?;
-                let mut layouts = Vec::new();
-                self.layouts = schema.fields().iter().flatten().try_for_each(|field| field_layouts(&field, &mut layouts)).map(|()| layouts);
-                (Some(schema_message(message.version().0, &schema)), None, body)
-            }
-            MessageHeader::RecordBatch => {
-                let batch = message.header_as_record_batch().ok_or("Arrow batch message has no batch")?;
-                match self.layouts.as_deref().and_then(|layouts| BodyPlan::new(&batch, layouts, body)) {
-                    Some((plan, nodes, buffers)) => {
-                        let length = plan.output_length();
-                        (Some(record_batch_message(message.version().0, length, &batch, &nodes, &buffers)), Some(plan), body)
-                    }
-                    None => (None, None, body),
+/// A rewritten message: its Java-layout metadata (none passes it through), its body plan, its input body length and its kind.
+struct Rewritten { metadata: Option<Vec<u8>>, plan: Option<BodyPlan>, body: usize, header: MessageHeader }
+
+/// Rewrites one message's metadata and plans its body; a schema replaces the batch layouts.
+fn rewrite(layouts: &mut Option<Vec<FieldLayout>>, metadata: &[u8]) -> Result<Rewritten, String> {
+    let message = arrow_ipc::root_as_message(metadata).map_err(|error| error.to_string())?;
+    let body = usize::try_from(message.bodyLength()).map_err(|_| "Negative Arrow body length".to_owned())?;
+    let header = message.header_type();
+    let (metadata, plan) = match header {
+        MessageHeader::Schema => {
+            let schema = message.header_as_schema().ok_or("Arrow schema message has no schema")?;
+            let mut fields = Vec::new();
+            *layouts = schema.fields().iter().flatten().try_for_each(|field| field_layouts(&field, &mut fields)).map(|()| fields);
+            (Some(schema_message(message.version().0, &schema)), None)
+        }
+        MessageHeader::RecordBatch => {
+            let batch = message.header_as_record_batch().ok_or("Arrow batch message has no batch")?;
+            match layouts.as_deref().and_then(|layouts| BodyPlan::new(&batch, layouts, body)) {
+                Some((plan, nodes, buffers)) => {
+                    let length = plan.output_length();
+                    (Some(record_batch_message(message.version().0, length, &batch, &nodes, &buffers)), Some(plan))
                 }
+                None => (None, None),
             }
-            _ => (None, None, body),
-        })
-    }
+        }
+        _ => (None, None),
+    };
+    Ok(Rewritten { metadata, plan, body, header })
 }
 
 impl BodyPlan {
@@ -133,7 +161,7 @@ impl BodyPlan {
                     if !layout.nullable { Emit::Drop }
                     else if input_length == 0 && node.length() > 0 { Emit::Fill(all_valid(usize::try_from(node.length()).ok()?)) }
                     else { Emit::Copy }
-                } else { Emit::Copy };
+                } else if layout.offsets && index == 1 && node.length() == 0 { Emit::Drop } else { Emit::Copy };
                 let written = match &emit { Emit::Copy => input_length, Emit::Drop => 0, Emit::Fill(bytes) => bytes.len() };
                 let padding = (8 - written % 8) % 8;
                 buffers.push(arrow_ipc::Buffer::new(output, i64::try_from(written).ok()?));
@@ -210,7 +238,8 @@ fn field_layouts(field: &Field<'_>, output: &mut Vec<FieldLayout>) -> Option<()>
         | Type::Timestamp | Type::Interval | Type::Duration | Type::FixedSizeBinary => (2, true),
         _ => return None,
     };
-    output.push(FieldLayout { nulls, buffers, validity, nullable: field.nullable() });
+    let offsets = matches!(field.type_type(), Type::Utf8 | Type::Binary | Type::LargeUtf8 | Type::LargeBinary | Type::List | Type::LargeList | Type::Map);
+    output.push(FieldLayout { nulls, buffers, validity, nullable: field.nullable(), offsets });
     for child in field.children().iter().flatten() { field_layouts(&child, output)?; }
     Some(())
 }
@@ -218,15 +247,39 @@ fn field_layouts(field: &Field<'_>, output: &mut Vec<FieldLayout>) -> Option<()>
 /// `MessageSerializer.serializeMessage` over `Schema.getSchema`.
 pub(crate) fn schema_message(version: i16, schema: &arrow_ipc::Schema<'_>) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
-    let fields: Vec<_> = schema.fields().iter().flatten().map(|field| java_field(&mut builder, &field)).collect();
+    let header = java_schema(&mut builder, schema);
+    message(builder, version, MessageHeader::Schema, header.as_union_value(), 0)
+}
+
+/// `Schema.getSchema`: fields, then custom metadata, then the schema table.
+fn java_schema<'b>(builder: &mut FlatBufferBuilder<'b>, schema: &arrow_ipc::Schema<'_>) -> WIPOffset<arrow_ipc::Schema<'b>> {
+    let fields: Vec<_> = schema.fields().iter().flatten().map(|field| java_field(builder, &field)).collect();
     let fields = builder.create_vector(&fields);
-    let metadata = key_values(&mut builder, schema.custom_metadata());
-    let mut table = arrow_ipc::SchemaBuilder::new(&mut builder);
+    let metadata = key_values(builder, schema.custom_metadata());
+    let mut table = arrow_ipc::SchemaBuilder::new(builder);
     table.add_endianness(schema.endianness());
     table.add_fields(fields);
     table.add_custom_metadata(metadata);
-    let header = table.finish();
-    message(builder, version, MessageHeader::Schema, header.as_union_value(), 0)
+    table.finish()
+}
+
+/// `ArrowFooter.writeTo` without dictionaries or custom metadata, as `ArrowUnloader`'s file mode writes it,
+/// over a Java-layout schema message and the record batches' blocks.
+pub(crate) fn footer(schema_message: &[u8], blocks: &[arrow_ipc::Block]) -> Result<Vec<u8>, String> {
+    let message = arrow_ipc::root_as_message(schema_message).map_err(|error| error.to_string())?;
+    let schema = message.header_as_schema().ok_or("Arrow schema message has no schema")?;
+    let mut builder = FlatBufferBuilder::new();
+    let schema = java_schema(&mut builder, &schema);
+    let dictionaries = builder.create_vector::<arrow_ipc::Block>(&[]);
+    let batches = builder.create_vector(blocks);
+    let mut table = arrow_ipc::FooterBuilder::new(&mut builder);
+    table.add_schema(schema);
+    table.add_dictionaries(dictionaries);
+    table.add_recordBatches(batches);
+    table.add_version(arrow_ipc::MetadataVersion::V5);
+    let root = table.finish();
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
 }
 
 fn message(mut builder: FlatBufferBuilder<'_>, version: i16, header_type: MessageHeader, header: WIPOffset<flatbuffers::UnionWIPOffset>, body: i64) -> Vec<u8> {

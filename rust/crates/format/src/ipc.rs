@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_ipc::reader::FileDecoder;
-use arrow_ipc::writer::{DictionaryTracker, FileWriter, IpcDataGenerator, IpcWriteOptions, StreamWriter, write_message};
+use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter, write_message};
 use arrow_schema::{Schema, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, Result};
@@ -472,23 +472,56 @@ fn schema_metrics(schema: &Schema) -> Result<(usize, usize)> {
 }
 
 pub fn write_file(schema: &Schema, pages: &[RecordBatch]) -> Result<Vec<u8>> {
-    let decimal_schema = crate::ipc_decimal::DecimalSchema::new(schema)?;
-    for page in pages { decimal_schema.validate_batch(page)?; }
-    let mut writer = FileWriter::try_new_with_options(Vec::new(), &decimal_schema.wire, write_options()?).map_err(invalid)?;
-    for page in pages { writer.write(page).map_err(invalid)?; }
-    writer.finish().map_err(invalid)?;
-    let mut bytes = writer.into_inner().map_err(invalid)?;
-    let footer_length_at = bytes.len().checked_sub(10).ok_or_else(|| invalid("Arrow writer omitted its footer"))?;
-    let footer_length = i32::from_le_bytes(bytes[footer_length_at..footer_length_at + 4].try_into().map_err(invalid)?);
-    let footer_length = usize::try_from(footer_length).map_err(invalid)?;
-    let footer_start = footer_length_at.checked_sub(footer_length).ok_or_else(|| invalid("Arrow footer exceeds its file"))?;
-    decimal_schema.patch_footer(&mut bytes[footer_start..footer_length_at])?;
-    patch_schema_frame(&mut bytes[8..], &decimal_schema)?;
-    jvm_end_marker(&mut bytes, footer_start)?;
-    Ok(bytes)
+    let mut writer = JavaFile::new(Vec::new(), schema)?;
+    for page in pages { writer.write(page)?; }
+    writer.finish()
 }
 
-pub struct ArrowFileWriter { writer: FileWriter<LimitedFile>, decimal_schema: crate::ipc_decimal::DecimalSchema, allocation: WriterAllocation }
+/// `ArrowUnloader`'s file mode, `xtdb.arrow.ArrowUnloader.Mode.FILE`: the magic padded to eight bytes, the stream's messages in the
+/// reference's Java layout, its single zero end marker, then the Java-layout footer, its length and the magic.
+struct JavaFile<W: Write> {
+    writer: StreamWriter<TailWriter<FirstSchemaWriter<java_layout::JavaLayout<W>>>>,
+    decimal_schema: Arc<crate::ipc_decimal::DecimalSchema>,
+}
+
+const FILE_MAGIC: &[u8; 6] = b"ARROW1";
+
+impl<W: Write> JavaFile<W> {
+    fn new(mut sink: W, schema: &Schema) -> Result<Self> {
+        let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
+        sink.write_all(FILE_MAGIC).map_err(invalid)?;
+        sink.write_all(&[0; 2]).map_err(invalid)?;
+        let layout = java_layout::JavaLayout::starting_at(sink, 8);
+        let first = FirstSchemaWriter { inner: layout, schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
+        let writer = StreamWriter::try_new_with_options(TailWriter { inner: first, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
+        Ok(Self { writer, decimal_schema })
+    }
+    fn write(&mut self, page: &RecordBatch) -> Result<()> {
+        self.decimal_schema.validate_batch(page)?;
+        self.writer.write(page).map_err(invalid)
+    }
+    fn sink(&mut self) -> &mut W { &mut self.writer.get_mut().inner.inner.inner }
+    /// Bytes the sink has received plus those the end-marker lookahead still holds.
+    fn pending_bytes(&mut self) -> u64 { self.writer.get_mut().pending.len() as u64 }
+    fn finish(mut self) -> Result<W> {
+        self.writer.finish().map_err(invalid)?;
+        let mut tail = self.writer.into_inner().map_err(invalid)?;
+        if tail.pending.as_slice() != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
+        tail.inner.write_all(&[0; 4]).map_err(invalid)?;
+        if !tail.inner.complete { return Err(invalid("Arrow file ended before its schema")); }
+        let layout = tail.inner.inner;
+        let schema = layout.schema.as_deref().ok_or_else(|| invalid("Arrow file has no schema message"))?;
+        let footer = java_layout::footer(schema, &layout.blocks).map_err(invalid)?;
+        let mut sink = layout.inner;
+        sink.write_all(&footer).map_err(invalid)?;
+        sink.write_all(&i32::try_from(footer.len()).map_err(invalid)?.to_le_bytes()).map_err(invalid)?;
+        sink.write_all(FILE_MAGIC).map_err(invalid)?;
+        sink.flush().map_err(invalid)?;
+        Ok(sink)
+    }
+}
+
+pub struct ArrowFileWriter { writer: JavaFile<LimitedFile>, allocation: WriterAllocation }
 
 enum WriterAllocation {
     CallerReserved,
@@ -520,9 +553,8 @@ impl ArrowFileWriter {
     /// The caller reserves schema translation, Arrow encoding and footer scratch through `finish`.
     pub fn new_bounded(mut file: File, schema: &Schema, byte_limit: u64) -> Result<Self> {
         if file.metadata().map_err(invalid)?.len() != 0 || file.stream_position().map_err(invalid)? != 0 { return Err(invalid("Arrow output file must be empty and positioned at zero")); }
-        let decimal_schema = crate::ipc_decimal::DecimalSchema::new(schema)?;
-        let writer = FileWriter::try_new_with_options(LimitedFile { file, position: 0, limit: byte_limit }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
-        Ok(Self { writer, decimal_schema, allocation: WriterAllocation::CallerReserved })
+        let writer = JavaFile::new(LimitedFile { file, position: 0, limit: byte_limit }, schema)?;
+        Ok(Self { writer, allocation: WriterAllocation::CallerReserved })
     }
 
     /// Reserves schema translation, block inventory and footer copies for this writer's lifetime.
@@ -541,58 +573,30 @@ impl ArrowFileWriter {
         Ok(writer)
     }
 
-    pub fn bytes_written(&mut self) -> u64 { self.writer.get_mut().position }
+    pub fn bytes_written(&mut self) -> u64 { self.writer.pending_bytes() + self.writer.sink().position }
 
     /// The owner may lower the remaining allowance between writes; already-written bytes must still fit.
     pub fn set_byte_limit(&mut self, byte_limit: u64) -> Result<()> {
-        let sink = self.writer.get_mut();
-        if sink.position > byte_limit { return Err(invalid("Arrow output already exceeds the requested byte limit")); }
+        let pending = self.writer.pending_bytes();
+        let sink = self.writer.sink();
+        if sink.position + pending > byte_limit { return Err(invalid("Arrow output already exceeds the requested byte limit")); }
         sink.limit = byte_limit;
         Ok(())
     }
 
     pub fn write(&mut self, page: &RecordBatch) -> Result<()> {
-        self.decimal_schema.validate_batch(page)?;
+        self.writer.decimal_schema.validate_batch(page)?;
         if let WriterAllocation::Owned { memory, blocks, block_bound, .. } = &mut self.allocation { blocks.push(memory.reserve(*block_bound)?); }
-        self.writer.write(page).map_err(invalid)
+        self.writer.write(page)
     }
 
     /// Finishes the JVM-compatible end marker and returns the caller-owned file at its end.
-    pub fn finish(mut self) -> Result<File> {
+    pub fn finish(self) -> Result<File> {
         let _footer = match &self.allocation {
             WriterAllocation::CallerReserved => None,
             WriterAllocation::Owned { memory, _schema, blocks, block_bound } => Some(memory.reserve(allocation_add(_schema.bytes(), allocation_mul(blocks.len(), *block_bound)?)?)?),
         };
-        self.writer.finish().map_err(invalid)?;
-        let mut file = self.writer.into_inner().map_err(invalid)?.file;
-        patch_file_schemas(&mut file, &self.decimal_schema)?;
-        let end = file.seek(SeekFrom::End(0)).map_err(invalid)?;
-        file.seek(SeekFrom::End(-10)).map_err(invalid)?;
-        let mut tail = [0; 10];
-        file.read_exact(&mut tail).map_err(invalid)?;
-        let length = arrow_ipc::reader::read_footer_length(tail).map_err(invalid)? as u64;
-        let footer_start = end.checked_sub(length + 10).ok_or_else(|| invalid("Arrow footer exceeds its file"))?;
-        let marker = footer_start.checked_sub(8).ok_or_else(|| invalid("Arrow file has no end marker"))?;
-        file.seek(SeekFrom::Start(marker)).map_err(invalid)?;
-        let mut expected = [0; 8];
-        file.read_exact(&mut expected).map_err(invalid)?;
-        if expected != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
-        file.seek(SeekFrom::Start(marker)).map_err(invalid)?;
-        file.write_all(&[0; 4]).map_err(invalid)?;
-        let mut buffer = [0; 8192];
-        let mut position = footer_start;
-        while position < end {
-            let count = usize::try_from((end - position).min(buffer.len() as u64)).map_err(invalid)?;
-            file.seek(SeekFrom::Start(position)).map_err(invalid)?;
-            file.read_exact(&mut buffer[..count]).map_err(invalid)?;
-            file.seek(SeekFrom::Start(position - 4)).map_err(invalid)?;
-            file.write_all(&buffer[..count]).map_err(invalid)?;
-            position += count as u64;
-        }
-        file.set_len(end - 4).map_err(invalid)?;
-        file.seek(SeekFrom::End(0)).map_err(invalid)?;
-        file.flush().map_err(invalid)?;
-        Ok(file)
+        Ok(self.writer.finish()?.file)
     }
 }
 
@@ -620,8 +624,8 @@ pub fn write_arrow_stream(schema: &Schema, pages: &[RecordBatch], options: IpcWr
 /// The caller reserves the schema translation and initial encoded schema frame through this call.
 /// A page with different native field metadata is rejected before encoding; the sink may already contain a valid prefix.
 pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
-    let decimal_schema = crate::ipc_decimal::DecimalSchema::new(schema)?;
-    let sink = FirstSchemaWriter { inner: java_layout::JavaLayout::new(sink), schema: &decimal_schema, pending: Vec::new(), expected: None, complete: false };
+    let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
+    let sink = FirstSchemaWriter { inner: java_layout::JavaLayout::new(sink), schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
     let mut writer = StreamWriter::try_new_with_options(TailWriter { inner: sink, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
     for page in pages { decimal_schema.validate_batch(page)?; writer.write(page).map_err(invalid)?; }
     writer.finish().map_err(invalid)?;
@@ -709,29 +713,8 @@ fn patch_schema_frame(bytes: &mut [u8], schema: &crate::ipc_decimal::DecimalSche
     let end = allocation_add(position, usize::try_from(length).map_err(invalid)?)?;
     schema.patch_message(bytes.get_mut(position..end).ok_or_else(|| invalid("Arrow schema frame is truncated"))?)
 }
-fn patch_file_schemas(file: &mut File, schema: &crate::ipc_decimal::DecimalSchema) -> Result<()> {
-    file.seek(SeekFrom::Start(8)).map_err(invalid)?;
-    let mut prefix = [0; 4]; file.read_exact(&mut prefix).map_err(invalid)?;
-    let mut length = i32::from_le_bytes(prefix);
-    if length == -1 { file.read_exact(&mut prefix).map_err(invalid)?; length = i32::from_le_bytes(prefix); }
-    let start = file.stream_position().map_err(invalid)?;
-    let mut bytes = vec![0; usize::try_from(length).map_err(invalid)?]; file.read_exact(&mut bytes).map_err(invalid)?;
-    schema.patch_message(&mut bytes)?;
-    file.seek(SeekFrom::Start(start)).map_err(invalid)?; file.write_all(&bytes).map_err(invalid)?;
-    drop(bytes);
-    file.seek(SeekFrom::End(-10)).map_err(invalid)?;
-    let mut tail = [0; 10]; file.read_exact(&mut tail).map_err(invalid)?;
-    let length = arrow_ipc::reader::read_footer_length(tail).map_err(invalid)?;
-    file.seek(SeekFrom::End(-10 - i64::try_from(length).map_err(invalid)?)).map_err(invalid)?;
-    let start = file.stream_position().map_err(invalid)?;
-    let mut bytes = vec![0; length]; file.read_exact(&mut bytes).map_err(invalid)?;
-    schema.patch_footer(&mut bytes)?;
-    file.seek(SeekFrom::Start(start)).map_err(invalid)?; file.write_all(&bytes).map_err(invalid)?;
-    Ok(())
-}
-
-struct FirstSchemaWriter<'a, W> { inner: W, schema: &'a crate::ipc_decimal::DecimalSchema, pending: Vec<u8>, expected: Option<usize>, complete: bool }
-impl<W: Write> Write for FirstSchemaWriter<'_, W> {
+struct FirstSchemaWriter<W> { inner: W, schema: Arc<crate::ipc_decimal::DecimalSchema>, pending: Vec<u8>, expected: Option<usize>, complete: bool }
+impl<W: Write> Write for FirstSchemaWriter<W> {
     fn write(&mut self, mut bytes: &[u8]) -> std::io::Result<usize> {
         let length = bytes.len();
         while !bytes.is_empty() {
@@ -748,7 +731,7 @@ impl<W: Write> Write for FirstSchemaWriter<'_, W> {
                     if self.expected.is_some_and(|end| end < self.pending.len()) { return Err(std::io::Error::other("Invalid Arrow schema frame")); }
                 }
                 if self.expected == Some(self.pending.len()) {
-                    patch_schema_frame(&mut self.pending, self.schema).map_err(std::io::Error::other)?;
+                    patch_schema_frame(&mut self.pending, &self.schema).map_err(std::io::Error::other)?;
                     self.inner.write_all(&self.pending)?; self.pending.clear(); self.complete = true;
                 }
             }
