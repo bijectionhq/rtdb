@@ -1559,45 +1559,43 @@ Other codec and consumer allocations need separate admission.
 The implementation revision remains unset.
 The new regression sources and the Phase 2 release matrix await execution after source closure.
 
-== Handoff: Phase 1 re-baseline and corpus parity, 2026-11-18
+== Handoff: Phase 1 closed, Phase 2 corpus parity, 2026-11-19
 
-The owner chose to close Phase 1 against the README gate rather than JVM-internal mechanism fidelity.
-Every open implementation finding was restated in observable terms in source-completeness.json; each keeps its earlier text as superseded_requirement, and the deferred mechanism comparisons moved to the new differential-equivalence qualification finding.
-Nine of the ten Phase 1 findings are resolved with production paths, tests and listed divergences.
-final-design-closure is still open, so implementation_revision is unset and phase_2_authorized_by_completeness_gate stays false.
+main is rebased onto xtdb/xtdb main, 40 upstream commits past the pinned reference c84f9334e; the in-repo JVM tests the corpus runs are upstream's.
+reference_revision in the manifests still names c84f9334e.
+Upstream's #6401 changed percentile semantics (an out-of-range fraction is rejected before any row is read), and the native engine and its tests follow it.
 
-About 60,000 lines of test-only JVM-internal emulation were removed: the columnar Arrow Java vector cells, Kafka producer Metadata, ordered Metadata and connection observation, Registry input windows and observed cursors, Avro schema objects and compiler-proven dead code across the workspace, including rtdb-sql.
-rust/conformance/unsupported-inventory.json lists every production unsupported code, and unsupported-classification.json gives every native-only code a category.
+Phase 1 is closed: final-design-closure resolved at df1c5426e and ab39298d3 records the transition, so source_gate.require_phase_two passes.
+Before closing, rust/conformance/unsupported_inventory.py was fixed to stop treating everything after a file's first `#[cfg(test)]` as test code; the regenerated inventory found two unclassified native gaps, now classified.
 
-Parity is measured by running original test Vars against the native engine: the bindings/jvm corpus task, rust/conformance/run_corpus.sh and corpus_summary.py.
-A Var counts as a pass only after a native query, transaction or statement; JVM-internal, JVM API boundary and cloud-only Vars are reported separately.
-At 7f5da2930, 846 of 1,013 executed natively runnable Vars passed; at f28d532d6, 874 of 948 passed, 92.2%.
+The four qualification findings stay open; Phase 2 so far is corpus parity.
+rust/conformance/run_corpus_parallel.sh runs the corpus in parallel JVMs from one resolved classpath; run_corpus.sh races when several Gradle builds run at once.
+Against the same classifier, natively runnable Vars passing went from 1,032 of 1,123 (91.9%) to 1,066 of 1,104 (96.6%) in round 4, and seven more Vars pass after it.
 
-Receipts at the last fully verified main revisions:
+The largest Phase 2 cluster was memory accounting for wide union columns, which heterogeneous documents produce.
+Reads rebuilt a column's logical type per cell, live-index type merging was quadratic, and many reservation bounds multiplied type or schema sizes by 32 to 256, charged per row or per array node, or grew exponentially with nesting.
+Together they made the block-boundary property tests fail on budget errors and then time out shrinking; all of its non-boundary Vars now pass.
+The bounds were reduced to the copies each path makes, with a regression test per path where one reproduces; the generator-driven scripts that found them are summarised in the commit messages.
 
-* Native all-feature workspace tests: 4,708 passed, 0 failed, 2 ignored at e1a1123c5.
-* JVM ./gradlew test with the native binding at 0beb8887d: 3,145 passed, 0 failed.
-* JVM integration-test and property-test at 0beb8887d: all 3,115 property iterations passed, and integration passed except three tests.
-  Two of those passed on a targeted rerun; xtdb.kafka-test/test-stale-log-recovery also fails on the pristine reference checkout c84f9334e against the same colima Kafka.
+Other parity fixes: temporal parse messages, port, JSON-parse, XTQL scope and RA unknown-symbol errors, mega-join import, GROUP BY aliases, X('hex') literals, ODBC-like struct keys, EXECUTE describe, SHOW CLOCK_TIME zone, null struct fields in pgwire output, ATTACH/DETACH details, unindexed-tx context, read-only log messages, AS OF after the basis (checked against the JVM), :now in XTQL temporal filters, XTQL return and with column order, and left-join argument bindings.
 
-The nine commits from 71e5140f2 to bff655f06 were pushed to main at the owner's request before their all-feature workspace run completed.
-They add EXPLAIN shape parity, linear-time union unencoding and cell reads, a node sync FFI entry, a corrected builder memory estimate for wide sparse documents, and corpus classification of the SQL logic engine.
-Scoped crate tests passed for each.
+Receipts: the all-feature workspace tests passed 4,679 with 2 ignored at the revision that records this handoff, after the one test pinning the old plan bound was retuned; the corpus rounds ran the release rtdb-ffi with all backends.
+
+Remaining corpus failures, by cluster:
+
+* indexer-test golden files: union legs and struct fields are written in sorted order where the reference uses first-seen order; LogicalType and Value::Struct are ordered sets and maps, so matching it needs an ordered representation from document decoding through the live index to the writer.
+  The files' logical content matches and the reference reads them by name.
+* pgwire: BEGIN syntax errors use the control parser's message (the reference diagnostic engine reports nothing for them), numeric-plus-integer parameters type as transit, psql output detail key order, EXPLAIN text, CAST(DATE AS TIME) error code, and server-shutdown draining.
+* XTQL: the inverted-valid-time delete case and the aggregate scope error variant.
+* SQL: a parenthesised subquery in an IN list, the non-reserved keyword tiers, and the information-schema query.timer metric.
+* Memory: tpch-test and one expression property still exceed the 256 MiB execution budget; the plan, runtime-schema and operator-state bounds still count type sizes several times.
+* compactor-test l2+, node-test log-processor-disabled, patch-test multiple-patches and pgwire cancel_big_query time out.
 
 Next steps:
 
-. Run the all-feature workspace tests on main; nothing after e1a1123c5 has a full run, so fix whatever fails first.
-. Rerun the corpus and confirm that the block-boundary timeouts clear with the corrected memory estimate.
-. Fix the remaining corpus clusters:
-.. indexer-test golden xt$txs metadata files differ from the JVM's;
-.. node-test date-time-parse code, startup port validation and field mismatch;
-.. the XTQL walkthrough DML;
-.. interrupt-test operator options;
-.. mega-join;
-.. a memory-budget property;
-.. Hikari URLs.
-. Resolve final-design-closure with `python3 rust/conformance/phase1_closure.py .` once its conclusions still hold, set implementation_revision and phase_2_authorized_by_completeness_gate, then close the qualification findings.
+. Fix the remaining clusters above, then rerun the corpus with run_corpus_parallel.sh and corpus_summary.py.
+. Build linux/arm64 packages with rust/release/build.py for local and all-backends and the JVM standalone reference, for build-and-artifacts.
+. Run the differential-equivalence comparisons the finding names.
 
-Environment: Docker runs through colima, so set DOCKER_HOST=unix://$HOME/.colima/default/docker.sock and TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock.
-JAVA_HOME is Temurin 25.0.5, and the shared CARGO_TARGET_DIR is ~/code/rtdb-target, built with CARGO_INCREMENTAL=0.
-The parity library must be built with rtdb-ffi --features all-backends.
+Environment: colima provides Docker (DOCKER_HOST=unix://$HOME/.colima/default/docker.sock, TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock), JAVA_HOME is Temurin 25.0.5, and the parity library is rtdb-ffi built in release with --features all-backends.
+Homebrew's rustc may be linked against a newer LLVM than it was built for; use the rustup toolchain.
