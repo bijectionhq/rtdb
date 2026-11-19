@@ -175,9 +175,14 @@ impl Node {
         self.ensure_open()?;
         self.catalog.open_databases().into_iter().map(|(name, database)| Ok((name, vec![database.logs.latest_source_position()?]))).collect()
     }
+    /// Awaiting indexed progress fails on a node whose indexer is disabled, as the reference's awaits do.
+    fn ensure_indexing(&self) -> Result<()> {
+        if self.factory.options.replication.enabled { Ok(()) } else { Err(Anomaly::fault("xtdb/log-processor-not-initialised", "log processor not initialised")) }
+    }
     pub async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         self.ensure_open()?;
         let Some(basis) = basis else { return Ok(()); };
+        if basis.databases.values().any(|positions| !positions.is_empty()) { self.ensure_indexing()?; }
         let databases = self.catalog.open_databases();
         let waits = databases.into_iter().filter_map(|(name, database)| basis.databases.get(&name).and_then(|positions| positions.first()).copied().map(|position| async move {
             database.replication.await_source(SourcePosition(position.0), cancellation).await
@@ -251,6 +256,7 @@ impl Node {
     }
     pub async fn await_transaction(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        self.ensure_indexing()?;
         let db = self.catalog.database(database)?;
         if let Some(result) = db.replication.await_tx(tx_id, cancellation).await? { return Ok(result.as_ref().clone()); }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };

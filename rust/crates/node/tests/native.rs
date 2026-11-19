@@ -1625,3 +1625,14 @@ async fn a_left_join_without_arguments_keeps_the_outer_binding() {
     assert_eq!(rows(session.query_xtql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1), Value::I64(2)], vec![Value::I64(2), Value::Null]]);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn executing_a_transaction_without_an_indexer_fails_and_queries_still_run() {
+    let mut config = options(); config.replication.enabled = false;
+    let (node, driver) = running(config, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default())).await.unwrap().unwrap_err();
+    assert_eq!((error.category, error.message.as_deref()), (rtdb_types::AnomalyCategory::Fault, Some("log processor not initialised")));
+    assert_eq!(rows(session.query_sql("SELECT 1 AS v", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+    drop(session); stop(&node, driver).await;
+}
