@@ -105,11 +105,14 @@ impl AggregateCursor {
         while let Some(page) = input.next_page().await? {
             self.execution.context.check_cancelled()?;
             let scope = self.execution.scope()?;
-            let projected = crate::pages::project(&page,&self.schema,self.groups.iter().map(|group|&group.expr),&self.execution).await?;
-            for field in &self.runtime.schema().fields()[..self.groups.len()] { rtdb_plan::validate_equality_types(&field.data_type,&field.data_type)?; }
             scope.reserve(page.len().checked_mul(std::mem::size_of::<usize>()).ok_or_else(||invalid("aggregate-size","Group mapping overflow"))?)?;
-            let mut mapping = Vec::with_capacity(page.len());
-            for key in projected.rows() { mapping.push(keys.insert(&key.values,&self.execution)?); }
+            let mapping = if self.groups.is_empty() { vec![0; page.len()] } else {
+                let projected = crate::pages::project(&page,&self.schema,self.groups.iter().map(|group|&group.expr),&self.execution).await?;
+                for field in &self.runtime.schema().fields()[..self.groups.len()] { rtdb_plan::validate_equality_types(&field.data_type,&field.data_type)?; }
+                let mut mapping = Vec::with_capacity(page.len());
+                for key in projected.rows() { mapping.push(keys.insert(&key.values,&self.execution)?); }
+                mapping
+            };
             for ((column,aggregate),types) in columns.iter_mut().zip(&self.aggregates).zip(self.runtime.aggregates()?) {
                 column.aggregate(&page,&mapping,keys.count,aggregate,types,&self.schema,&self.execution).await?;
             }
@@ -135,29 +138,36 @@ impl PageCursor for AggregateCursor {
     }
 }
 
-struct GroupKeys { rows: SpillWriter, count: usize, global: bool }
+/// Group keys in first-seen order, spilled for output, with an in-memory index from key hash to the groups that share it.
+struct GroupKeys { rows: SpillWriter, count: usize, global: bool, index: std::collections::HashMap<u32, Vec<usize>>, keys: Vec<OwnedRow>, _index_reservation: Option<Arc<rtdb_columnar::MemoryReservation>> }
 impl GroupKeys {
     fn new(global: bool,execution: &Execution) -> Result<Self> {
         let mut rows = execution.context.spill.create()?;
         if global { rows.write(&[Value::U64(0),Value::U32(0)],&execution.context.memory)?; }
-        Ok(Self { rows,count: usize::from(global),global })
+        Ok(Self { rows,count: usize::from(global),global,index: Default::default(),keys: Vec::new(),_index_reservation: None })
     }
     fn insert(&mut self,values: &[Value],execution: &Execution) -> Result<usize> {
         execution.context.check_cancelled()?;
         if self.global { return Ok(0); }
-        let _scratch = execution.context.memory.reserve(4096)?;
         let hash = crate::join_storage::hash_values(values)?;
-        let mut reader = self.rows.reader(Arc::clone(&execution.context.memory))?;
-        while let Some(previous) = reader.next()? {
-            execution.context.check_cancelled()?;
-            if previous.values.get(1) == Some(&Value::U32(hash)) && rows_equal(values,&previous.values[2..],&execution.context.timezone,&execution.context.memory)? {
-                return group_id(&previous.values);
+        if let Some(candidates) = self.index.get(&hash) {
+            for &id in candidates {
+                if rows_equal(values,&self.keys[id].values[2..],&execution.context.timezone,&execution.context.memory)? { return Ok(id); }
             }
         }
         let id = self.count;
         self.count = self.count.checked_add(1).filter(|count|*count <= i32::MAX as usize).ok_or_else(||invalid("group-count","Aggregate group count exceeds the reference vector limit"))?;
         let key = OwnedRow::copy_parts(&[&[Value::U64(id as u64),Value::U32(hash)],values],0,0,&execution.context.memory)?;
         self.rows.write(&key.values,&execution.context.memory)?;
+        if self.keys.len() == self.keys.capacity() {
+            let capacity = self.keys.capacity().saturating_mul(2).max(16);
+            let bytes = capacity.checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>())
+                .ok_or_else(||invalid("group-count","Aggregate group index exceeds addressable memory"))?;
+            self._index_reservation = Some(execution.context.memory.reserve(bytes)?);
+            self.keys.reserve_exact(capacity - self.keys.len());
+        }
+        self.keys.push(key);
+        self.index.entry(hash).or_default().push(id);
         Ok(id)
     }
 }
