@@ -14,6 +14,7 @@ use rtdb_types::{Anomaly, Result};
 mod decoded_schema;
 mod java_layout;
 mod nulls;
+mod undefined;
 
 pub struct ArrowFile {
     reader: Box<dyn RetainedReader>,
@@ -77,7 +78,9 @@ impl ArrowFile {
         let full_schema = Arc::new(crate::ipc_decimal::decode(ipc_schema)?);
         let decoded = decoded_schema::adapt(&full_schema)?;
         let schema = if let Some(projection) = &projection { Arc::new(decoded.project(projection).map_err(invalid)?) } else { Arc::clone(&decoded) };
-        let mut decoder = FileDecoder::new(decoded, footer.version());
+        // SAFETY: the reference marks undefined dense-union cells with type id -1, which validation rejects; `read_page`
+        // validates every decoded page in full once `undefined::reinstate` has rewritten those cells.
+        let mut decoder = unsafe { FileDecoder::new(decoded, footer.version()).with_skip_validation(true) };
         if let Some(projection) = projection { decoder = decoder.with_projection(projection); }
         if let Some(dictionaries) = footer.dictionaries() {
             for block in dictionaries { let buffer = read_block(reader.as_mut(), block, &full_schema)?; decoder.read_dictionary(block, &buffer).map_err(invalid)?; }
@@ -107,6 +110,7 @@ impl ArrowFile {
         let block = &self.blocks[page];
         let buffer = read_block(self.reader.as_mut(), block, &self.source_schema)?;
         let batch = self.decoder.read_record_batch(block, &buffer).map_err(invalid)?.ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
+        let batch = undefined::reinstate(batch)?;
         self.next_page = page + 1;
         Ok(batch)
     }
@@ -498,7 +502,7 @@ impl<W: Write> JavaFile<W> {
     }
     fn write(&mut self, page: &RecordBatch) -> Result<()> {
         self.decimal_schema.validate_batch(page)?;
-        self.writer.write(page).map_err(invalid)
+        self.writer.write(&undefined::undefine(page)?).map_err(invalid)
     }
     fn sink(&mut self) -> &mut W { &mut self.writer.get_mut().inner.inner.inner }
     /// Bytes the sink has received plus those the end-marker lookahead still holds.
