@@ -428,8 +428,9 @@ impl Compiler<'_, '_> {
     }
 
     fn join(&mut self, left: Bound, mut right: Bound, outer: bool, apply: Option<Vec<(usize, PExpr)>>) -> Result<Bound> {
-        // As in the reference's left-outer apply, a dependent-side variable replaces the outer one it unifies with.
-        let dependent_wins = outer && apply.is_some();
+        // A join with arguments is the reference's left-outer apply, whose dependent-side variable replaces the outer one it unifies with;
+        // without arguments it is a left-outer join, which keeps the outer one.
+        let dependent_wins = outer && apply.as_ref().is_some_and(|arguments| !arguments.is_empty());
         let shared: Vec<_> = left.variables.iter().filter_map(|(name, left)| right.variables.get(name).map(|right| (left.clone(), right.clone()))).collect();
         let relation = if let Some(mut arguments) = apply {
             for (left, right_field) in &shared {

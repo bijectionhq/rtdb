@@ -1610,3 +1610,18 @@ async fn wide_heterogeneous_documents_flush_and_delete_across_blocks() {
     assert_eq!(rows(session.query_sql("SELECT * FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await.len(), 80);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_left_join_without_arguments_keeps_the_outer_binding() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    for (id, parent) in [(1, None), (2, Some(1))] {
+        let mut document = BTreeMap::from([("_id".into(), Value::I64(id))]);
+        if let Some(parent) = parent { document.insert("parent".into(), Value::I64(parent)); }
+        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document], node.memory()).unwrap(), valid_from: None, valid_to: None };
+        assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    let query = "(-> (unify (from :docs [{:xt/id e}]) (left-join (from :docs [{:xt/id c :parent e}]) [e c])) (order-by e c) (return e c))";
+    assert_eq!(rows(session.query_xtql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1), Value::I64(2)], vec![Value::I64(2), Value::Null]]);
+    stop(&node, driver).await;
+}
