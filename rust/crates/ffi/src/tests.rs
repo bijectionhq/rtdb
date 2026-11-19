@@ -813,7 +813,7 @@ fn clojure_result_transit_encodes_doubles_without_precision_loss() {
     use rtdb_format::transit::{TransitValue as T, decode_json};
     use rtdb_types::Value;
     let value = 0.19736842105263158_f64;
-    let wire = transit::encode_rows(&Value::List(vec![Value::F64(value), Value::F64(-0.0)])).unwrap();
+    let wire = [b"[".as_slice(), &transit::encode_row(&Value::F64(value)).unwrap(), b",", &transit::encode_row(&Value::F64(-0.0)).unwrap(), b"]"].concat();
     let T::Array(values) = decode_json(&wire).unwrap() else { panic!("Expected rows") };
     let [T::Float(first), T::Float(second)] = values.as_slice() else { panic!("Expected double values") };
     assert_eq!(first.to_bits(), value.to_bits());

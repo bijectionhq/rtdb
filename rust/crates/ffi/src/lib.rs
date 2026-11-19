@@ -356,9 +356,22 @@ pub unsafe extern "C" fn rtdb_v1_cursor_next_transit(handle: u64, out: *mut u64,
                 for row in 0..batch.num_rows() {
                     rows.push(rtdb_types::Value::Struct(schema.fields().iter().zip(&readers).zip(batch.columns()).map(|((field, reader), column)| Ok((field.name().clone(), reader.read(column.as_ref(), row)?))).collect::<Result<_>>()?));
                 }
-                let value = rtdb_types::Value::List(rows);
-                let reservation = memory.reserve(add(mul(value.retained_bytes()?, 16)?, 8192)?)?;
-                let bytes = transit::encode_rows(&value)?;
+                // Rows encode one at a time into the same array, so only one row's transient encoding is charged at once.
+                let mut reservation = memory.reserve(8192)?;
+                let mut bytes = vec![b'['];
+                for (index, row) in rows.iter().enumerate() {
+                    let _transient = memory.reserve(add(mul(row.retained_bytes()?, 16)?, 8192)?)?;
+                    let element = transit::encode_row(row)?;
+                    let needed = add(add(bytes.len(), element.len())?, 2)?;
+                    Arc::get_mut(&mut reservation).expect("cursor encoding owns its reservation").grow_to(add(needed, 8192)?)?;
+                    bytes.reserve_exact(needed - bytes.len());
+                    if index > 0 { bytes.push(b','); }
+                    bytes.extend_from_slice(&element);
+                }
+                bytes.push(b']');
+                let retained = bytes.capacity().max(reservation.bytes());
+                Arc::get_mut(&mut reservation).expect("cursor encoding owns its reservation").grow_to(retained)?;
+                drop(rows);
                 let value = rtdb_tx::RetainedBytes::with_reservation(bytes, reservation)?;
                 handles::insert(Handle::Bytes(Arc::new(handles::NativeBytes { value, memory: Arc::clone(memory) })))
             })().inspect_err(|_| cursor.consumer_error())?;
