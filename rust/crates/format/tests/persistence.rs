@@ -130,7 +130,7 @@ fn nested_column_types_keep_bottom_null_and_missing_distinct() {
     let encoded = columns::column_from_type(&ty, Some(vec![1, 2, 3])).unwrap();
     assert_eq!(columns::logical_type(&encoded).unwrap(), ty);
     assert_eq!(encoded.hll.as_deref(), Some([1, 2, 3].as_slice()));
-    let block = TableBlock::from_parts(BTreeMap::from([("doc".into(), encoded)]), 3, Vec::new()).unwrap();
+    let block = TableBlock::from_parts(BTreeMap::from([("doc".into(), encoded)]), &Default::default(), 3, Vec::new()).unwrap();
     let decoded = TableBlock::decode(&block.encode()).unwrap();
     assert_eq!(decoded.column_types().unwrap()["doc"], ty);
     assert_eq!(decoded.column_hlls()["doc"], [1, 2, 3]);

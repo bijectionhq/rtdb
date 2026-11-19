@@ -66,7 +66,7 @@ fn persisted_partitions_repair_covered_l0_and_drop_old_l0_garbage_5395() {
         pb::Partition { level: Some(0), part: Some(vec![]), tries: vec![live_l0.to_proto(&table()), garbage_l0.to_proto(&table())], max_block_index: Some(1), ..Default::default() },
         pb::Partition { level: Some(1), part: Some(vec![]), tries: vec![l1.to_proto(&table())], max_block_index: Some(0), ..Default::default() },
     ];
-    let block = TableBlock::from_parts(BTreeMap::new(), 0, partitions).unwrap();
+    let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, partitions).unwrap();
     let catalog = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(101)).unwrap();
     assert_eq!(current(&catalog), names(&["l01-rc-b00"]));
     assert_eq!(catalog.all_tries(&table()).len(), 1);
@@ -78,7 +78,7 @@ fn partition_roundtrip_preserves_states_watermarks_and_omits_table_name() {
     let catalog = apply(&[("l00-rc-b00", 10), ("l01-rc-b00", 10), ("l01-rc-b01", 10), ("l02-rc-p0-b01", 10)]);
     let partitions = catalog.partitions(&table()).unwrap();
     assert!(partitions.iter().flat_map(|partition| &partition.tries).all(|trie| trie.table_name.is_none()));
-    let block = TableBlock::from_parts(BTreeMap::new(), 0, partitions).unwrap();
+    let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, partitions).unwrap();
     let loaded = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(200)).unwrap();
     assert_eq!(catalog.all_tries(&table()), loaded.all_tries(&table()));
     assert_eq!(loaded.l0_max_block_index(&table()), BlockIndex(0));
@@ -92,7 +92,7 @@ fn wide_recency_partitions_roundtrip_and_reject_microsecond_overflow() {
     let midnight = CivilDate::from_ymd(280_000, 1, 3).unwrap().epoch_day() * 86_400_000_000;
     assert_eq!(partitions[0].recency, Some(midnight));
     partitions[0].recency = Some(midnight + 86_400_000_000 - 1);
-    let block = TableBlock::from_parts(BTreeMap::new(), 0, partitions).unwrap();
+    let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, partitions).unwrap();
     let loaded = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(200)).unwrap();
     assert_eq!(catalog.all_tries(&table()), loaded.all_tries(&table()));
     assert_eq!(loaded.partitions(&table()).unwrap()[0].recency, Some(midnight));
@@ -125,7 +125,7 @@ fn table_oid_allocation_is_sorted_and_recorded_slugs_stay_frozen() {
     let zeta = TableRef::new("public", "zeta");
     let custom = TableEntry { oid: 20_000, table: alpha.clone(), slug: TableSlug::recorded("historical-location").unwrap() };
     let block = BlockCatalog::from_proto(pb::Block { block_index: Some(0), tables: vec![custom.to_proto()], ..Default::default() }).unwrap();
-    let metadata = TableBlock::from_parts(BTreeMap::new(), 0, vec![]).unwrap();
+    let metadata = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, vec![]).unwrap();
     let catalog = TableCatalog::load(Some(block), &BTreeMap::from([(alpha.clone(), metadata)])).unwrap();
     let next = catalog.with_entries_for([zeta.clone(), table()]).unwrap();
     assert_eq!(next.entry(&alpha).unwrap().slug.as_str(), "historical-location");

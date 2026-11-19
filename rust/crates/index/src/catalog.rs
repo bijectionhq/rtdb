@@ -53,7 +53,7 @@ impl TableMeta {
     }
     pub fn to_block(&self, partitions: Vec<block_pb::Partition>) -> Result<TableBlock> {
         let columns = self.column_types.iter().map(|(name, ty)| Ok((name.clone(), column_from_type(ty, self.hlls.get(name).cloned())?))).collect::<Result<_>>()?;
-        TableBlock::from_parts(columns, self.row_count, partitions)
+        TableBlock::from_parts(columns, &self.column_types, self.row_count, partitions)
     }
     pub fn contributed_type(&self, name: &str) -> LogicalType {
         self.column_types.get(name).cloned().unwrap_or_else(|| absent_type(&self.column_types))
