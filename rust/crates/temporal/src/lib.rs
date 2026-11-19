@@ -357,7 +357,8 @@ impl HistoryResolver {
         Ok(result)
     }
 
-    fn resolve_fragments(&mut self, header: &EventHeader, mut emit: impl FnMut(Interval, Interval) -> Result<()>) -> Result<()> {
+    /// Emits each visible fragment of the event's history, in the order `resolve_in` would return them.
+    pub fn resolve_fragments(&mut self, header: &EventHeader, mut emit: impl FnMut(Interval, Interval) -> Result<()>) -> Result<()> {
         let bounds = self.bounds;
         let clamp_valid_time = self.clamp_valid_time;
         let mut emit_polygon = |polygon: PolygonView<'_>| {

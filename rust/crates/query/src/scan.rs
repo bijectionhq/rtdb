@@ -98,7 +98,7 @@ fn summary_bytes(count: usize) -> Result<usize> {
 }
 
 enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File(Arc<IndexBatch>) }
-struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation> }
+struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation>, _charge: Option<Arc<MemoryReservation>> }
 impl ActiveRows {
     fn len(&self) -> usize { match self { Self::Live { rows, .. } => rows.len(), Self::File(batch) => batch.len() } }
     fn row(&self, index: usize) -> Result<RowSource> {
@@ -391,14 +391,28 @@ impl PartitionScan {
         if self.loaded.contains_key(&index) { return Ok(()); }
         let reservation = self.execution.context.memory.reserve(std::mem::size_of::<LoadedPage>() + 256)?;
         let page = &self.pages.entries[index];
+        let mut charge = None;
+        let mut cached = false;
         let rows = match &page.source {
             PageSource::Live { table, rows } => ActiveRows::Live { table: Arc::clone(table),rows: Arc::clone(rows) },
+            PageSource::File { file, page: page_index } if let Some((batch, bound)) = metadata_cache::page(&self.files.entries[*file].storage, &self.files.entries[*file].key, *page_index) => {
+                charge = Some(self.execution.context.memory.reserve(bound)?);
+                cached = true;
+                ActiveRows::File(batch)
+            }
             PageSource::File { file, page: page_index } => {
                 let data = &mut self.files.entries[*file];
                 if matches!(&data.state, DataState::Unopened) {
                     let lease = data.storage.get(&data.key).await?;
                     let mut cursor = Cursor::new(lease);
-                    let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
+                    let layout = match metadata_cache::layout(&data.storage, &data.key) {
+                        Some(layout) => layout,
+                        None => {
+                            let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
+                            metadata_cache::insert_layout(&data.storage, &data.key, layout.clone());
+                            layout
+                        }
+                    };
                     let reservation = self.execution.context.memory.reserve(layout.opening_allocation_bound()?)?;
                     data.state = DataState::Open { reader: ArrowFile::from_inspected_reader(cursor, None, layout)?, _reservation: reservation };
                 }
@@ -407,13 +421,24 @@ impl PartitionScan {
                 for field in reader.schema().fields() {
                     bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?).ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
                 }
-                let reservation = self.execution.context.memory.reserve(bound)?;
-                let batch = IndexBatch::from_owned(OwnedBatch::with_reservation(reader.read_page(*page_index)?, reservation)?)?;
+                let charged = self.execution.context.memory.reserve(bound)?;
+                let page = reader.read_page(*page_index)?;
+                let batch = match metadata_cache::page_reservation(bound) {
+                    Some(reservation) => {
+                        let batch = IndexBatch::from_owned(OwnedBatch::with_reservation(page, reservation)?)?;
+                        metadata_cache::insert_page(&data.storage, &data.key, *page_index, Arc::clone(&batch), bound);
+                        charge = Some(charged);
+                        batch
+                    }
+                    None => IndexBatch::from_owned(OwnedBatch::with_reservation(page, charged)?)?,
+                };
                 ActiveRows::File(batch)
             }
         };
         let mut previous: Option<EventHeader> = None;
-        for index in 0..rows.len() {
+        // A live page is a slice of this process's own trie, ordered as it was built; a file page is checked when first decoded.
+        let validated = if matches!(rows, ActiveRows::Live { .. }) || cached { 0 } else { rows.len() };
+        for index in 0..validated {
             let source = rows.row(index)?;
             let header = source.header()?;
             if header.iid < page.lower || header.iid > page.upper { return Err(invalid("page-path", "Data page contains an IID outside its metadata path")); }
@@ -422,7 +447,7 @@ impl PartitionScan {
             }
             previous = Some(header);
         }
-        self.loaded.insert(index,LoadedPage { rows,_reservation: reservation });
+        self.loaded.insert(index,LoadedPage { rows,_reservation: reservation,_charge: charge });
         Ok(())
     }
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
@@ -453,10 +478,14 @@ impl PartitionScan {
             self.counts.rows_read = self.counts.rows_read.saturating_add(rows.len() as u64);
             groups.push(Vec::new());
             group_reservations.push(self.execution.context.memory.reserve(256)?);
-            for ordinal in 0..rows.len() {
-                let header = rows.row(ordinal)?.header()?;
-                if header.iid > task.range.upper { break; }
-                if header.iid >= task.range.lower { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal });break; }
+            let (mut low, mut high) = (0, rows.len());
+            while low < high {
+                let middle = (low + high) / 2;
+                if rows.row(middle)?.header()?.iid < task.range.lower { low = middle + 1; } else { high = middle; }
+            }
+            if low < rows.len() {
+                let header = rows.row(low)?.header()?;
+                if header.iid <= task.range.upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
             }
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
@@ -471,15 +500,18 @@ impl PartitionScan {
             }
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
-            let history = resolver.resolve_in(&head.header, source, &self.execution.context.memory)?;
             let group: &mut Vec<_> = &mut groups[head.active];
-            if group.len() + history.as_slice().len() > group.capacity() {
-                let capacity = (group.len() + history.as_slice().len()).max(group.capacity().saturating_mul(2)).max(64);
-                let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<RowSource>>()).ok_or_else(|| invalid("scan-row-size", "Scan rows exceed addressable memory"))?;
-                group_reservations.push(self.execution.context.memory.reserve(bytes)?);
-                group.reserve_exact(capacity - group.len());
-            }
-            group.extend(history.as_slice().iter().cloned());
+            let memory = &self.execution.context.memory;
+            resolver.resolve_fragments(&head.header, |valid_time, system_time| {
+                if group.len() == group.capacity() {
+                    let capacity = group.capacity().saturating_mul(2).max(64);
+                    let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<RowSource>>()).ok_or_else(|| invalid("scan-row-size", "Scan rows exceed addressable memory"))?;
+                    group_reservations.push(memory.reserve(bytes)?);
+                    group.reserve_exact(capacity - group.len());
+                }
+                group.push(ResolvedRow { source: source.clone(), valid_time, system_time });
+                Ok(())
+            })?;
         }
         self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper);
         self.output = groups.iter().filter(|rows| !rows.is_empty())
@@ -530,11 +562,13 @@ async fn dimension(filter: &TemporalFilter, default: rtdb_types::Instant, execut
 /// every file it reads. Bounded by file count and decoded size.
 mod metadata_cache {
     use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock, Weak}};
-    use rtdb_format::metadata::MetadataFile;
+    use rtdb_format::{ipc::FileLayout, metadata::MetadataFile};
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_index::IndexBatch;
     use rtdb_storage::{ObjectKey, cache::BufferPool};
 
     const FILES: usize = 1024;
-    const BYTES: usize = 64 << 20;
+    const BYTES: usize = 256 << 20;
     struct Entry { storage: Weak<BufferPool>, metadata: Arc<MetadataFile>, bytes: usize, used: u64 }
     #[derive(Default)]
     struct Cache { entries: HashMap<(usize, String), Entry>, bytes: usize, clock: u64 }
@@ -550,8 +584,58 @@ mod metadata_cache {
         entry.used = clock;
         Some((Arc::clone(&entry.metadata), entry.bytes))
     }
+    /// A data file's inspected IPC layout, which a scan otherwise re-derives from the footer on every open.
+    pub(super) fn layout(storage: &Arc<BufferPool>, key: &ObjectKey) -> Option<FileLayout> {
+        let layouts = layouts().lock().ok()?;
+        let (live, layout) = layouts.get(&(Arc::as_ptr(storage) as usize, key.as_str().to_owned()))?;
+        live.upgrade().is_some_and(|live| Arc::ptr_eq(&live, storage)).then(|| layout.clone())
+    }
+    pub(super) fn insert_layout(storage: &Arc<BufferPool>, key: &ObjectKey, layout: FileLayout) {
+        let Ok(mut layouts) = layouts().lock() else { return };
+        if layouts.len() >= LAYOUTS { layouts.retain(|_, (live, _)| live.strong_count() > 0); }
+        if layouts.len() >= LAYOUTS { layouts.clear(); }
+        layouts.insert((Arc::as_ptr(storage) as usize, key.as_str().to_owned()), (Arc::downgrade(storage), layout));
+    }
+    const LAYOUTS: usize = 4096;
+    fn layouts() -> &'static Mutex<HashMap<(usize, String), (Weak<BufferPool>, FileLayout)>> { static LAYOUTS: OnceLock<Mutex<HashMap<(usize, String), (Weak<BufferPool>, FileLayout)>>> = OnceLock::new(); LAYOUTS.get_or_init(Default::default) }
+
+    /// Decoded data pages, held under the cache's own budget so no query's charge outlives it.
+    const PAGE_BYTES: usize = 512 << 20;
+    struct Page { storage: Weak<BufferPool>, batch: Arc<IndexBatch>, bound: usize, used: u64 }
+    #[derive(Default)]
+    struct Pages { entries: HashMap<(usize, String, usize), Page>, clock: u64 }
+    fn pages() -> &'static Mutex<Pages> { static PAGES: OnceLock<Mutex<Pages>> = OnceLock::new(); PAGES.get_or_init(Default::default) }
+    fn page_budget() -> &'static Arc<MemoryBudget> { static BUDGET: OnceLock<Arc<MemoryBudget>> = OnceLock::new(); BUDGET.get_or_init(|| MemoryBudget::new(PAGE_BYTES)) }
+
+    pub(super) fn page(storage: &Arc<BufferPool>, key: &ObjectKey, page: usize) -> Option<(Arc<IndexBatch>, usize)> {
+        let mut pages = pages().lock().ok()?;
+        pages.clock += 1;
+        let clock = pages.clock;
+        let entry = pages.entries.get_mut(&(Arc::as_ptr(storage) as usize, key.as_str().to_owned(), page))?;
+        if !entry.storage.upgrade().is_some_and(|live| Arc::ptr_eq(&live, storage)) { return None; }
+        entry.used = clock;
+        Some((Arc::clone(&entry.batch), entry.bound))
+    }
+    /// Admits a page of `bound` bytes to the cache's budget, evicting the least recently used pages to make room.
+    pub(super) fn page_reservation(bound: usize) -> Option<Arc<rtdb_columnar::MemoryReservation>> {
+        if bound > PAGE_BYTES / 8 { return None; }
+        let mut pages = pages().lock().ok()?;
+        loop {
+            if let Ok(reservation) = page_budget().reserve(bound) { return Some(reservation); }
+            let oldest = pages.entries.iter().min_by_key(|(_, entry)| entry.used).map(|(key, _)| key.clone())?;
+            pages.entries.remove(&oldest);
+        }
+    }
+    pub(super) fn insert_page(storage: &Arc<BufferPool>, key: &ObjectKey, page: usize, batch: Arc<IndexBatch>, bound: usize) {
+        let Ok(mut pages) = pages().lock() else { return };
+        pages.clock += 1;
+        let used = pages.clock;
+        pages.entries.retain(|_, entry| entry.storage.strong_count() > 0);
+        pages.entries.insert((Arc::as_ptr(storage) as usize, key.as_str().to_owned(), page), Page { storage: Arc::downgrade(storage), batch, bound, used });
+    }
+
     pub(super) fn insert(storage: &Arc<BufferPool>, key: &ObjectKey, metadata: Arc<MetadataFile>, bytes: usize) {
-        if bytes > BYTES / 16 { return; }
+        if bytes > BYTES / 4 { return; }
         let Ok(mut cache) = cache().lock() else { return };
         cache.clock += 1;
         let used = cache.clock;
@@ -1073,12 +1157,10 @@ mod tests {
         let timestamp_bytes = std::mem::size_of::<Timestamp>();
         let previous_ceiling = (2 * 3 + 1) * timestamp_bytes + 256;
         let replacement_ceiling = (2 * 6 + 1) * timestamp_bytes + 256;
-        let slot = std::mem::size_of::<ResolvedRow<RowSource>>();
-        let previous_history = 2 * slot + 256;
-        let replacement_history = 4 * slot + 256;
+        let history = 64 * std::mem::size_of::<ResolvedRow<RowSource>>();
         for (requested, charged) in [
             (replacement_ceiling, scratch + previous_ceiling),
-            (replacement_history, scratch + previous_ceiling + replacement_ceiling + previous_history),
+            (history, scratch + previous_ceiling + replacement_ceiling),
         ] {
             let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
             let partition = cursor.partitions.front_mut().unwrap();
