@@ -43,9 +43,27 @@ impl JoinPlan {
     fn probe_output(&self,probe: &OwnedRow) -> Result<OwnedRow> {
         OwnedRow::copy_parts(&[self.probe_layout().output(probe)],0,0,&self.execution.context.memory)
     }
-    async fn accepted(&self,comparisons: &[ExpressionInvocation<'_>],build: &OwnedRow,probe: &OwnedRow) -> Result<bool> {
+    /// The joined-row positions of a comparison that is an equality between two columns, which compares their cells directly.
+    fn direct_equalities(&self) -> Vec<Option<(usize,usize)>> {
+        self.layout.comparisons.iter().enumerate().map(|(index,expression)| {
+            let schema = if index < self.build_layout().key_count() { &self.layout.schema } else { &self.layout.theta_schema };
+            match expression {
+                rtdb_plan::Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } => match (left.as_ref(),right.as_ref()) {
+                    (rtdb_plan::Expr::Column { id: left, .. },rtdb_plan::Expr::Column { id: right, .. }) => Some((schema.position(*left)?,schema.position(*right)?)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }).collect()
+    }
+    fn cell<'a>(&self,build: &'a OwnedRow,probe: &'a OwnedRow,position: usize) -> Result<&'a Value> {
+        let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
+        if position < left.values.len() { Ok(&left.values[position]) }
+        else { right.values.get(position - left.values.len()).ok_or_else(|| invalid("join-row","Joined column is outside both rows")) }
+    }
+    async fn accepted(&self,comparisons: &[ExpressionInvocation<'_>],direct: &[Option<(usize,usize)>],build: &OwnedRow,probe: &OwnedRow) -> Result<bool> {
         if comparisons.is_empty() { return Ok(true); }
-        let joined = self.joined(build,probe)?;
+        let joined = if direct.iter().all(Option::is_some) { None } else { Some(self.joined(build,probe)?) };
         let mut unknown = false;
         for (index,comparison) in comparisons.iter().enumerate() {
             if self.preserve_probe() && index < self.build_layout().key_count() {
@@ -57,6 +75,15 @@ impl JoinPlan {
                 }
             }
             let scope = self.execution.scope()?;
+            if let Some((left,right)) = direct[index] {
+                match rtdb_expr::sql_eq_in_timezone(self.cell(build,probe,left)?,self.cell(build,probe,right)?,&self.execution.context.timezone,&scope)? {
+                    None => unknown = true,
+                    Some(false) => return Ok(false),
+                    Some(true) => {}
+                }
+                continue;
+            }
+            let joined = joined.as_ref().ok_or_else(|| invalid("join-row","Joined row was not built for an evaluated comparison"))?;
             let value = self.execution.evaluate_invocation(&scope,comparison,&joined.values).await?;
             if matches!(value,Value::Null | Value::Undefined) { unknown = true; }
             else if !is_true(&value)? { return Ok(false); }
@@ -71,6 +98,7 @@ impl JoinPlan {
             let schema = if index < self.build_layout().key_count() { &self.layout.schema } else { &self.layout.theta_schema };
             comparisons.push(self.execution.prepare_expression(expression,schema,&metadata)?);
         }
+        let direct = self.direct_equalities();
         let mut output = PageBuilder::new(0,&self.execution.context.memory)?;
         let _hash_scratch = self.execution.context.memory.reserve(4096)?;
         let BuildTable { rows,index,unmatched,.. } = table;
@@ -79,12 +107,12 @@ impl JoinPlan {
             let mut matched = false;
             if self.kind == JoinKind::Anti {
                 for build in rows.page.rows() {
-                    if self.accepted(&comparisons,build,probe).await? { matched = true;break; }
+                    if self.accepted(&comparisons,&direct,build,probe).await? { matched = true;break; }
                 }
             } else {
                 for build_index in index.candidates(self.probe_layout().hash(probe)?) {
                     let build = &rows.page.rows()[build_index];
-                    if !self.accepted(&comparisons,build,probe).await? { continue; }
+                    if !self.accepted(&comparisons,&direct,build,probe).await? { continue; }
                     if matched && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
                     matched = true;
                     if let Some(unmatched) = unmatched { unmatched[build_index] = 0; }

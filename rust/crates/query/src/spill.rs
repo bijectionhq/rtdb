@@ -8,9 +8,15 @@ use tempfile::{NamedTempFile, TempDir, TempPath};
 
 use crate::{cursor::OwnedRow, invalid};
 
-pub(crate) struct SpillRegion { directory: TempDir, limit: u64, retained: AtomicU64, peak: AtomicU64 }
+/// A query's spill files, in a directory created by the first of them: most queries never spill.
+pub(crate) struct SpillRegion { directory: std::sync::OnceLock<TempDir>, limit: u64, retained: AtomicU64, peak: AtomicU64 }
 impl SpillRegion {
-    pub fn new(limit: u64) -> Result<Self> { Ok(Self { directory: TempDir::new().map_err(io_error)?, limit, retained: AtomicU64::new(0), peak: AtomicU64::new(0) }) }
+    pub fn new(limit: u64) -> Result<Self> { Ok(Self { directory: std::sync::OnceLock::new(), limit, retained: AtomicU64::new(0), peak: AtomicU64::new(0) }) }
+    fn directory(&self) -> Result<&std::path::Path> {
+        if let Some(directory) = self.directory.get() { return Ok(directory.path()); }
+        let created = TempDir::new().map_err(io_error)?;
+        Ok(self.directory.get_or_init(|| created).path())
+    }
     pub fn retained_bytes(&self) -> u64 { self.retained.load(Ordering::Acquire) }
     pub fn peak_bytes(&self) -> u64 { self.peak.load(Ordering::Relaxed) }
     fn reserve(&self, bytes: u64) -> Result<()> {
@@ -20,7 +26,7 @@ impl SpillRegion {
         Ok(())
     }
     pub fn create(self: &Arc<Self>) -> Result<SpillWriter> {
-        let (file, path) = NamedTempFile::new_in(self.directory.path()).map_err(io_error)?.into_parts();
+        let (file, path) = NamedTempFile::new_in(self.directory()?).map_err(io_error)?.into_parts();
         Ok(SpillWriter { file: BufWriter::new(file), position: 0, retained: Arc::new(SpillFile { path, region: Arc::clone(self), bytes: AtomicU64::new(0) }) })
     }
 }
