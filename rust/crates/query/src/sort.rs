@@ -281,7 +281,8 @@ pub(crate) fn sort_records(store: &RecordStore,context: &Arc<crate::QueryContext
 }
 fn size_error() -> rtdb_types::Anomaly { invalid("sort-size", "Sort state exceeds addressable memory") }
 
-struct KeyTypes { values: Vec<LogicalType>, seen: Vec<LogicalType>, _reservation: Arc<MemoryReservation> }
+/// The declared key types joined with every key observed; `seen` holds key-type tuples already joined, which change nothing.
+struct KeyTypes { values: Vec<LogicalType>, seen: Vec<Vec<LogicalType>>, _reservation: Arc<MemoryReservation> }
 impl KeyTypes {
     fn declared(plan: &SortPlan) -> Result<Self> {
         let mut bound = crate::runtime_schema::schema_bound(&plan.schema)?;
@@ -294,18 +295,21 @@ impl KeyTypes {
         Self::new(values, plan)
     }
     fn new(values: Vec<LogicalType>, plan: &SortPlan) -> Result<Self> {
-        let reservation = plan.execution.context.memory.reserve(type_bytes(&values)?.saturating_mul(2))?;
+        let reservation = plan.execution.context.memory.reserve(type_bytes(&values)?.saturating_mul(17))?;
         Ok(Self { values, seen: Vec::new(), _reservation: reservation })
     }
     fn observe(&mut self, values: &[Value], plan: &SortPlan) -> Result<()> {
         if values.len() != self.values.len() { return Err(invalid("sort-state", "Sort key metadata width changed")); }
         let types: Vec<LogicalType> = values.iter().map(Value::logical_type).collect();
-        if types == self.seen { return Ok(()); }
+        if self.seen.contains(&types) { return Ok(()); }
         let bound = values.iter().try_fold(type_bytes(&self.values)?, |sum, value| sum.checked_add(value.retained_bytes()?).ok_or_else(size_error))?;
         let _temporary = plan.execution.context.memory.reserve(bound.checked_mul(16).and_then(|n| n.checked_add(4096)).ok_or_else(size_error)?)?;
         let values = self.values.iter().zip(&types).map(|(ty, value)| ty.join(value)).collect();
+        let mut seen = std::mem::take(&mut self.seen);
         *self = Self::new(values, plan)?;
-        self.seen = types;
+        if seen.len() == 16 { seen.remove(0); }
+        seen.push(types);
+        self.seen = seen;
         Ok(())
     }
     fn join(&self, other: &Self, plan: &SortPlan) -> Result<Self> {

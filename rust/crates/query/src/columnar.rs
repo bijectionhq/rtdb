@@ -325,7 +325,17 @@ mod kernel {
     impl<'a> Operand<'a> {
         fn of(expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, parameters: &'a [Value]) -> Option<Self> {
             match expr {
-                Expr::Column { id, .. } => Cells::of(&batch.columns[schema.position(*id)?]).map(Self::Cells),
+                Expr::Column { id, .. } => {
+                    let column = &batch.columns[schema.position(*id)?];
+                    match Cells::of(column) {
+                        Some(cells) => Some(Self::Cells(cells)),
+                        // A column without a direct cell reader, a union of integer legs say, is read once into owned cells.
+                        None => (0..batch.len).map(|row| {
+                            let value = column.value(row).ok()?;
+                            match scalar(&value).ok()? { None => Some(None), Some(cell) => owned(cell).map(Some) }
+                        }).collect::<Option<Vec<_>>>().map(|cells| Self::Cells(Cells::Owned(cells))),
+                    }
+                }
                 Expr::Literal(value) => scalar(value).ok().map(Self::Constant),
                 Expr::Parameter { index, .. } => scalar(parameters.get(*index)?).ok().map(Self::Constant),
                 Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, .. } => {
