@@ -31,6 +31,15 @@ impl IndexBatch {
         Self::from_owned(OwnedBatch::new(batch, budget)?)
     }
     pub fn from_owned(owned: OwnedBatch) -> Result<Arc<Self>> {
+        let headers = owned.reservation().budget().reserve(Self::header_bytes(owned.batch().num_rows())?)?;
+        Self::from_owned_with_headers(owned, headers)
+    }
+    /// The bytes `from_owned` charges for the decoded headers of a batch of `rows` events.
+    pub fn header_bytes(rows: usize) -> Result<usize> {
+        rows.checked_mul(std::mem::size_of::<EventHeader>()).ok_or_else(|| invalid("Event headers exceed addressable memory"))
+    }
+    /// As `from_owned`, with the headers charged to a reservation the caller already holds for `header_bytes`.
+    pub fn from_owned_with_headers(owned: OwnedBatch, header_reservation: Arc<MemoryReservation>) -> Result<Arc<Self>> {
         let events = EventBatch::new(owned.batch().clone())?;
         let schema = owned.batch().schema();
         let index = schema.index_of("op").map_err(invalid)?;
@@ -44,8 +53,6 @@ impl IndexBatch {
             _ => Vec::new(),
         };
         let mut system_times: Option<(Timestamp, Timestamp)> = None;
-        let header_bytes = events.len().checked_mul(std::mem::size_of::<EventHeader>()).ok_or_else(|| invalid("Event headers exceed addressable memory"))?;
-        let header_reservation = owned.reservation().budget().reserve(header_bytes)?;
         let mut headers = Vec::with_capacity(events.len());
         for row in 0..events.len() {
             let header = events.header(row)?;

@@ -393,6 +393,7 @@ impl PartitionScan {
         let page = &self.pages.entries[index];
         let mut charge = None;
         let mut cached = false;
+        let mut uncached: Option<(Arc<IndexBatch>, usize)> = None;
         let hit = match &page.source {
             PageSource::File { file, page: page_index } => metadata_cache::page(&self.files.entries[*file].storage, &self.files.entries[*file].key, *page_index),
             PageSource::Live { .. } => None,
@@ -427,10 +428,11 @@ impl PartitionScan {
                 }
                 let charged = self.execution.context.memory.reserve(bound)?;
                 let page = reader.read_page(*page_index)?;
-                let batch = match metadata_cache::page_reservation(bound) {
-                    Some(reservation) => {
-                        let batch = IndexBatch::from_owned(OwnedBatch::with_reservation(page, reservation)?)?;
-                        metadata_cache::insert_page(&data.storage, &data.key, *page_index, Arc::clone(&batch), bound);
+                let headers = IndexBatch::header_bytes(page.num_rows())?;
+                let batch = match metadata_cache::page_reservation(bound, headers) {
+                    Some((reservation, headers)) => {
+                        let batch = IndexBatch::from_owned_with_headers(OwnedBatch::with_reservation(page, reservation)?, headers)?;
+                        uncached = Some((Arc::clone(&batch), bound));
                         charge = Some(charged);
                         batch
                     }
@@ -450,6 +452,10 @@ impl PartitionScan {
                 return Err(invalid("page-order", "Data page is not in IID and descending system-time order"));
             }
             previous = Some(header);
+        }
+        if let (Some((batch, bound)), PageSource::File { file, page: page_index }) = (uncached, &page.source) {
+            let data = &self.files.entries[*file];
+            metadata_cache::insert_page(&data.storage, &data.key, *page_index, batch, bound);
         }
         self.loaded.insert(index,LoadedPage { rows,_reservation: reservation,_charge: charge });
         Ok(())
@@ -621,11 +627,14 @@ mod metadata_cache {
         Some((Arc::clone(&entry.batch), entry.bound))
     }
     /// Admits a page of `bound` bytes to the cache's budget, evicting the least recently used pages to make room.
-    pub(super) fn page_reservation(bound: usize) -> Option<Arc<rtdb_columnar::MemoryReservation>> {
-        if bound > PAGE_BYTES / 8 { return None; }
+    /// Reservations for a page and its decoded headers from the cache's own budget, evicting until both fit.
+    pub(super) fn page_reservation(bound: usize, headers: usize) -> Option<(Arc<rtdb_columnar::MemoryReservation>, Arc<rtdb_columnar::MemoryReservation>)> {
+        if bound.checked_add(headers)? > PAGE_BYTES / 8 { return None; }
         let mut pages = pages().lock().ok()?;
         loop {
-            if let Ok(reservation) = page_budget().reserve(bound) { return Some(reservation); }
+            if let Ok(reservation) = page_budget().reserve(bound) {
+                if let Ok(headers) = page_budget().reserve(headers) { return Some((reservation, headers)); }
+            }
             let oldest = pages.entries.iter().min_by_key(|(_, entry)| entry.used).map(|(key, _)| key.clone())?;
             pages.entries.remove(&oldest);
         }
@@ -960,6 +969,11 @@ mod tests {
     }
 
     async fn persisted_page_fixture() -> (PartitionState, TableRef, Vec<StoredEvent>, Arc<MemoryStore>, (usize, usize)) {
+        persisted_pages(false).await
+    }
+
+    /// Persists one page per event; `misplaced` writes the second event's page in the first one's place too.
+    async fn persisted_pages(misplaced: bool) -> (PartitionState, TableRef, Vec<StoredEvent>, Arc<MemoryStore>, (usize, usize)) {
         let (state, table, events) = live_table();
         let captured = state.value();
         let table_entry = captured.table_catalog().entry(&table).unwrap();
@@ -976,6 +990,7 @@ mod tests {
         builder.write_iid_branch(children).unwrap();
         let (metadata, statistics) = builder.finish().unwrap();
         let meta = metadata.write().unwrap();
+        if misplaced { pages[0] = pages[1].clone(); }
         let data = write_file(pages[0].schema().as_ref(), &pages).unwrap();
         let metadata_size = meta.len();
         let probe = MemoryBudget::new(1 << 24);
@@ -991,6 +1006,24 @@ mod tests {
         store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
         (state, table, events, store, (metadata_size, metadata_charge))
+    }
+
+    #[tokio::test]
+    async fn a_data_page_outside_its_metadata_path_fails_every_scan_that_reads_it() {
+        let (state, table, _, store, _) = persisted_pages(true).await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        for scan_number in 0..2 {
+            let (scan, execution, _) = descriptor_scan(state.value().snapshot(), table.clone(), Arc::clone(&storage));
+            let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+            let error = loop {
+                match cursor.next_page().await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!("scan {scan_number} served the misplaced page"),
+                    Err(error) => break error,
+                }
+            };
+            assert!(error.code.ends_with("page-path"), "scan {scan_number}: {error:?}");
+        }
     }
 
     #[tokio::test]
