@@ -57,6 +57,15 @@ impl FinalWriter<'_> {
         Ok(leaf)
     }
 
+    fn page(&mut self, batch: &arrow_array::RecordBatch) -> Result<usize> {
+        if self.cancellation.is_cancelled() { return Err(crate::closed()); }
+        let (leaf, metadata_charge) = self.metadata.write_leaf_reserved(batch, self.memory)?;
+        limit_writer(&mut self.data, self.directory, self.disk_limit)?;
+        self.data.write(batch)?;
+        self.metadata_charges.push(metadata_charge);
+        Ok(leaf)
+    }
+
     fn rows(&mut self, events: &[StoredEvent], depth: usize, page_size: usize) -> Result<usize> {
         if events.is_empty() { return self.metadata.write_nil(); }
         if events.len() <= page_size || depth == 64 || events.first().map(|event| event.iid) == events.last().map(|event| event.iid) { return self.leaf(events); }
@@ -73,6 +82,12 @@ impl FinalWriter<'_> {
     fn tree(&mut self, reader: &mut ArrowFile, leaves: &[Leaf], depth: usize, page_size: usize) -> Result<usize> {
         if leaves.is_empty() { return self.metadata.write_nil(); }
         let total = leaves.iter().try_fold(0usize, |total, leaf| total.checked_add(leaf.rows).ok_or_else(|| crate::invalid("Page tree row count overflow")))?;
+        if let [leaf] = leaves && leaf.rows > 0 && leaf.rows <= page_size {
+            // A spill page was built from its events with this output schema, so a leaf that is one whole page is written as it is.
+            let page = read_page(reader, leaf.page, self.memory)?;
+            if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
+            return self.page(page.batch());
+        }
         if (leaves.len() == 1 && leaves[0].path.len() == depth) || total <= page_size {
             let mut rows = Vec::new();
             let mut charges = Vec::new();
