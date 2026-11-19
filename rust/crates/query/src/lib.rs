@@ -1,3 +1,4 @@
+mod accelerate;
 mod aggregate;
 mod context;
 mod parameters;
@@ -33,6 +34,7 @@ mod cross;
 mod join_storage;
 mod mark;
 
+pub use accelerate::{ConstantEvaluator, ScanAccelerator, ScanRequest};
 pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 pub use cursor::{PreparedQuery, QueryCursor};
 pub use settings::unindexed_tx;

@@ -154,7 +154,16 @@ impl ScanCursor {
         let mut partitions = VecDeque::new();
         for snapshot in &database.partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
-            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(&database.storage), scan: scan.clone(), execution: execution.clone(), bounds,
+            let mut narrowed = scan.clone();
+            for accelerator in execution.context.accelerators.iter() {
+                let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage: &database.storage, bounds, memory: &execution.context.memory,
+                    current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution) };
+                if let Some(candidates) = accelerator.candidate_iids(&request).await? {
+                    let iids = match narrowed.iids.take() { Some(existing) => existing.intersection(&candidates).copied().collect(), None => candidates };
+                    narrowed.iids = Some(iids);
+                }
+            }
+            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(&database.storage), scan: narrowed, execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
                 output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
         }

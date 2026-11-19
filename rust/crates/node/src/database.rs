@@ -83,6 +83,7 @@ pub(crate) struct DatabaseFactory {
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     pub external_sources: ExternalSources,
     pub artefact_kinds: Vec<Arc<dyn ArtefactKind>>,
+    pub accelerators: Arc<[Arc<dyn rtdb_query::ScanAccelerator>]>,
 }
 
 pub(crate) struct OpenedDatabase {

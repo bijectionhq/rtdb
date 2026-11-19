@@ -32,6 +32,12 @@ pub struct NodeServices {
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     /// The kinds of derived artefact this node builds; empty disables the artefact lane.
     pub artefact_kinds: Vec<Arc<dyn rtdb_maintenance::ArtefactKind>>,
+    /// Consulted by every scan before it opens, unless `NodeOptions::scan_acceleration` is off.
+    pub scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>>,
+}
+fn default_scan_accelerators() -> Vec<Arc<dyn rtdb_query::ScanAccelerator>> {
+    #[cfg(feature = "search")] { vec![Arc::new(rtdb_search::SearchAccelerator::default())] }
+    #[cfg(not(feature = "search"))] { Vec::new() }
 }
 fn default_artefact_kinds() -> Vec<Arc<dyn rtdb_maintenance::ArtefactKind>> {
     #[cfg(feature = "search")] { vec![Arc::new(rtdb_search::SearchArtefacts)] }
@@ -39,7 +45,7 @@ fn default_artefact_kinds() -> Vec<Arc<dyn rtdb_maintenance::ArtefactKind>> {
 }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, artefact_kinds: default_artefact_kinds() }
+        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, artefact_kinds: default_artefact_kinds(), scan_accelerators: default_scan_accelerators() }
     }
 }
 
@@ -106,7 +112,8 @@ impl Node {
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
-            external_sources: services.external_sources, clock: services.clock, artefact_kinds: services.artefact_kinds, options });
+            external_sources: services.external_sources, clock: services.clock, artefact_kinds: services.artefact_kinds,
+            accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime };
         let mut initial = Vec::new();
@@ -239,6 +246,7 @@ impl Node {
         }
         let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())));
         QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+            .with_accelerators(Arc::clone(&self.factory.accelerators))
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
     }
 

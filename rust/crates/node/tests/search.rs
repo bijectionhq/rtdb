@@ -139,3 +139,73 @@ async fn the_lane_records_a_search_file_on_every_settled_trie_of_an_indexed_tabl
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+struct Counting { inner: rtdb_search::SearchAccelerator, narrowed: std::sync::atomic::AtomicUsize }
+#[async_trait]
+impl rtdb_query::ScanAccelerator for Counting {
+    async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<std::collections::BTreeSet<rtdb_types::Iid>>> {
+        let candidates = self.inner.candidate_iids(request).await?;
+        if candidates.is_some() { self.narrowed.fetch_add(1, Ordering::Relaxed); }
+        Ok(candidates)
+    }
+}
+
+#[tokio::test]
+async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_every_basis() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let counting = Arc::new(Counting { inner: rtdb_search::SearchAccelerator::default(), narrowed: Default::default() });
+    let services = NodeServices { scan_accelerators: vec![counting.clone()], ..services() };
+    let (node, driver) = Node::open(options, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let execute = |statement: String| TxOp::Sql { sql: statement, args: None };
+    assert!(session.state_mut().execute_tx(vec![execute("CREATE SEARCH INDEX docs_body ON docs (body)".into())], AutonomousTxOptions::default()).await.unwrap().committed());
+    let words = ["invoice", "overdue", "paid", "book", "library", "red", "blue", "green", "late", "early", "lost", "found", "open", "closed", "spare", "sharp"];
+    let mut systems = Vec::new();
+    let mut seed = 7u64;
+    let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
+    for round in 0..4 {
+        for id in 0..150 {
+            let body: Vec<_> = (0..2).map(|_| words[next() % words.len()]).collect();
+            let year = 2020 + next() % 4;
+            let statement = match next() % 6 {
+                0 => format!("DELETE FROM docs FOR PORTION OF VALID_TIME FROM TIMESTAMP '{year}-01-01Z' TO TIMESTAMP '{}-01-01Z' WHERE _id = {id}", year + 1),
+                1 => format!("INSERT INTO docs RECORDS {{_id: {id}, body: {}, _valid_from: TIMESTAMP '{year}-01-01Z'}}", next() % 100),
+                _ => format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{}', _valid_from: TIMESTAMP '{year}-01-01Z', _valid_to: TIMESTAMP '{}-06-01Z'}}", body.join(" "), year + 1),
+            };
+            let result = session.state_mut().execute_tx(vec![execute(statement)], AutonomousTxOptions::default()).await.unwrap();
+            if id == 0 { systems.push(result.tx_key().system_time); }
+        }
+        if round < 3 {
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+            database.compaction().unwrap().compact_all().await.unwrap();
+            if round < 2 { database.build_artefacts().await.unwrap(); }
+        }
+    }
+    let ids = |rows: Vec<Vec<Value>>| { let mut ids: Vec<_> = rows.into_iter().map(|row| row[0].clone()).map(|value| match value { Value::I64(id) => id, other => panic!("{other:?}") }).collect(); ids.sort_unstable(); ids };
+    let mut compared = 0;
+    let mut answers = std::collections::BTreeMap::<&str, std::collections::BTreeSet<Vec<i64>>>::new();
+    for query in ["overdue", "invoice overdue", "red blue", "paid book", "absent"] {
+        for valid in ["2020-03-01Z", "2021-07-01Z", "2023-02-01Z"] {
+            for system in [None, Some(systems[1]), Some(systems[3])] {
+                let system_clause = system.map_or(String::new(), |time| format!(" FOR SYSTEM_TIME AS OF TIMESTAMP '{}'", chrono::DateTime::from_timestamp_micros(time.0).unwrap().to_rfc3339()));
+                let accelerated = format!("SELECT _id FROM docs FOR VALID_TIME AS OF TIMESTAMP '{valid}'{system_clause} WHERE MATCH(body, '{query}')");
+                let oracle = format!("SELECT _id FROM docs FOR VALID_TIME AS OF TIMESTAMP '{valid}'{system_clause} WHERE MATCH(body, '{query}') OR _id < -1");
+                let expected = ids(rows(session.query_sql(&oracle, vec![]).await.unwrap()).await);
+                assert_eq!(ids(rows(session.query_sql(&accelerated, vec![]).await.unwrap()).await), expected, "{accelerated}");
+                answers.entry(query).or_default().insert(expected);
+                compared += 1;
+            }
+        }
+    }
+    assert_eq!(compared, 45);
+    assert!(answers["overdue"].len() > 2 && answers["overdue"].iter().any(|ids| !ids.is_empty()), "the bases disagree, so the test can tell versions apart: {answers:?}");
+    assert_eq!(answers["absent"], std::collections::BTreeSet::from([Vec::new()]));
+    assert!(counting.narrowed.load(Ordering::Relaxed) >= compared, "every MATCH scan was narrowed");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

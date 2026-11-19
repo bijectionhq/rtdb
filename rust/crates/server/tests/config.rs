@@ -124,6 +124,7 @@ fn search_is_on_by_default_and_switches_off_without_touching_other_settings() {
     assert_eq!(configured.artefact_threads, 3);
     let off = decode("search: {enabled: false}").unwrap().node_options(8192).unwrap();
     assert_eq!(off.artefact_threads, 0);
+    assert!(!off.scan_acceleration && defaults.scan_acceleration);
     assert_eq!(off.compaction_threads, defaults.compaction_threads);
     assert!(decode("search: {threads: 0}").is_err());
     assert!(decode("search: {unknown: 1}").is_err());
