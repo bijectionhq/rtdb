@@ -482,8 +482,15 @@ async fn dimension(filter: &TemporalFilter, default: rtdb_types::Instant, execut
     match filter {
         TemporalFilter::Default => point(default.as_micros()?), TemporalFilter::All => Ok(Interval::ALL),
         TemporalFilter::At(at) => point(value(at, execution.context.current_time, execution, &scope).await?),
-        TemporalFilter::FromTo { from, to } => Interval::new(value(from, Timestamp::MIN.into(), execution, &scope).await?, value(to, Timestamp::MAX.into(), execution, &scope).await?),
-        TemporalFilter::Between { from, to } => Interval::between(value(from, Timestamp::MIN.into(), execution, &scope).await?, value(to, Timestamp::MAX.into(), execution, &scope).await?),
+        TemporalFilter::FromTo { from, to } => {
+            let from = value(from, Timestamp::MIN.into(), execution, &scope).await?;
+            Interval::new(from, value(to, Timestamp::MAX.into(), execution, &scope).await?.max(from))
+        }
+        TemporalFilter::Between { from, to } => {
+            let from = value(from, Timestamp::MIN.into(), execution, &scope).await?;
+            let to = value(to, Timestamp::MAX.into(), execution, &scope).await?;
+            if to < from { Interval::new(from, from) } else { Interval::between(from, to) }
+        }
     }
 }
 fn project(row: &ResolvedRow<RowSource>, name: &str) -> Result<Value> {

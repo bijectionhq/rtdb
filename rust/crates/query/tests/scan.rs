@@ -700,3 +700,19 @@ async fn is_not_null_keeps_zero_count_pages_that_correct_delete_or_erase_matchin
         }
     }
 }
+
+#[tokio::test]
+async fn an_inverted_temporal_range_matches_nothing() {
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let mut transaction = tx(&state, &budget, 0, 10);
+    transaction.put(table(), document(1, Value::I64(1)), Interval::ALL).unwrap();
+    state.apply(&transaction.stage().unwrap()).unwrap();
+    let context = query_context(state.value().snapshot(), Arc::new(MemoryStore::default()), false);
+    for valid_time in [
+        TemporalFilter::FromTo { from: Expr::Literal(timestamp(500)), to: Expr::Literal(timestamp(100)) },
+        TemporalFilter::Between { from: Expr::Literal(timestamp(500)), to: Expr::Literal(timestamp(100)) },
+    ] {
+        assert_eq!(collect(scan(&context, &["v"], valid_time, TemporalFilter::All, None), Arc::clone(&context)).await.unwrap(), Vec::<Vec<Value>>::new());
+    }
+}
