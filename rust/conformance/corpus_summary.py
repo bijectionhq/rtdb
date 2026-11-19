@@ -8,7 +8,8 @@ test itself defines on the JVM, or configure the
 test-namespace in-memory object store. Vars that need cloud CLIs, cloud credentials, real cloud endpoints or a Docker build context report
 environment-unavailable. A failed assertion on the spills a test counts by redefining the JVM's temporary-directory
 function observes JVM operator internals, so it reports jvm-internal, as do the Vars in JVM_INTERNAL_VARS, whose
-assertions hold only through a with-redefs of a JVM implementation var.
+assertions hold only through a with-redefs of a JVM implementation var, and a metrics assertion missing only
+JVM-runtime or child-allocator gauges.
 """
 
 import argparse
@@ -30,6 +31,9 @@ ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|working dir should b
 JVM_INTERNAL = re.compile(r"\(clojure\.core/deref !spills\)")
 # Vars whose assertions hold only through a with-redefs of a JVM implementation var, which the native engine never reads.
 JVM_INTERNAL_VARS = {"xtdb.pgwire-test/canned-response-test": "redefines xtdb.pgwire/canned-responses"}
+# Gauges of the JVM runtime and of Arrow Java's child-allocator tree; a metric assertion missing only these is jvm-internal.
+JVM_ONLY_METRICS = {"jvm.memory.used", "xtdb.allocator.memory.allocated"}
+MISSING_METRICS = re.compile(r'actual: \(not \(empty\? #\{([^}]*)\}\)\)')
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 
 
@@ -43,6 +47,10 @@ def outcome(row):
         return "jvm-internal"
     if row["result"] in ("error", "fail") and row["var"] in JVM_INTERNAL_VARS:
         return "jvm-internal"
+    if row["result"] == "fail" and row["var"] == "xtdb.information-schema-test/test-metrics":
+        missing = [set(re.findall(r'"([^"]+)"', names)) for names in MISSING_METRICS.findall(detail)]
+        if missing and all(names <= JVM_ONLY_METRICS for names in missing):
+            return "jvm-internal"
     return row["result"]
 
 
