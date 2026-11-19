@@ -48,7 +48,6 @@ impl Database {
     pub fn progress(&self) -> &Arc<ProgressMonitor> { self.replication.progress() }
     pub fn status(&self) -> rtdb_replication::DriverStatus { self.replication.status() }
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
-    /// The trie catalog this node has applied.
     pub fn trie_catalog(&self) -> Arc<rtdb_index::TrieCatalog> { Arc::clone(self.partition.value().trie_catalog()) }
     /// Builds every artefact the lanes can currently build, returning once each is published or with the first failure.
     pub async fn build_artefacts(&self) -> Result<()> {

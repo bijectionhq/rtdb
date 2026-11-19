@@ -215,7 +215,6 @@ impl TrieCatalog {
         }
         next
     }
-    /// Records artefacts on the tries they were built from.
     /// A trie the catalog no longer holds takes no record, and a trie keeps the first record for each (kind, definition id, definition version).
     pub fn with_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
         let mut next = self.clone();

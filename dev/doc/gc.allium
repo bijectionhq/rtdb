@@ -323,16 +323,15 @@ rule DeleteAndCommitChunkRule {
     -- Any DELETE failure aborts the chunk before the publish happens.
     -- Followers must never drop catalog entries for files still on disk.
     --
-    -- A trie's search files (fts.allium, ahead of the implementation) go before its data file.
-    -- Their term dictionaries carry the data file's content, so they must not outlive it.
-    -- The keys deleted are those of every definition the trie's entry records or the table has in force, not only the recorded ones.
-    -- A search-files-added the leader accepted before the trie became garbage may still be ahead of its apply when this cycle reads the entry, and its key is one of the in-force definitions'.
+    -- A trie's artefacts, such as its search files (fts.allium), go before its data file: they carry the data file's content, so they must not outlive it.
+    -- They are found by listing the trie's artefact prefix rather than by reading its entry's records, which also catches an artefact whose record had not been applied when this cycle read its snapshot.
+    -- See: maintenance/src/gc.rs (collect_table)
     when: DeleteAndCommitChunk(table, chunk)
 
     ensures:
         for trie_key in chunk:
-            for index in search_indexes_of(table, trie_key):
-                ObjectStoreDelete(trie_cat/search_file_key(table, trie_key, index.index_id, index.index_version))
+            for key in ObjectStoreList(trie_cat/artefact_prefix(table, trie_key)):
+                ObjectStoreDelete(key)
             ObjectStoreDelete(data_file_path(table, trie_key))
             ObjectStoreDelete(meta_file_path(table, trie_key))
 
@@ -459,9 +458,7 @@ surface TrieGcAdmin {
 --                                   (storage/PathTools.kt)
 --   meta_file_path(table, key)    — table + trie_key -> ObjectStore key (meta)
 --                                   (storage/PathTools.kt)
---   search_indexes_of(table, key) — the (index_id, index_version) pairs the trie's entry records,
---                                   with those of the table's search index definitions in force
---                                   (trie-cat.allium: search_files; fts.allium: SearchDefinitions)
+--   ObjectStoreList(prefix)       — every key under a prefix (storage/ObjectStore.kt)
 --   default_garbage_as_of()       — block-time threshold minus garbage_lifetime
 --                                   (TrieGarbageCollector.kt: defaultGarbageAsOf)
 --   parse_table_ref(db, name)     — TableRef.parse (api/.../table/TableRef.kt)

@@ -18,6 +18,8 @@ use tantivy::tokenizer::{PreTokenizedString, Token};
 use tantivy::{Directory, Index, IndexSettings, TantivyDocument, Term};
 
 const MAGIC: &[u8; 8] = b"RTSRCH01";
+/// Bumped with the bundle layout or the tantivy version, either of which changes a search file's bytes.
+pub const FORMAT_VERSION: i32 = 1;
 const WRITER_MEMORY: usize = 32 << 20;
 
 /// One data-file row as the search file sees it: its own temporal columns and the tokens of each indexed column.
@@ -137,10 +139,17 @@ fn bundle(directory: &RamDirectory, uuid: &str) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-struct Shared(bytes::Bytes);
-impl std::ops::Deref for Shared { type Target = [u8]; fn deref(&self) -> &[u8] { &self.0 } }
-// SAFETY: `Bytes` keeps its buffer at a fixed address for as long as any handle to it lives, wherever the handle moves.
-unsafe impl stable_deref_trait::StableDeref for Shared {}
+/// The bytes a search file is read from: the object as read, or a lease on the buffer pool's copy of it.
+pub enum Source { Bytes(bytes::Bytes), Lease(rtdb_storage::cache::CacheLease) }
+impl From<bytes::Bytes> for Source { fn from(bytes: bytes::Bytes) -> Self { Self::Bytes(bytes) } }
+impl From<Vec<u8>> for Source { fn from(bytes: Vec<u8>) -> Self { Self::Bytes(bytes.into()) } }
+impl From<rtdb_storage::cache::CacheLease> for Source { fn from(lease: rtdb_storage::cache::CacheLease) -> Self { Self::Lease(lease) } }
+impl std::ops::Deref for Source {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { match self { Self::Bytes(bytes) => bytes, Self::Lease(lease) => lease.as_slice() } }
+}
+// SAFETY: both owners keep their buffer at a fixed address, behind a reference count, for as long as they live, wherever they move.
+unsafe impl stable_deref_trait::StableDeref for Source {}
 
 /// A read-only directory over a bundle held in memory.
 #[derive(Clone)]
@@ -151,8 +160,8 @@ impl std::fmt::Debug for BundleDirectory {
 }
 
 impl BundleDirectory {
-    fn open(bytes: bytes::Bytes) -> Result<Self> {
-        let data = bytes.as_ref();
+    fn open(bytes: Source) -> Result<Self> {
+        let data: &[u8] = &bytes;
         if data.len() < 2 * MAGIC.len() + 8 || &data[..8] != MAGIC || &data[data.len() - 8..] != MAGIC { return Err(corrupt("Search file has no bundle magic")); }
         let footer = usize::try_from(u64::from_le_bytes(data[data.len() - 16..data.len() - 8].try_into().map_err(fault)?)).map_err(fault)?;
         let mut cursor = data.get(footer..data.len() - 16).ok_or_else(|| corrupt("Search file footer is out of range"))?;
@@ -172,7 +181,7 @@ impl BundleDirectory {
             let end = offset.checked_add(size).filter(|end| *end <= footer).ok_or_else(|| corrupt("Search file entry is out of range"))?;
             files.insert(PathBuf::from(name), offset..end);
         }
-        Ok(Self { bytes: OwnedBytes::new(Shared(bytes)), files: Arc::new(files) })
+        Ok(Self { bytes: OwnedBytes::new(bytes), files: Arc::new(files) })
     }
     fn read_only(path: &Path) -> std::io::Error { std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("Search file is read-only: {}", path.display())) }
 }
@@ -198,8 +207,8 @@ impl Directory for BundleDirectory {
 pub struct SearchFile { index: Index, columns: Vec<String> }
 
 impl SearchFile {
-    pub fn open(bytes: bytes::Bytes, columns: &[String]) -> Result<Self> {
-        let index = Index::open(BundleDirectory::open(bytes)?).map_err(fault)?;
+    pub fn open(bytes: impl Into<Source>, columns: &[String]) -> Result<Self> {
+        let index = Index::open(BundleDirectory::open(bytes.into())?).map_err(fault)?;
         let (expected, _) = schema(columns);
         if index.schema() != expected { return Err(corrupt("Search file schema does not match its definition")); }
         Ok(Self { index, columns: columns.to_vec() })
@@ -275,7 +284,7 @@ mod tests {
 
     #[test]
     fn matches_name_every_row_holding_all_terms_with_its_own_temporal_columns() {
-        let file = SearchFile::open(build_search_file(&columns(), &rows(), "job").unwrap().into(), &columns()).unwrap();
+        let file = SearchFile::open(build_search_file(&columns(), &rows(), "job").unwrap(), &columns()).unwrap();
         let found = file.matches("body", &Query::parse("Overdue")).unwrap();
         assert_eq!(found.iter().map(|doc| (doc.doc, doc.iid[0], doc.system_from)).collect::<Vec<_>>(), [(0, 1, 30), (2, 2, 20)]);
         assert_eq!(found[0].recency, i64::MAX);
@@ -287,7 +296,7 @@ mod tests {
 
     #[test]
     fn corpus_statistics_count_documents_tokens_and_term_frequencies() {
-        let file = SearchFile::open(build_search_file(&columns(), &rows(), "job").unwrap().into(), &columns()).unwrap();
+        let file = SearchFile::open(build_search_file(&columns(), &rows(), "job").unwrap(), &columns()).unwrap();
         let corpus = file.corpus("body", &Query::parse("overdue invoice")).unwrap();
         assert_eq!(corpus.documents, 4);
         assert_eq!(corpus.tokens, 11);
@@ -296,12 +305,12 @@ mod tests {
 
     #[test]
     fn an_empty_trie_and_a_corrupt_object_are_told_apart() {
-        let empty = SearchFile::open(build_search_file(&columns(), &[], "job").unwrap().into(), &columns()).unwrap();
+        let empty = SearchFile::open(build_search_file(&columns(), &[], "job").unwrap(), &columns()).unwrap();
         assert!(empty.matches("body", &Query::parse("anything")).unwrap().is_empty());
         let mut bytes = build_search_file(&columns(), &rows(), "job").unwrap();
         let length = bytes.len();
         bytes[length - 1] ^= 1;
-        assert!(SearchFile::open(bytes.into(), &columns()).is_err());
-        assert!(SearchFile::open(build_search_file(&columns(), &rows(), "job").unwrap().into(), &["body".to_string()]).is_err(), "a definition with other columns does not read the file");
+        assert!(SearchFile::open(bytes, &columns()).is_err());
+        assert!(SearchFile::open(build_search_file(&columns(), &rows(), "job").unwrap(), &["body".to_string()]).is_err(), "a definition with other columns does not read the file");
     }
 }

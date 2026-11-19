@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 pub struct SearchDefinition { pub name: String, pub table: TableRef, pub columns: Vec<String>, pub version: i64 }
 
 impl SearchDefinition {
-    /// The artefact definition id; it names the analyzer version, so a tokenisation change builds new search files rather than reading old ones.
-    pub fn artefact_id(&self) -> String { format!("{}~a{}", self.name, rtdb_text::ANALYZER_VERSION) }
+    /// The artefact definition id names the analyzer and file format versions, so a change to either builds new search files rather than reading old ones.
+    pub fn artefact_id(&self) -> String { format!("{}~a{}f{}", self.name, rtdb_text::ANALYZER_VERSION, crate::file::FORMAT_VERSION) }
 }
 
 pub const DEFINITIONS: (&str, &str) = ("xt", "search_indexes");

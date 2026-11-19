@@ -31,6 +31,21 @@ Ordinary SQL equality continues to reject set/set comparisons at type admission.
 Stored Transit values use their registered object semantics, including distinct identity-bearing objects and the emitted representations of supported native scalars.
 The link:../../rust/crates/expr/README.adoc[expression reference] records the implemented comparison paths and their regression sources.
 
+== Full-text search
+
+`CREATE SEARCH INDEX docs_text ON docs (title, body)` defines a search index over a table's columns; `DROP SEARCH INDEX docs_text` removes it.
+Definitions are documents in `xt.search_indexes`, so they can be queried as of any basis.
+
+`MATCH(body, 'overdue invoice')` holds when the column's text holds every term of the query, and `SEARCH_SCORE(body, 'overdue invoice')` ranks it by BM25.
+Both see the version of each row visible at the query's valid and system time, whatever `FOR VALID_TIME` and `FOR SYSTEM_TIME` select.
+Terms are split on non-alphanumeric characters and lowercased; only string values match.
+
+A background lane builds a search file for every settled trie of an indexed table, and a scan with `MATCH` reads candidates from those files before resolving them.
+Results are the same with or without search files, so `search: {enabled: false}` in the node configuration turns the lane and the narrowing off without changing any answer.
+`search: {threads: N}` sizes the lane per database.
+Scores are relative to the search files a query read, and may change as compaction rewrites them.
+See link:../../rust/crates/search/README.adoc[the search reference] and link:fts.allium[the specification].
+
 == Operations
 
 Health HTTP exposes the index, metrics, started, alive and ready routes, plus POST `/system/finish-block`.

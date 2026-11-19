@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rtdb_format::{keys::TrieKey, log::proto::{ArtefactRecord, ArtefactsAdded}};
+use rtdb_format::log::proto::{ArtefactRecord, ArtefactsAdded};
 use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog, TrieState};
 use rtdb_maintenance::{ArtefactBuilder, ArtefactDefinition, ArtefactDriver, ArtefactJob, ArtefactPublisher, SnapshotSource, available_artefact_jobs};
 use rtdb_trie::TrieConfig;

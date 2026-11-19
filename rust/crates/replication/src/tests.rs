@@ -420,7 +420,7 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
 }
 
 #[tokio::test]
-async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_entries_it_refuses() {
+async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_entries_for_tries_it_does_not_hold() {
     let fixture = fixture(ReplicationConfig { rows_per_block: 2, assertion_interval: Duration::from_millis(10), ..Default::default() }, 1 << 27).await;
     let (handle, partition, store) = (fixture.handle.clone(), Arc::clone(&fixture.driver.partition), Arc::clone(&fixture.store));
     let writer = tokio::spawn(fixture.driver.run());
@@ -445,12 +445,15 @@ async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_ent
     let stale = proto::ArtefactsAdded { storage_version: Some(CURRENT_STORAGE_VERSION.0 + 1), storage_epoch: Some(0), table_name: Some(table.schema_and_table()),
         entries: vec![entry(&live, "title")], source_msg_id: None };
     handle.publish_artefacts(stale, &CancellationToken::new()).await.unwrap();
+    let malformed = proto::ArtefactsAdded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), table_name: Some(table.schema_and_table()),
+        entries: vec![proto::ArtefactEntry { trie_key: Some("not-a-trie".into()), record: Some(record("body")) }], source_msg_id: None };
+    handle.publish_artefacts(malformed, &CancellationToken::new()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async { while store.head(&file(&unknown, "body")).await.is_ok() { tokio::task::yield_now().await; } }).await.unwrap();
     let catalog = partition.value();
     let trie = catalog.trie_catalog().iter_tries(&table).find(|trie| trie.key == live).unwrap().clone();
     assert_eq!(trie.artefacts, vec![record("body")]);
     assert!(store.head(&file(&live, "body")).await.is_ok());
-    assert!(store.head(&file(&unknown, "body")).await.is_err(), "an entry for a trie the catalog does not hold is refused and its file deleted");
-    assert!(store.head(&file(&live, "title")).await.is_err(), "an entry under another storage version is refused and its file deleted");
+    assert!(store.head(&file(&live, "title")).await.is_ok(), "an entry under another storage version is dropped, and the key this node would compute for it left alone");
     handle.shutdown();
     writer.await.unwrap().unwrap();
 }

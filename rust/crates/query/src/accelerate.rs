@@ -37,22 +37,32 @@ pub trait CorpusSource: Send + Sync {
     fn corpus(&self, query: &rtdb_text::Query) -> Result<rtdb_text::Corpus>;
 }
 
-/// The corpus sources the scans of one query opened; a score sums them all, whatever column or table each came from.
+/// The corpus sources the scans of one query opened, once each however often a scan reopens; a score sums them all, whatever column or table each came from.
 #[derive(Default)]
-pub struct CorpusRegistry(parking_lot::Mutex<Vec<Arc<dyn CorpusSource>>>);
+pub struct CorpusRegistry(parking_lot::Mutex<Corpora>);
+
+#[derive(Default)]
+pub struct Corpora { sources: std::collections::BTreeMap<String, Arc<dyn CorpusSource>>, computed: std::collections::BTreeMap<String, Option<rtdb_text::Corpus>> }
 
 impl CorpusRegistry {
-    pub fn register(&self, source: Arc<dyn CorpusSource>) { self.0.lock().push(source); }
+    /// `key` names the source, such as its object key; a source already registered under it is kept.
+    pub fn register(&self, key: String, source: Arc<dyn CorpusSource>) {
+        let mut corpora = self.0.lock();
+        if !corpora.sources.contains_key(&key) { corpora.sources.insert(key, source); corpora.computed.clear(); }
+    }
+    pub fn holds(&self, key: &str) -> bool { self.0.lock().sources.contains_key(key) }
 }
 
 impl rtdb_expr::CorpusLookup for CorpusRegistry {
     fn corpus(&self, query: &str) -> Option<rtdb_text::Corpus> {
-        let sources = self.0.lock().clone();
-        if sources.is_empty() { return None; }
-        let query = rtdb_text::Query::parse(query);
+        let mut corpora = self.0.lock();
+        if let Some(computed) = corpora.computed.get(query) { return computed.clone(); }
+        let terms = rtdb_text::Query::parse(query);
         let mut total = rtdb_text::Corpus::default();
-        for source in sources { total.add(&source.corpus(&query).ok()?); }
-        (total.documents > 0).then_some(total)
+        let summed = corpora.sources.values().try_for_each(|source| { total.add(&source.corpus(&terms).ok()?); Some(()) });
+        let result = summed.filter(|_| total.documents > 0).map(|_| total);
+        corpora.computed.insert(query.to_string(), result.clone());
+        result
     }
 }
 

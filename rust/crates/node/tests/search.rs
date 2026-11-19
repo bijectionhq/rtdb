@@ -132,8 +132,6 @@ async fn the_lane_records_a_search_file_on_every_settled_trie_of_an_indexed_tabl
     for trie in settled {
         let record = trie.artefacts.iter().find(|record| record.kind() == "search").unwrap_or_else(|| panic!("{} has no search file", trie.key));
         assert!(record.definition_id().starts_with("docs_body~a"));
-        let stats = rtdb_search::SearchStats::decode(record.stats()).unwrap();
-        assert!(stats.documents > 0 && stats.tokens["body"] >= 5 * stats.documents);
     }
     database.build_artefacts().await.unwrap();
     node.shutdown();

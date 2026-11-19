@@ -3,20 +3,16 @@
 --
 -- Full-text search over a table's documents, answered at any valid time and system time.
 --
--- This spec runs ahead of the implementation: nothing in it is built yet.
---
 -- The unit indexed is the event, one row of a trie data file, never the resolved entity.
--- Each trie file of an indexed table may carry one search file per index definition: an inverted index over that file's rows, keyed by the trie and the definition, and living exactly as long as the trie does.
+-- Each trie file of an indexed table may carry one search file per index definition: an inverted index over that file's rows, built from it and deleted with it.
 -- A search file only nominates candidates.
 -- Which version of an entity is visible at the query's valid and system time is decided by the scan's bitemporal resolution, as it is for every other predicate, and MATCH is re-checked on the resolved row.
 -- So a search file that is missing costs a query time and never changes its result.
 --
--- Search files are built by an index lane: deterministic jobs, chosen from the trie catalog like compaction jobs, run by any node that runs the compactor.
--- Registration follows the path tries take: the builder appends to the source log, the leader forwards to the replica log, and every node records the file on the trie's catalog entry.
+-- The core knows a search file only as an artefact of kind `search`: trie-cat.allium records artefacts on a trie's entry, db.allium carries ArtefactsAdded through the leader, and gc.allium deletes a garbage trie's artefacts with it.
+-- This spec owns what an artefact of kind `search` holds, which definitions and jobs produce them, and how a query reads them.
 --
--- The record of a trie's search files, and the rule that adds one, live in trie-cat.allium.
--- The SearchFilesAdded message and its path through the leader live in db.allium.
--- Deleting a search file alongside its trie lives in gc.allium.
+-- See: rust/crates/search, rust/crates/text, rust/crates/maintenance/src/artefact.rs, rust/crates/query/src/accelerate.rs; plan: fts-implementation.adoc
 
 use "./trie-cat.allium" as trie_cat
 use "./db.allium" as db
@@ -35,48 +31,30 @@ given {
 -- Values
 ------------------------------------------------------------
 
-value SearchIndexRef {
-    -- Identifies one version of one index definition.
-    -- A definition that changes anything its search files depend on is a new version, so a search file never needs rewriting in place.
-    index_id: String
-    version: Integer
-}
-
 value SearchIndexDefinition {
-    ref: SearchIndexRef
+    -- A document of `xt.search_indexes`, keyed by the index's name.
+    name: String
     table: trie_cat/TableRef
     -- Only the UTF-8 leg of each named column is indexed; other legs of the same column contribute no terms.
     columns: List<String>
-    -- Names the analyzer: tokenisation, normalisation and stemming.
-    tokenizer: String
-    -- Whether postings record term positions, which phrase queries need.
-    positions: Boolean
-    -- The search file format version, so a format change is a new definition version too.
-    format_version: Integer
-    defined_at: db/MessageId
-}
-
-value SearchFileRef {
-    -- The record a catalog entry holds for it is trie-cat.allium's SearchFileRecord.
-    trie_key: trie_cat/TrieKey
-    index: SearchIndexRef
-
-    table: trie_cat/TableRef
+    analyzer: String
+    -- The defining transaction's id, so redefining an index under its name is a new version.
+    version: Integer
 
     -- Derived
-    object_key: trie_cat/search_file_key(table, trie_key, index.index_id, index.version)
+    -- The artefact definition id names the analyzer and search file format versions, so a change to either builds new search files rather than reading old ones.
+    artefact_id: "{name}~a{analyzer_version}f{format_version}"
 }
 
 value SearchDoc {
-    -- One document per row of the trie's data file, put, delete and erase alike.
-    -- A delete or erase row contributes no terms.
-    doc_id: Long        -- the row's ordinal in the data file
+    -- One document per row of the trie's data file, put, delete and erase alike; a delete or erase contributes no terms.
+    doc_id: Integer      -- the row's ordinal in the data file
     iid: Bytes
     system_from: Instant
     valid_from: Instant
     valid_to: Instant
-    -- Present exactly when the data file's rows carry `_recency` (compaction.allium: HistoricalRowsCarryComputedRecency).
-    recency: Instant?
+    -- The row's `_recency` where the data file carries it (compaction.allium: HistoricalRowsCarryComputedRecency), and ∞ otherwise.
+    recency: Instant
 }
 
 ------------------------------------------------------------
@@ -84,16 +62,32 @@ value SearchDoc {
 ------------------------------------------------------------
 
 entity SearchDefinitions {
-    -- The index definitions in force for this database, as of the latest applied transaction.
-    -- A function of log position: every node at the same position holds the same set.
-    definitions: Map<SearchIndexRef, SearchIndexDefinition>
+    -- The definitions in force: `xt.search_indexes` read at a basis, as of the reader's current time in valid time.
+    -- They are documents the indexer writes, so every node reading at the same basis holds the same set.
+    definitions: List<SearchIndexDefinition>
 }
 
-entity IndexJob {
-    -- Ephemeral, like compaction.allium's CompactionJob.
+entity SearchJob {
+    -- An artefact job of kind `search`; ephemeral, like compaction.allium's CompactionJob.
     table: trie_cat/TableRef
     trie_key: trie_cat/TrieKey
-    index: SearchIndexRef
+    definition: SearchIndexDefinition
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- See: server config `search: {enabled, threads}`, NodeOptions.artefact_threads / scan_acceleration.
+    -- Off stops the lane and the accelerator together; MATCH is then answered by scanning.
+    enabled: Boolean = true
+    threads: Integer = 1
+    -- Above this many candidates, the scan runs unnarrowed.
+    max_candidates: Integer = 100000
+    -- Above this many bytes of selected tries the lane should have indexed but has not, the scan runs unnarrowed rather than reading them twice.
+    -- Level 0 and the partial level-1 current trie, which the lane never indexes, do not count.
+    max_unindexed_bytes: Integer = 67108864
 }
 
 ------------------------------------------------------------
@@ -101,66 +95,59 @@ entity IndexJob {
 ------------------------------------------------------------
 
 rule DefineSearchIndex {
-    -- CREATE SEARCH INDEX is a transaction, resolved by the leader in log order like any other.
-    -- It takes effect from its own position, so the definitions a node holds are a function of how far it has applied the log.
+    -- CREATE SEARCH INDEX name ON table (column, ...) is a transaction; the indexer writes its document at the transaction's system time, valid from then on.
     when: SearchIndexDefined(definition)
 
     ensures:
-        search_definitions.definitions[definition.ref] = definition
+        search_definitions.definitions.add(definition)
 }
 
 rule DropSearchIndex {
-    -- A dropped definition's search files stay recorded on their tries' entries, and are deleted with those tries.
-    when: SearchIndexDropped(ref)
+    -- DROP SEARCH INDEX deletes the document; the dropped definition's search files stay on their tries' entries and go with those tries.
+    when: SearchIndexDropped(name)
 
     ensures:
-        search_definitions.definitions.remove(ref)
+        search_definitions.definitions.remove(name)
 }
 
 ------------------------------------------------------------
 -- Rules: Index lane
 ------------------------------------------------------------
 
--- Job selection is deterministic over the trie catalog and the definitions, as compaction's is.
--- A job covers one trie under one definition, which keeps two nodes choosing the same job rare and makes it harmless when they do.
---
--- A trie is eligible when it is live, it is above level 0, it is not a level-1 current trie still below the file size target, and it lacks a search file for the definition.
+-- Search jobs are the artefact lane's jobs (maintenance/src/artefact.rs: available_artefact_jobs) for the definitions in force:
+-- a live trie above level 0, other than a level-1 current trie below the file size target, lacking an artefact for the definition's artefact id and version.
 -- Level 0 and the partial level-1 current trie are rewritten within a block or two, so the scan evaluates MATCH on them directly.
--- Jobs are ordered current side first, then higher levels first, and then by trie key.
+-- Jobs run current side first, then higher levels first.
 
-deferred available_index_jobs(trie_catalog: trie_cat/TrieCatalog, definitions: SearchDefinitions) -> List<IndexJob>
-
-rule IndexJobRuns {
-    when: job: IndexJob.created
-
-    let file = SearchFileRef { trie_key: job.trie_key, index: job.index, table: job.table }
+rule SearchJobRuns {
+    when: job: SearchJob.created
 
     ensures:
-        BuildAndUploadSearchFile(job.table, file)
-        db/SearchFilesAddedMessage.created(
-            storage_version: storage_version_of(job.trie_key),
-            storage_epoch: storage_epoch_of(job.trie_key),
-            table: job.table,
-            files: [db/SearchFileEntry { trie_key: job.trie_key, record: search_file_record(file) }]
-        ) appended to database.source_log
+        BuildAndUploadSearchFile(job)
+        db/ArtefactsAdded(table: job.table, trie_key: job.trie_key, record: search_record(job)) appended to database.source_log
 }
 
 ------------------------------------------------------------
 -- Rules: Query
 ------------------------------------------------------------
 
--- MATCH(column, query) is defined by the one search index definition in force for the column at the query's basis: its analyzer, and the UTF-8 leg of the column.
--- A column with no definition in force has no MATCH.
+-- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer.
+-- SEARCH_SCORE(column, query) is the BM25 of that value for the query's terms.
 --
--- A query with MATCH on a scanned table plans as:
+-- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
 --
---   1. Select tries exactly as the scan does without MATCH, by temporal metadata and recency.
---   2. From each selected trie whose entry records a search file for the definition in force, take the docs whose terms satisfy the query.
---      Drop a doc whose own valid and system interval excludes the query's valid and system time, and one whose recency is at or before both the query's valid time and its system time, as the scan prunes a page.
---   3. The IIDs of the remaining docs, unioned across tries, are the candidate set.
---   4. A selected trie with no search file for that definition, and every live index segment, contributes candidates by evaluating MATCH on its rows.
---   5. The scan runs restricted to the candidate set, over every selected trie and live segment, resolving each candidate's history in full.
---   6. MATCH is evaluated on each resolved row; a row survives exactly when it would without the index.
+--   1. The scan selects tries exactly as it does without MATCH.
+--   2. A selected trie whose entry records a search file for that definition contributes the IIDs of its docs whose terms satisfy the query.
+--      A doc whose own valid interval misses the query's, whose system-from is at or after the query's system upper bound, or whose recency is at or before the earlier of the query's valid and system lower bounds, contributes nothing.
+--   3. A selected trie with no such record, or whose file cannot be read, contributes the IIDs of its matching rows, read from its data file, under the same rule.
+--   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
+--   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
+--   6. MATCH is evaluated on each resolved row.
+--
+-- Past max_candidates candidates, or max_unindexed_bytes of tries without a search file, the scan runs unnarrowed instead.
+--
+-- Each current-side search file the narrowing opens is registered with the query as a corpus source, once however often the scan reopens.
+-- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every source the query registered; with none, each term's inverse document frequency is 1.
 
 rule MatchIsAResidualPredicate {
     when: ScanWithMatch(scan, predicate)
@@ -172,58 +159,44 @@ rule MatchIsAResidualPredicate {
         FilterResolvedRows(scan, predicate)
 }
 
--- Ranked queries (ORDER BY score LIMIT k) score each event within its search file.
--- Candidates are drawn in descending upper-bound score across the selected search files and verified in batches through steps 5 and 6.
--- The threshold below which a candidate cannot enter the result rises only on verified rows.
--- The query ends once k verified rows score at least the best upper bound not yet verified; ties break on (score, iid).
---
--- Ranking statistics (document count, total tokens, document frequency) are summed over the current-side search files in the query's snapshot of the catalog.
-
 ------------------------------------------------------------
 -- Contracts
 ------------------------------------------------------------
 
 contract SearchFileLayout {
     -- What a search file holds.
+    -- See: search/src/file.rs
 
     @invariant PureFunctionOfFileAndDefinition
-        -- A search file is a deterministic function of its trie's data file and its index definition.
-        -- Every node that runs the same index job writes the same file.
+        -- A search file's bytes are a deterministic function of its trie's data file, its definition and the job's identity.
+        -- Every node that runs the same job writes the same object.
 
     @invariant OneDocPerRow
         -- A search file has one document per row of its trie's data file, and a document's id is that row's ordinal.
 
     @invariant DocColumnsAreTheRowsOwn
         -- A document's iid, system_from, valid_from, valid_to and recency are those its row was written with, unaffected by any later event.
+
+    @invariant TokensAreTheResidualsTokens
+        -- A search file's terms are the analyzer's tokens of each row's UTF-8 value, the same tokens MATCH evaluates on a resolved row.
 }
 
 contract SearchCorrectness {
-    -- What the index may and may not change about a query.
+    -- What narrowing may and may not change about a query.
 
     @invariant ResultIndependentOfSearchFiles
-        -- A query's result is the same whichever search files exist, including none.
+        -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.
+        -- SEARCH_SCORE's values are not rows: they depend on the search files a query read (ScoresApproximate).
 
     @invariant CandidatesAreASuperset
         -- Every IID with a visible row satisfying MATCH at the query's valid and system time is in the candidate set.
 
     @invariant VisibilityIsResolved
-        -- Whether a row is visible is decided by the scan's resolution over the candidate's full history in the selected tries and live segments.
-        -- A document's own columns only ever rule a candidate out.
+        -- Whether a row is visible is decided by the scan's resolution over the candidate's full history.
+        -- A document's own columns only ever rule a candidate out: resolution narrows an event's interval and never widens it.
 
     @invariant SearchFilesFromTheSnapshot
-        -- A query reads the search files its snapshot's catalog records, and no others.
-
-    @invariant RankingVerifiedBeforeThreshold
-        -- In a ranked query, only verified-visible rows raise the threshold that ends the query.
-}
-
-contract SearchFileLifecycle {
-    @invariant NeverOutlivesItsTrie
-        -- A search file is deleted no later than its trie's data and meta files.
-        -- Its term dictionary carries the trie's content, so an erase reaches the search file when it reaches the data file.
-
-    @invariant RecordedOnlyWhenUploaded
-        -- A search file is recorded on a catalog entry only after it is wholly in the object store.
+        -- A scan reads the search files its snapshot's catalog records, and no others.
 }
 
 ------------------------------------------------------------
@@ -237,7 +210,7 @@ surface FullTextSearch {
 
     provides:
         SearchIndexDefined(definition)
-        SearchIndexDropped(ref)
+        SearchIndexDropped(name)
         ScanWithMatch(scan, predicate)
 
     contracts:
@@ -248,31 +221,32 @@ surface FullTextSearch {
 
     @guarantee ScoresApproximate
         -- Scores rank results within one query.
-        -- They may differ across catalog snapshots at the same transaction basis, because compaction changes the files the statistics are summed over.
+        -- They are summed over the search files the query read, across every column and table it narrowed, so they move as compaction and the lane change those files, and with no files each term's inverse document frequency is 1.
 }
 
 -- Black box helpers used in rule expressions:
---   search_file_record(file)               — the catalog record of a built search file (trie-cat.allium: SearchFileRecord)
---   storage_version_of / storage_epoch_of  — the storage format the trie was written under
---   search_candidates(scan, predicate)     — steps 1–4 of the query plan
---   BuildAndUploadSearchFile(table, file)  — tokenise the data file's rows and upload the bundled index
+--   search_record(job)                  — the artefact record of a built search file: kind `search`, the definition's artefact id and version
+--   search_candidates(scan, predicate)  — steps 1–4 of the query plan
+--   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the trie's artefact key
 
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Is the search file format byte-deterministic? Tantivy names segments with random UUIDs; either names derive from the trie key and definition, or two builds are equivalent but differ in bytes, and nothing byte-derived may then enter the catalog."
+open question "A node that uploads a search file and fails before appending ArtefactsAdded leaves a file no record names until its trie is collected. Is that bounded enough, or does the lane sweep its own unrecorded keys?"
 
-open question "A node that uploads a search file for a definition dropped before its trie is collected, and fails before appending SearchFilesAdded, leaves a file that neither a record nor a definition in force names. Does a periodic sweep of each table's fts prefix against the catalog collect these, and who runs it?"
+open question "A recorded search file that cannot be read is never rebuilt, so its trie is evaluated from its data file for the trie's life. Does the lane need a way to retire a bad record?"
 
-open question "Verification after a candidate hit needs IID membership per newer trie. The Rust trie catalog discards `iid_bloom` today; is it written again and retained, or does verification read meta files?"
+open question "A search job holds its data file, its rows' tokens and the built segment in memory, outside the memory budget. Does the lane stream pages into the writer and reserve against the budget?"
 
-open question "Do definitions record positions by default? Phrase queries need them, at roughly double the search file size."
+open question "Ranking verifies candidates by resolving them all; does a block-max WAND top-k, verifying candidates in batches, earn its complexity?"
+
+open question "Do definitions record positions? Phrase queries need them, at roughly double the search file size."
 
 open question "Is the historical side indexed by default, or only on request? As-of-now queries read the current side and recent historical partitions only."
 
-open question "How does fan-out scale? Every current-side search file is a candidate for every query, one per ~100MB trie. Term blooms on the catalog record, and search files spanning a completed partition group, are the levers."
+open question "How does fan-out scale? Every current-side search file is a candidate for every query, one per ~100MB trie; term blooms on the artefact record, and search files spanning a completed partition group, are the levers."
 
-open question "NOT MATCH, and count(*) over MATCH, gain little from the index: the first has no candidate superset, the second must resolve every candidate. Are they evaluated by scan alone?"
+open question "NOT MATCH, and count(*) over MATCH, gain little from narrowing: the first has no candidate superset, the second must resolve every candidate. Both are answered by scanning today."
 
-open question "Does MATCH stay a base-table scan predicate, or may it appear above a join?"
+open question "Do live segments keep in-memory postings, rather than being tokenised by every query that narrows a scan?"

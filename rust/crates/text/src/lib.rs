@@ -3,13 +3,11 @@
 
 use std::collections::BTreeMap;
 
-/// The analyzer every search index definition currently uses.
 pub const SIMPLE_ANALYZER: &str = "simple";
 
 /// Bumped whenever tokenisation changes, so that search files built by an earlier analyzer are never read by a later one.
 pub const ANALYZER_VERSION: i32 = 1;
 
-/// Splits on every character that is not alphanumeric and lowercases what remains.
 pub fn tokens(text: &str) -> Vec<String> {
     text.split(|character: char| !character.is_alphanumeric()).filter(|token| !token.is_empty()).map(str::to_lowercase).collect()
 }

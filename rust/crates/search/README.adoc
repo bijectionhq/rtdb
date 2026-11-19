@@ -1,0 +1,31 @@
+= rtdb-search
+
+Bitemporal full-text search: the search files built over trie data files, the lane that builds them, and the accelerator that reads them.
+The behaviour is specified in link:../../../dev/doc/fts.allium[fts.allium]; link:../../../dev/doc/fts-implementation.adoc[the implementation plan] maps each piece to the crate it lives in.
+
+== Surfaces
+
+`CREATE SEARCH INDEX name ON table (column, ...)` and `DROP SEARCH INDEX name` write and delete documents in `xt.search_indexes`.
+`MATCH(column, query)` and `SEARCH_SCORE(column, query)` are scalar functions evaluated on resolved rows, with the analyzer in `rtdb-text`.
+The node configuration's `search: {enabled, threads}` switches the lane and the scan accelerator together.
+
+== Pieces
+
+`file`::
+A search file: one single-segment tantivy index over one data file, bundled into one object with names derived from the job, so every builder writes identical bytes.
+Documents are the data file's rows, in order, carrying each row's own IID and temporal columns as fast fields.
+
+`definitions`::
+Reads the definitions in force from `xt.search_indexes` at a snapshot.
+
+`lane`::
+The `search` artefact kind: a builder per database that the core artefact lane drives.
+
+`accelerate`::
+The scan accelerator: candidate IIDs from search files, data files and live segments, ruled out only by each event's own intervals, and the corpus sources `SEARCH_SCORE` sums.
+
+== Ownership
+
+The builder is a passive object driven by the artefact lane, which is the active object choosing among jobs, block signals and build requests.
+The accelerator is passive and completes on the scan's coroutine; the corpus registry it writes is a per-query transient read only after the scan has opened.
+A search file holds its bundle's bytes for as long as any reader of it lives.

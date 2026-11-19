@@ -9,20 +9,11 @@ use rtdb_index::PartitionValue;
 use rtdb_maintenance::{ArtefactBuilder, ArtefactDefinition, ArtefactJob};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_types::{Anomaly, Result, Value};
-use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{SearchRow, build_search_file, definitions::{SearchDefinition, definitions_in}};
 
 pub const KIND: &str = "search";
-
-/// Per-column corpus totals, carried on the artefact record so a query can sum them without opening the file.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct SearchStats { pub documents: u64, pub tokens: BTreeMap<String, u64> }
-
-impl SearchStats {
-    pub fn decode(bytes: &[u8]) -> Result<Self> { serde_json::from_slice(bytes).map_err(|error| Anomaly::fault("rtdb.search/stats", error.to_string())) }
-}
 
 /// The search artefact kind: install it in a node's services to build search files.
 pub struct SearchArtefacts;
@@ -78,18 +69,11 @@ impl ArtefactBuilder for SearchBuilder {
         let identity = format!("{}/{}/{}-v{}", entry.slug.as_str(), job.trie, definition.id, definition.version);
         let key = ObjectKey::new(entry.slug.artefact_key(&job.trie, KIND, &definition.id, definition.version)?)?;
         let build_columns = columns.clone();
-        let (bytes, stats) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, SearchStats)> {
-            let rows = search_rows(&data, &build_columns)?;
-            let mut stats = SearchStats { documents: rows.len() as u64, tokens: BTreeMap::new() };
-            for (index, column) in build_columns.iter().enumerate() {
-                stats.tokens.insert(column.clone(), rows.iter().map(|row| row.tokens[index].len() as u64).sum());
-            }
-            Ok((build_search_file(&build_columns, &rows, &identity)?, stats))
-        }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
+        let bytes = tokio::task::spawn_blocking(move || build_search_file(&build_columns, &search_rows(&data, &build_columns)?, &identity))
+            .await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
         self.store.put(&key, bytes::Bytes::from(bytes)).await?;
-        let stats = serde_json::to_vec(&stats).map_err(|error| Anomaly::fault("rtdb.search/stats", error.to_string()))?;
-        Ok(ArtefactRecord { kind: Some(KIND.into()), definition_id: Some(definition.id.clone()), definition_version: Some(definition.version), stats: Some(stats) })
+        Ok(ArtefactRecord { kind: Some(KIND.into()), definition_id: Some(definition.id.clone()), definition_version: Some(definition.version), stats: None })
     }
 }
 

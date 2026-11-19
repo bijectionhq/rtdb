@@ -155,10 +155,12 @@ impl ScanCursor {
         for snapshot in &database.partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             let mut narrowed = scan.clone();
-            for accelerator in execution.context.accelerators.iter() {
+            for accelerator in execution.context.accelerators.iter().filter(|_| scan.iids.is_none()) {
                 let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage: &database.storage, bounds, memory: &execution.context.memory,
                     current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution), corpora: execution.context.corpora.as_ref() };
-                if let Some(candidates) = accelerator.candidate_iids(&request).await? {
+                if let Some(mut candidates) = accelerator.candidate_iids(&request).await? {
+                    // `path_matches` stops consulting pushdowns once `iids` is set, so they are applied to the candidates here.
+                    if let Some(filters) = &pushdowns { candidates.retain(|iid| filters.iid_matches(&scan.columns, *iid, canonical_entity_iids)); }
                     let iids = match narrowed.iids.take() { Some(existing) => existing.intersection(&candidates).copied().collect(), None => candidates };
                     narrowed.iids = Some(iids);
                 }

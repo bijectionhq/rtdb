@@ -15,7 +15,7 @@ use crate::{KIND, SearchDefinition, SearchFile, definitions_in, search_rows};
 pub struct SearchAccelerator {
     /// Above this many candidates the scan runs unnarrowed: reading every page costs less than resolving that many point lookups.
     pub max_candidates: usize,
-    /// Above this many bytes of tries with no search file, the scan runs unnarrowed rather than reading them twice.
+    /// Above this many bytes of tries the lane should have indexed but has not, the scan runs unnarrowed rather than reading them twice.
     pub max_unindexed_bytes: i64,
 }
 
@@ -23,7 +23,6 @@ impl Default for SearchAccelerator {
     fn default() -> Self { Self { max_candidates: 100_000, max_unindexed_bytes: 64 * 1024 * 1024 } }
 }
 
-/// The `MATCH(column, query)` conjuncts of a predicate, as (column id, query expression).
 fn match_conjuncts<'a>(expression: &'a Expr, found: &mut Vec<(&'a rtdb_plan::ColumnId, &'a Expr)>) {
     match expression {
         Expr::Binary { op: BinaryOp::And, left, right } => { match_conjuncts(left, found); match_conjuncts(right, found); }
@@ -72,10 +71,10 @@ impl ScanAccelerator for SearchAccelerator {
                 Some(_) => {
                     let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
                     match request.storage.get(&key).await {
-                        Ok(lease) => match SearchFile::open(bytes::Bytes::copy_from_slice(lease.as_slice()), &definition.columns) {
+                        Ok(lease) => match SearchFile::open(lease, &definition.columns) {
                             Ok(file) => {
                                 let file = std::sync::Arc::new(file);
-                                if trie.key.recency().is_none() { request.corpora.register(std::sync::Arc::new(FileCorpus { file: std::sync::Arc::clone(&file), column: column.clone() })); }
+                                if trie.key.recency().is_none() { request.corpora.register(format!("{key}#{column}"), std::sync::Arc::new(FileCorpus { file: std::sync::Arc::clone(&file), column: column.clone() })); }
                                 for doc in file.matches(&column, &query)? {
                                     if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, bounds) { candidates.insert(Iid(doc.iid)); }
                                 }
@@ -89,8 +88,12 @@ impl ScanAccelerator for SearchAccelerator {
                 None => false,
             };
             if !indexed {
-                unindexed_bytes = unindexed_bytes.saturating_add(trie.data_file_size);
-                if unindexed_bytes > self.max_unindexed_bytes { return Ok(None); }
+                // The lane never indexes level 0 or the partial level-1 current trie, so only a trie it should have indexed counts against the budget.
+                let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < request.snapshot.trie_catalog().file_size_target());
+                if !by_policy {
+                    unindexed_bytes = unindexed_bytes.saturating_add(trie.data_file_size);
+                    if unindexed_bytes > self.max_unindexed_bytes { return Ok(None); }
+                }
                 unindexed.push(trie.key.clone());
             }
             if candidates.len() > self.max_candidates { return Ok(None); }

@@ -356,7 +356,7 @@ entity SourceMessage {
     -- A failed clock sample rejects the append before assigning a position or publishing a record.
     log_timestamp: Timestamp
     kind: TxMessage | LegacyTxMessage | FlushBlockMessage | TriesAddedMessage
-         | SearchFilesAddedMessage | AttachDbMessage | DetachDbMessage
+         | ArtefactsAddedMessage | AttachDbMessage | DetachDbMessage
 }
 
 variant TxMessage : SourceMessage {
@@ -391,18 +391,18 @@ variant TriesAddedMessage : SourceMessage {
     tries: List<trie_cat/TrieDetails>
 }
 
-variant SearchFilesAddedMessage : SourceMessage {
-    -- Search files the index lane has uploaded (fts.allium, ahead of the implementation).
+variant ArtefactsAddedMessage : SourceMessage {
+    -- Artefacts an artefact lane has uploaded, such as search files (fts.allium).
     -- The leader forwards the entries it accepts to the replica log.
     storage_version: Integer
     storage_epoch: Integer
     table: trie_cat/TableRef
-    files: List<SearchFileEntry>
+    entries: List<ArtefactEntry>
 }
 
-value SearchFileEntry {
+value ArtefactEntry {
     trie_key: trie_cat/TrieKey
-    record: trie_cat/SearchFileRecord
+    record: trie_cat/ArtefactRecord
 }
 
 variant AttachDbMessage : SourceMessage {
@@ -435,7 +435,7 @@ entity ReplicaMessage {
 
     kind: ResolvedTxMessage | BlockBoundaryMessage | BlockUploadedMessage
          | TriesAddedMessage | TriesDeletedMessage | NoOpMessage
-         | SearchFilesAddedMessage | OversizedMessage
+         | ArtefactsAddedMessage | OversizedMessage
 }
 
 variant ResolvedTxMessage : ReplicaMessage {
@@ -487,13 +487,13 @@ variant TriesAddedMessage : ReplicaMessage {
     source_msg_id: MessageId
 }
 
-variant SearchFilesAddedMessage : ReplicaMessage {
-    -- Search files the leader accepted, forwarded from the source log (fts.allium, ahead of the implementation).
+variant ArtefactsAddedMessage : ReplicaMessage {
+    -- Artefacts the leader accepted, forwarded from the source log.
     -- Staleness and the watchers treat source_msg_id as they do a tries-added's.
     storage_version: Integer
     storage_epoch: Integer
     table: trie_cat/TableRef
-    files: List<SearchFileEntry>
+    entries: List<ArtefactEntry>
     source_msg_id: MessageId
 }
 
@@ -680,7 +680,7 @@ config {
 -- Each kind is compared against the watermark that actually records its effect, rather than against a single source-log position:
 --   resolved transaction: stale if its tx_id is at or below watchers.latest_tx_id
 --   tries added:          stale if its source position is at or below watchers.latest_source_msg_id
---   search files added:   stale if its source position is at or below watchers.latest_source_msg_id
+--   artefacts added:      stale if its source position is at or below watchers.latest_source_msg_id
 --   block boundary:       stale if its block index is at or below table_catalog.current_block_index
 --   block uploaded:       stale if its block index is at or below table_catalog.current_block_index
 --   no-op:                stale if it carries a source position at or behind watchers.latest_source_msg_id;
@@ -944,27 +944,30 @@ rule LeaderProcessesTriesAdded {
         log_processor.last_resolved_src_msg_id = msg.msg_id
 }
 
-rule LeaderProcessesSearchFilesAdded {
-    -- Search files from the index lane (fts.allium), forwarded to the replica log, where every node records them on its trie catalog, this one included.
-    -- The leader deletes an entry's file only when the entry's trie is absent from its catalog, trie GC having already run for it.
-    -- An entry it does not accept whose trie is still present is dropped and its file left in place: the key may be one another builder's accepted entry already names, and trie GC deletes it with the trie (gc.allium: DeleteAndCommitChunkRule).
+rule LeaderProcessesArtefactsAdded {
+    -- Artefacts from an artefact lane, forwarded to the replica log, where every node records them on its trie catalog, this one included.
+    -- An entry is accepted when its trie is live in the leader's durable catalog and its storage version and epoch are the leader's.
+    -- The leader deletes the file of an entry whose trie is not live: a reader treats a missing artefact as absent, so deleting one is never wrong, and a file nothing records would otherwise wait for its trie's collection.
+    -- An entry under another storage version or epoch, or one that does not parse, is dropped without deleting anything, the key this node would compute for it being under its own storage root.
+    -- The deletes run beside resolution, never ahead of it.
     -- The message is forwarded even with no entry accepted, because it carries the source watermark forward.
-    when: SourceSearchFilesAddedMessageReceived(msg)
+    -- See: replication/src/driver.rs (accept_artefacts)
+    when: SourceArtefactsAddedMessageReceived(msg)
     requires: log_processor.mode = Leader
 
-    let accepted = accepted_search_files(msg)
+    let accepted = accepted_artefacts(msg)
 
     ensures:
-        AppendReplicaMessage(SearchFilesAddedMessage.created(
+        AppendReplicaMessage(ArtefactsAddedMessage.created(
             storage_version: msg.storage_version,
             storage_epoch: msg.storage_epoch,
             table: msg.table,
-            files: accepted,
+            entries: accepted,
             source_msg_id: msg.msg_id
         ))
-        for entry in msg.files
-            where not trie_cat/trie_catalog.holds(msg.table, entry.trie_key):
-            ObjectStoreDelete(trie_cat/search_file_key(msg.table, entry.trie_key, entry.record.index_id, entry.record.index_version))
+        for entry in msg.entries
+            where not accepted.contains(entry) and storage_matches(msg):
+            ObjectStoreDelete(trie_cat/artefact_key(msg.table, entry.trie_key, entry.record.kind, entry.record.definition_id, entry.record.definition_version))
 
         log_processor.last_resolved_src_msg_id = msg.msg_id
 }
@@ -1151,16 +1154,15 @@ rule LeaderAppliesOwnTriesDeleted {
         trie_cat/trie_catalog.deleteTries(record.table_name, record.trie_keys)
 }
 
-rule LeaderAppliesOwnSearchFilesAdded {
-    -- The leader reads its own forwarded search-files-added back and records the files on its trie catalog, under the same storage guard every node applies.
+rule LeaderAppliesOwnArtefactsAdded {
+    -- The leader reads its own forwarded artefacts-added back and records the artefacts on its trie catalog, under the same storage guard every node applies.
     when: ApplyOwnRecord(record)
-    requires: record.kind = SearchFilesAddedMessage
+    requires: record.kind = ArtefactsAddedMessage
 
     ensures:
         if record.storage_version = storage_format.storage_version
            and record.storage_epoch = storage_format.storage_epoch:
-            for entry in record.files:
-                trie_cat/trie_catalog.addSearchFile(record.table, entry.trie_key, entry.record)
+            trie_cat/trie_catalog.withArtefacts(record.table, record.entries)
 
         watchers.notifyMsg(record.source_msg_id)
 }
@@ -1333,11 +1335,10 @@ rule HandleReplicaMessage {
                 trie_cat/trie_catalog.addTries(msg.tries, msg.log_timestamp)
             watchers.notifyMsg(msg.source_msg_id)
 
-        if msg.kind = SearchFilesAddedMessage:
+        if msg.kind = ArtefactsAddedMessage:
             if msg.storage_version = storage_format.storage_version
                and msg.storage_epoch = storage_format.storage_epoch:
-                for entry in msg.files:
-                    trie_cat/trie_catalog.addSearchFile(msg.table, entry.trie_key, entry.record)
+                trie_cat/trie_catalog.withArtefacts(msg.table, msg.entries)
             watchers.notifyMsg(msg.source_msg_id)
 
         if msg.kind = TriesDeletedMessage:
@@ -1698,6 +1699,7 @@ open question "What processing obligations apply to a database opened with index
     -- The pinned database opens its persisted state and logs, accepts source submissions, and runs no log processor or external source.
     -- This model currently requires a log processor for each database.
 
--- Black box helpers for search files (fts.allium, ahead of the implementation):
---   accepted_search_files(msg)  — the entries whose trie the leader's catalog holds live, whose storage version and epoch match the leader's, and whose definition is the one in force for the table
---   ObjectStoreDelete(key)      — as in gc.allium
+-- Black box helpers for artefacts:
+--   accepted_artefacts(msg)  — the entries whose trie the leader's durable catalog holds live, under the leader's storage version and epoch
+--   storage_matches(msg)     — whether the message's storage version and epoch are the leader's
+--   ObjectStoreDelete(key)   — as in gc.allium

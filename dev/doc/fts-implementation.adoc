@@ -55,25 +55,55 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
 * *Definitions are documents.*
   `xt.search_indexes` is written by the indexer, so the definitions in force are a function of log position and readable as of any basis.
 
-== Phases
+== Where it lives
 
-Each phase lands as its own commit on `docs/fts-spec`, with its tests.
+Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 
-. *Artefact records.* Proto fields, `CatalogTrie.artefacts`, persistence through block files, `TableSlug::artefact_key`.
-. *Artefact messages.* `ArtefactsAdded` through the source log, the leader's acceptance, apply on every node, staleness.
-. *Artefact GC.* Garbage tries' artefact prefixes deleted before their data files.
-. *Artefact lane.* A driver selecting deterministic jobs, with a builder trait and a publisher.
-. *Analyzer and `MATCH`.* `rtdb-text`, the scalar functions, brute-force evaluation — correct with no index, and the oracle for everything after.
-. *Definitions.* `CREATE SEARCH INDEX` / `DROP SEARCH INDEX` and `xt.search_indexes`.
-. *Search files.* The tantivy bundle format, its builder and reader, determinism tests.
-. *Lane wiring.* The search builder in the artefact lane, node options and the Cargo feature.
-. *Acceleration.* The scan accelerator: candidate IIDs from search files, brute force for uncovered tries and live segments, a candidate cap above which the scan runs unnarrowed.
-. *Ranking.* `SEARCH_SCORE` as BM25 over corpus statistics summed from the current-side artefact records.
-. *Specs and docs.* `fts.allium` and the core specs brought in line with the implementation.
+[cols="1,2,2"]
+|===
+| Piece | Code | Tests
+
+| Artefact records and messages
+| `format/src/keys.rs`, `index/src/trie_catalog.rs`, `replication/src/driver.rs` (`accept_artefacts`)
+| `index/tests/catalogs.rs`, `replication/src/tests.rs`
+
+| Artefact GC
+| `maintenance/src/gc.rs`
+| `maintenance/tests/gc.rs`
+
+| Artefact lane
+| `maintenance/src/artefact.rs`, `node/src/database.rs`
+| `maintenance/tests/artefacts.rs`
+
+| Analyzer, `MATCH`, `SEARCH_SCORE`
+| `text`, `plan/src/search.rs`, `expr/src/search.rs`
+| `text`, `node/tests/search.rs`
+
+| Definitions
+| `sql/src/parse.rs`, `tx/src/resolver.rs`
+| `node/tests/search.rs`
+
+| Search files
+| `search/src/file.rs`
+| `search/src/file.rs`
+
+| Lane builder, switches
+| `search/src/lane.rs`, `node/src/node.rs`, `server/src/config`
+| `node/tests/search.rs`, `server/tests/config.rs`
+
+| Acceleration, ranking
+| `query/src/accelerate.rs`, `search/src/accelerate.rs`
+| `search/src/accelerate.rs`, `node/tests/search.rs`
+|===
+
+`node/tests/search.rs` holds the oracle: every accelerated query is compared with the same predicate widened so that it is never pushed to the scan, across valid and system times, over tries with and without search files, an uncovered L0 tail and live rows.
 
 == Deferred
 
 * Block-max WAND top-k over search files, which needs the scan to verify candidates in batches.
+* Streaming search builds within the memory budget; a job holds its data file, tokens and segment in memory today.
+* Retiring a recorded search file that cannot be read, so the lane rebuilds it.
+* Caching definitions and opened search files per query, rather than per scan opening.
 * In-memory postings for live segments.
 * Phrase queries, which need positions.
 * Indexing the historical side, and search files spanning a completed partition group.

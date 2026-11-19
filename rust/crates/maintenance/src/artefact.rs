@@ -162,7 +162,8 @@ impl ArtefactDriver {
                     if let Err(error) = result { self.report_failure(&job, &error); failed.insert(job, error); }
                 }
                 Some(request) = self.requests.recv() => pending.push(request),
-                Some(()) = self.signals.recv() => (),
+                // A new block may have healed whatever failed, so failed jobs become eligible again.
+                Some(()) = self.signals.recv() => failed.clear(),
                 else => break Ok(()),
             }
         };
