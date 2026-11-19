@@ -37,6 +37,35 @@ fn build_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constr
     Ok(crate::pages::rows(pages, context))
 }) }
 
+/// Builds a scan, its filters and column-only projections as a batch source, or `None` where the subtree has another shape.
+/// The boolean reports whether the batches passed through a projection.
+fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> { Box::pin(async move {
+    let relation = Arc::clone(runtime.relation());
+    match relation.node() {
+        RelationNode::Scan(scan) if !crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none() => {
+            let batches: crate::columnar::BoxBatchCursor = Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?);
+            let batches = match scan.predicates.iter().cloned().reduce(|left,right|Expr::binary(rtdb_plan::BinaryOp::And,left,right)) {
+                Some(predicate) => Box::new(crate::columnar::BatchFilter::new(batches,runtime.schema().clone(),predicate,execution)) as crate::columnar::BoxBatchCursor,
+                None => batches,
+            };
+            Ok(Some((batches,false)))
+        }
+        RelationNode::Filter { predicate,.. } => {
+            let Some((batches,projected)) = build_batches(runtime.child(0)?,execution.child(0),pushdowns).await? else { return Ok(None) };
+            if projected { return Ok(None); }
+            Ok(Some((Box::new(crate::columnar::BatchFilter::new(batches,runtime.child(0)?.schema().clone(),predicate.clone(),execution)) as crate::columnar::BoxBatchCursor,false)))
+        }
+        RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
+            let child = runtime.child(0)?;
+            let Some(positions) = expressions.iter().map(|named| match &named.expr { Expr::Column { id,.. } => child.schema().position(*id), _ => None }).collect::<Option<Vec<_>>>() else { return Ok(None) };
+            let pushdowns = pushdowns.map(|filters|filters.project(expressions,&execution.context.memory)).transpose()?;
+            let Some((batches,_)) = build_batches(child,execution.child(0),pushdowns).await? else { return Ok(None) };
+            Ok(Some((Box::new(crate::columnar::BatchProject::new(batches,positions,Arc::clone(&execution.context.memory))) as crate::columnar::BoxBatchCursor,true)))
+        }
+        _ => Ok(None),
+    }
+}) }
+
 fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<crate::pages::BoxPageCursor>> { Box::pin(async move {
     execution.context.check_cancelled()?;
     let relation = Arc::clone(runtime.relation());
@@ -147,13 +176,26 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         RelationNode::SortLimit { order_by,offset,fetch,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
-            let mut pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
+            let schema = runtime.child(0)?.schema().clone();
+            let batches = if !order_by.is_empty() && execution.analysis.is_none() && execution.context.tracer.is_none() && crate::sort::SortCursor::batch_eligible(&schema,order_by,0) {
+                build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await?
+            } else { None };
+            let input = match batches {
+                Some(batches) => Ok(batches),
+                None => Err(build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?),
+            };
             let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
             let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            if !order_by.is_empty() {
-                let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
-                pages = Box::new(crate::sort::SortCursor::with_row_limit(pages,runtime.child(0)?.schema().clone(),order_by.clone(),row_limit,execution.clone()));
-            }
+            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
+            let mut pages: BoxPageCursor = match input {
+                Ok((batches,projected)) if crate::sort::SortCursor::batch_eligible(&schema,order_by,row_limit) =>
+                    Box::new(crate::sort::SortCursor::top_batches(batches,projected,schema,order_by.clone(),row_limit,execution.clone())),
+                Ok((batches,projected)) => {
+                    let pages: BoxPageCursor = Box::new(crate::columnar::BatchRows::new(batches,Arc::clone(&execution.context.memory)).admitting_dates(projected));
+                    Box::new(crate::sort::SortCursor::with_row_limit(pages,schema,order_by.clone(),row_limit,execution.clone()))
+                }
+                Err(pages) => if order_by.is_empty() { pages } else { Box::new(crate::sort::SortCursor::with_row_limit(pages,schema,order_by.clone(),row_limit,execution.clone())) },
+            };
             if offset.is_some() || fetch.is_some() { pages = Box::new(Limit { input: Some(pages),offset: offset_value,remaining,execution }); }
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -226,8 +268,16 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
         RelationNode::Aggregate { groups,aggregates,.. } => {
-            let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
-            let pages = Box::new(crate::aggregate::AggregateCursor::new(input,runtime.child(0)?.schema().clone(),groups.clone(),aggregates.clone(),Arc::clone(&runtime),execution)?);
+            let schema = runtime.child(0)?.schema().clone();
+            let columnar = execution.analysis.is_none() && execution.context.tracer.is_none() && crate::aggregate::AggregateCursor::reads_columns(&schema,groups,aggregates).is_some();
+            let batches = if columnar { build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await? } else { None };
+            let pages: Box<crate::aggregate::AggregateCursor> = match batches {
+                Some((batches,projected)) => Box::new(crate::aggregate::AggregateCursor::from_batches(batches,projected,schema,groups.clone(),aggregates.clone(),Arc::clone(&runtime),execution)?),
+                None => {
+                    let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
+                    Box::new(crate::aggregate::AggregateCursor::new(input,schema,groups.clone(),aggregates.clone(),Arc::clone(&runtime),execution)?)
+                }
+            };
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }

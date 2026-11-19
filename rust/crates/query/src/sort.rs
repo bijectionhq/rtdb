@@ -18,7 +18,7 @@ const MERGE_FAN_IN: usize = 4;
 struct SortPlan { schema: Schema, order: Vec<SortExpr>, limit: u64, execution: Execution }
 const TOP_ROWS: u64 = 10_000;
 pub(crate) struct SortCursor { plan: SortPlan, phase: SortPhase }
-enum SortPhase { Input(BoxPageCursor), Output(SortOutput), Done }
+enum SortPhase { Input(BoxPageCursor), Batches { batches: crate::columnar::BoxBatchCursor, projected: bool }, Output(SortOutput), Done }
 enum OutputRows { Records(RecordCursor), Spill(SpillReader), Retained(std::vec::IntoIter<OwnedRow>) }
 struct SortOutput { rows: OutputRows, remaining: u64, page_rows: usize, empty_callback: bool }
 impl SortOutput {
@@ -48,10 +48,20 @@ impl SortCursor {
     pub fn with_row_limit(input: BoxPageCursor, schema: Schema, order: Vec<SortExpr>, limit: u64, execution: Execution) -> Self {
         Self { plan: SortPlan { schema, order, limit, execution }, phase: SortPhase::Input(input) }
     }
+    /// A top-k over batches whose sort keys are all input columns; rows are built only for the rows it keeps.
+    pub fn top_batches(batches: crate::columnar::BoxBatchCursor, projected: bool, schema: Schema, order: Vec<SortExpr>, limit: u64, execution: Execution) -> Self {
+        Self { plan: SortPlan { schema, order, limit, execution }, phase: SortPhase::Batches { batches, projected } }
+    }
+    /// Whether a top-k of `limit` rows can read its keys from batch columns; a zero limit asks only about the keys.
+    pub fn batch_eligible(schema: &Schema, order: &[SortExpr], limit: u64) -> bool {
+        limit <= TOP_ROWS && order.iter().all(|order| matches!(&order.expr, rtdb_plan::Expr::Column { id, .. } if schema.position(*id).is_some()))
+    }
     async fn initialize(&mut self) -> Result<()> {
-        if !matches!(self.phase, SortPhase::Input(_)) { return Ok(()); }
-        let SortPhase::Input(input) = std::mem::replace(&mut self.phase, SortPhase::Done) else { unreachable!() };
-        if let Some(output) = self.plan.initialize(input).await? { self.phase = SortPhase::Output(output); }
+        match std::mem::replace(&mut self.phase, SortPhase::Done) {
+            SortPhase::Input(input) => if let Some(output) = self.plan.initialize(input).await? { self.phase = SortPhase::Output(output); },
+            SortPhase::Batches { batches, projected } => if let Some(output) = self.plan.top_batches(batches, projected).await? { self.phase = SortPhase::Output(output); },
+            other => self.phase = other,
+        }
         Ok(())
     }
 }
@@ -163,6 +173,46 @@ impl SortPlan {
                 }
                 if low < limit {
                     kept.insert(low, OwnedRow::copy_parts(&[&key, &row.values], 0, 0, &self.execution.context.memory)?);
+                    kept.truncate(limit);
+                }
+            }
+        }
+        keys.validate()?;
+        if !seen { return Ok(None); }
+        let rows = kept.len();
+        Ok(Some(SortOutput { rows: OutputRows::Retained(kept.into_iter()), remaining: rows as u64, page_rows: rows, empty_callback: rows == 0 }))
+    }
+    async fn top_batches(&self, mut batches: crate::columnar::BoxBatchCursor, projected: bool) -> Result<Option<SortOutput>> {
+        let limit = usize::try_from(self.limit).map_err(|_| invalid("sort-limit", "Sort limit exceeds addressable memory"))?;
+        let mut keys = KeyTypes::declared(self)?;
+        let positions: Vec<usize> = self.order.iter().map(|order| match &order.expr { rtdb_plan::Expr::Column { id, .. } => self.schema.position(*id), _ => None })
+            .collect::<Option<_>>().ok_or_else(|| invalid("sort-state", "A batch top-k sorts by input columns"))?;
+        let _kept = self.execution.context.memory.reserve(limit.saturating_add(1).saturating_mul(std::mem::size_of::<OwnedRow>()))?;
+        let mut kept: Vec<OwnedRow> = Vec::with_capacity(limit.saturating_add(1));
+        let mut seen = false;
+        let cell = |batch: &crate::columnar::ColumnBatch, row: usize, position: usize| -> Result<Value> {
+            let mut value = batch.columns[position].value(row)?;
+            if projected { value.admit_expression_dates()?; }
+            Ok(value)
+        };
+        while let Some(batch) = batches.next_batch().await? {
+            seen |= batch.len > 0;
+            for row in 0..batch.len {
+                self.execution.context.check_cancelled()?;
+                let key = positions.iter().map(|position| cell(&batch, row, *position)).collect::<Result<Vec<_>>>()?;
+                keys.observe(&key, self)?;
+                if kept.len() == limit {
+                    match kept.last() { Some(worst) if self.compare(&key, &worst.values[..key.len()])? != Ordering::Less => continue, _ => {} }
+                }
+                let mut low = 0;
+                let mut high = kept.len();
+                while low < high {
+                    let middle = (low + high) / 2;
+                    if self.compare(&key, &kept[middle].values[..key.len()])? == Ordering::Less { high = middle; } else { low = middle + 1; }
+                }
+                if low < limit {
+                    let values = (0..batch.columns.len()).map(|position| cell(&batch, row, position)).collect::<Result<Vec<_>>>()?;
+                    kept.insert(low, OwnedRow::copy_parts(&[&key, &values], 0, 0, &self.execution.context.memory)?);
                     kept.truncate(limit);
                 }
             }

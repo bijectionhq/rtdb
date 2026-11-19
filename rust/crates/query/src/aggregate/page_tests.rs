@@ -319,7 +319,7 @@ fn failing_duration_average_sum_does_not_start_the_count_pass() {
     for value in [Value::Duration { value: 10,unit: TimeUnit::Millisecond },Value::Null] { page.push(OwnedRow::new(vec![value],&execution.context.memory).unwrap()).unwrap(); }
     let page = page.finish();let scope = execution.scope().unwrap();
     let mut states = ScalarGroups::new(&execution).unwrap();
-    assert_eq!(states.aggregate(&page,&[0,0],&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
+    assert_eq!(states.aggregate(Rows::Page(&page),&[0,0],&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
     assert_eq!(states.values[0].count,0);
     assert_eq!(states.values[0].accumulator.as_ref().unwrap().values,[Value::Duration { value: 10,unit: TimeUnit::Millisecond }]);
     drop(states);drop(scope);drop(page);
@@ -357,7 +357,7 @@ async fn variance_preserves_full_column_square_values_and_nullable_group_counts(
             page.finish()
         };
         let scope = execution.scope().unwrap();
-        assert_eq!(square_column(&page,Some(0),&ty,&scope,&execution).unwrap(),[Some(9.0),None,Some(16.0)]);
+        assert_eq!(square_column(Rows::Page(&page),Some(0),&ty,&scope,&execution).unwrap(),[Some(9.0),None,Some(16.0)]);
         drop(scope);drop(page);
         assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
     }

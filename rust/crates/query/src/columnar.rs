@@ -59,7 +59,8 @@ impl ColumnBatch {
 
     /// Materialises every row, admitting the page's rows together before any is built.
     /// Rows share the page's charge, which ends when the last of them drops.
-    pub fn rows(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedPage> {
+    pub fn rows(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedPage> { self.rows_admitting(memory, false) }
+    pub fn rows_admitting(&self, memory: &Arc<MemoryBudget>, admit_dates: bool) -> Result<OwnedPage> {
         let mut page = PageBuilder::new(self.len, memory)?;
         let mut bound = 0usize;
         for row in 0..self.len {
@@ -69,7 +70,11 @@ impl ColumnBatch {
         let reservation = memory.reserve(bound)?;
         for row in 0..self.len {
             let mut values = Vec::with_capacity(self.columns.len());
-            for column in &self.columns { values.push(column.value(row)?); }
+            for column in &self.columns {
+                let mut value = column.value(row)?;
+                if admit_dates { value.admit_expression_dates()?; }
+                values.push(value);
+            }
             page.push(OwnedRow::with_reservation(values, Arc::clone(&reservation))?)?;
         }
         Ok(page.finish())
@@ -159,13 +164,17 @@ impl BatchCursor for crate::scan::ScanCursor {
 }
 
 /// Materialises a batch source's rows for row operators.
-pub(crate) struct BatchRows { input: BoxBatchCursor, memory: Arc<MemoryBudget> }
-impl BatchRows { pub fn new(input: BoxBatchCursor, memory: Arc<MemoryBudget>) -> Self { Self { input, memory } } }
+pub(crate) struct BatchRows { input: BoxBatchCursor, memory: Arc<MemoryBudget>, admit_dates: bool }
+impl BatchRows {
+    pub fn new(input: BoxBatchCursor, memory: Arc<MemoryBudget>) -> Self { Self { input, memory, admit_dates: false } }
+    /// Admits each cell's dates as the row projection the batches stand in for would have.
+    pub fn admitting_dates(self, admit_dates: bool) -> Self { Self { admit_dates, ..self } }
+}
 #[async_trait::async_trait]
 impl crate::pages::PageCursor for BatchRows {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
-        batch.rows(&self.memory).map(Some)
+        batch.rows_admitting(&self.memory, self.admit_dates).map(Some)
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
@@ -436,5 +445,33 @@ mod tests {
             }
         }
         assert!(evaluated > 200, "the kernel should take most generated predicates, took {evaluated}");
+    }
+}
+
+/// Reorders, selects or renames a batch's columns, for a projection whose expressions are all input columns.
+pub(crate) struct BatchProject { input: BoxBatchCursor, positions: Vec<usize>, memory: Arc<MemoryBudget> }
+impl BatchProject { pub fn new(input: BoxBatchCursor, positions: Vec<usize>, memory: Arc<MemoryBudget>) -> Self { Self { input, positions, memory } } }
+#[async_trait::async_trait]
+impl BatchCursor for BatchProject {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
+        let len = batch.len;
+        let mut columns: Vec<Option<Column>> = batch.columns.into_iter().map(Some).collect();
+        let mut uses = vec![0usize; columns.len()];
+        for &position in &self.positions { uses[position] += 1; }
+        let mut output = Vec::with_capacity(self.positions.len());
+        for &position in &self.positions {
+            uses[position] -= 1;
+            output.push(if uses[position] == 0 { columns[position].take().ok_or_else(|| invalid("column-project", "Projected column was already moved"))? }
+                else { columns[position].as_ref().map(Column::duplicate).ok_or_else(|| invalid("column-project", "Projected column is absent"))? });
+        }
+        ColumnBatch::new(output, len, &self.memory).map(Some)
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+impl Column {
+    fn duplicate(&self) -> Self {
+        match self { Self::Arrow { array, field, logical } => Self::Arrow { array: Arc::clone(array), field: Arc::clone(field), logical: logical.clone() }, Self::Values(values) => Self::Values(values.clone()) }
     }
 }
