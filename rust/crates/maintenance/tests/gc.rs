@@ -64,7 +64,7 @@ async fn trie_gc_deletes_both_files_before_publishing_and_preserves_l0_recovery(
     let entry = tables.entry(&table).unwrap().clone();
     let mut catalog = TrieCatalog::new(16).unwrap();
     for key in ["l00-rc-b00", "l01-rc-b00", "l01-rc-b01"] {
-        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live }], Timestamp(100)).unwrap();
+        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(100)).unwrap();
     }
     let store = Arc::new(MemoryStore::default());
     for key in ["l00-rc-b00", "l01-rc-b00"] {

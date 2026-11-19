@@ -100,6 +100,12 @@ impl ReplicationHandle {
         self.await_source(position, cancellation).await?;
         Ok(position)
     }
+    /// Returns once this node has applied the message; an entry the leader did not accept is recorded on no trie.
+    pub async fn publish_artefacts(&self, message: proto::ArtefactsAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
+        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::ArtefactsAdded(message)), (self.clock)()).await?;
+        self.await_source(position, cancellation).await?;
+        Ok(position)
+    }
 }
 #[derive(Clone)]
 pub struct TermHandle { handle: ReplicationHandle, term: Term }
@@ -791,6 +797,14 @@ impl ReplicationDriver {
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
                 }
+                ReplicaBody::ArtefactsAdded(message) => {
+                    if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
+                        let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
+                        self.partition.add_artefacts(&table, artefact_entries(message)?);
+                    }
+                    self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
+                    self.complete_control(&record);
+                }
                 ReplicaBody::BlockBoundary(_) => {
                     let prepared = self.partition.prepare_block()?;
                     self.pending_block = Some(PendingBlock::new(record.clone(), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
@@ -832,6 +846,7 @@ impl ReplicationDriver {
         match &record.envelope.message {
             ReplicaBody::ResolvedTx(message) => message.tx_id.unwrap_or_default() <= progress.tx_id().0,
             ReplicaBody::TriesAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
+            ReplicaBody::ArtefactsAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
             ReplicaBody::BlockBoundary(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::BlockUploaded(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::NoOp(message) => message.src_msg_id.is_some_and(|source| source <= progress.source_position.0),
@@ -966,6 +981,15 @@ impl ReplicationDriver {
                 leader.resolver_mut()?.advance_source(position)?;
                 None
             }
+            Some(SourceMessage::Protobuf(SourceBody::ArtefactsAdded(mut message))) => {
+                let rejected = accept_artefacts(&mut message, &durable, self.logs.storage_version.0, self.logs.storage_epoch.0)?;
+                message.source_msg_id = Some(position.0);
+                leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsAdded(message)), block, None, &self.resolve.memory)?;
+                leader.resolver_mut()?.advance_source(position)?;
+                // Best effort: readers treat a missing artefact as absent, and a file left behind is only space.
+                for key in rejected { let _ = self.resolve.storage.object_store().delete(&key).await; }
+                None
+            }
             Some(SourceMessage::Protobuf(SourceBody::FlushBlock(message))) => {
                 let expected = self.partition.value().table_catalog().block_index().map_or(-1, |index| index.0);
                 leader.resolver_mut()?.advance_source(position)?;
@@ -1052,6 +1076,30 @@ fn additions(details: &[proto::TrieDetails]) -> Result<BTreeMap<TableRef, Vec<Ca
     }
     Ok(result)
 }
+/// Keeps the entries whose trie is live in the durable catalog under this node's storage version and epoch, and returns the object keys of the rest.
+fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::Snapshot, version: i32, epoch: i32) -> Result<Vec<rtdb_storage::ObjectKey>> {
+    let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
+    let current_storage = message.storage_version == Some(version) && message.storage_epoch.unwrap_or_default() == epoch;
+    let slug = durable.table_entry(&table).map(|entry| entry.slug.clone());
+    let mut rejected = Vec::new();
+    let mut accepted = Vec::with_capacity(message.entries.len());
+    for entry in std::mem::take(&mut message.entries) {
+        let key: TrieKey = entry.trie_key.as_deref().unwrap_or_default().parse()?;
+        let live = durable.trie_catalog().iter_tries(&table).any(|trie| trie.key == key && trie.state == rtdb_index::TrieState::Live);
+        if current_storage && live && entry.record.is_some() { accepted.push(entry); continue; }
+        if let (Some(slug), Some(record)) = (&slug, &entry.record) {
+            rejected.push(rtdb_storage::ObjectKey::new(slug.artefact_key(&key, record.kind(), record.definition_id(), record.definition_version())?)?);
+        }
+    }
+    message.entries = accepted;
+    Ok(rejected)
+}
+
+fn artefact_entries(message: &proto::ArtefactsAdded) -> Result<Vec<(TrieKey, proto::ArtefactRecord)>> {
+    message.entries.iter().filter_map(|entry| entry.record.clone().map(|record| (entry.trie_key.as_deref().unwrap_or_default(), record)))
+        .map(|(key, record)| Ok((key.parse()?, record))).collect()
+}
+
 fn check_db_op(effects: &dyn DatabaseEffects, resolver: &TxResolver, operation: &DbOp) -> Result<()> {
     let name = match operation { DbOp::AttachDatabase(message) => message.db_name.as_deref(), DbOp::DetachDatabase(message) => message.db_name.as_deref() }.unwrap_or_default();
     match (operation, resolver.staged_db_op(name)) {

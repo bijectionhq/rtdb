@@ -13,13 +13,15 @@ pub struct CatalogTrie {
     pub data_file_size: i64,
     pub metadata: Option<log_pb::TrieMetadata>,
     pub state: TrieState,
+    /// Files derived from this trie's data file, at most one per (kind, definition id, definition version).
+    pub artefacts: Vec<log_pb::ArtefactRecord>,
 }
 
 impl CatalogTrie {
     pub fn notification(key: TrieKey, data_file_size: i64, mut metadata: Option<log_pb::TrieMetadata>) -> Result<Self> {
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
         if let Some(metadata) = &mut metadata { metadata.iid_bloom = None; }
-        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent })
+        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent, artefacts: Vec::new() })
     }
 
     pub fn from_proto(value: &log_pb::TrieDetails) -> Result<Self> {
@@ -32,7 +34,7 @@ impl CatalogTrie {
         };
         let data_file_size = value.data_file_size.unwrap_or_default();
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
-        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state })
+        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state, artefacts: value.artefacts.clone() })
     }
 
     pub fn to_proto(&self, table: &TableRef) -> log_pb::TrieDetails {
@@ -43,8 +45,12 @@ impl CatalogTrie {
         log_pb::TrieDetails {
             table_name: Some(table.schema_and_table()), trie_key: Some(self.key.to_string()),
             data_file_size: Some(self.data_file_size), trie_metadata: self.metadata.clone(),
-            trie_state: Some(state), garbage_as_of,
+            trie_state: Some(state), garbage_as_of, artefacts: self.artefacts.clone(),
         }
+    }
+
+    pub fn artefact(&self, kind: &str, definition_id: &str, definition_version: i32) -> Option<&log_pb::ArtefactRecord> {
+        self.artefacts.iter().find(|record| same_artefact(record, kind, definition_id, definition_version))
     }
 
     fn garbage(&mut self, as_of: Timestamp) { self.state = TrieState::Garbage { as_of }; self.metadata = None; }
@@ -209,6 +215,19 @@ impl TrieCatalog {
         }
         next
     }
+    /// Records artefacts on the tries they were built from.
+    /// A trie the catalog no longer holds takes no record, and a trie keeps the first record for each (kind, definition id, definition version).
+    pub fn with_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
+        let mut next = self.clone();
+        if let Some(state) = next.tables.get_mut(table) {
+            for (key, record) in entries {
+                let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
+                let (kind, id, version) = (record.kind(), record.definition_id(), record.definition_version());
+                if trie.artefact(kind, id, version).is_none() { trie.artefacts.push(record); }
+            }
+        }
+        next
+    }
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<Self> {
         let mut next = self.clone();
         for (table, tries) in replacements {
@@ -285,6 +304,10 @@ impl TrieCatalog {
         }
         Ok(catalog)
     }
+}
+
+fn same_artefact(record: &log_pb::ArtefactRecord, kind: &str, definition_id: &str, definition_version: i32) -> bool {
+    record.kind() == kind && record.definition_id() == definition_id && record.definition_version() == definition_version
 }
 
 fn table_partitions(block: &TableBlock) -> Result<Vec<block_pb::Partition>> {

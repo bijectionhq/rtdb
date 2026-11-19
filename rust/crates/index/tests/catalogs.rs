@@ -131,3 +131,34 @@ fn table_oid_allocation_is_sorted_and_recorded_slugs_stay_frozen() {
     assert_eq!(next.entry(&table()).unwrap().oid, 20_001);
     assert_eq!(next.entry(&zeta).unwrap().oid, 20_002);
 }
+
+fn artefact(definition_id: &str, version: i32, stats: u8) -> rtdb_format::log::proto::ArtefactRecord {
+    rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]) }
+}
+
+#[test]
+fn a_trie_keeps_the_first_artefact_per_definition_version_and_unknown_tries_take_none() {
+    let catalog = apply(&[("l01-rc-b00", 30)]);
+    let key = "l01-rc-b00".parse().unwrap();
+    let recorded = catalog.with_artefacts(&table(), [
+        (key, artefact("body", 1, 1)),
+        ("l01-rc-b00".parse().unwrap(), artefact("body", 1, 2)),
+        ("l01-rc-b00".parse().unwrap(), artefact("body", 2, 3)),
+        ("l01-rc-b07".parse().unwrap(), artefact("body", 1, 4)),
+    ]);
+    let tries = recorded.all_tries(&table());
+    let [trie] = tries.as_slice() else { panic!("one trie expected, got {tries:?}") };
+    assert_eq!(trie.artefacts, vec![artefact("body", 1, 1), artefact("body", 2, 3)]);
+    assert_eq!(trie.artefact("search", "body", 2), Some(&artefact("body", 2, 3)));
+    assert!(trie.artefact("search", "title", 1).is_none());
+    assert!(recorded.with_artefacts(&TableRef::new("public", "other"), [("l01-rc-b00".parse().unwrap(), artefact("body", 1, 1))]).all_tries(&TableRef::new("public", "other")).is_empty());
+}
+
+#[test]
+fn artefact_records_survive_the_block_file_roundtrip() {
+    let catalog = apply(&[("l01-rc-b00", 30), ("l01-rc-b01", 30)]).with_artefacts(&table(), [("l01-rc-b01".parse().unwrap(), artefact("body", 1, 9))]);
+    let block = TableBlock::from_parts(BTreeMap::new(), 0, catalog.partitions(&table()).unwrap()).unwrap();
+    let loaded = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(200)).unwrap();
+    assert_eq!(catalog.all_tries(&table()), loaded.all_tries(&table()));
+    assert!(loaded.all_tries(&table()).iter().any(|trie| trie.artefact("search", "body", 1).is_some()));
+}

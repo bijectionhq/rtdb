@@ -100,6 +100,13 @@ impl PartitionState {
         *value = Arc::new(next);
         Ok(())
     }
+    pub fn add_artefacts(&self, table: &TableRef, entries: Vec<(TrieKey, rtdb_format::log::proto::ArtefactRecord)>) {
+        let mut value = self.value.write();
+        let trie_catalog = value.trie_catalog.with_artefacts(table, entries);
+        let mut next = value.as_ref().clone();
+        next.trie_catalog = Arc::new(trie_catalog);
+        *value = Arc::new(next);
+    }
     pub fn delete_tries(&self, deletions: &BTreeMap<TableRef, BTreeSet<TrieKey>>) {
         let mut value = self.value.write();
         let mut trie_catalog = value.trie_catalog.as_ref().clone();

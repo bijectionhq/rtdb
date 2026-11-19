@@ -15,6 +15,7 @@ message ReplicaLogMessage {
         NoOp no_op = 5;
         TriesDeleted tries_deleted = 6;
         OversizedMessage oversized_message = 8;
+        ArtefactsAdded artefacts_added = 10;
     }
 
     // The leader term that produced this message, for read-side fencing: followers

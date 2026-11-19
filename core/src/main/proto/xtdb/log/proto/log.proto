@@ -18,6 +18,7 @@ message SourceLogMessage {
         AttachDatabase attach_database = 3;
         DetachDatabase detach_database = 4;
         Tx tx = 6;
+        ArtefactsAdded artefacts_added = 7;
     }
 }
 
@@ -80,6 +81,30 @@ message TrieDetails {
     TrieMetadata trie_metadata = 4;
     TrieState trie_state = 5;
     int64 garbage_as_of = 6;
+    repeated ArtefactRecord artefacts = 7;
+}
+
+// A file derived from a trie's data file (e.g. a search index), recorded on the trie's catalog entry and deleted with it.
+// Behavioural spec: dev/doc/fts.allium
+message ArtefactRecord {
+    string kind = 1;
+    string definition_id = 2;
+    int32 definition_version = 3;
+    // Opaque to the core: the artefact kind owns its encoding.
+    bytes stats = 4;
+}
+
+message ArtefactEntry {
+    string trie_key = 1;
+    ArtefactRecord record = 2;
+}
+
+message ArtefactsAdded {
+    int32 storage_version = 1;
+    int32 storage_epoch = 2;
+    string table_name = 3;
+    repeated ArtefactEntry entries = 4;
+    int64 source_msg_id = 5;
 }
 
 message AttachDatabase {

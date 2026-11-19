@@ -9,6 +9,7 @@ fn borrowed_transaction_classification_preserves_source_oneof_and_legacy_headers
         (SourceMessage::Protobuf(SourceBody::TriesAdded(proto::TriesAdded::default())), false),
         (SourceMessage::Protobuf(SourceBody::AttachDatabase(proto::AttachDatabase::default())), false),
         (SourceMessage::Protobuf(SourceBody::DetachDatabase(proto::DetachDatabase::default())), false),
+        (SourceMessage::Protobuf(SourceBody::ArtefactsAdded(proto::ArtefactsAdded::default())), false),
     ] {
         assert_eq!(SourceMessage::is_transaction_encoded(&message.encode().unwrap()).unwrap(), transaction);
     }
@@ -16,7 +17,7 @@ fn borrowed_transaction_classification_preserves_source_oneof_and_legacy_headers
     assert!(!SourceMessage::is_transaction_encoded(&[3]).unwrap());
     assert!(!SourceMessage::is_transaction_encoded(&[3, 0x32, 0, 0x0a, 0]).unwrap());
     assert!(SourceMessage::is_transaction_encoded(&[3, 0x0a, 0, 0x32, 0]).unwrap());
-    assert!(SourceMessage::is_transaction_encoded(&[3, 0x32, 0, 0x3b, 0x08, 1, 0x3c]).unwrap());
+    assert!(SourceMessage::is_transaction_encoded(&[3, 0x32, 0, 0x43, 0x08, 1, 0x44]).unwrap());
 }
 
 #[test]

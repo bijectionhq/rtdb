@@ -44,6 +44,21 @@ fn trie_keys_and_recorded_slugs_retain_existing_object_paths() {
 }
 
 #[test]
+fn a_tries_artefacts_live_under_one_prefix_of_its_own() {
+    let slug = TableSlug::recorded("public$docs").unwrap();
+    let key: TrieKey = "l01-rc-b03".parse().unwrap();
+    let artefact = slug.artefact_key(&key, "search", "docs_body", 2).unwrap();
+    assert_eq!(artefact, "tables/public$docs/artefacts/l01-rc-b03/search/docs_body-v2.bin");
+    assert!(artefact.starts_with(&slug.artefact_prefix(&key)));
+    let other: TrieKey = "l02-rc-p0-b03".parse().unwrap();
+    assert!(!slug.artefact_key(&other, "search", "docs_body", 2).unwrap().starts_with(&slug.artefact_prefix(&key)));
+    for bad in ["", ".", "..", "a/b", "a\\b"] {
+        assert!(slug.artefact_key(&key, bad, "docs_body", 2).is_err(), "{bad:?}");
+        assert!(slug.artefact_key(&key, "search", bad, 2).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
 fn trie_recency_keys_preserve_the_nonnegative_java_calendar_range() {
     use rtdb_types::CivilDate;
     for (date, text) in [

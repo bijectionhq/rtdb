@@ -419,6 +419,42 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     assert_eq!(recovered.partition.value().table_catalog().metadata(&TableRef::new("public", "docs")).unwrap().row_count, 1);
 }
 
+#[tokio::test]
+async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_entries_it_refuses() {
+    let fixture = fixture(ReplicationConfig { rows_per_block: 2, assertion_interval: Duration::from_millis(10), ..Default::default() }, 1 << 27).await;
+    let (handle, partition, store) = (fixture.handle.clone(), Arc::clone(&fixture.driver.partition), Arc::clone(&fixture.store));
+    let writer = tokio::spawn(fixture.driver.run());
+    let table = TableRef::new("public", "docs");
+    let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: table.clone(), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("value".into()))])], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
+    handle.submit_source_encoded(transaction.encode().unwrap().into_bytes(), Timestamp(100)).await.unwrap();
+    let mut status = handle.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop { if status.borrow_and_update().adopted_block.is_some() { break; } status.changed().await.unwrap(); }
+    }).await.unwrap();
+    let value = partition.value();
+    let live = value.trie_catalog().current_tries(&table)[0].key.clone();
+    let slug = value.table_catalog().entry(&table).unwrap().slug.clone();
+    let record = |id: &str| proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None };
+    let unknown: rtdb_format::keys::TrieKey = "l01-rc-b07".parse().unwrap();
+    let file = |key: &rtdb_format::keys::TrieKey, id: &str| rtdb_storage::ObjectKey::new(slug.artefact_key(key, "search", id, 1).unwrap()).unwrap();
+    for key in [file(&live, "body"), file(&unknown, "body"), file(&live, "title")] { store.put(&key, Bytes::from_static(b"artefact")).await.unwrap(); }
+    let entry = |key: &rtdb_format::keys::TrieKey, id: &str| proto::ArtefactEntry { trie_key: Some(key.to_string()), record: Some(record(id)) };
+    let current = proto::ArtefactsAdded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), table_name: Some(table.schema_and_table()),
+        entries: vec![entry(&live, "body"), entry(&unknown, "body")], source_msg_id: None };
+    handle.publish_artefacts(current, &CancellationToken::new()).await.unwrap();
+    let stale = proto::ArtefactsAdded { storage_version: Some(CURRENT_STORAGE_VERSION.0 + 1), storage_epoch: Some(0), table_name: Some(table.schema_and_table()),
+        entries: vec![entry(&live, "title")], source_msg_id: None };
+    handle.publish_artefacts(stale, &CancellationToken::new()).await.unwrap();
+    let catalog = partition.value();
+    let trie = catalog.trie_catalog().iter_tries(&table).find(|trie| trie.key == live).unwrap().clone();
+    assert_eq!(trie.artefacts, vec![record("body")]);
+    assert!(store.head(&file(&live, "body")).await.is_ok());
+    assert!(store.head(&file(&unknown, "body")).await.is_err(), "an entry for a trie the catalog does not hold is refused and its file deleted");
+    assert!(store.head(&file(&live, "title")).await.is_err(), "an entry under another storage version is refused and its file deleted");
+    handle.shutdown();
+    writer.await.unwrap().unwrap();
+}
+
 async fn local_recovery_driver(
     source: Arc<dyn Log>, replica: Arc<dyn Log>, store: Arc<MemoryStore>, may_lead: bool, assertion_interval: Duration,
 ) -> (ReplicationHandle, ReplicationDriver) {
