@@ -10,17 +10,20 @@ use rtdb_types::{LogicalType, Result, Value};
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
 use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, parameter_types};
 
-pub(crate) struct OwnedRow { pub values: Vec<Value>, reservation: Arc<MemoryReservation> }
+/// A row and the lease charging it; a lease may be shared by the rows of one page, so the row records its own size.
+pub(crate) struct OwnedRow { pub values: Vec<Value>, reservation: Arc<MemoryReservation>, bytes: usize }
 impl OwnedRow {
     pub fn new(values: Vec<Value>, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let reservation = memory.reserve(row_bytes(&values, values.capacity())?)?;
-        Ok(Self { values, reservation })
+        let bytes = row_bytes(&values, values.capacity())?;
+        let reservation = memory.reserve(bytes)?;
+        Ok(Self { values, reservation, bytes })
     }
     pub fn with_reservation(values: Vec<Value>, reservation: Arc<MemoryReservation>) -> Result<Self> {
-        if row_bytes(&values, values.capacity())? > reservation.bytes() { return Err(invalid("row-reservation", "Decoded row exceeds its memory reservation")); }
-        Ok(Self { values, reservation })
+        let bytes = row_bytes(&values, values.capacity())?;
+        if bytes > reservation.bytes() { return Err(invalid("row-reservation", "Decoded row exceeds its memory reservation")); }
+        Ok(Self { values, reservation, bytes })
     }
-    pub fn bytes(&self) -> usize { self.reservation.bytes() }
+    pub fn bytes(&self) -> usize { self.bytes }
     pub fn replace_value(&mut self, index: usize, value: Value, memory: &Arc<MemoryBudget>) -> Result<()> {
         let previous = self.values.get(index).ok_or_else(|| invalid("row-index", "Output column is outside its row"))?;
         let value_bytes = value.retained_bytes()?;
@@ -29,6 +32,7 @@ impl OwnedRow {
         let reservation = memory.reserve(bytes)?;
         self.values[index] = value;
         self.reservation = reservation;
+        self.bytes = bytes;
         Ok(())
     }
     pub fn copy_parts(parts: &[&[Value]], prefix_nulls: usize, suffix_nulls: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -278,5 +282,5 @@ impl QueryCursor {
 }
 struct OwnedRows { rows: std::vec::IntoIter<Vec<Value>>, reservation: Arc<MemoryReservation> }
 #[async_trait]
-impl RowCursor for OwnedRows { async fn next(&mut self) -> Result<Option<OwnedRow>> { Ok(self.rows.next().map(|values| OwnedRow { values, reservation: Arc::clone(&self.reservation) })) } }
+impl RowCursor for OwnedRows { async fn next(&mut self) -> Result<Option<OwnedRow>> { Ok(self.rows.next().map(|values| OwnedRow { values, bytes: self.reservation.bytes(), reservation: Arc::clone(&self.reservation) })) } }
 impl Drop for QueryCursor { fn drop(&mut self) { self.context.cancellation.cancel(); self.finish_trace(); } }

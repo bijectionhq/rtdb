@@ -86,14 +86,22 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         }
         RelationNode::Scan(scan) => {
             let mut constraints = constraints;for predicate in &scan.predicates { constraints.add(predicate); }
-            let pages: BoxPageCursor = if crate::inspection::is_inspection(&scan.table.name.table) {
-                crate::pages::from_rows(Box::new(crate::inspection::InspectionCursor::new(scan.clone(),execution.clone(),&constraints).await?),Arc::clone(&execution.context))
-            } else if crate::system_schema::definition(&scan.table.name.table).is_some() {
-                crate::pages::from_rows(Box::new(crate::system::SystemCursor::new(scan.clone(),execution.clone())),Arc::clone(&execution.context))
-            } else { Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?) };
-            let pages = match scan.predicates.iter().cloned().reduce(|left,right|Expr::binary(rtdb_plan::BinaryOp::And,left,right)) {
-                Some(predicate) => Box::new(PageFilter { input: pages,schema: runtime.schema().clone(),predicate,execution }) as BoxPageCursor,
-                None => pages,
+            let predicate = scan.predicates.iter().cloned().reduce(|left,right|Expr::binary(rtdb_plan::BinaryOp::And,left,right));
+            let pages: BoxPageCursor = if crate::inspection::is_inspection(&scan.table.name.table) || crate::system_schema::definition(&scan.table.name.table).is_some() {
+                let pages = if crate::inspection::is_inspection(&scan.table.name.table) {
+                    crate::pages::from_rows(Box::new(crate::inspection::InspectionCursor::new(scan.clone(),execution.clone(),&constraints).await?),Arc::clone(&execution.context))
+                } else { crate::pages::from_rows(Box::new(crate::system::SystemCursor::new(scan.clone(),execution.clone())),Arc::clone(&execution.context)) };
+                match predicate {
+                    Some(predicate) => Box::new(PageFilter { input: pages,schema: runtime.schema().clone(),predicate,execution }) as BoxPageCursor,
+                    None => pages,
+                }
+            } else {
+                let batches: crate::columnar::BoxBatchCursor = Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?);
+                let batches = match predicate {
+                    Some(predicate) => Box::new(crate::columnar::BatchFilter::new(batches,runtime.schema().clone(),predicate,execution.clone())) as crate::columnar::BoxBatchCursor,
+                    None => batches,
+                };
+                Box::new(crate::columnar::BatchRows::new(batches,Arc::clone(&execution.context.memory)))
             };
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));

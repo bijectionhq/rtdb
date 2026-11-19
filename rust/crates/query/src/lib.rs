@@ -16,6 +16,7 @@ mod pushdown;
 mod sort;
 mod window;
 mod scan;
+mod columnar;
 mod page_metadata;
 mod scan_tasks;
 mod spill;
