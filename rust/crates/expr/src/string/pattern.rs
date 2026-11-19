@@ -609,12 +609,22 @@ impl LikePattern {
 
 pub(crate) fn like(value: &Value,needle: &Value,escape: Option<char>,insensitive: bool,negated: bool,context: &EvalContext<'_>) -> Result<Value> {
     if crate::compare::nullish(value) || crate::compare::nullish(needle) { return Ok(Value::Null); }
-    compile_like(needle,escape,insensitive,context)?.search(value,negated,context)
+    with_scratch(context, |context| compile_like(needle,escape,insensitive,context)?.search(value,negated,context))
 }
 
 pub(crate) fn matches(args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
-    let pattern = compile(text(&args[1])?,text(&args[2])?,context)?;
-    pattern.search(text(&args[0])?,context).map(Value::Bool)
+    with_scratch(context, |context| {
+        let pattern = compile(text(&args[1])?,text(&args[2])?,context)?;
+        pattern.search(text(&args[0])?,context).map(Value::Bool)
+    })
+}
+
+/// Charges a boolean match's compilation and search to a child scope released with the pattern,
+/// so a row-by-row evaluation retains none of them.
+fn with_scratch(context: &EvalContext<'_>, evaluate: impl FnOnce(&EvalContext<'_>) -> Result<Value>) -> Result<Value> {
+    let Some(allocation) = context.allocation else { return evaluate(context); };
+    let scratch = allocation.scratch();
+    evaluate(&EvalContext { allocation: Some(&scratch), ..*context })
 }
 
 pub(crate) fn replace(args: &[Value], context: &EvalContext<'_>) -> Result<Value> {

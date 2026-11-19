@@ -58,3 +58,16 @@ fn like_matcher_reserves_its_translation_and_matching_state_before_use() {
     assert!(scalar_call("like",&[text("a"),text("%")],&context).is_err());
     drop(scope);assert_eq!(memory.used_bytes(),0);
 }
+
+#[test]
+fn repeated_like_calls_in_one_scope_release_each_patterns_charges() {
+    let memory = MemoryBudget::new(256 << 20);
+    let scope = EvaluationScope::new(&memory).unwrap();
+    let context = EvalContext { allocation: Some(&scope), ..EvalContext::default() };
+    let pattern = "x%_".repeat(20);
+    for row in 0..32 {
+        let value = text(&format!("{row}"));
+        assert_eq!(scalar_call("like",&[value,text(&pattern)],&context).unwrap(),V::Bool(false));
+    }
+    assert!(memory.used_bytes() < 1 << 20, "retained {} bytes", memory.used_bytes());
+}
