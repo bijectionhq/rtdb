@@ -766,3 +766,20 @@ async fn records_query_unions_record_keys_and_leaves_missing_keys_null() {
     let error = PreparedSql::prepare("RECORDS ?", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).err().unwrap();
     assert_eq!(error, Anomaly::incorrect("xtdb.sql/records-param-outside-DML", "RECORDS ? not supported outside of DML"));
 }
+
+#[tokio::test]
+async fn a_top_k_over_unorderable_keys_rejects_them_only_when_it_has_rows() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    let empty = PreparedSql::prepare("SELECT v FROM (VALUES ({a: 1})) t(v) WHERE FALSE ORDER BY v LIMIT 10", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = empty.open_query(Arc::clone(&context), vec![]).await.unwrap();
+    let mut rows = 0;
+    while let Some(batch) = cursor.next_batch().await.unwrap() { rows += batch.batch().num_rows(); }
+    assert_eq!(rows, 0);
+    drop(cursor);
+    let rows = PreparedSql::prepare("SELECT v FROM (VALUES ({a: 1}), ({a: 2})) t(v) ORDER BY v LIMIT 10", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let error = match rows.open_query(Arc::clone(&context), vec![]).await {
+        Err(error) => error,
+        Ok(mut cursor) => loop { match cursor.next_batch().await { Err(error) => break error, Ok(Some(_)) => continue, Ok(None) => panic!("sorted unorderable keys") } },
+    };
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.expression/function-type-mismatch", Some("compare is not applicable to these vector types")));
+}

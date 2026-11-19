@@ -151,6 +151,7 @@ impl SortPlan {
         let _kept = self.execution.context.memory.reserve(limit.saturating_add(1).saturating_mul(std::mem::size_of::<OwnedRow>()))?;
         let mut kept: Vec<OwnedRow> = Vec::with_capacity(limit.saturating_add(1));
         let mut seen = false;
+        let mut deferred = None;
         while let Some(mut page) = input.next_page().await? {
             seen |= page.len() > 0;
             let mut projected = match &positions { Some(_) => None, None => Some(crate::pages::project(&page, &self.schema, self.order.iter().map(|order| &order.expr), &self.execution).await?) };
@@ -162,25 +163,33 @@ impl SortPlan {
                     (None, None) => unreachable!(),
                 };
                 keys.observe(&key, self)?;
-                if kept.len() == limit {
-                    match kept.last() { Some(worst) if self.compare(&key, &worst.values[..key.len()])? != Ordering::Less => continue, _ => {} }
-                }
-                let mut low = 0;
-                let mut high = kept.len();
-                while low < high {
-                    let middle = (low + high) / 2;
-                    if self.compare(&key, &kept[middle].values[..key.len()])? == Ordering::Less { high = middle; } else { low = middle + 1; }
-                }
-                if low < limit {
+                if deferred.is_some() { continue; }
+                let low = match self.top_position(&kept, limit, &key) { Ok(Some(low)) => low, Ok(None) => continue, Err(error) => { deferred = Some(error); continue } };
+                {
                     kept.insert(low, OwnedRow::copy_parts(&[&key, &row.values], 0, 0, &self.execution.context.memory)?);
                     kept.truncate(limit);
                 }
             }
         }
-        keys.validate()?;
         if !seen { return Ok(None); }
+        keys.validate()?;
+        if let Some(error) = deferred { return Err(error); }
         let rows = kept.len();
         Ok(Some(SortOutput { rows: OutputRows::Retained(kept.into_iter()), remaining: rows as u64, page_rows: rows, empty_callback: rows == 0 }))
+    }
+    /// Where `key` belongs among the kept rows, or `None` when it falls outside the limit.
+    /// A comparison fails only on keys the sort rejects, and those report their key types first, so the caller defers it.
+    fn top_position(&self, kept: &[OwnedRow], limit: usize, key: &[Value]) -> Result<Option<usize>> {
+        if kept.len() == limit {
+            match kept.last() { Some(worst) if self.compare(key, &worst.values[..key.len()])? != Ordering::Less => return Ok(None), _ => {} }
+        }
+        let mut low = 0;
+        let mut high = kept.len();
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.compare(key, &kept[middle].values[..key.len()])? == Ordering::Less { high = middle; } else { low = middle + 1; }
+        }
+        Ok((low < limit).then_some(low))
     }
     async fn top_batches(&self, mut batches: crate::columnar::BoxBatchCursor, projected: bool) -> Result<Option<SortOutput>> {
         let limit = usize::try_from(self.limit).map_err(|_| invalid("sort-limit", "Sort limit exceeds addressable memory"))?;
@@ -190,6 +199,7 @@ impl SortPlan {
         let _kept = self.execution.context.memory.reserve(limit.saturating_add(1).saturating_mul(std::mem::size_of::<OwnedRow>()))?;
         let mut kept: Vec<OwnedRow> = Vec::with_capacity(limit.saturating_add(1));
         let mut seen = false;
+        let mut deferred = None;
         let cell = |batch: &crate::columnar::ColumnBatch, row: usize, position: usize| -> Result<Value> {
             let mut value = batch.columns[position].value(row)?;
             if projected { value.admit_expression_dates()?; }
@@ -201,24 +211,18 @@ impl SortPlan {
                 self.execution.context.check_cancelled()?;
                 let key = positions.iter().map(|position| cell(&batch, row, *position)).collect::<Result<Vec<_>>>()?;
                 keys.observe(&key, self)?;
-                if kept.len() == limit {
-                    match kept.last() { Some(worst) if self.compare(&key, &worst.values[..key.len()])? != Ordering::Less => continue, _ => {} }
-                }
-                let mut low = 0;
-                let mut high = kept.len();
-                while low < high {
-                    let middle = (low + high) / 2;
-                    if self.compare(&key, &kept[middle].values[..key.len()])? == Ordering::Less { high = middle; } else { low = middle + 1; }
-                }
-                if low < limit {
+                if deferred.is_some() { continue; }
+                let low = match self.top_position(&kept, limit, &key) { Ok(Some(low)) => low, Ok(None) => continue, Err(error) => { deferred = Some(error); continue } };
+                {
                     let values = (0..batch.columns.len()).map(|position| cell(&batch, row, position)).collect::<Result<Vec<_>>>()?;
                     kept.insert(low, OwnedRow::copy_parts(&[&key, &values], 0, 0, &self.execution.context.memory)?);
                     kept.truncate(limit);
                 }
             }
         }
-        keys.validate()?;
         if !seen { return Ok(None); }
+        keys.validate()?;
+        if let Some(error) = deferred { return Err(error); }
         let rows = kept.len();
         Ok(Some(SortOutput { rows: OutputRows::Retained(kept.into_iter()), remaining: rows as u64, page_rows: rows, empty_callback: rows == 0 }))
     }
