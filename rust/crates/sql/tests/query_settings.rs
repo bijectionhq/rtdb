@@ -57,9 +57,10 @@ async fn defaults_reach_nested_scans_and_explicit_extents_override_each_dimensio
 async fn scalar_settings_keep_lexical_parameter_indices_and_snapshot_caps_explicit_time() {
     let sql = "SETTING SNAPSHOT_TOKEN = ?, CLOCK_TIME = ? SELECT v,CURRENT_TIMESTAMP,SNAPSHOT_TOKEN,? AS tail FROM foo FOR ALL VALID_TIME FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000300Z'";
     assert_eq!(rtdb_sql::parse(sql).unwrap()[0].parameter_count(), 3);
-    assert!(query(context(), sql, vec![V::Utf8(token(150)), timestamp(999), V::I64(7)]).await.unwrap().is_empty());
+    let old = [vec![V::Utf8("old".into()), timestamp(999), V::Utf8(token(150)), V::I64(7)]];
+    assert_eq!(query(context(), sql, vec![V::Utf8(token(150)), timestamp(999), V::I64(7)]).await.unwrap(), old, "the transaction after the snapshot does not supersede");
     let rows = query(context(), &sql.replace("000300Z", "000100Z"), vec![V::Utf8(token(150)), timestamp(999), V::I64(7)]).await.unwrap();
-    assert_eq!(rows, [vec![V::Utf8("old".into()), timestamp(999), V::Utf8(token(150)), V::I64(7)]]);
+    assert_eq!(rows, old);
     assert_eq!(query(context(), &format!("SETTING SNAPSHOT_TOKEN = '{}' SELECT 1 WHERE FALSE", token(201)), vec![]).await.unwrap_err().code, "xtdb/unindexed-tx");
     assert_eq!(query(context(), "SETTING SNAPSHOT_TOKEN = 'bad token' SELECT 1", vec![]).await.unwrap_err().code, "xtdb.basis/invalid-basis");
 }
