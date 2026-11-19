@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(binary(&typed).len(), bytes); assert_eq!(binary(&typed).first(), Some(&7)); assert_eq!(binary(&typed).last(), Some(&7));
         assert_eq!(binary(&old).capacity(), 2 * 1024 * 1024); assert_eq!(binary(&typed).capacity(), bytes);
         assert_eq!(serde_json::to_vec(&*old).unwrap(), serde_json::to_vec(&*typed).unwrap());
-        let memory = MemoryBudget::new(384 * 1024 * 1024);
+        let memory = MemoryBudget::new(12 * 1024 * 1024);
         let error = PreparedQuery::from_prepared(prepared(&old), &memory).err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded"); assert_eq!(memory.used_bytes(), 0);
         let query = PreparedQuery::from_prepared(prepared(&typed), &memory).unwrap();
