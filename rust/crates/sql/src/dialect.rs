@@ -1,6 +1,32 @@
 use sqlparser::{ast, dialect::{Dialect, GenericDialect, Precedence}, keywords::Keyword, parser::{Parser, ParserError}, tokenizer::{Token,TokenWithSpan,Word}};
 use std::{cell::Cell,fmt::Write};
 
+/// `Sql.g4`'s `nonReservedKeyword` production, with its sub-productions expanded: the grammar's keywords that may name a correlation or column.
+const NON_RESERVED_KEYWORDS: &[&str] = &[
+    "START", "END", "COMMITTED", "UNCOMMITTED", "TIMEZONE", "VERSION", "SYSTEM_TIME", "VALID_TIME", "SELECT", "INSERT", "UPDATE", "DELETE", "ERASE",
+    "SETTING", "ROLE", "USER", "PASSWORD", "VARBINARY", "BYTEA", "URI", "OID", "COPY", "FORMAT", "ATTACH", "DETACH", "DATABASE", "LEVEL", "FILTER",
+    "TABLE", "METADATA", "SYNC", "DISCARD", "PLANS", "TEMP", "TEMPORARY", "SEQUENCES", "AT", "BETWEEN", "BY", "CURRENT", "FIRST", "LAST", "NEXT",
+    "OF", "POSITION", "BIGINT", "BOOLEAN", "CHAR", "DATE", "DEC", "DECIMAL", "DOUBLE", "DURATION", "FLOAT", "INT", "INTEGER", "INTERVAL", "KEYWORD",
+    "NUMERIC", "OBJECT", "PERIOD", "PRECISION", "REAL", "RECORD", "REGCLASS", "REGPROC", "ROW", "SMALLINT", "TEXT", "TIME", "TIMESTAMP",
+    "TIMESTAMPTZ", "TSTZRANGE", "UUID", "VARCHAR", "BOOL", "BPCHAR", "NAME",
+    "AVG", "MAX", "MIN", "SUM", "COUNT", "EVERY", "BOOL_AND", "BOOL_OR", "STDDEV_POP", "STDDEV_SAMP", "VAR_SAMP", "VAR_POP",
+    "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DOW", "ISODOW", "DOY", "WEEK", "QUARTER", "EPOCH",
+    "RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST",
+];
+
+fn grammar_keyword(token: &TokenWithSpan) -> Option<&str> {
+    match &token.token { Token::Word(word) if word.quote_style.is_none() && crate::lexer::keyword(&word.value).is_some() => Some(&word.value), _ => None }
+}
+fn non_reserved(token: &TokenWithSpan) -> bool {
+    grammar_keyword(token).is_some_and(|word| NON_RESERVED_KEYWORDS.iter().any(|keyword| word.eq_ignore_ascii_case(keyword)))
+}
+/// The alias candidate the parser has just consumed, when it is one of the grammar's reserved keywords.
+fn reserved_word(parser: &Parser) -> Option<String> {
+    let token = parser.get_current_token();
+    if non_reserved(token) { return None; }
+    grammar_keyword(token).map(str::to_owned)
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SqlDialect { position_work: Cell<Option<usize>> }
 
@@ -124,7 +150,14 @@ impl Dialect for SqlDialect {
         *keyword != Keyword::WINDOW && GenericDialect {}.is_column_alias(keyword, parser)
     }
     fn is_select_item_alias(&self, explicit: bool, keyword: &Keyword, parser: &mut Parser) -> bool {
-        explicit || (*keyword != Keyword::DEFAULT && self.is_column_alias(keyword, parser))
+        match reserved_word(parser) {
+            Some(word) => explicit && (word.eq_ignore_ascii_case("CURRENT_USER") || word.eq_ignore_ascii_case("DEFAULT")),
+            None => explicit || (*keyword != Keyword::DEFAULT && self.is_column_alias(keyword, parser)),
+        }
+    }
+    fn is_table_factor_alias(&self, explicit: bool, keyword: &Keyword, parser: &mut Parser) -> bool {
+        reserved_word(parser).is_none() && (explicit || self.is_table_alias(keyword, parser)
+            || (non_reserved(parser.get_current_token()) && matches!(parser.peek_token_ref().token, Token::EOF | Token::RParen | Token::Comma | Token::SemiColon)))
     }
 
     generic_flags!(
@@ -627,5 +660,40 @@ mod position_tests {
         }
         let ast::Expr::UnaryOp { expr,.. } = parse("-a->'b'::BIGINT") else { panic!("unary") };
         assert!(matches!(expr.as_ref(),ast::Expr::BinaryOp { op: ast::BinaryOperator::Arrow,.. }));
+    }
+}
+
+#[cfg(test)]
+mod keyword_tier_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn accepted_by(source: impl Fn(&str) -> String) -> BTreeSet<&'static str> {
+        crate::lexer::spellings().filter(|(spelling, name)| spelling == name && name.chars().all(|c| c.is_ascii_alphabetic() || c == '_'))
+            .map(|(name, _)| name).filter(|word| crate::parse(&source(word)).is_ok()).collect()
+    }
+
+    #[test]
+    fn a_correlation_name_accepts_exactly_the_non_reserved_keywords() {
+        let tier: BTreeSet<_> = NON_RESERVED_KEYWORDS.iter().copied().collect();
+        for (position, source) in [("with AS", "SELECT 1 AS r FROM (VALUES (1)) AS "), ("without AS", "SELECT 1 AS r FROM (VALUES (1)) ")] {
+            let accepted = accepted_by(|word| format!("{source}{word}"));
+            assert_eq!(tier.difference(&accepted).collect::<Vec<_>>(), Vec::<&&str>::new(), "{position}: the tier names a keyword the parser rejects");
+            assert_eq!(accepted.difference(&tier).collect::<Vec<_>>(), Vec::<&&str>::new(), "{position}: the parser accepts a reserved keyword");
+        }
+    }
+
+    #[test]
+    fn a_column_alias_also_accepts_current_user_and_default() {
+        let tier: BTreeSet<_> = NON_RESERVED_KEYWORDS.iter().copied().collect();
+        let accepted = accepted_by(|word| format!("SELECT 1 AS {word}"));
+        assert_eq!(tier.difference(&accepted).collect::<Vec<_>>(), Vec::<&&str>::new());
+        assert_eq!(accepted.difference(&tier).copied().collect::<Vec<_>>(), ["CURRENT_USER", "DEFAULT"]);
+    }
+
+    #[test]
+    fn a_from_first_query_does_not_take_its_select_as_an_alias() {
+        assert!(crate::parse("FROM (VALUES (1)) t(a) SELECT a").is_ok());
+        assert!(crate::parse("SELECT 1 FROM (VALUES (1)) AS select").is_ok());
     }
 }

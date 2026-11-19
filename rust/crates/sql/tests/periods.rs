@@ -196,7 +196,7 @@ async fn infix_period_predicates_keep_pinned_endpoint_comparisons() {
     }
     assert!(query(&format!("SELECT \"leads\"({left},{right}) AS scalar_leads")).await.is_err());
     assert_eq!(query("SELECT PERIOD(NULL,NULL) EQUALS PERIOD(NULL,NULL) AS same").await.unwrap().1, [vec![V::Bool(true)]]);
-    assert_eq!(query("SELECT NULL OVERLAPS PERIOD(NULL,NULL) AS unknown").await.unwrap().1, [vec![V::Null]]);
+    assert_eq!(query("SELECT NULL OVERLAPS PERIOD(NULL,NULL) AS unknown_overlap").await.unwrap().1, [vec![V::Null]]);
     assert!(query(&format!("SELECT LEADS({left},{right}) AS bad")).await.is_err());
 }
 
