@@ -69,7 +69,8 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let mut expression_count = 0usize;
         fn count(input: &Relation, total: &mut usize) { for expr in input.expressions() { expr.visit(&mut |_| *total += 1); } for child in input.children() { count(child, total); } }
         count(&plan.input, &mut expression_count);
-        let bound = parameter_bytes.checked_add(sql.len().checked_mul(128).ok_or_else(overflow)?).and_then(|bytes| bytes.checked_mul(expression_count.checked_add(8)?)).ok_or_else(overflow)?;
+        // Literal values come from the statement text, so their copies scale with its length; only parameters can be copied per expression.
+        let bound = parameter_bytes.checked_mul(expression_count.checked_add(8).ok_or_else(overflow)?).and_then(|bytes| bytes.checked_add(sql.len().checked_mul(128)?)).ok_or_else(overflow)?;
         let _evaluation = memory.reserve(bound)?;
         let mut parameters = parameters.to_vec();
         parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
