@@ -8,23 +8,24 @@ const NON_RESERVED_KEYWORDS: &[&str] = &[
     "TABLE", "METADATA", "SYNC", "DISCARD", "PLANS", "TEMP", "TEMPORARY", "SEQUENCES", "AT", "BETWEEN", "BY", "CURRENT", "FIRST", "LAST", "NEXT",
     "OF", "POSITION", "BIGINT", "BOOLEAN", "CHAR", "DATE", "DEC", "DECIMAL", "DOUBLE", "DURATION", "FLOAT", "INT", "INTEGER", "INTERVAL", "KEYWORD",
     "NUMERIC", "OBJECT", "PERIOD", "PRECISION", "REAL", "RECORD", "REGCLASS", "REGPROC", "ROW", "SMALLINT", "TEXT", "TIME", "TIMESTAMP",
-    "TIMESTAMPTZ", "TSTZRANGE", "UUID", "VARCHAR", "BOOL", "BPCHAR", "NAME",
+    "TIMESTAMPTZ", "TSTZRANGE", "UUID", "VARCHAR", "INT2", "INT4", "INT8", "FLOAT4", "FLOAT8", "BOOL", "BPCHAR", "NAME",
     "AVG", "MAX", "MIN", "SUM", "COUNT", "EVERY", "BOOL_AND", "BOOL_OR", "STDDEV_POP", "STDDEV_SAMP", "VAR_SAMP", "VAR_POP",
     "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DOW", "ISODOW", "DOY", "WEEK", "QUARTER", "EPOCH",
     "RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST",
 ];
 
-fn grammar_keyword(token: &TokenWithSpan) -> Option<&str> {
-    match &token.token { Token::Word(word) if word.quote_style.is_none() && crate::lexer::keyword(&word.value).is_some() => Some(&word.value), _ => None }
+/// The grammar token an unquoted word lexes as; an alternative spelling such as INT8 lexes as its canonical keyword.
+fn grammar_keyword(token: &TokenWithSpan) -> Option<&'static str> {
+    match &token.token { Token::Word(word) if word.quote_style.is_none() => crate::lexer::keyword(&word.value).map(crate::lexer::Keyword::name), _ => None }
 }
 fn non_reserved(token: &TokenWithSpan) -> bool {
     grammar_keyword(token).is_some_and(|word| NON_RESERVED_KEYWORDS.iter().any(|keyword| word.eq_ignore_ascii_case(keyword)))
 }
 /// The alias candidate the parser has just consumed, when it is one of the grammar's reserved keywords.
-fn reserved_word(parser: &Parser) -> Option<String> {
+fn reserved_word(parser: &Parser) -> Option<&'static str> {
     let token = parser.get_current_token();
     if non_reserved(token) { return None; }
-    grammar_keyword(token).map(str::to_owned)
+    grammar_keyword(token)
 }
 
 #[derive(Debug, Default)]
@@ -673,9 +674,14 @@ mod keyword_tier_tests {
             .map(|(name, _)| name).filter(|word| crate::parse(&source(word)).is_ok()).collect()
     }
 
+    /// The tier's keywords the vocabulary walk enumerates: as in the reference's test, those spelt with letters and underscores.
+    fn enumerable_tier() -> BTreeSet<&'static str> {
+        NON_RESERVED_KEYWORDS.iter().copied().filter(|word| word.chars().all(|c| c.is_ascii_alphabetic() || c == '_')).collect()
+    }
+
     #[test]
     fn a_correlation_name_accepts_exactly_the_non_reserved_keywords() {
-        let tier: BTreeSet<_> = NON_RESERVED_KEYWORDS.iter().copied().collect();
+        let tier = enumerable_tier();
         for (position, source) in [("with AS", "SELECT 1 AS r FROM (VALUES (1)) AS "), ("without AS", "SELECT 1 AS r FROM (VALUES (1)) ")] {
             let accepted = accepted_by(|word| format!("{source}{word}"));
             assert_eq!(tier.difference(&accepted).collect::<Vec<_>>(), Vec::<&&str>::new(), "{position}: the tier names a keyword the parser rejects");
@@ -685,10 +691,16 @@ mod keyword_tier_tests {
 
     #[test]
     fn a_column_alias_also_accepts_current_user_and_default() {
-        let tier: BTreeSet<_> = NON_RESERVED_KEYWORDS.iter().copied().collect();
+        let tier = enumerable_tier();
         let accepted = accepted_by(|word| format!("SELECT 1 AS {word}"));
         assert_eq!(tier.difference(&accepted).collect::<Vec<_>>(), Vec::<&&str>::new());
         assert_eq!(accepted.difference(&tier).copied().collect::<Vec<_>>(), ["CURRENT_USER", "DEFAULT"]);
+    }
+
+    #[test]
+    fn an_alternative_spelling_takes_its_keywords_tier() {
+        assert!(crate::parse("SELECT 1 AS int8").is_ok());
+        assert!(crate::parse("SELECT 1 AS r FROM (VALUES (1)) AS int8").is_ok());
     }
 
     #[test]
