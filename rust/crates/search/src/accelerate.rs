@@ -9,7 +9,7 @@ use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
 use rtdb_types::{Iid, Result, TemporalBounds, Timestamp, Value};
 
-use crate::{KIND, SearchDefinition, SearchFile, definitions_in, search_rows};
+use crate::{KIND, SearchDefinition, SearchFile, search_rows};
 
 /// Narrows a scan with a `MATCH` predicate to the IIDs whose events hold the query's terms (fts.allium: the query plan).
 pub struct SearchAccelerator {
@@ -17,10 +17,15 @@ pub struct SearchAccelerator {
     pub max_candidates: usize,
     /// Above this many bytes of tries the lane should have indexed but has not, the scan runs unnarrowed rather than reading them twice.
     pub max_unindexed_bytes: i64,
+    runtime: std::sync::Arc<crate::SearchRuntime>,
+}
+
+impl SearchAccelerator {
+    pub fn with_runtime(runtime: std::sync::Arc<crate::SearchRuntime>) -> Self { Self { max_candidates: 100_000, max_unindexed_bytes: 64 * 1024 * 1024, runtime } }
 }
 
 impl Default for SearchAccelerator {
-    fn default() -> Self { Self { max_candidates: 100_000, max_unindexed_bytes: 64 * 1024 * 1024 } }
+    fn default() -> Self { Self::with_runtime(crate::SearchRuntime::new(256 << 20)) }
 }
 
 fn match_conjuncts<'a>(expression: &'a Expr, found: &mut Vec<(&'a rtdb_plan::ColumnId, &'a Expr)>) {
@@ -48,7 +53,7 @@ impl ScanAccelerator for SearchAccelerator {
         for predicate in &scan.predicates { match_conjuncts(predicate, &mut conjuncts); }
         if conjuncts.is_empty() { return Ok(None); }
         let table = &scan.table.name.table;
-        let definitions = definitions_in(request.database, vec![request.snapshot.clone()], std::sync::Arc::clone(request.storage), std::sync::Arc::clone(request.memory), request.current_time, request.cancellation).await?;
+        let definitions = self.runtime.definitions(request.database, request.snapshot, request.storage, request.memory, request.current_time, request.cancellation).await?;
         let mut chosen: Option<(String, Query, &SearchDefinition)> = None;
         for (id, query) in conjuncts {
             let Some(column) = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.clone()) else { continue };
@@ -70,10 +75,8 @@ impl ScanAccelerator for SearchAccelerator {
             let indexed = match trie.artefact(KIND, &artefact_id, definition.version) {
                 Some(_) => {
                     let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
-                    match request.storage.get(&key).await {
-                        Ok(lease) => match SearchFile::open(lease, &definition.columns) {
+                    match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
                             Ok(file) => {
-                                let file = std::sync::Arc::new(file);
                                 if trie.key.recency().is_none() { request.corpora.register(format!("{key}#{column}"), std::sync::Arc::new(FileCorpus { file: std::sync::Arc::clone(&file), column: column.clone() })); }
                                 for doc in file.matches(&column, &query)? {
                                     if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, bounds) { candidates.insert(Iid(doc.iid)); }
@@ -81,8 +84,6 @@ impl ScanAccelerator for SearchAccelerator {
                                 true
                             }
                             Err(_) => false,
-                        },
-                        Err(_) => false,
                     }
                 }
                 None => false,

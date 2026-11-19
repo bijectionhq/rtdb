@@ -64,6 +64,7 @@ value SearchDoc {
 entity SearchDefinitions {
     -- The definitions in force: `xt.search_indexes` read at a basis, as of the reader's current time in valid time.
     -- They are documents the indexer writes, so every node reading at the same basis holds the same set.
+    -- A node reads them once per committed basis and reuses them across scans and jobs; a snapshot carrying a transaction's own writes reads them afresh.
     definitions: List<SearchIndexDefinition>
 }
 
@@ -200,6 +201,7 @@ contract SearchCorrectness {
 
     @invariant SearchFilesFromTheSnapshot
         -- A scan reads the search files its snapshot's catalog records, and no others.
+        -- A node keeps opened files across queries by object key, which names immutable bytes, so a kept file is never stale.
 }
 
 ------------------------------------------------------------

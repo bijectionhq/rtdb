@@ -35,17 +35,20 @@ pub struct NodeServices {
     /// Consulted by every scan before it opens, unless `NodeOptions::scan_acceleration` is off.
     pub scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>>,
 }
-fn default_scan_accelerators() -> Vec<Arc<dyn rtdb_query::ScanAccelerator>> {
-    #[cfg(feature = "search")] { vec![Arc::new(rtdb_search::SearchAccelerator::default())] }
-    #[cfg(not(feature = "search"))] { Vec::new() }
+/// The search kind and accelerator share one runtime, so a node's lane and scans share its caches.
+fn default_search() -> SearchServices {
+    #[cfg(feature = "search")] {
+        let runtime = rtdb_search::SearchRuntime::new(256 << 20);
+        SearchServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()] }
+    }
+    #[cfg(not(feature = "search"))] { SearchServices { artefact_kinds: Vec::new(), scan_accelerators: Vec::new() } }
 }
-fn default_artefact_kinds() -> Vec<Arc<dyn rtdb_maintenance::ArtefactKind>> {
-    #[cfg(feature = "search")] { vec![Arc::new(rtdb_search::SearchArtefacts)] }
-    #[cfg(not(feature = "search"))] { Vec::new() }
-}
+struct SearchServices { artefact_kinds: Vec<Arc<dyn rtdb_maintenance::ArtefactKind>>, scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>> }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, artefact_kinds: default_artefact_kinds(), scan_accelerators: default_scan_accelerators() }
+        let search = default_search();
+        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None,
+            artefact_kinds: search.artefact_kinds, scan_accelerators: search.scan_accelerators }
     }
 }
 

@@ -21,6 +21,8 @@ impl Snapshot {
         Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new() }
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
+    /// Whether a transaction's own uncommitted writes are layered over this snapshot.
+    pub fn has_overlays(&self) -> bool { !self.layered.is_empty() }
     pub fn system_time_cap(&self) -> Option<Timestamp> { self.system_time_cap }
     /// Bounds a clone's owned overlay map, table names and segment references; immutable index buffers stay shared.
     pub fn clone_allocation_bound(&self) -> Result<usize> {

@@ -11,19 +11,23 @@ use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_types::{Anomaly, Result, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchRow, file::write_search_file, definitions::{SearchDefinition, definitions_in}};
+use crate::{SearchRow, file::write_search_file, definitions::SearchDefinition};
 use rtdb_maintenance::input::{download, open_input, read_page};
 
 pub const KIND: &str = "search";
 
 /// The search artefact kind: install it in a node's services to build search files.
-pub struct SearchArtefacts;
+pub struct SearchArtefacts { runtime: Arc<crate::SearchRuntime> }
+
+impl SearchArtefacts {
+    pub fn with_runtime(runtime: Arc<crate::SearchRuntime>) -> Self { Self { runtime } }
+}
 
 impl rtdb_maintenance::ArtefactKind for SearchArtefacts {
     fn name(&self) -> &str { KIND }
     fn builder(&self, database: rtdb_maintenance::ArtefactDatabase) -> Result<Arc<dyn ArtefactBuilder>> {
         let clock = Arc::clone(&database.clock);
-        Ok(Arc::new(SearchBuilder::new(database.name, database.store, database.storage, database.memory, Arc::new(move || clock().into()))))
+        Ok(Arc::new(SearchBuilder::new(database.name, database.store, database.storage, database.memory, Arc::new(move || clock().into()), Arc::clone(&self.runtime))))
     }
 }
 
@@ -34,15 +38,16 @@ pub struct SearchBuilder {
     storage: Arc<BufferPool>,
     memory: Arc<MemoryBudget>,
     clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>,
+    runtime: Arc<crate::SearchRuntime>,
     columns: Mutex<BTreeMap<(String, i64), Vec<String>>>,
 }
 
 impl SearchBuilder {
-    pub fn new(database: String, store: Arc<dyn ObjectStore>, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>) -> Self {
-        Self { database, store, storage, memory, clock, columns: Mutex::new(BTreeMap::new()) }
+    pub fn new(database: String, store: Arc<dyn ObjectStore>, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>, runtime: Arc<crate::SearchRuntime>) -> Self {
+        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()) }
     }
-    async fn search_definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<SearchDefinition>> {
-        definitions_in(&self.database, vec![snapshot.snapshot()], Arc::clone(&self.storage), Arc::clone(&self.memory), (self.clock)(), cancellation).await
+    async fn search_definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Arc<Vec<SearchDefinition>>> {
+        self.runtime.definitions(&self.database, &snapshot.snapshot(), &self.storage, &self.memory, (self.clock)(), cancellation).await
     }
 }
 
@@ -51,10 +56,10 @@ impl ArtefactBuilder for SearchBuilder {
     async fn definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<ArtefactDefinition>> {
         let definitions = self.search_definitions(snapshot, cancellation).await?;
         let mut columns = self.columns.lock();
-        Ok(definitions.into_iter().map(|definition| {
+        Ok(definitions.iter().map(|definition| {
             let id = definition.artefact_id();
-            columns.insert((id.clone(), definition.version), definition.columns);
-            ArtefactDefinition { table: definition.table, kind: KIND.into(), id, version: definition.version }
+            columns.insert((id.clone(), definition.version), definition.columns.clone());
+            ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version }
         }).collect())
     }
 
