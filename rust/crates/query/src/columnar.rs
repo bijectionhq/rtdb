@@ -231,7 +231,7 @@ impl BatchCursor for BatchFilter {
 /// Three-valued predicate evaluation over a batch's columns, for the predicate shapes and cell types whose
 /// semantics are exactly those of the scalar evaluator; `None` sends the batch to it instead.
 mod kernel {
-    use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow_array::{Array, BooleanArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
     use arrow_schema::{DataType, TimeUnit as ArrowUnit};
     use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
     use rtdb_types::{LogicalType, ScalarType, TimeUnit, Value};
@@ -243,7 +243,7 @@ mod kernel {
     #[derive(Clone, Copy, PartialEq, PartialOrd)]
     enum Cell<'a> { Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, bool) }
 
-    enum Cells<'a> { Int(&'a Int64Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray), Values(&'a [Value]) }
+    enum Cells<'a> { Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>) }
 
     impl<'a> Cells<'a> {
         fn of(column: &'a Column) -> Option<Self> {
@@ -254,6 +254,9 @@ mod kernel {
                     let any = array.as_any();
                     match array.data_type() {
                         DataType::Int64 if plain(ScalarType::I64) => any.downcast_ref().map(Self::Int),
+                        DataType::Int32 if plain(ScalarType::I32) => any.downcast_ref().map(Self::Int32),
+                        DataType::Int16 if plain(ScalarType::I16) => any.downcast_ref().map(Self::Int16),
+                        DataType::Int8 if plain(ScalarType::I8) => any.downcast_ref().map(Self::Int8),
                         DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
                         DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
                         DataType::Boolean if plain(ScalarType::Bool) => any.downcast_ref().map(Self::Bool),
@@ -268,6 +271,10 @@ mod kernel {
             fn valid<A: Array>(array: &A, row: usize) -> bool { array.is_valid(row) }
             Ok(match self {
                 Self::Int(array) => valid(*array, row).then(|| Cell::Int(array.value(row))),
+                Self::Int32(array) => valid(*array, row).then(|| Cell::Int(i64::from(array.value(row)))),
+                Self::Int16(array) => valid(*array, row).then(|| Cell::Int(i64::from(array.value(row)))),
+                Self::Int8(array) => valid(*array, row).then(|| Cell::Int(i64::from(array.value(row)))),
+                Self::Owned(cells) => cells[row],
                 Self::Float(array) => valid(*array, row).then(|| Cell::Float(array.value(row))),
                 Self::Text(array) => valid(*array, row).then(|| Cell::Text(array.value(row))),
                 Self::Bool(array) => valid(*array, row).then(|| Cell::Bool(array.value(row))),
@@ -277,6 +284,10 @@ mod kernel {
         }
     }
 
+    /// A computed numeric cell, which borrows nothing.
+    fn owned(cell: Cell<'_>) -> Option<Cell<'static>> {
+        match cell { Cell::Int(value) => Some(Cell::Int(value)), Cell::Float(value) => Some(Cell::Float(value)), Cell::Bool(value) => Some(Cell::Bool(value)), Cell::Micros(value, zoned) => Some(Cell::Micros(value, zoned)), Cell::Text(_) => None }
+    }
     fn scalar(value: &Value) -> Result<Option<Cell<'_>>, ()> {
         Ok(match value {
             Value::Null => None,
@@ -317,6 +328,11 @@ mod kernel {
                 Expr::Column { id, .. } => Cells::of(&batch.columns[schema.position(*id)?]).map(Self::Cells),
                 Expr::Literal(value) => scalar(value).ok().map(Self::Constant),
                 Expr::Parameter { index, .. } => scalar(parameters.get(*index)?).ok().map(Self::Constant),
+                Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, .. } => {
+                    let column = super::projection::column(expr, schema, batch, parameters).ok()??;
+                    let cells = Cells::of(&column)?;
+                    Some(Self::Cells(Cells::Owned((0..batch.len).map(|row| match cells.get(row).ok()? { None => Some(None), Some(cell) => owned(cell).map(Some) }).collect::<Option<_>>()?)))
+                }
                 _ => None,
             }
         }
@@ -356,6 +372,19 @@ mod kernel {
                     (Some(a), Some(b)) => order(a, b, equality_only).ok().map(|ordering| Some(accept(ordering))),
                     _ => Some(None),
                 }).collect()
+            }
+            Expr::Call { name, args, .. } if name == "===" && args.len() == 2 => {
+                let (left, right) = (Operand::of(&args[0], schema, batch, parameters)?, Operand::of(&args[1], schema, batch, parameters)?);
+                (0..rows).map(|row| Some(Some(match (left.get(row).ok()?, right.get(row).ok()?) {
+                    (None, None) => true,
+                    (None, Some(_)) | (Some(_), None) => false,
+                    (Some(Cell::Int(a)), Some(Cell::Int(b))) => a == b,
+                    (Some(Cell::Float(a)), Some(Cell::Float(b))) => if a.is_nan() || b.is_nan() { return None } else { a == b },
+                    (Some(Cell::Int(_)), Some(Cell::Float(_))) | (Some(Cell::Float(_)), Some(Cell::Int(_))) => false,
+                    (Some(Cell::Text(a)), Some(Cell::Text(b))) => a == b,
+                    (Some(Cell::Bool(a)), Some(Cell::Bool(b))) => a == b,
+                    _ => return None,
+                }))).collect()
             }
             Expr::Between { operand, low, high, symmetric: false } => {
                 let (operand, low, high) = (Operand::of(operand, schema, batch, parameters)?, Operand::of(low, schema, batch, parameters)?, Operand::of(high, schema, batch, parameters)?);
@@ -420,8 +449,48 @@ mod tests {
             4 => schema.fields()[3].expression(),
             5 => Expr::binary(BinaryOp::And, predicate(random, schema, depth - 1), predicate(random, schema, depth - 1)),
             6 => Expr::binary(BinaryOp::Or, predicate(random, schema, depth - 1), predicate(random, schema, depth - 1)),
+            7 if random.below(2) == 0 => {
+                let arithmetic = Expr::binary(BinaryOp::Multiply, schema.fields()[[0usize, 1, 4][random.below(3) as usize]].expression(), operand(random, schema));
+                if random.below(2) == 0 { Expr::Call { name: "===".into(), args: vec![arithmetic, operand(random, schema)], return_type: LogicalType::Scalar(ScalarType::Bool) } }
+                else { Expr::binary(comparison[random.below(6) as usize], arithmetic, operand(random, schema)) }
+            }
             _ => Expr::Unary { op: UnaryOp::Not, expr: Box::new(predicate(random, schema, depth - 1)) },
         }
+    }
+
+    fn arithmetic(random: &mut Random, schema: &Schema, depth: u32) -> Expr {
+        let ops = [BinaryOp::Add, BinaryOp::Subtract, BinaryOp::Multiply];
+        match if depth == 0 { random.below(3) } else { random.below(5) } {
+            0 => schema.fields()[[0usize, 1][random.below(2) as usize]].expression(),
+            1 => Expr::Literal([Value::I64(random.below(21) as i64 - 10), Value::I32(random.below(9) as i32 - 4), Value::F64((random.below(41) as f64 - 20.0) / 4.0), Value::I64(i64::MAX - random.below(3) as i64)][random.below(4) as usize].clone()),
+            2 => schema.fields()[[0usize, 1, 2][random.below(3) as usize]].expression(),
+            _ => Expr::binary(ops[random.below(3) as usize], arithmetic(random, schema, depth - 1), arithmetic(random, schema, depth - 1)),
+        }
+    }
+
+    #[test]
+    fn the_projection_kernel_agrees_with_the_evaluator_on_every_batch_it_computes() {
+        let memory = MemoryBudget::new(1 << 28);
+        let schema = Schema::new(vec![field(0, ScalarType::I64), field(1, ScalarType::F64), field(2, ScalarType::Utf8), field(3, ScalarType::Bool), field(4, ScalarType::I64)]).unwrap();
+        let mut random = Random(0x2545f4914f6cdd1d);
+        let mut computed = 0;
+        for _ in 0..400 {
+            let batch = batch(&mut random, 64, &memory);
+            let expression = if random.below(3) == 0 {
+                Expr::Struct(vec![("a".into(), arithmetic(&mut random, &schema, 2)), ("t".into(), schema.fields()[2].expression()), ("b".into(), arithmetic(&mut random, &schema, 2))])
+            } else { arithmetic(&mut random, &schema, 3) };
+            let Some(column) = projection::column(&expression, &schema, &batch, &[]).unwrap() else { continue };
+            computed += 1;
+            let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+            let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
+                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
+            for row in 0..batch.len {
+                let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
+                let expected = rtdb_expr::evaluate_projection(&expression, &schema, &values, &context).unwrap();
+                assert_eq!(column.value(row).unwrap(), expected, "{expression:?} on {values:?}");
+            }
+        }
+        assert!(computed > 150, "the kernel should compute most generated projections, computed {computed}");
     }
 
     #[test]
@@ -473,5 +542,170 @@ impl BatchCursor for BatchProject {
 impl Column {
     fn duplicate(&self) -> Self {
         match self { Self::Arrow { array, field, logical } => Self::Arrow { array: Arc::clone(array), field: Arc::clone(field), logical: logical.clone() }, Self::Values(values) => Self::Values(values.clone()) }
+    }
+}
+
+/// Projects batches through expressions computed over whole columns where the kernel's arithmetic is exactly the
+/// evaluator's, and row by row through the evaluator for any expression or batch where it isn't.
+pub(crate) struct BatchExpressions { input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution }
+impl BatchExpressions {
+    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self { Self { input, schema, expressions, execution } }
+}
+#[async_trait::async_trait]
+impl BatchCursor for BatchExpressions {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
+        self.execution.context.check_cancelled()?;
+        let parameters = self.execution.parameters.values();
+        let mut page = None;
+        let mut columns = Vec::with_capacity(self.expressions.len());
+        for expression in &self.expressions {
+            if let Some(column) = projection::column(expression, &self.schema, &batch, parameters)? { columns.push(column); continue; }
+            if page.is_none() { page = Some(batch.rows(&self.execution.context.memory)?); }
+            let rows = page.as_ref().expect("rows were materialised for the evaluator");
+            let metadata = self.execution.scope()?;
+            let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
+            let scope = self.execution.scope()?;
+            let mut values = Vec::with_capacity(batch.len);
+            for row in rows.rows() {
+                values.push(self.execution.evaluate_invocation(&scope, &invocation, &row.values).await?);
+                scope.reset()?;
+            }
+            columns.push(Column::Values(values));
+        }
+        ColumnBatch::new(columns, batch.len, &self.execution.context.memory).map(Some)
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+/// Column-at-a-time projection for input columns, scalar constants, `+ - *` over 64-bit integers and floats, and
+/// records of those; `Ok(None)` where the evaluator must compute it, including any integer overflow, so its error is raised.
+pub(crate) mod projection {
+    use std::sync::Arc;
+    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array};
+    use arrow_schema::{DataType, Field as ArrowField};
+    use rtdb_plan::{BinaryOp, Expr, Schema};
+    use rtdb_types::{LogicalType, Result, ScalarType, StructFields, Value};
+    use super::{Column, ColumnBatch};
+
+    #[derive(Clone, Copy)]
+    enum Number { Int(i64), Float(f64) }
+    enum Numbers<'a> { Int(&'a Int64Array), Float(&'a Float64Array), Constant(Option<Number>) }
+    impl Numbers<'_> {
+        fn get(&self, row: usize) -> Option<Number> {
+            match self {
+                Self::Int(array) => array.is_valid(row).then(|| Number::Int(array.value(row))),
+                Self::Float(array) => array.is_valid(row).then(|| Number::Float(array.value(row))),
+                Self::Constant(number) => *number,
+            }
+        }
+        fn floating(&self) -> Option<bool> { match self { Self::Int(_) => Some(false), Self::Float(_) => Some(true), Self::Constant(Some(Number::Float(_))) => Some(true), Self::Constant(Some(Number::Int(_))) => Some(false), Self::Constant(None) => None } }
+    }
+    fn constant(value: &Value) -> Option<Option<Number>> {
+        match value {
+            Value::Null => Some(None),
+            Value::I8(value) => Some(Some(Number::Int(i64::from(*value)))), Value::I16(value) => Some(Some(Number::Int(i64::from(*value)))),
+            Value::I32(value) => Some(Some(Number::Int(i64::from(*value)))), Value::I64(value) => Some(Some(Number::Int(*value))),
+            Value::F64(value) => Some(Some(Number::Float(*value))),
+            _ => None,
+        }
+    }
+    fn numbers<'a>(expr: &Expr, schema: &Schema, batch: &'a ColumnBatch, computed: &'a mut Option<Column>, parameters: &[Value]) -> Result<Option<Numbers<'a>>> {
+        let plain = |logical: &Option<LogicalType>, field: &ArrowField, expected: ScalarType| match logical { Some(LogicalType::Scalar(scalar)) => *scalar == expected, Some(_) => false, None => field.metadata().is_empty() };
+        let array_numbers = |column: &'a Column| -> Option<Numbers<'a>> {
+            let Column::Arrow { array, field, logical } = column else { return None };
+            match array.data_type() {
+                DataType::Int64 if plain(logical, field, ScalarType::I64) => array.as_any().downcast_ref().map(Numbers::Int),
+                DataType::Float64 if plain(logical, field, ScalarType::F64) => array.as_any().downcast_ref().map(Numbers::Float),
+                _ => None,
+            }
+        };
+        Ok(match expr {
+            Expr::Column { id, .. } => schema.position(*id).and_then(|position| array_numbers(&batch.columns[position])),
+            Expr::Literal(value) => constant(value).map(Numbers::Constant),
+            Expr::Parameter { index, .. } => parameters.get(*index).and_then(constant).map(Numbers::Constant),
+            Expr::Binary { .. } => {
+                *computed = arithmetic(expr, schema, batch, parameters)?;
+                computed.as_ref().and_then(array_numbers)
+            }
+            _ => None,
+        })
+    }
+    fn arithmetic(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Result<Option<Column>> {
+        let Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply), left, right } = expr else { return Ok(None) };
+        let (mut left_computed, mut right_computed) = (None, None);
+        let Some(left) = numbers(left, schema, batch, &mut left_computed, parameters)? else { return Ok(None) };
+        let Some(right) = numbers(right, schema, batch, &mut right_computed, parameters)? else { return Ok(None) };
+        if matches!(left, Numbers::Constant(_)) && matches!(right, Numbers::Constant(_)) { return Ok(None); }
+        let floating = match (left.floating(), right.floating()) { (Some(a), Some(b)) => a || b, (Some(a), None) | (None, Some(a)) => a, (None, None) => return Ok(None) };
+        let float = |number: Number| match number { Number::Int(value) => value as f64, Number::Float(value) => value };
+        let (array, scalar): (ArrayRef, ScalarType) = if floating {
+            let values: Float64Array = (0..batch.len).map(|row| match (left.get(row), right.get(row)) {
+                (Some(a), Some(b)) => Some(match op { BinaryOp::Add => float(a) + float(b), BinaryOp::Subtract => float(a) - float(b), _ => float(a) * float(b) }),
+                _ => None,
+            }).collect();
+            (Arc::new(values), ScalarType::F64)
+        } else {
+            let mut values = Vec::with_capacity(batch.len);
+            for row in 0..batch.len {
+                values.push(match (left.get(row), right.get(row)) {
+                    (Some(Number::Int(a)), Some(Number::Int(b))) => match match op { BinaryOp::Add => a.checked_add(b), BinaryOp::Subtract => a.checked_sub(b), _ => a.checked_mul(b) } {
+                        Some(value) => Some(value),
+                        None => return Ok(None),
+                    },
+                    _ => None,
+                });
+            }
+            (Arc::new(Int64Array::from(values)), ScalarType::I64)
+        };
+        let field = Arc::new(ArrowField::new("value", array.data_type().clone(), true));
+        Ok(Some(Column::Arrow { array, field, logical: Some(LogicalType::Scalar(scalar)) }))
+    }
+
+    /// Whether an expression has a shape the kernel may compute; its cells' types decide per batch.
+    pub(crate) fn shaped(expr: &Expr) -> bool {
+        match expr {
+            Expr::Column { .. } | Expr::Parameter { .. } => true,
+            Expr::Literal(value) => constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_)),
+            Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => shaped(left) && shaped(right),
+            Expr::Struct(fields) => fields.iter().all(|(_, field)| shaped(field)),
+            _ => false,
+        }
+    }
+    pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Result<Option<Column>> {
+        match expr {
+            Expr::Column { id, .. } => {
+                let Some(position) = schema.position(*id) else { return Ok(None) };
+                Ok(Some(match &batch.columns[position] {
+                    column @ Column::Arrow { .. } => column.duplicate(),
+                    Column::Values(values) => Column::Values(values.iter().map(|value| { let mut value = value.clone(); value.admit_expression_dates()?; Ok(value) }).collect::<Result<_>>()?),
+                }))
+            }
+            Expr::Literal(value) if constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_)) => Ok(Some(Column::Values(vec![value.clone(); batch.len]))),
+            Expr::Binary { .. } => arithmetic(expr, schema, batch, parameters),
+            Expr::Struct(fields) => {
+                let mut columns = Vec::with_capacity(fields.len());
+                for (_, field) in fields {
+                    let Some(column) = column(field, schema, batch, parameters)? else { return Ok(None) };
+                    columns.push(column);
+                }
+                let mut values = Vec::with_capacity(batch.len);
+                for row in 0..batch.len {
+                    let mut document = StructFields::new();
+                    for ((name, _), column) in fields.iter().zip(&columns) {
+                        let mut value = column.value(row)?;
+                        value.admit_box_date()?;
+                        document.insert(name.clone(), value);
+                    }
+                    let mut value = Value::Struct(document);
+                    value.admit_expression_dates()?;
+                    rtdb_expr::validate_projection_value(&value)?;
+                    values.push(value);
+                }
+                Ok(Some(Column::Values(values)))
+            }
+            _ => Ok(None),
+        }
     }
 }

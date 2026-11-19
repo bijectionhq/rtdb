@@ -57,10 +57,16 @@ fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution, pushdowns:
         }
         RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
             let child = runtime.child(0)?;
-            let Some(positions) = expressions.iter().map(|named| match &named.expr { Expr::Column { id,.. } => child.schema().position(*id), _ => None }).collect::<Option<Vec<_>>>() else { return Ok(None) };
+            let positions = expressions.iter().map(|named| match &named.expr { Expr::Column { id,.. } => child.schema().position(*id), _ => None }).collect::<Option<Vec<_>>>();
+            if positions.is_none() && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
+            let schema = child.schema().clone();
             let pushdowns = pushdowns.map(|filters|filters.project(expressions,&execution.context.memory)).transpose()?;
             let Some((batches,_)) = build_batches(child,execution.child(0),pushdowns).await? else { return Ok(None) };
-            Ok(Some((Box::new(crate::columnar::BatchProject::new(batches,positions,Arc::clone(&execution.context.memory))) as crate::columnar::BoxBatchCursor,true)))
+            let batches: crate::columnar::BoxBatchCursor = match positions {
+                Some(positions) => Box::new(crate::columnar::BatchProject::new(batches,positions,Arc::clone(&execution.context.memory))),
+                None => Box::new(crate::columnar::BatchExpressions::new(batches,schema,expressions.iter().map(|named|named.expr.clone()).collect(),execution)),
+            };
+            Ok(Some((batches,true)))
         }
         _ => Ok(None),
     }
@@ -81,6 +87,14 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         let pages = Box::new(crate::patch::PatchGaps::new(input_pages, input.schema(), [*iid, *valid_from, *valid_to, *document], from, to, execution).await?);
         let pages = crate::pages::retain_page_state(pages, state_reservation);
         return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
+    }
+    if let RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } = relation.node()
+        && execution.analysis.is_none() && execution.context.tracer.is_none()
+        && !expressions.iter().all(|named| matches!(named.expr, Expr::Column { .. })) && expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr))
+        && let Some((batches,_)) = build_batches(Arc::clone(&runtime),execution.clone(),pushdowns.clone()).await? {
+        let pages: BoxPageCursor = Box::new(crate::columnar::BatchRows::new(batches,Arc::clone(&execution.context.memory)));
+        let pages = crate::pages::retain_page_state(pages,state_reservation);
+        return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
     }
     match relation.node() {
         RelationNode::Join { kind: rtdb_plan::JoinKind::Cross,.. } => {

@@ -451,7 +451,7 @@ pub async fn evaluate_projection_async(expr: &Expr, schema: &Schema, row: &[Valu
     Ok(value)
 }
 
-fn validate_projection_value(value: &Value) -> Result<()> {
+pub fn validate_projection_value(value: &Value) -> Result<()> {
     match value {
         Value::Decimal(value) => crate::decimal::validate_write(value),
         Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().try_for_each(validate_projection_value),
