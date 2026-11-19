@@ -1522,3 +1522,24 @@ async fn a_write_to_a_read_only_database_is_rejected_by_its_log() {
     assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb/read-only-database", Some("Cannot append to read-only database log")));
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_table_of_wide_heterogeneous_documents_stays_queryable_within_its_budget() {
+    let mut options = options();
+    options.execution_memory_bytes = 64 * 1024 * 1024;
+    let (node, driver) = running(options, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let leaf = |i: i64| match i % 6 {
+        0 => Value::I64(i), 1 => Value::Utf8(format!("s{i}")), 2 => Value::F64(i as f64 / 3.0), 3 => Value::Bool(i % 4 == 0),
+        4 => Value::Timestamp { value: i * 1_000_000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some(format!("+{:02}:00", i % 12)) },
+        _ => Value::Keyword(rtdb_types::Keyword::from_name(&format!("k{i}"))),
+    };
+    for i in 0..60 {
+        let nested = Value::Struct(BTreeMap::from([(format!("f{}", i % 7), leaf(i)), ("l".into(), Value::List((0..(i % 5)).map(|j| leaf(i + j)).collect()))]));
+        let document = BTreeMap::from([("_id".into(), Value::I64(1)), (format!("c{}", i % 9), Value::List(vec![nested, leaf(i + 1)]))]);
+        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document], node.memory()).unwrap(), valid_from: None, valid_to: None };
+        assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    assert_eq!(rows(session.query_sql("SELECT * FROM docs FOR VALID_TIME ALL", vec![]).await.unwrap()).await.len(), 60);
+    stop(&node, driver).await;
+}
