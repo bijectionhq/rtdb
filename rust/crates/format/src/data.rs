@@ -78,6 +78,10 @@ impl EventBatch {
     }
 
     pub fn arrow(&self) -> &RecordBatch { &self.batch }
+    /// The dense union of each row's operation, whose put leg holds its document.
+    pub fn operations(&self) -> Result<&UnionArray> {
+        self.batch.column(self.op).as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Event operation array type changed"))
+    }
     pub fn len(&self) -> usize { self.batch.num_rows() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 

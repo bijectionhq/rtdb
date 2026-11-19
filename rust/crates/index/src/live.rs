@@ -19,6 +19,8 @@ pub struct IndexBatch {
     put_field_types: Vec<LogicalType>,
     system_times: Option<(Timestamp, Timestamp)>,
     canonical_iids: OnceLock<bool>,
+    /// Every row's header, decoded once with the batch: a scan reads each row's several times, and a batch is shared by every query.
+    headers: (Box<[EventHeader]>, Arc<MemoryReservation>),
 }
 
 #[derive(Clone, Copy)]
@@ -42,11 +44,16 @@ impl IndexBatch {
             _ => Vec::new(),
         };
         let mut system_times: Option<(Timestamp, Timestamp)> = None;
+        let header_bytes = events.len().checked_mul(std::mem::size_of::<EventHeader>()).ok_or_else(|| invalid("Event headers exceed addressable memory"))?;
+        let header_reservation = owned.reservation().budget().reserve(header_bytes)?;
+        let mut headers = Vec::with_capacity(events.len());
         for row in 0..events.len() {
-            let time = events.header(row)?.system_from;
+            let header = events.header(row)?;
+            let time = header.system_from;
             system_times = Some(system_times.map_or((time, time), |(first, last)| (first.min(time), last.max(time))));
+            headers.push(header);
         }
-        Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new() }))
+        Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new(), headers: (headers.into_boxed_slice(), header_reservation) }))
     }
     pub fn from_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::Write, budget)
@@ -115,6 +122,9 @@ impl IndexBatch {
         Some(true)
     }
     pub fn view(&self) -> &EventBatch { &self.events }
+    pub fn header(&self, row: usize) -> Result<EventHeader> {
+        self.headers.0.get(row).copied().ok_or_else(|| Anomaly::incorrect("rtdb.index/event-row", "Event row exceeds batch length"))
+    }
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
     pub fn len(&self) -> usize { self.events.len() }
     pub fn is_empty(&self) -> bool { self.events.is_empty() }
@@ -126,7 +136,7 @@ impl IndexBatch {
 #[derive(Clone, Debug)]
 pub struct RowSource { pub batch: Arc<IndexBatch>, pub row: usize }
 impl RowSource {
-    pub fn header(&self) -> Result<EventHeader> { self.batch.view().header(self.row) }
+    pub fn header(&self) -> Result<EventHeader> { self.batch.header(self.row) }
     pub fn event(&self) -> Result<StoredEvent> { self.batch.view().read_event(self.row) }
 }
 
