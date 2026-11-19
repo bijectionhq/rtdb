@@ -95,8 +95,8 @@ impl Context<'_> {
                         let admitted = self.literals.temporal(value.value.span, Temporal::Time, text);
                         Expr::Cast { expr: Box::new(Expr::Literal(admitted)), target: self.cast_target(&value.data_type)? }
                     }
-                    (_, Value::Utf8(text)) if let Some(kind) = CustomStringLiteral::from_type(&value.data_type) => {
-                        match kind {
+                    (_, Value::Utf8(text)) if CustomStringLiteral::from_type(&value.data_type).is_some() => {
+                        match CustomStringLiteral::from_type(&value.data_type).expect("guarded custom literal type") {
                             CustomStringLiteral::Uri => {
                                 rtdb_types::UriParts::parse(text).map_err(|failure| error(format!("Cannot parse uri: {}", failure.message.as_deref().unwrap_or("null"))))?;
                                 Expr::Literal(Value::Uri(text.clone()))

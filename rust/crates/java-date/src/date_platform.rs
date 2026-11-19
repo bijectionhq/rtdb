@@ -122,7 +122,7 @@ fn host_offset(now: i64) -> Result<String> {
     let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
     if unsafe { libc::localtime_r(&time,local.as_mut_ptr()) }.is_null() { return Ok("GMT".into()); }
     let local = unsafe { local.assume_init() };
-    let mut output = [0i8;6];
+    let mut output = [0 as libc::c_char;6];
     if unsafe { libc::strftime(output.as_mut_ptr(),output.len(),c"%z".as_ptr(),&local) } != 5 { return Ok("GMT".into()); }
     let value = bounded_c_string(output.as_ptr(),5)?;
     if value == "+0000" || value == "-0000" { Ok("GMT".into()) } else { Ok(format!("GMT{}:{}",&value[..3],&value[3..])) }
@@ -171,7 +171,7 @@ mod macos {
     fn owned(value: Ref) -> Option<Owned> { (!value.is_null()).then_some(Owned(value)) }
     fn text(value: Ref) -> Option<String> {
         if value.is_null() { return None; }
-        let mut buffer = [0i8;128];
+        let mut buffer = [0 as libc::c_char;128];
         if unsafe { CFStringGetCString(value,buffer.as_mut_ptr(),buffer.len() as isize,CFStringGetSystemEncoding()) } == 0 { return None; }
         super::bounded_c_string(buffer.as_ptr(),127).ok()
     }
