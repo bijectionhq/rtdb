@@ -195,23 +195,22 @@ impl Engine {
             let batch = batch.batch();
             for row in 0..batch.num_rows() {
                 if rows.len() >= options.max_rows { return Err(gap("SLT result exceeded configured row retention limit")); }
-                let mut bound = 1024usize;
-                for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
-                    bound = bound.checked_add(estimate_read_value_bytes(field, array.as_ref(), row)?.checked_mul(8).ok_or_else(|| gap("SLT row size overflow"))?).ok_or_else(|| gap("SLT row size overflow"))?;
-                }
-                bytes = bytes.checked_add(bound).ok_or_else(|| gap("SLT result size overflow"))?;
-                if bytes > options.max_result_bytes { return Err(gap("SLT result exceeded configured byte retention limit")); }
-                charges.push(context.memory.reserve(bound)?);
-                let mut output = Vec::new();
+                let mut output = Vec::with_capacity(types.len().min(batch.num_columns()));
+                let mut retained = output.capacity().checked_mul(std::mem::size_of::<String>()).and_then(|bytes| bytes.checked_add(64)).ok_or_else(|| gap("SLT row size overflow"))?;
                 actual_values += batch.num_columns();
                 for ((kind, field), array) in types.iter().zip(batch.schema().fields()).zip(batch.columns()) {
+                    // Reading and formatting are charged for the cell alone; only its formatted text is retained.
+                    let _read = context.memory.reserve(estimate_read_value_bytes(field, array.as_ref(), row)?.checked_mul(8).ok_or_else(|| gap("SLT row size overflow"))?)?;
                     let value = read_value(field, array.as_ref(), row)?;
-                    let bound = format::allocation_bound(*kind, &value)?.checked_mul(4).ok_or_else(|| gap("SLT formatted size overflow"))?;
-                    bytes = bytes.checked_add(bound).ok_or_else(|| gap("SLT result size overflow"))?;
-                    if bytes > options.max_result_bytes { return Err(gap("SLT result exceeded configured byte retention limit")); }
-                    charges.push(context.memory.reserve(bound)?);
-                    output.push(format::cell(*kind, &value, bound / 4)?);
+                    let bound = format::allocation_bound(*kind, &value)?;
+                    let _formatting = context.memory.reserve(bound.checked_mul(4).ok_or_else(|| gap("SLT formatted size overflow"))?)?;
+                    let text = format::cell(*kind, &value, bound)?;
+                    retained = retained.checked_add(text.capacity()).ok_or_else(|| gap("SLT result size overflow"))?;
+                    output.push(text);
                 }
+                bytes = bytes.checked_add(retained).ok_or_else(|| gap("SLT result size overflow"))?;
+                if bytes > options.max_result_bytes { return Err(gap("SLT result exceeded configured byte retention limit")); }
+                charges.push(context.memory.reserve(retained)?);
                 rows.push(output);
             }
         }
