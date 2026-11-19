@@ -1,5 +1,5 @@
 use rtdb_types::StructFields;
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
+use std::{future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, Value};
 use super::{EvalContext, boolean, integer, nullish, overflow};
@@ -16,7 +16,7 @@ enum Kind { List, Set, Fixed }
 #[derive(Clone)]
 enum EvalValue<'a> {
     Scalar(Value),
-    Struct(Arc<BTreeMap<String,EvalValue<'a>>>),
+    Struct(Arc<StructFields<EvalValue<'a>>>),
     List(Kind,Arc<ListReader<'a>>),
 }
 
@@ -296,7 +296,7 @@ fn from_value<'a>(value: Value,frame: &EvaluationFrame<'_>) -> Result<EvalValue<
         Value::Set(values) => make_list(Kind::Set,ListReader::Values(values),frame),
         Value::FixedSizeList(values) => make_list(Kind::Fixed,ListReader::Values(values),frame),
         Value::Struct(fields) => {
-            let mut cells = BTreeMap::new();
+            let mut cells = StructFields::new();
             for (name,value) in fields { frame.context.reserve(4096)?;cells.insert(name,box_cell(from_value(value,frame)?)?); }
             frame.context.reserve(256)?;
             Ok(EvalValue::Struct(Arc::new(cells)))
@@ -438,7 +438,7 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
         match expr {
             Expr::List(items) => make_list(Kind::List,ListReader::Expressions(items),frame),
             Expr::Struct(fields) => {
-                let mut values = BTreeMap::new();
+                let mut values = StructFields::new();
                 for (name,expr) in fields {
                     frame.context.reserve(name.len().checked_add(4096).ok_or_else(overflow)?)?;
                     values.insert(name.clone(),box_cell(evaluate(expr,frame)?.await?)?);

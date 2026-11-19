@@ -34,9 +34,10 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
                 Ok(if unknown { None } else { Some(true) })
             }
             (EvalValue::Struct(a),EvalValue::Struct(b)) => {
-                if !a.keys().eq(b.keys()) { return Ok(Some(false)); }
+                if a.len() != b.len() || a.keys().any(|key| !b.contains_key(key)) { return Ok(Some(false)); }
                 let mut unknown = false;
-                for (a,b) in a.values().zip(b.values()) {
+                for (key,a) in a.iter() {
+                    let b = &b[key];
                     match equal_cells(clone_value(a,frame)?,clone_value(b,frame)?,strict,frame)?.await? {
                         Some(false) => return Ok(Some(false)),None => unknown = true,_ => (),
                     }

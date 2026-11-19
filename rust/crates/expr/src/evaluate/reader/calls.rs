@@ -180,7 +180,7 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
         if name == "_patch" {
             let left = values.remove(0);let right = values.remove(0);
             let EvalValue::Struct(right) = right else { return Err(invalid("_patch")); };
-            let mut fields = BTreeMap::new();
+            let mut fields = rtdb_types::StructFields::new();
             if let EvalValue::Struct(left) = &left {
                 for (key,value) in left.iter() {
                     frame.context.reserve(key.len().checked_add(4096).ok_or_else(overflow)?)?;

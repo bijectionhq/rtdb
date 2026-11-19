@@ -1,5 +1,5 @@
 use rtdb_types::{OrderedSet, StructFields};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, UnionFields, UnionMode};

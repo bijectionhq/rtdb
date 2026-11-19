@@ -1656,3 +1656,23 @@ async fn a_put_error_names_its_table_and_a_patch_error_does_not() {
     assert!(!error.context.contains_key("table"), "the reference's patch path adds no table: {:?}", error.context);
     drop(session); stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_stored_struct_reads_back_with_its_fields_in_written_order() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let data = Value::Struct(StructFields::from([("foo".into(), Value::I64(1)), ("bar".into(), Value::I64(2))]));
+    let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::I64(1)), ("data".into(), data.clone())])], node.memory()).unwrap();
+    let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents, valid_from: None, valid_to: None };
+    assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
+    let insert = TxOp::Sql { sql: "INSERT INTO sql_docs (_id, data) VALUES (1, OBJECT(foo: 1, bar: 2))".into(), args: None };
+    assert!(session.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap().committed());
+    for table in ["docs", "sql_docs"] {
+        let cursor = session.query_sql(&format!("SELECT data FROM {table}"), vec![]).await.unwrap();
+        let Value::Struct(fields) = &rows(cursor).await[0][0] else { panic!("Expected a struct") };
+        assert_eq!(fields.keys().collect::<Vec<_>>(), ["foo", "bar"], "{table}");
+    }
+    let equal = rows(session.query_sql("SELECT OBJECT(a: 1, b: 2) = OBJECT(b: 2, a: 1), OBJECT(a: 1) = OBJECT(a: 1, b: 2)", vec![]).await.unwrap()).await;
+    assert_eq!(equal, [vec![Value::Bool(true), Value::Bool(false)]], "structs compare as maps whatever their field order");
+    drop(session); stop(&node, driver).await;
+}
