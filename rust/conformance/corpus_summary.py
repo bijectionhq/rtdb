@@ -3,8 +3,9 @@
 Errors raised because a test reaches a JVM-only API (a cast to xtdb.api.Xtdb, NodeBase or the database catalog)
 are reported as jvm-api-boundary: the binding documents those types as a migration boundary, so such Vars
 cannot run natively without changing the original test. So are Vars that read the JVM node's system map for a port
-(their URL has an empty port), plan a logical operator the test itself defines on the JVM, or configure the
-test-namespace in-memory object store. Vars that need cloud CLIs, cloud credentials or real cloud endpoints report
+(their URL has an empty port) or its pgwire server's state atom and connection futures, plan a logical operator the
+test itself defines on the JVM, or configure the
+test-namespace in-memory object store. Vars that need cloud CLIs, cloud credentials, real cloud endpoints or a Docker build context report
 environment-unavailable. A failed assertion on the spills a test counts by redefining the JVM's temporary-directory
 function observes JVM operator internals, so it reports jvm-internal.
 """
@@ -21,8 +22,9 @@ BOUNDARY = re.compile(
     r"NativeDatabase cannot be cast to class clojure\.lang\.(Associative|ILookup|IPersistentMap)|"
     r"Unsupported native start-node options|No serializer found for class|plans through the JVM database catalog|"
     r"plans a logical operator it defines on the JVM|Unknown object store configuration tag '!InMemory'|"
-    r"jdbc:(postgresql|xtdb)://localhost:/")
-ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|Unable to load credentials from any of the providers|'
+    r"jdbc:(postgresql|xtdb)://localhost:/|"
+    r'Cannot invoke "clojure\.lang\.IAtom\.swap\(.*because "atom" is null|Cannot invoke "java\.util\.concurrent\.Future\.get\(\)" because "fut" is null')
+ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|working dir should be core2 root \(with Dockerfile\)|Unable to load credentials from any of the providers|'
                          r'error occurred while loading credentials|POST https://oauth\d*\.googleapis\.com/token|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
 JVM_INTERNAL = re.compile(r"\(clojure\.core/deref !spills\)")
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")

@@ -47,7 +47,7 @@ tasks.register<JavaExec>("corpus") {
     args("-m", "xtdb.rust.corpus")
     providers.gradleProperty("corpusNs").orNull?.let { args(it.split(",")) }
     javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(25)) })
-    jvmArgs("--enable-native-access=ALL-UNNAMED", "--add-opens=java.base/java.nio=ALL-UNNAMED", "-Xmx4g")
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "--add-opens=java.base/java.nio=ALL-UNNAMED", "-Xmx4g", "-XX:-OmitStackTraceInFastThrow")
     systemProperty("io.netty.noUnsafe", "false")
     systemProperty("io.netty.tryReflectionSetAccessible", "true")
     systemProperty("xtdb.corpus.root", rootProject.file("src/test/clojure").absolutePath)
