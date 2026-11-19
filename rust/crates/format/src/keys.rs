@@ -85,13 +85,13 @@ impl TableSlug {
     pub fn metadata_key(&self, trie: &TrieKey) -> String { format!("{}/meta/{trie}.arrow", self.table_prefix()) }
 
     /// Every artefact derived from one trie lives under this prefix, so collecting the trie can list and delete them all.
-    pub fn artefact_prefix(&self, trie: &TrieKey) -> String { format!("{}/artefacts/{trie}/", self.table_prefix()) }
+    pub fn artefact_prefix(&self, trie: &TrieKey) -> String { format!("{}/artefacts/{trie}", self.table_prefix()) }
 
     pub fn artefact_key(&self, trie: &TrieKey, kind: &str, definition_id: &str, definition_version: i32) -> Result<String> {
         for component in [kind, definition_id] {
             if component.is_empty() || matches!(component, "." | "..") || component.contains(['/', '\\', '\0']) { return Err(invalid_key(component)); }
         }
-        Ok(format!("{}{kind}/{definition_id}-v{definition_version}.bin", self.artefact_prefix(trie)))
+        Ok(format!("{}/{kind}/{definition_id}-v{definition_version}.bin", self.artefact_prefix(trie)))
     }
 
     pub fn block_key(&self, block: BlockIndex) -> Result<String> {

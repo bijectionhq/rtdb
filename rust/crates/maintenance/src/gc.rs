@@ -89,6 +89,11 @@ impl TrieCollector {
                 let key = &chunk[index];
                 let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                 if cancellation.is_cancelled() { return Err(crate::closed()); }
+                // Artefacts carry the data file's content, so they go first; listing catches any whose record has not reached this catalog.
+                let artefacts = ObjectKey::new(entry.slug.artefact_prefix(key)).map_err(crate::invalid)?;
+                for artefact in self.store.list(Some(&artefacts)).await.map_err(crate::invalid)? {
+                    self.store.delete(&artefact.key).await.map_err(crate::invalid)?;
+                }
                 self.store.delete(&ObjectKey::new(entry.slug.data_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)?;
                 self.store.delete(&ObjectKey::new(entry.slug.metadata_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)
             }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<Result<()>>>().await;
