@@ -424,6 +424,8 @@ impl Compiler<'_, '_> {
     }
 
     fn join(&mut self, left: Bound, mut right: Bound, outer: bool, apply: Option<Vec<(usize, PExpr)>>) -> Result<Bound> {
+        // As in the reference's left-outer apply, a dependent-side variable replaces the outer one it unifies with.
+        let dependent_wins = outer && apply.is_some();
         let shared: Vec<_> = left.variables.iter().filter_map(|(name, left)| right.variables.get(name).map(|right| (left.clone(), right.clone()))).collect();
         let relation = if let Some(mut arguments) = apply {
             for (left, right_field) in &shared {
@@ -441,7 +443,7 @@ impl Compiler<'_, '_> {
         let mut variables = left.variables;
         for (name, mut field) in right.variables {
             if outer { field.data_type = field.data_type.maybe(); }
-            variables.entry(name).or_insert(field);
+            if dependent_wins { variables.insert(name, field); } else { variables.entry(name).or_insert(field); }
         }
         self.visible(Bound { relation: Arc::new(relation), variables })
     }

@@ -1555,3 +1555,17 @@ async fn now_in_an_xtql_temporal_filter_is_the_query_time() {
     assert_eq!(rows(session.query_xtql(at_now, vec![]).await.unwrap()).await, [vec![Value::I64(7)]]);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_left_join_through_an_argument_subquery_takes_the_dependent_binding() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    for (id, b) in [(1, 1), (2, 3), (3, 0)] {
+        let document = BTreeMap::from([("_id".into(), Value::I64(id)), ("a".into(), Value::I64(2)), ("b".into(), Value::I64(b))]);
+        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document], node.memory()).unwrap(), valid_from: None, valid_to: None };
+        assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    let query = "(-> (unify (from :docs [{:xt/id id} a b]) (left-join [(fn [a] (rel [{:b a}] [b])) (+ a 1)] [b])) (order-by id) (return id b))";
+    assert_eq!(rows(session.query_xtql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1), Value::Null], vec![Value::I64(2), Value::I64(3)], vec![Value::I64(3), Value::Null]]);
+    stop(&node, driver).await;
+}
