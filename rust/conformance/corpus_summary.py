@@ -7,7 +7,8 @@ cannot run natively without changing the original test. So are Vars that read th
 test itself defines on the JVM, or configure the
 test-namespace in-memory object store. Vars that need cloud CLIs, cloud credentials, real cloud endpoints or a Docker build context report
 environment-unavailable. A failed assertion on the spills a test counts by redefining the JVM's temporary-directory
-function observes JVM operator internals, so it reports jvm-internal.
+function observes JVM operator internals, so it reports jvm-internal, as do the Vars in JVM_INTERNAL_VARS, whose
+assertions hold only through a with-redefs of a JVM implementation var.
 """
 
 import argparse
@@ -17,7 +18,7 @@ import pathlib
 import re
 
 BOUNDARY = re.compile(
-    r"cannot be cast to class xtdb\.api\.Xtdb\b|xtdb\.NodeBase|xtdb\.database\.Database\$Catalog|"
+    r"cannot be cast to class xtdb\.api\.Xtdb\b|xtdb\.NodeBase|xtdb\.database\.Database\$Catalog|Cannot invoke \"xtdb\.database\.DatabaseCatalog\.|"
     r"cannot be cast to class xtdb\.api\.Xtdb\$Connection|No implementation of method: :\S+ of protocol: #'xtdb\.(db|node)|"
     r"NativeDatabase cannot be cast to class clojure\.lang\.(Associative|ILookup|IPersistentMap)|"
     r"Unsupported native start-node options|No serializer found for class|plans through the JVM database catalog|"
@@ -27,6 +28,8 @@ BOUNDARY = re.compile(
 ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|working dir should be core2 root \(with Dockerfile\)|Unable to load credentials from any of the providers|'
                          r'error occurred while loading credentials|POST https://oauth\d*\.googleapis\.com/token|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
 JVM_INTERNAL = re.compile(r"\(clojure\.core/deref !spills\)")
+# Vars whose assertions hold only through a with-redefs of a JVM implementation var, which the native engine never reads.
+JVM_INTERNAL_VARS = {"xtdb.pgwire-test/canned-response-test": "redefines xtdb.pgwire/canned-responses"}
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 
 
@@ -37,6 +40,8 @@ def outcome(row):
     if row["result"] in ("error", "fail") and ENVIRONMENT.search(detail):
         return "environment-unavailable"
     if row["result"] == "fail" and JVM_INTERNAL.search(detail):
+        return "jvm-internal"
+    if row["result"] in ("error", "fail") and row["var"] in JVM_INTERNAL_VARS:
         return "jvm-internal"
     return row["result"]
 
