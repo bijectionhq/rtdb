@@ -215,6 +215,10 @@ pub(crate) fn allocation_bound(relation: &Relation) -> Result<usize> {
 
 fn field_type(field: &Field, data_type: L) -> Field { let mut field = field.clone(); field.data_type = data_type; field }
 fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc<EmittedRelation>> {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || relation_types_at(relation, emitter))
+}
+
+fn relation_types_at(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc<EmittedRelation>> {
     let type_of = |expr: &Expr, input: &Schema| expression_type(expr, input, emitter);
     let mut children = Vec::new();
     let mut aggregates = Vec::new();

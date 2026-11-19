@@ -125,7 +125,19 @@ fn superseded(outer: &[NamedExpr], input: &Arc<Relation>) -> Option<(Arc<Relatio
     Some((Arc::clone(inner_input), expressions))
 }
 
+/// Selects beneath an existing selection by extending its conjunction rather than stacking another.
+fn filter(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
+    match input.node() {
+        RelationNode::Filter { input: child, predicate: existing } => Ok(Arc::new(Arc::clone(child).filter(Expr::binary(BinaryOp::And, existing.clone(), predicate))?)),
+        _ => Ok(Arc::new(input.filter(predicate)?)),
+    }
+}
+
 fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || select_at(input, predicate))
+}
+
+fn select_at(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
     if matches!(predicate, Expr::Binary { op: BinaryOp::And, .. }) {
         let mut remaining = vec![predicate];
         let mut conjuncts = Vec::new();
@@ -140,7 +152,7 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
     }
     let columns = predicate.referenced_columns();
     if columns.is_empty() {
-        return Ok(Arc::new(input.filter(predicate)?));
+        return filter(input, predicate);
     }
     match input.node() {
         RelationNode::Project { input: child, expressions }
@@ -154,7 +166,7 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
                         replacements.insert(*id, (*source, data_type.clone()));
                     }
                     None if retains_child_fields && child.schema().get(*id).is_some() => {}
-                    _ => return Ok(Arc::new(input.filter(predicate)?)),
+                    _ => return filter(input, predicate),
                 }
             }
             let child = select(Arc::clone(child), replace(predicate, &replacements))?;
@@ -166,10 +178,7 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
             };
             Ok(Arc::new(Relation::new(input.schema().clone(), node)?))
         }
-        RelationNode::Filter { input: child, predicate: existing } => {
-            let child = select(Arc::clone(child), predicate)?;
-            Ok(Arc::new(Relation::new(input.schema().clone(), RelationNode::Filter { input: child, predicate: existing.clone() })?))
-        }
+        RelationNode::Filter { input: child, predicate: existing } => filter(select(Arc::clone(child), predicate)?, existing.clone()),
         RelationNode::Join { left, right, kind, condition } => {
             let within = |side: &Relation| columns.iter().all(|id| side.schema().get(*id).is_some());
             let (in_left, in_right) = (within(left), within(right));
@@ -186,7 +195,7 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
                 let condition = Some(match condition { Some(existing) => Expr::binary(BinaryOp::And, existing.clone(), predicate), None => predicate });
                 return join(Arc::clone(left), Arc::clone(right), JoinKind::Inner, condition);
             }
-            Ok(Arc::new(input.filter(predicate)?))
+            filter(input, predicate)
         }
         RelationNode::Unnest { input: child, expr, element, ordinality, outer }
             if columns.iter().all(|id| child.schema().get(*id).is_some()) => {
@@ -204,7 +213,7 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
             scan.predicates.sort_by_key(|predicate| scan.columns.iter().position(|field| predicate.referenced_columns().contains(&field.id)));
             Ok(Arc::new(Relation::scan(scan)?))
         }
-        _ => Ok(Arc::new(input.filter(predicate)?)),
+        _ => filter(input, predicate),
     }
 }
 
