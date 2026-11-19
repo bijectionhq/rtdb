@@ -350,12 +350,14 @@ pub struct TransactionBuffer {
     tx_key: TransactionKey,
     budget: Arc<MemoryBudget>,
     tables: BTreeMap<TableRef, PendingTable>,
+    /// Each table's transaction segment as last read, with the events and declarations it holds; a read appends only what was written since.
+    segments: std::sync::Mutex<BTreeMap<TableRef, (Arc<LiveTable>, usize, StructFields<LogicalType>)>>,
 }
 
 impl TransactionBuffer {
     pub fn new(base: Snapshot, tx_key: TransactionKey, budget: Arc<MemoryBudget>) -> Result<Self> {
         StagedWrite::new(tx_key, base.tx_basis(), base.block_index(), BTreeMap::new())?;
-        Ok(Self { base, tx_key, budget, tables: BTreeMap::new() })
+        Ok(Self { base, tx_key, budget, tables: BTreeMap::new(), segments: Default::default() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.tx_key }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> {
@@ -405,7 +407,21 @@ impl TransactionBuffer {
         pending.reservations.push(reservation);
         Ok(())
     }
-    pub fn snapshot(&self) -> Result<Snapshot> { self.base.with_staged(&[Arc::new(self.materialize()?)]) }
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
+        for (table, pending) in &self.tables {
+            let (segment, done, declared) = match segments.get(table) {
+                Some((segment, done, declared)) => (Arc::clone(segment), *done, Some(declared)),
+                None => (Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())), 0, None),
+            };
+            if done == pending.events.len() && declared == Some(&pending.declared) { continue; }
+            let batch = (done < pending.events.len()).then(|| IndexBatch::copy_events(&pending.events[done..], &pending.declared, &self.budget)).transpose()?;
+            let segment = Arc::new(segment.append(&TableWrite::new(pending.declared.clone(), batch), self.tx_key.system_time)?);
+            segments.insert(table.clone(), (segment, pending.events.len(), pending.declared.clone()));
+        }
+        let current = segments.iter().map(|(table, (segment, ..))| (table.clone(), Arc::clone(segment))).collect();
+        self.base.with_transaction_segments(self.tx_key, &current)
+    }
     pub fn stage(self) -> Result<StagedWrite> { self.materialize() }
     fn materialize(&self) -> Result<StagedWrite> {
         let tables = self.tables.iter().map(|(table, pending)| {

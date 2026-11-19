@@ -105,6 +105,15 @@ impl Snapshot {
         }).collect()
     }
 
+    /// Layers a transaction's own segments over this snapshot, as staging its whole write would.
+    pub fn with_transaction_segments(&self, tx_key: rtdb_types::TransactionKey, segments: &std::collections::BTreeMap<TableRef, Arc<LiveTable>>) -> Result<Self> {
+        let mut next = self.clone();
+        for (table, segment) in segments { next.layered.entry(table.clone()).or_default().push(Arc::clone(segment)); }
+        next.table_catalog = Arc::new(next.table_catalog.with_entries_for(segments.keys().cloned())?);
+        next.basis = Some(tx_key);
+        next.system_time_cap = Some(tx_key.system_time);
+        Ok(next)
+    }
     pub fn with_staged(&self, staged: &[Arc<StagedWrite>]) -> Result<Self> {
         let mut next = self.clone();
         for write in staged {

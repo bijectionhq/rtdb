@@ -59,7 +59,12 @@ async fn external_writer_query_admits_sql_and_reads_its_own_staged_rows() {
             drop(page);
             assert!(query.next_batch().await?.is_none());
             drop(query);
-            assert_eq!(self.0.used_bytes(), staged);
+            let cached = self.0.used_bytes();
+            assert!(cached >= staged, "the transaction keeps the segment its reads see");
+            let mut again = transaction.open_query("SELECT v FROM docs", Vec::new()).await?;
+            while again.next_batch().await?.is_some() {}
+            drop(again);
+            assert_eq!(self.0.used_bytes(), cached, "a second read of unchanged writes retains nothing more");
             Ok(WriterResult::Committed { user_metadata: None })
         }
     }
