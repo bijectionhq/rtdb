@@ -261,7 +261,12 @@ impl ProtocolSession {
         let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, _bind_storage: None };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
-            (Some(PreparedKind::Query(query)), _) => { let checked = !self.session.state().is_read_write(); let context = self.session.query_context_with(&token, checked).await?; Some(query.open_query(context, std::mem::take(&mut portal.arguments)).await?) },
+            (Some(PreparedKind::Query(query)), _) => {
+                let _active = self.cancellations.enter(&token);
+                let checked = !self.session.state().is_read_write();
+                let context = self.session.query_context_with(&token, checked).await?;
+                Some(token.run_until_cancelled(query.open_query(context, std::mem::take(&mut portal.arguments))).await.ok_or_else(cancelled)??)
+            },
             (_, Some(statement @ ControlStatement::Show { .. })) => match self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? { ControlResult::Rows(cursor) => Some(cursor), _ => return Err(protocol("SHOW did not produce rows")) },
             (_, Some(statement @ ControlStatement::Execute { .. })) => {
                 let ControlResult::Execute { name, arguments, reservation, allocation: _allocation } = self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? else { return Err(protocol("EXECUTE did not produce arguments")); };

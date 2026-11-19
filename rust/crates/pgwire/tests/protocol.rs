@@ -148,6 +148,27 @@ async fn sql_parse_failures_return_anomaly_details_and_an_idle_connection() {
     running.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_request_stops_a_large_sorted_query() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("", "FROM GENERATE_SERIES(1,4000000) AS system(_id) ORDER BY _id", &[]).await;
+    client.bind("", "").await; client.execute("", 0).await; client.send(b'S', &[]).await;
+    let (address, process) = (running.server.address(), client.process);
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket.write_i32(16).await.unwrap(); socket.write_i32(80877102).await.unwrap(); socket.write_i32(process).await.unwrap(); socket.write_i32(0).await.unwrap(); socket.flush().await.unwrap();
+    });
+    let started = std::time::Instant::now();
+    let frames = client.through(b'Z').await;
+    canceller.await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10), "cancellation took {:?}", started.elapsed());
+    let error = frames.iter().find(|frame| frame.0 == b'E').expect("an error");
+    assert_eq!(error_fields(&error.1).0, "57014");
+    drop(client); running.stop().await;
+}
+
 #[tokio::test]
 async fn begin_syntax_errors_report_the_grammar_diagnostic() {
     let running = Running::start(ServerConfig::default(), None).await;

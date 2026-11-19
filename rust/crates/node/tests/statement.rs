@@ -57,6 +57,21 @@ async fn an_xtql_query_of_a_table_absent_when_prepared_and_executed_returns_no_r
     let mut cursor = prepared.open_query(context, vec![]).await.unwrap();
     while let Some(page) = cursor.next_batch().await.unwrap() { assert_eq!(page.batch().num_rows(), 0); }
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_large_sorted_series_stops_it_promptly() {
+    let memory = MemoryBudget::new(1 << 30);
+    let token = CancellationToken::new();
+    let database = DatabaseSnapshot { partitions: Vec::new(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions::default(), &token).unwrap();
+    let prepared = PreparedSql::prepare("FROM GENERATE_SERIES(1,10000000) AS system(_id) ORDER BY _id", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let canceller = { let token = token.clone(); tokio::spawn(async move { tokio::time::sleep(std::time::Duration::from_millis(2000)).await; token.cancel(); }) };
+    let started = std::time::Instant::now();
+    let result = async { let mut cursor = prepared.open_query(context, vec![]).await?; while cursor.next_batch().await?.is_some() {} Ok::<_, Anomaly>(()) }.await;
+    canceller.await.unwrap();
+    assert!(result.is_err(), "the query ran to completion");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "cancellation took {:?}", started.elapsed());
+}
 fn write(state: &PartitionState, tx: i64, value: Value, memory: &Arc<MemoryBudget>) {
     let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(memory)).unwrap();
     buffer.put(TableRef::new("public", "docs"), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), value)]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
