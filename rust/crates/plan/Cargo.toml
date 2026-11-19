@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+stacker.workspace = true
 async-trait.workspace = true
 rtdb-types.workspace = true
 serde.workspace = true

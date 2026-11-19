@@ -272,6 +272,9 @@ impl Expr {
     }
 
     pub fn data_type(&self) -> LogicalType {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.data_type_at())
+    }
+    fn data_type_at(&self) -> LogicalType {
         use BinaryOp as B;
         use UnaryOp as U;
         match self {

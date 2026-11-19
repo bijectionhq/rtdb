@@ -39,6 +39,9 @@ fn retained_type(ty: &LogicalType,frame: &EvaluationFrame<'_>) -> Result<Logical
     Ok(ty.unencoded())
 }
 pub(super) fn emitted_type(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalType> {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || emitted_type_at(expr,frame))
+}
+fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalType> {
     let child = |expr: &Expr| emitted_type(expr,frame);
     Ok(match expr {
         Expr::Literal(value) => { frame.context.reserve(value_type_bound(value)?.checked_mul(8).ok_or_else(overflow)?)?;value.logical_type() }

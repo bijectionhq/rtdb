@@ -4227,6 +4227,7 @@ dependencies = [
  "rtdb-types",
  "serde",
  "serde_json",
+ "stacker",
 ]
 
 [[package]]
@@ -4252,6 +4253,7 @@ dependencies = [
  "rtdb-types",
  "serde",
  "serde_json",
+ "stacker",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -4365,6 +4367,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlparser",
+ "stacker",
  "tokio",
  "tokio-util",
 ]

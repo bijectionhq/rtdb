@@ -23,7 +23,8 @@ impl Context<'_> {
     }
 
     pub(crate) fn expr_bound(&mut self, expression: &ast::Expr, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
-        self.expr_inner(expression, input, replacements).map_err(|anomaly| {
+        // Binding recurses once per expression level; the parser admits deeper nesting than a worker thread's stack holds.
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.expr_inner(expression, input, replacements)).map_err(|anomaly| {
             if anomaly.context.contains_key("span") { anomaly }
             else { let span = crate::parse::source_span(self.source, expression.span()); anomaly.with_context("span", serde_json::json!({"start":span.start,"end":span.end})).with_context("position", serde_json::json!(span.start + 1)) }
         })

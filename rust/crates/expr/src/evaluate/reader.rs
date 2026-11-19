@@ -60,6 +60,9 @@ fn value_type_bound(value: &Value) -> Result<usize> {
 }
 
 fn expression_type_bound(expr: &Expr) -> Result<usize> {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || expression_type_bound_at(expr))
+}
+fn expression_type_bound_at(expr: &Expr) -> Result<usize> {
     let mut bytes = 512usize;
     let mut add = |value: usize| -> Result<()> { bytes = bytes.checked_add(value).ok_or_else(overflow)?;Ok(()) };
     match expr {
@@ -143,7 +146,18 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
 
 fn boxed<'a,T>(future: impl Future<Output=Result<T>> + Send + 'a, frame: &EvaluationFrame<'_>) -> Result<Pending<'a,T>> {
     frame.context.reserve(std::mem::size_of_val(&future).checked_add(256).ok_or_else(overflow)?)?;
-    Ok(Box::pin(future))
+    Ok(Box::pin(GrowStack(future)))
+}
+
+/// Polls its future with stack to spare: each expression level nests one poll inside its parent's.
+struct GrowStack<F>(F);
+impl<F: Future> Future for GrowStack<F> {
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
+        // SAFETY: the inner future is structurally pinned; it is never moved out of or replaced.
+        let inner = unsafe { self.map_unchecked_mut(|grow| &mut grow.0) };
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || inner.poll(cx))
+    }
 }
 
 fn invalid(name: &str) -> Anomaly { Anomaly::incorrect("xtdb/invalid-argument-types",format!("{name} is not applicable to these collection values")) }

@@ -326,6 +326,10 @@ fn tokenize_into(
     })
 }
 
+/// Nesting the reference grammar parses: its generated parser has no depth limit, and the SQLite logic corpus nests boolean predicates
+/// well beyond the vendor parser's default of 50. The vendor parser grows its stack as it recurses.
+const STATEMENT_RECURSION_LIMIT: usize = 256;
+
 pub fn parse(sql: &str) -> Result<Vec<ParsedStatement<'_>>> {
     parse_with(sql, crate::bind::FormAllocation::Untracked)
 }
@@ -388,7 +392,7 @@ pub(super) fn parse_statement_syntax<'input>(
     let mut statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
         let patch = word(tokens.first(), "PATCH");
         let start = if word(tokens.get(1), "INTO") { 2 } else { 1 };
-        let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
+        let mut parser = Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens[start..].to_vec());
         let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
         if patch {
             let end = table.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
@@ -402,7 +406,7 @@ pub(super) fn parse_statement_syntax<'input>(
         Syntax::Records { patch, table, records }
     } else if word(tokens.first(), "CREATE") && (word(tokens.get(1), "TABLE") || (word(tokens.get(1), "OR") && word(tokens.get(2), "ALTER") && word(tokens.get(3), "TABLE"))) {
         let start = if word(tokens.get(1), "TABLE") { 2 } else { 4 };
-        let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
+        let mut parser = Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens[start..].to_vec());
         let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
         let mut columns = Vec::new();
         if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
@@ -425,7 +429,7 @@ pub(super) fn parse_statement_syntax<'input>(
         let ast::Statement::Delete(delete) = statement else { return Err(sql_error("ERASE must target a table", sql, slice[0].span)); };
         Syntax::Erase(delete)
     } else if word(tokens.first(), "ASSERT") {
-        let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[1..].to_vec());
+        let mut parser = Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens[1..].to_vec());
         let expression = dialect.checked(parser.parse_expr()).map_err(|error| parser_error(error, sql, slice[0].span))?;
         let message = if parser.consume_token(&Token::Comma) {
             match parser.next_token().token { Token::SingleQuotedString(message) => Some(message), _ => return Err(sql_error("ASSERT message must be a string", sql, slice[0].span)) }
@@ -457,7 +461,7 @@ pub(super) fn parse_statement_syntax<'input>(
 fn standard(tokens: Vec<TokenWithSpan>, source: &str) -> Result<ast::Statement> {
     let at = tokens.first().map(|token| token.span).unwrap_or_else(Span::empty);
     let dialect = SqlDialect::default();
-    let mut statements = dialect.checked(Parser::new(&dialect).with_tokens_with_locations(tokens).parse_statements()).map_err(|error| parser_error(error, source, at))?;
+    let mut statements = dialect.checked(Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens).parse_statements()).map_err(|error| parser_error(error, source, at))?;
     if statements.len() != 1 { return Err(sql_error("Expected one SQL statement", source, at)); }
     Ok(statements.remove(0))
 }
@@ -511,7 +515,7 @@ pub(crate) fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Resu
 
 pub(crate) fn expression(tokens: &[TokenWithSpan], source: &str, precedence: u8) -> Result<(ast::Expr, usize)> {
     let dialect = SqlDialect::default();
-    let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens.to_vec());
+    let mut parser = Parser::new(&dialect).with_recursion_limit(STATEMENT_RECURSION_LIMIT).with_tokens_with_locations(tokens.to_vec());
     let expression = dialect.checked(parser.parse_subexpr(precedence)).map_err(|error| parser_error(error, source, parser.peek_token().span))?;
     Ok((expression, parser.index()))
 }
