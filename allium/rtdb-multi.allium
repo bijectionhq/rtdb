@@ -355,6 +355,10 @@ contract Directory {
     @invariant EpochsOnlyRise
         -- A record's epoch never decreases, and every change of holder increments it.
 
+    @invariant WatchesMayLagButNeverRewind
+        -- A watcher receives each record's changes in epoch order, possibly late, and discards any change older than the one it holds.
+        --   A late change costs a redirect, never a wrong answer, because no watcher authorises anything by what it has seen.
+
     @invariant StaticStability
         -- A directory outage stalls activations, moves, flush publication and lifecycle changes.
         -- It does not stop a placed holder from committing or serving reads.
@@ -363,6 +367,7 @@ contract Directory {
 
 contract LogService {
     -- What a cell's log servers supply, per deployment.
+    -- The log servers are logkeepers, built for this contract; the loglet kind is recorded per loglet, so another kind can back a deployment from its next epoch.
     -- A deployment's log is a dense sequence of records addressed by Lsn, carried by a chain of loglets.
     append: (deployment: DeploymentId, epoch: Epoch, lsn: Lsn, records: List<LogRecord>) -> Lsn
     seal: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> SealReply
@@ -1982,10 +1987,6 @@ open question "What does an idle RTDB database cost in memory today, and what is
 open question "Is losing submit-and-walk-away during a holder gap acceptable as the default?"
     -- Routed commits are retried by the gateway across a failover; only deployments with an intake stream accept work while no holder exists.
     -- If clients rely on durable-before-resolution submission, the intake becomes mandatory for them.
-
-open question "Which log implementation backs the first loglets?"
-    -- The loglet contract admits a purpose-built quorum log, BookKeeper ledgers, and an object-store WAL as a cheaper, higher-latency tier.
-    -- A multiplexed Kafka loglet satisfies everything except AppendIsConditionalOnEpochAndPosition, and needs the epoch checked on read-back instead.
 
 open question "How is per-deployment cryptographic erasure reconciled with objects shared across a lineage?"
     -- TransferSharedObjects re-wraps shared objects' keys to a surviving referrer, so deleting one member is proved by absence and key destruction of what it alone owned.

@@ -46,7 +46,7 @@ What RTDB already provides, and what the endgame keeps from it:
 | Many databases per node, each with its own logs, storage, live index, election, compactor and GC | `node/src/database.rs` (`Database`), `node/src/catalog.rs` (`DatabaseCatalog`) | A deployment is one `Database`; the per-database machinery is the unit a `Holding` drives |
 | Runtime attach/detach through the primary database's source log | `node/src/node.rs` (`attach_database`, `detach_database`), `node/src/catalog.rs` (`CatalogEffects::apply_db_op`) | Replaced in multi mode by directory-driven placement; kept in classic mode |
 | Two `Membership` kinds, `Durable` and `Fixed` | `node/src/catalog.rs` (`Membership`) | A third kind, `Placed`, follows the directory |
-| Per-database leader election by term claims in the replica log, fence on read-back | `replication/src/driver.rs` (`Role`, `start_claim`, `promote`, `demote`, `consume_record`), `replication/src/admission.rs` (`TermFence`), `replication/src/appender.rs` (idle no-op heartbeat) | Replaced in multi mode by directory epochs and loglet seals; `TermFence` survives only behind the Kafka loglet |
+| Per-database leader election by term claims in the replica log, fence on read-back | `replication/src/driver.rs` (`Role`, `start_claim`, `promote`, `demote`, `consume_record`), `replication/src/admission.rs` (`TermFence`), `replication/src/appender.rs` (idle no-op heartbeat) | Replaced in multi mode by directory epochs and loglet seals; `TermFence` stays in classic mode |
 | Resolution, staging, apply | `tx/src/resolver.rs` (`TxResolver`), `index/src/snapshot.rs` (`Snapshot::with_staged`), `index/src/partition.rs` (`PartitionState`) | Kept unchanged: the holder resolves and applies exactly as a leader does today |
 | Follower replay of resolved transactions, block adoption at `BlockUploaded` | `replication/src/driver.rs` (follower path), `replication/src/state.rs` | Kept as the `Subscription` apply path and the holder's tail replay |
 | The `Log` trait: enqueue, latest, tail, range | `storage/src/log/mod.rs` | Extended by a `Loglet` trait with conditional append and seal; `Log` stays for classic mode |
@@ -59,7 +59,7 @@ What RTDB already provides, and what the endgame keeps from it:
 | One pgwire listener choosing the database from the startup parameter | `pgwire/src/connection.rs` | Protocol layer reused by the gateway; execution moves behind an RPC |
 | Compaction on every non-read-only node; trie and block GC on the leader | `node/src/database.rs` (`MaintenanceSupervisor::start_term`), `maintenance/src/` | Compaction becomes a worker pool; deletion moves to the reaper |
 | `flush_timeout` 4 h, `rows_per_block` 100k | `replication/src/driver.rs` (`ReplicationConfig::default`) | Replaced in multi mode by size, replay-budget, age, idle and degradation triggers |
-| Kafka log, one producer and consumer per log | `kafka/src/lib.rs` (`KafkaLog`), `kafka/src/driver.rs` | Kept for classic mode; a multiplexed Kafka loglet is the fallback loglet |
+| Kafka log, one producer and consumer per log | `kafka/src/lib.rs` (`KafkaLog`), `kafka/src/driver.rs` | Kept for classic mode and for external sources; not a multi-mode log |
 | Health and driver status per database | `node/src/health.rs`, `replication/src/driver.rs` (`DriverStatus`) | Feeds the controller's load vectors |
 
 ## 3. Concept map: spec to code
@@ -95,8 +95,8 @@ What RTDB already provides, and what the endgame keeps from it:
 | Crate | Role in the spec | Depends on |
 | --- | --- | --- |
 | `affinity` | `Rank`, `Select`, `PrewarmOnJoin`; pure policy, ported from Bijection with `fixtures/vectors.json` | none |
-| `directory` | `Directory` contract: `DeploymentRecord`, `MemberRecord`, `Lineage`, CAS, watches; in-memory and production backends | `format` |
-| `loglet` | `Loglet` trait, `VirtualLog`, loglet kinds (memory, local file, logkeeper client, multiplexed Kafka) | `storage`, `directory` |
+| `directory` | `Directory` contract: `DeploymentRecord`, `MemberRecord`, `Lineage`, CAS, watches; an in-memory backend and a DynamoDB backend | `format`, the AWS SDK |
+| `loglet` | `Loglet` trait, `VirtualLog`, loglet kinds (memory, local file, logkeeper client) | `storage`, `directory` |
 | `logkeeper` | The log server: segments per writer, per-stream index, promise, group commit, seal announcements, trim | `loglet` |
 | `holding` | `HoldingDriver`: claim, seal, recover, open, serve, flush, park, hand off | `replication`, `loglet`, `directory`, `tx`, `index` |
 | `gateway` | Session termination for pgwire and Flight SQL, capabilities, idempotency keys, routing, redirects | `pgwire`, `flight-sql`, `affinity`, `directory` |
@@ -169,7 +169,15 @@ This stage introduces it while keeping the existing logs and election, so placem
 **Changes.**
 
 1. **Crate `directory`.**
-   The `Directory` trait (read, CAS conditional on epoch, watch), protos for `DeploymentRecord`, `MemberRecord` and `Lineage` in `format`, an in-memory backend for tests and simulation, and one production backend (decision point 1).
+   The `Directory` trait (read, CAS conditional on epoch, watch), protos for `DeploymentRecord`, `MemberRecord` and `Lineage` in `format`, an in-memory backend for tests and simulation, and the DynamoDB backend for production (decision 1, settled).
+   The DynamoDB backend:
+   - one table per record kind (deployments, members, lineages), keyed by id, in on-demand capacity mode, in the cell's region only (global tables are not used: multi-region replication would break the linearizable CAS);
+   - every epoch-bound change is an `UpdateItem` with a `ConditionExpression` on the expected epoch, and every read that a claim or a fence depends on is strongly consistent;
+   - a fork, which writes the child and bumps the lineage version together, is one `TransactWriteItems`;
+   - a secondary index on `holder` answers "every deployment held by member X" for the drainer; it is eventually consistent, so the drainer re-reads each record strongly before it claims;
+   - watches are DynamoDB Streams (new images), fanned out to gateways and nodes by a small watch service; a stream is ordered per item, consumers drop any image whose epoch is below the one they hold, and a late image costs a redirect, never a wrong answer;
+   - member leases are conditional `UpdateItem`s every `member_heartbeat`, about 1,000 writes a second for a 500-member cell;
+   - the contract suite runs against the in-memory backend and against DynamoDB Local.
 2. **Members.**
    Each process registers a `MemberRecord` with a fresh `MemberId`, renews a lease every `member_heartbeat`, and is marked dead on expiry (spec rules `RenewLease`, `ExpireLease`).
 3. **`Membership::Placed`.**
@@ -245,8 +253,10 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    A client in `loglet` holding one connection per ensemble member per node, multiplexing every deployment the node holds, with write quorum 2 of 3 across zones.
 3. **Ensemble assignment.**
    The directory records each loglet's ensemble; the controller balances writers across logkeepers.
-4. **Multiplexed Kafka loglet, as the fallback.**
-   Many deployments share one partition; the epoch is checked on read-back with the existing `TermFence` logic, since Kafka offers no conditional append.
+4. **Deployment of the logkeepers.**
+   The logkeeper is the first production loglet (decision 2, settled).
+   Logkeepers run on EC2 instances with instance-store NVMe, at least one per availability zone per ensemble, with ensembles spread so that losing a host re-replicates its streams to the rest of the cell.
+   The `Loglet` trait still admits other kinds (a multiplexed Kafka loglet, an object-store WAL for a cheaper tier); none is built on this branch.
 
 **Tests.**
 Logkeeper unit tests; the loglet contract suite from stage 3 run against a three-logkeeper ensemble; fault injection (a killed server, a partitioned server, a slow fsync, a torn segment) in the simulation crate; throughput and latency benchmarks against the spec's estimates (2–4 ms p50 commit, tens of thousands of appends per second per server).
@@ -474,14 +484,18 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
 
 ## 8. Decision points
 
-These block the stage named, and each is an open question in the spec.
+Settled:
 
-1. **Directory backend (stage 2).**
-   FoundationDB (transactions over a sharded, linearizable store, proven at this scale) or etcd (simpler, smaller envelope).
-   The recommendation is FoundationDB for production and the in-memory backend for tests.
-2. **First production loglet (stage 4).**
-   A purpose-built logkeeper, BookKeeper ledgers, or the multiplexed Kafka fallback.
-   The recommendation is the logkeeper, with the Kafka loglet kept as a fallback behind the same trait.
+1. **Directory backend (stage 2): DynamoDB.**
+   The directory's safety rests on one conditional write per record, which DynamoDB provides fully managed, and Bijection already runs it.
+   Its watches are asynchronous, which the design tolerates.
+   FoundationDB remains the backend to reach for if a cell has to run outside AWS; the `Directory` contract suite keeps the backends interchangeable.
+2. **First production loglet (stage 4): the logkeeper.**
+   It enforces the epoch at append time, group-commits across deployments and serves per-deployment reads, which no existing log does together.
+   The `Loglet` trait keeps the choice reversible per deployment at its next epoch.
+
+Open, each also an open question in the spec:
+
 3. **Default read freshness and submission semantics (stages 3, 10).**
    Whether `at_basis` is the default read contract, and whether losing submit-and-walk-away without an intake is acceptable.
 4. **Erasure contract with forks (stage 12).**

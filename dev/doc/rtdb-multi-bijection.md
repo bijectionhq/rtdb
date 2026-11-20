@@ -172,6 +172,7 @@ Each phase rolls back on its own, because the `WorldStore` conformance suite gat
 2. **Who owns the directory.**
    Either the RTDB directory becomes Bijection's cell catalog, or Bijection's catalog implements RTDB's `Directory` contract; the Appliers already apply epoch-checked placement and could be the first backend.
    In the end there is exactly one, and the recommendation is the RTDB directory, since RTDB's single-writer safety rests on it.
+   Its production backend is DynamoDB, which Bijection already runs for key authority, and its log servers are logkeepers on EC2 with instance-store NVMe, like the Conductor hosts.
 3. **Search.**
    Built from the change feed with ownership unchanged, or moved into RTDB later.
 4. **Files and blobs.**
