@@ -34,6 +34,8 @@ pub struct AgentOptions {
     pub max_active: Option<usize>,
     /// Activation failures after which a deployment is quarantined to the isolation pool.
     pub quarantine_after: u32,
+    /// The most unflushed rows this node's holdings may keep in their live indexes together; beyond it, the largest are flushed first (`BoundTailMemory`).
+    pub max_tail_rows: Option<u64>,
     /// Whether this node is a compaction worker: it holds nothing, and compacts every held deployment that ranks it first among the cell's workers.
     pub compaction_worker: bool,
 }
@@ -41,7 +43,7 @@ pub struct AgentOptions {
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
         Self { storage, activation_timeout: Duration::from_secs(30), watch_interval: Duration::from_millis(250), park_after: None,
-            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false }
+            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None }
     }
 }
 
@@ -271,6 +273,21 @@ impl NodeAgent {
         Ok(Response::Published { position: position.0 })
     }
 
+    #[doc(hidden)]
+    pub async fn bound_tails_for_test(&self, limit: u64) { self.bound_tails(limit).await }
+
+    /// Flushes the largest tails until the holdings' unflushed rows fit within `limit`.
+    async fn bound_tails(&self, limit: u64) {
+        let names: Vec<String> = self.holdings.lock().keys().cloned().collect();
+        let mut tails: Vec<(u64, String)> = names.into_iter().filter_map(|name| self.node.catalog().database(&name).ok().map(|database| (database.live_rows(), name))).collect();
+        let mut total: u64 = tails.iter().map(|(rows, _)| rows).sum();
+        tails.sort_by(|left, right| right.cmp(left));
+        for (rows, name) in tails {
+            if total <= limit || rows == 0 { break; }
+            if self.flush(&name).await.is_ok() { total -= rows; }
+        }
+    }
+
     /// A compaction worker opens, as a compacting replica, every held deployment that ranks it first among the cell's live workers, and closes the rest.
     async fn reconcile_compaction(&self) {
         let (Ok(deployments), Ok(members)) = (self.directory.deployments().await, self.members().await) else { return };
@@ -328,6 +345,7 @@ impl NodeAgent {
             if draining || over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
         }
         if self.options.compaction_worker { self.reconcile_compaction().await; }
+        if let Some(limit) = self.options.max_tail_rows { self.bound_tails(limit).await; }
         let subscribed: Vec<(String, String, Instant)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role == Role::Subscriber)
             .map(|(name, subscription)| (name.clone(), subscription.id.clone(), subscription.last_touch)).collect();
         for (name, id, last_touch) in subscribed {

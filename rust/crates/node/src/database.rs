@@ -47,6 +47,8 @@ impl Database {
     pub fn progress(&self) -> &Arc<ProgressMonitor> { self.replication.progress() }
     pub fn status(&self) -> rtdb_replication::DriverStatus { self.replication.status() }
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
+    /// Rows applied since the last block, held in the live index until the next flush.
+    pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }
     /// Publishes a compaction produced elsewhere, as this database's writer.
     pub async fn publish_compaction(&self, notification: TriesAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
         self.require_writable()?;

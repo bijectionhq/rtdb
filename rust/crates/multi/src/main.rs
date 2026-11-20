@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES]\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--cell NAME --cell-map ADDR]\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
@@ -95,6 +95,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
             let mut agent = AgentOptions::new(CellStorage::Local { root: PathBuf::from(arguments.required("storage-root")?) });
+            agent.max_tail_rows = arguments.optional("max-tail-rows").map(|count| count.parse()).transpose().map_err(|_| usage("--max-tail-rows must be a number".into()))?;
             agent.max_active = arguments.optional("max-active").map(|count| count.parse()).transpose().map_err(|_| usage("--max-active must be a number".into()))?;
             agent.park_after = arguments.optional("park-after").map(|seconds| seconds.parse().map(Duration::from_secs)).transpose().map_err(|_| usage("--park-after must be a number of seconds".into()))?;
             let node = process::start_node(directory, process::NodeSettings {

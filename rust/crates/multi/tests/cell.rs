@@ -428,3 +428,22 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     east.stop().await;
     west.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_over_its_tail_budget_flushes_its_largest_tail_first() {
+    let cell = Cell::start(1, None).await;
+    for name in ["big", "small"] { admin::create_deployment(cell.directory.as_ref(), name, "acme", 3).await.unwrap(); }
+    let big = cell.connect("big").await;
+    for id in 0..40 { big.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, {id})")).await.unwrap(); }
+    let small = cell.connect("small").await;
+    small.simple_query("INSERT INTO orders (_id, total) VALUES (1, 1)").await.unwrap();
+    let node = cell.node(0);
+    let rows = |name: &str| node.server.node().catalog().database(name).unwrap().live_rows();
+    let small_tail = rows("small");
+    assert!(rows("big") > small_tail && small_tail > 0);
+    node.agent.bound_tails_for_test(small_tail + 1).await;
+    assert_eq!((rows("big"), rows("small")), (0, small_tail), "the largest tail is flushed, and only as much as needed to fit");
+    assert_eq!(values(&big, "SELECT COUNT(*) FROM orders").await, ["40"]);
+    drop((big, small));
+    cell.stop().await;
+}
