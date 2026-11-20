@@ -778,3 +778,39 @@ async fn a_fork_at_a_past_block_holds_that_blocks_state_and_diverges_from_it() {
     drop((then, client));
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    for id in 0..3 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    for _ in 0..50 {
+        if cell.directory.deployment_by_name("shop").await.unwrap().unwrap().checkpoint.is_some() { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for id in 3..5 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
+    let written = values(&client, "SELECT _system_from FROM orders WHERE _id = 4").await.remove(0);
+    let then = rtdb_types::Timestamp(chrono::DateTime::parse_from_str(&written, "%Y-%m-%d %H:%M:%S%.f%:z").unwrap().timestamp_micros());
+    for id in 5..7 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
+
+    assert!(admin::fork_at_time(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "too-early", rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
+        "a time before the checkpoint is a past block's");
+    admin::fork_at_time(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-then", then, Duration::from_secs(3600), 4 << 20).await.unwrap();
+    let fork = connect_eventually(&cell, "shop-then").await;
+    assert_eq!(values(&fork, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"], "the fork holds the block and the tail up to the time, and nothing after");
+    fork.simple_query("INSERT INTO orders (_id, total) VALUES (50, 1)").await.unwrap();
+    assert_eq!(values(&fork, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "50"], "and takes writes of its own");
+    assert_eq!(values(&client, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5", "6"], "while the parent is untouched");
+    drop((fork, client));
+    let mut cell = cell;
+    let fork_holder = cell.holder("shop-then").await.unwrap();
+    cell.nodes[fork_holder].take().unwrap().kill().await.unwrap();
+    cell.add_node().await;
+    let fork = connect_eventually(&cell, "shop-then").await;
+    assert_eq!(values(&fork, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "50"], "the copied tail is the fork's history, recovered by its next holder");
+    drop(fork);
+    cell.stop().await;
+}

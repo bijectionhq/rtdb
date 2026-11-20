@@ -165,7 +165,14 @@ pub struct DeploymentRecord {
 
 /// The directory's record of a deployment's last published block (value `Checkpoint`): its index, the replica offset of its boundary record, and the last source offset it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Checkpoint { pub block: i64, pub boundary: i64, pub source: i64 }
+pub struct Checkpoint {
+    pub block: i64,
+    pub boundary: i64,
+    pub source: i64,
+    /// The system time, in microseconds, of the last transaction the block holds.
+    #[serde(default)]
+    pub system_time: i64,
+}
 
 impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {

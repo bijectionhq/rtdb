@@ -29,7 +29,7 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
-       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N [--grace SECONDS]] [--cell-secret FILE]\n\
+       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --name NAME\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n";
@@ -172,12 +172,19 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             let storage = CellStorage::Local { root: PathBuf::from(arguments.required("storage-root")?) };
             let (from, name) = (arguments.required("from")?, arguments.required("name")?);
-            let record = match arguments.optional("at-block") {
+            let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
+                (None, Some(time)) => {
+                    let time = time.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| usage("--at-time must be an RFC 3339 timestamp".into()))?;
+                    admin::fork_at_time(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name, rtdb_types::Timestamp(time.timestamp_micros()),
+                        Duration::from_secs(arguments.number("grace", 3600u64)?), 4 << 20).await?
+                }
+                (at_block, _) => match at_block {
                 Some(block) => {
                     let block = block.parse().map_err(|_| usage("--at-block must be a block index".into()))?;
                     admin::fork_at_block(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
                 }
                 None => admin::fork(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
+                },
             };
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
             Ok(())

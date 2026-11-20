@@ -154,7 +154,31 @@ pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, key
     fork_from(directory, storage, keys, parent, name, Some(block)).await
 }
 
+/// Forks `parent` as of a system time at or after its checkpoint: the fork starts from the checkpoint's block, with the parent's transactions after it up to `system_time` copied into its own stream.
+/// A time before the checkpoint is a past block's, which `fork_at_block` forks from.
+pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, system_time: rtdb_types::Timestamp, grace: std::time::Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    let source = record(directory, parent).await?;
+    let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
+    if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
+    match storage {
+        CellStorage::Local { root } => {
+            let age = crate::reference::written_at(root, &source.storage_prefix(), checkpoint.block)?.elapsed().unwrap_or_default();
+            if age >= grace { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace"))); }
+        }
+    }
+    let members = members(directory).await?;
+    let servers: Vec<String> = source.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
+    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), tokio_util::sync::CancellationToken::new()).await?, &keys.key(&source.id)?, &stream.stream)?;
+    let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
+    fork_with_tail(directory, storage, keys, parent, name, Some(checkpoint.block), tail, maximum_message_bytes).await
+}
+
 async fn fork_from(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, at_block: Option<i64>) -> Result<DeploymentRecord> {
+    fork_with_tail(directory, storage, keys, parent, name, at_block, Vec::new(), 4 << 20).await
+}
+
+async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
     let source = record(directory, parent).await?;
     let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
     child.lineage = source.lineage.clone();
@@ -166,6 +190,18 @@ async fn fork_from(directory: &dyn Directory, storage: &CellStorage, keys: &dyn 
         CellStorage::Local { root } => crate::reference::fork(root, &source.storage_prefix(), &child.storage_prefix(), at_block)?,
     }
     keys.copy(&source.id, &child.id)?;
+    if !tail.is_empty() {
+        // The tail is written at the first writer epoch, so the fork's first holder claims the next and seals it.
+        child.epoch = 1;
+        crate::logs::renumber_into(&mut tail, rtdb_types::StorageEpoch(child.log_epoch))?;
+        // Written before the fork is recorded, so no holder can open it until its stream holds the tail.
+        let members = members(directory).await?;
+        let servers: Vec<String> = child.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+        let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes };
+        let writer = crate::logs::SealedLog::new(rtdb_logkeeper::open_writer(stream.clone(), child.epoch, tokio_util::sync::CancellationToken::new()).await?, &keys.key(&child.id)?, &stream.stream)?;
+        use rtdb_storage::log::Log;
+        for envelope in tail { writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?; }
+    }
     directory.create_deployment(child).await
 }
 

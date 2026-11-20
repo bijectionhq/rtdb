@@ -4267,6 +4267,7 @@ dependencies = [
  "aws-config",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "futures",
  "parking_lot",
  "prost",

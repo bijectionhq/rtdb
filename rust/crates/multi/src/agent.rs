@@ -353,13 +353,13 @@ impl NodeAgent {
     /// The boundary record itself is kept: it names the source position a later holder's intake starts past.
     async fn publish_and_trim(&self, name: &str, id: &str, epoch: u64) {
         let Ok(database) = self.node.catalog().database(name) else { return };
-        let adopted = database.status().adopted_block.as_ref().and_then(|block| Some((block.block_index().0, block.boundary_replica_position()?.offset(), block.latest_source_position())));
-        if let Some((block, boundary, source)) = adopted {
+        let adopted = database.status().adopted_block.as_ref().and_then(|block| Some((block.block_index().0, block.boundary_replica_position()?.offset(), block.latest_source_position(), block.latest_completed_tx().map_or(i64::MIN, |tx| tx.system_time.0))));
+        if let Some((block, boundary, source, system_time)) = adopted {
             if let Ok(Some(record)) = self.directory.deployment(id).await {
                 if record.epoch == epoch && record.holder.as_ref() == Some(&self.member()) && record.checkpoint.is_none_or(|checkpoint| checkpoint.block < block) {
                     let mut next = record.clone();
                     let source = source.map_or(-1, |position| position.after_offset(rtdb_types::StorageEpoch(record.log_epoch)));
-                    next.checkpoint = Some(rtdb_directory::Checkpoint { block, boundary, source });
+                    next.checkpoint = Some(rtdb_directory::Checkpoint { block, boundary, source, system_time });
                     let _ = self.directory.replace_deployment(next, record.version).await;
                 }
             }

@@ -158,6 +158,44 @@ fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
     })
 }
 
+/// The transactions after replica offset `boundary` up to `system_time`, renumbered as one fresh term above every term the log has used, for a fork's stream.
+/// Their ids are still the parent's: `renumber_into` gives them the fork's.
+/// A tail holding an oversized message is refused: its payload object is the parent's, written after the fork's block.
+pub async fn transactions_until(replica: &dyn Log, boundary: i64, system_time: rtdb_types::Timestamp) -> Result<Vec<ReplicaEnvelope>> {
+    let latest = replica.latest()?.0;
+    let mut kept = Vec::new();
+    let mut highest = rtdb_types::Term(0);
+    let mut next = boundary;
+    let mut past = false;
+    while next < latest {
+        let end = (next + 1 + SCAN_WINDOW).min(latest + 1);
+        for record in replica.read_range(LogOffset(next + 1), LogOffset(end)).await? {
+            let Some(envelope) = ReplicaEnvelope::decode(&record.payload)? else { continue };
+            highest = highest.max(envelope.term);
+            match envelope.message {
+                ReplicaBody::OversizedMessage(_) => return Err(Anomaly::unsupported("rtdb.multi/fork-oversized", "The tail holds an oversized transaction: flush the parent and fork again")),
+                ReplicaBody::ResolvedTx(tx) if !past && tx.system_time_micros.is_none_or(|micros| micros <= system_time.0) => kept.push(ReplicaBody::ResolvedTx(tx)),
+                ReplicaBody::ResolvedTx(_) => past = true,
+                _ => {}
+            }
+        }
+        next = end - 1;
+    }
+    let term = rtdb_types::Term(highest.0 + 1);
+    Ok(kept.into_iter().enumerate().map(|(sequence, message)| ReplicaEnvelope { term, term_sequence: Some(rtdb_types::TermSequence(sequence as i64)), message }).collect())
+}
+
+/// Gives a fork's copied transactions ids, and source positions, in the fork's log epoch, so they come after its block's and before its own.
+pub fn renumber_into(tail: &mut [ReplicaEnvelope], epoch: StorageEpoch) -> Result<()> {
+    for (offset, envelope) in tail.iter_mut().enumerate() {
+        let ReplicaBody::ResolvedTx(tx) = &mut envelope.message else { continue };
+        let position = rtdb_types::SourcePosition::from_epoch_offset(epoch, offset as i64)?.0;
+        tx.tx_id = Some(position);
+        tx.src_msg_id = Some(position);
+    }
+    Ok(())
+}
+
 /// A log whose payloads are sealed under the deployment's key, so a logkeeper never holds a row in the clear.
 pub struct SealedLog { inner: Arc<dyn Log>, cipher: Arc<Cipher>, stream: Arc<str> }
 
