@@ -153,6 +153,10 @@ impl QueryContext {
     pub fn check_cancelled(&self) -> Result<()> {
         if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
     }
+    /// Checks for cancellation at the first of every 1024 indices: reading a token takes its lock, which per row adds up.
+    pub fn check_cancelled_at(&self, index: usize) -> Result<()> {
+        if index % 1024 == 0 { self.check_cancelled() } else { Ok(()) }
+    }
     pub fn spill_bytes(&self) -> u64 { self.spill.retained_bytes() }
     pub fn spill_peak_bytes(&self) -> u64 { self.spill.peak_bytes() }
     pub fn snapshot_token(&self) -> Option<&str> { self.read_basis.as_ref().and_then(|basis| basis.token.as_deref()) }

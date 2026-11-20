@@ -190,6 +190,14 @@ impl AggregateCursor {
                         let key_positions = &positions.as_ref().expect("column rows have positions")[..self.groups.len()];
                         let mut key = Vec::with_capacity(key_positions.len());
                         for row in 0..rows.len() {
+                            // A single key cell that admitting would leave as it is groups in place, without a copy.
+                            if let [position] = key_positions {
+                                let value = rows.value(row, Some(*position));
+                                if !matches!(value, Value::Date(_) | Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Struct(_) | Value::Map { .. }) {
+                                    mapping.push(keys.insert(std::slice::from_ref(value),&self.execution)?);
+                                    continue;
+                                }
+                            }
                             key.clear();
                             for position in key_positions {
                                 let mut value = rows.value(row, Some(*position)).clone();
@@ -228,15 +236,16 @@ impl PageCursor for AggregateCursor {
 }
 
 /// Group keys in first-seen order, spilled for output, with an in-memory index from key hash to the groups that share it.
-struct GroupKeys { rows: SpillWriter, count: usize, global: bool, index: std::collections::HashMap<u32, Vec<usize>>, keys: Vec<OwnedRow>, _index_reservation: Option<Arc<rtdb_columnar::MemoryReservation>> }
+struct GroupKeys { rows: SpillWriter, count: usize, global: bool, index: std::collections::HashMap<u32, Vec<usize>>, keys: Vec<OwnedRow>, _index_reservation: Option<Arc<rtdb_columnar::MemoryReservation>>, inserts: usize }
 impl GroupKeys {
     fn new(global: bool,execution: &Execution) -> Result<Self> {
         let mut rows = execution.context.spill.create()?;
         if global { rows.write(&[Value::U64(0),Value::U32(0)],&execution.context.memory)?; }
-        Ok(Self { rows,count: usize::from(global),global,index: Default::default(),keys: Vec::new(),_index_reservation: None })
+        Ok(Self { rows,count: usize::from(global),global,index: Default::default(),keys: Vec::new(),_index_reservation: None,inserts: 0 })
     }
     fn insert(&mut self,values: &[Value],execution: &Execution) -> Result<usize> {
-        execution.context.check_cancelled()?;
+        self.inserts = self.inserts.wrapping_add(1);
+        execution.context.check_cancelled_at(self.inserts - 1)?;
         if self.global { return Ok(0); }
         let hash = crate::join_storage::hash_values(values)?;
         if let Some(candidates) = self.index.get(&hash) {
@@ -450,7 +459,7 @@ impl ScalarGroups {
             _ => {
                 self.ensure(group_count,execution)?;
                 for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
-                    execution.context.check_cancelled()?;
+                    execution.context.check_cancelled_at(row)?;
                     if *selected {
                         let value = page.value(row,argument);
                         self.values[*group].step(value,aggregate,types,execution)?;
@@ -463,7 +472,7 @@ impl ScalarGroups {
     fn sum_page(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
         let _scratch = execution.context.memory.reserve(4096)?;
         for (index,(group,selected)) in mapping.iter().zip(mask).enumerate() {
-            execution.context.check_cancelled()?;
+            execution.context.check_cancelled_at(index)?;
             if !*selected { continue; }
             let value = page.value(index,argument);
             let state = &mut self.values[*group];
@@ -479,7 +488,7 @@ impl ScalarGroups {
     }
     fn count_page(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],argument: Option<usize>,all: bool,execution: &Execution) -> Result<()> {
         for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
-            execution.context.check_cancelled()?;
+            execution.context.check_cancelled_at(row)?;
             let value = page.value(row,argument);
             if *selected && (all || !matches!(value,Value::Null | Value::Undefined)) {
                 let state = &mut self.values[*group];

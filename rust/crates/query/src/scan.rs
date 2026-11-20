@@ -499,8 +499,10 @@ impl PartitionScan {
             }
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
+        let mut visited = 0usize;
         while let Some(head) = heads.pop() {
-            self.execution.context.check_cancelled()?;
+            self.execution.context.check_cancelled_at(visited)?;
+            visited += 1;
             let rows = &self.loaded[&selected[head.active]].rows;
             let source = rows.row(head.ordinal)?;
             let ordinal = head.ordinal + 1;
