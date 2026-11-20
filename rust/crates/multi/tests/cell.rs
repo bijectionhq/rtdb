@@ -584,6 +584,8 @@ async fn a_snapshot_session_reads_the_checkpoint_from_object_storage_on_another_
         .options("-c rtdb.read=snapshot").connect(NoTls).await.unwrap();
     tokio::spawn(connection);
     assert_eq!(values(&snapshot, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"], "a snapshot reads the deployment as of its checkpoint, with no logkeeper up");
+    let second = values(&snapshot, "SELECT _system_from FROM orders WHERE _id = 1").await.remove(0);
+    assert_eq!(values(&snapshot, &format!("SELECT _id FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP '{second}'")).await, ["0", "1"], "and at any earlier basis");
     assert!(cell.node(1 - holder).agent.subscribed().contains(&"shop".to_owned()), "on a node that does not hold it");
     assert!(snapshot.simple_query("INSERT INTO orders (_id, total) VALUES (7, 1)").await.is_err(), "and it never writes");
     let reader = cell.node(1 - holder);
