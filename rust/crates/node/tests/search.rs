@@ -403,11 +403,12 @@ async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_
         }
     }
     let ranked = |rows: Vec<Vec<Value>>| rows.into_iter().map(|row| (row[0].clone(), row[1].clone())).collect::<Vec<_>>();
-    for (matching, scoring) in [("invoice", "invoice overdue"), ("overdue late", "late"), ("book", "book red paid")] {
+    for (filter, scoring) in [("MATCH(body, 'invoice')", "invoice overdue"), ("MATCH(body, 'overdue late')", "late"), ("MATCH(body, 'book')", "book red paid"),
+        ("MATCH(body, 'invoice') AND MATCH(body, 'paid')", "invoice overdue"), ("MATCH(body, 'book') AND _id % 3 = 0", "book")] {
         for valid in ["2020-06-01Z", "2022-06-01Z"] {
             for system in [None, Some(systems[0]), Some(systems[1])] {
                 let system_clause = system.map_or(String::new(), |time| format!(" FOR SYSTEM_TIME AS OF TIMESTAMP '{}'", chrono::DateTime::from_timestamp_micros(time.0).unwrap().to_rfc3339()));
-                let query = format!("SELECT _id, SEARCH_SCORE(body, '{scoring}') AS score FROM docs FOR VALID_TIME AS OF TIMESTAMP '{valid}'{system_clause} WHERE MATCH(body, '{matching}') ORDER BY score DESC, _id");
+                let query = format!("SELECT _id, SEARCH_SCORE(body, '{scoring}') AS score FROM docs FOR VALID_TIME AS OF TIMESTAMP '{valid}'{system_clause} WHERE {filter} ORDER BY score DESC, _id");
                 let everything = ranked(rows(session.query_sql(&query, vec![]).await.unwrap()).await);
                 for k in [1, 5, 20] {
                     let limited = ranked(rows(session.query_sql(&format!("{query} LIMIT {k}"), vec![]).await.unwrap()).await);

@@ -131,8 +131,9 @@ fn cut(rectangles: &mut Vec<[i64; 4]>, events: Vec<crate::file::KeyedEvent>) -> 
         for rectangle in rectangles.drain(..) {
             let [valid_from, valid_to, system_from, system_to] = rectangle;
             tied |= event.system_from == system_from;
-            if event.system_from <= system_from || event.system_from >= system_to { kept.push(rectangle); continue; }
+            if event.system_from <= system_from { kept.push(rectangle); continue; }
             if event.op == rtdb_types::EventOp::Erase { continue; }
+            if event.system_from >= system_to { kept.push(rectangle); continue; }
             let (cut_from, cut_to) = (event.valid_from.max(valid_from), event.valid_to.min(valid_to));
             if cut_from >= cut_to { kept.push(rectangle); continue; }
             if valid_from < cut_from { kept.push([valid_from, cut_from, system_from, system_to]); }
@@ -352,12 +353,11 @@ impl SearchAccelerator {
             Ok((selected.members, selected.file.ranked(column, matching, &scoring, corpus.as_ref(), request.bounds)?))
         }).collect::<Result<Vec<_>>>()?;
         let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, &skipped, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
-        // The scan resolves exactly what the index decides only when MATCH is all it filters by; any other predicate is the verifier's to apply.
-        let trusted = request.scan.predicates.iter().all(|predicate| match predicate {
-            Expr::Column { id, .. } => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),
-            Expr::Call { name, .. } => name.eq_ignore_ascii_case("match"),
+        let trusted = match request.scan.predicates.as_slice() {
+            [Expr::Column { id, .. }] => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),
+            [Expr::Call { name, .. }] => name.eq_ignore_ascii_case("match"),
             _ => false,
-        });
+        };
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
             for row in self.runtime.live_rows(request.database, segment, column, matching)? {
                 let event = segment.row(row)?.event()?;
@@ -529,9 +529,9 @@ mod tests {
         let mut rectangles = vec![whole];
         cut(&mut rectangles, vec![event(40, 50, 50, Delete)]);
         assert_eq!(rectangles, [whole], "an empty valid interval takes nothing");
-        let mut rectangles = vec![whole, [0, 5, 1, 3]];
+        let mut rectangles = vec![whole, [0, 5, 1, 3], [0, 5, 40, 50]];
         cut(&mut rectangles, vec![event(30, 0, 1, Erase)]);
-        assert_eq!(rectangles, [[0, 5, 1, 3]], "an erase takes every rectangle it is later than");
+        assert_eq!(rectangles, [[0, 5, 40, 50]], "an erase also removes versions superseded before it");
     }
 
     #[test]
