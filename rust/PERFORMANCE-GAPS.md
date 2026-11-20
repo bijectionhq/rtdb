@@ -63,6 +63,44 @@ Keep those workloads in subsequent regression runs.
   This can add foreground copy and allocation cost during ingest, and can amplify staging work during large updates.
   Sources are [RTDB live index](crates/index/src/live.rs) and [XTDB live table](../core/src/main/kotlin/xtdb/indexer/LiveTable.kt).
 
+## One-million-row follow-up
+
+The table shows single sequential runs of the full benchmark, using the old RTDB and XTDB images and two compaction workers.
+The jemalloc run used the same RTDB image with jemalloc preloaded and a background purge enabled.
+Each row count check passed in these three runs.
+
+| Metric | RTDB, glibc | XTDB | RTDB, jemalloc |
+| --- | ---: | ---: | ---: |
+| pgwire ingest | 36.5k rows/s | 55.0k rows/s | 48.4k rows/s |
+| Flight ingest after pgwire | 95.0k rows/s | 151.9k rows/s | 103.5k rows/s |
+| pgwire concurrent INSERT | 1,892 tx/s | 1,839 tx/s | 992 tx/s |
+| Flight concurrent INSERT | 1,354 tx/s | 1,234 tx/s | 824 tx/s |
+| pgwire UPDATE of 10% of orders | 740 ms | 640 ms | 578 ms |
+| Peak working set during pgwire | 1,330 MiB | 690 MiB | 618 MiB |
+| Peak working set during Flight | 1,650 MiB | 1,056 MiB | 659 MiB |
+
+During early pgwire ingest in a separate allocator trace, the engine reported about 1.5 MiB of cache reservations as anonymous memory reached 708 MiB, with glibc reporting about 706 MiB of free arena space.
+During the read workload the cache reservation approached 768 MiB, while glibc still reported about 1.8 GiB in free arena blocks and anonymous memory exceeded 2 GiB.
+Cache reservations bound admission and are an estimate of allocations, while glibc reports allocator accounting and cgroups report residency.
+The controlled allocator swap supports allocator retention as a major contributor to the observed memory gap.
+A further run with glibc restricted to two arenas reached 663 MiB during pgwire and 618 MiB during Flight.
+It handled only 290 pgwire concurrent writes per second, compared with 1,892 on the default setup.
+Repeat the jemalloc comparison with current builds and investigate the concurrent-write regression before adopting an allocator setting.
+
+One instrumented RTDB run returned a row count other than 1,000,000 immediately after Flight ingest.
+The final assertion did not print the returned value.
+Its throughput is excluded from the comparison.
+Reproduce on the current baseline with the first count, follow-up counts and logs retained before relying on the result.
+
+## Candidate changes
+
+- `7455d1f99` specializes the numeric metadata loop by Arrow array type, eliminating the boxed per-cell converter.
+  The format and maintenance suites passed all 170 tests, including numeric bounds under a nullable parent.
+  End-to-end impact remains unmeasured.
+- The static SQL path can skip invocation preparation for values it copies directly.
+  The candidate keeps date admission and retains the full expression evaluator for computed values, collections and mismatched parameter schemas.
+  It needs a matched rerun to measure its effect on Flight ingest.
+
 ## Verification
 
 Compare a current RTDB baseline, each candidate, and the pinned XTDB reference with the same limits, storage setup, data shape and synchronous commit settings.
