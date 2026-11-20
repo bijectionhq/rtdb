@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
+use arrow_array::{Array, StructArray};
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_format::{ipc::{ArrowFile, FileLayout, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
@@ -144,6 +146,10 @@ struct PartitionScan {
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
+    /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
+    matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
+    /// Parallel to the scan's columns: the match each evaluates, if any.
+    slots: Vec<Option<usize>>,
 }
 
 use crate::analysis::ScanCounts;
@@ -175,23 +181,61 @@ fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::B
 }
 pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, memory: Arc<MemoryBudget>, _reservation: Arc<MemoryReservation> }
 impl ScanCursor {
-    pub async fn new(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
-        if scan.iids.is_none() { scan.iids = id_selection(&scan, execution.parameters.values()); }
+    pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
+        let context = Arc::clone(&execution.context);
+        let database = context.catalog.database(&scan.table.name.database)?;
+        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage).await
+    }
+    /// A scan of the given partitions of its database, which share `storage`.
+    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>) -> Result<Self> {
+        let fixed_iids = scan.iids.is_some();
+        if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
-        let database = execution.context.catalog.database(&scan.table.name.database)?;
         let canonical_entity_iids = scan.iids.is_none()
             && pushdowns.as_ref().is_some_and(|filters| filters.needs_entity_iid_proof(&scan.columns))
-            && database.partitions.iter().all(|snapshot| snapshot.has_canonical_entity_iids(&scan.table.name.table));
+            && database_partitions.iter().all(|snapshot| snapshot.has_canonical_entity_iids(&scan.table.name.table));
         if let (Some(analysis), Some(pushdowns)) = (&execution.analysis, &pushdowns) {
             analysis.set_pushdowns(pushdowns, &scan.columns, canonical_entity_iids, &execution.context.memory)?;
         }
         let name = scan.table.name.database.clone();
         let source = format!("{}.{}", scan.table.name.table.schema, scan.table.name.table.table);
+        let mut queries = Vec::with_capacity(scan.matches.len());
+        for evaluated in &scan.matches {
+            let constants = crate::accelerate::ExecutionConstants(&execution);
+            queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(text), _ => None });
+        }
+        let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
         let mut partitions = VecDeque::new();
-        for snapshot in &database.partitions {
+        for snapshot in database_partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
-            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(&database.storage), scan: scan.clone(), execution: execution.clone(), bounds,
+            let mut narrowed = scan.clone();
+            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage };
+            for accelerator in execution.context.accelerators.iter().filter(|_| !fixed_iids) {
+                let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
+                    current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
+                    corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
+                if let Some(mut candidates) = accelerator.candidate_iids(&request).await? {
+                    // `path_matches` stops consulting pushdowns once `iids` is set, so they are applied to the candidates here.
+                    if let Some(filters) = &pushdowns { candidates.retain(|iid| filters.iid_matches(&scan.columns, *iid, canonical_entity_iids)); }
+                    let iids = match narrowed.iids.take() { Some(existing) => existing.intersection(&candidates).copied().collect(), None => candidates };
+                    narrowed.iids = Some(iids);
+                }
+            }
+            let mut matches = Vec::with_capacity(scan.matches.len());
+            for (evaluated, query) in scan.matches.iter().zip(&queries) {
+                let mut answers = None;
+                if let Some(query) = query {
+                    let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
+                        current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
+                        corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
+                    for accelerator in execution.context.accelerators.iter() {
+                        if let Some(found) = accelerator.match_answers(&request, &evaluated.column, query).await? { answers = Some(found); break; }
+                    }
+                }
+                matches.push((query.as_deref().map(rtdb_text::Query::parse), answers));
+            }
+            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, slots: slots.clone(), scan: narrowed, execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
                 output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
         }
@@ -207,6 +251,42 @@ impl ScanCursor {
             self.partitions.pop_front();
         }
         Ok(None)
+    }
+}
+
+/// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
+struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool> }
+
+#[async_trait]
+impl crate::CandidateVerifier for ScanVerifier<'_> {
+    async fn visible(&self, iids: std::collections::BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+        if iids.is_empty() { return Ok(Vec::new()); }
+        let mut scan = self.scan.clone();
+        scan.top_k = None;
+        scan.iids = Some(iids);
+        if !scan.columns.iter().any(|field| field.name == "_iid") {
+            let id = rtdb_plan::ColumnId(scan.columns.iter().map(|field| field.id.0).max().unwrap_or(0) + 1);
+            scan.columns.push(rtdb_plan::Field { id, name: "_iid".into(), qualifier: None, qualified_only: false, unnamed: true, data_type: rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16)) });
+        }
+        let position = |found: &dyn Fn(&rtdb_plan::Field) -> bool| scan.columns.iter().position(|field| found(field)).ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"));
+        let (iid_at, column_at) = (position(&|field| field.name == "_iid")?, position(&|field| field.id == column)?);
+        let schema = Schema::new(scan.columns.clone())?;
+        let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+        let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage).await?;
+        let metadata = self.execution.scope()?;
+        let invocation = predicate.as_ref().map(|predicate| self.execution.prepare_expression(predicate, &schema, &metadata)).transpose()?;
+        let mut visible = Vec::new();
+        while let Some(mut page) = cursor.next_page().await? {
+            while let Some(row) = page.next() {
+                if let Some(invocation) = &invocation {
+                    let scope = self.execution.scope()?;
+                    if !rtdb_expr::is_true(&self.execution.evaluate_invocation(&scope, invocation, &row.values).await?)? { continue; }
+                }
+                let Value::FixedSizeBinary(iid) = &row.values[iid_at] else { return Err(invalid("verifier-iid", "Verified row has no IID")) };
+                visible.push((Iid::from_slice(iid)?, row.values[column_at].clone()));
+            }
+        }
+        Ok(visible)
     }
 }
 
@@ -572,13 +652,57 @@ impl PartitionScan {
             })?;
         }
         self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper);
-        self.output = groups.iter().filter(|rows| !rows.is_empty())
-            .map(|rows| crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory)).collect::<Result<_>>()?;
+        self.output = groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()).map(|(group, rows)| {
+            let page = &self.pages.entries[selected[group]].source;
+            crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory, |position| {
+                self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches)).transpose()
+            })
+        }).collect::<Result<_>>()?;
         drop(group_reservations);
         self.output_reservation = Some(reservation);
         Ok(())
     }
+
+    fn match_column(&self, evaluated: usize, source: &PageSource, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
+        let (Some(query), answers) = &self.matches[evaluated] else {
+            return Ok(crate::columnar::Column::Values(vec![Value::Null; rows.len()]));
+        };
+        let page_answers = match (answers, source) {
+            (Some(answers), PageSource::File { file, page }) => answers.file(&self.files.entries[*file].key).map(|matches| (matches, *page)),
+            _ => None,
+        };
+        let name = &self.scan.matches[evaluated].column;
+        rows.iter().map(|row| {
+            let position = row.source.1 as usize;
+            if let Some((matches, page)) = page_answers {
+                if let Ok(value) = matches.value(page, position) {
+                    return Ok(value.map_or(Value::Null, Value::Bool));
+                }
+            }
+            let value = match name.as_str() {
+                "_valid_to" if row.valid_time.upper() == Timestamp::MAX => Value::Null,
+                "_system_to" if row.system_time.upper() == Timestamp::MAX => Value::Null,
+                "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => return Ok(Value::Bool(false)),
+                _ => read_match_input(&batches[row.source.0 as usize], position, name)?,
+            };
+            Ok(rtdb_expr::match_value(&value, query))
+        }).collect::<Result<_>>().map(crate::columnar::Column::Values)
+    }
 }
+
+fn read_match_input(batch: &IndexBatch, row: usize, name: &str) -> Result<Value> {
+    let op = batch.view().operations()?;
+    let put = op.child(op.type_id(row)).as_any().downcast_ref::<StructArray>()
+        .ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?;
+    let DataType::Struct(fields) = put.data_type() else { return Err(invalid("event-schema", "Put has no struct fields")); };
+    let Some(index) = fields.iter().position(|field| field.name() == name) else { return Ok(Value::Null) };
+    let (field, array, offset) = (&fields[index], put.column(index).as_ref(), op.value_offset(row));
+    match batch.put_field_type(index) {
+        Some(logical) => rtdb_columnar::read_execution_value_as(logical, field, array, offset),
+        None => rtdb_columnar::read_execution_value(field, array, offset),
+    }
+}
+
 async fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Result<TemporalBounds> {
     let valid_time = dimension(&scan.valid_time, execution.context.current_time, execution).await?;
     let basis = snapshot.system_time_cap();
@@ -665,6 +789,7 @@ fn may_satisfy_not_null(scan: &Scan, columns: &[Value]) -> bool {
     let Expr::Column { id, .. } = expr.as_ref() else {
         return true;
     };
+    if scan.matches.iter().any(|evaluated| evaluated.id == *id) { return true; }
     let mut fields = scan.columns.iter().filter(|field| field.id == *id);
     let (Some(field), None) = (fields.next(), fields.next()) else {
         return true;
@@ -720,7 +845,7 @@ mod tests {
         let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
         let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
         let scan = |predicate: Expr| Scan { table: table.clone(), columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
-            clamp_valid_time: false, iids: None, predicates: vec![predicate] };
+            clamp_valid_time: false, iids: None, predicates: vec![predicate], top_k: None, matches: Vec::new() };
         let equals = |value: Expr| Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), value);
         let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) };
         let iid = |value: Value| value.entity_id().unwrap().iid();
@@ -763,7 +888,7 @@ mod tests {
         let field = Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: binding.columns["v"].clone() };
         let scan = Scan {
             table: binding, columns: vec![field], valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(),
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
         };
         let memory = MemoryBudget::new(1 << 24);
         let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
@@ -1186,7 +1311,7 @@ mod tests {
         }).collect();
         let scan = Scan {
             table: binding, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(),
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
         };
         let root = MemoryBudget::new(1 << 24);
         let memory = root.scope();

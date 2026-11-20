@@ -12,6 +12,7 @@ mod observer;
 mod trace;
 mod temporal;
 mod period;
+mod search;
 mod string;
 mod regex;
 mod regex_replace;

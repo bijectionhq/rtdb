@@ -174,6 +174,8 @@ fn source_message(message: Option<&SourceMessage>) -> Result<(&'static str, Stri
         Some(SourceMessage::Protobuf(SourceBody::FlushBlock(block))) => ("flush-block", edn::map([("type", ":flush-block".into()), ("expected-block-idx", block.expected_block_idx.unwrap_or_default().to_string())])),
         Some(SourceMessage::Protobuf(SourceBody::TriesAdded(tries))) => ("tries-added", tries_message(tries, false)),
         Some(SourceMessage::Protobuf(SourceBody::AttachDatabase(attach))) => ("attach-database", edn::map([("type", ":attach-database".into()), ("db-name", edn::quoted(attach.db_name.as_deref().unwrap_or_default())), ("config", edn::quoted(&format!("{:?}", attach.config)))])),
+        Some(SourceMessage::Protobuf(SourceBody::ArtefactsAdded(artefacts))) => ("artefacts-added", artefacts_message(&ArtefactsMessage::Added(artefacts), false)),
+        Some(SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(artefacts))) => ("artefacts-removed", artefacts_message(&ArtefactsMessage::Removed(artefacts), false)),
         Some(SourceMessage::Protobuf(SourceBody::DetachDatabase(detach))) => ("detach-database", edn::map([("type", ":detach-database".into()), ("db-name", edn::quoted(detach.db_name.as_deref().unwrap_or_default()))])),
         None => ("unknown", edn::map([("type", ":unknown".into())])),
     })
@@ -191,12 +193,31 @@ fn replica_message(message: &ReplicaBody) -> Result<(&'static str, String)> {
         ReplicaBody::BlockBoundary(block) => ("block-boundary", edn::map([("type", ":block-boundary".into()), ("block-index", block.block_index.unwrap_or_default().to_string()), ("latest-processed-msg-id", block.latest_processed_msg_id.unwrap_or_default().to_string())])),
         ReplicaBody::BlockUploaded(block) => ("block-uploaded", edn::map([("type", ":block-uploaded".into()), ("block-index", block.block_index.unwrap_or_default().to_string()), ("latest-processed-msg-id", block.latest_processed_msg_id.unwrap_or_default().to_string()), ("storage-version", block.storage_version.unwrap_or_default().to_string()), ("storage-epoch", block.storage_epoch.unwrap_or_default().to_string()), ("tries", tries(&block.tries))])),
         ReplicaBody::NoOp(_) => ("no-op", edn::map([("type", ":no-op".into())])),
+        ReplicaBody::ArtefactsAdded(artefacts) => ("artefacts-added", artefacts_message(&ArtefactsMessage::Added(artefacts), true)),
+        ReplicaBody::ArtefactsRemoved(artefacts) => ("artefacts-removed", artefacts_message(&ArtefactsMessage::Removed(artefacts), true)),
         _ => ("unknown", edn::map([("type", ":unknown".into())])),
     })
 }
 fn tries_message(message: &proto::TriesAdded, replica: bool) -> String {
     let mut fields = vec![("type", ":tries-added".into()), ("storage-version", message.storage_version.unwrap_or_default().to_string()), ("storage-epoch", message.storage_epoch.unwrap_or_default().to_string()), ("tries", tries(&message.tries))];
     if replica { fields.push(("source-msg-id", message.source_msg_id.unwrap_or_default().to_string())); }
+    edn::map(fields)
+}
+enum ArtefactsMessage<'a> { Added(&'a proto::ArtefactsAdded), Removed(&'a proto::ArtefactsRemoved) }
+
+fn artefacts_message(message: &ArtefactsMessage<'_>, replica: bool) -> String {
+    let (kind, table_name, storage_version, storage_epoch, entries, source_msg_id) = match message {
+        ArtefactsMessage::Added(message) => (":artefacts-added", &message.table_name, message.storage_version, message.storage_epoch, &message.entries, message.source_msg_id),
+        ArtefactsMessage::Removed(message) => (":artefacts-removed", &message.table_name, message.storage_version, message.storage_epoch, &message.entries, message.source_msg_id),
+    };
+    let entries = edn::vector(entries.iter().map(|entry| {
+        let record = entry.record.clone().unwrap_or_default();
+        edn::map([("trie-key", edn::quoted(entry.trie_key.as_deref().unwrap_or_default())), ("kind", edn::quoted(record.kind())),
+            ("definition-id", edn::quoted(record.definition_id())), ("definition-version", record.definition_version().to_string())])
+    }));
+    let mut fields = vec![("type", kind.into()), ("table-name", edn::quoted(table_name.as_deref().unwrap_or_default())),
+        ("storage-version", storage_version.unwrap_or_default().to_string()), ("storage-epoch", storage_epoch.unwrap_or_default().to_string()), ("entries", entries)];
+    if replica { fields.push(("source-msg-id", source_msg_id.unwrap_or_default().to_string())); }
     edn::map(fields)
 }
 fn tries(tries: &[proto::TrieDetails]) -> String { edn::vector(tries.iter().map(|trie| edn::map([("table-name", edn::quoted(trie.table_name.as_deref().unwrap_or_default())), ("trie-key", edn::quoted(trie.trie_key.as_deref().unwrap_or_default())), ("data-file-size", trie.data_file_size.unwrap_or_default().to_string())]))) }

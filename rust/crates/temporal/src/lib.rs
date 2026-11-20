@@ -437,3 +437,19 @@ pub fn resolve_ordered<'a, R: Clone>(
     for (header, source) in events { result.extend(resolver.resolve(header, source)?); }
     Ok(result)
 }
+
+/// A region of valid time × system time where an event is the visible version of its entity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rectangle { pub valid_time: Interval, pub system_time: Interval }
+
+impl Rectangle {
+    /// Whether a scan at `bounds` emits this rectangle, as `HistoryResolver` decides it.
+    pub fn meets(&self, bounds: TemporalBounds) -> bool { bounds.valid_time.intersects(self.valid_time) && bounds.system_time.intersects(self.system_time) }
+}
+
+/// Every rectangle where each event of an IID-ascending, system-time-descending history is visible, as the scan resolves it with no bounds.
+/// A scan at any bounds emits exactly the rectangles that meet them, so an index holding these answers visibility as the scan does.
+pub fn visibility<'a, R: Clone>(events: impl IntoIterator<Item = (&'a EventHeader, R)>) -> Result<Vec<(R, Rectangle)>> {
+    let all = TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL };
+    Ok(resolve_ordered(events, all, false)?.into_iter().map(|row| (row.source, Rectangle { valid_time: row.valid_time, system_time: row.system_time })).collect())
+}

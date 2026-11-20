@@ -44,13 +44,35 @@ pub struct SegmentCompactor {
     version: StorageVersion,
     epoch: StorageEpoch,
     config: MergeConfig,
+    artefacts: Vec<Arc<dyn crate::ArtefactBuilder>>,
 }
 
 impl SegmentCompactor {
     pub fn new(store: Arc<dyn ObjectStore>, snapshots: Arc<dyn SnapshotSource>, memory: Arc<MemoryBudget>,
         version: StorageVersion, epoch: StorageEpoch, config: MergeConfig) -> Result<Self> {
         if config.page_size == 0 || config.temporary_byte_limit == 0 { return Err(crate::invalid("Compaction page size and temporary byte limit must be positive")); }
-        Ok(Self { store, snapshots, memory, version, epoch, config })
+        Ok(Self { store, snapshots, memory, version, epoch, config, artefacts: Vec::new() })
+    }
+
+    /// Builds the artefacts these builders' definitions want on each output trie from its data file before the trie is published, and records them with it.
+    pub fn with_artefacts(mut self, artefacts: Vec<Arc<dyn crate::ArtefactBuilder>>) -> Self { self.artefacts = artefacts; self }
+
+    /// The records of every artefact built on an output; one that fails is left to the artefact lane, which builds whatever a live trie lacks.
+    async fn artefacts_of(&self, snapshot: &Arc<rtdb_index::PartitionValue>, table: &rtdb_types::TableRef, trie: &TrieKey, data: &Path, size: u64, cancellation: &CancellationToken) -> Vec<rtdb_format::log::proto::ArtefactRecord> {
+        let mut records = Vec::new();
+        let size_signed = i64::try_from(size).unwrap_or(i64::MAX);
+        for builder in &self.artefacts {
+            let Ok(definitions) = builder.definitions(snapshot, cancellation).await else { continue };
+            for definition in definitions.into_iter().filter(|definition| &definition.table == table && crate::wants(definition, trie, size_signed, snapshot.trie_catalog().file_size_target())) {
+                // Tiered compaction publishes one bucket at a time; the lane sees the whole group once it is live.
+                if trie.part_group().is_some() && definition.group_bytes.is_some_and(|limit| size_signed <= limit) { continue; }
+                let job = crate::ArtefactJob { definition, owner: rtdb_format::keys::ArtefactOwner::Trie(trie.clone()) };
+                if let Ok(record) = builder.build(&job, crate::ArtefactSource::Local { data, size }, snapshot, cancellation).await {
+                    records.push(rtdb_format::log::proto::ArtefactRecord { scope: Some(job.scope() as i32), ..record });
+                }
+            }
+        }
+        records
     }
 }
 
@@ -109,15 +131,15 @@ fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> R
     writer.set_byte_limit(allowance)
 }
 
-async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
-    let object = store.head(key).await.map_err(crate::invalid)?;
+pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
+    let object = store.head(key).await?;
     let mut file = create_file(path)?;
     let mut position = 0;
     while position < object.size {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let count = usize::try_from((object.size - position).min(1024 * 1024)).map_err(crate::invalid)?;
         let reservation = ReadReservation::new(count, memory.reserve(count)?);
-        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await.map_err(crate::invalid)?;
+        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await?;
         file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
         position += count as u64;
     }
@@ -125,14 +147,14 @@ async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &Obj
     Ok(file)
 }
 
-fn open_input(mut file: File, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
+pub fn open_input(mut file: File, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
     let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
     let reservation = memory.reserve(layout.opening_allocation_bound()?)?;
     let reader = ArrowFile::from_inspected_reader(file, None, layout)?;
     Ok((reader, reservation))
 }
 
-fn read_page(reader: &mut ArrowFile, index: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+pub fn read_page(reader: &mut ArrowFile, index: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let bound = reader.page_allocation_bound(index)?;
     let reservation = memory.reserve(bound)?;
     OwnedBatch::with_reservation(reader.read_page(index)?, reservation)
@@ -305,7 +327,8 @@ impl CompactionExecutor for SegmentCompactor {
             let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
             self.store.put_file(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
-            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), ..Default::default() });
+            let artefacts = self.artefacts_of(&snapshot, &job.table, &key, &data_path, size, cancellation).await;
+            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, ..Default::default() });
         }
         Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })
     }

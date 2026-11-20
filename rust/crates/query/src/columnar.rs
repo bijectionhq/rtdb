@@ -102,7 +102,8 @@ impl ColumnBatch {
 struct Source { batch: Arc<IndexBatch>, put: StructArray }
 
 /// Gathers the scan's columns for rows that name their batch by its place in `sources`, in the order given.
-pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBatch>], columns: &[Field], memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
+pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBatch>], columns: &[Field], memory: &Arc<MemoryBudget>,
+    mut derived: impl FnMut(usize) -> Result<Option<Column>>) -> Result<ColumnBatch> {
     let mut sources: Vec<Source> = Vec::new();
     // Each batch's operation union, and the sources its put legs became, found once per batch rather than per row.
     let mut batches: Vec<(UnionArray, Vec<(i8, usize)>)> = Vec::new();
@@ -135,19 +136,23 @@ pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBa
     // How much a gathered column holds depends on which cells it picks, so each is charged as soon as it is built.
     let mut reservation = memory.reserve(256)?;
     let mut output = Vec::with_capacity(columns.len());
-    for field in columns {
-        let column = match field.name.as_str() {
-            "_valid_from" => times("_valid_from", rows.iter().map(|row| row.valid_time.lower()), false),
-            "_valid_to" => times("_valid_to", rows.iter().map(|row| row.valid_time.upper()), true),
-            "_system_from" => times("_system_from", rows.iter().map(|row| row.system_time.lower()), false),
-            "_system_to" => times("_system_to", rows.iter().map(|row| row.system_time.upper()), true),
-            "_iid" => {
-                let iids = rows.iter().map(|row| sources_in[row.source.0 as usize].header(row.source.1 as usize).map(|header| header.iid.0)).collect::<Result<Vec<_>>>()?;
-                let array = arrow_array::FixedSizeBinaryArray::try_from_iter(iids.iter()).map_err(|error| invalid("column-gather", error))?;
-                Column::Arrow { array: Arc::new(array), field: Arc::new(ArrowField::new("_iid", DataType::FixedSizeBinary(16), false)),
-                    logical: Some(LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16))) }
+    for (position, field) in columns.iter().enumerate() {
+        let column = if let Some(column) = derived(position)? {
+            column
+        } else {
+            match field.name.as_str() {
+                "_valid_from" => times("_valid_from", rows.iter().map(|row| row.valid_time.lower()), false),
+                "_valid_to" => times("_valid_to", rows.iter().map(|row| row.valid_time.upper()), true),
+                "_system_from" => times("_system_from", rows.iter().map(|row| row.system_time.lower()), false),
+                "_system_to" => times("_system_to", rows.iter().map(|row| row.system_time.upper()), true),
+                "_iid" => {
+                    let iids = rows.iter().map(|row| sources_in[row.source.0 as usize].header(row.source.1 as usize).map(|header| header.iid.0)).collect::<Result<Vec<_>>>()?;
+                    let array = arrow_array::FixedSizeBinaryArray::try_from_iter(iids.iter()).map_err(|error| invalid("column-gather", error))?;
+                    Column::Arrow { array: Arc::new(array), field: Arc::new(ArrowField::new("_iid", DataType::FixedSizeBinary(16), false)),
+                        logical: Some(LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16))) }
+                }
+                name => stored(&sources, &cells, name)?,
             }
-            name => stored(&sources, &cells, name)?,
         };
         let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
         lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
@@ -749,7 +754,7 @@ mod tests {
             computed += 1;
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
-                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
+                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
             for row in 0..batch.len {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 let expected = rtdb_expr::evaluate_projection(&expression, &schema, &values, &context).unwrap();
@@ -790,7 +795,7 @@ mod tests {
             evaluated += 1;
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
-                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
+                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
             for (row, expected) in truth.iter().enumerate() {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 let actual = match rtdb_expr::evaluate(&predicate, &schema, &values, &context).unwrap() { Value::Bool(value) => Some(value), Value::Null => None, other => panic!("{other:?}") };
@@ -916,7 +921,7 @@ mod tests {
                 let batch = batch(&mut random, 32, &memory);
                 let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
                 let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
-                    outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
+                    outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
                 let rows: Vec<Vec<Value>> = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect();
                 if round % 2 == 0 {
                     let predicate = predicate(&mut random, &schema);

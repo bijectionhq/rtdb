@@ -43,8 +43,8 @@ pub struct CompactionDriver {
     requests: mpsc::Receiver<Completion>,
 }
 
-struct Completion { reply: oneshot::Sender<Result<()>>, _permit: OwnedSemaphorePermit }
-impl Completion { fn send(self, result: Result<()>) { let _ = self.reply.send(result); } }
+pub(crate) struct Completion { pub(crate) reply: oneshot::Sender<Result<()>>, pub(crate) _permit: OwnedSemaphorePermit }
+impl Completion { pub(crate) fn send(self, result: Result<()>) { let _ = self.reply.send(result); } }
 
 type JobKey = (TableRef, TrieKey);
 
