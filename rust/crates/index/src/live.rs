@@ -180,6 +180,10 @@ impl LiveTable {
     pub fn header_at(&self, (chunk, offset): (u32, u32)) -> Result<EventHeader> {
         self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?.1.header(offset as usize)
     }
+    /// The batch and position of the row `locate` found, without taking a handle on the batch.
+    pub fn batch_at(&self, (chunk, offset): (u32, u32)) -> Result<(&Arc<IndexBatch>, u32)> {
+        Ok((&self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?.1, offset))
+    }
     /// The row `locate` found.
     pub fn row_at(&self, (chunk, offset): (u32, u32)) -> Result<RowSource> {
         let (_, batch) = self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?;

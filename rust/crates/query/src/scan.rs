@@ -105,6 +105,13 @@ impl ActiveRows {
     fn row(&self, index: usize) -> Result<RowSource> {
         match self { Self::Live { table, located } => table.row_at(located[index]), Self::File(batch) => Ok(RowSource { batch: Arc::clone(batch), row: index }) }
     }
+    /// The batch holding row `index`, and the row's position in it.
+    fn batch(&self, index: usize) -> Result<(&Arc<IndexBatch>, u32)> {
+        match self {
+            Self::Live { table, located } => table.batch_at(located[index]),
+            Self::File(batch) => Ok((batch, u32::try_from(index).map_err(|_| invalid("page-size", "A page row exceeds u32 addressing"))?)),
+        }
+    }
     fn header(&self, index: usize) -> Result<EventHeader> {
         match self { Self::Live { table, located } => table.header_at(located[index]), Self::File(batch) => batch.header(index) }
     }
@@ -508,6 +515,10 @@ impl PartitionScan {
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let mut visited = 0usize;
         let active: Vec<&ActiveRows> = selected.iter().map(|index| &self.loaded[index].rows).collect();
+        // Resolved rows name their batch by its place here, so a row costs no handle on its batch.
+        let mut batches: Vec<Arc<IndexBatch>> = Vec::new();
+        let mut batch_index: std::collections::HashMap<*const IndexBatch, u32, std::hash::BuildHasherDefault<crate::columnar::AddressHasher>> = Default::default();
+        let mut last_batch: Option<(*const IndexBatch, u32)> = None;
         let mut next = heads.pop();
         while let Some(head) = next.take() {
             self.execution.context.check_cancelled_at(visited)?;
@@ -526,23 +537,30 @@ impl PartitionScan {
             };
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
-            let source = rows.row(head.ordinal)?;
+            let (batch, row) = rows.batch(head.ordinal)?;
+            let address = Arc::as_ptr(batch);
+            let handle = match last_batch {
+                Some((last, handle)) if last == address => handle,
+                _ => *batch_index.entry(address).or_insert_with(|| { batches.push(Arc::clone(batch)); (batches.len() - 1) as u32 }),
+            };
+            last_batch = Some((address, handle));
+            let source = (handle, row);
             let group: &mut Vec<_> = &mut groups[head.active];
             let memory = &self.execution.context.memory;
             resolver.resolve_fragments(&head.header, |valid_time, system_time| {
                 if group.len() == group.capacity() {
                     let capacity = group.capacity().saturating_mul(2).max(64);
-                    let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<RowSource>>()).ok_or_else(|| invalid("scan-row-size", "Scan rows exceed addressable memory"))?;
+                    let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<(u32, u32)>>()).ok_or_else(|| invalid("scan-row-size", "Scan rows exceed addressable memory"))?;
                     group_reservations.push(memory.reserve(bytes)?);
                     group.reserve_exact(capacity - group.len());
                 }
-                group.push(ResolvedRow { source: source.clone(), valid_time, system_time });
+                group.push(ResolvedRow { source, valid_time, system_time });
                 Ok(())
             })?;
         }
         self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper);
         self.output = groups.iter().filter(|rows| !rows.is_empty())
-            .map(|rows| crate::columnar::gather(rows, &self.scan.columns, &self.execution.context.memory)).collect::<Result<_>>()?;
+            .map(|rows| crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory)).collect::<Result<_>>()?;
         drop(group_reservations);
         self.output_reservation = Some(reservation);
         Ok(())
@@ -1211,7 +1229,7 @@ mod tests {
         let timestamp_bytes = std::mem::size_of::<Timestamp>();
         let previous_ceiling = (2 * 3 + 1) * timestamp_bytes + 256;
         let replacement_ceiling = (2 * 6 + 1) * timestamp_bytes + 256;
-        let history = 64 * std::mem::size_of::<ResolvedRow<RowSource>>();
+        let history = 64 * std::mem::size_of::<ResolvedRow<(u32, u32)>>();
         for (requested, charged) in [
             (replacement_ceiling, scratch + previous_ceiling),
             (history, scratch + previous_ceiling + replacement_ceiling),

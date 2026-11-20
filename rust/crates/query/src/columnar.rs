@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, StructArray, UnionArray};
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, read_execution_value, read_execution_value_as};
-use rtdb_index::{IndexBatch, RowSource};
+use rtdb_index::IndexBatch;
 use rtdb_plan::Field;
 use rtdb_temporal::ResolvedRow;
 use rtdb_types::{LogicalType, Result, Timestamp, Value};
@@ -100,7 +100,7 @@ impl ColumnBatch {
 
 /// Hashes the batch addresses that identify gather sources; a multiplicative mix suffices for distinct pointers.
 #[derive(Default)]
-struct AddressHasher(u64);
+pub(crate) struct AddressHasher(u64);
 impl std::hash::Hasher for AddressHasher {
     fn finish(&self) -> u64 { self.0 }
     fn write(&mut self, bytes: &[u8]) { for byte in bytes { self.0 = (self.0.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15); } }
@@ -112,7 +112,8 @@ impl std::hash::Hasher for AddressHasher {
 struct Source { batch: Arc<IndexBatch>, put: StructArray }
 
 /// Gathers the scan's columns for rows resolved from any number of event batches, in the order given.
-pub(crate) fn gather(rows: &[ResolvedRow<RowSource>], columns: &[Field], memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
+/// Gathers the scan's columns for rows that name their batch by its place in `sources`, in the order given.
+pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBatch>], columns: &[Field], memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
     let mut sources: Vec<Source> = Vec::new();
     // Each batch's operation union, and the sources its put legs became, found once per batch rather than per row.
     let mut batches: Vec<(UnionArray, Vec<(i8, usize)>)> = Vec::new();
@@ -120,13 +121,15 @@ pub(crate) fn gather(rows: &[ResolvedRow<RowSource>], columns: &[Field], memory:
     let mut cells = Vec::with_capacity(rows.len());
     let mut previous: Option<(*const IndexBatch, usize)> = None;
     for row in rows {
-        let address = Arc::as_ptr(&row.source.batch);
+        let (handle, position) = (row.source.0 as usize, row.source.1 as usize);
+        let row_batch = sources_in.get(handle).ok_or_else(|| invalid("column-gather", "A resolved row names no batch"))?;
+        let address = Arc::as_ptr(row_batch);
         let batch = match previous {
             Some((last, batch)) if last == address => batch,
             _ => match index.get(&address) {
                 Some(batch) => *batch,
                 None => {
-                    batches.push((row.source.batch.view().operations()?.clone(), Vec::new()));
+                    batches.push((row_batch.view().operations()?.clone(), Vec::new()));
                     index.insert(address, batches.len() - 1);
                     batches.len() - 1
                 }
@@ -134,17 +137,17 @@ pub(crate) fn gather(rows: &[ResolvedRow<RowSource>], columns: &[Field], memory:
         };
         previous = Some((address, batch));
         let (op, legs) = &mut batches[batch];
-        let leg = op.type_id(row.source.row);
+        let leg = op.type_id(position);
         let source = match legs.iter().find(|(known, _)| *known == leg) {
             Some((_, source)) => *source,
             None => {
                 let put = op.child(leg).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?.clone();
-                sources.push(Source { batch: Arc::clone(&row.source.batch), put });
+                sources.push(Source { batch: Arc::clone(row_batch), put });
                 legs.push((leg, sources.len() - 1));
                 sources.len() - 1
             }
         };
-        cells.push((source, op.value_offset(row.source.row)));
+        cells.push((source, op.value_offset(position)));
     }
     // How much a gathered column holds depends on which cells it picks, so each is charged as soon as it is built.
     let mut reservation = memory.reserve(256)?;
@@ -155,7 +158,7 @@ pub(crate) fn gather(rows: &[ResolvedRow<RowSource>], columns: &[Field], memory:
             "_valid_to" => Column::Values(rows.iter().map(|row| time(row.valid_time.upper(), true)).collect()),
             "_system_from" => Column::Values(rows.iter().map(|row| time(row.system_time.lower(), false)).collect()),
             "_system_to" => Column::Values(rows.iter().map(|row| time(row.system_time.upper(), true)).collect()),
-            "_iid" => Column::Values(rows.iter().map(|row| row.source.header().map(|header| Value::FixedSizeBinary(header.iid.0.to_vec()))).collect::<Result<_>>()?),
+            "_iid" => Column::Values(rows.iter().map(|row| sources_in[row.source.0 as usize].header(row.source.1 as usize).map(|header| Value::FixedSizeBinary(header.iid.0.to_vec()))).collect::<Result<_>>()?),
             name => stored(&sources, &cells, name)?,
         };
         let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
