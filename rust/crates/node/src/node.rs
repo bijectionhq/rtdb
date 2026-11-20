@@ -34,10 +34,17 @@ pub struct NodeServices {
     /// Where a read-only database's compactor sends what it produced, to be published by the database's writer elsewhere.
     /// Absent, a read-only database runs no compactor.
     pub compaction_relay: Option<Arc<dyn crate::database::CompactionRelay>>,
+    /// Asked before every query whether this node may still serve its database: a linearizable read waits on it, and a deposed holder is refused.
+    pub read_fence: Option<Arc<dyn ReadFence>>,
+}
+
+#[async_trait::async_trait]
+pub trait ReadFence: Send + Sync {
+    async fn confirm(&self, database: &str) -> Result<()>;
 }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, compaction_relay: None }
+        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, compaction_relay: None, read_fence: None }
     }
 }
 
@@ -48,6 +55,7 @@ pub struct Node {
     commands: mpsc::Sender<CatalogCommand>,
     cancellation: CancellationToken,
     pub(crate) runtime: Arc<crate::runtime::RuntimeProviders>,
+    read_fence: Option<Arc<dyn ReadFence>>,
 }
 
 pub struct NodeDriver {
@@ -102,11 +110,12 @@ impl Node {
         options.default_timezone = rtdb_expr::normalize_timezone(&options.default_timezone)?;
         let catalog = DatabaseCatalog::new(options.membership.clone());
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
+        let read_fence = services.read_fence.clone();
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
             external_sources: services.external_sources, compaction_relay: services.compaction_relay, clock: services.clock, options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
-        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime };
+        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence };
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
@@ -232,6 +241,7 @@ impl Node {
 
     pub async fn query_context(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
         let mut snapshots = BTreeMap::new();
         // A placed node's databases belong to different tenants: a session sees its own database and no other.
         let isolated = matches!(self.factory.options.membership, Membership::Placed);

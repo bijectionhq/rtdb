@@ -17,6 +17,8 @@ pub struct PlacedOptions {
     pub log_factories: Vec<(String, Arc<dyn rtdb_node::LogFactory>)>,
     /// Storage factories for the placed databases' object stores, by protobuf type name.
     pub storage_factories: Vec<(String, Arc<dyn rtdb_node::RemoteStorageFactory>)>,
+    /// Asked before every query whether the node may still serve its database.
+    pub read_fence: Option<Arc<dyn rtdb_node::ReadFence>>,
     /// Publishes compactions this node's read-only databases produce through their writers elsewhere.
     pub compaction_relay: Option<Arc<dyn rtdb_node::CompactionRelay>>,
     /// How long a placed holder waits on an empty replica read before claiming.
@@ -118,11 +120,12 @@ impl ServerDriver {
             None => resources,
         };
         let compaction_relay = placed.as_ref().and_then(|placed| placed.compaction_relay.clone());
+        let read_fence = placed.as_ref().and_then(|placed| placed.read_fence.clone());
         if let Some(placed) = placed {
             for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
         }
-        let services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay,
+        let services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, read_fence,
             ..NodeServices::local(auth.clone(), metrics.clone(), auth.clone(), metrics.clone()) };
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;
         let cancellation = CancellationToken::new();
