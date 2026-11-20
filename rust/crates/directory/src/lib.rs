@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod feed;
 pub mod policy;
 pub mod watch;
 #[cfg(feature = "network")]
@@ -20,6 +21,7 @@ pub mod network;
 #[cfg(feature = "dynamodb")]
 pub mod dynamo;
 
+pub use feed::ChangeFeed;
 pub use policy::{claim, effective_holder, park};
 pub use watch::watch_deployment;
 #[cfg(feature = "network")]
@@ -216,6 +218,11 @@ pub trait Directory: Send + Sync {
     async fn member(&self, id: &MemberId) -> Result<Option<MemberRecord>>;
     async fn members(&self) -> Result<Vec<MemberRecord>>;
     async fn replace_member(&self, record: MemberRecord, expected: Version) -> Result<Cas<MemberRecord>>;
+
+    /// Every deployment record applied from now on, as the backend learns of it; `None` if this backend has no feed, and its watches poll.
+    /// A receiver sees each record's versions in order, possibly late; it may miss some, and then sees `RecvError::Lagged` or a later version only.
+    /// Called within a Tokio runtime, since a backend may start following its source on the first call.
+    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { None }
 }
 
 pub fn now_ms() -> i64 {
@@ -228,7 +235,7 @@ pub fn exists(what: &str, key: &str) -> Anomaly {
 
 /// The directory for tests, simulation and single-process cells: one lock, so trivially linearizable.
 #[derive(Default)]
-pub struct MemoryDirectory { state: Mutex<MemoryState> }
+pub struct MemoryDirectory { state: Mutex<MemoryState>, changes: ChangeFeed }
 
 #[derive(Default)]
 struct MemoryState {
@@ -250,6 +257,7 @@ impl Directory for MemoryDirectory {
         record.version = 1;
         state.names.insert(record.name.clone(), record.id.clone());
         state.deployments.insert(record.id.clone(), record.clone());
+        self.changes.publish(record.clone());
         Ok(record)
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state.lock().deployments.get(id).cloned()) }
@@ -268,6 +276,7 @@ impl Directory for MemoryDirectory {
         if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
         record.version = expected + 1;
         state.deployments.insert(record.id.clone(), record.clone());
+        self.changes.publish(record.clone());
         Ok(Cas::Applied(record))
     }
     async fn register_member(&self, mut record: MemberRecord) -> Result<MemberRecord> {
@@ -287,6 +296,7 @@ impl Directory for MemoryDirectory {
         state.members.insert(record.id.clone(), record.clone());
         Ok(Cas::Applied(record))
     }
+    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { Some(self.changes.subscribe()) }
 }
 
 pub mod contract;

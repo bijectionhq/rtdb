@@ -237,7 +237,7 @@ async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
 async fn dynamodb(prefix: &str) -> Result<Arc<dyn Directory>> {
     let tables = rtdb_directory::DynamoTables::with_prefix(prefix);
     let directory = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
-        Ok(endpoint) => rtdb_directory::DynamoDirectory::new(rtdb_directory::DynamoDirectory::local_client(&endpoint), tables),
+        Ok(endpoint) => rtdb_directory::DynamoDirectory::local(&endpoint, tables),
         Err(_) => rtdb_directory::DynamoDirectory::from_sdk_config(&aws_config::load_from_env().await, tables),
     };
     directory.create_tables().await?;

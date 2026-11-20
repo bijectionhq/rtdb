@@ -2,6 +2,7 @@
 //!
 //! The protocol is newline-delimited JSON: each request carries an id, each response names the request it answers, and responses come back in completion order.
 //! An `Anomaly` crosses the wire whole, so a server-side Conflict is a Conflict at the client.
+//! A subscription to the server's change feed has a connection of its own: every current deployment record, then each change as it applies, until the connection closes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,11 +15,11 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::{Cas, DeploymentRecord, Directory, MemberId, MemberRecord, Version};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, MemberId, MemberRecord, Version};
 
 /// A longer line closes the connection rather than growing the buffer without bound.
 const MAX_LINE: u64 = 64 << 20;
@@ -60,6 +61,21 @@ enum Reply {
 
 #[derive(Deserialize)]
 struct Request { id: u64, op: Op }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Feed { Deployments }
+
+#[derive(Serialize, Deserialize)]
+struct Subscribe { id: u64, subscribe: Feed }
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Incoming { Request(Request), Subscribe(Subscribe) }
+
+/// One message of a subscription; an error ends it, and the subscriber resubscribes to start again from a fresh snapshot.
+#[derive(Serialize, Deserialize)]
+struct Changed { id: u64, result: std::result::Result<DeploymentRecord, Anomaly> }
 
 /// A request as sent: the op is borrowed, so a resend needs no clone.
 #[derive(Serialize)]
@@ -129,6 +145,8 @@ async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, canc
         }
     });
 
+    let connection_closed = cancellation.child_token();
+    let _closes_subscriptions = connection_closed.clone().drop_guard();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     loop {
@@ -137,8 +155,12 @@ async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, canc
             more = read_line(&mut reader, &mut line) => more,
         };
         if !matches!(more, Ok(true)) { return; }
-        let request = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => request,
+        let request = match serde_json::from_str::<Incoming>(&line) {
+            Ok(Incoming::Request(request)) => request,
+            Ok(Incoming::Subscribe(Subscribe { id, subscribe: Feed::Deployments })) => {
+                tracker.spawn(forward_changes(directory.clone(), id, responses.clone(), connection_closed.clone()));
+                continue;
+            }
             Err(error) => {
                 let Ok(RequestId { id }) = serde_json::from_str(&line) else { return };
                 let refusal = Anomaly::incorrect("rtdb.directory/malformed-request", format!("Malformed directory request: {error}"));
@@ -151,6 +173,35 @@ async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, canc
             let result = dispatch(directory.as_ref(), request.op).await;
             let _ = responses.send(encode(&Response { id: request.id, result }));
         });
+    }
+}
+
+/// Sends every current deployment record, then each change, until the connection closes or the feed lags.
+/// Subscribing before the snapshot means no change between the two is lost; one that arrives older than the snapshot is dropped by the subscriber's `ChangeFeed`.
+async fn forward_changes(directory: Arc<dyn Directory>, id: u64, responses: mpsc::UnboundedSender<String>, closed: CancellationToken) {
+    let send = |result| responses.send(encode(&Changed { id, result })).is_ok();
+    let Some(mut changes) = directory.deployment_changes() else {
+        send(Err(Anomaly::unsupported("rtdb.directory/no-change-feed", "This directory has no change feed")));
+        return;
+    };
+    match directory.deployments().await {
+        Ok(records) => for record in records { if !send(Ok(record)) { return; } },
+        Err(error) => { send(Err(error)); return; }
+    }
+    loop {
+        let change = tokio::select! {
+            _ = closed.cancelled() => return,
+            change = changes.recv() => change,
+        };
+        let sent = match change {
+            Ok(record) => send(Ok(record)),
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                send(Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.directory/changes-lost", format!("The subscriber fell {missed} changes behind"))));
+                return;
+            }
+            Err(broadcast::error::RecvError::Closed) => { send(Err(unavailable("rtdb.directory/feed-closed", "The directory's change feed ended"))); return; }
+        };
+        if !sent { return; }
     }
 }
 
@@ -249,8 +300,11 @@ pub struct RemoteDirectory {
     request_timeout: Duration,
     next_id: AtomicU64,
     connection: tokio::sync::Mutex<Option<Arc<Connection>>>,
-    /// Parent of every connection's `closed`, so dropping the client closes its connection.
+    /// Parent of every connection's `closed`, so dropping the client closes its connection and ends its subscription.
     shutdown: CancellationToken,
+    /// The server's feed, relayed by a subscription started on the first `deployment_changes`.
+    changes: Arc<ChangeFeed>,
+    subscribed: Mutex<bool>,
 }
 
 impl RemoteDirectory {
@@ -261,7 +315,7 @@ impl RemoteDirectory {
     /// Connects now, so an unreachable address fails here; `request_timeout` bounds each call, including any reconnect it makes.
     pub async fn connect_with_timeout(address: &str, request_timeout: Duration) -> Result<Arc<Self>> {
         let directory = Self { address: address.to_owned(), request_timeout, next_id: AtomicU64::new(1), connection: tokio::sync::Mutex::new(None),
-            shutdown: CancellationToken::new() };
+            shutdown: CancellationToken::new(), changes: Arc::new(ChangeFeed::new()), subscribed: Mutex::new(false) };
         tokio::time::timeout(request_timeout, directory.connection()).await.map_err(|_| directory.timed_out(false))??;
         Ok(Arc::new(directory))
     }
@@ -312,6 +366,45 @@ impl RemoteDirectory {
     }
 }
 
+const RESUBSCRIBE_MIN: Duration = Duration::from_millis(50);
+const RESUBSCRIBE_MAX: Duration = Duration::from_secs(2);
+
+/// Relays the server's feed into `changes`, resubscribing with backoff whenever the subscription ends, until `shutdown`.
+/// Each subscription opens with a snapshot, so whatever changed while it was down reaches `changes` as the latest version.
+async fn relay_changes(address: String, request_timeout: Duration, changes: Arc<ChangeFeed>, shutdown: CancellationToken) {
+    let mut backoff = RESUBSCRIBE_MIN;
+    loop {
+        let received = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            received = follow_changes(&address, request_timeout, &changes) => received,
+        };
+        if received { backoff = RESUBSCRIBE_MIN; }
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(RESUBSCRIBE_MAX);
+    }
+}
+
+/// Follows one subscription until it ends; whether it delivered anything.
+async fn follow_changes(address: &str, request_timeout: Duration, changes: &ChangeFeed) -> bool {
+    let Ok(Ok(stream)) = tokio::time::timeout(request_timeout, TcpStream::connect(address)).await else { return false };
+    let _ = stream.set_nodelay(true);
+    let (read_half, mut write_half) = stream.into_split();
+    if write_half.write_all(encode(&Subscribe { id: 0, subscribe: Feed::Deployments }).as_bytes()).await.is_err() { return false; }
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let mut received = false;
+    while let Ok(true) = read_line(&mut reader, &mut line).await {
+        match serde_json::from_str::<Changed>(&line) {
+            Ok(Changed { result: Ok(record), .. }) => { received = true; changes.publish(record); }
+            _ => break,
+        }
+    }
+    received
+}
+
 impl Drop for RemoteDirectory {
     fn drop(&mut self) { self.shutdown.cancel(); }
 }
@@ -351,6 +444,16 @@ impl Directory for RemoteDirectory {
     }
     async fn replace_member(&self, record: MemberRecord, expected: Version) -> Result<Cas<MemberRecord>> {
         match self.call(Op::ReplaceMember { record, expected }).await? { Reply::MemberCas(cas) => Ok(cas), other => Err(protocol(other)) }
+    }
+    /// Outside a Tokio runtime there is nothing to relay the server's feed on, so there is no feed.
+    fn deployment_changes(&self) -> Option<broadcast::Receiver<DeploymentRecord>> {
+        let mut subscribed = self.subscribed.lock();
+        if !*subscribed {
+            let runtime = tokio::runtime::Handle::try_current().ok()?;
+            runtime.spawn(relay_changes(self.address.clone(), self.request_timeout, self.changes.clone(), self.shutdown.clone()));
+            *subscribed = true;
+        }
+        Some(self.changes.subscribe())
     }
 }
 
@@ -439,5 +542,82 @@ mod tests {
         let refused = remote.deployment("absent").await.unwrap_err();
         assert_eq!((refused.category, refused.code.as_str()), (AnomalyCategory::Unavailable, "rtdb.directory/timeout"));
         silent.abort();
+    }
+
+    /// Waits until `receiver` has seen every one of `records`, which shows the subscription is established.
+    async fn await_versions(receiver: &mut broadcast::Receiver<DeploymentRecord>, records: &[DeploymentRecord]) {
+        let mut awaited = records.iter().map(|record| (record.id.clone(), record.version)).collect::<HashMap<_, _>>();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !awaited.is_empty() {
+                let seen = receiver.recv().await.expect("the feed runs");
+                if awaited.get(&seen.id).is_some_and(|version| seen.version >= *version) { awaited.remove(&seen.id); }
+            }
+        }).await.expect("the records arrive");
+    }
+
+    async fn await_version(receiver: &mut broadcast::Receiver<DeploymentRecord>, record: &DeploymentRecord) {
+        await_versions(receiver, std::slice::from_ref(record)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_network_feed_delivers_every_change_in_version_order() {
+        use std::collections::BTreeMap;
+        let directory = MemoryDirectory::new();
+        let served = served(directory.clone()).await;
+        let remote = RemoteDirectory::connect(&served.address).await.unwrap();
+        let mut records = Vec::new();
+        for index in 0..4 { records.push(remote.create_deployment(DeploymentRecord::new(format!("shop-{index}"), "acme", vec![], 0)).await.unwrap()); }
+        let mut receiver = remote.deployment_changes().expect("the remote directory relays the server's feed");
+        await_versions(&mut receiver, &records).await;
+
+        let seen = records.iter().map(|record| (record.id.clone(), record.version)).collect::<BTreeMap<_, _>>();
+        let last = crate::feed::tests::replace_concurrently(remote.clone(), records, 50).await;
+        crate::feed::tests::expect_every_change(&mut receiver, seen, &last).await;
+        drop(remote);
+        served.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_network_feed_resubscribes_and_catches_up_after_the_server_restarts() {
+        let directory = MemoryDirectory::new();
+        let served = served(directory.clone()).await;
+        let address = served.address.clone();
+        let remote = RemoteDirectory::connect(&address).await.unwrap();
+        let created = remote.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let mut receiver = remote.deployment_changes().unwrap();
+        await_version(&mut receiver, &created).await;
+        served.stop().await;
+
+        let mut changed = created.clone();
+        changed.epoch = 7;
+        let changed = directory.replace_deployment(changed, created.version).await.unwrap().applied().unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket.bind(address.parse().unwrap()).unwrap();
+        let restarted = serve_on(socket.listen(64).unwrap(), directory).await;
+        let seen = tokio::time::timeout(Duration::from_secs(10), receiver.recv()).await.expect("the change made while down arrives").unwrap();
+        assert_eq!(seen, changed);
+        drop(remote);
+        restarted.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_watch_over_the_network_sees_a_change_within_milliseconds() {
+        let served = served(MemoryDirectory::new()).await;
+        let remote = RemoteDirectory::connect(&served.address).await.unwrap();
+        let created = remote.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let mut probe = remote.deployment_changes().unwrap();
+        await_version(&mut probe, &created).await;
+        let mut watched = crate::watch_deployment(remote.clone(), created.id.clone(), Duration::from_secs(60));
+        tokio::time::timeout(Duration::from_secs(5), watched.changed()).await.unwrap().unwrap();
+
+        let mut changed = created.clone();
+        changed.epoch = 1;
+        let changed = remote.replace_deployment(changed, created.version).await.unwrap().applied().unwrap();
+        tokio::time::timeout(Duration::from_millis(500), watched.changed()).await.expect("the change arrives long before the next poll").unwrap();
+        assert_eq!(watched.borrow().as_ref().unwrap().version, changed.version);
+        drop(watched);
+        drop(remote);
+        served.stop().await;
     }
 }

@@ -3,8 +3,10 @@
 //! One table per record kind, keyed by id, plus a names table that makes deployment names unique.
 //! Each item carries the record as a JSON blob beside the attributes DynamoDB has to see: the key, `version` for conditions, `holder` for the index.
 //! Every replace is a `PutItem` conditional on `version = expected`, and every read is strongly consistent except the holder index query.
+//! The deployments table streams its new images, which the directory follows as its change feed.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,13 +14,18 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, IndexStatus, KeySchemaElement, KeyType, Projection, ProjectionType, Put,
-    ReturnValuesOnConditionCheckFailure, ScalarAttributeType, TableStatus, TransactWriteItem,
+    ReturnValuesOnConditionCheckFailure, ScalarAttributeType, StreamSpecification, StreamViewType, TableStatus, TransactWriteItem,
 };
+use aws_sdk_dynamodbstreams::Client as StreamsClient;
+use parking_lot::Mutex;
+use tokio::sync::broadcast;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{exists, Cas, DeploymentRecord, Directory, MemberId, MemberRecord, Version};
+use crate::{exists, Cas, ChangeFeed, DeploymentRecord, Directory, MemberId, MemberRecord, Version};
+
+mod streams;
 
 type Item = HashMap<String, AttributeValue>;
 
@@ -49,13 +56,24 @@ impl DynamoTables {
 
 pub struct DynamoDirectory {
     client: Client,
+    streams: StreamsClient,
     tables: DynamoTables,
+    /// The deployments table's stream, followed from the first `deployment_changes` until the directory is dropped.
+    changes: Arc<ChangeFeed>,
+    following: Mutex<bool>,
 }
 
 impl DynamoDirectory {
-    pub fn new(client: Client, tables: DynamoTables) -> Self { Self { client, tables } }
+    pub fn new(client: Client, streams: StreamsClient, tables: DynamoTables) -> Self {
+        Self { client, streams, tables, changes: Arc::new(ChangeFeed::new()), following: Mutex::new(false) }
+    }
 
-    pub fn from_sdk_config(config: &aws_types::SdkConfig, tables: DynamoTables) -> Self { Self::new(Client::new(config), tables) }
+    pub fn from_sdk_config(config: &aws_types::SdkConfig, tables: DynamoTables) -> Self { Self::new(Client::new(config), StreamsClient::new(config), tables) }
+
+    /// A directory on DynamoDB Local at `endpoint`, with static dummy credentials.
+    pub fn local(endpoint: &str, tables: DynamoTables) -> Self {
+        Self::new(Self::local_client(endpoint), Self::local_streams_client(endpoint), tables)
+    }
 
     /// A client for DynamoDB Local at `endpoint`, with static dummy credentials.
     pub fn local_client(endpoint: &str) -> Client {
@@ -69,9 +87,21 @@ impl DynamoDirectory {
         Client::from_conf(config)
     }
 
+    /// A DynamoDB Streams client for DynamoDB Local at `endpoint`, with static dummy credentials.
+    pub fn local_streams_client(endpoint: &str) -> StreamsClient {
+        use aws_sdk_dynamodbstreams::config::{BehaviorVersion, Credentials, Region};
+        let config = aws_sdk_dynamodbstreams::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("local", "local", None, None, "rtdb-directory"))
+            .build();
+        StreamsClient::from_conf(config)
+    }
+
     pub fn tables(&self) -> &DynamoTables { &self.tables }
 
-    /// Creates any of the tables that do not exist, on-demand, with the holder index, and waits until all are active.
+    /// Creates any of the tables that do not exist, on-demand, with the holder index and the deployments' stream of new images, and waits until all are active.
     /// For tests and local cells; production tables belong to the cell's infrastructure code.
     pub async fn create_tables(&self) -> Result<()> {
         self.create_table(&self.tables.deployments, ID).await?;
@@ -90,7 +120,8 @@ impl DynamoDirectory {
             let index = GlobalSecondaryIndex::builder().index_name(HOLDER_INDEX).key_schema(key_schema(HOLDER)?)
                 .projection(Projection::builder().projection_type(ProjectionType::KeysOnly).build())
                 .build().map_err(build_fault)?;
-            request = request.attribute_definitions(attribute_definition(HOLDER)?).global_secondary_indexes(index);
+            let stream = StreamSpecification::builder().stream_enabled(true).stream_view_type(StreamViewType::NewImage).build().map_err(build_fault)?;
+            request = request.attribute_definitions(attribute_definition(HOLDER)?).global_secondary_indexes(index).stream_specification(stream);
         }
         match request.send().await {
             Ok(_) => Ok(()),
@@ -114,14 +145,7 @@ impl DynamoDirectory {
 
     async fn get(&self, table: &str, key: &str, value: &str) -> Result<Option<Item>> { get_item(&self.client, table, key, value).await }
 
-    async fn scan(&self, table: &str) -> Result<Vec<Item>> {
-        let mut pages = self.client.scan().table_name(table).consistent_read(true).into_paginator().send();
-        let mut items = Vec::new();
-        while let Some(page) = pages.next().await {
-            items.extend(page.map_err(|error| sdk_anomaly("Scan", error))?.items.unwrap_or_default());
-        }
-        Ok(items)
-    }
+    async fn scan(&self, table: &str) -> Result<Vec<Item>> { scan_items(&self.client, table).await }
 
     async fn put_new(&self, table: &str, item: Item) -> Result<bool> {
         let written = self.client.put_item().table_name(table).set_item(Some(item))
@@ -162,6 +186,15 @@ impl DynamoDirectory {
             },
         }
     }
+}
+
+async fn scan_items(client: &Client, table: &str) -> Result<Vec<Item>> {
+    let mut pages = client.scan().table_name(table).consistent_read(true).into_paginator().send();
+    let mut items = Vec::new();
+    while let Some(page) = pages.next().await {
+        items.extend(page.map_err(|error| sdk_anomaly("Scan", error))?.items.unwrap_or_default());
+    }
+    Ok(items)
 }
 
 async fn get_item(client: &Client, table: &str, key: &str, value: &str) -> Result<Option<Item>> {
@@ -347,6 +380,19 @@ impl Directory for DynamoDirectory {
             Err(current) => Ok(Cas::Conflict(current.as_ref().map(decode_member).transpose()?)),
         }
     }
+
+    /// Outside a Tokio runtime there is nothing to follow the stream on, so there is no feed.
+    fn deployment_changes(&self) -> Option<broadcast::Receiver<DeploymentRecord>> {
+        let mut following = self.following.lock();
+        if !*following {
+            let runtime = tokio::runtime::Handle::try_current().ok()?;
+            let follower = streams::Follower { client: self.client.clone(), streams: self.streams.clone(), table: self.tables.deployments.clone(),
+                changes: Arc::downgrade(&self.changes) };
+            runtime.spawn(follower.run());
+            *following = true;
+        }
+        Some(self.changes.subscribe())
+    }
 }
 
 #[cfg(test)]
@@ -365,7 +411,7 @@ mod tests {
             return None;
         };
         let prefix = format!("rtdb-test-{}", uuid::Uuid::new_v4().simple());
-        let directory = DynamoDirectory::new(DynamoDirectory::local_client(&endpoint), DynamoTables::with_prefix(&prefix));
+        let directory = DynamoDirectory::local(&endpoint, DynamoTables::with_prefix(&prefix));
         directory.create_tables().await.expect("create tables");
         Some(directory)
     }
@@ -396,5 +442,50 @@ mod tests {
         let parked = crate::park(&held, &holder, held.epoch).unwrap();
         directory.replace_deployment(parked, held.version).await.unwrap().applied().unwrap();
         assert_eq!(directory.deployments_held_by(&holder).await.unwrap(), vec![]);
+    }
+
+    /// Waits until `receiver` has seen every one of `records`, which shows the follower has reached the stream.
+    async fn await_versions(receiver: &mut broadcast::Receiver<DeploymentRecord>, records: &[DeploymentRecord]) {
+        let mut awaited = records.iter().map(|record| (record.id.clone(), record.version)).collect::<HashMap<_, _>>();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !awaited.is_empty() {
+                let seen = receiver.recv().await.expect("the feed runs");
+                if awaited.get(&seen.id).is_some_and(|version| seen.version >= *version) { awaited.remove(&seen.id); }
+            }
+        }).await.expect("the records arrive");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_dynamodb_stream_delivers_every_change_in_version_order() {
+        let Some(directory) = local().await else { return };
+        let directory = Arc::new(directory);
+        let mut records = Vec::new();
+        for index in 0..3 { records.push(directory.create_deployment(DeploymentRecord::new(format!("shop-{index}"), "acme", vec![], 0)).await.unwrap()); }
+        let mut receiver = directory.deployment_changes().expect("the DynamoDB directory follows its stream");
+        await_versions(&mut receiver, &records).await;
+
+        let seen = records.iter().map(|record| (record.id.clone(), record.version)).collect::<std::collections::BTreeMap<_, _>>();
+        let last = crate::feed::tests::replace_concurrently(directory.clone(), records, 10).await;
+        crate::feed::tests::expect_every_change(&mut receiver, seen, &last).await;
+
+        let created = directory.create_deployment(DeploymentRecord::new("shop-late", "acme", vec![], 0)).await.unwrap();
+        await_versions(&mut receiver, std::slice::from_ref(&created)).await;
+    }
+
+    #[tokio::test]
+    async fn a_watch_over_the_dynamodb_stream_sees_a_change_long_before_the_next_poll() {
+        let Some(directory) = local().await else { return };
+        let directory = Arc::new(directory);
+        let created = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let mut probe = directory.deployment_changes().unwrap();
+        await_versions(&mut probe, std::slice::from_ref(&created)).await;
+        let mut watched = crate::watch_deployment(directory.clone(), created.id.clone(), Duration::from_secs(60));
+        tokio::time::timeout(Duration::from_secs(5), watched.changed()).await.unwrap().unwrap();
+
+        let mut changed = created.clone();
+        changed.epoch = 1;
+        let changed = directory.replace_deployment(changed, created.version).await.unwrap().applied().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watched.changed()).await.expect("the change arrives long before the next poll").unwrap();
+        assert_eq!(watched.borrow().as_ref().unwrap().version, changed.version);
     }
 }

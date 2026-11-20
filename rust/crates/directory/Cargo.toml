@@ -11,7 +11,7 @@ description = "The RTDB multi cell directory: deployment placement, writer epoch
 # Serves any directory over TCP, and the client that reaches it.
 network = ["dep:tokio-util"]
 # The production backend.
-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-types"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-sdk-dynamodbstreams", "dep:aws-types"]
 
 [dependencies]
 rtdb-types.workspace = true
@@ -23,6 +23,7 @@ uuid.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-dynamodbstreams = { workspace = true, optional = true }
 aws-types = { workspace = true, optional = true }
 
 [dev-dependencies]
