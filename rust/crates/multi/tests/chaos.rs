@@ -99,5 +99,8 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
     let invented: Vec<_> = stored.iter().filter(|id| !acknowledged.contains(id) && !unknown.contains(id)).collect();
     assert!(invented.is_empty(), "rows appeared that were never attempted: {invented:?}");
     drop(client);
+    let report = admin::audit(cell.directory.as_ref(), &cell.keys(), "shop", 4 << 20).await.unwrap();
+    println!("audit: {} records, {} transactions, highest term {}", report.records, report.transactions, report.highest_term);
+    assert!(report.violations.is_empty(), "the history is one chain: {:?}", report.violations);
     cell.stop().await;
 }

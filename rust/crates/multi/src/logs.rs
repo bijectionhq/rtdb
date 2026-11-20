@@ -136,6 +136,10 @@ fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Option<i64>> {
 /// A log whose payloads are sealed under the deployment's key, so a logkeeper never holds a row in the clear.
 pub struct SealedLog { inner: Arc<dyn Log>, cipher: Arc<Cipher>, stream: Arc<str> }
 
+impl SealedLog {
+    pub fn new(inner: Arc<dyn Log>, key: &[u8], stream: &str) -> Result<Self> { Ok(Self { inner, cipher: Arc::new(Cipher::new(key)?), stream: Arc::from(stream) }) }
+}
+
 fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
     Ok(LogRecord { metadata: record.metadata, payload: cipher.open(stream, &record.payload)? })
 }

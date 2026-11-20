@@ -25,6 +25,7 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
        rtdb-multi status --directory DIR [--target-per-node N]\n\
+       rtdb-multi audit --directory DIR --keys PATH --name NAME\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
@@ -189,6 +190,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let status = admin::cell_status(directory.as_ref(), arguments.number("target-per-node", 1000usize)?).await?;
             println!("{}", serde_json::to_string_pretty(&status).expect("a status serializes"));
             Ok(())
+        }
+        "audit" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let report = admin::audit(directory.as_ref(), keys(&arguments)?.as_ref(), arguments.required("name")?, 4 << 20).await?;
+            println!("{}", serde_json::to_string_pretty(&report).expect("a report serializes"));
+            if report.violations.is_empty() { Ok(()) } else { Err(Anomaly::fault("rtdb.multi/audit", format!("{} violations", report.violations.len()))) }
         }
         "drain" => {
             let directory = directory(arguments.required("directory")?).await?;

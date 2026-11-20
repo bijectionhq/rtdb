@@ -245,6 +245,47 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     Ok(deletion)
 }
 
+/// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct AuditReport { pub records: usize, pub transactions: usize, pub highest_term: i64, pub violations: Vec<String> }
+
+/// Reads a deployment's whole replica stream through its logkeepers, decrypts it, and checks that it is one history: dense positions, terms that never go back, transaction ids, system times and source positions that strictly rise.
+pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<AuditReport> {
+    use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
+    use rtdb_storage::log::Log;
+    let current = record(directory, name).await?;
+    let members = members(directory).await?;
+    let servers: Vec<String> = current.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
+    let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
+    let log = crate::logs::SealedLog::new(reader, &keys.key(&current.id)?, &current.stream("replica"))?;
+    let latest = log.latest()?.0;
+    let mut report = AuditReport::default();
+    let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);
+    while next <= latest {
+        let records = log.read_range(rtdb_storage::log::LogOffset(next), rtdb_storage::log::LogOffset((next + 1024).min(latest + 1))).await?;
+        if records.is_empty() { report.violations.push(format!("no record at position {next}")); break; }
+        for record in records {
+            if record.metadata.offset.0 != next { report.violations.push(format!("position {} follows {}", record.metadata.offset.0, next - 1)); }
+            next = record.metadata.offset.0 + 1;
+            report.records += 1;
+            let Some(envelope) = ReplicaEnvelope::decode(&record.payload)? else { continue };
+            if envelope.term.0 < report.highest_term { report.violations.push(format!("position {}: term {} after term {}", record.metadata.offset.0, envelope.term.0, report.highest_term)); }
+            report.highest_term = report.highest_term.max(envelope.term.0);
+            if let ReplicaBody::ResolvedTx(tx) = &envelope.message {
+                report.transactions += 1;
+                for (what, value, last) in [("transaction id", tx.tx_id, &mut last_tx), ("system time", tx.system_time_micros, &mut last_time), ("source position", tx.src_msg_id, &mut last_source)] {
+                    if let Some(value) = value {
+                        if value <= *last { report.violations.push(format!("position {}: {what} {value} does not rise past {}", record.metadata.offset.0, *last)); }
+                        *last = value;
+                    }
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// Starts scaling a node in: it keeps serving what it holds, receives no new placements, and parks everything it holds so that each deployment's next request activates it elsewhere.
 pub async fn drain(directory: &dyn Directory, member: &MemberId) -> Result<()> {
     for _ in 0..8 {
