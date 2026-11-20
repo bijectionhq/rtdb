@@ -34,6 +34,8 @@ pub enum Error {
     Remote { key: String, message: String },
     #[error("remote storage permission denied at {key}: {message}")]
     PermissionDenied { key: String, message: String },
+    #[error("log writer at epoch {epoch} was deposed by a seal at epoch {promised}")]
+    Deposed { epoch: u64, promised: u64 },
     #[error("{upload}; multipart abort also failed: {abort}")]
     MultipartAbort { #[source] upload: Box<Error>, abort: Box<Error> },
 }
@@ -64,6 +66,7 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
             Error::Task(_) => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),
             Error::Remote { key, .. } => (Category::Unavailable, "rtdb.storage/remote", serde_json::json!({"key": key})),
+            Error::Deposed { epoch, promised } => (Category::Conflict, "rtdb.storage/deposed", serde_json::json!({"epoch": epoch, "promised": promised})),
             Error::PermissionDenied { key, .. } => (Category::Forbidden, "rtdb.storage/permission-denied", serde_json::json!({"key": key})),
             Error::MultipartAbort { upload, abort } => {
                 let mut anomaly = Anomaly::from(*upload);

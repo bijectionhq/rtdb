@@ -1,0 +1,115 @@
+//! The logkeeper server: many named streams on one data directory, served over one multiplexed protocol.
+
+mod journal;
+mod state;
+mod store;
+
+use crate::protocol::{Request, RequestBody, Response, ResponseBody, read_frame, encode_frame};
+use bytes::BytesMut;
+use journal::Journal;
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use store::{Outcome, Store, failed};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
+pub struct ServerOptions {
+    pub data_dir: PathBuf,
+    /// Syncs every round before acknowledging it; only tests turn this off.
+    pub fsync: bool,
+}
+
+/// Serves until `cancellation`, then closes every connection and drains the journal.
+/// A failed journal write stops the server, since its later acknowledgements could no longer be trusted.
+pub async fn serve(listener: TcpListener, options: ServerOptions, cancellation: CancellationToken) -> Result<()> {
+    let journal = tokio::task::spawn_blocking(move || -> Result<_> {
+        let journal = Arc::new(Journal::open(&options.data_dir, options.fsync)?);
+        let recovered = journal.recover()?;
+        Ok((journal, recovered))
+    }).await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))?;
+    let (journal, recovered) = journal?;
+    let (queue, work) = mpsc::unbounded_channel();
+    let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));
+    let mut journal_task = tokio::spawn(journal::run(journal, work));
+    let connections = TaskTracker::new();
+    let stopping = cancellation.child_token();
+    let result = loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => break Ok(()),
+            result = &mut journal_task => break result.map_err(|error| Anomaly::fault("rtdb.logkeeper/journal-task", error.to_string())).and_then(|result| result.and(Err(Anomaly::fault("rtdb.logkeeper/journal-stopped", "the journal stopped")))),
+            accepted = listener.accept() => match accepted {
+                Ok((socket, _)) => { connections.spawn(connection(socket, Arc::clone(&store), connections.clone(), stopping.clone())); }
+                Err(error) => break Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/accept", error.to_string())),
+            },
+        }
+    };
+    stopping.cancel();
+    drop(listener);
+    connections.close();
+    connections.wait().await;
+    drop(store);
+    if result.is_err() { return result; }
+    journal_task.await.map_err(|error| Anomaly::fault("rtdb.logkeeper/journal-task", error.to_string()))?
+}
+
+/// One task reads and decides, another writes replies; a reply that waits on durability or a long poll gets a short-lived task of its own.
+async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, cancellation: CancellationToken) {
+    let _ = socket.set_nodelay(true);
+    let (mut reader, writer) = socket.into_split();
+    let (replies, outbox) = mpsc::unbounded_channel::<Response>();
+    let writing = tasks.spawn(write_replies(writer, outbox));
+    loop {
+        let request = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            request = read_frame::<Request>(&mut reader) => match request { Ok(Some(request)) => request, Ok(None) | Err(_) => break },
+        };
+        let id = request.id;
+        let reply = |body: ResponseBody| Response { id, body: Some(body) };
+        match request.body {
+            None => { let _ = replies.send(reply(failed("a request without a body"))); }
+            Some(RequestBody::Fetch(fetch)) => {
+                let body = store.fetch(&fetch.stream, fetch.from_lsn, fetch.to_lsn, fetch.max_entries as usize, fetch.max_bytes as usize);
+                let _ = replies.send(reply(body));
+            }
+            Some(RequestBody::Read(read)) => {
+                let (store, replies, cancellation) = (Arc::clone(&store), replies.clone(), cancellation.clone());
+                tasks.spawn(async move {
+                    let body = store.read(&read.stream, read.from_lsn, read.max_entries as usize, read.max_bytes as usize, Duration::from_millis(read.wait_ms.into()), &cancellation).await;
+                    let _ = replies.send(Response { id, body: Some(body) });
+                });
+            }
+            Some(mutation) => match store.mutate(mutation) {
+                Outcome::Now(body) => { let _ = replies.send(reply(body)); }
+                Outcome::Durable(durable, body) => {
+                    let replies = replies.clone();
+                    tasks.spawn(async move {
+                        let body = match durable.await {
+                            Ok(Ok(())) => body,
+                            Ok(Err(error)) => failed(format!("journal write failed: {error}")),
+                            Err(_) => failed("the journal stopped"),
+                        };
+                        let _ = replies.send(Response { id, body: Some(body) });
+                    });
+                }
+            },
+        }
+    }
+    drop(replies);
+    let _ = writing.await;
+}
+
+async fn write_replies(mut writer: tokio::net::tcp::OwnedWriteHalf, mut outbox: mpsc::UnboundedReceiver<Response>) {
+    let mut buffer = BytesMut::new();
+    while let Some(reply) = outbox.recv().await {
+        encode_frame(&reply, &mut buffer);
+        while let Ok(reply) = outbox.try_recv() { encode_frame(&reply, &mut buffer); }
+        if writer.write_all(&buffer).await.is_err() { return; }
+        buffer.clear();
+    }
+    let _ = writer.shutdown().await;
+}

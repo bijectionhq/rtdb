@@ -49,6 +49,7 @@ rtdb-ffi = { path = "crates/ffi" }
 rtdb-tls = { path = "crates/tls" }
 rtdb-affinity = { path = "crates/affinity" }
 rtdb-directory = { path = "crates/directory" }
+rtdb-logkeeper = { path = "crates/logkeeper" }
 sqlparser = { path = "vendor/sqlparser", version = "=0.63.0" }
 arrow-array = { version = "=58.4.1", features = ["ffi"] }
 arrow-buffer = "=58.4.1"
@@ -61,6 +62,7 @@ async-stream = "=0.3.6"
 http = "1"
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
+crc32fast = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
 bigdecimal = "0.4.10"

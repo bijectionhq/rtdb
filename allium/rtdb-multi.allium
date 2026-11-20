@@ -376,7 +376,8 @@ contract LogService {
     trim: (deployment: DeploymentId, through: Lsn) -> Lsn
 
     @invariant AppendIsConditionalOnEpochAndPosition
-        -- A log server accepts an append for a deployment only if its epoch equals the server's promised epoch for that deployment and its lsn is one above the server's last.
+        -- A log server accepts an append for a deployment only if its epoch equals the server's promised epoch for that deployment, the server is synced at that epoch, and its lsn is one above the server's last.
+        -- A server is synced at e once e's writer has copied its whole recovered history onto it; a partial copy leaves it unsynced.
         --   A deposed writer's append is refused at the server, so no window exists in which two writers both commit.
 
     @invariant CommitIsAWriteQuorum
@@ -384,7 +385,7 @@ contract LogService {
         -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
 
     @invariant SealIsAPromise
-        -- A seal at epoch e durably raises the server's promised epoch for the deployment to at least e, and returns the epoch and lsn of the server's last record with every record above the deployment's trim point.
+        -- A seal at epoch e durably raises the server's promised epoch for the deployment to at least e, and returns the epoch it is synced at, its last lsn, and the epoch of every record above the deployment's trim point.
         -- Once write_quorum servers of a loglet have answered a seal at e, no append below e reaches a quorum of that loglet.
         --   Any commit quorum and any seal quorum of one ensemble intersect.
 
@@ -572,7 +573,7 @@ entity Lineage {
 value SealReply {
     server: MemberId
     loglet: Loglet
-    last_epoch: Epoch
+    synced_epoch: Epoch
     last_lsn: Lsn
     records: List<LogRecord>
 }
@@ -596,8 +597,10 @@ entity LogServerStream {
     -- Exists only while the server holds a loglet of the deployment above its trim point.
     deployment: DeploymentId
     promised_epoch: Epoch
-    last_epoch: Epoch
+    -- The epoch whose writer last copied its whole history here; absent while a copy is partial.
+    synced_epoch: Epoch?
     last_lsn: Lsn
+    commit_lsn: Lsn
     trimmed_through: Lsn
     -- Deployments sealed here since the previous acknowledged round, per writer, for SealsAreAnnounced.
     sealed_since_last_round: Boolean
@@ -949,13 +952,14 @@ rule SealQuorumReached {
 }
 
 rule RecoverTail {
-    -- Take, per prior loglet, the reply whose last record is greatest by (epoch, lsn).
+    -- Take, per prior loglet, the reply greatest by (synced epoch, last lsn).
+    --   Records keep the epoch they were written at, so a record's own epoch does not say whether its server holds a later writer's whole history; the synced epoch does.
     -- Its records above the checkpoint are the tail: every committed record is in it (NothingCommittedIsLost).
     -- Records a deposed holder put on a minority were never acknowledged; recovery may keep or drop them, and a client retry with the same idempotency key settles the outcome either way.
     when: holding: Holding.state becomes recovering
 
     ensures:
-        let tail = GreatestByEpochThenLsn(holding.seal_replies)
+        let tail = GreatestBySyncedEpochThenLsn(holding.seal_replies)
         VerifyChain(from: holding.deployment.checkpoint.chain_hash, records: tail)
         ReplicatedUnderEpoch(records: tail, loglet: last(holding.deployment.loglets), epoch: holding.epoch)
         holding.state = opening
