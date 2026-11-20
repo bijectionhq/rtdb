@@ -184,6 +184,7 @@ rule RepairUnreadableSearchFile {
 --
 --   1. The scan selects tries exactly as it does without MATCH.
 --      A trie whose recency is at or before the earlier of the query's valid and system lower bounds holds no event the query can see, so no search file of it is read or built.
+--      A recorded trie none of whose lifespan sections, read from its record's stats, meets the bounds is left unopened, and within a file a document whose section misses them is passed over.
 --   2. A selected trie whose entry records a search file for that definition contributes the IIDs of its docs whose terms satisfy the query and one of whose rectangles meets the query's bounds.
 --   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
 --      A data file never changes, so a kept one serves every later query of the trie.
@@ -239,7 +240,7 @@ rule CutByLaterEvents {
     -- A put or delete whose system-from is later than a rectangle's takes the event's valid interval from that system time on; an erase later than it takes the whole rectangle; an earlier event takes nothing.
     -- An event at the same instant takes nothing: the scan orders such events itself, so the document stays a candidate and is no longer exact.
     -- The tries cut by are those step 1 keeps, each found for the entity by its IID path and its file's key table, and the live segments by their kept keys; a trie step 1 leaves out holds no cut the query can see.
-    -- A document is exactly visible where a rectangle it keeps meets the bounds and no tie touched it.
+    -- A document is exactly visible where a rectangle it keeps meets the bounds, no tie touched it, and no trie left unopened by its sections covers its entity: such a trie may hold a cut, a delete say.
     when: ScanWithMatch(scan, predicate)
 
     ensures:
@@ -291,6 +292,13 @@ contract SearchFileLayout {
 
     @invariant KeysAreRecorded
         -- The file records every row's IID, system from, valid interval and operation, in the data file's order.
+
+    @invariant LifespanSections
+        -- A document's lifespan runs from its birth, the earliest of its rectangles' later lower bound, to its death, the latest of their earlier upper bound, clipped to its trie's recency: no row of a historical trie is visible from its recency on, whatever its own file's events say.
+        -- Documents fall into classes by lifespan: under one, four, sixteen, sixty-four and two hundred and fifty-six weeks, and longer.
+        -- Each class's section bounds its documents' rectangles, births and deaths, and the file records it in its sidecar and in its artefact record's stats.
+        -- A document is visible at a point only where its birth is before the point's later coordinate and its death after the earlier, so a section whose bounds miss a query's holds nothing visible to it.
+        -- A query at a past valid time but the present system time prunes little this way: only the bounds on each axis apply.
 
     @invariant WindowBoundsAreUpperBounds
         -- Documents fall in windows of 128 consecutive ids.

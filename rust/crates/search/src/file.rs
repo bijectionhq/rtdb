@@ -20,7 +20,7 @@ use tantivy::{Directory, Index, IndexSettings, TantivyDocument, Term};
 
 const MAGIC: &[u8; 8] = b"RTSRCH01";
 /// Bumped with the bundle layout or the tantivy version, either of which changes a search file's bytes.
-pub const FORMAT_VERSION: i32 = 4;
+pub const FORMAT_VERSION: i32 = 5;
 const WRITER_MEMORY: usize = 32 << 20;
 /// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
 const SIDECAR: &str = "rtdb.sidecar";
@@ -47,6 +47,64 @@ pub struct SearchRow {
     pub values: Vec<Option<Vec<String>>>,
 }
 
+/// Lifespans, in weeks, below which a document falls into each class but the last, which is unbounded.
+const LIFESPAN_WEEKS: [i64; 5] = [1, 4, 16, 64, 256];
+const WEEK: i64 = 7 * 86_400_000_000;
+
+/// The bounds of one lifespan class's documents in a search file: where any of them can be visible, the latest any stops being, and the earliest any starts.
+/// A document visible at a point of valid time × system time is born before both its coordinates' later one and dies after their earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Section { pub class: u8, pub valid_from: i64, pub valid_to: i64, pub system_from: i64, pub system_to: i64, pub birth: i64, pub death: i64 }
+
+impl Section {
+    fn of(class: u8, rectangle: [i64; 4], ceiling: i64) -> Self {
+        Self { class, valid_from: rectangle[0], valid_to: rectangle[1], system_from: rectangle[2], system_to: rectangle[3], birth: rectangle[0].max(rectangle[2]), death: rectangle[1].min(rectangle[3]).min(ceiling) }
+    }
+    fn widen(&mut self, other: &Self) {
+        self.valid_from = self.valid_from.min(other.valid_from); self.valid_to = self.valid_to.max(other.valid_to);
+        self.system_from = self.system_from.min(other.system_from); self.system_to = self.system_to.max(other.system_to);
+        self.birth = self.birth.min(other.birth); self.death = self.death.max(other.death);
+    }
+    /// Whether any document of the section can be visible in `bounds`.
+    pub fn meets(&self, bounds: TemporalBounds) -> bool {
+        let (valid, system) = (bounds.valid_time, bounds.system_time);
+        self.valid_from < valid.upper().0 && valid.lower().0 < self.valid_to && self.system_from < system.upper().0 && system.lower().0 < self.system_to
+            && self.death > valid.lower().0.min(system.lower().0) && self.birth < valid.upper().0.max(system.upper().0)
+    }
+}
+
+/// A trie's recency as an instant: no row of it is visible from then on.
+pub fn ceiling_of(trie: &rtdb_format::keys::TrieKey) -> Option<i64> { trie.recency().map(|date| date.epoch_day().saturating_mul(86_400_000_000)) }
+
+/// Sections as an artefact record's stats hold them.
+pub fn encode_sections(sections: &[Section]) -> Vec<u8> {
+    let mut bytes = vec![sections.len() as u8];
+    for section in sections {
+        bytes.push(section.class);
+        for value in [section.valid_from, section.valid_to, section.system_from, section.system_to, section.birth, section.death] { bytes.extend_from_slice(&value.to_le_bytes()); }
+    }
+    bytes
+}
+
+/// The sections a record's stats hold, or `None` for stats in no form this version wrote.
+pub fn decode_sections(bytes: &[u8]) -> Option<Vec<Section>> {
+    let (count, rest) = bytes.split_first()?;
+    if rest.len() != *count as usize * 49 { return None; }
+    Some(rest.chunks_exact(49).map(|chunk| {
+        let at = |index: usize| i64::from_le_bytes(chunk[1 + index * 8..9 + index * 8].try_into().unwrap_or_default());
+        Section { class: chunk[0], valid_from: at(0), valid_to: at(1), system_from: at(2), system_to: at(3), birth: at(4), death: at(5) }
+    }).collect())
+}
+
+/// A document's lifespan class, from its rectangles clipped to the trie's ceiling.
+fn lifespan(rectangles: &[[i64; 4]], ceiling: i64) -> (u8, Section) {
+    let mut bounds = Section::of(0, rectangles[0], ceiling);
+    for rectangle in &rectangles[1..] { bounds.widen(&Section::of(0, *rectangle, ceiling)); }
+    let span = bounds.death.saturating_sub(bounds.birth);
+    let class = if bounds.death == i64::MAX { LIFESPAN_WEEKS.len() } else { LIFESPAN_WEEKS.iter().position(|weeks| span < weeks.saturating_mul(WEEK)).unwrap_or(LIFESPAN_WEEKS.len()) };
+    (class as u8, Section { class: class as u8, ..bounds })
+}
+
 /// A document visible somewhere in the bounds asked about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocMatch { pub doc: u32, pub iid: [u8; 16] }
@@ -71,12 +129,12 @@ fn op_of(code: u8) -> Result<EventOp> { match code { 0 => Ok(EventOp::Put), 1 =>
 /// Builds the bundled search file over rows in data-file order, as one page, in memory.
 pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str) -> Result<Vec<u8>> {
     let mut bundle = Vec::new();
-    write_search_file(columns, [Ok(rows.to_vec())], identity, RamDirectory::create(), &mut bundle)?;
+    write_search_file(columns, [Ok(rows.to_vec())], identity, None, RamDirectory::create(), &mut bundle)?;
     Ok(bundle)
 }
 
 /// What the writer accumulates beside tantivy's segment, to become the sidecar.
-struct Accumulated { page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
+struct Accumulated { ceiling: i64, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
 
 /// One entity's rows while they arrive: each row's position and header, and per column, its value as an index into the column's distinct values.
 #[derive(Default)]
@@ -94,13 +152,14 @@ impl Entity {
     }
 }
 
-/// Builds the search file over a data file's pages of rows, in order, building its segment in `directory` and writing the bundle to `output`.
-/// The bytes are a function of the rows, their pages, the columns and `identity` alone, wherever the segment is built, so every builder of one job writes the same object.
-pub fn write_search_file<D: Directory + Clone + 'static, W: std::io::Write>(columns: &[String], pages: impl IntoIterator<Item = Result<Vec<SearchRow>>>, identity: &str, directory: D, output: W) -> Result<()> {
+/// Builds the search file over a data file's pages of rows, in order, building its segment in `directory` and writing the bundle to `output`, and returns its sections.
+/// `ceiling` is the trie's recency, which bounds when any of its rows stops being visible; a current trie has none.
+/// The bytes are a function of the rows, their pages, the columns, `identity` and `ceiling` alone, wherever the segment is built, so every builder of one job writes the same object.
+pub fn write_search_file<D: Directory + Clone + 'static, W: std::io::Write>(columns: &[String], pages: impl IntoIterator<Item = Result<Vec<SearchRow>>>, identity: &str, ceiling: Option<i64>, directory: D, output: W) -> Result<Vec<Section>> {
     let (schema, fields) = schema(columns);
     let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
     let mut writer = Index::builder().schema(schema).settings(settings).single_segment_index_writer(directory.clone(), WRITER_MEMORY).map_err(fault)?;
-    let mut sidecar = Accumulated { page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
+    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
     let mut entity = Entity::new(columns.len());
     let mut rows = 0u32;
     for page in pages {
@@ -122,7 +181,8 @@ pub fn write_search_file<D: Directory + Clone + 'static, W: std::io::Write>(colu
     writer.finalize().map_err(fault)?;
     let bytes = encode(&Index::open(directory.clone()).map_err(fault)?, &fields, rows, &sidecar)?;
     directory.atomic_write(Path::new(SIDECAR), &bytes).map_err(fault)?;
-    bundle(&directory, &segment_uuid(identity), output)
+    bundle(&directory, &segment_uuid(identity), output)?;
+    Ok(sidecar.sections.into_values().collect())
 }
 
 /// Merges rectangles that share one interval and abut in the other, so a run of versions that each followed the last is one rectangle.
@@ -170,7 +230,11 @@ fn runs(writer: &mut tantivy::SingleSegmentIndexWriter, fields: &[Field], sideca
                 document.add_pre_tokenized_text(*field, PreTokenizedString { text: String::new(), tokens });
             }
             writer.add_document(document).map_err(fault)?;
-            sidecar.rectangles.extend(coalesce(members.iter().flat_map(|index| visible[*index].iter().copied()).collect()));
+            let rectangles = coalesce(members.iter().flat_map(|index| visible[*index].iter().copied()).collect());
+            let (class, bounds) = lifespan(&rectangles, sidecar.ceiling);
+            sidecar.sections.entry(class).and_modify(|section| section.widen(&bounds)).or_insert(bounds);
+            sidecar.doc_classes.push(class);
+            sidecar.rectangles.extend(rectangles);
             sidecar.rectangle_starts.push(u32::try_from(sidecar.rectangles.len()).map_err(fault)?);
             sidecar.doc_iids.push(iid);
             sidecar.column_docs[column] += 1;
@@ -200,13 +264,15 @@ fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tanti
     impacts
 }
 
-/// The sidecar, in order: row, document and page counts, page starts, each column's document count, each row's run in each column, each document's IID and rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
+/// The sidecar, in order: row, document and page counts, page starts, each column's document count, each row's run in each column, each document's IID, each document's lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
 fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let documents = sidecar.doc_iids.len() as u32;
     for count in [rows, documents, sidecar.page_starts.len() as u32] { bytes.extend_from_slice(&count.to_le_bytes()); }
     for value in sidecar.page_starts.iter().chain(&sidecar.column_docs).chain(sidecar.row_docs.iter().flatten()) { bytes.extend_from_slice(&value.to_le_bytes()); }
     for iid in &sidecar.doc_iids { bytes.extend_from_slice(iid); }
+    bytes.extend_from_slice(&sidecar.doc_classes);
+    bytes.extend_from_slice(&encode_sections(&sidecar.sections.values().copied().collect::<Vec<_>>()));
     for start in &sidecar.rectangle_starts { bytes.extend_from_slice(&start.to_le_bytes()); }
     for rectangle in &sidecar.rectangles { for value in rectangle { bytes.extend_from_slice(&value.to_le_bytes()); } }
     bytes.extend_from_slice(&sidecar.keys);
@@ -375,7 +441,7 @@ impl Directory for BundleDirectory {
 }
 
 /// What the sidecar holds, located within the bundle's bytes.
-struct Sidecar { bytes: OwnedBytes, rows: u32, documents: u32, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
+struct Sidecar { bytes: OwnedBytes, rows: u32, documents: u32, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
 
 impl Sidecar {
     fn parse(bytes: OwnedBytes, columns: usize, documents: u32) -> Result<Self> {
@@ -403,6 +469,11 @@ impl Sidecar {
             return Err(corrupt("Search file row names no document"));
         }
         let doc_iids = take(documents as usize * 16)?.start;
+        let doc_classes = take(documents as usize)?.start;
+        let counted = take(1)?;
+        let body = take(data[counted.start] as usize * 49)?;
+        let sections = decode_sections(&data[counted.start..body.end]).ok_or_else(|| corrupt("Search file sections are malformed"))?;
+        if data[doc_classes..doc_classes + documents as usize].iter().any(|class| !sections.iter().any(|section| section.class == *class)) { return Err(corrupt("Search file document has no section")); }
         let starts = take((documents as usize + 1) * 4)?;
         let rectangle_starts: Vec<u32> = data[starts.clone()].chunks_exact(4).map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap_or_default())).collect();
         if rectangle_starts.first() != Some(&0) || rectangle_starts.windows(2).any(|pair| pair[0] > pair[1]) { return Err(corrupt("Search file rectangles are out of order")); }
@@ -421,7 +492,7 @@ impl Sidecar {
             impacts.insert((column, term), range);
         }
         if position != data.len() { return Err(corrupt("Search file sidecar has trailing bytes")); }
-        Ok(Self { bytes, rows, documents, page_starts, column_docs, row_docs: row_docs.start, doc_iids, rectangle_starts: starts.start, rectangles, keys, impacts })
+        Ok(Self { bytes, rows, documents, page_starts, column_docs, row_docs: row_docs.start, doc_iids, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
     }
     fn data(&self) -> &[u8] { self.bytes.as_slice() }
     fn u32_at(&self, offset: usize) -> u32 { u32::from_le_bytes(self.data()[offset..offset + 4].try_into().unwrap_or_default()) }
@@ -438,6 +509,7 @@ impl Sidecar {
         if row >= self.rows || column >= self.column_docs.len() { return RowDoc::Invisible; }
         match self.u32_at(self.row_docs + (column * self.rows as usize + row as usize) * 4) { NO_DOC => RowDoc::Invisible, NULL_DOC => RowDoc::Null, doc => RowDoc::Run(doc) }
     }
+    fn section(&self, doc: u32) -> Option<&Section> { let class = self.data()[self.doc_classes + doc as usize]; self.sections.iter().find(|section| section.class == class) }
     fn doc_iid(&self, doc: u32) -> [u8; 16] { self.data()[self.doc_iids + doc as usize * 16..][..16].try_into().unwrap_or_default() }
     fn rectangles(&self, doc: u32) -> impl Iterator<Item = [i64; 4]> + '_ {
         let (start, end) = (self.u32_at(self.rectangle_starts + doc as usize * 4), self.u32_at(self.rectangle_starts + (doc as usize + 1) * 4));
@@ -490,7 +562,12 @@ impl SearchFile {
     fn field(&self, column: &str) -> Option<Field> { self.column(column).map(|index| Field::from_field_id(index as u32)) }
 
     /// Whether the document is visible anywhere in `bounds` as far as this file's own events decide; events elsewhere can only cut it further.
-    pub fn visible(&self, doc: u32, bounds: TemporalBounds) -> bool { self.sidecar.rectangles(doc).any(|rectangle| meets(rectangle, bounds)) }
+    pub fn visible(&self, doc: u32, bounds: TemporalBounds) -> bool {
+        self.sidecar.section(doc).is_some_and(|section| section.meets(bounds)) && self.sidecar.rectangles(doc).any(|rectangle| meets(rectangle, bounds))
+    }
+
+    /// The bounds of each lifespan class's documents.
+    pub fn sections(&self) -> &[Section] { &self.sidecar.sections }
 
     /// The rectangles where the document is visible as far as this file's own events decide, as valid from, valid to, system from, system to.
     pub fn rectangles(&self, doc: u32) -> impl Iterator<Item = [i64; 4]> + '_ { self.sidecar.rectangles(doc) }
@@ -744,7 +821,7 @@ mod tests {
     fn a_segment_built_on_disk_bundles_to_the_same_bytes_as_one_built_in_memory() {
         let directory = tempfile::tempdir().unwrap();
         let mut streamed = Vec::new();
-        write_search_file(&columns(), [Ok(rows())], "job", tantivy::directory::MmapDirectory::open(directory.path()).unwrap(), &mut streamed).unwrap();
+        write_search_file(&columns(), [Ok(rows())], "job", None, tantivy::directory::MmapDirectory::open(directory.path()).unwrap(), &mut streamed).unwrap();
         assert_eq!(streamed, build_search_file(&columns(), &rows(), "job").unwrap());
     }
 
@@ -880,7 +957,7 @@ mod tests {
         let rows = corpus_rows(300, 3);
         let pages: Vec<Vec<SearchRow>> = rows.chunks(70).map(<[SearchRow]>::to_vec).collect();
         let mut bytes = Vec::new();
-        write_search_file(&columns(), pages.iter().cloned().map(Ok), "job", RamDirectory::create(), &mut bytes).unwrap();
+        write_search_file(&columns(), pages.iter().cloned().map(Ok), "job", None, RamDirectory::create(), &mut bytes).unwrap();
         let file = Arc::new(SearchFile::open(bytes, &columns()).unwrap());
         let query = Query::parse("invoice");
         let set = file.match_set("body", &query).unwrap();
@@ -919,5 +996,31 @@ mod tests {
             corrupted[offset] ^= 0x10;
             assert!(SearchFile::open(corrupted, &columns()).is_err(), "byte {offset}");
         }
+    }
+
+    #[test]
+    fn documents_fall_into_lifespan_classes_whose_bounds_say_where_none_can_be_visible() {
+        let day = 86_400_000_000i64;
+        let rows = vec![
+            SearchRow { iid: [1; 16], system_from: 10 * day, ..row(1, 0, "", "short lived") },
+            SearchRow { iid: [1; 16], system_from: 9 * day, ..row(1, 0, "", "superseded the next day") },
+            SearchRow { iid: [2; 16], system_from: 400 * day, ..row(2, 0, "", "long lived") },
+            SearchRow { iid: [2; 16], system_from: 0, ..row(2, 0, "", "superseded after 400 days") },
+        ];
+        let mut bytes = Vec::new();
+        let sections = write_search_file(&columns(), [Ok(rows)], "job", Some(1000 * day), RamDirectory::create(), &mut bytes).unwrap();
+        let file = SearchFile::open(bytes, &columns()).unwrap();
+        assert_eq!(file.sections(), sections.as_slice());
+        let class = |text: &str| sections.iter().find(|section| section.class == file.sidecar.data()[file.sidecar.doc_classes + file.matches("body", &Query::parse(text), all()).unwrap()[0].doc as usize]).copied().unwrap();
+        let (short, long, open) = (class("next day"), class("400 days"), class("long lived"));
+        assert_eq!((short.class, long.class, open.class), (0, 3, 4), "four hundred days is under 64 weeks; the open run, clipped to the ceiling at 1000 days, under 256");
+        assert_eq!((short.birth, short.death), (9 * day, 10 * day));
+        assert!(short.meets(at(9 * day + 1, 9 * day + 1)) && !short.meets(at(20 * day, 20 * day)), "a version alive for one day is visible only around it");
+        assert!(!short.meets(at(5 * day, 5 * day)), "nor before it was born");
+        let later_valid = TemporalBounds { valid_time: Interval::from_micros(500 * day, 500 * day + 1).unwrap(), system_time: Interval::from_micros(9 * day + day / 2, 9 * day + day / 2 + 1).unwrap() };
+        assert!(short.meets(later_valid), "visible at a far later valid time, as known during its one day");
+        assert!(!open.meets(at(1000 * day, 1000 * day)), "the ceiling ends every version");
+        assert_eq!(decode_sections(&encode_sections(&sections)), Some(sections.clone()));
+        assert_eq!(decode_sections(&[1, 2, 3]), None);
     }
 }

@@ -123,18 +123,19 @@ impl ArtefactBuilder for SearchBuilder {
         let indexing = self.memory.reserve(indexing_allowance(trie_size))?;
         let (memory, token, bundle) = (Arc::clone(&self.memory), cancellation.clone(), workdir.path().join("bundle.bin"));
         let (segment, output) = (workdir.path().join("segment"), bundle.clone());
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let ceiling = crate::file::ceiling_of(&job.trie);
+        let sections = tokio::task::spawn_blocking(move || -> Result<Vec<crate::file::Section>> {
             let _indexing = indexing;
             let (reader, _opened) = open_input(input, &memory)?;
             std::fs::create_dir(&segment).map_err(fault)?;
             let directory = tantivy::directory::MmapDirectory::open(&segment).map_err(fault)?;
             let output = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
-            write_search_file(&columns, PageRows::new(reader, &columns, &memory, &token), &identity, directory, output)
+            write_search_file(&columns, PageRows::new(reader, &columns, &memory, &token), &identity, ceiling, directory, output)
         }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
         self.store.put_file(&key, &bundle).await?;
         if repairing { self.runtime.clear(&suspect); }
-        Ok(record())
+        Ok(ArtefactRecord { stats: Some(crate::file::encode_sections(&sections)), ..record() })
     }
 }
 

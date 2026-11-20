@@ -67,8 +67,8 @@ impl ScanAccelerator for SearchAccelerator {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
             if ranked { if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition).await? { return Ok(Some(candidates)); } }
         }
-        let TrieFiles::Complete(files) = self.trie_files(request, &definition).await? else { return Ok(None) };
-        let cutter = Cutter::new(&files, request, &self.runtime);
+        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, &definition).await? else { return Ok(None) };
+        let cutter = Cutter::new(&files, &skipped, request, &self.runtime);
         let mut candidates = BTreeSet::new();
         for (own, trie) in files.iter().enumerate() {
             for doc in trie.file.matches(column, &query, request.bounds)? {
@@ -82,7 +82,7 @@ impl ScanAccelerator for SearchAccelerator {
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
         let Some(definition) = self.definition(request, column).await? else { return Ok(None) };
-        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(files) | TrieFiles::Recorded(files) => files };
+        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => found.files };
         let query = Query::parse(query);
         let mut answers = MatchAnswers::default();
         for trie in files { answers.insert(&trie.data, self.runtime.match_set(request.database, &trie, column, &query)?); }
@@ -91,17 +91,21 @@ impl ScanAccelerator for SearchAccelerator {
 }
 
 /// A partition's search files: one for every live trie, or only the recorded ones where building the rest would exceed max_unindexed_bytes.
-enum TrieFiles { Complete(Vec<TrieFile>), Recorded(Vec<TrieFile>) }
+enum TrieFiles { Complete(Found), Recorded(Found) }
+
+/// A partition's search files, and the recorded tries left unopened because no lifespan section of theirs meets the bounds.
+struct Found { files: Vec<TrieFile>, skipped: Vec<rtdb_format::keys::TrieKey> }
 
 /// Whether the scan's other sources leave a file's document visible in the query's bounds, and whether that is exact.
 enum Judged { Hidden, Visible { exact: bool } }
 
 /// Cuts a file's documents by the events of the same entity in the partition's other tries and its live segments (fts.allium: CutByLaterEvents).
-struct Cutter<'a> { files: &'a [TrieFile], segments: Vec<&'a Arc<rtdb_index::LiveTable>>, runtime: &'a crate::SearchRuntime, database: &'a str, bounds: TemporalBounds }
+/// A trie left unopened may still hold an event that cuts, a delete say, so a document whose entity it covers is no longer exact.
+struct Cutter<'a> { files: &'a [TrieFile], skipped: &'a [rtdb_format::keys::TrieKey], segments: Vec<&'a Arc<rtdb_index::LiveTable>>, runtime: &'a crate::SearchRuntime, database: &'a str, bounds: TemporalBounds }
 
 impl<'a> Cutter<'a> {
-    fn new(files: &'a [TrieFile], request: &'a ScanRequest<'_>, runtime: &'a crate::SearchRuntime) -> Self {
-        Self { files, segments: request.snapshot.iter_segments(&request.scan.table.name.table).collect(), runtime, database: request.database, bounds: request.bounds }
+    fn new(files: &'a [TrieFile], skipped: &'a [rtdb_format::keys::TrieKey], request: &'a ScanRequest<'_>, runtime: &'a crate::SearchRuntime) -> Self {
+        Self { files, skipped, segments: request.snapshot.iter_segments(&request.scan.table.name.table).collect(), runtime, database: request.database, bounds: request.bounds }
     }
 
     fn judge(&self, own: usize, doc: crate::DocMatch) -> Result<Judged> {
@@ -113,7 +117,7 @@ impl<'a> Cutter<'a> {
         }
         for segment in &self.segments { tied |= cut(&mut rectangles, self.runtime.live_events(self.database, segment, &doc.iid)?); }
         if !rectangles.iter().any(|rectangle| crate::file::meets(*rectangle, self.bounds)) { return Ok(Judged::Hidden); }
-        Ok(Judged::Visible { exact: !tied })
+        Ok(Judged::Visible { exact: !tied && !self.skipped.iter().any(|trie| covers(trie.part(), &doc.iid)) })
     }
 }
 
@@ -174,13 +178,16 @@ impl SearchAccelerator {
     /// The search files of the partition's live tries that can hold a visible event: every such trie's, its recorded one or one this node builds from its data file, unless the tries the lane should have indexed but has not exceed max_unindexed_bytes.
     /// The lane never indexes level 0, the partial level-1 current trie, or history for a definition that excludes it, so those do not count.
     async fn trie_files(&self, request: &ScanRequest<'_>, definition: &SearchDefinition) -> Result<TrieFiles> {
-        self.trie_files_in(request, request.snapshot, definition, request.bounds, Some(self.max_unindexed_bytes)).await
+        self.trie_files_in(request, request.snapshot, definition, request.bounds, Some(self.max_unindexed_bytes), true).await
     }
 
     /// The search files of a partition's live tries that can hold an event visible in `bounds`; with a `limit`, only the recorded ones once the tries the lane should have indexed but has not exceed it.
-    async fn trie_files_in(&self, request: &ScanRequest<'_>, snapshot: &Snapshot, definition: &SearchDefinition, bounds: TemporalBounds, limit: Option<i64>) -> Result<TrieFiles> {
+    /// With `prune`, a recorded trie whose record's lifespan sections all miss the bounds is left unopened.
+    async fn trie_files_in(&self, request: &ScanRequest<'_>, snapshot: &Snapshot, definition: &SearchDefinition, bounds: TemporalBounds, limit: Option<i64>, prune: bool) -> Result<TrieFiles> {
         let table = &request.scan.table.name.table;
-        let Some(entry) = snapshot.table_entry(table) else { return Ok(TrieFiles::Complete(Vec::new())) };
+        let Some(entry) = snapshot.table_entry(table) else { return Ok(TrieFiles::Complete(Found { files: Vec::new(), skipped: Vec::new() })) };
+        let artefact_id = definition.artefact_id();
+        let mut skipped = Vec::new();
         let mut files = Vec::new();
         let mut unbuilt = Vec::new();
         let mut unindexed = 0i64;
@@ -188,6 +195,8 @@ impl SearchAccelerator {
         // A trie's recency bounds its rows' recency above, so a trie at or before the query's earliest instant holds nothing it can see.
         let visible = |trie: &&rtdb_index::CatalogTrie| trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
         for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).filter(visible) {
+            let sections = trie.artefact(KIND, &artefact_id, definition.version).and_then(|record| record.stats.as_deref()).and_then(crate::file::decode_sections);
+            if prune && sections.is_some_and(|sections| !sections.iter().any(|section| section.meets(bounds))) { skipped.push(trie.key.clone()); continue; }
             let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
             let recorded = match Self::recorded_key(snapshot, table, trie, definition)? { Some(key) => self.recorded(request, key, trie, definition).await?, None => None };
             if let Some((key, file)) = recorded { files.push(TrieFile { trie: trie.key.clone(), data, identity: key.as_str().to_string(), file }); continue; }
@@ -196,9 +205,9 @@ impl SearchAccelerator {
             if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
             unbuilt.push((trie.key.clone(), data));
         }
-        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Recorded(files)); }
+        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Recorded(Found { files, skipped })); }
         for (trie, data) in unbuilt { files.push(self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await?); }
-        Ok(TrieFiles::Complete(files))
+        Ok(TrieFiles::Complete(Found { files, skipped }))
     }
 
     /// Registers the column's corpus at the snapshot's instant, from every partition's search files for the tries visible then and its live segments, once a query.
@@ -213,7 +222,8 @@ impl SearchAccelerator {
         let mut files = Vec::new();
         let mut segments = Vec::new();
         for snapshot in request.partitions {
-            match self.trie_files_in(request, snapshot, definition, point, None).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => files.extend(found) }
+            // A corpus resolves entities across every source, so no trie is left out by its sections.
+            match self.trie_files_in(request, snapshot, definition, point, None, false).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => files.extend(found.files) }
             segments.extend(snapshot.iter_segments(table).cloned());
         }
         request.corpora.register(name, Arc::new(TableCorpus { runtime: Arc::clone(&self.runtime), database: request.database.to_string(), files: parking_lot::Mutex::new(Some(files)), computed: std::sync::OnceLock::new(), segments, column: column.to_string(), at }));
@@ -298,11 +308,11 @@ impl SearchAccelerator {
         };
         let Ok(limit) = usize::try_from(limit) else { return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
-        let TrieFiles::Complete(files) = self.trie_files(request, definition).await? else { return Ok(None) };
+        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition).await? else { return Ok(None) };
         let scoring = Query::parse(&text);
         let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
         let ranked = files.iter().enumerate().map(|(own, trie)| Ok((own, trie.file.ranked(column, matching, &scoring, corpus.as_ref(), request.bounds)?))).collect::<Result<Vec<_>>>()?;
-        let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
+        let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, &skipped, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
         // The scan resolves exactly what the index decides only when MATCH is all it filters by; any other predicate is the verifier's to apply.
         let trusted = request.scan.predicates.iter().all(|predicate| match predicate {
             Expr::Column { id, .. } => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),

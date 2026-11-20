@@ -191,12 +191,13 @@ impl SearchRuntime {
         let cell = Arc::clone(self.building.lock().entry(cache_key.clone()).or_default());
         let outcome = cell.get_or_try_init(|| async {
             let lease = storage.get(data).await?;
+            let ceiling = crate::file::ceiling_of(trie);
             let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
             let (indexed, token) = (columns.to_vec(), cancellation.clone());
             let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                 let _indexing = indexing;
                 let mut bytes = Vec::new();
-                crate::file::write_search_file(&indexed, crate::search_pages(lease.as_slice(), &indexed, &token)?, "built", tantivy::directory::RamDirectory::create(), &mut bytes)?;
+                crate::file::write_search_file(&indexed, crate::search_pages(lease.as_slice(), &indexed, &token)?, "built", ceiling, tantivy::directory::RamDirectory::create(), &mut bytes)?;
                 Ok(bytes)
             }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
             let size = bytes.len();
