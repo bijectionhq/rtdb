@@ -52,10 +52,14 @@ impl Column {
 pub(crate) struct ColumnBatch { pub columns: Vec<Column>, pub len: usize, _reservation: Arc<MemoryReservation> }
 
 impl ColumnBatch {
-    pub fn new(columns: Vec<Column>, len: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    /// A page of columns allocated under `reservation`, whose charge becomes exactly what they retain.
+    pub fn settled(columns: Vec<Column>, len: usize, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
         let bytes = columns.iter().try_fold(256usize, |bytes, column| bytes.checked_add(column.retained_bytes()?).ok_or_else(size_error))?;
-        Ok(Self { columns, len, _reservation: memory.reserve(bytes)? })
+        let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+        if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+        Ok(Self { columns, len, _reservation: reservation })
     }
+    fn charged(&self) -> usize { self._reservation.bytes() }
 
     /// Materialises every row, admitting the page's rows together before any is built.
     /// Rows share the page's charge, which ends when the last of them drops.
@@ -104,18 +108,23 @@ pub(crate) fn gather(rows: &[ResolvedRow<RowSource>], columns: &[Field], memory:
         }
         cells.push((source, op.value_offset(row.source.row)));
     }
+    // How much a gathered column holds depends on which cells it picks, so each is charged as soon as it is built.
+    let mut reservation = memory.reserve(256)?;
     let mut output = Vec::with_capacity(columns.len());
     for field in columns {
-        output.push(match field.name.as_str() {
+        let column = match field.name.as_str() {
             "_valid_from" => Column::Values(rows.iter().map(|row| time(row.valid_time.lower(), false)).collect()),
             "_valid_to" => Column::Values(rows.iter().map(|row| time(row.valid_time.upper(), true)).collect()),
             "_system_from" => Column::Values(rows.iter().map(|row| time(row.system_time.lower(), false)).collect()),
             "_system_to" => Column::Values(rows.iter().map(|row| time(row.system_time.upper(), true)).collect()),
             "_iid" => Column::Values(rows.iter().map(|row| row.source.header().map(|header| Value::FixedSizeBinary(header.iid.0.to_vec()))).collect::<Result<_>>()?),
             name => stored(&sources, &cells, name)?,
-        });
+        };
+        let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+        lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+        output.push(column);
     }
-    ColumnBatch::new(output, rows.len(), memory)
+    ColumnBatch::settled(output, rows.len(), reservation)
 }
 
 fn time(time: Timestamp, upper: bool) -> Value {
@@ -185,12 +194,14 @@ impl ColumnBatch {
     fn select(self, mask: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let selected = mask.iter().filter(|keep| **keep).count();
         if selected == self.len { return Ok(self); }
+        // A selection holds a subset of each column's cells, so it retains no more than the page it is taken from.
+        let reservation = memory.reserve(self.charged().saturating_add(mask.len()))?;
         let predicate = arrow_array::BooleanArray::from(mask.to_vec());
         let columns = self.columns.into_iter().map(|column| Ok(match column {
             Column::Arrow { array, field, logical } => Column::Arrow { array: arrow_select::filter::filter(array.as_ref(), &predicate).map_err(|error| invalid("column-filter", error))?, field, logical },
             Column::Values(values) => Column::Values(values.into_iter().zip(mask).filter_map(|(value, keep)| keep.then_some(value)).collect()),
         })).collect::<Result<Vec<_>>>()?;
-        Self::new(columns, selected, memory)
+        Self::settled(columns, selected, reservation)
     }
 }
 
@@ -439,8 +450,8 @@ mod tests {
         let texts: StringArray = (0..rows).map(|_| (!null(random)).then(|| ["a", "b", "ab", "B", ""][random.below(5) as usize])).collect();
         let bools: BooleanArray = (0..rows).map(|_| (!null(random)).then(|| random.below(2) == 0)).collect();
         let values = (0..rows).map(|_| if null(random) { Value::Null } else { Value::I64(random.below(21) as i64 - 10) }).collect();
-        ColumnBatch::new(vec![arrow(Arc::new(ints), ScalarType::I64), arrow(Arc::new(floats), ScalarType::F64), arrow(Arc::new(texts), ScalarType::Utf8),
-            arrow(Arc::new(bools), ScalarType::Bool), Column::Values(values)], rows, memory).unwrap()
+        ColumnBatch::settled(vec![arrow(Arc::new(ints), ScalarType::I64), arrow(Arc::new(floats), ScalarType::F64), arrow(Arc::new(texts), ScalarType::Utf8),
+            arrow(Arc::new(bools), ScalarType::Bool), Column::Values(values)], rows, memory.reserve(0).unwrap()).unwrap()
     }
 
     fn operand(random: &mut Random, schema: &Schema) -> Expr {
@@ -515,7 +526,7 @@ mod tests {
         use rtdb_plan::BinaryOp::{Eq, GtEq, Lt};
         let memory = MemoryBudget::new(1 << 24);
         let schema = Schema::new(vec![field(1, ScalarType::F64)]).unwrap();
-        let batch = ColumnBatch::new(vec![arrow(Arc::new(Float64Array::from(vec![-0.0, 0.0])), ScalarType::F64)], 2, &memory).unwrap();
+        let batch = ColumnBatch::settled(vec![arrow(Arc::new(Float64Array::from(vec![-0.0, 0.0])), ScalarType::F64)], 2, memory.reserve(0).unwrap()).unwrap();
         let column = Expr::Column { id: rtdb_plan::ColumnId(1), data_type: LogicalType::Scalar(ScalarType::F64) };
         for (op, literal, expected) in [(Lt, Value::F64(0.0), [true, false]), (Lt, Value::I64(0), [true, false]), (GtEq, Value::F64(0.0), [false, true]), (Eq, Value::F64(0.0), [true, true])] {
             let predicate = Expr::binary(op, column.clone(), Expr::Literal(literal));
@@ -555,6 +566,8 @@ impl BatchCursor for BatchProject {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
         let len = batch.len;
+        let bound = self.positions.iter().try_fold(256usize, |bound, position| bound.checked_add(batch.columns[*position].retained_bytes()?).ok_or_else(size_error))?;
+        let reservation = self.memory.reserve(bound)?;
         let mut columns: Vec<Option<Column>> = batch.columns.into_iter().map(Some).collect();
         let mut uses = vec![0usize; columns.len()];
         for &position in &self.positions { uses[position] += 1; }
@@ -564,7 +577,7 @@ impl BatchCursor for BatchProject {
             output.push(if uses[position] == 0 { columns[position].take().ok_or_else(|| invalid("column-project", "Projected column was already moved"))? }
                 else { columns[position].as_ref().map(Column::duplicate).ok_or_else(|| invalid("column-project", "Projected column is absent"))? });
         }
-        ColumnBatch::new(output, len, &self.memory).map(Some)
+        ColumnBatch::settled(output, len, reservation).map(Some)
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
@@ -589,21 +602,31 @@ impl BatchCursor for BatchExpressions {
         let parameters = self.execution.parameters.values();
         let mut page = None;
         let mut columns = Vec::with_capacity(self.expressions.len());
+        let mut reservation = self.execution.context.memory.reserve(256)?;
         for expression in &self.expressions {
-            if let Some(column) = projection::column(expression, &self.schema, &batch, parameters)? { columns.push(column); continue; }
+            if let Some(bound) = projection::bound(expression, &self.schema, &batch)? {
+                let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+                lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?)?;
+                if let Some(column) = projection::column(expression, &self.schema, &batch, parameters)? { columns.push(column); continue; }
+            }
             if page.is_none() { page = Some(batch.rows(&self.execution.context.memory)?); }
             let rows = page.as_ref().expect("rows were materialised for the evaluator");
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
             let scope = self.execution.scope()?;
             let mut values = Vec::with_capacity(batch.len);
+            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+            lease.grow_to(lease.bytes().checked_add(batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?).ok_or_else(size_error)?)?;
             for row in rows.rows() {
-                values.push(self.execution.evaluate_invocation(&scope, &invocation, &row.values).await?);
+                let value = self.execution.evaluate_invocation(&scope, &invocation, &row.values).await?;
+                // The value is charged before the evaluator's scope releases what it allocated it under.
+                lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(size_error)?)?;
+                values.push(value);
                 scope.reset()?;
             }
             columns.push(Column::Values(values));
         }
-        ColumnBatch::new(columns, batch.len, &self.execution.context.memory).map(Some)
+        ColumnBatch::settled(columns, batch.len, reservation).map(Some)
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
@@ -702,6 +725,35 @@ pub(crate) mod projection {
             Expr::Struct(fields) => fields.iter().all(|(_, field)| shaped(field)),
             _ => false,
         }
+    }
+    /// Bounds what `column` allocates for `expr`, or `None` where it would not compute it.
+    pub(crate) fn bound(expr: &Expr, schema: &Schema, batch: &ColumnBatch) -> Result<Option<usize>> {
+        let rows = batch.len;
+        let per_row = |bytes: usize| rows.checked_mul(bytes).and_then(|total| total.checked_add(256)).ok_or_else(super::size_error);
+        Ok(Some(match expr {
+            Expr::Column { id, .. } => match schema.position(*id) { Some(position) => batch.columns[position].retained_bytes()?, None => return Ok(None) },
+            Expr::Literal(value) if constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_)) => per_row(std::mem::size_of::<Value>().checked_add(value.retained_bytes()?).ok_or_else(super::size_error)?)?,
+            Expr::Parameter { .. } => 0,
+            // The checked path builds `Option<i64>` cells before the array, and each operand may be computed too.
+            Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => {
+                let (Some(left), Some(right)) = (bound(left, schema, batch)?, bound(right, schema, batch)?) else { return Ok(None) };
+                per_row(32)?.checked_add(left).and_then(|bytes| bytes.checked_add(right)).ok_or_else(super::size_error)?
+            }
+            Expr::Struct(fields) => {
+                let mut total = per_row(std::mem::size_of::<Value>().checked_add(256).ok_or_else(super::size_error)?)?;
+                for (name, field) in fields {
+                    let Some(child) = bound(field, schema, batch)? else { return Ok(None) };
+                    let cells = match field {
+                        Expr::Column { id, .. } => match schema.position(*id) { Some(position) => (0..rows).try_fold(0usize, |sum, row| sum.checked_add(batch.columns[position].bound(row)?).ok_or_else(super::size_error))?, None => return Ok(None) },
+                        _ => child,
+                    };
+                    total = per_row(name.len().checked_add(std::mem::size_of::<Value>() + std::mem::size_of::<String>() + 64).ok_or_else(super::size_error)?)?
+                        .checked_add(child).and_then(|bytes| bytes.checked_add(cells)).and_then(|bytes| bytes.checked_add(total)).ok_or_else(super::size_error)?;
+                }
+                total
+            }
+            _ => return Ok(None),
+        }))
     }
     pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Result<Option<Column>> {
         match expr {
