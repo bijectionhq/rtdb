@@ -140,7 +140,7 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
     }).collect();
     let Some((_, field, logical)) = children.iter().flatten().next().cloned() else { return Ok(Column::Values(vec![Value::Null; cells.len()])) };
     let uniform = children.iter().all(|child| child.as_ref().is_some_and(|(_, other, other_logical)| other == &field && other_logical == &logical));
-    if uniform {
+    if uniform && flat(field.data_type()) {
         let arrays: Vec<&dyn Array> = children.iter().flatten().map(|(array, ..)| array.as_ref()).collect();
         let array = arrow_select::interleave::interleave(&arrays, cells).map_err(|error| invalid("column-gather", error))?;
         return Ok(Column::Arrow { array, field, logical });
@@ -152,6 +152,12 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
             Ok(if matches!(value, Value::Undefined) { Value::Null } else { value })
         }
     }).collect::<Result<Vec<_>>>().map(Column::Values)
+}
+
+/// Whether Arrow's interleave copies the layout without validating it: nested layouts are rebuilt and checked, and
+/// stored cells such as nulls under a non-nullable list item fail that check by panicking, so they are read as values.
+fn flat(data_type: &DataType) -> bool {
+    data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) | DataType::Null)
 }
 
 fn size_error() -> rtdb_types::Anomaly { invalid("column-size", "Column page exceeds addressable memory") }

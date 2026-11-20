@@ -810,3 +810,16 @@ fn a_thousand_unpushable_conjuncts_plan_and_run_on_a_worker_stack() {
         })
     }).unwrap().join().unwrap();
 }
+
+#[tokio::test]
+async fn a_list_holding_a_null_among_mixed_types_reads_back_through_every_valid_time() {
+    let memory = MemoryBudget::new(1 << 26);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    write(&state, 1, Value::List(vec![Value::Bool(false), Value::Null, Value::I64(0)]), &memory);
+    let context = context(Some(&state), &memory);
+    let statement = PreparedSql::prepare("SELECT v FROM docs FOR VALID_TIME ALL", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = statement.open_query(Arc::clone(&context), vec![]).await.unwrap();
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    let field = batch.batch().schema().field(0).clone();
+    assert_eq!(read_value(&field, batch.batch().column(0).as_ref(), 0).unwrap(), Value::List(vec![Value::Bool(false), Value::Null, Value::I64(0)]));
+}
