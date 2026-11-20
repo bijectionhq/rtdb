@@ -239,6 +239,8 @@ impl Session {
                     }
                     Event::Reply(Some(Err(_)) | None) => {
                         backend = None;
+                        // A refusal whose ReadyForQuery never came is over with its backend: the resent command's replies are the client's.
+                        self.discarding = false;
                         if self.status != Status::Idle {
                             // A keyed command none of whose replies reached the client is resent under its key: whatever of it committed is not run again.
                             if self.key.is_none() || self.answered { break Err(lost("the holder went away during a command, whose outcome is unknown")); }
@@ -414,6 +416,44 @@ mod tests {
         send(&mut successor, b'Z', b"I").await;
         assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()), "and the client sees only its own command's reply");
         assert_eq!(receive(&mut client).await.0, b'Z');
+        drop(client);
+        let _ = running.await;
+    }
+
+    #[tokio::test]
+    async fn a_command_refused_by_a_backend_lost_before_its_ready_for_query_is_answered_by_the_next() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway_side) = pair(&listener).await;
+        let (first, mut refusing) = pair(&listener).await;
+        let (second, mut successor) = pair(&listener).await;
+        let mut startup = 196608i32.to_be_bytes().to_vec();
+        startup.extend_from_slice(b"user\0xtdb\0database\0shop\0\0");
+        let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&startup);
+        let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
+        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        greet(&mut refusing).await;
+        receive(&mut client).await;
+        receive(&mut client).await;
+        send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+        let key = query(&mut refusing).await;
+        send(&mut refusing, b'C', b"SET\0").await;
+        send(&mut refusing, b'Z', b"I").await;
+        query(&mut refusing).await;
+        send(&mut refusing, b'E', format!("SERROR\0C57P03\0M{}\0\0", rtdb_node::NOT_HELD).as_bytes()).await;
+        drop(refusing);
+
+        greet(&mut successor).await;
+        assert_eq!(query(&mut successor).await, key);
+        send(&mut successor, b'C', b"SET\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(query(&mut successor).await, "UPDATE counters SET n = n + 1");
+        send(&mut successor, b'C', b"UPDATE 1\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), receive(&mut client)).await.expect("the successor's answer reaches the client");
+        assert_eq!(answer, (b'C', b"UPDATE 1\0".to_vec()), "rather than being discarded as the refused command's");
         drop(client);
         let _ = running.await;
     }
