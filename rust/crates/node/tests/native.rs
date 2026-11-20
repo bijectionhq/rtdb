@@ -1744,3 +1744,24 @@ async fn concurrent_transactions_with_one_idempotency_key_commit_once_and_both_r
     drop((first, second));
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_command_resent_under_its_session_key_on_a_new_session_writes_nothing_again() {
+    let (node, driver) = running(options(), services()).await;
+    let command = |key: &'static str, ids: [i64; 2]| {
+        let node = node.clone();
+        async move {
+            let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+            session.state_mut().set_parameter(rtdb_node::IDEMPOTENCY_KEY_PARAMETER, Some(key.into())).unwrap();
+            for id in ids { assert!(session.state_mut().execute_tx(vec![put(&node, id, id)], AutonomousTxOptions::default()).await.unwrap().committed()); }
+        }
+    };
+    command("first", [1, 2]).await;
+    command("first", [3, 4]).await;
+    command("second", [5, 6]).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert_eq!(rows(session.query_sql("SELECT _id FROM docs ORDER BY _id", vec![]).await.unwrap()).await, [[Value::I64(1)], [Value::I64(2)], [Value::I64(5)], [Value::I64(6)]].map(Vec::from),
+        "the resent command's transactions take the keys the first run's did, in order, and run no more");
+    drop(session);
+    stop(&node, driver).await;
+}

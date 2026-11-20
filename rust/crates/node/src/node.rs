@@ -270,8 +270,7 @@ impl Node {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
         let key = idempotency_key(&options);
         if let Some(key) = &key {
-            // A transaction carrying a key that already committed is not run again: its submission is the original's.
-            if let Some(original) = self.keyed_transaction(database, key, identity, cancellation).await? { return Ok(SubmittedTx { tx_id: original }); }
+            // A transaction carrying a key that already committed aborts on its assertion, and awaiting it answers with the original's outcome.
             let literal = quoted(key);
             let put = |id: &str| -> Result<TxOp> {
                 let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([("_id".to_owned(), Value::Utf8(id.to_owned()))])], &self.factory.memory)?;
@@ -590,6 +589,20 @@ const IDEMPOTENCY_SENTINEL: &str = "~table";
 fn idempotency_key(options: &SubmitOptions) -> Option<String> {
     let Value::Struct(fields) = options.user_metadata.as_ref()?.value() else { return None };
     fields.iter().find(|(name, _)| name.as_str() == "idempotency_key").and_then(|(_, value)| match value { Value::Utf8(key) => Some(key.clone()), _ => None })
+}
+
+/// The session parameter a gateway sets at the start of each command: the command's transactions are keyed by it and their order within the command.
+pub const IDEMPOTENCY_KEY_PARAMETER: &str = "rtdb_idempotency_key";
+
+/// `metadata` with `key` as its idempotency key, unless it names one already.
+pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_tx::UserMetadata> {
+    let mut fields = match metadata.as_ref().map(|metadata| metadata.value()) {
+        Some(Value::Struct(fields)) if fields.iter().any(|(name, _)| name.as_str() == "idempotency_key") => return Ok(metadata.expect("present")),
+        Some(Value::Struct(fields)) => fields.clone(),
+        _ => rtdb_types::StructFields::new(),
+    };
+    fields.insert("idempotency_key".into(), Value::Utf8(key.to_owned()));
+    rtdb_tx::UserMetadata::new(Value::Struct(fields), memory)
 }
 
 fn quoted(text: &str) -> String { format!("'{}'", text.replace('\'', "''")) }

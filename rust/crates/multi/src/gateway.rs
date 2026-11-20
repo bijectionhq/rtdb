@@ -101,7 +101,8 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
         })
     });
     let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
-    let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants);
+    let keyed = !startup.read_only();
+    let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed);
     let outcome = tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
         outcome = session.run(client, server, epoch) => outcome,

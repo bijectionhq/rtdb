@@ -188,6 +188,8 @@ pub struct Session {
     await_token: Option<RetainedText>,
     last_submitted: Option<LastSubmittedTx>,
     parameters: BTreeMap<String, Parameter>,
+    /// The session key its transactions were last keyed under, and the sequence number of the next.
+    idempotency_sequence: Option<(String, u64)>,
     cancellation: CancellationToken,
 }
 
@@ -198,7 +200,7 @@ impl Session {
         let database = RetainedText::new(database.into(), service.memory())?;
         let timezone = RetainedText::new(timezone, service.memory())?;
         Ok(Self { service, database, lifecycle: Lifecycle::Open(None), auto_commit: true, default_access_mode: None,
-            initial_timezone: timezone.clone(), timezone, await_token: None, last_submitted: None, parameters: BTreeMap::new(), cancellation: parent.child_token() })
+            initial_timezone: timezone.clone(), timezone, await_token: None, last_submitted: None, parameters: BTreeMap::new(), idempotency_sequence: None, cancellation: parent.child_token() })
     }
     fn ensure_open(&self) -> Result<()> {
         if matches!(self.lifecycle, Lifecycle::Closed) { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); }
@@ -425,6 +427,11 @@ impl Session {
         self.ensure_open()?;
         options.user = self.service.user().map(str::to_owned);
         if options.default_tz.is_empty() { options.default_tz = self.timezone.to_string(); }
+        // Each transaction submitted under a session key takes the next key in its sequence, unless its metadata names its own: a command resent under the same key replays the same sequence.
+        if let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
+            let sequence = match &mut self.idempotency_sequence { Some((current, next)) if *current == key => { *next += 1; *next - 1 } sequence => { *sequence = Some((key.clone(), 1)); 0 } };
+            options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{key}/{sequence}"), self.service.memory())?);
+        }
         let submitted = self.service.submit(&database, operations, options, &self.cancellation).await.inspect_err(|_| {
             if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
         })?;

@@ -105,12 +105,18 @@ pub struct Session {
     answered: bool,
     /// Discarding a refused command's replies through its ReadyForQuery, before resending it.
     discarding: bool,
+    /// Whether the gateway keys the session's commands, so that one whose holder went away can be resent without running twice.
+    keyed: bool,
+    /// The key of the pending command, which began while the session was idle.
+    key: Option<String>,
+    /// ReadyForQuery replies still owed to the gateway's own statements, swallowed rather than passed to the client.
+    swallowing: usize,
 }
 
 impl Session {
-    pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>) -> Self {
+    pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, std::time::Duration::from_millis(100));
-        Self { startup, grants, authenticated: false, router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, discarding: false }
+        Self { startup, grants, authenticated: false, router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, discarding: false, keyed, key: None, swallowing: 0 }
     }
 
     /// Reconnects to the current holder, retrying through a failover: until the dead holder's lease expires, no other node may claim.
@@ -191,9 +197,11 @@ impl Session {
                             break Ok(());
                         }
                         // A request sent while idle starts a new command: the previous command's frames are no longer pending, and must not shape a reconnection's replay.
-                        if self.status == Status::Idle { self.pending.clear(); self.answered = false; }
-                        if self.status == Status::Idle && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
+                        let starts = self.status == Status::Idle;
+                        if starts { self.pending.clear(); self.answered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
+                        if starts && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
                         if backend.is_none() { backend = Some(self.connect().await?); }
+                        if starts { if let Some(key) = self.key.clone() { self.send_key(backend.as_mut().expect("connected"), &key).await?; } }
                         self.remember(&request);
                         self.pending.push(request.clone());
                         self.status = Status::Busy;
@@ -203,13 +211,16 @@ impl Session {
                         }
                     }
                     Event::Reply(Some(Ok(frame))) => {
+                        if self.swallowing > 0 {
+                            if frame.tag == b'Z' { self.swallowing -= 1; }
+                            continue;
+                        }
                         if !self.answered && !self.discarding && frame.tag == b'E' && not_held(&frame) { self.discarding = true; }
                         if self.discarding {
                             if frame.tag == b'Z' {
                                 self.discarding = false;
                                 backend = Some(self.connect().await?);
-                                let current = backend.as_mut().expect("connected");
-                                for request in &self.pending { current.writer.write_all(&request.encode()).await.map_err(io)?; }
+                                self.resend(backend.as_mut().expect("connected")).await?;
                             }
                             continue;
                         }
@@ -221,8 +232,15 @@ impl Session {
                         client_write.write_all(&frame.encode()).await.map_err(io)?;
                     }
                     Event::Reply(Some(Err(_)) | None) => {
-                        if self.status != Status::Idle { break Err(lost("the holder went away during a command, whose outcome is unknown")); }
                         backend = None;
+                        if self.status != Status::Idle {
+                            // A keyed command none of whose replies reached the client is resent under its key: whatever of it committed is not run again.
+                            if self.key.is_none() || self.answered { break Err(lost("the holder went away during a command, whose outcome is unknown")); }
+                            self.swallowing = 0;
+                            backend = Some(self.connect().await?);
+                            self.resend(backend.as_mut().expect("connected")).await?;
+                            continue;
+                        }
                         backend = Some(self.connect().await?);
                     }
                 }
@@ -233,6 +251,22 @@ impl Session {
             let _ = client_write.write_all(&error_frame("08006", error.message.as_deref().unwrap_or(error.code.as_ref())).encode()).await;
         }
         outcome
+    }
+
+    /// Keys the transactions of the command that follows on `backend` by `key`, swallowing the statement's replies.
+    async fn send_key(&mut self, backend: &mut Backend, key: &str) -> Result<()> {
+        let mut body = format!("SET {} = '{key}'", rtdb_node::IDEMPOTENCY_KEY_PARAMETER).into_bytes();
+        body.push(0);
+        backend.writer.write_all(&Frame { tag: b'Q', body: Bytes::from(body) }.encode()).await.map_err(io)?;
+        self.swallowing += 1;
+        Ok(())
+    }
+
+    /// Sends the pending command again on a new backend, under its key if it has one.
+    async fn resend(&mut self, backend: &mut Backend) -> Result<()> {
+        if let Some(key) = self.key.clone() { self.send_key(backend, &key).await?; }
+        for request in &self.pending { backend.writer.write_all(&request.encode()).await.map_err(io)?; }
+        Ok(())
     }
 
     fn remember(&mut self, request: &Frame) {
@@ -270,3 +304,86 @@ pub fn error_frame(sqlstate: &str, message: &str) -> Frame {
 
 fn lost(message: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/holder-lost", message) }
 fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/session-io", error.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn send(stream: &mut TcpStream, tag: u8, body: &[u8]) { stream.write_all(&Frame { tag, body: Bytes::copy_from_slice(body) }.encode()).await.unwrap(); }
+
+    async fn receive(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let tag = stream.read_u8().await.unwrap();
+        let mut body = vec![0; stream.read_i32().await.unwrap() as usize - 4];
+        stream.read_exact(&mut body).await.unwrap();
+        (tag, body)
+    }
+
+    async fn greet(stream: &mut TcpStream) {
+        let mut startup = vec![0; stream.read_i32().await.unwrap() as usize - 4];
+        stream.read_exact(&mut startup).await.unwrap();
+        send(stream, b'R', &[0, 0, 0, 0]).await;
+        send(stream, b'Z', b"I").await;
+    }
+
+    /// Reads a query, answering a keying statement and returning its key, or returning the query's text.
+    async fn query(stream: &mut TcpStream) -> String {
+        let (tag, body) = receive(stream).await;
+        assert_eq!(tag, b'Q');
+        String::from_utf8(body[..body.len() - 1].to_vec()).unwrap()
+    }
+
+    struct Next(tokio::sync::Mutex<Option<TcpStream>>);
+
+    #[async_trait::async_trait]
+    impl Router for Next {
+        async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
+            Ok((self.0.lock().await.take().expect("routed once"), None, 0))
+        }
+    }
+
+    async fn pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
+        let near = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        (near, listener.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_command_whose_backend_goes_away_unanswered_is_resent_under_the_same_key() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway_side) = pair(&listener).await;
+        let (first, mut dying) = pair(&listener).await;
+        let (second, mut successor) = pair(&listener).await;
+        let mut startup = 196608i32.to_be_bytes().to_vec();
+        startup.extend_from_slice(b"user\0xtdb\0database\0shop\0\0");
+        let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&startup);
+        let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
+        let running = tokio::spawn(session.run(gateway_side, first, 0));
+
+        greet(&mut dying).await;
+        assert_eq!(receive(&mut client).await.0, b'R');
+        assert_eq!(receive(&mut client).await.0, b'Z');
+        send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+        let key = query(&mut dying).await;
+        assert!(key.starts_with(&format!("SET {} = '", rtdb_node::IDEMPOTENCY_KEY_PARAMETER)), "{key}");
+        send(&mut dying, b'C', b"SET\0").await;
+        send(&mut dying, b'Z', b"I").await;
+        assert_eq!(query(&mut dying).await, "UPDATE counters SET n = n + 1");
+        drop(dying);
+
+        greet(&mut successor).await;
+        assert_eq!(query(&mut successor).await, key, "the command is resent under the key it was first sent with");
+        send(&mut successor, b'C', b"SET\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(query(&mut successor).await, "UPDATE counters SET n = n + 1");
+        send(&mut successor, b'C', b"UPDATE 1\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()), "and the client sees only its own command's reply");
+        assert_eq!(receive(&mut client).await.0, b'Z');
+        drop(client);
+        let _ = running.await;
+    }
+}

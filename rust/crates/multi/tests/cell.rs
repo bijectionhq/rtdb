@@ -581,3 +581,27 @@ async fn a_snapshot_session_reads_the_checkpoint_from_object_storage_on_another_
     cell.gateway_cancellation.cancel();
     for node in cell.nodes.iter_mut().filter_map(Option::take) { node.kill().await.unwrap(); }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn updates_sent_back_to_back_across_a_holders_death_are_neither_lost_nor_doubled() {
+    let mut cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    let doomed = cell.nodes[holder].take().unwrap();
+    let killer = tokio::spawn(async move { tokio::time::sleep(Duration::from_millis(300)).await; doomed.kill().await.unwrap(); });
+    // Commands run back to back from before the holder dies until well after, so it dies while one is in flight.
+    let mut commands = 0;
+    let mut after = 0;
+    while after < 20 {
+        client.simple_query("UPDATE counters SET n = n + 1 WHERE _id = 1").await.unwrap_or_else(|error| panic!("command {commands} failed across the holder's death: {error:?}"));
+        commands += 1;
+        if killer.is_finished() { after += 1; }
+    }
+    killer.await.unwrap();
+    assert_eq!(values(&client, "SELECT n FROM counters").await, [commands.to_string()], "every command ran exactly once");
+    drop(client);
+    cell.add_node().await;
+    cell.stop().await;
+}
