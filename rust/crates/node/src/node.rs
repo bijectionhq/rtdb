@@ -31,10 +31,13 @@ pub struct NodeServices {
     pub catalog_metrics: Arc<dyn CatalogMetrics>,
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
+    /// Where a read-only database's compactor sends what it produced, to be published by the database's writer elsewhere.
+    /// Absent, a read-only database runs no compactor.
+    pub compaction_relay: Option<Arc<dyn crate::database::CompactionRelay>>,
 }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None }
+        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, compaction_relay: None }
     }
 }
 
@@ -101,7 +104,7 @@ impl Node {
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
-            external_sources: services.external_sources, clock: services.clock, options });
+            external_sources: services.external_sources, compaction_relay: services.compaction_relay, clock: services.clock, options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime };
         let mut initial = Vec::new();

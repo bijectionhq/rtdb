@@ -47,6 +47,11 @@ impl Database {
     pub fn progress(&self) -> &Arc<ProgressMonitor> { self.replication.progress() }
     pub fn status(&self) -> rtdb_replication::DriverStatus { self.replication.status() }
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
+    /// Publishes a compaction produced elsewhere, as this database's writer.
+    pub async fn publish_compaction(&self, notification: TriesAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
+        self.require_writable()?;
+        self.replication.publish_compaction(notification, cancellation).await
+    }
     pub async fn flush(&self) -> Result<SourcePosition> {
         self.require_writable()?;
         self.replication.flush().await
@@ -74,6 +79,19 @@ pub(crate) struct DatabaseFactory {
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     pub external_sources: ExternalSources,
+    pub compaction_relay: Option<Arc<dyn CompactionRelay>>,
+}
+
+/// Publishes a compaction a read-only database produced through the database's writer, which alone may append it.
+#[async_trait]
+pub trait CompactionRelay: Send + Sync {
+    async fn publish(&self, database: &str, notification: TriesAdded) -> Result<SourcePosition>;
+}
+
+struct RelayCompaction { relay: Arc<dyn CompactionRelay>, database: String }
+#[async_trait]
+impl CompactionPublisher for RelayCompaction {
+    async fn publish(&self, notification: TriesAdded) -> Result<SourcePosition> { self.relay.publish(&self.database, notification).await }
 }
 
 pub(crate) struct OpenedDatabase {
@@ -122,12 +140,17 @@ impl DatabaseFactory {
             replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
-            let (compactor, compaction) = if read_only || self.options.compaction_threads == 0 { (None, None) } else {
+            let publisher: Option<Arc<dyn CompactionPublisher>> = match (&self.compaction_relay, read_only) {
+                _ if self.options.compaction_threads == 0 => None,
+                (_, false) => Some(Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() })),
+                (Some(relay), true) => Some(Arc::new(RelayCompaction { relay: Arc::clone(relay), database: name.clone() })),
+                (None, true) => None,
+            };
+            let (compactor, compaction) = match publisher { None => (None, None), Some(publisher) => {
                 let executor = Arc::new(TimedCompaction { executor: SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?, observer: self.execution_observer.clone() });
-                let publisher = Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() });
                 let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
                 (Some(driver), Some(handle))
-            };
+            } };
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
                 match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }
             } else { None };

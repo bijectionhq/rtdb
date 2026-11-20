@@ -22,7 +22,7 @@ pub use session::*;
 pub use resources::*;
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
-pub use database::Database;
+pub use database::{CompactionRelay, Database};
 pub use node::{NOT_HELD, NativeSession, Node, NodeDriver, NodeServices};
 
 mod statement;
