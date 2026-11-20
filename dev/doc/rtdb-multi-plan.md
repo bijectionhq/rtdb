@@ -23,45 +23,34 @@ Paths are relative to `rust/crates/` unless they start with another top-level di
 
 ## Implementation status
 
-What runs today on the `rtdb-multi` branch, and where it still departs from the spec.
-Update this section as stages land.
+What runs on the `rtdb-multi` branch, stage by stage, and where it still departs from the spec.
+Update this section as work lands.
 
-**Runs end to end.**
-`rtdb-multi directory|logkeeper|node|gateway|controller|create|list|drain` runs a cell as separate processes, and `crates/multi/tests/cell.rs` runs one in process under tokio-postgres:
+`rtdb-multi` runs every cell process: `directory`, `cell-map`, `logkeeper`, `node`, `gateway`, `controller`, `reaper`, plus the administrative commands `create`, `list`, `status`, `drain`, `move`, `move-cell`, `read-width`, `unquarantine`, `fork`, `delete` and `audit`.
+`crates/multi/tests/cell.rs` drives an in-process cell (or two) through tokio-postgres; `tests/chaos.rs` runs a writer against a seeded sequence of faults and audits the history afterwards; `tests/footprint.rs` measures an idle deployment.
 
-- the directory (`crates/directory`): records, version-conditional replace, the claim and park rules, the contract suite, and in-memory, TCP and DynamoDB backends (DynamoDB tested against DynamoDB Local);
-- the logkeeper (`crates/logkeeper`): a quorum log with epoch promises checked at append time, seal, recovery by synced epoch, background repair of lagging servers, and the `Log` contract;
-- placed nodes (stage 2): `Membership::Placed`, local attach and detach, claims that wait no election and an idle term that appends nothing;
-- the node agent: claim, open as the epoch's writer, depose on directory change or a stopped database, park on idleness after the flushed block is adopted, self-fence on a lost lease;
-- the gateway: routes a pgwire connection to the holder, activating it on the first node of the affinity order;
-- isolation (stage 1, in part): the disk cache keyed by the store, and a session on a placed node confined to its own database;
-- scale-in by draining a node.
+| Stage | Built | Departures and gaps |
+| --- | --- | --- |
+| 0 | `tests/footprint.rs`: in a debug build, an open idle (empty) deployment costs about 94 KiB resident and 9 tasks, and activates in about 8 ms; the disk cache is keyed by the store; a placed node's query opens only its own database | `StorageRoot` as the only key constructor in classic mode is not done; multi derives every prefix from the record |
+| 1 | a session on a placed node sees only its own database; one pool's idle cache entries no longer starve another's; a node bounds its holdings' unflushed rows together (`--max-tail-rows`); a deployment's store refuses any other deployment | `Principal::authorize_database` grants in classic mode are not built |
+| 2 | the directory with in-memory, TCP and DynamoDB backends (DynamoDB tested against DynamoDB Local); members, leases, pools; `Membership::Placed`; claims without elections; idle terms append nothing | watches poll the directory rather than consuming DynamoDB Streams |
+| 3 | one quorum append per transaction: the only durable stream is the replica stream, and the source log is the holder's in-process intake, started past every position the replica stream may hold | no idempotency keys: a command refused before it ran is resent by the gateway, but a command whose outcome is unknown is reported to the client, which must retry it itself |
+| 4 | the logkeeper: append-time epoch promises, seal, recovery by synced epoch, background repair, seal announcements and `confirm_leadership`, moving a stream to a new ensemble, segment files shared by every stream on a server | segments are per server rather than per writer member, and retained entries are held in memory |
+| 5 | the store is fenced by the holder's epoch, cannot delete (a delete is a garbage record), and the reaper erases released objects and packs after a grace period | object names do not carry the writer's epoch (put-if-absent and the fence stand in for it); recovery still lists `blocks/`; no per-epoch cloud credentials, since storage is local |
+| 6 | a block flush writes one pack and its catalog; placed nodes flush within 15 minutes and on park | no boot object: a cold start reads the catalog, then the pack |
+| 7 | compaction workers compact the deployments that rank them first and relay the result to the holder, which publishes it; holders on such a cell run no compactor | |
+| 8 | parking after idleness, under `--max-active`, on drain, and waking on the next connection | resident-idle is not separate from active: a held idle deployment keeps its database open, which the measurement shows to be cheap |
+| 9 | the gateway reads pgwire frames, survives a planned move or a holder's death while the session is idle, replays the startup and prepared statements, and resends a command a former holder refused as not held | replay carries no password exchange, so transparent reconnection needs nodes that trust the gateway; the gateway does not mint capabilities |
+| 10 | read replicas fed by the log for read-only sessions within a deployment's read width; opt-in linearizable reads confirmed with the logkeepers before each query | no separate snapshot tier (replicas serve historical reads); no scan fragments for deployments larger than one node's cache |
+| 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal | autoscaling acts on the signal outside RTDB |
+| 12 | per-deployment AES-256-GCM keys for objects (above the disk cache) and log payloads; forks by copy into the parent's lineage on fresh logs; deletion that seals, trims, destroys the key, erases and proves | forks copy their parent's objects rather than referencing them |
+| 13 | the cell map, gateway forwarding, creation in the least occupied cell, cell moves that carry the unflushed tail across | |
+| 14 | the chaos test and the history audit | no deterministic simulation of a whole cell |
 
-**Departures from the spec, to close.**
+**Fixed on the way.**
 
-- **Two streams per deployment.**
-  Each deployment keeps a source and a replica stream on its ensemble, both written only by the holder; routed resolution with idempotency keys (stage 3, items 3 and 6) is not built, so a transaction costs two quorum appends.
-- **One ensemble for every epoch.**
-  A deployment's streams stay on the ensemble chosen at creation.
-  The logkeeper client can move a stream across epochs (`open_writer_on` seals the previous loglet, recovers its tail and copies it onto the new ensemble; `open_reader_on` reads a whole chain), but the directory does not record a chain and no holder moves one.
-  A move seals only the chain's last loglet, not every earlier one as `SealPriorLoglets` does: an earlier loglet was sealed by the move that ended it, and no later writer appends to it.
-- **Logkeeper storage.**
-  Every stream on a server shares one sequence of segment files, so a round across streams costs one write and one sync, but the segments are per server rather than per writer member.
-  Retained entries are held in memory, and space is reclaimed by compaction rather than per segment: once the segments hold more than twice what the streams retain, a base segment snapshotting every stream replaces them all, so an untrimmed tail costs copying rather than pinning a segment (`TrimFollowsPublication`).
-- **Linearizable reads are not wired.**
-  Acknowledgements announce seals (`SealsAreAnnounced`) and `QuorumLog::confirm_leadership` runs the check `ServeLinearizableReadOnWriter` needs, but no holder calls it before serving a linearizable read.
-- **The gateway splices bytes.**
-  It does not own session state, so a planned move or a failover drops open connections; clients reconnect.
-- **The controller only reaps expired members.**
-  Rebalancing, planned handoff with a warm subscriber, quarantine and autoscaling signals (stage 11) are not built.
-
-**Not started.**
-Stage 5 (epoch-named objects, per-epoch credentials, the reaper as sole deleter), stage 6 (packs, boot objects, the multi flush policy), stage 7 (the compaction job pool), resident-idle residency (stage 8), the subscriber and snapshot read tiers (stage 10), stage 12 (encryption, lineages, forks, deletion), stage 13 (cells) and the simulation crate (stage 14).
-
-**Open issue found on the way.**
-A park that released its placement right after `flush()` sometimes left the next holder failing with "Source reader did not advance": its promotion inherited a dangling flushed block, and the block's adoption moved applied progress past where the new leader's source tail had started.
-Parking now waits for the flushed block's adoption, which removes it in practice, but a holder that dies between cutting a flush and uploading it reaches the same promotion path.
-Reverting the wait in `agent.rs` reproduces it in `cell.rs` about one run in five; it needs a replication-level test and a fix in `ReplicationDriver::promote`.
+- A promotion that inherited a flushed block reopened its source tail behind the flush and stopped with "Source reader did not advance" (`ReplicationDriver::promote`); it affected classic failover too.
+- A planned move whose target died afterwards left a move intent no node could ever satisfy.
 
 ## 1. Ground rules
 
