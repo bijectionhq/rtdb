@@ -28,10 +28,35 @@ use crate::keys::KeyService;
 const INTAKE_RETAINED_BEHIND: i64 = 1024;
 const SCAN_WINDOW: i64 = 256;
 
-pub struct LogkeeperLogFactory { pub maximum_message_bytes: usize, pub keys: Arc<dyn KeyService> }
+/// The writers a node has opened, by deployment, for confirming leadership before a linearizable read.
+pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<rtdb_logkeeper::QuorumLog>>>>;
+
+/// Records a completed ensemble move, as the holder that made it at `epoch`, before anything is appended on the new ensemble.
+#[async_trait]
+pub trait EnsembleRecorder: Send + Sync {
+    async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
+}
+
+pub struct LogkeeperLogFactory { pub maximum_message_bytes: usize, pub keys: Arc<dyn KeyService>, pub writers: Writers, pub recorder: Arc<dyn EnsembleRecorder> }
 
 impl LogkeeperLogFactory {
-    pub fn new(maximum_message_bytes: usize, keys: Arc<dyn KeyService>) -> Arc<Self> { Arc::new(Self { maximum_message_bytes, keys }) }
+    pub fn new(maximum_message_bytes: usize, keys: Arc<dyn KeyService>, writers: Writers, recorder: Arc<dyn EnsembleRecorder>) -> Arc<Self> { Arc::new(Self { maximum_message_bytes, keys, writers, recorder }) }
+}
+
+pub struct DirectoryRecorder { pub directory: Arc<dyn rtdb_directory::Directory> }
+
+#[async_trait]
+impl EnsembleRecorder for DirectoryRecorder {
+    async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()> {
+        for _ in 0..8 {
+            let current = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
+            if current.epoch != epoch { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its new ensemble was recorded")); }
+            let mut next = current.clone();
+            next.ensemble = ensemble.clone();
+            if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
+        }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its new ensemble was recorded"))
+    }
 }
 
 #[async_trait]
@@ -41,7 +66,19 @@ impl LogFactory for LogkeeperLogFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/log-config", format!("Logkeeper log configuration is malformed: {error}")))?;
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
         let quorum: Arc<dyn Log> = match access {
-            LogAccess::ReadWrite => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
+            LogAccess::ReadWrite => {
+                let writer = match &config.previous_servers {
+                    Some(previous) => {
+                        let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0 }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
+                        // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
+                        self.recorder.record(&config.deployment, config.epoch, config.ensemble.iter().map(|id| rtdb_directory::MemberId(id.clone())).collect()).await?;
+                        moved
+                    }
+                    None => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
+                };
+                self.writers.lock().insert(config.deployment.clone(), Arc::downgrade(&writer));
+                writer
+            }
             LogAccess::ReadOnly => rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?,
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),

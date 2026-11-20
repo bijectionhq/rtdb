@@ -126,6 +126,10 @@ pub async fn set_read_width(directory: &dyn Directory, name: &str, width: u32) -
     update(directory, name, |record| { record.read_width = width.max(1); Ok(()) }).await
 }
 
+pub async fn set_linearizable_reads(directory: &dyn Directory, name: &str, on: bool) -> Result<DeploymentRecord> {
+    update(directory, name, |record| { record.linearizable_reads = on; Ok(()) }).await
+}
+
 pub async fn unquarantine(directory: &dyn Directory, name: &str) -> Result<DeploymentRecord> {
     update(directory, name, |record| { if record.lifecycle == Lifecycle::Quarantined { record.lifecycle = Lifecycle::Live; } record.activation_crashes = 0; Ok(()) }).await
 }

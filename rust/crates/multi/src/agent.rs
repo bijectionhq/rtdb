@@ -45,7 +45,7 @@ impl AgentOptions {
     }
 }
 
-struct LocalHolding { id: String, epoch: u64, last_touch: Instant }
+struct LocalHolding { id: String, epoch: u64, last_touch: Instant, linearizable: bool }
 struct LocalSubscription { id: String, last_touch: Instant, role: Role }
 
 pub struct NodeAgent {
@@ -55,14 +55,15 @@ pub struct NodeAgent {
     address: String,
     options: AgentOptions,
     holdings: Mutex<BTreeMap<String, LocalHolding>>,
+    writers: crate::logs::Writers,
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
     /// One activation, subscription or park at a time per deployment name.
     turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl NodeAgent {
-    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, holdings: Mutex::new(BTreeMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()) })
+    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers) -> Arc<Self> {
+        Arc::new(Self { directory, node, lease, address, options, holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -119,14 +120,14 @@ impl NodeAgent {
     async fn open(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Response> {
         self.stop_running(&record.name).await;
         let opened = async {
-            let configuration = database_config(&record, Self::servers(&record, members)?, &self.options.storage, Role::Holder);
+            let configuration = self.holder_config(&record, members)?;
             let database = self.node.database_or_attach(record.name.clone(), configuration).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the deployment"))?;
             self.await_leadership(&record.name, &database).await
         }.await;
         match opened {
             Ok(()) => {
-                self.holdings.lock().insert(record.name.clone(), LocalHolding { id: record.id.clone(), epoch: record.epoch, last_touch: Instant::now() });
+                self.holdings.lock().insert(record.name.clone(), LocalHolding { id: record.id.clone(), epoch: record.epoch, last_touch: Instant::now(), linearizable: record.linearizable_reads });
                 Ok(Response::Held { epoch: record.epoch, address: self.address.clone() })
             }
             Err(error) => {
@@ -135,6 +136,34 @@ impl NodeAgent {
                 Err(error)
             }
         }
+    }
+
+    /// The configuration a holder opens `record` with: on its ensemble while a quorum of it is live and every member is, otherwise moving the stream to an ensemble of live logkeepers that keeps the live members (`FlushOnDegradedEnsemble`).
+    fn holder_config(&self, record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<rtdb_format::database::proto::DatabaseConfig> {
+        let now = now_ms();
+        let live = |id: &MemberId| members.get(id).is_some_and(|member| member.is_live(now));
+        let servers = Self::servers(record, members)?;
+        let alive: Vec<MemberId> = record.ensemble.iter().filter(|id| live(id)).cloned().collect();
+        if alive.len() == record.ensemble.len() || alive.len() < crate::deployment::write_quorum(record.ensemble.len()) {
+            return Ok(database_config(record, servers, &self.options.storage, Role::Holder));
+        }
+        let candidates: Vec<&MemberRecord> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now) && !record.ensemble.contains(&member.id)).collect();
+        let mut ensemble = alive;
+        for member in rtdb_affinity::rank(&record.storage_identity(), &candidates, |member| member.id.as_str()) {
+            if ensemble.len() == record.ensemble.len() { break; }
+            ensemble.push(member.id.clone());
+        }
+        if ensemble.len() < record.ensemble.len() { return Ok(database_config(record, servers, &self.options.storage, Role::Holder)); }
+        let next: Vec<String> = ensemble.iter().map(|id| members[id].address.clone()).collect();
+        Ok(crate::deployment::moving_config(record, next, Some((servers, ensemble)), &self.options.storage, Role::Holder))
+    }
+
+    /// Before a query on a deployment held with linearizable reads, confirms with a quorum of its logkeepers that no later holder has sealed its stream (`ServeLinearizableReadOnWriter`).
+    pub async fn confirm_read(&self, name: &str) -> Result<()> {
+        let Some(id) = self.holdings.lock().get(name).filter(|holding| holding.linearizable).map(|holding| holding.id.clone()) else { return Ok(()) };
+        let writer = self.writers.lock().get(&id).and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}")))?;
+        writer.confirm_leadership().await.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}")))
     }
 
     async fn await_leadership(&self, name: &str, database: &Arc<Database>) -> Result<()> {

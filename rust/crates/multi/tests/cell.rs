@@ -342,3 +342,58 @@ async fn the_controller_confirms_a_silent_node_dead_before_its_lease_runs_out() 
     drop(client);
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
+    let mut cell = Cell::start(2, None).await;
+    cell.add_logkeeper().await;
+    let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+
+    fn position(cell: &Cell, id: &rtdb_directory::MemberId) -> Option<usize> { cell.logkeepers.iter().position(|logkeeper| logkeeper.lease.id() == *id) }
+    let first_dead = position(&cell, &record.ensemble[0]).unwrap();
+    let dead_id = record.ensemble[0].clone();
+    cell.logkeepers.remove(first_dead).stop().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.park("shop").await.unwrap();
+
+    let client = cell.connect("shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    let moved = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert!(!moved.ensemble.contains(&dead_id), "the dead logkeeper left the ensemble: {:?}", moved.ensemble);
+    assert_eq!(moved.ensemble.len(), 3);
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+
+    let second = record.ensemble.iter().skip(1).find_map(|id| position(&cell, id)).unwrap();
+    cell.logkeepers.remove(second).stop().await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20", "30"], "a second original logkeeper's death leaves a quorum of the new ensemble");
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deposed_holder_refuses_a_linearizable_read_instead_of_serving_it_stale() {
+    let cell = Cell::start_watching(vec![MemberPool::General; 2], None, Some(Duration::from_secs(3600))).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    admin::set_linearizable_reads(cell.directory.as_ref(), "shop", true).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"], "a linearizable read is served while the holder holds");
+    drop(client);
+
+    let zombie_index = cell.holder("shop").await.unwrap();
+    let zombie = cell.node(zombie_index);
+    let direct = connect(&zombie.pgwire_address.to_string(), "shop").await;
+    let zombie_id = zombie.lease.id();
+    zombie.stop_renewing();
+    while cell.directory.member(&zombie_id).await.unwrap().unwrap().lease_expires_at_ms > rtdb_directory::now_ms() { tokio::time::sleep(Duration::from_millis(50)).await; }
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    assert!(direct.simple_query("SELECT total FROM orders").await.is_err(), "the deposed holder does not answer from its stale state");
+    drop((client, direct));
+    cell.stop().await;
+}

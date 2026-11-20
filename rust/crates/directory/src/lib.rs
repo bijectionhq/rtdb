@@ -149,6 +149,9 @@ pub struct DeploymentRecord {
     /// The deployment a fork was taken from.
     #[serde(default)]
     pub parent: Option<String>,
+    /// Whether its holder confirms its leadership with the logkeepers before serving each query.
+    #[serde(default)]
+    pub linearizable_reads: bool,
     pub version: Version,
 }
 
@@ -156,7 +159,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, linearizable_reads: false, version: 0 }
     }
 
     /// The affinity key: stable across epochs and residency, distinct across incarnations.

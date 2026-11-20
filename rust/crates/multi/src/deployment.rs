@@ -36,6 +36,12 @@ pub struct LogkeeperLogConfig {
     #[serde(default)]
     pub deployment: String,
     pub replica_stream: String,
+    /// The ensemble the stream moves from, when the holder opening it moves it to `servers`.
+    #[serde(default)]
+    pub previous_servers: Option<Vec<String>>,
+    /// The members `servers` are, recorded as the deployment's ensemble once a move completes.
+    #[serde(default)]
+    pub ensemble: Vec<String>,
     /// The writer epoch a holder opens its streams at; ignored by a subscriber.
     pub epoch: u64,
     /// The namespace of the deployment's log positions.
@@ -48,7 +54,13 @@ pub fn write_quorum(ensemble: usize) -> usize { ensemble / 2 + 1 }
 
 /// The configuration a node opens `record` with, given its ensemble's addresses.
 pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage: &CellStorage, role: Role) -> DatabaseConfig {
-    let log = LogkeeperLogConfig { write_quorum: write_quorum(servers.len()), servers, deployment: record.id.clone(), replica_stream: record.stream("replica"), epoch: record.epoch, log_epoch: record.log_epoch };
+    moving_config(record, servers, None, storage, role)
+}
+
+/// The configuration a holder opens `record` with when it moves the stream from `previous` to `servers`, the ensemble `ensemble`.
+pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Option<(Vec<String>, Vec<rtdb_directory::MemberId>)>, storage: &CellStorage, role: Role) -> DatabaseConfig {
+    let mut log = LogkeeperLogConfig { write_quorum: write_quorum(servers.len()), servers, deployment: record.id.clone(), replica_stream: record.stream("replica"), epoch: record.epoch, log_epoch: record.log_epoch, previous_servers: None, ensemble: record.ensemble.iter().map(|id| id.0.clone()).collect() };
+    if let Some((previous, ensemble)) = moving { log.previous_servers = Some(previous); log.ensemble = ensemble.into_iter().map(|id| id.0).collect(); }
     let storage = match storage {
         CellStorage::Local { root } => {
             let store = crate::store::CellStoreConfig { root: root.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),

@@ -10,8 +10,9 @@ use rtdb_server::config::NodeConfiguration;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
-async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, index: usize, pool: MemberPool, park_after: Option<Duration>, compaction_workers: bool) -> process::RunningNode {
+async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, index: usize, pool: MemberPool, park_after: Option<Duration>, compaction_workers: bool, watch: Option<Duration>) -> process::RunningNode {
     let mut agent = AgentOptions::new(CellStorage::Local { root: data.join("objects") });
+    if let Some(watch) = watch { agent.watch_interval = watch; }
     agent.park_after = park_after;
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     process::start_node(Arc::clone(directory), process::NodeSettings {
@@ -35,7 +36,10 @@ pub struct Cell {
 impl Cell {
     pub async fn start(nodes: usize, park_after: Option<Duration>) -> Self { Self::start_with(vec![MemberPool::General; nodes], park_after).await }
 
-    pub async fn start_with(pools: Vec<MemberPool>, park_after: Option<Duration>) -> Self {
+    pub async fn start_with(pools: Vec<MemberPool>, park_after: Option<Duration>) -> Self { Self::start_watching(pools, park_after, None).await }
+
+    /// A cell whose agents check their holdings against the directory only every `watch`, so other fences are what a test observes.
+    pub async fn start_watching(pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
         let directory: Arc<dyn Directory> = MemoryDirectory::new();
@@ -47,7 +51,7 @@ impl Cell {
             }).await.unwrap());
         }
         let mut running = Vec::new();
-        for (index, pool) in pools.into_iter().enumerate() { running.push(Some(start_node(&directory, data.path(), index, pool, park_after, compaction_workers).await)); }
+        for (index, pool) in pools.into_iter().enumerate() { running.push(Some(start_node(&directory, data.path(), index, pool, park_after, compaction_workers, watch).await)); }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = listener.local_addr().unwrap();
         let gateway_cancellation = CancellationToken::new();
@@ -55,10 +59,19 @@ impl Cell {
         Self { directory, nodes: running, logkeepers, gateway, gateway_cancellation, data }
     }
 
+    /// Starts one more logkeeper.
+    pub async fn add_logkeeper(&mut self) {
+        let index = self.logkeepers.len() + 10;
+        self.logkeepers.push(process::start_logkeeper(Arc::clone(&self.directory), process::LogkeeperSettings {
+            listen: "127.0.0.1:0".parse().unwrap(), data_dir: self.data.path().join(format!("logkeeper-{index}")), fsync: false,
+            availability_zone: format!("zone-{index}"), lease: lease(),
+        }).await.unwrap());
+    }
+
     /// Starts one more general node, as autoscaling or a replacement would.
     pub async fn add_node(&mut self) -> usize {
         let index = self.nodes.len();
-        self.nodes.push(Some(start_node(&self.directory, self.data.path(), index, MemberPool::General, None, false).await));
+        self.nodes.push(Some(start_node(&self.directory, self.data.path(), index, MemberPool::General, None, false, None).await));
         index
     }
 

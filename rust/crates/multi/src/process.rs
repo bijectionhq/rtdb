@@ -56,11 +56,15 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     settings.agent.compaction_worker = settings.pool == rtdb_directory::MemberPool::Compaction;
     let options = settings.configuration.node_options(settings.allocation_limit_bytes)?;
     let memory = MemoryBudget::new(options.execution_memory_bytes);
+    let writers: crate::logs::Writers = Default::default();
+    let fence = Arc::new(FenceSlot::default());
+    let recorder = Arc::new(crate::logs::DirectoryRecorder { directory: Arc::clone(&directory) });
     let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys), fence_interval: Duration::from_millis(100) });
     let placed = PlacedOptions {
-        log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys)))],
+        log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
         claim_wait: settings.claim_wait,
+        read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
         compaction_relay: (settings.pool == rtdb_directory::MemberPool::Compaction).then(|| Arc::new(crate::relay::HolderRelay { directory: Arc::clone(&directory) }) as Arc<dyn rtdb_node::CompactionRelay>),
     };
     let (server, driver) = ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed).await?;
@@ -70,7 +74,8 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
         role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone, pool: settings.pool,
     }, settings.lease).await?;
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent);
+    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent, writers);
+    let _ = fence.0.set(Arc::clone(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -105,6 +110,17 @@ impl RunningNode {
             if let Ok(Err(error)) = result { if error.category != AnomalyCategory::Interrupted { return Err(error); } }
         }
         Ok(())
+    }
+}
+
+/// The read fence, filled once the agent that answers it exists.
+#[derive(Default)]
+struct FenceSlot(std::sync::OnceLock<Arc<NodeAgent>>);
+
+#[async_trait::async_trait]
+impl rtdb_node::ReadFence for FenceSlot {
+    async fn confirm(&self, database: &str) -> Result<()> {
+        match self.0.get() { Some(agent) => agent.confirm_read(database).await, None => Ok(()) }
     }
 }
 
