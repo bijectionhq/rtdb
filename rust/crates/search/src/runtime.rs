@@ -85,6 +85,8 @@ pub struct SearchRuntime {
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
     built: Mutex<Bounded<(String, String), OpenedFile>>,
+    /// Builds in progress, which a second query for the same file awaits rather than repeats.
+    building: Mutex<BTreeMap<(String, String), Arc<tokio::sync::OnceCell<Arc<SearchFile>>>>>,
     mapped: Mutex<Bounded<(String, String), OpenedFile>>,
     match_sets: Mutex<Bounded<(String, String, String, rtdb_text::Query), (std::sync::Weak<SearchFile>, Arc<crate::file::MatchSet>)>>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
@@ -94,7 +96,7 @@ pub struct SearchRuntime {
 impl SearchRuntime {
     /// `file_bytes` bounds the recorded search files kept across queries, each keeping its buffer-pool lease so its bytes stay charged to the pool; half as much bounds the files a node builds itself, and 32 times as much the files mapped from this node's disk, of which only the pages a query reads are resident.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -158,19 +160,27 @@ impl SearchRuntime {
         if let Some((pool, file)) = self.built.lock().get(&cache_key) {
             if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { data: data.clone(), identity, file }); }
         }
-        let lease = storage.get(data).await?;
-        let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
-        let (indexed, token) = (columns.to_vec(), cancellation.clone());
-        let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let _indexing = indexing;
-            let mut bytes = Vec::new();
-            crate::file::write_search_file(&indexed, crate::search_pages(lease.as_slice(), &indexed, &token)?, "built", tantivy::directory::RamDirectory::create(), &mut bytes)?;
-            Ok(bytes)
-        }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
-        let size = bytes.len();
-        let file = Arc::new(SearchFile::open(bytes, columns)?);
-        self.built.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), size);
-        Ok(TrieFile { data: data.clone(), identity, file })
+        // A build that fails or whose query is cancelled leaves the cell empty, and the next caller builds.
+        let cell = Arc::clone(self.building.lock().entry(cache_key.clone()).or_default());
+        let outcome = cell.get_or_try_init(|| async {
+            let lease = storage.get(data).await?;
+            let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
+            let (indexed, token) = (columns.to_vec(), cancellation.clone());
+            let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                let _indexing = indexing;
+                let mut bytes = Vec::new();
+                crate::file::write_search_file(&indexed, crate::search_pages(lease.as_slice(), &indexed, &token)?, "built", tantivy::directory::RamDirectory::create(), &mut bytes)?;
+                Ok(bytes)
+            }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
+            let size = bytes.len();
+            let file = Arc::new(SearchFile::open(bytes, columns)?);
+            self.built.lock().insert(cache_key.clone(), (Arc::downgrade(storage), Arc::clone(&file)), size);
+            Ok::<_, rtdb_types::Anomaly>(file)
+        }).await.cloned();
+        let mut building = self.building.lock();
+        if building.get(&cache_key).is_some_and(|current| Arc::ptr_eq(current, &cell)) { building.remove(&cache_key); }
+        drop(building);
+        Ok(TrieFile { data: data.clone(), identity, file: outcome? })
     }
 
     pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) {
@@ -263,6 +273,33 @@ mod tests {
         runtime.forget_file("xtdb", &key);
         assert!(matches!(runtime.file("xtdb", &pool, &key, &columns).await, Err(FileError::Missing)));
         store.close_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn queries_building_the_same_file_at_once_share_one_build() {
+        use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
+        let store = Arc::new(MemoryStore::default());
+        let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
+        let (memory, cancellation) = (rtdb_columnar::MemoryBudget::new(1 << 30), CancellationToken::new());
+        let data = ObjectKey::new("tables/docs/data/l00-rc-b00.arrow").unwrap();
+        let data_file = || {
+            let event = rtdb_format::data::StoredEvent { iid: rtdb_types::Iid([1; 16]), system_from: rtdb_types::Timestamp(1), valid_time: rtdb_types::Interval::new(rtdb_types::Timestamp(0), rtdb_types::Timestamp::MAX).unwrap(),
+                operation: rtdb_format::data::StoredOperation::Put(BTreeMap::from([("body".into(), rtdb_types::Value::Utf8("an overdue invoice".into()))])), recency: None };
+            let batch = rtdb_format::data::build_event_batch(&[event], Some(BTreeMap::from([("body".into(), rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Utf8))])), None).unwrap();
+            bytes::Bytes::from(rtdb_format::ipc::write_file(&batch.schema(), &[batch]).unwrap())
+        };
+        store.put(&data, data_file()).await.unwrap();
+        let columns = vec!["body".to_string()];
+        let runtime = SearchRuntime::new(1 << 20);
+        let (first, second) = tokio::join!(runtime.built("xtdb", &pool, &data, &columns, &memory, &cancellation), runtime.built("xtdb", &pool, &data, &columns, &memory, &cancellation));
+        assert!(Arc::ptr_eq(&first.unwrap().file, &second.unwrap().file));
+        assert!(runtime.building.lock().is_empty(), "a finished build leaves nothing in flight");
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let other = ObjectKey::new("tables/docs/data/l00-rc-b01.arrow").unwrap();
+        store.put(&other, data_file()).await.unwrap();
+        let _ = runtime.built("xtdb", &pool, &other, &columns, &memory, &cancelled).await;
+        assert!(runtime.built("xtdb", &pool, &other, &columns, &memory, &cancellation).await.is_ok(), "a cancelled build leaves the next caller free to build");
     }
 
     #[tokio::test]

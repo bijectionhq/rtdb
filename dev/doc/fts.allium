@@ -176,6 +176,7 @@ rule RepairUnreadableSearchFile {
 --      A doc whose own valid interval misses the query's, whose system-from is at or after the query's system upper bound, or whose recency is at or before the earlier of the query's valid and system lower bounds, contributes nothing.
 --   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
 --      A data file never changes, so a kept one serves every later query of the trie.
+--      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
 --      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
