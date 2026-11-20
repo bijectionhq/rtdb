@@ -44,8 +44,8 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
 
 == Decisions
 
-* *Index events, not resolved entities.*
-  A search file covers exactly one trie data file; a document is one row, and its id is the row's ordinal.
+* *Index text runs, with where they are visible.*
+  A search file covers exactly one trie data file; a document is every version of one entity there with the same indexed values, with its rectangles of valid time × system time, from the scan's own resolver.
 * *A search file only nominates candidates, and answers MATCH exactly.*
   The scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
   A `MATCH` with a constant query in a scan predicate becomes a column the scan evaluates: from the search file of the row's data file, null included, and from the row's value where there is none.

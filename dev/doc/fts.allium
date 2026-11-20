@@ -3,8 +3,8 @@
 --
 -- Full-text search over a table's documents, answered at any valid time and system time.
 --
--- The unit indexed is the event, one row of a trie data file, never the resolved entity.
--- Each trie file of an indexed table may carry one search file per index definition: an inverted index over that file's rows, built from it and deleted with it.
+-- The unit indexed is the text run: every version of one entity in a trie data file whose indexed values are the same, with the rectangles of valid time × system time where one of them is visible, as the scan's own resolver decides them over the file.
+-- Each trie file of an indexed table may carry one search file per index definition: an inverted index over that file's runs, built from it and deleted with it.
 -- A search file only nominates candidates.
 -- Which version of an entity is visible at the query's valid and system time is decided by the scan's bitemporal resolution, as it is for every other predicate, and MATCH is re-checked on the resolved row.
 -- So a search file that is missing costs a query time and never changes its result.
@@ -49,14 +49,19 @@ value SearchIndexDefinition {
 }
 
 value SearchDoc {
-    -- One document per row of the trie's data file, put, delete and erase alike; a delete or erase contributes no terms.
-    doc_id: Integer      -- the row's ordinal in the data file
+    -- One document per text run of a column: an entity's versions in the data file whose value in that column has the same tokens, a value that is not text having none.
+    -- A version visible nowhere within the file, a delete, an erase, and a version whose column is null or absent belong to no run of the column.
+    doc_id: Integer
     iid: Bytes
-    system_from: Instant
+    -- Where one of the run's versions is visible, as rtdb_temporal::visibility resolves the file's events of the entity with no bounds.
+    rectangles: List<Rectangle>
+}
+
+value Rectangle {
     valid_from: Instant
     valid_to: Instant
-    -- The row's `_recency` where the data file carries it (compaction.allium: HistoricalRowsCarryComputedRecency), and ∞ otherwise.
-    recency: Instant
+    system_from: Instant
+    system_to: Instant
 }
 
 ------------------------------------------------------------
@@ -176,8 +181,7 @@ rule RepairUnreadableSearchFile {
 --
 --   1. The scan selects tries exactly as it does without MATCH.
 --      A trie whose recency is at or before the earlier of the query's valid and system lower bounds holds no event the query can see, so no search file of it is read or built.
---   2. A selected trie whose entry records a search file for that definition contributes the IIDs of its docs whose terms satisfy the query.
---      A doc whose own valid interval misses the query's, whose system-from is at or after the query's system upper bound, or whose recency is at or before the earlier of the query's valid and system lower bounds, contributes nothing.
+--   2. A selected trie whose entry records a search file for that definition contributes the IIDs of its docs whose terms satisfy the query and one of whose rectangles meets the query's bounds.
 --   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
 --      A data file never changes, so a kept one serves every later query of the trie.
 --      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.
@@ -244,11 +248,17 @@ contract SearchFileLayout {
         -- A search file's bytes are a deterministic function of its trie's data file, its definition and the job's identity.
         -- Every node that runs the same job writes the same object.
 
-    @invariant OneDocPerRow
-        -- A search file has one document per row of its trie's data file, and a document's id is that row's ordinal.
+    @invariant OneDocPerRun
+        -- A search file has one document per text run of each column of its trie's data file, so a version changing one column adds no posting to another.
+        -- It records each row's run in each column, or that the row is visible with the column null or absent, or that it is visible nowhere within the file.
+        -- A document's rectangles are coalesced: two that share one interval and abut in the other are one.
 
-    @invariant DocColumnsAreTheRowsOwn
-        -- A document's iid, system_from, valid_from, valid_to and recency are those its row was written with, unaffected by any later event.
+    @invariant RectanglesFromTheResolver
+        -- A document's rectangles are where the scan's resolver, run over the file's events of the entity with no bounds, makes one of the run's versions visible.
+        -- A scan at any bounds sees exactly the events whose rectangles meet them (temporal/tests/visibility.rs), so within the file a document is visible exactly where a rectangle is.
+
+    @invariant KeysAreRecorded
+        -- The file records every row's IID, system from, valid interval and operation, in the data file's order.
 
     @invariant WindowBoundsAreUpperBounds
         -- Documents fall in windows of 128 consecutive ids.
@@ -256,8 +266,7 @@ contract SearchFileLayout {
         -- A term's part of BM25 rises with its frequency and, its inverse document frequency being positive, falls with the length, so no document in the window scores above the sum of the parts at those, whatever the corpus.
 
     @invariant RowsAndNullsAreRecorded
-        -- The file records the first document of each data page, and for each column the documents whose value is neither null nor absent.
-        -- A row's page and position within it name its document, so MATCH on any row of the data file, null included, is read from the file alone.
+        -- The file records the first row of each data page, so a row's page and position within it name its run in each column, and MATCH on any visible row of the data file, null included, is read from the file alone.
 
     @invariant TokensAreTheResidualsTokens
         -- A search file's terms are the analyzer's tokens of each row's UTF-8 value, the same tokens MATCH evaluates on a resolved row, with their positions, so a phrase matches in the file exactly when it matches the row.
@@ -278,7 +287,7 @@ contract SearchCorrectness {
 
     @invariant VisibilityIsResolved
         -- Whether a row is visible is decided by the scan's resolution over the candidate's full history.
-        -- A document's own columns only ever rule a candidate out: resolution narrows an event's interval and never widens it.
+        -- A document's rectangles only ever rule a candidate out: an event in another trie or the live index can cut a run's rectangles and never widen them.
 
     @invariant SearchFilesFromTheSnapshot
         -- A scan reads the search files its snapshot's catalog records, and those its node builds from the snapshot's data files, and no others.

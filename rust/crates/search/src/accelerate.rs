@@ -70,9 +70,7 @@ impl ScanAccelerator for SearchAccelerator {
         let TrieFiles::Complete(files) = self.trie_files(request, &definition).await? else { return Ok(None) };
         let mut candidates = BTreeSet::new();
         for trie in &files {
-            for doc in trie.file.matches(column, &query)? {
-                if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, request.bounds) { candidates.insert(Iid(doc.iid)); }
-            }
+            candidates.extend(trie.file.matches(column, &query, request.bounds)?.into_iter().map(|doc| Iid(doc.iid)));
             if candidates.len() > self.max_candidates { return Ok(None); }
         }
         candidates.extend(self.live_candidates(request, column, &query)?);
@@ -190,7 +188,7 @@ impl Ord for Pending { fn cmp(&self, other: &Self) -> std::cmp::Ordering { desce
 
 /// The IIDs of the matching events that may be visible, each at its best event's score, best first.
 /// Search files are expanded a batch of windows at a time, only while one may hold an event above every event already scored.
-struct Candidates { files: Vec<crate::file::Ranked>, pending: std::collections::BinaryHeap<Pending>, seen: BTreeSet<Iid>, scored: usize, bounds: TemporalBounds }
+struct Candidates { files: Vec<crate::file::Ranked>, pending: std::collections::BinaryHeap<Pending>, seen: BTreeSet<Iid>, scored: usize }
 
 impl Candidates {
     fn push(&mut self, iid: Iid, score: f64) { self.scored += 1; self.pending.push(Pending(score, iid)); }
@@ -210,9 +208,7 @@ impl Candidates {
             self.drop_seen();
             match (self.pending.peek().map(|top| top.0), self.best_file()) {
                 (pending, Some((index, bound))) if pending.is_none_or(|score| bound > score) => {
-                    for (doc, score) in self.files[index].expand()? {
-                        if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, self.bounds) { self.push(Iid(doc.iid), score); }
-                    }
+                    for (doc, score) in self.files[index].expand()? { self.push(Iid(doc.iid), score); }
                 }
                 _ => {
                     let Some(Pending(score, iid)) = self.pending.pop() else { return Ok(None) };
@@ -238,8 +234,8 @@ impl SearchAccelerator {
         let TrieFiles::Complete(files) = self.trie_files(request, definition).await? else { return Ok(None) };
         let scoring = Query::parse(&text);
         let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
-        let ranked = files.iter().map(|trie| trie.file.ranked(column, matching, &scoring, corpus.as_ref())).collect::<Result<Vec<_>>>()?;
-        let mut candidates = Candidates { files: ranked, pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0, bounds: request.bounds };
+        let ranked = files.iter().map(|trie| trie.file.ranked(column, matching, &scoring, corpus.as_ref(), request.bounds)).collect::<Result<Vec<_>>>()?;
+        let mut candidates = Candidates { files: ranked, pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
             for row in self.runtime.live_rows(request.database, segment, column, matching)? {
                 let event = segment.row(row)?.event()?;

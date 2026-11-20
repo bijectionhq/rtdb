@@ -16,7 +16,7 @@ fn rows(seed: u64) -> Vec<SearchRow> {
     let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) as usize };
     (0..DOCUMENTS).map(|document| {
         let tokens = (0..20).map(|_| format!("w{}", next() % VOCABULARY)).collect();
-        SearchRow { iid: [(document % 251) as u8; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, recency: None, values: vec![Some(tokens)] }
+        SearchRow { iid: [(document / 8) as u8; 16], system_from: -(document as i64), valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put, values: vec![Some(tokens)] }
     }).collect()
 }
 
@@ -29,7 +29,7 @@ async fn time_queries(store: Arc<dyn ObjectStore>, keys: &[ObjectKey], columns: 
     let mut pass = || async {
         let start = Instant::now();
         let mut matches = 0;
-        for key in keys { matches += runtime.file("bench", &pool, key, columns).await.unwrap().matches("body", &query).unwrap().len(); }
+        for key in keys { matches += runtime.file("bench", &pool, key, columns).await.unwrap().matches("body", &query, rtdb_types::TemporalBounds { valid_time: rtdb_types::Interval::ALL, system_time: rtdb_types::Interval::ALL }).unwrap().len(); }
         (start.elapsed(), matches)
     };
     let (cold, matches) = pass().await;

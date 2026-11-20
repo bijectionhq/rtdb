@@ -146,8 +146,8 @@ fn search_row(event: &rtdb_format::data::StoredEvent, columns: &[String]) -> Sea
         },
         _ => None,
     }).collect();
-    SearchRow { iid: event.iid.0, system_from: event.system_from.0, valid_from: event.valid_time.lower().0, valid_to: event.valid_time.upper().0,
-        recency: event.recency.map(|recency| recency.0), values }
+    let op = match &event.operation { StoredOperation::Put(_) => rtdb_types::EventOp::Put, StoredOperation::Delete => rtdb_types::EventOp::Delete, StoredOperation::Erase => rtdb_types::EventOp::Erase };
+    SearchRow { iid: event.iid.0, system_from: event.system_from.0, valid_from: event.valid_time.lower().0, valid_to: event.valid_time.upper().0, op, values }
 }
 
 /// A data file's pages of rows in order, each read under its memory reservation.
