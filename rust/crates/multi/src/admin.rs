@@ -157,6 +157,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     if !from.exists() { return Ok(()); }
     for entry in std::fs::read_dir(from).map_err(io)? {
         let entry = entry.map_err(io)?;
+        // A copy belongs to the deployment it is copied for, which marks it on first open.
+        if entry.file_name() == crate::store::ROOT_MARKER { continue; }
         let target = to.join(entry.file_name());
         if entry.file_type().map_err(io)?.is_dir() { copy_tree(&entry.path(), &target)?; } else { std::fs::copy(entry.path(), &target).map_err(io)?; }
     }

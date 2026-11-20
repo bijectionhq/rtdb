@@ -54,6 +54,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let local = LocalStore::open_in(config.root.join(&config.prefix).join(storage_root.as_str()), io)?;
+        claim_root(&local, &config.deployment).await?;
         let packed = crate::packing::PackingStore::open(Arc::new(local)).await?;
         Ok(GarbageStore::open(packed).await?)
     }
@@ -192,6 +193,22 @@ impl ObjectStore for GarbageStore {
     }
 }
 
+pub const ROOT_MARKER: &str = "~root";
+
+/// Marks a store as one deployment's, and refuses to open it for any other: a misconfiguration pointing two deployments at one prefix fails at once instead of corrupting both.
+async fn claim_root(store: &LocalStore, deployment: &str) -> Result<()> {
+    let marker = ObjectKey::new(ROOT_MARKER)?;
+    match store.get(&marker).await {
+        Ok(owner) if owner.as_ref() == deployment.as_bytes() => Ok(()),
+        Ok(owner) => Err(Anomaly::incorrect("rtdb.multi/foreign-root", format!("This store belongs to deployment {}, not {deployment}", String::from_utf8_lossy(&owner)))),
+        Err(Error::MissingObject(_)) => match store.put(&marker, Bytes::from(deployment.as_bytes().to_vec())).await {
+            Ok(()) => Ok(()),
+            Err(_) => Box::pin(claim_root(store, deployment)).await,
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// What a reaper pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaped { pub erased: usize, pub waiting: usize }
@@ -326,5 +343,14 @@ mod tests {
         store.delete(&key("tables/t/meta/l00-rc-b00.arrow")).await.unwrap();
         assert_eq!(reap_local(directory.path(), &record, Duration::ZERO).unwrap().erased, 2);
         assert_eq!(packs(), 0, "a fully released pack is erased");
+    }
+
+    #[tokio::test]
+    async fn a_store_refuses_a_deployment_it_was_not_created_for() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalStore::open(directory.path()).unwrap();
+        claim_root(&store, "one").await.unwrap();
+        claim_root(&store, "one").await.unwrap();
+        assert_eq!(claim_root(&store, "two").await.unwrap_err().code, "rtdb.multi/foreign-root");
     }
 }
