@@ -1741,6 +1741,9 @@ async fn concurrent_transactions_with_one_idempotency_key_commit_once_and_both_r
     assert!(a.committed() && b.committed(), "both callers are told the keyed transaction committed");
     assert_eq!(a.tx_key(), b.tx_key(), "and both are told it is the same transaction");
     assert_eq!(rows(first.query_sql("SELECT COUNT(*) FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(1)]], "only one of them ran");
+    let mut reserved = AutonomousTxOptions::default();
+    reserved.user_metadata = Some(rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([("idempotency_key".into(), Value::Utf8("~table".into()))])), node.memory()).unwrap());
+    assert!(first.state_mut().execute_tx(vec![put(&node, 3, 30)], reserved).await.is_err(), "the key the keys table is created with is not a caller's to use");
     drop((first, second));
     stop(&node, driver).await;
 }
