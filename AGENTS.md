@@ -66,6 +66,7 @@ That commentary belongs in the commit body and the PR, which are read once aroun
 | `dev/doc/compaction.allium` | Coordination-free compaction — deterministic job selection and the merge algorithm. The message flow around it lives in `db.allium`. |
 | `dev/doc/gc.allium` | Trie garbage collection — leader-only, signalled at block boundaries, deleting superseded data/meta files and publishing those deletions atomically to the replica log. |
 | `dev/doc/block-gc.allium` | Garbage collection of superseded block-catalog and per-table block files — leader-only, and needs no replica-log coordination because block files are read only at startup/catch-up. |
+| `allium/rtdb-multi.allium` | Target design, ahead of the implementation: many deployments on shared, autoscaling cells — the directory and writer epochs, loglets and their seal, the storage fence and reaper, residency, read tiers, affinity, gateways, forks and deletion. Staged by `dev/doc/rtdb-multi-plan.md`. |
 
 ## Definition of Done (Session Completion)
 

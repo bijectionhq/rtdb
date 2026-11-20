@@ -1,0 +1,2007 @@
+-- allium: 3
+-- rtdb-multi.allium
+--
+-- Scope: hosting an unbounded number of deployments on one shared, autoscaling infrastructure.
+-- A deployment is one RTDB database belonging to one customer application.
+-- Every cost a deployment imposes is proportional to its activity and its stored bytes; a deployment nobody is using is a directory record and objects in storage.
+--
+-- Status: target design, ahead of the implementation.
+-- Nothing in this spec is implemented yet.
+-- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
+-- Where this spec and an existing spec describe the same mechanism, the existing spec describes the code as it stands and this one describes where it is going:
+--   - election and the term fence: log-processor-lifecycle.allium
+--   - the source log, the replica log and the block cycle: db.allium
+--   - database membership on a node: database-lifecycle.allium
+--   - trie and block garbage collection: gc.allium, block-gc.allium
+--   - where compaction runs: compaction.allium (its job selection and merge algorithm are kept unchanged)
+--
+-- Includes:
+--   - cells, and the map from deployment to cell;
+--   - the directory, the authority for every deployment's placement, epoch and checkpoint;
+--   - node membership and liveness;
+--   - the deployment log, its loglets and the log servers that hold them;
+--   - the single-writer fence, at every surface where a writer has effect;
+--   - object-storage namespaces, manifests, packs, boot objects and the reaper;
+--   - residency: active, resident-idle and parked;
+--   - the read tiers, read freshness and basis tokens;
+--   - cache affinity, cache fairness and per-deployment quotas;
+--   - gateways and sessions;
+--   - activation, planned handoff, failover, scale-out and scale-in;
+--   - lineages, forks, deletion and encryption;
+--   - format and engine upgrades, quarantine, and moving a deployment between cells.
+-- Excludes: transaction resolution, the live index's structure, the trie format, compaction's job selection and merge, query planning and execution.
+-- Those are the existing specs', and this spec treats them as given.
+--
+-- Vocabulary, used throughout.
+--
+-- - CELL -- one independent unit of infrastructure: its own directory, log servers, nodes, gateways, workers and buckets, sized to a bounded envelope.
+--   An unbounded number of deployments is reached by adding cells.
+--
+-- - MEMBER -- one process lifetime of a node, gateway, log server or worker in a cell.
+--   A restart is a new member.
+--   A member's identity is also the lifetime of its caches, which is what affinity ranks.
+--
+-- - HOLDER -- the member that is a deployment's writer for one epoch.
+--   At most one member's writes take effect per epoch, and epochs only rise.
+--
+-- - EPOCH -- the writer fence.
+--   Allocated by the directory, one claimant per value, and checked at every surface where a writer has effect: the log, the directory, object storage.
+--
+-- - LOGLET -- one epoch's segment of a deployment's log, held by an ensemble of log servers.
+--   A deployment's log is the chain of its loglets.
+--
+-- - CHECKPOINT -- the directory's pointer to a deployment's last published manifest, and the log position it covers.
+--   Everything at or below it is in object storage; everything above it is the tail.
+--
+-- - TAIL -- the committed log records above the checkpoint.
+--   Short by construction: flushing keeps it under a replay budget.
+--
+-- - RESIDENCY -- how much of a deployment a node holds in memory.
+--   active: tail live index and work in flight.
+--   resident_idle: holder retained, catalogs loaded, no tail, no tasks.
+--   parked: no holder anywhere; the deployment is its directory record and its objects.
+--
+-- - LINEAGE -- a root deployment and every fork descended from it within one organisation.
+--   Objects are shared within a lineage and never across one.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity ObjectStore {
+    -- Durable, immutable-object storage (S3, GCS, Azure Blob).
+    -- Supplies put-if-absent, ranged get, versioned delete and inventory.
+    -- Supplies scoped credentials: a credential can be restricted to a key prefix, to put-if-absent, and to a lifetime.
+}
+
+external entity KeyService {
+    -- A key-management service (KMS).
+    -- Wraps and unwraps data keys under a key bound to an encryption context, and destroys keys irreversibly.
+}
+
+external entity Clock {
+    -- A member's wall clock.
+    -- Used for system time, leases and timeouts.
+    -- No safety property in this spec depends on clocks agreeing; system-time monotonicity and lease expiry do, and say so.
+}
+
+external entity Client {
+    -- An application connecting over pgwire, Flight SQL or HTTP, with credentials for one deployment.
+}
+
+external entity Resolver {
+    -- The transaction resolver of db.allium and live-index.allium, opaque here.
+    -- Given a live index at a basis and a submitted transaction, produces a resolved transaction or an abort, deterministically.
+}
+
+external entity CompactionPlanner {
+    -- compaction.allium's deterministic job selection, opaque here.
+    -- Given a manifest, yields the same set of jobs, with the same output names, on every member that computes it.
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value DeploymentId {
+    -- Minted at creation, never reused, never derived from a name.
+    uuid: String
+}
+
+value OrgId {
+    uuid: String
+}
+
+value LineageId {
+    -- The DeploymentId of the lineage's root.
+    uuid: String
+}
+
+value CellId {
+    name: String
+}
+
+value MemberId {
+    -- One process lifetime.
+    -- A restarted process registers a new MemberId.
+    uuid: String
+}
+
+value Epoch {
+    -- The writer fence for one deployment.
+    -- 0 means never held.
+    value: Integer
+}
+
+value Lsn {
+    -- A position in one deployment's log.
+    -- Dense from 1 across every loglet of the deployment.
+    value: Integer
+}
+
+value Basis {
+    -- What a commit acknowledgement returns and a read may require.
+    -- A read at a basis sees every transaction at or below lsn.
+    epoch: Epoch
+    lsn: Lsn
+}
+
+value IdempotencyKey {
+    -- Minted by the gateway for each submitted transaction, carried through retries of that transaction.
+    value: String
+}
+
+value StorageRoot {
+    -- The only handle from which object keys can be built.
+    -- Issued by the directory; engine code receives it and never composes a prefix of its own.
+    deployment: DeploymentId
+    org: OrgId
+    lineage: LineageId
+    incarnation: Integer
+    -- Derived: hash16(deployment) "/" org "/" lineage "/" deployment "/" incarnation
+    prefix: String
+}
+
+value ObjectRef {
+    -- A reference to one immutable object, as a manifest records it.
+    -- The key always carries the epoch of the member that wrote it.
+    key: String
+    size: Integer
+    checksum: String
+    owner: DeploymentId
+}
+
+value Checkpoint {
+    -- The directory's record of a deployment's last published manifest.
+    manifest: ObjectRef
+    boot: ObjectRef
+    lsn: Lsn
+    -- The hash of the log record at lsn, so recovery verifies the tail it replays continues this history.
+    chain_hash: String
+    format_version: Integer
+}
+
+value Loglet {
+    -- One epoch's segment of a deployment's log.
+    epoch: Epoch
+    ensemble: List<MemberId>
+    start_lsn: Lsn
+}
+
+value Capability {
+    -- A short-lived, signed grant minted by a gateway for one session.
+    -- Names exactly one deployment and the access it grants.
+    deployment: DeploymentId
+    principal: String
+    access: read | read_write | admin
+    expires_at: Timestamp
+}
+
+value StorageCredential {
+    -- A credential a holder uses to write objects.
+    -- Restricted to put-if-absent, under its own epoch's prefix only, and expiring within credential_ttl.
+    deployment: DeploymentId
+    epoch: Epoch
+    prefix: String
+    expires_at: Timestamp
+}
+
+value LoadVector {
+    -- What placement balances, per deployment and summed per node.
+    write_bytes_per_second: Integer
+    tail_bytes: Integer
+    query_cpu_millis_per_second: Integer
+    cache_bytes: Integer
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum MemberRole {
+    gateway | node | log_server | worker | reaper | controller
+}
+
+enum MemberState {
+    -- joining:  registered, warming, receives no new placements.
+    -- eligible: may hold, serve and receive placements.
+    -- draining: keeps what it holds and serves it, receives nothing new, hands everything off.
+    -- retired:  holds nothing and has left.
+    -- dead:     its lease expired or it was suspected and confirmed; everything it held is unheld.
+    joining | eligible | draining | retired | dead
+}
+
+enum Lifecycle {
+    -- live:        the ordinary state.
+    -- quarantined: activation crashed members repeatedly; placed only on the isolation pool.
+    -- moving:      being moved to another cell; writes are fenced while the cutover completes.
+    -- deleting:    fenced; its objects, log and keys are being destroyed.
+    -- deleted:     a tombstone carrying the deletion record.
+    live | quarantined | moving | deleting | deleted
+}
+
+enum Residency {
+    active | resident_idle | parked
+}
+
+enum IsolationClass {
+    -- shared:    placed on any eligible node of the cell's general pool.
+    -- pinned:    placed only within a fixed small node set named on the record.
+    -- dedicated: placed on nodes reserved for it, with a loglet ensemble reserved for it.
+    -- isolation: placed only on the isolation pool; every quarantined deployment is here.
+    shared | pinned | dedicated | isolation
+}
+
+enum ReadTier {
+    -- writer:     the holder serves the read from its tail and cache.
+    -- subscriber: a member that subscribes to the deployment's log and holds a tail live index serves it.
+    -- snapshot:   any member serves a read at a basis at or below the checkpoint from object storage and cache alone.
+    writer | subscriber | snapshot
+}
+
+enum ReadFreshness {
+    -- at_basis:     sees at least the session's basis token; the default.
+    -- linearizable: sees every transaction acknowledged before the read began.
+    -- as_of:        sees exactly an explicit basis, which may be historical.
+    at_basis | linearizable | as_of
+}
+
+------------------------------------------------------------
+-- Configuration
+------------------------------------------------------------
+
+config {
+    -- Cell envelope.
+    cell_max_deployments: Integer = 2000000
+    cell_max_nodes: Integer = 500
+
+    -- Liveness.
+    member_heartbeat: Duration = 500.milliseconds
+    member_lease: Duration = 3.seconds
+    -- Independent gateway reports that corroborate a suspicion before the controller confirms it.
+    suspicion_reporters: Integer = 2
+
+    -- The log.
+    ensemble_size: Integer = 3
+    write_quorum: Integer = 2
+    group_commit_window: Duration = 1.milliseconds
+    log_max_retention: Duration = 7.days
+
+    -- Flushing.
+    flush_tail_bytes: Integer = 33554432
+    flush_replay_budget: Duration = 500.milliseconds
+    flush_max_age: Duration = 15.minutes
+    block_max_rows: Integer = 100000
+    clean_after_idle: Duration = 60.seconds
+
+    -- Residency.
+    min_residency: Duration = 5.minutes
+    resident_idle_target_bytes: Integer = 65536
+
+    -- Storage fence and garbage.
+    credential_ttl: Duration = 15.minutes
+    max_snapshot_lifetime: Duration = 30.minutes
+    -- reaper_grace must exceed max_snapshot_lifetime + credential_ttl.
+    reaper_grace: Duration = 1.hours
+    boot_inline_limit: Integer = 1048576
+
+    -- Transactions.
+    idempotency_window: Duration = 1.hours
+    system_time_skew_bound: Duration = 500.milliseconds
+
+    -- Reads.
+    subscriber_basis_wait: Duration = 20.milliseconds
+    max_read_width: Integer = 8
+
+    -- Control.
+    activations_per_node_per_second: Integer = 200
+    moves_per_node_per_pass: Integer = 8
+    handoff_lag_threshold: Duration = 10.milliseconds
+    quarantine_crashes: Integer = 2
+    quarantine_window: Duration = 10.minutes
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract CellMap {
+    -- The only global state: which cell a deployment lives in.
+    -- Near-immutable: a row changes only when a deployment moves cells.
+    -- Encoded in the deployment's hostname where the client protocol allows, so the request path makes no global lookup.
+    cell_of: (deployment: DeploymentId) -> CellId
+
+    @invariant OneCellPerDeployment
+        -- A deployment is live in exactly one cell at a time.
+        -- A move flips the row only after the source cell has fenced the deployment (MoveCutover).
+}
+
+contract Directory {
+    -- A cell's linearizable, transactional, sharded key-value store.
+    -- Holds DeploymentRecords and MemberRecords and nothing else.
+    -- Sits on the activation, placement, flush-publication and lifecycle paths; never on the commit path or the steady-state read path.
+    read: (deployment: DeploymentId) -> DeploymentRecord
+    cas: (deployment: DeploymentId, expected_epoch: Epoch, change: DeploymentChange) -> DeploymentRecord
+    watch: (member: MemberId) -> Stream<MemberRecord>
+
+    @invariant EveryEpochHasOneClaimant
+        -- An epoch value is written into a record by exactly one successful cas, naming exactly one member.
+        --   Every fence in this spec is the epoch, so this is the root of single-writer safety.
+
+    @invariant EpochBoundChangesAreConditional
+        -- Every change to holder, loglets, checkpoint, lifecycle, isolation class or engine pin is a cas conditional on the record's current epoch.
+        --   A holder whose epoch has been superseded can change nothing about its deployment.
+
+    @invariant EpochsOnlyRise
+        -- A record's epoch never decreases, and every change of holder increments it.
+
+    @invariant StaticStability
+        -- A directory outage stalls activations, moves, flush publication and lifecycle changes.
+        -- It does not stop a placed holder from committing or serving reads.
+        --   Tails grow while publication is stalled, bounded by log-server capacity, and flush backpressure turns that bound into write stalls rather than data risk.
+}
+
+contract LogService {
+    -- What a cell's log servers supply, per deployment.
+    -- A deployment's log is a dense sequence of records addressed by Lsn, carried by a chain of loglets.
+    append: (deployment: DeploymentId, epoch: Epoch, lsn: Lsn, records: List<LogRecord>) -> Lsn
+    seal: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> SealReply
+    read: (deployment: DeploymentId, from: Lsn) -> List<LogRecord>
+    subscribe: (deployment: DeploymentId, from: Lsn) -> Stream<LogRecord>
+    trim: (deployment: DeploymentId, through: Lsn) -> Lsn
+
+    @invariant AppendIsConditionalOnEpochAndPosition
+        -- A log server accepts an append for a deployment only if its epoch equals the server's promised epoch for that deployment and its lsn is one above the server's last.
+        --   A deposed writer's append is refused at the server, so no window exists in which two writers both commit.
+
+    @invariant CommitIsAWriteQuorum
+        -- A record is committed when write_quorum of its loglet's ensemble have made it durable.
+        -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
+
+    @invariant SealIsAPromise
+        -- A seal at epoch e durably raises the server's promised epoch for the deployment to at least e, and returns the epoch and lsn of the server's last record with every record above the deployment's trim point.
+        -- Once write_quorum servers of a loglet have answered a seal at e, no append below e reaches a quorum of that loglet.
+        --   Any commit quorum and any seal quorum of one ensemble intersect.
+
+    @invariant NothingCommittedIsLost
+        -- Every record committed in a loglet is held by at least one server of any seal quorum of that loglet.
+        --   So recovery from a seal quorum can always find it (RecoverTail).
+
+    @invariant ReadsAreDemultiplexed
+        -- A read or subscription for one deployment is served from that deployment's own index and returns only its records.
+        --   Records of many deployments share physical segments; no reader of one deployment reads another's.
+
+    @invariant GroupCommitSpansDeployments
+        -- One durable round on a log server carries the pending appends of every deployment its writers have sent, within group_commit_window.
+        --   A deployment writing one small transaction shares its replication round with every other deployment on the same writer.
+
+    @invariant IdleCostsNothing
+        -- A deployment with no appends causes no log traffic: no heartbeat, no no-op, no timer.
+
+    @invariant SealsAreAnnounced
+        -- Every durable round's acknowledgement lists the deployments sealed on that server since the previous round to the same writer.
+        --   This is what a holder serving a linearizable read waits on (ServeLinearizableReadOnWriter).
+
+    @invariant TrimFollowsPublication
+        -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
+        -- A physical segment is reclaimed once every deployment's records in it are trimmed.
+        -- A deployment whose tail pins a segment past log_max_retention is force-flushed (FlushOnRetention).
+
+    @invariant DurabilityIsConfiguredNotHoped
+        -- Expected of the operator: each ensemble spans three availability zones, and a server acknowledges only after fsync.
+}
+
+contract ObjectStorage {
+    -- What the cell requires of object storage, and how it uses it.
+    put_if_absent: (credential: StorageCredential, key: String, bytes: Bytes) -> ObjectRef
+    get: (key: String, from: Integer, to: Integer) -> Bytes
+    delete_all_versions: (key: String) -> Integer
+    inventory: (prefix: String) -> List<String>
+
+    @invariant ObjectsAreImmutable
+        -- Every object is written once, under a key never reused.
+        -- So a cached object or range is correct forever or unreachable; nothing is ever invalidated.
+
+    @invariant WritersCarryTheirEpoch
+        -- Every object a holder writes is under prefix + "/e" + epoch, written with put-if-absent, using a StorageCredential scoped to that epoch's prefix.
+        --   A deposed holder cannot overwrite a successor's object, and cannot write at all once its credential expires.
+
+    @invariant OnlyTheReaperDeletes
+        -- No node, gateway or worker holds a credential that can delete.
+        -- The reaper deletes, and only objects the reachability rule (ReapUnreachable) has found unreachable for reaper_grace.
+
+    @invariant VisibilityIsByReference
+        -- An object has effect only once a committed log record or a published manifest references it.
+        -- An object nothing references is an orphan, invisible to every reader, and reclaimed by the reaper.
+
+    @invariant NoListingOnADataPath
+        -- Recovery, activation, reads, compaction and garbage collection find objects through manifests.
+        -- Listing (inventory) is used by the scrubber and by deletion proofs only.
+
+    @invariant RequestsSpreadAcrossPartitions
+        -- The hash at the head of every StorageRoot prefix spreads deployments over the store's request partitions.
+        -- A deployment whose request rate exceeds one partition's adds a second hash level inside its prefix.
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Cell {
+    id: CellId
+    directory: Directory
+    log: LogService
+    members: Set<MemberRecord>
+    -- The engine version a new deployment is pinned to, and the storage format it is created at.
+    default_engine_pin: String
+    current_format_version: Integer
+    -- Derived: the deployments recorded in this cell's directory.
+    deployments: Set<DeploymentRecord>
+
+    @invariant WithinEnvelope
+        -- A cell holds at most cell_max_deployments deployments and cell_max_nodes nodes.
+        -- A cell at its envelope receives no new deployments; the global layer creates them in another cell.
+}
+
+entity MemberRecord {
+    -- One process lifetime, as the directory records it.
+    id: MemberId
+    role: MemberRole
+    address: String
+    availability_zone: String
+    engine_version: String
+    capacity: LoadVector
+    -- Which node pool it belongs to; meaningful for nodes only.
+    pool: general | isolation | dedicated
+    -- The member renews this every member_heartbeat while alive.
+    lease_expires_at: Timestamp
+    state: MemberState
+
+    transitions state {
+        joining -> eligible      -- prewarmed and admitted by the controller
+        joining -> dead          -- lease expired before admission
+        eligible -> draining     -- the controller chose it for scale-in, rollout or replacement
+        eligible -> dead         -- lease expired, or suspicion confirmed
+        draining -> retired      -- holds nothing and serves nothing
+        draining -> dead         -- lease expired while draining
+        -- retired and dead are terminal: a restarted process is a new member.
+    }
+
+    -- Derived: what it may hold or serve.
+    may_hold: role = node and (state = eligible or state = draining)
+    may_receive_placements: role = node and state = eligible
+}
+
+entity DeploymentRecord {
+    -- One deployment, as the directory records it.
+    -- About 300 bytes when parked.
+    id: DeploymentId
+    org: OrgId
+    lineage: LineageId
+    -- Bumped when a deployment is recreated under the same name, so the new one's objects never meet the old one's.
+    incarnation: Integer
+    -- The fork's parent and the basis it was forked at, absent for a lineage root.
+    parent: DeploymentId?
+    fork_basis: Basis?
+    storage_root: StorageRoot
+    -- The KeyService key wrapping this deployment's object data keys.
+    key_id: String
+    lifecycle: Lifecycle
+    isolation_class: IsolationClass
+    -- Members permitted when isolation_class is pinned or dedicated.
+    pinned_members: Set<MemberId>
+    -- The engine versions permitted to hold this deployment.
+    engine_pin: String
+    format_version: Integer
+    quotas: Quotas
+
+    epoch: Epoch
+    holder: MemberId?
+    -- The chain of loglets whose records are above the checkpoint.
+    -- Empty when the tail is sealed and flushed.
+    loglets: List<Loglet>
+    checkpoint: Checkpoint?
+    -- How many ranks of the affinity order may serve reads.
+    read_width: Integer
+    -- Activations that ended in the holder crashing, within quarantine_window.
+    activation_crashes: Integer
+    -- A planned move in progress, naming its target.
+    move_intent: MemberId?
+    -- Whether producers may submit to an intake stream without waiting for a holder.
+    intake_enabled: Boolean
+    -- When a request last reached this deployment, maintained coarsely by the holder; orders the drainer.
+    last_activity: Timestamp
+
+    -- Derived: the affinity key, stable across epochs and residency.
+    storage_identity: id.uuid + "/" + incarnation
+
+    transitions lifecycle {
+        live -> quarantined      -- activation_crashes reached quarantine_crashes
+        quarantined -> live      -- an operator cleared it
+        live -> moving           -- a cell move began
+        moving -> live           -- the move was abandoned in the source cell
+        moving -> deleted        -- the move completed; the source cell keeps a tombstone forwarding to the target
+        live -> deleting
+        quarantined -> deleting
+        deleting -> deleted
+        -- deleted is terminal.
+    }
+
+    -- Derived.
+    -- A holder counts only while its member may hold; a dead member's placements are unheld without any write to them.
+    effective_holder: holder when holder != null and members[holder].may_hold
+    is_held: effective_holder != null
+    tail_open: loglets != []
+    is_parked: not is_held and not tail_open
+}
+
+entity Lineage {
+    -- A root deployment and every fork descended from it within one organisation.
+    id: LineageId
+    org: OrgId
+    -- Bumped by every fork and every deletion in the lineage; the reaper's deletions are conditional on it.
+    version: Integer
+    members: Set<DeploymentId>
+}
+
+value SealReply {
+    server: MemberId
+    loglet: Loglet
+    last_epoch: Epoch
+    last_lsn: Lsn
+    records: List<LogRecord>
+}
+
+external entity LiveIndex {
+    -- live-index.allium's live index, opaque here.
+}
+
+entity Quotas {
+    max_tx_per_second: Integer
+    max_log_bytes_per_second: Integer
+    max_object_requests_per_second: Integer
+    max_stored_bytes: Integer
+    max_query_memory_bytes: Integer
+    cpu_weight: Integer
+    max_connections: Integer
+}
+
+entity LogServerStream {
+    -- One deployment's state on one log server.
+    -- Exists only while the server holds a loglet of the deployment above its trim point.
+    deployment: DeploymentId
+    promised_epoch: Epoch
+    last_epoch: Epoch
+    last_lsn: Lsn
+    trimmed_through: Lsn
+    -- Deployments sealed here since the previous acknowledged round, per writer, for SealsAreAnnounced.
+    sealed_since_last_round: Boolean
+}
+
+entity LogRecord {
+    deployment: DeploymentId
+    epoch: Epoch
+    lsn: Lsn
+    -- Hash of the previous record's hash and this record's payload, across epochs.
+    -- The chain from a checkpoint's chain_hash is verifiable offline.
+    prev_hash: String
+    -- Encrypted under the deployment's data key.
+    payload: ResolvedTx | EpochStart | BlockUploaded | TriesAdded | TriesReleased | Handoff | Parked
+}
+
+variant ResolvedTx : LogRecord {
+    -- One resolved transaction, applied by every reader without re-resolution.
+    tx_id: Integer
+    system_time: Timestamp
+    idempotency_key: IdempotencyKey
+    -- committed or aborted; an aborted transaction is recorded so that its retry returns the same outcome.
+    outcome: committed | aborted
+}
+
+variant EpochStart : LogRecord {
+    -- The first record a holder appends in its epoch, after recovery.
+    -- Everything before it in the log belongs to earlier epochs.
+    holder: MemberId
+}
+
+variant BlockUploaded : LogRecord {
+    -- A flush has written its pack and manifest; readers adopt the block at this record.
+    manifest: ObjectRef
+    boot: ObjectRef
+    through_lsn: Lsn
+}
+
+variant TriesAdded : LogRecord {
+    -- The holder adopts compaction outputs: from this record on they are live.
+    outputs: List<ObjectRef>
+    replaced: List<ObjectRef>
+}
+
+variant TriesReleased : LogRecord {
+    -- Objects this deployment no longer references.
+    -- Candidates for the reaper, which deletes them only once no manifest in the lineage references them.
+    released: List<ObjectRef>
+}
+
+variant Handoff : LogRecord {
+    -- The last record a holder appends before a planned move, naming the member that takes over.
+    to: MemberId
+}
+
+variant Parked : LogRecord {
+    -- The last record of a deployment going parked, after its final flush.
+    final_lsn: Lsn
+}
+
+entity Holding {
+    -- One node's holding of one deployment for one epoch.
+    deployment: DeploymentRecord
+    member: MemberId
+    epoch: Epoch
+    residency: Residency
+    -- Bytes of committed records above the checkpoint held in the tail live index.
+    tail_bytes: Integer
+    -- Commit time of the oldest record above the checkpoint.
+    oldest_unflushed_at: Timestamp?
+    last_request_at: Timestamp
+    resident_since: Timestamp
+    -- Idempotency keys of transactions committed within idempotency_window, with their outcomes.
+    recent_keys: Set<IdempotencyKey>
+    -- The highest system time committed, carried across epochs through the tail and the checkpoint.
+    last_system_time: Timestamp
+    credential: StorageCredential
+    load: LoadVector
+    -- The log position this holding has applied through, and its basis.
+    applied_lsn: Lsn
+    applied_basis: Basis
+    -- Rows above the checkpoint, for FlushOnRows.
+    tail_rows: Integer
+    -- The live index over the tail, absent while resident_idle.
+    live_index: LiveIndex?
+    -- The manifest this holding currently reads through.
+    manifest: ObjectRef
+    -- Seal replies gathered while sealing, consumed by RecoverTail.
+    seal_replies: List<SealReply>
+    -- Lifecycle within the epoch.
+    state: claiming | sealing | recovering | opening | serving | handing_off | deposed
+
+    transitions state {
+        claiming -> sealing        -- cas won and an earlier loglet is open
+        claiming -> opening        -- cas won and the tail was sealed and flushed
+        claiming -> deposed        -- cas lost
+        sealing -> recovering      -- a seal quorum answered for every open loglet
+        sealing -> deposed         -- the directory moved past this epoch
+        recovering -> opening      -- the recovered tail is replicated into this epoch's loglet
+        recovering -> deposed
+        opening -> serving         -- manifest loaded, tail replayed, EpochStart committed
+        opening -> deposed
+        serving -> handing_off     -- a move intent names another member and its lag is under handoff_lag_threshold
+        serving -> deposed         -- an append was refused for a higher epoch, or the directory moved past this epoch
+        handing_off -> deposed     -- Handoff committed
+        -- deposed is terminal for the holding; the member may hold the deployment again only under a new epoch.
+    }
+
+    transitions residency {
+        active -> resident_idle    -- no requests for clean_after_idle, and the tail flushed
+        resident_idle -> active    -- a request arrived
+        resident_idle -> parked    -- memory pressure chose it, after min_residency
+        active -> parked           -- the member drains or is told to park, after a final flush
+        -- parked ends the holding: Parked is committed and the holder is cleared.
+    }
+}
+
+entity Subscription {
+    -- A non-holder member serving reads for a deployment from a log-fed tail live index.
+    -- Exists only while the deployment's read width admits the member's rank and its demand continues.
+    deployment: DeploymentRecord
+    member: MemberId
+    applied_lsn: Lsn
+    tail_bytes: Integer
+}
+
+entity Session {
+    -- A client session, held by a gateway.
+    -- Everything a session needs is reconstructible from the client, so a gateway is stateless in the sense that matters: losing one loses connections, never data.
+    gateway: MemberId
+    deployment: DeploymentId
+    capability: Capability
+    -- Parameters, prepared statements, the transaction buffer up to commit.
+    state: Bytes
+    -- The highest basis this session has been acknowledged or has read at.
+    basis: Basis?
+    freshness: ReadFreshness
+    -- Present while a cursor is open; pins the session's reads to that member until the cursor closes.
+    pinned_member: MemberId?
+}
+
+entity GatewayRoute {
+    -- A gateway's cached view of one active deployment: its holder and epoch, pushed for the active set.
+    -- A wrong view costs one redirect; a gateway never authorises a write by its view.
+    deployment: DeploymentId
+    holder: MemberId?
+    epoch: Epoch
+    read_width: Integer
+}
+
+entity CompactionJob {
+    -- One deterministic job, derived from a manifest.
+    deployment: DeploymentId
+    job_key: String
+    -- Output names are fixed by the job, so duplicated work writes the same keys and put-if-absent makes it harmless.
+    outputs: List<String>
+    state: queued | running | written | adopted | abandoned
+}
+
+entity GarbageCandidate {
+    -- An object released by some deployment's manifest, awaiting the reaper.
+    object: ObjectRef
+    lineage: LineageId
+    released_at: Timestamp
+}
+
+entity DeletionRecord {
+    -- The signed proof that a deployment's data is gone.
+    deployment: DeploymentId
+    key_destroyed_at: Timestamp
+    prefix_empty_first_at: Timestamp
+    prefix_empty_second_at: Timestamp
+    transferred_objects: Integer
+    signature: String
+}
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    cell: Cell
+}
+
+------------------------------------------------------------
+-- Rules: creation
+------------------------------------------------------------
+
+rule CreateDeployment {
+    -- Creation allocates identity and nothing else: no objects, no log state, no compute.
+    when: CreateRequested(org, cell)
+
+    requires: count(cell.deployments) < config.cell_max_deployments
+
+    ensures:
+        let id = DeploymentId.created()
+        DeploymentRecord.created(
+            id: id,
+            org: org,
+            lineage: LineageId(uuid: id.uuid),
+            incarnation: 1,
+            parent: null,
+            fork_basis: null,
+            storage_root: StorageRoot.created(deployment: id, org: org, lineage: LineageId(uuid: id.uuid), incarnation: 1),
+            key_id: KeyCreated(context: id),
+            lifecycle: live,
+            isolation_class: shared,
+            pinned_members: {},
+            engine_pin: cell.default_engine_pin,
+            format_version: cell.current_format_version,
+            quotas: org.default_quotas,
+            epoch: Epoch(value: 0),
+            holder: null,
+            loglets: [],
+            checkpoint: null,
+            read_width: 1,
+            activation_crashes: 0,
+            move_intent: null
+        )
+        CellMapRowWritten(deployment: id, cell: cell.id)
+}
+
+------------------------------------------------------------
+-- Rules: membership and liveness
+--
+-- Liveness is per member.
+-- No rule here writes to any deployment record: a member's death unholds everything it held through effective_holder.
+------------------------------------------------------------
+
+rule RenewLease {
+    when: HeartbeatSent(member)
+
+    requires: member.state in {joining, eligible, draining}
+
+    ensures:
+        member.lease_expires_at = now + config.member_lease
+}
+
+rule ExpireLease {
+    when: member: MemberRecord.lease_expires_at <= now
+
+    requires: member.state in {joining, eligible, draining}
+
+    ensures:
+        member.state = dead
+}
+
+rule ConfirmSuspicion {
+    -- Gateways report connection failures to the controller.
+    -- Safety never depends on this verdict, so it can be quick: a wrong one costs one seal and a cache move.
+    when: SuspicionReported(member, reporters)
+
+    requires: member.state in {eligible, draining}
+    requires: count(reporters) >= config.suspicion_reporters
+    requires: not LeaseRenewedSince(member, earliest(reporters.reported_at))
+
+    ensures:
+        member.state = dead
+}
+
+rule AdmitMember {
+    when: MemberPrewarmed(member)
+
+    requires: member.state = joining
+
+    ensures:
+        member.state = eligible
+}
+
+rule RetireDrainedMember {
+    when: MemberEmpty(member)
+
+    requires: member.state = draining
+    requires: not exists h in Holdings: h.member = member.id and h.state != deposed
+    requires: not exists s in Subscriptions: s.member = member.id
+
+    ensures:
+        member.state = retired
+        ProcessStopped(member: member)
+}
+
+------------------------------------------------------------
+-- Rules: becoming the holder
+--
+-- First activation, failover, reactivation and the target side of a planned move are one protocol: claim, seal, recover, open.
+------------------------------------------------------------
+
+rule Claim {
+    -- A member takes a deployment under the next epoch.
+    -- Triggered by a request the gateway routed to it, by the drainer sweeping open tails, or by a move intent naming it.
+    when: ClaimAttempted(member, record, expected_epoch)
+
+    requires: members[member].may_receive_placements or record.move_intent = member
+    requires: record.lifecycle = live or (record.lifecycle = quarantined and members[member].pool = isolation)
+    requires: EngineSatisfiesPin(members[member].engine_version, record.engine_pin)
+    requires: record.isolation_class in {shared, isolation} or member in record.pinned_members
+    requires: record.epoch = expected_epoch
+    requires: not record.is_held or record.move_intent = member
+
+    ensures:
+        let e = Epoch(value: expected_epoch.value + 1)
+        let fresh = Loglet.created(epoch: e, ensemble: EnsembleFor(member), start_lsn: NextLsn(record))
+        Directory.cas(record.id, expected_epoch, change: {
+            epoch: e,
+            holder: member,
+            loglets: record.loglets + [fresh],
+            move_intent: null
+        })
+        Holding.created(
+            deployment: record,
+            member: member,
+            epoch: e,
+            residency: active,
+            credential: StorageCredentialIssued(record.storage_root, e, config.credential_ttl),
+            state: if record.tail_open: sealing else: opening
+        )
+}
+
+rule ClaimLost {
+    when: ClaimRefused(holding)
+
+    requires: holding.state = claiming
+
+    ensures:
+        holding.state = deposed
+        -- The gateway reads the record and redirects to whoever won.
+        RedirectedTo(deployment: holding.deployment.id, holder: holding.deployment.holder)
+}
+
+rule SealPriorLoglets {
+    -- Every loglet of an earlier epoch that is still above the checkpoint is sealed at the new epoch.
+    when: holding: Holding.state becomes sealing
+
+    ensures:
+        for loglet in holding.deployment.loglets where loglet.epoch < holding.epoch:
+            for server in loglet.ensemble:
+                SealSent(server: server, deployment: holding.deployment.id, epoch: holding.epoch)
+}
+
+rule SealQuorumReached {
+    when: SealRepliesReceived(holding, replies)
+
+    requires: holding.state = sealing
+    requires: for loglet in holding.deployment.loglets where loglet.epoch < holding.epoch:
+                  count(replies where reply.loglet = loglet) >= config.write_quorum
+
+    ensures:
+        holding.state = recovering
+}
+
+rule RecoverTail {
+    -- Take, per prior loglet, the reply whose last record is greatest by (epoch, lsn).
+    -- Its records above the checkpoint are the tail: every committed record is in it (NothingCommittedIsLost).
+    -- Records a deposed holder put on a minority were never acknowledged; recovery may keep or drop them, and a client retry with the same idempotency key settles the outcome either way.
+    when: holding: Holding.state becomes recovering
+
+    ensures:
+        let tail = GreatestByEpochThenLsn(holding.seal_replies)
+        VerifyChain(from: holding.deployment.checkpoint.chain_hash, records: tail)
+        ReplicatedUnderEpoch(records: tail, loglet: last(holding.deployment.loglets), epoch: holding.epoch)
+        holding.state = opening
+}
+
+rule OpenHolding {
+    when: holding: Holding.state becomes opening
+
+    ensures:
+        BootLoaded(holding.deployment.checkpoint.boot)
+        TailReplayed(holding, from: holding.deployment.checkpoint.lsn)
+        holding.recent_keys = KeysWithin(config.idempotency_window, checkpoint: holding.deployment.checkpoint, tail: holding.tail)
+        holding.last_system_time = LastSystemTime(holding.deployment.checkpoint, holding.tail)
+        AppendCommitted(holding, EpochStart.created(holder: holding.member))
+        holding.state = serving
+}
+
+rule RefuseToLeadWithSkewedClock {
+    -- A holder whose clock disagrees with the log servers' by more than system_time_skew_bound does not open.
+    --   One bad clock would otherwise push a bitemporal timeline into the future for good.
+    when: holding: Holding.state becomes opening
+
+    requires: ClockSkew(holding.member, holding.deployment.loglets) > config.system_time_skew_bound
+
+    ensures:
+        holding.state = deposed
+        ReleasedForReclaim(holding.deployment)
+}
+
+------------------------------------------------------------
+-- Rules: committing
+------------------------------------------------------------
+
+rule SubmitThroughGateway {
+    -- The gateway mints the idempotency key once per transaction and reuses it for every retry.
+    when: CommitRequested(session, tx)
+
+    ensures:
+        let key = session.idempotency_key_for(tx)
+        RoutedToHolder(session.deployment, tx, key)
+}
+
+rule AnswerRetryFromWindow {
+    when: TxArrived(holding, tx, key)
+
+    requires: holding.state = serving
+    requires: key in holding.recent_keys
+
+    ensures:
+        Replied(tx, outcome: holding.recent_keys[key].outcome, basis: holding.recent_keys[key].basis)
+}
+
+rule ResolveAndAppend {
+    -- The holder resolves against its state, pipelining later transactions against speculative state, and exposes nothing until the append commits.
+    when: TxArrived(holding, tx, key)
+
+    requires: holding.state = serving
+    requires: key not in holding.recent_keys
+    requires: WithinQuota(holding.deployment.quotas, tx)
+
+    ensures:
+        let system_time = max(now, holding.last_system_time + 1.microseconds)
+        let resolved = Resolver.resolve(holding.live_index, tx, system_time)
+        AppendSent(holding, ResolvedTx.created(
+            tx_id: resolved.tx_id,
+            system_time: system_time,
+            idempotency_key: key,
+            outcome: resolved.outcome
+        ))
+}
+
+rule ApplyOnCommit {
+    when: AppendCommitted(holding, record: ResolvedTx)
+
+    requires: holding.state = serving
+
+    ensures:
+        LiveIndexApplied(holding, record)
+        holding.last_system_time = record.system_time
+        holding.recent_keys = holding.recent_keys + {record.idempotency_key}
+        holding.tail_bytes = holding.tail_bytes + record.size
+        Replied(record.tx, outcome: record.outcome, basis: Basis(epoch: holding.epoch, lsn: record.lsn))
+}
+
+rule DeposeOnRefusedAppend {
+    -- A refusal citing a higher promised epoch means a successor has sealed this holder's loglet.
+    -- Speculative state is discarded and queued work is forwarded; nothing unacknowledged was ever visible.
+    when: AppendRefused(holding, promised)
+
+    requires: promised > holding.epoch
+
+    ensures:
+        SpeculativeStateDiscarded(holding)
+        QueuedWorkForwarded(holding, to: Directory.read(holding.deployment.id).holder)
+        holding.state = deposed
+}
+
+rule RejectOverQuota {
+    when: TxArrived(holding, tx, key)
+
+    requires: not WithinQuota(holding.deployment.quotas, tx)
+
+    ensures:
+        Replied(tx, outcome: throttled)
+}
+
+------------------------------------------------------------
+-- Rules: optional intake
+--
+-- A deployment may enable an intake stream for producers that submit and do not wait: bulk loads, CDC, external sources.
+-- The intake is an ordinary deployment-scoped stream on the log servers, appended without a holder.
+------------------------------------------------------------
+
+rule AppendToIntake {
+    when: IntakeSubmitted(deployment, tx, key)
+
+    requires: deployment.intake_enabled
+
+    ensures:
+        IntakeAppended(deployment, tx, key)
+        if not deployment.is_held:
+            ActivationRequested(deployment)
+}
+
+rule ConsumeIntake {
+    -- The holder resolves intake transactions in intake order, interleaved with routed ones, and records the intake position it has consumed in each ResolvedTx so a successor resumes exactly.
+    when: IntakeRecordAvailable(holding, tx, key)
+
+    requires: holding.state = serving
+
+    ensures:
+        TxArrived(holding, tx, key)
+}
+
+------------------------------------------------------------
+-- Rules: flushing
+--
+-- A flush writes one pack and one manifest under the holder's epoch, commits BlockUploaded, then publishes the checkpoint.
+-- The log record is the commit point for readers; the directory checkpoint is the commit point for trimming and cold start.
+------------------------------------------------------------
+
+rule FlushOnTailBudget {
+    when: holding: Holding.tail_bytes changes
+
+    requires: holding.state = serving
+    requires: holding.tail_bytes >= config.flush_tail_bytes or EstimatedReplay(holding) >= config.flush_replay_budget
+
+    ensures:
+        FlushStarted(holding)
+}
+
+rule FlushOnAge {
+    when: holding: Holding.oldest_unflushed_at + config.flush_max_age <= now
+
+    requires: holding.state = serving
+
+    ensures:
+        FlushStarted(holding)
+}
+
+rule FlushOnIdle {
+    when: holding: Holding.last_request_at + config.clean_after_idle <= now
+
+    requires: holding.state = serving
+    requires: holding.tail_bytes > 0
+
+    ensures:
+        FlushStarted(holding)
+}
+
+rule FlushOnDegradedEnsemble {
+    -- A degraded ensemble restores durability through object storage rather than by re-replicating the log.
+    when: EnsembleDegraded(holding, loglet)
+
+    requires: holding.state = serving
+
+    ensures:
+        FlushStarted(holding)
+}
+
+rule FlushOnRetention {
+    when: SegmentPinnedPastRetention(deployment)
+
+    ensures:
+        if deployment.is_held:
+            FlushStarted(holdings[deployment])
+        else:
+            ActivationRequested(deployment, reason: flush)
+}
+
+rule FlushOnRows {
+    when: holding: Holding.tail_rows changes
+
+    requires: holding.tail_rows >= config.block_max_rows
+
+    ensures:
+        FlushStarted(holding)
+}
+
+rule WritePackAndManifest {
+    -- A small flush writes one pack: every table's trie data, metadata and catalog delta, with a footer index, read by range.
+    -- A large flush may write one pack per table.
+    -- The boot object inlines catalogs, schema and the top trie levels, up to boot_inline_limit.
+    when: FlushStarted(holding)
+
+    ensures:
+        let pack = ObjectStorage.put_if_absent(holding.credential, PackKey(holding), PackOf(holding.tail))
+        let manifest = ObjectStorage.put_if_absent(holding.credential, ManifestKey(holding), ManifestOf(holding, pack))
+        let boot = ObjectStorage.put_if_absent(holding.credential, BootKey(holding), BootOf(holding, manifest))
+        AppendSent(holding, BlockUploaded.created(manifest: manifest, boot: boot, through_lsn: holding.applied_lsn))
+        CompactionJobsEnqueued(CompactionPlanner.jobs(manifest))
+}
+
+rule PublishCheckpoint {
+    -- Publication is a cas conditional on the epoch, batched per node.
+    when: AppendCommitted(holding, record: BlockUploaded)
+
+    ensures:
+        Directory.cas(holding.deployment.id, holding.epoch, change: {
+            checkpoint: Checkpoint.created(
+                manifest: record.manifest,
+                boot: record.boot,
+                lsn: record.through_lsn,
+                chain_hash: record.hash,
+                format_version: holding.deployment.format_version
+            ),
+            loglets: LogletsAbove(holding.deployment.loglets, record.through_lsn)
+        })
+        LogTrimmed(holding.deployment.id, through: record.through_lsn)
+        holding.tail_bytes = TailBytesAbove(holding, record.through_lsn)
+        holding.oldest_unflushed_at = OldestAbove(holding, record.through_lsn)
+}
+
+------------------------------------------------------------
+-- Rules: compaction
+--
+-- compaction.allium decides the jobs.
+-- Here: where they run and how their outputs take effect.
+------------------------------------------------------------
+
+rule RunCompactionJob {
+    -- Workers are selected by affinity on (deployment, job_key), so a retry lands on the worker that has the inputs cached.
+    when: job: CompactionJob.state becomes queued
+
+    ensures:
+        let worker = Affinity.select(key: job.deployment.uuid + "/" + job.job_key, pool: workers)
+        JobDispatched(job, worker)
+        job.state = running
+}
+
+rule WriteCompactionOutputs {
+    when: JobFinished(job, worker)
+
+    ensures:
+        for output in job.outputs:
+            ObjectStorage.put_if_absent(WorkerCredential(job), output, bytes)
+        job.state = written
+        OutputsOffered(job.deployment, job)
+}
+
+rule AdoptCompactionOutputs {
+    -- Outputs take effect by a committed record, so correctness does not depend on two binaries producing identical bytes.
+    when: OutputsOffered(deployment, job)
+
+    requires: holdings[deployment].state = serving
+    requires: InputsStillLive(holdings[deployment].manifest, job)
+
+    ensures:
+        AppendSent(holdings[deployment], TriesAdded.created(outputs: job.output_refs, replaced: job.input_refs))
+        AppendSent(holdings[deployment], TriesReleased.created(released: job.input_refs))
+        job.state = adopted
+}
+
+rule AbandonStaleCompaction {
+    when: OutputsOffered(deployment, job)
+
+    requires: not InputsStillLive(holdings[deployment].manifest, job)
+
+    ensures:
+        job.state = abandoned
+        -- Its outputs are orphans; the reaper collects them.
+}
+
+rule MaintenanceClaim {
+    -- A parked deployment with compaction debt is claimed at low priority by a worker-hosting node, which adopts the outputs and parks again.
+    -- The claim is an ordinary epoch; client demand pre-empts it through an ordinary move.
+    when: CompactionDebtFound(deployment)
+
+    requires: deployment.is_parked
+
+    ensures:
+        ClaimAttempted(member: MaintenanceMember(deployment), record: deployment, expected_epoch: deployment.epoch)
+}
+
+------------------------------------------------------------
+-- Rules: garbage and the reaper
+------------------------------------------------------------
+
+rule NoteReleased {
+    when: AppendCommitted(holding, record: TriesReleased)
+
+    ensures:
+        for object in record.released:
+            GarbageCandidate.created(object: object, lineage: holding.deployment.lineage, released_at: now)
+}
+
+rule ReapUnreachable {
+    -- An object is deleted only when no published manifest of any live deployment in its lineage references it, and reaper_grace has passed since it was released.
+    -- The reaper's deletions are conditional on the lineage's version, which every fork and every deletion bumps, so a fork created mid-sweep keeps what it references.
+    when: candidate: GarbageCandidate.released_at + config.reaper_grace <= now
+
+    requires: not exists d in LiveDeploymentsOf(candidate.lineage): candidate.object in ReferencedBy(d.checkpoint.manifest)
+
+    ensures:
+        ObjectStorage.delete_all_versions(candidate.object.key)
+        candidate.deleted = true
+}
+
+rule ScrubOrphans {
+    -- The scrubber diffs inventory against every manifest in a lineage and enqueues objects older than reaper_grace that nothing references: uploads of deposed holders, abandoned compaction outputs.
+    when: ScrubDue(lineage)
+
+    ensures:
+        for key in Inventory(lineage) where not ReferencedByAnyManifest(lineage, key) and Age(key) > config.reaper_grace:
+            GarbageCandidate.created(object: RefOf(key), lineage: lineage, released_at: now - config.reaper_grace)
+}
+
+------------------------------------------------------------
+-- Rules: residency
+------------------------------------------------------------
+
+rule BecomeIdle {
+    when: holding: Holding.last_request_at + config.clean_after_idle <= now
+
+    requires: holding.residency = active
+    requires: holding.tail_bytes = 0
+
+    ensures:
+        holding.residency = resident_idle
+        TailIndexReleased(holding)
+}
+
+rule WakeOnRequest {
+    when: RequestArrived(holding)
+
+    requires: holding.residency = resident_idle
+
+    ensures:
+        holding.residency = active
+        holding.last_request_at = now
+}
+
+rule ParkUnderPressure {
+    -- A node under memory pressure parks its least recently used resident-idle deployments.
+    when: MemoryPressure(member)
+
+    ensures:
+        for holding in LeastRecentlyUsed(member, residency: resident_idle)
+            where holding.resident_since + config.min_residency <= now:
+            ParkStarted(holding)
+}
+
+rule Park {
+    -- Parking flushes whatever tail remains, commits Parked, then clears the holder and the loglets in one cas.
+    when: ParkStarted(holding)
+
+    ensures:
+        if holding.tail_bytes > 0:
+            FlushStarted(holding)
+        AppendCommitted(holding, Parked.created(final_lsn: holding.applied_lsn))
+        Directory.cas(holding.deployment.id, holding.epoch, change: {
+            epoch: Epoch(value: holding.epoch.value + 1),
+            holder: null,
+            loglets: []
+        })
+        holding.state = deposed
+}
+
+rule ActivateOnDemand {
+    -- A request for an unheld deployment claims it on the highest-ranked eligible, unpressured member.
+    -- Activations are admitted at most activations_per_node_per_second per node; others queue at the gateway with a deadline, interactive before background.
+    when: ActivationRequested(deployment)
+
+    requires: not deployment.is_held
+
+    ensures:
+        let member = Affinity.first_unpressured(key: deployment.storage_identity, pool: PoolFor(deployment))
+        ClaimAttempted(member: member, record: deployment, expected_epoch: deployment.epoch)
+}
+
+------------------------------------------------------------
+-- Rules: failover
+------------------------------------------------------------
+
+rule ReclaimOnDemand {
+    -- A request for a deployment whose holder is dead claims it on the next eligible rank.
+    -- Rendezvous order spreads a dead member's deployments over every survivor.
+    when: RequestFailed(session, holder)
+
+    requires: not members[holder].may_hold
+
+    ensures:
+        ActivationRequested(Directory.read(session.deployment))
+}
+
+rule DrainOrphanedTails {
+    -- A dead member's deployments that have an open tail and no demand are claimed, flushed and parked by the drainer, most recently active first, at a bounded rate.
+    -- Deployments with nothing unflushed need nothing.
+    when: member: MemberRecord.state becomes dead
+
+    ensures:
+        for record in DeploymentsHeldBy(member) where record.tail_open, ordered by record.last_activity desc:
+            DrainScheduled(record)
+}
+
+rule CountActivationCrash {
+    when: HolderCrashedDuringOrSoonAfterActivation(record)
+
+    ensures:
+        record.activation_crashes = record.activation_crashes + 1
+        if record.activation_crashes >= config.quarantine_crashes:
+            Directory.cas(record.id, record.epoch, change: { lifecycle: quarantined, isolation_class: isolation })
+}
+
+------------------------------------------------------------
+-- Rules: planned handoff
+--
+-- Rebalancing, scale-in and engine rollout are all planned handoffs.
+------------------------------------------------------------
+
+rule IntendMove {
+    when: MoveChosen(record, target)
+
+    requires: record.is_held
+    requires: members[target].may_receive_placements
+
+    ensures:
+        Directory.cas(record.id, record.epoch, change: { move_intent: target })
+        Subscription.created(deployment: record, member: target, applied_lsn: record.checkpoint.lsn)
+        HotRangesPrefetched(from: record.holder, to: target)
+}
+
+rule HandOff {
+    -- The source pauses admission (the gateway holds new transactions), drains in-flight resolution, commits Handoff, and the target claims.
+    -- The target has applied through Handoff already, so its recovery is empty.
+    when: SubscriptionCaughtUp(subscription)
+
+    requires: subscription.deployment.move_intent = subscription.member
+    requires: SubscriptionLag(subscription) <= config.handoff_lag_threshold
+
+    ensures:
+        let source = holdings[subscription.deployment]
+        AdmissionPaused(source)
+        AppendCommitted(source, Handoff.created(to: subscription.member))
+        source.state = deposed
+        ClaimAttempted(member: subscription.member, record: subscription.deployment, expected_epoch: source.epoch)
+}
+
+rule AnswerMoved {
+    when: TxArrived(holding, tx, key)
+
+    requires: holding.state = deposed
+
+    ensures:
+        Replied(tx, moved: Directory.read(holding.deployment.id).holder)
+}
+
+rule DrainMember {
+    -- Scale-in, replacement and rollout drain a member by handing off its active deployments and parking its idle ones, at most moves_per_node_per_pass per pass.
+    when: member: MemberRecord.state becomes draining
+
+    ensures:
+        for holding in HoldingsOf(member):
+            if holding.residency = active:
+                MoveChosen(holding.deployment, Affinity.next_rank(holding.deployment, excluding: member))
+            else:
+                ParkStarted(holding)
+}
+
+rule Rebalance {
+    -- The balancer moves deployments off a node over a watermark on any LoadVector dimension, each to its next eligible rank.
+    when: NodeOverWatermark(member, dimension)
+
+    ensures:
+        for holding in LargestBy(member, dimension) limit config.moves_per_node_per_pass:
+            MoveChosen(holding.deployment, Affinity.next_rank(holding.deployment, excluding: member))
+}
+
+------------------------------------------------------------
+-- Rules: reads
+------------------------------------------------------------
+
+rule RouteRead {
+    -- The gateway walks the deployment's affinity order within its read width.
+    -- The holder is normally rank 1, so the first choice is usually the writer.
+    when: ReadRequested(session, query)
+
+    ensures:
+        if session.pinned_member != null:
+            Dispatched(query, session.pinned_member)
+        else if session.freshness = as_of and query.basis <= Directory.read(session.deployment).checkpoint.lsn:
+            Dispatched(query, Affinity.select(key: session.deployment.storage_identity, pool: readers, tier: snapshot))
+        else:
+            Dispatched(query, Affinity.select(key: session.deployment.storage_identity, pool: readers, width: route.read_width))
+}
+
+rule ServeOnWriter {
+    when: QueryArrived(holding, query, session)
+
+    requires: holding.state = serving
+    requires: session.freshness != linearizable
+
+    ensures:
+        Served(query, tier: writer, at: max(session.basis, holding.applied_basis))
+}
+
+rule ServeLinearizableReadOnWriter {
+    -- A holder serves a linearizable read only after the next durable round's acknowledgements from a write quorum show its loglet unsealed.
+    --   That adds at most one group-commit round and involves no clock.
+    when: QueryArrived(holding, query, session)
+
+    requires: holding.state = serving
+    requires: session.freshness = linearizable
+
+    ensures:
+        let round = NextRoundAcknowledged(holding)
+        if not SealedIn(round, holding.deployment):
+            Served(query, tier: writer, at: holding.applied_basis)
+        else:
+            holding.state = deposed
+            Replied(query, moved: Directory.read(holding.deployment.id).holder)
+}
+
+rule ServeOnSubscriber {
+    when: QueryArrived(subscription, query, session)
+
+    ensures:
+        if session.freshness = linearizable:
+            let committed = ReadIndexFromHolder(subscription.deployment)
+            AwaitApplied(subscription, committed)
+            Served(query, tier: subscriber, at: committed)
+        else if subscription.applied_lsn >= session.basis.lsn:
+            Served(query, tier: subscriber, at: subscription.applied_lsn)
+        else:
+            if AwaitApplied(subscription, session.basis.lsn, within: config.subscriber_basis_wait):
+                Served(query, tier: subscriber, at: session.basis)
+            else:
+                Replied(query, behind: true)
+                -- The gateway retries on the holder.
+}
+
+rule ServeSnapshot {
+    -- A read at a basis at or below the checkpoint needs neither the log nor a live index.
+    when: QueryArrived(member, query, session)
+
+    requires: query.basis.lsn <= Directory.read(session.deployment).checkpoint.lsn
+
+    ensures:
+        Served(query, tier: snapshot, at: query.basis)
+}
+
+rule WidenOnPressure {
+    when: ReadOverflow(deployment)
+
+    requires: deployment.read_width < config.max_read_width
+
+    ensures:
+        Directory.cas(deployment.id, deployment.epoch, change: { read_width: deployment.read_width + 1 })
+        Subscription.created(deployment: deployment, member: Affinity.rank(deployment, deployment.read_width + 1), applied_lsn: deployment.checkpoint.lsn)
+}
+
+rule NarrowOnQuiet {
+    when: ReadQuiet(deployment)
+
+    requires: deployment.read_width > 1
+
+    ensures:
+        Directory.cas(deployment.id, deployment.epoch, change: { read_width: deployment.read_width - 1 })
+        SubscriptionEnded(deployment, rank: deployment.read_width)
+}
+
+rule RecordBasis {
+    when: Replied(tx, outcome, basis)
+
+    ensures:
+        tx.session.basis = max(tx.session.basis, basis)
+}
+
+------------------------------------------------------------
+-- Rules: affinity
+--
+-- Rendezvous (highest-random-weight) hashing over (key, member identity), as in Bijection's affinity crate, whose score bytes are fixed by shared test vectors.
+------------------------------------------------------------
+
+rule Rank {
+    -- Every member of a pool, most preferred first, by score(key, member) descending, ties broken by member identity.
+    -- Adding or removing a member never reorders the others.
+    when: RankRequested(key, pool)
+
+    ensures:
+        Ranked(key, SortDescending(pool, by: Score(key, member.id)))
+}
+
+rule Select {
+    -- Walk the order within width: skip members that may not serve and members the caller excluded after a refusal; set pressured members aside; take the first that grants a slot under its per-key in-flight bound; else the first pressured member that does; else refuse.
+    -- Pressure and occupancy gate preference and never reorder it, so a hot key's overflow always warms the same next members.
+    when: SelectRequested(key, pool, width, excluded)
+
+    ensures:
+        Selected(key, WalkRanked(Rank(key, pool), width, excluded))
+}
+
+rule PrewarmOnJoin {
+    -- A joining member pulls, from peers before object storage, the hottest ranges of the keys it now ranks first or second for.
+    when: member: MemberRecord.state becomes joining
+
+    ensures:
+        for key in KeysRankedWithin(member, 2):
+            HotRangesPrefetched(from: PreviousRank(key, member), to: member)
+        MemberPrewarmed(member)
+}
+
+rule RefineKeyForLargeDeployments {
+    -- A deployment whose data exceeds one member's cache distributes scan fragments by (storage identity, table, trie prefix), so each member keeps a stable slice warm.
+    when: ScanPlanned(deployment, scan)
+
+    requires: deployment.cache_bytes > PerMemberCacheShare()
+
+    ensures:
+        for fragment in Fragments(scan):
+            Dispatched(fragment, Affinity.select(key: deployment.storage_identity + "/" + fragment.table + "/" + fragment.trie_prefix, pool: readers))
+}
+
+------------------------------------------------------------
+-- Rules: forks
+------------------------------------------------------------
+
+rule Fork {
+    -- A fork within an organisation is a new deployment in the parent's lineage.
+    -- Its first manifest references the parent's objects at the fork basis, plus one pack holding the parent's tail up to that basis.
+    when: ForkRequested(parent, basis, org)
+
+    requires: org = parent.org
+
+    ensures:
+        let child = DeploymentId.created()
+        BumpLineageVersion(parent.lineage)
+        DeploymentRecord.created(
+            id: child,
+            org: org,
+            lineage: parent.lineage,
+            incarnation: 1,
+            parent: parent.id,
+            fork_basis: basis,
+            storage_root: StorageRoot.created(deployment: child, org: org, lineage: parent.lineage, incarnation: 1),
+            key_id: KeyCreated(context: child),
+            lifecycle: live,
+            checkpoint: ForkCheckpoint(parent, basis),
+            epoch: Epoch(value: 0),
+            holder: null,
+            loglets: []
+        )
+        KeyGrantIssued(to: child, on: parent.key_id)
+}
+
+rule ForkAcrossOrganisations {
+    -- A fork into another organisation is a server-side copy, re-encrypted under the child's key, into a new lineage.
+    when: ForkRequested(parent, basis, org)
+
+    requires: org != parent.org
+
+    ensures:
+        let child = CreateDeployment(org)
+        CopiedAndReencrypted(from: ForkCheckpoint(parent, basis), to: child)
+}
+
+rule ForkReadsAreCapped {
+    -- A fork at a past basis reads inherited objects with a system-time cap at its fork basis, until its own compaction has rewritten them into its prefix.
+    when: QueryArrived(member, query, session)
+
+    requires: session.deployment.parent != null
+
+    ensures:
+        InheritedObjectsCappedAt(session.deployment.fork_basis)
+}
+
+------------------------------------------------------------
+-- Rules: deletion
+------------------------------------------------------------
+
+rule BeginDeletion {
+    -- The epoch bump fences every writer before anything is destroyed.
+    when: DeleteRequested(record)
+
+    requires: record.lifecycle in {live, quarantined}
+
+    ensures:
+        Directory.cas(record.id, record.epoch, change: {
+            epoch: Epoch(value: record.epoch.value + 1),
+            holder: null,
+            lifecycle: deleting
+        })
+        for loglet in record.loglets:
+            SealSent(loglet, epoch: Epoch(value: record.epoch.value + 1))
+        StreamDropped(record.id)
+        DeletionScheduled(record, after: now + config.credential_ttl)
+}
+
+rule TransferSharedObjects {
+    -- Objects of the deleted deployment still referenced by another live deployment in its lineage move to that deployment's ownership by re-wrapping their data keys; no bytes are copied.
+    when: DeletionDue(record)
+
+    ensures:
+        for object in OwnedBy(record) where ReferencedByAnotherLiveMember(record.lineage, object):
+            DataKeyRewrapped(object, to: FirstLiveReferrer(record.lineage, object))
+        BumpLineageVersion(record.lineage)
+}
+
+rule EraseAndProve {
+    when: SharedObjectsTransferred(record)
+
+    ensures:
+        DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
+        AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
+        KeyService.destroy(record.key_id)
+        DeletionRecord.created(deployment: record.id, signature: SignedByCell())
+        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted })
+}
+
+------------------------------------------------------------
+-- Rules: upgrades
+------------------------------------------------------------
+
+rule RollEngine {
+    -- An engine rollout drains members of the old version cell by cell, and moves each deployment to a member that satisfies its engine pin.
+    -- A deployment pinned to the old version stays on the old pool until its pin is advanced.
+    when: EngineRolloutStarted(cell, version)
+
+    ensures:
+        for member in cell.members where member.engine_version != version:
+            DrainScheduled(member)
+}
+
+rule UpgradeFormatLazily {
+    -- Members read format versions N-2 to N and write N.
+    -- A flush or compaction rewrites what it touches; a trickle of maintenance claims rewrites the rest.
+    when: FlushStarted(holding)
+
+    requires: holding.deployment.format_version < CurrentFormatVersion()
+
+    ensures:
+        holding.deployment.format_version = CurrentFormatVersion()
+}
+
+------------------------------------------------------------
+-- Rules: moving between cells
+------------------------------------------------------------
+
+rule BeginCellMove {
+    when: CellMoveRequested(record, target_cell)
+
+    requires: record.lifecycle = live
+
+    ensures:
+        Directory.cas(record.id, record.epoch, change: { lifecycle: moving })
+        ForkedInto(target_cell, from: record, basis: CurrentBasis(record))
+}
+
+rule MoveCutover {
+    -- The source fences the deployment, the target replays the remaining tail, the cell map flips, and the source keeps a forwarding tombstone.
+    when: TargetCaughtUp(record, target_cell)
+
+    ensures:
+        Directory.cas(record.id, record.epoch, change: { epoch: Epoch(value: record.epoch.value + 1), holder: null })
+        RemainingTailCopied(record, to: target_cell)
+        CellMapRowWritten(deployment: record.id, cell: target_cell)
+        Directory.cas(record.id, Epoch(value: record.epoch.value + 1), change: { lifecycle: deleted })
+}
+
+------------------------------------------------------------
+-- Rules: fairness
+------------------------------------------------------------
+
+rule ChargeQuery {
+    -- Query CPU is scheduled by weighted deficit round robin across deployments, on a runtime separate from the write path.
+    -- Memory is granted per query from the deployment's quota within the node's budget, and a query over its grant spills or is refused.
+    when: QueryArrived(member, query, session)
+
+    ensures:
+        Scheduled(query, weight: session.deployment.quotas.cpu_weight)
+        MemoryGranted(query, within: session.deployment.quotas.max_query_memory_bytes)
+}
+
+rule EvictFairly {
+    -- One node-wide cache, keyed by object key and byte range.
+    -- Each deployment keeps a small reserved floor; above it, eviction takes from the deployment furthest over its weighted share, least recently used first within it.
+    when: CacheFull(member)
+
+    ensures:
+        Evicted(member, from: FurthestOverShare(member.cache))
+}
+
+rule BoundTailMemory {
+    -- Tail live indexes share one node budget; under pressure the node flushes the largest tails first.
+    when: TailMemoryPressure(member)
+
+    ensures:
+        for holding in LargestTails(member):
+            FlushStarted(holding)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant CostFollowsActivity {
+    -- A parked deployment holds no memory on any member, no log-server state, no timer, no task and no connection.
+    -- Its cost is its directory record and its objects.
+    for record in DeploymentRecords:
+        record.is_parked implies
+            (not exists h in Holdings: h.deployment = record and h.state != deposed)
+            and (not exists s in LogServerStreams: s.deployment = record.id)
+            and (not exists sub in Subscriptions: sub.deployment = record)
+}
+
+invariant OneEffectiveWriterPerEpoch {
+    -- For every deployment and epoch, at most one member has a holding that is not deposed.
+    for record in DeploymentRecords:
+        for e in Epochs:
+            count(h in Holdings where h.deployment = record and h.epoch = e and h.state != deposed) <= 1
+}
+
+invariant NoTwoWritersHaveEffect {
+    -- Effect takes five forms, and each is closed by the epoch.
+    --   1. A committed log record: AppendIsConditionalOnEpochAndPosition and SealIsAPromise.
+    --   2. A client acknowledgement: ApplyOnCommit acknowledges only committed records.
+    --   3. A visible object: WritersCarryTheirEpoch and VisibilityIsByReference.
+    --   4. A deletion: OnlyTheReaperDeletes.
+    --   5. A durable state change: EpochBoundChangesAreConditional.
+    -- A stale read is the remaining risk, and ServeLinearizableReadOnWriter closes it for linearizable reads; at_basis and as_of reads are correct on any member because history is immutable.
+    for record in DeploymentRecords:
+        CommittedRecordsFormOneChain(record)
+        and for r1, r2 in CommittedRecords(record): r1.lsn < r2.lsn implies r1.epoch <= r2.epoch
+}
+
+invariant SafetyIgnoresFailureDetection {
+    -- No rule's safety depends on a member's lease, a suspicion verdict, or a clock agreeing.
+    -- A wrong verdict costs one seal and one cache move.
+}
+
+invariant SystemTimeRises {
+    -- Within a deployment, system time strictly increases with lsn, across epochs and members.
+    for record in DeploymentRecords:
+        for r1, r2 in CommittedResolvedTxs(record): r1.lsn < r2.lsn implies r1.system_time < r2.system_time
+}
+
+invariant CheckpointNeverAheadOfLog {
+    for record in DeploymentRecords:
+        record.checkpoint != null implies record.checkpoint.lsn <= LastCommittedLsn(record)
+}
+
+invariant TailIsBounded {
+    -- A serving holding's tail stays within its flush triggers, up to one flush in flight.
+    for holding in Holdings where holding.state = serving:
+        holding.tail_bytes <= 2 * config.flush_tail_bytes
+}
+
+invariant ObjectsStayInTheirLineage {
+    -- A manifest references only objects whose owner is a deployment of its own lineage.
+    for record in DeploymentRecords where record.checkpoint != null:
+        for object in ReferencedBy(record.checkpoint.manifest):
+            deployments[object.owner].lineage = record.lineage
+}
+
+invariant OneDatabasePerSession {
+    -- A session's catalog contains exactly its capability's deployment; the planner cannot name another.
+    -- Cross-deployment reads exist only through an explicit grant, served on the snapshot tier.
+    for session in Sessions:
+        Catalog(session) = { session.capability.deployment } + GrantedSnapshots(session)
+}
+
+invariant KeysNameTheirOwner {
+    -- Every object key begins with its owner's StorageRoot prefix.
+    for object in Objects:
+        StartsWith(object.key, deployments[object.owner].storage_root.prefix)
+}
+
+invariant QuarantineIsolates {
+    for record in DeploymentRecords where record.lifecycle = quarantined:
+        record.isolation_class = isolation
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Gateway {
+    -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, routes by affinity, reports suspicion.
+    identified_by: MemberRecord where role = gateway
+}
+
+actor Node {
+    -- Holds deployments, serves reads in every tier, hosts subscriptions.
+    identified_by: MemberRecord where role = node
+}
+
+actor LogServer {
+    -- Holds loglets and enforces the epoch promise.
+    identified_by: MemberRecord where role = log_server
+}
+
+actor Worker {
+    -- Runs compaction jobs and scan fragments; holds nothing.
+    identified_by: MemberRecord where role = worker
+}
+
+actor Reaper {
+    -- The only principal that deletes objects.
+    identified_by: MemberRecord where role = reaper
+}
+
+actor Controller {
+    -- Confirms suspicion, admits and drains members, rebalances, autoscales, drains orphaned tails, rolls engines.
+    -- Holds no state of its own: every fact it acts on is in the directory.
+    -- If it is down, placed deployments keep working; only membership changes and moves wait.
+    identified_by: MemberRecord where role = controller
+}
+
+actor Operator {
+    -- Creates cells, sets quotas and isolation classes, clears quarantine.
+    identified_by: String
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ClientAccess {
+    -- What a client sees.
+    facing client: Client
+
+    context session: Session
+
+    exposes:
+        session.basis
+        session.freshness
+
+    provides:
+        CommitRequested(client, session, tx)
+        ReadRequested(client, session, query)
+        IntakeSubmitted(client, session.deployment, tx, key)
+        ForkRequested(client, session.deployment, basis, org)
+        DeleteRequested(client, session.deployment)
+
+    @guarantee MovesAreInvisible
+        -- A planned handoff stalls writes for one log round plus a redirect, and touches no client connection.
+        -- A failover stalls writes until detection and claim complete, and a retried commit returns the outcome the first attempt had.
+
+    @guarantee ReadYourWrites
+        -- Within a session, every read sees every transaction the session was acknowledged.
+
+    @guarantee OneOutcomePerKey
+        -- A transaction retried with the same idempotency key within idempotency_window has exactly one outcome, whichever member answers.
+}
+
+surface HolderToLog {
+    -- What a holder exchanges with its loglet's ensemble.
+    facing node: Node
+
+    context holding: Holding
+
+    provides:
+        AppendCommitted(node, holding, record)
+        AppendRefused(node, holding, promised)
+        SealRepliesReceived(node, holding, replies)
+        EnsembleDegraded(node, holding, loglet)
+
+    contracts:
+        demands LogService
+
+    @guarantee OneDurableWritePerTransaction
+        -- A committed transaction costs one quorum append, shared with every other deployment on the same writer within group_commit_window.
+}
+
+surface ControlPlane {
+    facing controller: Controller
+
+    context cell: Cell
+
+    provides:
+        SuspicionReported(controller, member, reporters)
+        MoveChosen(controller, record, target)
+        NodeOverWatermark(controller, member, dimension)
+        EngineRolloutStarted(controller, cell, version)
+        CellMoveRequested(controller, record, target_cell)
+
+    contracts:
+        demands Directory
+        demands CellMap
+
+    @guarantee FailoverIsBulkAndCheap
+        -- A member's death changes one member record.
+        -- No deployment record is written for it, and only deployments with demand or an open tail are claimed.
+
+    @guarantee PlacementFollowsLoad
+        -- A deployment is claimed by the highest-ranked eligible, unpressured member, and moved only to a next rank when a node is over a watermark.
+}
+
+surface StorageAccess {
+    facing node: Node
+
+    context holding: Holding
+
+    contracts:
+        demands ObjectStorage
+
+    @guarantee ZombiesCannotDamageStorage
+        -- A deposed holder can create only orphans under its own epoch's prefix until its credential expires, and can delete nothing.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "What does an idle RTDB database cost in memory today, and what is the least it can be made to cost?"
+    -- resident_idle_target_bytes is a target, not a measurement.
+    -- If a realistic deployment's catalogs and schema cost megabytes rather than kilobytes, warm density falls tenfold and ParkUnderPressure parks far more often.
+
+open question "Is losing submit-and-walk-away during a holder gap acceptable as the default?"
+    -- Routed commits are retried by the gateway across a failover; only deployments with an intake stream accept work while no holder exists.
+    -- If clients rely on durable-before-resolution submission, the intake becomes mandatory for them.
+
+open question "Which log implementation backs the first loglets?"
+    -- The loglet contract admits a purpose-built quorum log, BookKeeper ledgers, and an object-store WAL as a cheaper, higher-latency tier.
+    -- A multiplexed Kafka loglet satisfies everything except AppendIsConditionalOnEpochAndPosition, and needs the epoch checked on read-back instead.
+
+open question "How is per-deployment cryptographic erasure reconciled with objects shared across a lineage?"
+    -- TransferSharedObjects re-wraps shared objects' keys to a surviving referrer, so deleting one member is proved by absence and key destruction of what it alone owned.
+    -- Erasing a row (ERASE) applies to every member of the lineage that can see it; the compliance contract has to say so.
+
+open question "What lies beyond one holder's write rate?"
+    -- A deployment beyond one resolver's throughput gets a dedicated class first.
+    -- Parallel deterministic resolution over the one order (Block-STM over non-interactive transactions) raises the ceiling without changing the log.
+    -- Declared partitions with a deterministic cross-partition sequencer are the step after that, and are not designed here.
+
+open question "Is the batched seal check the right price for linearizable reads?"
+    -- It adds up to one group-commit round to a linearizable read, and involves no clock.
+    -- A clock-bound read lease would be cheaper and would bring clocks into read safety.
+
+open question "How far may placement depart from rank 1 before routing needs the directory on every request?"
+    -- Every off-rank placement makes gateways depend on pushed routes and leaves a cold cache behind.
+
+open question "Can cooperative scheduling isolate tenants well enough inside one process?"
+    -- A query that fails to yield, or memory accounting that undercounts Arrow buffers, defeats weighted fairness; a process or microVM boundary per tenant costs density.
