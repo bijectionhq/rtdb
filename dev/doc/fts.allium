@@ -284,6 +284,7 @@ contract SearchCorrectness {
         -- A scan reads the search files its snapshot's catalog records, and those its node builds from the snapshot's data files, and no others.
         -- A node keeps recorded files by object key, and the files it builds by data-file key and columns, each naming immutable bytes, and uses one only while the database's storage is the one it was read through, so a kept file is never stale.
         -- A recorded file the object store holds on this node's disk, its local store or disk cache, is mapped from there rather than read into memory, so the files kept open are bounded by disk and only the pages a query reads are resident.
+        -- A file read into memory holds its buffer-pool lease, so when the pool refuses a read for want of room, the node drops the files it keeps that way and reads again.
 }
 
 ------------------------------------------------------------
@@ -323,5 +324,5 @@ surface FullTextSearch {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "How does fan-out scale? Every current-side search file is a candidate for every query, one per ~100MB trie; term blooms on the artefact record, and search files spanning a completed partition group, are the levers."
+open question "How far does fan-out scale? Every visible trie's search file is read by every MATCH, about 5µs each once kept, so 10,000 files cost some 50ms a query (search/tests/fanout.rs). Search files spanning a completed partition group would cut the count; when does a table's size warrant them?"
 

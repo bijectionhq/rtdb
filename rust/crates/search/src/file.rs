@@ -374,7 +374,8 @@ impl DocColumns {
 }
 
 /// An opened search file.
-pub struct SearchFile { index: Index, columns: Vec<String>, documents: u32, sidecar: Sidecar }
+/// The searcher is made once: a search file never changes, so neither does its one segment's reader.
+pub struct SearchFile { searcher: tantivy::Searcher, columns: Vec<String>, documents: u32, sidecar: Sidecar }
 
 impl SearchFile {
     pub fn open(bytes: impl Into<Source>, columns: &[String]) -> Result<Self> {
@@ -387,16 +388,14 @@ impl SearchFile {
         let segments = index.searchable_segment_metas().map_err(fault)?;
         if segments.len() > 1 { return Err(corrupt("A search file holds at most one segment")); }
         let documents = segments.iter().map(|segment| segment.max_doc()).sum();
-        Ok(Self { sidecar: Sidecar::parse(sidecar, columns.len(), documents)?, index, columns: columns.to_vec(), documents })
+        let reader: tantivy::IndexReader = index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
+        Ok(Self { sidecar: Sidecar::parse(sidecar, columns.len(), documents)?, searcher: reader.searcher(), columns: columns.to_vec(), documents })
     }
 
     fn column(&self, column: &str) -> Option<usize> { self.columns.iter().position(|candidate| candidate == column) }
     fn field(&self, column: &str) -> Option<Field> { self.column(column).map(|index| Field::from_field_id(index as u32)) }
 
-    fn searcher(&self) -> Result<tantivy::Searcher> {
-        let reader: tantivy::IndexReader = self.index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
-        Ok(reader.searcher())
-    }
+    fn searcher(&self) -> Result<tantivy::Searcher> { Ok(self.searcher.clone()) }
 
     /// Every query term and phrase as one conjunction over the column.
     fn conjunction(field: Field, query: &Query) -> BooleanQuery {

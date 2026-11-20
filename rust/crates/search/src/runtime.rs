@@ -32,6 +32,7 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
         }
     }
     fn remove(&mut self, key: &K) { if let Some((_, _, weight)) = self.entries.remove(key) { self.weight -= weight; } }
+    fn clear(&mut self) { self.entries.clear(); self.weight = 0; }
 }
 
 type DefinitionKey = (String, Vec<(Option<(i64, i64)>, Option<i64>)>);
@@ -132,8 +133,12 @@ impl SearchRuntime {
         }
         let lease = match storage.get(key).await {
             Ok(lease) => lease,
-            Err(rtdb_storage::Error::MissingObject(_)) => return Err(FileError::Missing),
-            Err(error) => return Err(FileError::Unavailable(error.into())),
+            // Every kept file holds its lease, so a pool they fill refuses the next read; they give way to it.
+            Err(rtdb_storage::Error::MemoryLimit { .. }) if self.files.lock().weight > 0 => {
+                self.files.lock().clear();
+                storage.get(key).await.map_err(unavailable)?
+            }
+            Err(error) => return Err(unavailable(error)),
         };
         let size = lease.as_slice().len();
         let file = Arc::new(SearchFile::open(lease, columns).map_err(FileError::Corrupt)?);
@@ -300,6 +305,21 @@ mod tests {
         store.put(&other, data_file()).await.unwrap();
         let _ = runtime.built("xtdb", &pool, &other, &columns, &memory, &cancelled).await;
         assert!(runtime.built("xtdb", &pool, &other, &columns, &memory, &cancellation).await.is_ok(), "a cancelled build leaves the next caller free to build");
+    }
+
+    #[tokio::test]
+    async fn kept_files_give_way_to_a_buffer_pool_they_have_filled() {
+        use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
+        let store = Arc::new(MemoryStore::default());
+        let columns = vec!["body".to_string()];
+        let rows: Vec<_> = (0..3000).map(|index| crate::SearchRow { iid: [(index % 251) as u8; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, recency: None,
+            values: vec![Some(rtdb_text::tokens(&format!("word{index} another{} overdue", index * 7)))] }).collect();
+        let bytes = crate::build_search_file(&columns, &rows, "job").unwrap();
+        let pool = Arc::new(BufferPool::new(store.clone(), bytes.len() * 2 + bytes.len() / 2));
+        let runtime = SearchRuntime::new(1 << 30);
+        let keys: Vec<_> = (0..4).map(|index| ObjectKey::new(format!("tables/docs/artefacts/l02-rc-p{index}-b00/search/docs~a2f3-v1.bin")).unwrap()).collect();
+        for key in &keys { store.put(key, bytes.clone().into()).await.unwrap(); }
+        for key in &keys { assert!(runtime.file("xtdb", &pool, key, &columns).await.is_ok(), "{key}"); }
     }
 
     #[tokio::test]
