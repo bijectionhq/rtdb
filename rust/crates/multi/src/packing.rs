@@ -149,6 +149,11 @@ impl PackingStore {
         };
         let (bytes, index) = encode_pack(&held, previous);
         if let Err(error) = self.inner.put(&name, bytes).await {
+            // Another store packed the block first: its pack serves, if it holds the same objects.
+            if matches!(error, Error::ConflictingObject(_)) && catalog.is_some() && self.same_pack(&name, &held).await? {
+                self.adopt(name).await?;
+                return Ok(());
+            }
             let mut state = self.state.lock();
             for (object, bytes) in held { state.held.entry(object).or_insert(bytes); }
             return Err(error);
@@ -158,6 +163,17 @@ impl PackingStore {
         for (object, entry) in index.entries { state.located.insert(object, (name.clone(), entry)); }
         state.packs.push(name);
         Ok(())
+    }
+
+    /// Whether the stored pack `name` holds exactly `objects`.
+    async fn same_pack(&self, name: &ObjectKey, objects: &BTreeMap<String, Bytes>) -> rtdb_storage::Result<bool> {
+        let index = read_index(self.inner.as_ref(), name).await?;
+        if index.entries.len() != objects.len() { return Ok(false); }
+        for (key, entry) in &index.entries {
+            let Some(bytes) = objects.get(key) else { return Ok(false) };
+            if self.inner.get_range(name, entry.offset..entry.offset + entry.length).await? != *bytes { return Ok(false); }
+        }
+        Ok(true)
     }
 
     fn held(&self, object: &ObjectKey) -> Option<Bytes> { self.state.lock().held.get(object.as_str()).cloned() }
@@ -219,7 +235,13 @@ impl ObjectStore for PackingStore {
         if is_catalog(object.as_str()) {
             // Put-if-absent holds for a packed catalog as for any object: the same bytes again succeed, others conflict.
             if self.located(object).is_some() || self.locate(object).await?.is_some() {
-                return if self.get(object).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(object.to_string())) };
+                if self.get(object).await? != bytes { return Err(Error::ConflictingObject(object.to_string())); }
+                // The block was packed already, by a deposed holder say: what this store held back for it is in that pack.
+                let mut state = self.state.lock();
+                let packed: Vec<String> = state.held.keys().filter(|key| state.located.contains_key(key.as_str())).cloned().collect();
+                for key in packed { state.held.remove(&key); }
+                state.held_bytes = state.held.values().map(Bytes::len).sum();
+                return Ok(());
             }
             self.state.lock().held.insert(object.as_str().to_owned(), bytes);
             return self.write_pack(Some(object)).await;
@@ -322,5 +344,22 @@ mod tests {
         assert_eq!(raw.lists.load(std::sync::atomic::Ordering::SeqCst), lists, "from a published block, nothing is listed");
         let reader = PackingStore::open(raw.clone(), PackDiscovery::From(9)).await.unwrap();
         assert_eq!(reader.get(&object("tables/t/data/l00-rc-b01.arrow")).await.unwrap().as_ref(), b"rows 1", "a hint that is gone falls back to listing");
+    }
+
+    #[tokio::test]
+    async fn a_block_packed_already_by_a_deposed_writer_is_taken_as_its_successors() {
+        let raw = Arc::new(MemoryStore::default());
+        let (deposed, successor) = (PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap(), PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap());
+        successor.put(&object("tables/t/data/l00-rc-b00.arrow"), Bytes::from_static(b"rows")).await.unwrap();
+        deposed.put(&object("tables/t/data/l00-rc-b00.arrow"), Bytes::from_static(b"rows")).await.unwrap();
+        deposed.put(&catalog_key(0).unwrap(), Bytes::from_static(b"catalog")).await.unwrap();
+        successor.put(&catalog_key(0).unwrap(), Bytes::from_static(b"catalog")).await.unwrap();
+        assert_eq!(raw.list(None).await.unwrap().len(), 1, "the block is one pack still");
+        assert_eq!(successor.get(&object("tables/t/data/l00-rc-b00.arrow")).await.unwrap().as_ref(), b"rows");
+        assert!(successor.put(&catalog_key(0).unwrap(), Bytes::from_static(b"a different catalog")).await.is_err(), "a different block under the same name is still refused");
+        successor.put(&object("tables/t/data/l00-rc-b01.arrow"), Bytes::from_static(b"next")).await.unwrap();
+        successor.put(&catalog_key(1).unwrap(), Bytes::from_static(b"catalog 1")).await.unwrap();
+        let index = read_index(raw.as_ref(), &pack_key(1).unwrap()).await.unwrap();
+        assert_eq!(index.entries.keys().cloned().collect::<Vec<_>>(), ["blocks/b01.binpb", "tables/t/data/l00-rc-b01.arrow"], "and the next block's pack holds only its own objects");
     }
 }

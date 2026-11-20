@@ -143,7 +143,7 @@ pub struct EncryptingStore { inner: Arc<dyn ObjectStore>, cipher: Cipher }
 
 impl EncryptingStore {
     pub fn new(inner: Arc<dyn ObjectStore>, key: &[u8]) -> Result<Self> { Ok(Self { inner, cipher: Cipher::new(key)? }) }
-    fn seal(&self, key: &ObjectKey, plaintext: &[u8]) -> rtdb_storage::Result<Bytes> { self.cipher.seal(key.as_str(), plaintext) }
+    fn seal(&self, key: &ObjectKey, plaintext: &[u8]) -> rtdb_storage::Result<Bytes> { self.cipher.seal_deterministic(key.as_str(), plaintext) }
     fn open(&self, key: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<Bytes> { self.cipher.open(key.as_str(), &sealed) }
 }
 
