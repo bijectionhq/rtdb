@@ -152,8 +152,10 @@ impl SortPlan {
         let mut kept: Vec<OwnedRow> = Vec::with_capacity(limit.saturating_add(1));
         let mut seen = false;
         let mut deferred = None;
+        let mut accumulated = 0usize;
         while let Some(mut page) = input.next_page().await? {
             seen |= page.len() > 0;
+            accumulated = accumulated.saturating_add(page.len());
             let mut projected = match &positions { Some(_) => None, None => Some(crate::pages::project(&page, &self.schema, self.order.iter().map(|order| &order.expr), &self.execution).await?) };
             while let Some(row) = page.next() {
                 self.execution.context.check_cancelled()?;
@@ -169,6 +171,12 @@ impl SortPlan {
                     kept.insert(low, OwnedRow::copy_parts(&[&key, &row.values], 0, 0, &self.execution.context.memory)?);
                     kept.truncate(limit);
                 }
+            }
+            // The full sort reduces, and so checks its key types, once its accumulation outgrows a block.
+            if accumulated > BLOCK_ROWS {
+                keys.validate()?;
+                if let Some(error) = deferred.take() { return Err(error); }
+                accumulated = kept.len();
             }
         }
         if !seen { return Ok(None); }
@@ -200,6 +208,7 @@ impl SortPlan {
         let mut kept: Vec<OwnedRow> = Vec::with_capacity(limit.saturating_add(1));
         let mut seen = false;
         let mut deferred = None;
+        let mut accumulated = 0usize;
         let cell = |batch: &crate::columnar::ColumnBatch, row: usize, position: usize| -> Result<Value> {
             let mut value = batch.columns[position].value(row)?;
             if projected { value.admit_expression_dates()?; }
@@ -207,6 +216,7 @@ impl SortPlan {
         };
         while let Some(batch) = batches.next_batch().await? {
             seen |= batch.len > 0;
+            accumulated = accumulated.saturating_add(batch.len);
             for row in 0..batch.len {
                 self.execution.context.check_cancelled()?;
                 let key = positions.iter().map(|position| cell(&batch, row, *position)).collect::<Result<Vec<_>>>()?;
@@ -218,6 +228,12 @@ impl SortPlan {
                     kept.insert(low, OwnedRow::copy_parts(&[&key, &values], 0, 0, &self.execution.context.memory)?);
                     kept.truncate(limit);
                 }
+            }
+            // The full sort reduces, and so checks its key types, once its accumulation outgrows a block.
+            if accumulated > BLOCK_ROWS {
+                keys.validate()?;
+                if let Some(error) = deferred.take() { return Err(error); }
+                accumulated = kept.len();
             }
         }
         if !seen { return Ok(None); }
