@@ -372,7 +372,7 @@ mod tests {
         let (parent_store, raw) = open_store(root, &parent);
         let parent_view = GarbageStore::open(Arc::new(raw)).await.unwrap();
         for name in ["tables/t/data/kept.arrow", "tables/t/data/parent-drops.arrow", "tables/t/data/child-drops.arrow"] { parent_view.put(&key(name), Bytes::from_static(b"rows")).await.unwrap(); }
-        crate::reference::fork(root, &parent.storage_prefix(), &child.storage_prefix()).unwrap();
+        crate::reference::fork(root, &parent.storage_prefix(), &child.storage_prefix(), None).unwrap();
         let (child_store, raw) = open_store(root, &child);
         let child_view = GarbageStore::open(Arc::new(raw)).await.unwrap();
         assert_eq!(child_view.list(Some(&key("tables"))).await.unwrap().len(), 3, "a fork lists what it references");

@@ -138,16 +138,32 @@ pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn K
     let holder = ensure_held(directory, parent).await?;
     let members = members(directory).await?;
     expect(&control_address(&members, &holder)?, Request::Flush { name: parent.to_owned() }).await?;
+    fork_from(directory, storage, keys, parent, name, None).await
+}
+
+/// Forks `parent` as of one of its past blocks: the fork's state is that block's, and what the parent wrote after it is not the fork's.
+/// Only a block younger than the reaper's `grace` can be forked from: an object it needs that the parent released since is erased only once the grace has passed.
+pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: std::time::Duration) -> Result<DeploymentRecord> {
+    let source = record(directory, parent).await?;
+    match storage {
+        CellStorage::Local { root } => {
+            let age = crate::reference::written_at(root, &source.storage_prefix(), block)?.elapsed().unwrap_or_default();
+            if age >= grace { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age.as_secs(), grace.as_secs()))); }
+        }
+    }
+    fork_from(directory, storage, keys, parent, name, Some(block)).await
+}
+
+async fn fork_from(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, at_block: Option<i64>) -> Result<DeploymentRecord> {
     let source = record(directory, parent).await?;
     let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
     child.lineage = source.lineage.clone();
     child.parent = Some(source.id.clone());
     child.log_epoch = source.log_epoch + 1;
-    // The fork's store starts as its parent's, so its parent's checkpoint is where its first holder starts.
-    child.checkpoint = source.checkpoint;
+    // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
     child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
     match storage {
-        CellStorage::Local { root } => crate::reference::fork(root, &source.storage_prefix(), &child.storage_prefix())?,
+        CellStorage::Local { root } => crate::reference::fork(root, &source.storage_prefix(), &child.storage_prefix(), at_block)?,
     }
     keys.copy(&source.id, &child.id)?;
     directory.create_deployment(child).await

@@ -122,16 +122,30 @@ pub fn stores(prefix: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(prefix).map(|entries| entries.flatten().filter(|entry| entry.path().is_dir()).map(|entry| entry.path()).collect()).unwrap_or_default()
 }
 
-/// Forks the deployment at `parent` (a prefix under `root`) into `child`, referencing every object the parent's stores hold or reference.
-pub fn fork(root: &Path, parent: &str, child: &str) -> Result<()> {
+/// Forks the deployment at `parent` (a prefix under `root`) into `child`, referencing every object the parent's stores hold or reference, or, from a past block, only those that existed when it was written.
+pub fn fork(root: &Path, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
+    let cutoff = at_block.map(|block| written_at(root, parent, block)).transpose()?;
+    let existed = |path: &Path| cutoff.is_none_or(|cutoff| std::fs::metadata(path).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified <= cutoff));
     for store in stores(&root.join(parent)) {
         let version = store.file_name().expect("a store directory has a name").to_string_lossy().into_owned();
         let mut base = Base::load(&store)?;
+        base.objects.retain(|key, directory| existed(&root.join(directory.as_str()).join(key)));
         let relative = format!("{parent}/{version}");
-        for key in physical_objects(&store)? { base.objects.insert(key, relative.clone()); }
+        for key in physical_objects(&store)? { if existed(&store.join(&key)) { base.objects.insert(key, relative.clone()); } }
         base.save(&root.join(child).join(&version))?;
     }
     Ok(())
+}
+
+/// When `block`'s pack, the one object a flush of it writes, was written in `parent`'s stores.
+pub fn written_at(root: &Path, parent: &str, block: i64) -> Result<std::time::SystemTime> {
+    let catalog = rtdb_format::keys::block_key(rtdb_types::BlockIndex(block))?;
+    let pack = crate::packing::block_pack(&catalog);
+    for store in stores(&root.join(parent)) {
+        let location = match Base::load(&store)?.objects.get(&pack) { Some(directory) if !store.join(&pack).exists() => root.join(directory).join(&pack), _ => store.join(&pack) };
+        if let Ok(modified) = std::fs::metadata(&location).and_then(|metadata| metadata.modified()) { return Ok(modified); }
+    }
+    Err(Anomaly::incorrect("rtdb.multi/no-such-block", format!("Block {block} has no pack in the deployment's store")))
 }
 
 /// Every reference in a cell: for each physical object, the store directories that reference it.
@@ -202,7 +216,7 @@ mod tests {
         std::fs::create_dir_all(parent.join("blocks")).unwrap();
         std::fs::write(parent.join("blocks/b00"), b"parent").unwrap();
         std::fs::write(parent.join(crate::store::ROOT_MARKER), b"p").unwrap();
-        fork(here.path(), "p", "c").unwrap();
+        fork(here.path(), "p", "c", None).unwrap();
         std::fs::create_dir_all(here.path().join("c/v06/blocks")).unwrap();
         std::fs::write(here.path().join("c/v06/blocks/b01"), b"child").unwrap();
         materialize(here.path(), "c", there.path(), "c").unwrap();

@@ -732,3 +732,29 @@ async fn a_fragment_whose_reader_does_not_answer_is_read_by_the_coordinator() {
     drop(client);
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_at_a_past_block_holds_that_blocks_state_and_diverges_from_it() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    for id in 0..3 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    for id in 3..6 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (99, 1)").await.unwrap();
+
+    assert!(admin::fork_at_block(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "too-old", 0, Duration::ZERO).await.is_err(), "a block older than the reaper's grace is refused");
+    admin::fork_at_block(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-then", 0, Duration::from_secs(3600)).await.unwrap();
+    let then = cell.connect("shop-then").await;
+    assert_eq!(values(&then, "SELECT _id FROM orders").await, ["0", "1", "2"], "the fork holds the first block's state, and none of what came after");
+    then.simple_query("INSERT INTO orders (_id, total) VALUES (50, 1)").await.unwrap();
+    let fork_holder = cell.holder("shop-then").await.unwrap();
+    cell.node(fork_holder).agent.flush("shop-then").await.unwrap();
+    then.simple_query("INSERT INTO orders (_id, total) VALUES (51, 1)").await.unwrap();
+    assert_eq!(values(&then, "SELECT _id FROM orders").await, ["0", "1", "2", "50", "51"], "and writes and flushes its own blocks");
+    assert_eq!(values(&client, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5", "99"], "while the parent is untouched");
+    drop((then, client));
+    cell.stop().await;
+}
