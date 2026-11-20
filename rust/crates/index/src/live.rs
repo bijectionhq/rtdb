@@ -429,7 +429,11 @@ impl TransactionBuffer {
         let current = segments.iter().map(|(table, (segment, ..))| (table.clone(), Arc::clone(segment))).collect();
         self.base.with_transaction_segments(self.tx_key, &current)
     }
-    pub fn stage(self) -> Result<StagedWrite> { self.materialize() }
+    pub fn stage(mut self) -> Result<StagedWrite> {
+        // The segments only served the transaction's own reads; the staged write supersedes them.
+        if let Ok(segments) = self.segments.get_mut() { segments.clear(); }
+        self.materialize()
+    }
     fn materialize(&self) -> Result<StagedWrite> {
         let tables = self.tables.iter().map(|(table, pending)| {
             let batch = Some(IndexBatch::copy_events(&pending.events, &pending.declared, &self.budget)?);
