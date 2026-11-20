@@ -3684,6 +3684,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtdb-affinity"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "rtdb-auth"
 version = "0.1.0"
 dependencies = [
@@ -3819,6 +3828,19 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
+ "uuid",
+]
+
+[[package]]
+name = "rtdb-directory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "rtdb-types",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
