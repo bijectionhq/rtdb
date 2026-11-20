@@ -84,8 +84,15 @@ async fn manual_compaction_schedules_only_during_a_request() {
 
     let mut request = Box::pin(handle.compact_all());
     assert!(futures::poll!(request.as_mut()).is_pending());
-    assert!(futures::poll!(run.as_mut()).is_pending());
-    assert_eq!(futures::poll!(request.as_mut()), Poll::Ready(Ok(())));
+    // The requested job runs on a thread of its own, so the driver is driven until the request completes.
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Poll::Ready(result) = futures::poll!(request.as_mut()) { break result; }
+            assert!(futures::poll!(run.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the requested compaction completes");
+    assert_eq!(completed, Ok(()));
     assert!(available_jobs(state.value().trie_catalog()).unwrap().is_empty());
     let calls = snapshots.calls.load(Ordering::SeqCst);
     assert!(calls > 0);
