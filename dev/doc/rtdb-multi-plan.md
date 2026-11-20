@@ -303,6 +303,25 @@ A cell needs a quorum log shared by every deployment, with group commit across d
 **Tests.**
 Logkeeper unit tests; the loglet contract suite from stage 3 run against a three-logkeeper ensemble; fault injection (a killed server, a partitioned server, a slow fsync, a torn segment) in the simulation crate; throughput and latency benchmarks against the spec's estimates (2–4 ms p50 commit, tens of thousands of appends per second per server).
 
+**Local performance evidence.**
+A release build ran three trials per concurrency on an Apple M4 Max with three loopback TCP logkeepers, three journals on the same SSD, fsync enabled, and a two-member write quorum.
+Each stream made 1,000 measured durable appends of 512 bytes with one append in flight per stream.
+The measurement covers enqueue through durable receipt after writer setup and warmup.
+
+| Concurrent streams | Quorum commits/s | Median commit latency (ms) | p99 commit latency (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 4,651–6,924 | 0.139–0.146 | 0.248–0.285 |
+| 64 | 37,990–51,919 | 1.021–1.045 | 4.880–11.020 |
+| 256 | 50,507–60,314 | 3.835–4.089 | 10.459–14.254 |
+
+```sh
+RTDB_LOG_BENCH_STREAMS=64 RTDB_LOG_BENCH_APPENDS=1000 \
+  cargo test --manifest-path rust/Cargo.toml -p rtdb-logkeeper --release \
+  --test throughput -- --ignored --nocapture
+```
+
+The cross-availability-zone performance gate remains to be measured with one server per zone.
+
 **Specs.**
 `rtdb-multi.allium`'s `LogService` contract, corrected by what the implementation teaches.
 
