@@ -185,10 +185,20 @@ impl EventBatch {
             None => None,
         };
         let page = Arc::new(EventPage { put });
+        let mut ops = [None; 128];
+        for (id, leg) in legs.iter() {
+            let op = match leg.name().as_str() { "put" => EventOp::Put, "delete" => EventOp::Delete, "erase" => EventOp::Erase, name => return Err(invalid(format!("Unknown event operation: {name}"))) };
+            if let Ok(id) = usize::try_from(id) { ops[id] = Some(op); }
+        }
+        let iids = IidView::new(self.batch.column(self.iid).as_ref())?;
+        let times = |index: usize| self.batch.column(index).as_any().downcast_ref::<TimestampMicrosecondArray>().map(|array| array.values()).ok_or_else(|| invalid("Event timestamp array type changed"));
+        let (system_from, valid_from, valid_to) = (times(self.system_from)?, times(self.valid_from)?, times(self.valid_to)?);
+        let recency = self.recency.map(times).transpose()?;
         (0..self.len()).map(|row| {
-            let header = self.header(row)?;
-            Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), iid: header.iid, system_from: header.system_from, valid_time: header.valid_time,
-                op: header.op, recency: self.recency.map(|index| self.timestamp(index, row)).transpose()?, bytes: std::sync::OnceLock::new() })
+            let op = usize::try_from(union.type_id(row)).ok().and_then(|id| ops[id]).ok_or_else(|| invalid("Event operation type ID has no leg"))?;
+            Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
+                valid_time: Interval::new(Timestamp(valid_from[row]), Timestamp(valid_to[row]))?, op,
+                recency: recency.map(|recency| Timestamp(recency[row])), bytes: std::sync::OnceLock::new() })
         }).collect()
     }
     /// The dense union of each row's operation, whose put leg holds its document.
