@@ -15,6 +15,7 @@ pub mod keys;
 pub mod lease;
 pub mod logs;
 pub mod packing;
+pub mod reference;
 pub mod process;
 pub mod relay;
 pub mod session;

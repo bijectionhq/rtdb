@@ -204,6 +204,9 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
 
     let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview").await.unwrap();
     assert_eq!((child.lineage.as_str(), child.parent.as_deref()), (parent.lineage.as_str(), Some(parent.id.as_str())));
+    let rtdb_multi::deployment::CellStorage::Local { root } = cell.storage();
+    let own = |prefix: &str| files_under(&root.join(prefix)).into_iter().filter(|path| !path.ends_with(rtdb_multi::reference::BASE_MANIFEST)).count();
+    assert_eq!(own(&child.storage_prefix()), 0, "a fork copies nothing: it references its parent's objects");
     let preview = cell.connect("shop-preview").await;
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20"], "the fork starts from its parent's state");
     preview.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
@@ -212,11 +215,14 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     shop.simple_query("INSERT INTO orders (_id, total) VALUES (4, 40)").await.unwrap();
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20", "30"], "and the parent's in the parent");
     drop((shop, preview));
+    let holder = cell.holder("shop-preview").await.unwrap();
+    cell.node(holder).agent.park("shop-preview").await.unwrap();
+    let written = own(&child.storage_prefix());
 
     let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
     assert!(deletion.verified_empty);
-    let rtdb_multi::deployment::CellStorage::Local { root } = cell.storage();
     assert!(!root.join(parent.storage_prefix()).exists(), "the parent's objects are erased");
+    assert!(own(&child.storage_prefix()) > written, "after the fork's shared objects were copied into it");
     assert!(!cell.data.path().join("keys").join(format!("{}.key", parent.id)).exists(), "its key is destroyed");
     assert_eq!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
     assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await.is_err(), "a deleted deployment is refused");

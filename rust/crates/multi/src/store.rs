@@ -53,9 +53,12 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
-        let local = LocalStore::open_in(config.root.join(&config.prefix).join(storage_root.as_str()), io)?;
+        let directory = config.root.join(&config.prefix).join(storage_root.as_str());
+        let local = LocalStore::open_in(&directory, Arc::clone(&io))?;
         claim_root(&local, &config.deployment).await?;
-        let packed = crate::packing::PackingStore::open(Arc::new(local)).await?;
+        let base = crate::reference::Base::load(&directory)?;
+        let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { Arc::new(local) } else { Arc::new(crate::reference::ReferencingStore::new(local, config.root.clone(), base, io)) };
+        let packed = crate::packing::PackingStore::open(own).await?;
         Ok(GarbageStore::open(packed).await?)
     }
 
@@ -214,41 +217,55 @@ async fn claim_root(store: &LocalStore, deployment: &str) -> Result<()> {
 pub struct Reaped { pub erased: usize, pub waiting: usize }
 
 /// Erases every object a deployment released more than `grace` ago, under a cell's local storage root.
-pub fn reap_local(root: &Path, record: &DeploymentRecord, grace: Duration) -> Result<Reaped> {
-    let prefix = root.join(record.storage_prefix());
+/// An object other deployments still reference is copied into them first; an object this deployment only references is dropped from its manifest.
+pub fn reap_local(root: &Path, record: &DeploymentRecord, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
+    use crate::reference::Base;
     let mut reaped = Reaped::default();
-    let Ok(versions) = std::fs::read_dir(&prefix) else { return Ok(reaped); };
     let threshold = now_ms() - grace.as_millis() as i64;
-    for version in versions.flatten() {
-        let Ok(records) = std::fs::read_dir(version.path().join(GARBAGE_DIRECTORY)) else { continue };
+    for store in crate::reference::stores(&root.join(record.storage_prefix())) {
+        let mut base = Base::load(&store)?;
+        let before = base.clone();
+        // Where each object physically is: in this store, or in the one its manifest names.
+        let physical = |key: &str| -> Option<PathBuf> {
+            let own = store.join(key);
+            if own.exists() { return Some(own); }
+            before.objects.get(key).map(|directory| root.join(directory).join(key)).filter(|path| path.exists())
+        };
+        let mut records: Vec<String> = crate::reference::physical_objects(&store.join(GARBAGE_DIRECTORY))?.into_iter().map(|key| format!("{GARBAGE_DIRECTORY}/{key}")).collect();
+        records.extend(before.objects.keys().filter(|key| key.starts_with(&format!("{GARBAGE_DIRECTORY}/")) && !store.join(key.as_str()).exists()).cloned());
         // A released object is either its own file or one entry of a pack; a pack goes once every entry in it has been released for the grace period.
-        let mut due: BTreeMap<String, PathBuf> = BTreeMap::new();
-        for entry in records.flatten() {
-            let Ok(bytes) = std::fs::read(entry.path()) else { continue };
+        let mut due: BTreeMap<String, String> = BTreeMap::new();
+        for name in records {
+            let Some(bytes) = physical(&name).and_then(|path| std::fs::read(path).ok()) else { continue };
             let Ok(released) = serde_json::from_slice::<GarbageRecord>(&bytes) else { continue };
             if released.released_at_ms > threshold { reaped.waiting += 1; continue; }
-            due.insert(released.key, entry.path());
+            due.insert(released.key, name);
         }
+        // Erases an object this store holds, or forgets one it references.
+        let release = |key: &str, base: &mut Base| -> Result<()> {
+            let own = store.join(key);
+            if own.exists() { references.erase(&own, key) } else { base.objects.remove(key); Ok(()) }
+        };
         let mut erased: BTreeSet<String> = BTreeSet::new();
-        for (key, _) in &due {
-            let object = version.path().join(key);
-            if object.exists() { std::fs::remove_file(&object).map_err(io)?; erased.insert(key.clone()); }
+        for key in due.keys() {
+            if physical(key).is_some() { release(key, &mut base)?; erased.insert(key.clone()); }
         }
         let mut packed: BTreeSet<String> = BTreeSet::new();
-        if let Ok(packs) = std::fs::read_dir(version.path().join(crate::packing::PACK_DIRECTORY)) {
-            for pack in packs.flatten() {
-                let Some(index) = read_pack_index(&pack.path()) else { continue };
-                if index.entries.keys().all(|key| due.contains_key(key)) {
-                    std::fs::remove_file(pack.path()).map_err(io)?;
-                    erased.extend(index.entries.into_keys());
-                } else {
-                    packed.extend(index.entries.into_keys());
-                }
+        let mut packs: BTreeSet<String> = crate::reference::physical_objects(&store.join(crate::packing::PACK_DIRECTORY))?.into_iter().map(|key| format!("{}/{key}", crate::packing::PACK_DIRECTORY)).collect();
+        packs.extend(before.objects.keys().filter(|key| key.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY))).cloned());
+        for pack in packs {
+            let Some(index) = physical(&pack).and_then(|path| read_pack_index(&path)) else { continue };
+            if index.entries.keys().all(|key| due.contains_key(key)) {
+                release(&pack, &mut base)?;
+                erased.extend(index.entries.into_keys());
+            } else {
+                packed.extend(index.entries.into_keys());
             }
         }
         for (key, record) in &due {
-            if erased.contains(key) || !packed.contains(key) { std::fs::remove_file(record).map_err(io)?; reaped.erased += 1; } else { reaped.waiting += 1; }
+            if erased.contains(key) || !packed.contains(key) { release(record, &mut base)?; reaped.erased += 1; } else { reaped.waiting += 1; }
         }
+        if base != before { base.save(&store)?; }
     }
     Ok(reaped)
 }
@@ -266,14 +283,14 @@ pub async fn run_reaper(directory: Arc<dyn Directory>, root: PathBuf, grace: Dur
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(interval) => {
                 if let Ok(deployments) = directory.deployments().await {
-                    for record in deployments.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) { let _ = reap_local(&root, record, grace); }
+                    let Ok(references) = crate::reference::References::scan(&root, &deployments) else { continue };
+                    for record in deployments.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) { let _ = reap_local(&root, record, grace, &references); }
                 }
             }
         }
     }
 }
 
-fn io(error: std::io::Error) -> Anomaly { Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/reaper", error.to_string()) }
 
 #[cfg(test)]
 mod tests {
@@ -306,9 +323,51 @@ mod tests {
         assert!(root.join("tables/t/data/a.arrow").exists(), "a node's delete erases nothing");
         assert!(store.list(Some(&key("tables"))).await.unwrap().is_empty(), "a released object is no longer listed");
         assert_eq!(GarbageStore::open(Arc::new(LocalStore::open(&root).unwrap())).await.unwrap().list(Some(&key("tables"))).await.unwrap().len(), 0, "and stays unlisted across a reopen");
-        assert_eq!(reap_local(directory.path(), &record, Duration::from_secs(3600)).unwrap(), Reaped { erased: 0, waiting: 1 }, "within the grace period it waits");
-        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO).unwrap(), Reaped { erased: 1, waiting: 0 });
+        assert_eq!(reap_local(directory.path(), &record, Duration::from_secs(3600), &Default::default()).unwrap(), Reaped { erased: 0, waiting: 1 }, "within the grace period it waits");
+        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO, &Default::default()).unwrap(), Reaped { erased: 1, waiting: 0 });
         assert!(!root.join("tables/t/data/a.arrow").exists());
+    }
+
+    /// Opens the store of `record`'s storage version under `root` as a node would, references and all.
+    fn open_store(root: &Path, record: &DeploymentRecord) -> (PathBuf, crate::reference::ReferencingStore) {
+        let store = root.join(record.storage_prefix()).join("v06");
+        let io = IoRegion::new();
+        let local = LocalStore::open_in(&store, Arc::clone(&io)).unwrap();
+        let base = crate::reference::Base::load(&store).unwrap();
+        (store, crate::reference::ReferencingStore::new(local, root.to_path_buf(), base, io))
+    }
+
+    #[tokio::test]
+    async fn a_fork_reads_what_it_references_until_it_releases_it_and_keeps_it_when_its_parent_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let child = DeploymentRecord::new("shop-preview", "acme", vec![], 0);
+        let (parent_store, raw) = open_store(root, &parent);
+        let parent_view = GarbageStore::open(Arc::new(raw)).await.unwrap();
+        for name in ["tables/t/data/kept.arrow", "tables/t/data/parent-drops.arrow", "tables/t/data/child-drops.arrow"] { parent_view.put(&key(name), Bytes::from_static(b"rows")).await.unwrap(); }
+        crate::reference::fork(root, &parent.storage_prefix(), &child.storage_prefix()).unwrap();
+        let (child_store, raw) = open_store(root, &child);
+        let child_view = GarbageStore::open(Arc::new(raw)).await.unwrap();
+        assert_eq!(child_view.list(Some(&key("tables"))).await.unwrap().len(), 3, "a fork lists what it references");
+        assert_eq!(child_view.get(&key("tables/t/data/kept.arrow")).await.unwrap().as_ref(), b"rows");
+        child_view.put(&key("tables/t/data/kept.arrow"), Bytes::from_static(b"rows")).await.unwrap();
+        assert!(child_view.put(&key("tables/t/data/kept.arrow"), Bytes::from_static(b"other")).await.is_err(), "put-if-absent holds across a reference");
+
+        parent_view.delete(&key("tables/t/data/parent-drops.arrow")).await.unwrap();
+        child_view.delete(&key("tables/t/data/child-drops.arrow")).await.unwrap();
+        let records = [parent.clone(), child.clone()];
+        let references = crate::reference::References::scan(root, &records).unwrap();
+        reap_local(root, &parent, Duration::ZERO, &references).unwrap();
+        reap_local(root, &child, Duration::ZERO, &references).unwrap();
+        assert!(!parent_store.join("tables/t/data/parent-drops.arrow").exists(), "the parent's release erases its object");
+        assert!(child_store.join("tables/t/data/parent-drops.arrow").exists(), "after copying it into the fork that still uses it");
+        assert!(parent_store.join("tables/t/data/child-drops.arrow").exists(), "the fork's release leaves its parent's object alone");
+        let (_, raw) = open_store(root, &child);
+        let reopened = GarbageStore::open(Arc::new(raw)).await.unwrap();
+        let mut listed: Vec<String> = reopened.list(Some(&key("tables"))).await.unwrap().into_iter().map(|object| object.key.as_str().to_owned()).collect();
+        listed.sort();
+        assert_eq!(listed, ["tables/t/data/kept.arrow", "tables/t/data/parent-drops.arrow"], "and the fork no longer references it");
     }
 
     #[tokio::test]
@@ -338,10 +397,10 @@ mod tests {
         let packs = || std::fs::read_dir(root.join(crate::packing::PACK_DIRECTORY)).map(|entries| entries.count()).unwrap_or(0);
         assert_eq!(packs(), 1);
         store.delete(&key("tables/t/data/l00-rc-b00.arrow")).await.unwrap();
-        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO).unwrap(), Reaped { erased: 0, waiting: 1 }, "half a pack released keeps the pack");
+        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO, &Default::default()).unwrap(), Reaped { erased: 0, waiting: 1 }, "half a pack released keeps the pack");
         assert_eq!(packs(), 1);
         store.delete(&key("tables/t/meta/l00-rc-b00.arrow")).await.unwrap();
-        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO).unwrap().erased, 2);
+        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO, &Default::default()).unwrap().erased, 2);
         assert_eq!(packs(), 0, "a fully released pack is erased");
     }
 

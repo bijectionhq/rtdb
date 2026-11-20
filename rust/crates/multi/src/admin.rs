@@ -1,7 +1,6 @@
 //! Cell administration: creating, moving, rebalancing, forking and deleting deployments, and confirming dead members (`CreateDeployment`, `IntendMove`, `Rebalance`, `Fork`, `BeginDeletion`, `EraseAndProve`, `ExpireLease`).
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -146,24 +145,12 @@ pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn K
     child.log_epoch = source.log_epoch + 1;
     child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
     match storage {
-        CellStorage::Local { root } => copy_tree(&root.join(source.storage_prefix()), &root.join(child.storage_prefix()))?,
+        CellStorage::Local { root } => crate::reference::fork(root, &source.storage_prefix(), &child.storage_prefix())?,
     }
     keys.copy(&source.id, &child.id)?;
     directory.create_deployment(child).await
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to).map_err(io)?;
-    if !from.exists() { return Ok(()); }
-    for entry in std::fs::read_dir(from).map_err(io)? {
-        let entry = entry.map_err(io)?;
-        // A copy belongs to the deployment it is copied for, which marks it on first open.
-        if entry.file_name() == crate::store::ROOT_MARKER { continue; }
-        let target = to.join(entry.file_name());
-        if entry.file_type().map_err(io)?.is_dir() { copy_tree(&entry.path(), &target)?; } else { std::fs::copy(entry.path(), &target).map_err(io)?; }
-    }
-    Ok(())
-}
 
 /// One cell, as cell administration reaches it.
 pub struct CellHandle<'a> { pub name: &'a str, pub directory: &'a dyn Directory, pub storage: &'a CellStorage, pub keys: &'a dyn KeyService, pub maximum_deployments: usize }
@@ -198,7 +185,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers: servers.clone(), stream: fenced.stream("replica"), maximum_message_bytes };
     rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
     match (from.storage, to.storage) {
-        (CellStorage::Local { root: source }, CellStorage::Local { root: target }) => copy_tree(&source.join(fenced.storage_prefix()), &target.join(fenced.storage_prefix()))?,
+        (CellStorage::Local { root: source }, CellStorage::Local { root: target }) => crate::reference::materialize(source, &fenced.storage_prefix(), target, &fenced.storage_prefix())?,
     }
     to.keys.install(&fenced.id, from.keys.key(&fenced.id)?)?;
     let mut arrived = fenced.clone();
@@ -236,6 +223,10 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     let verified_empty = match storage {
         CellStorage::Local { root } => {
             let prefix = root.join(fenced.storage_prefix());
+            // Its forks keep what they share with it: those objects are copied into them before it goes.
+            let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
+            let references = crate::reference::References::scan(root, &others)?;
+            for store in crate::reference::stores(&prefix) { references.erase_store(&store)?; }
             if prefix.exists() { std::fs::remove_dir_all(&prefix).map_err(io)?; }
             !prefix.exists()
         }
