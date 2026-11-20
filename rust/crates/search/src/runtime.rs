@@ -85,15 +85,16 @@ pub struct SearchRuntime {
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
     built: Mutex<Bounded<(String, String), OpenedFile>>,
+    mapped: Mutex<Bounded<(String, String), OpenedFile>>,
     match_sets: Mutex<Bounded<(String, String, String, rtdb_text::Query), (std::sync::Weak<SearchFile>, Arc<crate::file::MatchSet>)>>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
     reported: Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 impl SearchRuntime {
-    /// `file_bytes` bounds the recorded search files kept across queries, each keeping its buffer-pool lease so its bytes stay charged to the pool; half as much again bounds the files a node builds itself.
+    /// `file_bytes` bounds the recorded search files kept across queries, each keeping its buffer-pool lease so its bytes stay charged to the pool; half as much bounds the files a node builds itself, and 32 times as much the files mapped from this node's disk, of which only the pages a query reads are resident.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -115,8 +116,17 @@ impl SearchRuntime {
     /// A kept file is used only while the pool it was read through is the database's pool, so a database detached and attached anew starts afresh.
     pub async fn file(&self, database: &str, storage: &Arc<BufferPool>, key: &rtdb_storage::ObjectKey, columns: &[String]) -> std::result::Result<Arc<SearchFile>, FileError> {
         let cache_key = (database.to_string(), key.as_str().to_string());
-        if let Some((pool, file)) = self.files.lock().get(&cache_key) {
-            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(file); }
+        for kept in [&self.mapped, &self.files] {
+            if let Some((pool, file)) = kept.lock().get(&cache_key) {
+                if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(file); }
+            }
+        }
+        let unavailable = |error: rtdb_storage::Error| match error { rtdb_storage::Error::MissingObject(_) => FileError::Missing, error => FileError::Unavailable(error.into()) };
+        if let Some(local) = storage.object_store().local_file(key).await.map_err(unavailable)? {
+            let size = usize::try_from(local.file().metadata().map_err(|error| FileError::Unavailable(rtdb_types::Anomaly::fault("rtdb.search/file", error.to_string())))?.len()).unwrap_or(usize::MAX);
+            let file = Arc::new(SearchFile::open(crate::Source::mapped(local).map_err(FileError::Corrupt)?, columns).map_err(FileError::Corrupt)?);
+            self.mapped.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), size);
+            return Ok(file);
         }
         let lease = match storage.get(key).await {
             Ok(lease) => lease,
@@ -163,7 +173,10 @@ impl SearchRuntime {
         Ok(TrieFile { data: data.clone(), identity, file })
     }
 
-    pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) { self.files.lock().remove(&(database.to_string(), key.as_str().to_string())); }
+    pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) {
+        let cache_key = (database.to_string(), key.as_str().to_string());
+        for kept in [&self.mapped, &self.files] { kept.lock().remove(&cache_key); }
+    }
 
     /// The rows of a live segment whose column holds every term of the query; phrases are left to the caller.
     /// Postings are kept per segment and extended by the rows appended since, so a growing live index is tokenised once.
@@ -229,6 +242,27 @@ mod tests {
         assert_eq!(cache.get(&"huge"), Some(4), "an entry heavier than the limit is still kept alone");
         cache.remove(&"huge");
         assert_eq!(cache.weight, 0);
+    }
+
+    #[tokio::test]
+    async fn a_search_file_on_this_nodes_disk_is_mapped_rather_than_read_into_memory() {
+        use rtdb_storage::{LocalStore, ObjectKey, ObjectStore};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalStore::open(directory.path()).unwrap());
+        let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
+        let columns = vec!["body".to_string()];
+        let rows = vec![crate::SearchRow { iid: [1; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, recency: None, values: vec![Some(rtdb_text::tokens("an overdue invoice"))] }];
+        let key = ObjectKey::new("tables/docs/artefacts/l01-rc-b00/search/docs~a2f3-v1.bin").unwrap();
+        store.put(&key, crate::build_search_file(&columns, &rows, "job").unwrap().into()).await.unwrap();
+        let runtime = SearchRuntime::new(1 << 20);
+        let file = runtime.file("xtdb", &pool, &key, &columns).await.unwrap();
+        assert_eq!(pool.retained_bytes(), 0, "nothing was read through the buffer pool");
+        store.delete(&key).await.unwrap();
+        assert_eq!(file.matches("body", &rtdb_text::Query::parse("overdue")).unwrap().len(), 1, "the mapping outlives the delete");
+        assert!(Arc::ptr_eq(&file, &runtime.file("xtdb", &pool, &key, &columns).await.unwrap()), "a mapped file is kept");
+        runtime.forget_file("xtdb", &key);
+        assert!(matches!(runtime.file("xtdb", &pool, &key, &columns).await, Err(FileError::Missing)));
+        store.close_and_wait().await;
     }
 
     #[tokio::test]

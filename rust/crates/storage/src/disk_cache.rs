@@ -307,6 +307,16 @@ impl ObjectStore for DiskCachedStore {
         }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }
+    /// The lease pins the cached file, so the cache neither evicts nor counts as free what a reader still maps.
+    async fn local_file(&self, key: &ObjectKey) -> Result<Option<crate::LocalFile>> {
+        let scope = self.io.admit()?;
+        let lease = self.cache.get(&self.key(key)?, self.remote.as_ref(), key).await?;
+        let operation = self.cache.begin_operation()?.and(scope);
+        IoRegion::run_admitted(operation, move || {
+            let file = lease.open().map_err(|error| Error::io(lease.path(), error))?;
+            Ok(Some(crate::LocalFile::new(file, Some(lease))))
+        }).await
+    }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
         let scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;

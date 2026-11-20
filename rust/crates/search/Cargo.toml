@@ -23,6 +23,7 @@ parking_lot.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tantivy.workspace = true
+memmap2.workspace = true
 stable_deref_trait.workspace = true
 bytes.workspace = true
 serde_json.workspace = true

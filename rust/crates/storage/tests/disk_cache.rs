@@ -583,3 +583,22 @@ fn lock_symlink_is_rejected_before_orphan_cleanup() {
     assert_eq!(std::fs::read(&target).unwrap(), b"outside cache");
     assert_eq!(std::fs::read(temporary.join("unclaimed")).unwrap(), b"preserved");
 }
+
+#[tokio::test]
+async fn a_local_file_of_a_cached_object_is_pinned_while_held() {
+    use std::io::Read;
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 4, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let remote = Arc::new(MemoryStore::default());
+    let key = ObjectKey::new("tables/docs/first").unwrap();
+    remote.put(&key, Bytes::from_static(b"123456")).await.unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote).unwrap();
+    let local = store.local_file(&key).await.unwrap().expect("a disk-cached store keeps a local file");
+    let mut bytes = Vec::new();
+    local.file().try_clone().unwrap().read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"123456");
+    assert_eq!(cache.stats().pinned_bytes, 6, "held over capacity, as any lease is");
+    drop(local);
+    assert_eq!(cache.stats().pinned_bytes + cache.stats().evictable_bytes, 0);
+    assert!(matches!(store.local_file(&ObjectKey::new("tables/docs/absent").unwrap()).await, Err(Error::MissingObject(_))));
+}

@@ -232,16 +232,25 @@ fn bundle(directory: &dyn Directory, uuid: &str, mut output: impl std::io::Write
     output.flush().map_err(fault)
 }
 
-/// The bytes a search file is read from: the object as read, or a lease on the buffer pool's copy of it.
-pub enum Source { Bytes(bytes::Bytes), Lease(rtdb_storage::cache::CacheLease) }
+/// The bytes a search file is read from: the object as read, a lease on the buffer pool's copy of it, or this node's local file mapped into memory.
+pub enum Source { Bytes(bytes::Bytes), Lease(rtdb_storage::cache::CacheLease), Mapped(memmap2::Mmap, rtdb_storage::LocalFile) }
 impl From<bytes::Bytes> for Source { fn from(bytes: bytes::Bytes) -> Self { Self::Bytes(bytes) } }
 impl From<Vec<u8>> for Source { fn from(bytes: Vec<u8>) -> Self { Self::Bytes(bytes.into()) } }
 impl From<rtdb_storage::cache::CacheLease> for Source { fn from(lease: rtdb_storage::cache::CacheLease) -> Self { Self::Lease(lease) } }
 impl std::ops::Deref for Source {
     type Target = [u8];
-    fn deref(&self) -> &[u8] { match self { Self::Bytes(bytes) => bytes, Self::Lease(lease) => lease.as_slice() } }
+    fn deref(&self) -> &[u8] { match self { Self::Bytes(bytes) => bytes, Self::Lease(lease) => lease.as_slice(), Self::Mapped(map, _) => map } }
 }
-// SAFETY: both owners keep their buffer at a fixed address, behind a reference count, for as long as they live, wherever they move.
+
+impl Source {
+    /// Maps a local file whose object is immutable.
+    pub fn mapped(local: rtdb_storage::LocalFile) -> Result<Self> {
+        // SAFETY: an object is never rewritten under its key, and the local file is held for as long as the map, so the mapped bytes do not change beneath it.
+        let map = unsafe { memmap2::Mmap::map(local.file()) }.map_err(fault)?;
+        Ok(Self::Mapped(map, local))
+    }
+}
+// SAFETY: every owner keeps its bytes at a fixed address for as long as it lives, wherever it moves: behind a reference count, or in a mapping.
 unsafe impl stable_deref_trait::StableDeref for Source {}
 
 /// A read-only directory over a bundle held in memory.
