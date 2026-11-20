@@ -181,6 +181,8 @@ impl BufferPool {
     }
 
     fn reserve(&self, bytes: usize) -> Result<Reservation> {
+        // A request no eviction could make fit evicts nothing.
+        if bytes > self.budget.limit { return Err(Error::MemoryLimit { requested: bytes, limit: self.budget.limit, retained: self.budget.retained_bytes() }); }
         loop {
             match self.budget.reserve(&self.shared.retained, bytes) {
                 Ok(reservation) => return Ok(reservation),
@@ -236,5 +238,18 @@ mod fairness_tests {
         let lease = second.get(&ObjectKey::new("b").unwrap()).await.expect("the second pool evicts the first pool's idle entries");
         assert_eq!(lease.as_slice().len(), 60);
         assert_eq!(budget.retained_bytes(), 85, "only as many as it needed");
+    }
+
+    #[tokio::test]
+    async fn a_request_larger_than_the_budget_evicts_nothing() {
+        let budget = CacheBudget::new(100);
+        let (small, large) = (Arc::new(MemoryStore::default()), Arc::new(MemoryStore::default()));
+        small.put(&ObjectKey::new("a").unwrap(), Bytes::from(vec![1u8; 50])).await.unwrap();
+        large.put(&ObjectKey::new("b").unwrap(), Bytes::from(vec![2u8; 200])).await.unwrap();
+        let first = BufferPool::with_budget(small, Arc::clone(&budget));
+        let second = BufferPool::with_budget(large, Arc::clone(&budget));
+        drop(first.get(&ObjectKey::new("a").unwrap()).await.unwrap());
+        assert!(matches!(second.get(&ObjectKey::new("b").unwrap()).await, Err(Error::MemoryLimit { .. })));
+        assert_eq!(budget.retained_bytes(), 50, "the other pool's entry survives");
     }
 }
