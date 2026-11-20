@@ -262,7 +262,7 @@ fn ceiling_growth_reserves_both_buffers_before_visiting_and_can_retry() {
 }
 
 #[test]
-fn visitor_failure_consumes_the_event_and_refused_iid_rollover_keeps_it_current() {
+fn visitor_failure_consumes_the_event_and_the_next_iid_reuses_its_ceiling_without_admitting_more() {
     let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
     let root = MemoryBudget::new(2 * ceiling);
     let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&root));
@@ -271,23 +271,35 @@ fn visitor_failure_consumes_the_event_and_refused_iid_rollover_keeps_it_current(
     assert_eq!(calculator.visit(&first, |_| Err::<(), _>(failure.clone())).unwrap_err(), failure);
     assert_eq!(root.used_bytes(), ceiling);
 
-    let pressure = root.reserve(1).unwrap();
+    let pressure = root.reserve(ceiling).unwrap();
     let next_iid = event(2, 100, 10, 20, EventOp::Put);
-    let refused = calculator.visit(&next_iid, |_| -> rtdb_types::Result<()> { panic!("refused IID reached the visitor") }).unwrap_err();
-    assert_eq!(refused.code, "rtdb/memory-budget-exceeded");
-    let current_iid = event(1, 199, 10, 20, EventOp::Put);
-    calculator.visit(&current_iid, |view| {
-        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp(200))]);
-        Ok(())
-    }).unwrap().unwrap();
-    assert_eq!(root.used_bytes(), ceiling + 1);
-    drop(pressure);
     calculator.visit(&next_iid, |view| {
-        assert_eq!(root.used_bytes(), 2 * ceiling);
         assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp::MAX)]);
         Ok(())
     }).unwrap().unwrap();
+    assert_eq!(root.used_bytes(), 2 * ceiling);
+    drop(pressure);
     assert_eq!(root.used_bytes(), ceiling);
+}
+
+#[test]
+fn a_refused_iid_rollover_keeps_the_current_entity() {
+    let root = MemoryBudget::new(4096);
+    let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&root));
+    let empty = event(1, 200, 10, 10, EventOp::Put);
+    calculator.visit(&empty, |_| Ok(())).unwrap();
+    assert_eq!(root.used_bytes(), 0);
+
+    let pressure = root.reserve(4096).unwrap();
+    let next_iid = event(2, 100, 10, 20, EventOp::Put);
+    let refused = calculator.visit(&next_iid, |_| -> rtdb_types::Result<()> { panic!("refused IID reached the visitor") }).unwrap_err();
+    assert_eq!(refused.code, "rtdb/memory-budget-exceeded");
+    drop(pressure);
+    let current_iid = event(1, 199, 10, 20, EventOp::Put);
+    calculator.visit(&current_iid, |view| {
+        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp::MAX)]);
+        Ok(())
+    }).unwrap().unwrap();
 }
 
 #[test]

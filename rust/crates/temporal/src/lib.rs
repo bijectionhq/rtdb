@@ -205,6 +205,13 @@ struct AdmittedCeiling {
 }
 
 impl AdmittedCeiling {
+    /// The ceiling entries applying an event over `interval` needs.
+    fn required(valid_times: &[Timestamp], system_time_ceilings: &[Timestamp], interval: Interval) -> Result<usize> {
+        let inserts = usize::from(valid_times.binary_search(&interval.lower()).is_err())
+            + usize::from(valid_times.binary_search(&interval.upper()).is_err());
+        system_time_ceilings.len().checked_add(inserts).ok_or_else(ceiling_size)
+    }
+
     fn replacement(
         valid_times: &[Timestamp],
         system_time_ceilings: &[Timestamp],
@@ -263,11 +270,25 @@ impl AdmittedPolygonCalculator {
             return Ok(None);
         }
 
+        // A new entity starts from the initial ceiling, so it takes the previous entity's buffers when they are large
+        // enough; they are only taken once it is certain they are reused, so a refused event leaves the entity current.
+        let recyclable = !step.same_entity && !header.valid_time.is_empty() && match self.state.entity.as_ref().and_then(|entity| entity.ceiling.as_ref()) {
+            Some(ceiling) => ceiling.capacity >= AdmittedCeiling::required(INITIAL_VALID_TIMES, INITIAL_SYSTEM_TIME_CEILINGS, header.valid_time)?,
+            None => false,
+        };
+        let recycled = if recyclable { self.state.entity.as_mut().and_then(|entity| entity.ceiling.take()) } else { None };
         let current = self.state.entity.as_ref().filter(|_| step.same_entity).and_then(|entity| entity.ceiling.as_ref());
         let (valid, system, capacity) = current.map_or((INITIAL_VALID_TIMES, INITIAL_SYSTEM_TIME_CEILINGS, 0), |current| {
             (current.ceiling.valid_times(), current.ceiling.system_time_ceilings(), current.capacity)
         });
-        let replacement = AdmittedCeiling::replacement(valid, system, capacity, header.valid_time, &self.memory)?;
+        let replacement = match recycled {
+            Some(mut recycled) => {
+                recycled.ceiling.valid_times.clear(); recycled.ceiling.valid_times.extend_from_slice(INITIAL_VALID_TIMES);
+                recycled.ceiling.system_time_ceilings.clear(); recycled.ceiling.system_time_ceilings.extend_from_slice(INITIAL_SYSTEM_TIME_CEILINGS);
+                Some(recycled)
+            }
+            _ => AdmittedCeiling::replacement(valid, system, capacity, header.valid_time, &self.memory)?,
+        };
         let result = visitor(PolygonView::new(valid, system, header.valid_time));
         let entity = self.state.advance(header, step);
         if let Some(replacement) = replacement { entity.ceiling = Some(replacement); }
