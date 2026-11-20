@@ -1865,6 +1865,8 @@ invariant QuarantineIsolates {
 
 actor Gateway {
     -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, routes by affinity, reports suspicion.
+    -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
+    -- A configured gateway refuses plaintext startup before any holder receives credentials.
     identified_by: MemberRecord where role = gateway
 }
 

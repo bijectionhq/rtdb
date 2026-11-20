@@ -4291,6 +4291,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls 0.26.6",
  "tokio-util",
  "uuid",
 ]

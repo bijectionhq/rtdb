@@ -12,9 +12,9 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, watch};
 
 const MAXIMUM_FRAME_BYTES: usize = 1 << 30;
@@ -36,7 +36,7 @@ impl Frame {
     }
 }
 
-async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Frame>> {
+async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<Frame>> {
     let tag = match reader.read_u8().await {
         Ok(tag) => tag,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -51,7 +51,7 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Frame>
 }
 
 /// Reads frames off `reader` into a channel, so the session can wait on both directions without losing a partly read frame.
-fn pump(mut reader: OwnedReadHalf) -> (mpsc::Receiver<std::io::Result<Frame>>, tokio::task::JoinHandle<()>) {
+fn pump(mut reader: impl AsyncRead + Unpin + Send + 'static) -> (mpsc::Receiver<std::io::Result<Frame>>, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(64);
     let task = tokio::spawn(async move {
         loop {
@@ -184,8 +184,10 @@ impl Session {
     }
 
     /// Runs the session over an already-routed first backend whose greeting the client has not yet seen.
-    pub async fn run(mut self, client: TcpStream, first: TcpStream, first_epoch: u64) -> Result<()> {
-        let (client_read, mut client_write) = client.into_split();
+    pub async fn run(
+        mut self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, first: TcpStream, first_epoch: u64,
+    ) -> Result<()> {
+        let (client_read, mut client_write) = tokio::io::split(client);
         let (mut requests, client_reader) = pump(client_read);
         let mut backend = Some(Backend::new(first, first_epoch));
         enum Event { Request(Option<std::io::Result<Frame>>), Reply(Option<std::io::Result<Frame>>) }
@@ -232,6 +234,7 @@ impl Session {
                             self.greeting.observe(&frame, &mut self.authenticated);
                             if self.greeting.done { self.status = Status::Idle; }
                             client_write.write_all(&frame.encode()).await.map_err(io)?;
+                            client_write.flush().await.map_err(io)?;
                             if frame.tag == b'E' { break Ok(()); }
                             continue;
                         }
@@ -271,6 +274,7 @@ impl Session {
                             _ => {}
                         }
                         client_write.write_all(&frame.encode()).await.map_err(io)?;
+                        client_write.flush().await.map_err(io)?;
                     }
                     Event::Reply(Some(Err(_)) | None) => {
                         if !self.greeting.done { break Err(lost("the holder closed during session startup")); }
@@ -294,6 +298,7 @@ impl Session {
         client_reader.abort();
         if let Err(error) = &outcome {
             let _ = client_write.write_all(&error_frame("08006", error.message.as_deref().unwrap_or(error.code.as_ref())).encode()).await;
+            let _ = client_write.flush().await;
         }
         outcome
     }

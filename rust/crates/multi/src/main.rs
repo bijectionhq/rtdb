@@ -16,7 +16,7 @@ const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
-       rtdb-multi gateway --directory DIR --listen ADDR [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
+       rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
@@ -115,7 +115,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:5432")?).await.map_err(io)?;
             eprintln!("gateway listening on {}", listener.local_addr().map_err(io)?);
-            let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, ..Default::default() };
+            let tls = if let Some(path) = arguments.optional("config") {
+                let configuration = NodeConfiguration::from_yaml(&std::fs::read_to_string(path).map_err(io)?)?;
+                let settings = configuration.server.and_then(|server| server.ssl)
+                    .ok_or_else(|| usage("The gateway configuration must provide server.ssl".into()))?;
+                Some(rtdb_server::tls::load(&settings, &rtdb_columnar::MemoryBudget::new(16 << 20))?)
+            } else {
+                None
+            };
+            let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls, ..Default::default() };
             if let (Some(cell), Some(map)) = (arguments.optional("cell"), arguments.optional("cell-map")) {
                 let map: Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::RemoteCellMap::new(map);
                 let advertised = arguments.optional("advertise").map(str::to_owned).unwrap_or(listener.local_addr().map_err(io)?.to_string());
