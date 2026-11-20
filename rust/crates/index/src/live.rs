@@ -490,6 +490,8 @@ impl TransactionBuffer {
         pending.reservations.push(reservation);
         Ok(())
     }
+    /// The snapshot the transaction started from, without its own writes, for a statement that reads no table.
+    pub fn base_snapshot(&self) -> Snapshot { self.base.clone() }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
         for (table, pending) in &self.tables {

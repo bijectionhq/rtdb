@@ -137,11 +137,16 @@ pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBa
     let mut output = Vec::with_capacity(columns.len());
     for field in columns {
         let column = match field.name.as_str() {
-            "_valid_from" => Column::Values(rows.iter().map(|row| time(row.valid_time.lower(), false)).collect()),
-            "_valid_to" => Column::Values(rows.iter().map(|row| time(row.valid_time.upper(), true)).collect()),
-            "_system_from" => Column::Values(rows.iter().map(|row| time(row.system_time.lower(), false)).collect()),
-            "_system_to" => Column::Values(rows.iter().map(|row| time(row.system_time.upper(), true)).collect()),
-            "_iid" => Column::Values(rows.iter().map(|row| sources_in[row.source.0 as usize].header(row.source.1 as usize).map(|header| Value::FixedSizeBinary(header.iid.0.to_vec()))).collect::<Result<_>>()?),
+            "_valid_from" => times("_valid_from", rows.iter().map(|row| row.valid_time.lower()), false),
+            "_valid_to" => times("_valid_to", rows.iter().map(|row| row.valid_time.upper()), true),
+            "_system_from" => times("_system_from", rows.iter().map(|row| row.system_time.lower()), false),
+            "_system_to" => times("_system_to", rows.iter().map(|row| row.system_time.upper()), true),
+            "_iid" => {
+                let iids = rows.iter().map(|row| sources_in[row.source.0 as usize].header(row.source.1 as usize).map(|header| header.iid.0)).collect::<Result<Vec<_>>>()?;
+                let array = arrow_array::FixedSizeBinaryArray::try_from_iter(iids.iter()).map_err(|error| invalid("column-gather", error))?;
+                Column::Arrow { array: Arc::new(array), field: Arc::new(ArrowField::new("_iid", DataType::FixedSizeBinary(16), false)),
+                    logical: Some(LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16))) }
+            }
             name => stored(&sources, &cells, name)?,
         };
         let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
@@ -151,8 +156,12 @@ pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBa
     ColumnBatch::settled(output, rows.len(), reservation)
 }
 
-fn time(time: Timestamp, upper: bool) -> Value {
-    if upper && time == Timestamp::MAX { Value::Null } else { Value::Timestamp { value: time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
+/// A temporal column as microsecond UTC timestamps; an upper bound at the end of time reads as null.
+fn times(name: &str, times: impl Iterator<Item = Timestamp>, upper: bool) -> Column {
+    let array = arrow_array::TimestampMicrosecondArray::from_iter(times.map(|time| (!(upper && time == Timestamp::MAX)).then_some(time.0))).with_timezone("UTC");
+    let logical = LogicalType::Scalar(rtdb_types::ScalarType::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+    Column::Arrow { array: Arc::new(array), field: Arc::new(ArrowField::new(name, DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), upper)),
+        logical: Some(if upper { logical.maybe() } else { logical }) }
 }
 
 /// One stored field across every source; a single array when every source that stores it agrees on its layout.

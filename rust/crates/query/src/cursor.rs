@@ -110,6 +110,11 @@ pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::Que
 #[derive(Clone)]
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
 impl PreparedQuery {
+    /// The same plan, its retained bytes charged to `memory` instead: a plan kept beyond one query moves its charge to its keeper.
+    pub fn recharged(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let _plan_reservation = self._plan_reservation.as_ref().map(|reservation| memory.reserve(reservation.bytes())).transpose()?;
+        Ok(Self { _plan_reservation, ..self.clone() })
+    }
     pub fn new(relation: Arc<Relation>) -> Result<Self> { Self::with_settings(relation, rtdb_plan::QuerySettings::default()) }
     /// Retains a validated relation with its existing operator shape.
     /// The supplied budget holds the plan charge until the last prepared query or cursor drops.

@@ -279,12 +279,16 @@ impl<'a> OpenTransaction<'a> {
     }
 
     pub async fn execute_sql(&mut self, sql: &str, arguments: Option<&[Value]>) -> Result<()> {
-        self.execute_sql_typed(sql, arguments, None).await
+        self.execute_sql_typed(sql, arguments, None, &mut None).await
     }
 
-    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<&[Value]>, types: Option<&[rtdb_types::LogicalType]>) -> Result<()> {
+    /// `planned` carries one operation's mutation from each argument row to the next, which reuses it while the
+    /// transaction's catalog answers the planning's lookups the same.
+    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<&[Value]>, types: Option<&[rtdb_types::LogicalType]>, planned: &mut Option<PlannedMutation>) -> Result<()> {
         self.context.check_cancelled()?;
-        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        // A statement whose plan reads no table can't see the transaction's own writes, so it skips extending the snapshot with them.
+        let snapshot = if planned.as_ref().is_some_and(|planned| !planned.reads) { self.buffer.base_snapshot() } else { self.snapshot()? };
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let parameter_types = match types {
             Some(types) => types.iter().map(rtdb_columnar::execution_type).enumerate().collect(),
             None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
@@ -292,7 +296,19 @@ impl<'a> OpenTransaction<'a> {
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let with_sql = |error: Anomaly| error.with_context("sql", sql.into());
         let syntax = admit_sql_syntax(sql, &context.memory).map_err(with_sql)?;
-        let mutation = rtdb_sql::prepare_tx_in(sql, &context.catalog, &options, &context.memory).map_err(with_sql)?;
+        let reused = match planned.as_ref().filter(|planned| planned.options == options) {
+            Some(planned) if planned.lookups.replay(&context.catalog).map_err(with_sql)? => Some(planned.mutation.clone()),
+            _ => None,
+        };
+        let mutation = match reused {
+            Some(mutation) => mutation,
+            None => {
+                let recording = rtdb_plan::RecordingCatalog::new(&context.catalog);
+                let mutation = rtdb_sql::prepare_tx_in(sql, &recording, &options, &context.memory).map_err(with_sql)?;
+                *planned = recording.finish().map(|lookups| PlannedMutation { options, lookups, reads: reads_tables(&mutation), mutation: mutation.clone() });
+                mutation
+            }
+        };
         self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
     }
 
@@ -361,13 +377,18 @@ impl<'a> OpenTransaction<'a> {
         self.context.check_cancelled()?;
         match operation {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
-                Some(arguments) => { for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types())).await.map_err(|error| error.with_context("arg-idx", index.into()))?; } Ok(()) }
+                Some(arguments) => {
+                    let mut planned = None;
+                    for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types()), &mut planned).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                    Ok(())
+                }
                 None => self.execute_sql(sql, None).await,
             },
             Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
                 if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
                 let arguments = decode_arguments(arg_bytes.as_slice(), &self.context.memory)?;
-                for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types())).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                let mut planned = None;
+                for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types()), &mut planned).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
                 Ok(())
             }
             Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to),
@@ -449,6 +470,22 @@ fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {
 
 fn admit_sql_syntax(sql: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {
     memory.reserve(rtdb_sql::statement_syntax_estimate(sql.len()).ok_or_else(overflow)?)
+}
+
+/// A mutation planned for one argument row, and what its planning read from the catalog.
+struct PlannedMutation { options: rtdb_sql::PrepareOptions, lookups: rtdb_plan::CatalogLookups, reads: bool, mutation: rtdb_sql::Mutation }
+
+/// Whether a mutation's input may read a table: anything but literal rows and the expressions over them may.
+fn reads_tables(mutation: &rtdb_sql::Mutation) -> bool {
+    fn reads(relation: &rtdb_plan::Relation) -> bool {
+        use rtdb_plan::RelationNode as N;
+        !matches!(relation.node(), N::Values { .. } | N::LiteralPages { .. } | N::Project { .. } | N::Extend { .. } | N::Rename { .. } | N::Filter { .. })
+            || relation.children().into_iter().any(|child| reads(child))
+    }
+    match mutation {
+        rtdb_sql::Mutation::Put { input, .. } | rtdb_sql::Mutation::Delete { input, .. } | rtdb_sql::Mutation::Erase { input, .. } => reads(input),
+        _ => true,
+    }
 }
 
 async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {

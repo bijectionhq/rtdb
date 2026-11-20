@@ -8,7 +8,6 @@ use rtdb_types::{Result, Value};
 
 use crate::context::Execution;
 use crate::cursor::{BoxCursor, OwnedRow};
-use crate::spill::SpillReader;
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
 use crate::{invalid, QueryContext};
 use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
@@ -528,8 +527,9 @@ pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory
     Ok(true)
 }
 /// A hash that rows equal under `rows_equal` share.
-/// A date-time equals one of another unit or zone once the session zone localizes it, so date-times all hash alike, and `rows_equal` tells them apart.
-fn equality_hash(values: &[Value]) -> u32 {
+/// A date or timestamp equals one of another unit or zone once the session zone localizes it, so it hashes as the
+/// wall-clock time it reads as there; date-times nested in a container hash alike, and `rows_equal` tells them apart.
+fn equality_hash(values: &[Value], timezone: &str) -> u32 {
     fn temporal(value: &Value) -> bool {
         match value {
             Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
@@ -540,7 +540,12 @@ fn equality_hash(values: &[Value]) -> u32 {
         }
     }
     values.iter().fold(0u32, |hash, value| {
-        let cell = if temporal(value) { 0x7e3a_11c5 } else { rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32) };
+        let cell = match value {
+            Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) => rtdb_expr::local_micros(value, timezone)
+                .and_then(|micros| rtdb_columnar::hash_value(&Value::I64(micros), 0).ok()).map_or(0x7e3a_11c5, |cell| (cell as u32) ^ 0x7e3a_11c5),
+            value if temporal(value) => 0x7e3a_11c5,
+            value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
+        };
         (hash ^ cell.wrapping_mul(0xcc9e_2d51).rotate_left(15)).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64)
     })
 }
@@ -553,7 +558,7 @@ impl SeenRows {
             for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
             self.validated = true;
         }
-        let hash = equality_hash(values);
+        let hash = equality_hash(values, &self.context.timezone);
         if let Some(candidates) = self.index.get(&hash) {
             for &candidate in candidates {
                 if rows_equal(values, &self.rows[candidate].values, &self.context.timezone, &self.context.memory)? { return Ok(false); }
@@ -570,21 +575,6 @@ impl SeenRows {
         self.index.entry(hash).or_default().push(self.rows.len());
         self.rows.push(row);
         Ok(true)
-    }
-}
-/// The ordinals of right rows already matched.
-pub(crate) struct OrdinalSet { ordinals: std::collections::HashSet<u64>, context: Arc<QueryContext>, _reservation: Option<Arc<rtdb_columnar::MemoryReservation>> }
-impl OrdinalSet {
-    pub fn new(context: &Arc<QueryContext>) -> Result<Self> { Ok(Self { ordinals: Default::default(), context: Arc::clone(context), _reservation: None }) }
-    pub fn contains(&mut self, ordinal: u64) -> Result<bool> { Ok(self.ordinals.contains(&ordinal)) }
-    pub fn insert(&mut self, ordinal: u64) -> Result<()> {
-        if self.ordinals.len() == self.ordinals.capacity() {
-            let capacity = self.ordinals.capacity().saturating_mul(2).max(16);
-            self._reservation = Some(self.context.memory.reserve(capacity.checked_mul(2 * std::mem::size_of::<u64>()).ok_or_else(|| invalid("set-size", "Set ordinals exceed addressable memory"))?)?);
-            self.ordinals.reserve(capacity - self.ordinals.len());
-        }
-        self.ordinals.insert(ordinal);
-        Ok(())
     }
 }
 struct Distinct { input: BoxPageCursor, seen: SeenRows, execution: Execution }
@@ -604,19 +594,28 @@ impl PageCursor for Distinct {
     }
 }
 
-struct SetCursor { left: BoxPageCursor, right: Option<BoxPageCursor>, reader: Option<SpillReader>, operator: SetOperator, all: bool, consumed: OrdinalSet, seen: SeenRows, runtime: Arc<EmittedRelation>, execution: Execution }
+struct SetCursor { left: BoxPageCursor, right: Option<BoxPageCursor>, built: Option<RightRows>, operator: SetOperator, all: bool, seen: SeenRows, runtime: Arc<EmittedRelation>, execution: Execution }
+/// The right input, indexed by the hash rows equal under `rows_equal` share, and which of its rows an ALL operator consumed.
+struct RightRows { rows: Vec<OwnedRow>, index: std::collections::HashMap<u32, Vec<usize>>, consumed: Vec<bool>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl SetCursor {
     fn new(left: BoxPageCursor, right: BoxPageCursor, operator: SetOperator, all: bool, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
-        Ok(Self { left, right: Some(right), reader: None, operator, all, consumed: OrdinalSet::new(&execution.context)?, seen: SeenRows::new(&execution.context, runtime.child(0)?.output())?, runtime, execution })
+        Ok(Self { left, right: Some(right), built: None, operator, all, seen: SeenRows::new(&execution.context, runtime.child(0)?.output())?, runtime, execution })
     }
 }
 #[async_trait]
 impl PageCursor for SetCursor {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         if let Some(mut right) = self.right.take() {
-            let mut writer = self.execution.context.spill.create()?;
-            while let Some(mut page) = right.next_page().await? { while let Some(row) = page.next() { self.execution.context.check_cancelled()?;writer.write(&row.values,&self.execution.context.memory)?; } }
-            self.reader = Some(writer.finish()?.reader(Arc::clone(&self.execution.context.memory))?);
+            let memory = &self.execution.context.memory;
+            let mut rows = Vec::new();
+            while let Some(mut page) = right.next_page().await? { while let Some(row) = page.next() { self.execution.context.check_cancelled()?; rows.push(OwnedRow::copy_parts(&[&row.values], 0, 0, memory)?); } }
+            let bytes = rows.len().checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>() + 1)
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| invalid("set-size", "Set rows exceed addressable memory"))?;
+            let reservation = memory.reserve(bytes)?;
+            let mut index: std::collections::HashMap<u32, Vec<usize>> = Default::default();
+            for (ordinal, row) in rows.iter().enumerate() { index.entry(equality_hash(&row.values, &self.execution.context.timezone)).or_default().push(ordinal); }
+            let consumed = vec![false; rows.len()];
+            self.built = Some(RightRows { rows, index, consumed, _reservation: reservation });
         }
         while let Some(mut page) = self.left.next_page().await? {
           let mut output = PageBuilder::new(page.len(),&self.execution.context.memory)?;
@@ -625,18 +624,17 @@ impl PageCursor for SetCursor {
             let left_types = self.runtime.child(0)?;let right_types = self.runtime.child(1)?;
             for (left, right) in left_types.schema().fields().iter().zip(right_types.schema().fields()) { rtdb_plan::validate_equality_types(&left.data_type, &right.data_type)?; }
             if !self.all && !self.seen.insert(&left.values)? { continue; }
-            let reader = self.reader.as_mut().ok_or_else(|| invalid("set-state", "Set input was not spooled"))?;
-            reader.rewind()?;
-            let mut ordinal = 0u64;
+            let built = self.built.as_mut().ok_or_else(|| invalid("set-state", "Set input was not built"))?;
             let mut matched = false;
-            while let Some(right) = reader.next()? {
-                self.execution.context.check_cancelled()?;
-                if rows_equal(&left.values, &right.values, &self.execution.context.timezone, &self.execution.context.memory)? && (!self.all || !self.consumed.contains(ordinal)?) {
-                    if self.all { self.consumed.insert(ordinal)?; }
-                    matched = true;
-                    break;
+            if let Some(candidates) = built.index.get(&equality_hash(&left.values, &self.execution.context.timezone)) {
+                for &ordinal in candidates {
+                    if self.all && built.consumed[ordinal] { continue; }
+                    if rows_equal(&left.values, &built.rows[ordinal].values, &self.execution.context.timezone, &self.execution.context.memory)? {
+                        if self.all { built.consumed[ordinal] = true; }
+                        matched = true;
+                        break;
+                    }
                 }
-                ordinal = ordinal.checked_add(1).ok_or_else(|| invalid("row-count", "Set row count overflow"))?;
             }
             if matched == (self.operator == SetOperator::Intersect) { output.push(left)?; }
           }

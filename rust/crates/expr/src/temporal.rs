@@ -58,6 +58,9 @@ fn rescale(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
     i64::try_from(i128::from(value) * i128::from(target.units_per_second()) / i128::from(source.units_per_second())).map_err(|_| overflow())
 }
 pub(crate) fn date_days(value: &Value) -> Option<i64> { value.date_days() }
+/// The wall-clock microseconds a date or timestamp reads as in `timezone`: date-times that compare equal share it.
+pub fn local_micros(value: &Value, timezone: &str) -> Option<i64> { timestamp_units(value, TimeUnit::Microsecond, true, timezone).ok() }
+
 pub(crate) fn timestamp_units(value: &Value, unit: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
     if let Some(days) = date_days(value) { return days.checked_mul(86_400).and_then(|seconds| seconds.checked_mul(unit.units_per_second())).ok_or_else(overflow); }
     match value {

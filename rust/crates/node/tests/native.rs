@@ -1676,3 +1676,20 @@ async fn a_stored_struct_reads_back_with_its_fields_in_written_order() {
     assert_eq!(equal, [vec![Value::Bool(true), Value::Bool(false)]], "structs compare as maps whatever their field order");
     drop(session); stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn each_argument_row_of_a_batched_update_reads_what_the_rows_before_it_wrote() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let insert = TxOp::Sql { sql: "INSERT INTO docs (_id, value) VALUES (?, ?)".into(), args: Some(SqlArguments::from_rows(vec![vec![Value::I64(1), Value::I64(10)], vec![Value::I64(2), Value::I64(20)]], node.memory()).unwrap()) };
+        assert!(session.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap().committed());
+        let arguments = vec![vec![Value::I64(5), Value::I64(1)], vec![Value::I64(7), Value::I64(2)], vec![Value::I64(100), Value::I64(1)]];
+        let update = TxOp::Sql { sql: "UPDATE docs SET added = ?, value = value + 1 WHERE _id = ?".into(), args: Some(SqlArguments::from_rows(arguments, node.memory()).unwrap()) };
+        let updated = session.state_mut().execute_tx(vec![update], AutonomousTxOptions::default()).await.unwrap();
+        assert!(updated.committed(), "{:?}", updated.error());
+        assert_eq!(rows(session.query_sql("SELECT _id, value, added FROM docs ORDER BY _id", vec![]).await.unwrap()).await,
+            vec![vec![Value::I64(1), Value::I64(12), Value::I64(100)], vec![Value::I64(2), Value::I64(21), Value::I64(7)]]);
+        stop(&node, driver).await;
+    }).await.unwrap();
+}

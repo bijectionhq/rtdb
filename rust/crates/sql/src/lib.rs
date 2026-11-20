@@ -36,7 +36,7 @@ use rtdb_plan::{Catalog, PreparedStatement};
 use rtdb_types::{LogicalType, MemoryBudget, Result};
 use std::{collections::BTreeMap, sync::Arc};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PrepareOptions {
     pub search_path: Vec<String>,
     pub parameter_types: BTreeMap<usize, LogicalType>,
