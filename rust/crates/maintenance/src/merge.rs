@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
 use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
-use rtdb_format::{data::{EventBatch, StoredEvent, copy_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
+use rtdb_format::{data::{EventBatch, StoredEvent, StoredOperation, copy_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
@@ -282,7 +282,10 @@ impl CompactionExecutor for SegmentCompactor {
                     }
                 } else { 0 };
                 bucket_charges.push(self.memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Output row allocation overflow"))?)?);
-                let mut event = event.clone();
+                // The heap compares only rows it has yet to yield, by their headers, so a yielded row gives up its document.
+                let source = &mut rows[stream][row];
+                let mut event = StoredEvent { iid: source.iid, system_from: source.system_from, valid_time: source.valid_time,
+                    operation: std::mem::replace(&mut source.operation, StoredOperation::Delete), recency: source.recency };
                 event.recency = if outputs[target].carries_recency { Some(if job.recency_mode == RecencyMode::Partition { recency } else { event.recency.ok_or_else(|| crate::invalid("Historical input lost recency"))? }) } else { None };
                 buckets.entry(target).or_default().push(event);
             }
