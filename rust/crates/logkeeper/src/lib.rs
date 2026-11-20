@@ -8,5 +8,5 @@ mod client;
 mod protocol;
 mod server;
 
-pub use client::{QuorumLog, StreamConfig, open_reader, open_writer, seal, trim};
+pub use client::{CopyFrom, Loglet, QuorumLog, StreamConfig, open_reader, open_reader_on, open_writer, open_writer_on, seal, trim};
 pub use server::{ServerOptions, serve};

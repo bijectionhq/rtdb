@@ -42,7 +42,9 @@ Update this section as stages land.
 - **Two streams per deployment.**
   Each deployment keeps a source and a replica stream on its ensemble, both written only by the holder; routed resolution with idempotency keys (stage 3, items 3 and 6) is not built, so a transaction costs two quorum appends.
 - **One ensemble for every epoch.**
-  A deployment's streams stay on the ensemble chosen at creation; the loglet chain that lets an epoch move to other logkeepers is not built.
+  A deployment's streams stay on the ensemble chosen at creation.
+  The logkeeper client can move a stream across epochs (`open_writer_on` seals the previous loglet, recovers its tail and copies it onto the new ensemble; `open_reader_on` reads a whole chain), but the directory does not record a chain and no holder moves one.
+  A move seals only the chain's last loglet, not every earlier one as `SealPriorLoglets` does: an earlier loglet was sealed by the move that ended it, and no later writer appends to it.
 - **Logkeeper storage.**
   One journal file per stream rather than per writer, and retained entries held in memory.
 - **Linearizable reads are not wired.**

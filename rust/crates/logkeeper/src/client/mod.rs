@@ -32,12 +32,40 @@ pub struct StreamConfig {
     pub maximum_message_bytes: usize,
 }
 
+/// One ensemble's span of a stream: it holds the stream's lsns from `start_lsn` up to the next loglet's `start_lsn` in a chain.
+/// A chain lists a stream's loglets oldest first; one stream name names the stream on every ensemble, and a server may belong to several of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Loglet {
+    pub servers: Vec<String>,
+    pub start_lsn: i64,
+}
+
+/// Where a moved stream's new loglet starts holding its history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyFrom {
+    /// The previous loglet's start, or its trim point when that is higher: the new ensemble holds everything the previous one held.
+    Retained,
+    /// This lsn, kept between the previous loglet's trim point and one past its recovered tail.
+    Lsn(i64),
+}
+
 pub struct QuorumLog { shared: Arc<Shared> }
 
 struct Shared {
     ensemble: Arc<Ensemble>,
+    /// The first lsn the current loglet holds; lower lsns are read from `earlier`.
+    start: i64,
+    earlier: Vec<Earlier>,
     role: Role,
     cancellation: CancellationToken,
+}
+
+/// A loglet before the current one, read for lsns in `[start, end)`, every one of them committed.
+struct Earlier {
+    ensemble: Ensemble,
+    start: i64,
+    end: i64,
+    reader: Reader,
 }
 
 enum Role {
@@ -68,12 +96,66 @@ pub async fn open_writer(config: StreamConfig, epoch: u64, cancellation: Cancell
     if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "writer epochs start at 1")); }
     let ensemble = Arc::new(Ensemble::new(config));
     let writer = Writer::open(Arc::clone(&ensemble), epoch).await?;
-    Ok(Arc::new(QuorumLog { shared: Arc::new(Shared { ensemble, role: Role::Writer(writer), cancellation }) }))
+    Ok(Arc::new(QuorumLog { shared: Arc::new(Shared { ensemble, start: 0, earlier: Vec::new(), role: Role::Writer(writer), cancellation }) }))
+}
+
+fn loglet_config(loglet: &Loglet, like: &StreamConfig) -> rtdb_types::Result<StreamConfig> {
+    let config = StreamConfig { servers: loglet.servers.clone(), ..like.clone() };
+    validate(&config)?;
+    Ok(config)
+}
+
+fn validate_chain(chain: &[Loglet]) -> rtdb_types::Result<()> {
+    if chain.is_empty() { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-chain", "a chain needs at least one loglet")); }
+    if chain.windows(2).any(|pair| pair[0].start_lsn >= pair[1].start_lsn) || chain[0].start_lsn < 0 {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-chain", "a chain's loglets start at rising lsns from 0"));
+    }
+    Ok(())
+}
+
+/// The loglets of `chain` below `start`, each read up to its successor's start or `start`.
+fn earlier(chain: &[Loglet], start: i64, like: &StreamConfig) -> rtdb_types::Result<Vec<Earlier>> {
+    let kept: Vec<&Loglet> = chain.iter().take_while(|loglet| loglet.start_lsn < start).collect();
+    kept.iter().enumerate().map(|(index, loglet)| {
+        let end = kept.get(index + 1).map_or(start, |next| next.start_lsn);
+        let reader = Reader { latest: AtomicI64::new(end - 1), preferred: AtomicUsize::new(0) };
+        Ok(Earlier { ensemble: Ensemble::new(loglet_config(loglet, like)?), start: loglet.start_lsn, end, reader })
+    }).collect()
+}
+
+/// Moves the stream to `new.servers` at `epoch`: seals the last loglet of `chain` at `epoch`, recovers its committed tail, copies it onto the new ensemble from where `from` says, and returns the stream's only writer at that epoch, which appends to the new ensemble alone.
+/// `chain` lists the stream's earlier loglets oldest first; each is read with `new`'s stream name and write quorum.
+/// Lsns stay dense across the move, and [`QuorumLog::loglets`] gives the chain to record and hand to readers.
+/// An `open_writer` or `seal` of the old ensemble at `epoch` or below is refused afterwards.
+pub async fn open_writer_on(chain: Vec<Loglet>, new: StreamConfig, epoch: u64, from: CopyFrom, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
+    validate(&new)?;
+    validate_chain(&chain)?;
+    if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "writer epochs start at 1")); }
+    let previous_loglet = chain.last().expect("validated non-empty");
+    let previous = Ensemble::new(loglet_config(previous_loglet, &new)?);
+    let ensemble = Arc::new(Ensemble::new(new.clone()));
+    let (writer, start) = Writer::open_moved(&previous, previous_loglet.start_lsn, Arc::clone(&ensemble), epoch, from).await?;
+    let earlier = earlier(&chain, start, &new)?;
+    Ok(Arc::new(QuorumLog { shared: Arc::new(Shared { ensemble, start, earlier, role: Role::Writer(writer), cancellation }) }))
 }
 
 /// Reads committed entries from whichever reachable server has the highest commit lsn, failing over on error.
 pub async fn open_reader(config: StreamConfig, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
     validate(&config)?;
+    let current = Loglet { servers: config.servers.clone(), start_lsn: 0 };
+    open_reader_on(vec![current], config, cancellation).await
+}
+
+/// Reads a stream across its whole `chain`, oldest first: an lsn below a loglet's successor's start is read from that loglet.
+/// `config` names the stream and its last loglet's servers, which must be the chain's last.
+pub async fn open_reader_on(chain: Vec<Loglet>, config: StreamConfig, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
+    validate(&config)?;
+    validate_chain(&chain)?;
+    let current = chain.last().expect("validated non-empty");
+    if current.servers != config.servers {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-chain", "a reader's servers are its chain's last loglet's"));
+    }
+    let (start, earlier) = (current.start_lsn, earlier(&chain, current.start_lsn, &config)?);
     let ensemble = Arc::new(Ensemble::new(config));
     let probes: Vec<_> = (0..ensemble.len()).map(|server| { let ensemble = &ensemble; async move { (server, ensemble.read(server, 0, 0, Duration::ZERO).await) } })
         .collect::<FuturesUnordered<_>>().collect().await;
@@ -88,7 +170,7 @@ pub async fn open_reader(config: StreamConfig, cancellation: CancellationToken) 
     }
     let (preferred, latest) = best.ok_or_else(|| Anomaly::from(Error::Remote { key: ensemble.config.stream.clone(), message: format!("no server reachable: {}", failures.join("; ")) }))?;
     let reader = Reader { latest: AtomicI64::new(latest), preferred: AtomicUsize::new(preferred) };
-    Ok(Arc::new(QuorumLog { shared: Arc::new(Shared { ensemble, role: Role::Reader(reader), cancellation }) }))
+    Ok(Arc::new(QuorumLog { shared: Arc::new(Shared { ensemble, start, earlier, role: Role::Reader(reader), cancellation }) }))
 }
 
 /// Fences the stream at `epoch` without becoming its writer; returns the highest lsn a write quorum of servers holds.
@@ -113,6 +195,14 @@ pub async fn trim(config: &StreamConfig, through: LogOffset) -> rtdb_types::Resu
 }
 
 impl QuorumLog {
+    /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
+    pub fn loglets(&self) -> Vec<Loglet> {
+        let shared = &self.shared;
+        shared.earlier.iter().map(|loglet| Loglet { servers: loglet.ensemble.config.servers.clone(), start_lsn: loglet.start })
+            .chain([Loglet { servers: shared.ensemble.config.servers.clone(), start_lsn: shared.start }])
+            .collect()
+    }
+
     /// For the stream's writer: succeeds once a write quorum of servers has confirmed, in a round that started after this call, that the stream is not sealed beyond the writer's epoch.
     /// A read served afterwards from what the writer had committed is linearizable, since no successor can have committed before the call began; this involves no clock.
     /// Concurrent callers share one round, so a burst costs at most two; a server reporting a higher promise deposes the writer, failing this and its appends with `Error::Deposed`.
@@ -169,6 +259,14 @@ impl Shared {
     /// Committed records from `from` and below `to`, waiting up to `wait` for the first; empty means `from` is past the committed tip.
     async fn read(&self, from: i64, to: i64, max_entries: u32, wait: Duration) -> Result<Vec<LogRecord>> {
         self.check_open()?;
+        if from < self.start {
+            let Some(loglet) = self.earlier.iter().rev().find(|loglet| loglet.start <= from) else {
+                return Err(Error::UnavailableLogRange { requested: from, first_retained: self.earlier.first().map_or(self.start, |loglet| loglet.start) });
+            };
+            let records = self.read_committed(&loglet.ensemble, &loglet.reader, from, to.min(loglet.end), max_entries, Duration::ZERO).await?;
+            if records.is_empty() && from < to { return Err(unavailable(&self.ensemble.config.stream, format!("no server of the loglet starting at {} holds committed lsn {from}", loglet.start))); }
+            return Ok(records);
+        }
         match &self.role {
             Role::Writer(writer) => {
                 let tip = self.await_tip(writer, from - 1, wait).await?;
@@ -187,29 +285,50 @@ impl Shared {
                 }
                 Err(failure.unwrap_or_else(|| unavailable(&self.ensemble.config.stream, format!("no live server holds committed lsn {from}"))))
             }
-            Role::Reader(reader) => {
-                let servers = self.ensemble.len();
-                let start = reader.preferred.load(Ordering::Relaxed);
-                let mut failure = None;
-                let mut reached = false;
-                for attempt in 0..servers {
-                    let server = (start + attempt) % servers;
-                    let wait = if attempt == 0 { wait } else { Duration::ZERO };
-                    let read = tokio::select! {
-                        _ = self.cancellation.cancelled() => return Err(Error::Closed("shutdown".into())),
-                        read = self.ensemble.read(server, from, max_entries, wait) => read,
-                    };
-                    let entries = match read { Ok(entries) => entries, Err(error) => { failure = Some(error); continue } };
-                    reached = true;
-                    check_retained(from, &entries)?;
-                    let latest = reader.latest.fetch_max(entries.commit_lsn, Ordering::AcqRel).max(entries.commit_lsn);
-                    if entries.entries.is_empty() && entries.commit_lsn < latest && from <= latest { continue; }
-                    reader.preferred.store(server, Ordering::Relaxed);
-                    return Ok(entries.entries.into_iter().take_while(|entry| entry.lsn < to).map(record).collect());
-                }
-                if reached { Ok(Vec::new()) } else { Err(failure.unwrap_or_else(|| unavailable(&self.ensemble.config.stream, "no server reachable"))) }
-            }
+            Role::Reader(reader) => self.read_committed(&self.ensemble, reader, from, to, max_entries, wait).await,
         }
+    }
+
+    /// Committed records of `ensemble` from `from` and below `to`, from the preferred server or, failing that, the others in turn.
+    async fn read_committed(&self, ensemble: &Ensemble, reader: &Reader, from: i64, to: i64, max_entries: u32, wait: Duration) -> Result<Vec<LogRecord>> {
+        let servers = ensemble.len();
+        let start = reader.preferred.load(Ordering::Relaxed);
+        let mut failure = None;
+        let mut reached = false;
+        for attempt in 0..servers {
+            let server = (start + attempt) % servers;
+            let wait = if attempt == 0 { wait } else { Duration::ZERO };
+            let read = tokio::select! {
+                _ = self.cancellation.cancelled() => return Err(Error::Closed("shutdown".into())),
+                read = ensemble.read(server, from, max_entries, wait) => read,
+            };
+            let entries = match read { Ok(entries) => entries, Err(error) => { failure = Some(error); continue } };
+            reached = true;
+            check_retained(from, &entries)?;
+            let latest = reader.latest.fetch_max(entries.commit_lsn, Ordering::AcqRel).max(entries.commit_lsn);
+            if entries.entries.is_empty() && entries.commit_lsn < latest && from <= latest { continue; }
+            reader.preferred.store(server, Ordering::Relaxed);
+            return Ok(entries.entries.into_iter().take_while(|entry| entry.lsn < to).map(record).collect());
+        }
+        if reached { Ok(Vec::new()) } else { Err(failure.unwrap_or_else(|| unavailable(&ensemble.config.stream, "no server reachable"))) }
+    }
+
+    /// The trim point across the chain: the current loglet's, unless it leaves lsns below its start to an earlier loglet, whose own trim point then counts.
+    async fn chain_trim(&self, current_trim: i64) -> Result<i64> {
+        if current_trim >= self.start || self.earlier.is_empty() { return Ok(current_trim); }
+        for loglet in &self.earlier {
+            let mut failure = None;
+            let mut trim = None;
+            for server in 0..loglet.ensemble.len() {
+                match loglet.ensemble.read(server, loglet.end, 0, Duration::ZERO).await {
+                    Ok(entries) => { trim = Some(entries.trim_lsn); break; }
+                    Err(error) => failure = Some(error),
+                }
+            }
+            let trim = trim.ok_or_else(|| failure.unwrap_or_else(|| unavailable(&loglet.ensemble.config.stream, "no server reachable")))?;
+            if trim < loglet.end - 1 { return Ok(trim.max(loglet.start - 1)); }
+        }
+        Ok(self.start - 1)
     }
 
     /// The committed tip and the trim point, asked of a server.
@@ -232,7 +351,7 @@ impl Shared {
                         Role::Writer(_) => tip,
                         Role::Reader(reader) => reader.latest.fetch_max(entries.commit_lsn, Ordering::AcqRel).max(entries.commit_lsn),
                     };
-                    return Ok((tip, entries.trim_lsn));
+                    return Ok((tip, self.chain_trim(entries.trim_lsn).await?));
                 }
                 Err(error) => failure = Some(error),
             }
