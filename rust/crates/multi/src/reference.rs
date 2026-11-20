@@ -221,8 +221,10 @@ impl References {
         let mut references = Self::default();
         for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) {
             for store in stores(bucket, &record.storage_prefix()).await? {
+                // One listing per store, rather than a request per reference, on every reaper pass.
+                let own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();
                 for (name, owner) in Base::load(bucket, &store).await?.objects {
-                    if holds(bucket, &store, &name).await? { continue; }
+                    if own.contains(&name) { continue; }
                     references.by_object.entry(format!("{owner}/{name}")).or_default().insert(store.clone());
                 }
             }
