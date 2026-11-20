@@ -605,3 +605,130 @@ async fn updates_sent_back_to_back_across_a_holders_death_are_neither_lost_nor_d
     cell.add_node().await;
     cell.stop().await;
 }
+
+/// Every column of every row `sql` returns, sorted.
+async fn rows(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
+    let mut rows: Vec<String> = client.simple_query(sql).await.unwrap().into_iter().filter_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => Some((0..row.len()).map(|column| row.get(column).unwrap_or("NULL").to_owned()).collect::<Vec<_>>().join("|")),
+        _ => None,
+    }).collect();
+    rows.sort();
+    rows
+}
+
+const FRAGMENT_QUERIES: [&str; 5] = [
+    "SELECT * FROM orders",
+    "SELECT _id, total FROM orders WHERE total > 2500",
+    "SELECT count(*) AS n, sum(total) AS total, max(note) AS note FROM orders",
+    "SELECT i._id, i.qty, o.note FROM items AS i JOIN orders AS o ON i.order_id = o._id",
+    "SELECT _id, _system_from, _system_to, note FROM orders FOR ALL SYSTEM_TIME WHERE _id < 400",
+];
+
+/// A deployment with three tables spanning many trie leaves, flushed to a block and then written past it.
+async fn large_deployment(cell: &Cell, name: &str) -> tokio_postgres::Client {
+    admin::create_deployment(cell.directory.as_ref(), name, "acme", 3).await.unwrap();
+    let client = cell.connect(name).await;
+    for chunk in 0..150 {
+        let rows: Vec<String> = (chunk * 20..(chunk + 1) * 20).map(|id| format!("({id}, {id}, 'order {id}')")).collect();
+        client.simple_query(&format!("INSERT INTO orders (_id, total, note) VALUES {}", rows.join(", "))).await.unwrap();
+    }
+    for chunk in 0..75 {
+        let items: Vec<String> = (chunk * 20..(chunk + 1) * 20).map(|id| format!("('item-{id}', {}, {})", id * 2, id % 9)).collect();
+        client.simple_query(&format!("INSERT INTO items (_id, order_id, qty) VALUES {}", items.join(", "))).await.unwrap();
+    }
+    client.simple_query("INSERT INTO users (_id, name) VALUES (1, 'ada'), (2, 'grace')").await.unwrap();
+    client.simple_query("UPDATE orders SET total = total + 0.5 WHERE _id % 7 = 0").await.unwrap();
+    let holder = cell.holder(name).await.unwrap();
+    cell.node(holder).agent.flush(name).await.unwrap();
+    client.simple_query("UPDATE orders SET note = 'tail' WHERE _id BETWEEN 100 AND 300").await.unwrap();
+    client.simple_query("DELETE FROM orders WHERE _id BETWEEN 2000 AND 2100").await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total, note) VALUES (5000, 1, 'late'), (5001, 2, 'late')").await.unwrap();
+    client
+}
+
+async fn fragment_answers(client: &tokio_postgres::Client) -> Vec<Vec<String>> {
+    let mut answers = Vec::new();
+    for sql in FRAGMENT_QUERIES { answers.push(rows(client, sql).await); }
+    answers
+}
+
+fn split_above(cell: &Cell, bytes: u64) { for node in cell.nodes.iter().flatten() { node.fragmenter.split_above(bytes); } }
+
+/// The fragments each node read for another node's scans, by node index.
+fn fragments_read(cell: &Cell) -> Vec<std::collections::BTreeMap<(String, String, String), u64>> {
+    cell.nodes.iter().map(|node| node.as_ref().map(|node| node.agent.fragments_read()).unwrap_or_default()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_deployments_scans_read_as_fragments_on_the_nodes_their_slices_rank_first_on() {
+    let cell = Cell::start(3, None).await;
+    let client = large_deployment(&cell, "big").await;
+    let whole = fragment_answers(&client).await;
+    assert!(whole[0].len() > 2900 && !whole[3].is_empty() && whole[4].len() > 400);
+    assert!(fragments_read(&cell).iter().all(|read| read.is_empty()), "a deployment within one node's cache is scanned whole");
+
+    split_above(&cell, 0);
+    let fragmented = fragment_answers(&client).await;
+    for ((sql, whole), fragmented) in FRAGMENT_QUERIES.iter().zip(&whole).zip(&fragmented) { assert_eq!(fragmented, whole, "{sql}"); }
+    let first = fragments_read(&cell);
+    let holder = cell.holder("big").await.unwrap();
+    assert!(first[holder].is_empty(), "the coordinating holder reads its own fragments without sending them to itself");
+    assert_eq!(first.iter().filter(|read| !read.is_empty()).count(), 2, "both other nodes read the slices that rank them first: {first:?}");
+    assert_eq!(cell.node(holder).fragmenter.failures(), 0, "every fragment sent was read at the holder's basis");
+
+    let record = cell.directory.deployment_by_name("big").await.unwrap().unwrap();
+    let members = cell.directory.members().await.unwrap();
+    let readers = rtdb_multi::fragments::readers(&members);
+    for (index, read) in first.iter().enumerate() {
+        for (_, table, prefix) in read.keys() {
+            let (schema, table) = table.split_once('.').unwrap();
+            let prefix = rtdb_query::TriePrefix::new(prefix.bytes().map(|digit| digit - b'0').collect()).unwrap();
+            let key = rtdb_multi::fragments::fragment_key(&record.storage_identity(), &rtdb_types::TableRef::new(schema, table), &prefix);
+            let ranked = rtdb_affinity::rank(&key, &readers, |member| member.id.as_str());
+            assert_eq!(ranked[0].id, cell.node(index).lease.id(), "{key} is read on the node it ranks first on");
+        }
+    }
+
+    let again = fragment_answers(&client).await;
+    assert_eq!(again, whole);
+    let second = fragments_read(&cell);
+    for (first, second) in first.iter().zip(&second) {
+        assert_eq!(first.keys().collect::<Vec<_>>(), second.keys().collect::<Vec<_>>(), "each slice is read on the same node again");
+        assert!(first.iter().all(|(key, count)| second[key] > *count));
+    }
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fragment_whose_reader_does_not_answer_is_read_by_the_coordinator() {
+    let cell = Cell::start(2, None).await;
+    let client = large_deployment(&cell, "big").await;
+    let whole = fragment_answers(&client).await;
+
+    // A reader the directory still lists, whose agent no longer listens, ranks first for some of the orders table's slices.
+    let closed = { let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(); listener.local_addr().unwrap().to_string() };
+    let record = cell.directory.deployment_by_name("big").await.unwrap().unwrap();
+    let members = cell.directory.members().await.unwrap();
+    let template = members.iter().find(|member| member.role == rtdb_directory::MemberRole::Node).unwrap().clone();
+    let orders = rtdb_types::TableRef::new("public", "orders");
+    let ranks_first = |fake: &rtdb_directory::MemberRecord| {
+        let mut all = members.clone();
+        all.push(fake.clone());
+        let readers = rtdb_multi::fragments::readers(&all);
+        rtdb_query::FragmentDepth::new(2).unwrap().prefixes().iter().any(|prefix| {
+            rtdb_affinity::rank(&rtdb_multi::fragments::fragment_key(&record.storage_identity(), &orders, prefix), &readers, |member| member.id.as_str())[0].id == fake.id
+        })
+    };
+    let fake = (0..100).map(|index| rtdb_directory::MemberRecord { id: rtdb_directory::MemberId(format!("vanished-{index}")), control_address: Some(closed.clone()),
+        lease_expires_at_ms: rtdb_directory::now_ms() + 3_600_000, ..template.clone() }).find(|fake| ranks_first(fake)).unwrap();
+    cell.directory.register_member(fake).await.unwrap();
+
+    split_above(&cell, 0);
+    let fragmented = fragment_answers(&client).await;
+    for ((sql, whole), fragmented) in FRAGMENT_QUERIES.iter().zip(&whole).zip(&fragmented) { assert_eq!(fragmented, whole, "{sql}"); }
+    let holder = cell.holder("big").await.unwrap();
+    assert!(cell.node(holder).fragmenter.failures() > 0, "the vanished reader's fragments failed and were read by the holder");
+    drop(client);
+    cell.stop().await;
+}

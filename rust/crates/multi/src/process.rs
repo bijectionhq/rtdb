@@ -42,6 +42,7 @@ pub struct NodeSettings {
 pub struct RunningNode {
     pub server: ServerHandle,
     pub agent: Arc<NodeAgent>,
+    pub fragmenter: Arc<crate::fragments::CellFragmenter>,
     pub lease: Arc<MemberLease>,
     pub control_address: SocketAddr,
     pub pgwire_address: SocketAddr,
@@ -61,6 +62,8 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let writers: crate::logs::Writers = Default::default();
     let fence = Arc::new(FenceSlot::default());
     let recorder = Arc::new(crate::logs::DirectoryRecorder { directory: Arc::clone(&directory) });
+    let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
+    let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes);
     let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys), fence_interval: Duration::from_millis(100) });
     let placed = PlacedOptions {
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
@@ -68,6 +71,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         claim_wait: settings.claim_wait,
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
+        scan_fragmenter: Some(fragmenter.clone() as Arc<dyn rtdb_query::ScanFragmenter>),
         compaction_relay: (settings.pool == rtdb_directory::MemberPool::Compaction).then(|| Arc::new(crate::relay::HolderRelay { directory: Arc::clone(&directory) }) as Arc<dyn rtdb_node::CompactionRelay>),
     };
     let (server, driver) = ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed).await?;
@@ -77,6 +81,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
         role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone, pool: settings.pool,
     }, settings.lease).await?;
+    fragmenter.set_member(lease.id());
     let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent, writers);
     let _ = fence.0.set(Arc::clone(&agent));
     let cancellation = CancellationToken::new();
@@ -86,7 +91,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     { let lease = Arc::clone(&lease); let cancellation = lease_cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     { let agent = Arc::clone(&agent); let cancellation = cancellation.clone(); tasks.spawn(async move { agent.run(cancellation).await; Ok(()) }); }
     tasks.spawn(crate::control::serve(control, agent.clone(), cancellation.clone()));
-    Ok(RunningNode { server, agent, lease, control_address, pgwire_address, cancellation, lease_cancellation, tasks })
+    Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, tasks })
 }
 
 impl RunningNode {

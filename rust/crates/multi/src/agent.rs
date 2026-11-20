@@ -40,19 +40,23 @@ pub struct AgentOptions {
     pub compaction_worker: bool,
     /// How long a snapshot stays open; it must be shorter than the reaper's grace (`max_snapshot_lifetime`).
     pub snapshot_lifetime: Duration,
+    /// When this node's sessions split a scan into fragments, and how it reads the fragments other nodes send it.
+    pub fragments: crate::fragments::FragmentOptions,
 }
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
         Self { storage, activation_timeout: Duration::from_secs(30), watch_interval: Duration::from_millis(250), park_after: None,
-            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: Duration::from_secs(30 * 60) }
+            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: Duration::from_secs(30 * 60),
+            fragments: crate::fragments::FragmentOptions::default() }
     }
 }
 
 const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
 
 struct LocalHolding { id: String, epoch: u64, last_touch: Instant, linearizable: bool }
-struct LocalSubscription { id: String, last_touch: Instant, opened: Instant, role: Role }
+/// `fragments` keeps a replica open for the fragments other nodes send it, whatever the deployment's read width.
+struct LocalSubscription { id: String, last_touch: Instant, opened: Instant, role: Role, fragments: bool }
 
 pub struct NodeAgent {
     directory: Arc<dyn Directory>,
@@ -67,16 +71,20 @@ pub struct NodeAgent {
     trimmed: Mutex<HashMap<String, i64>>,
     /// One activation, subscription or park at a time per deployment name.
     turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// How many fragments this node has read for other nodes' scans, by deployment, table and prefix.
+    fragments_read: Mutex<BTreeMap<(String, String, String), u64>>,
 }
 
 impl NodeAgent {
     pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()) })
+        Arc::new(Self { directory, node, lease, address, options, holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
     pub fn held(&self) -> BTreeMap<String, u64> { self.holdings.lock().iter().map(|(name, holding)| (name.clone(), holding.epoch)).collect() }
     pub fn subscribed(&self) -> Vec<String> { self.subscriptions.lock().keys().cloned().collect() }
+    /// The fragments this node has read for other nodes, as (deployment, `schema.table`, prefix) with how often.
+    pub fn fragments_read(&self) -> BTreeMap<(String, String, String), u64> { self.fragments_read.lock().clone() }
 
     fn turn(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(self.turns.lock().entry(name.to_owned()).or_default())
@@ -253,7 +261,10 @@ impl NodeAgent {
         Ok(Response::Done)
     }
 
-    pub async fn subscribe(&self, name: &str) -> Result<Response> {
+    pub async fn subscribe(&self, name: &str) -> Result<Response> { self.subscribe_for(name, false).await }
+
+    /// Opens a log-fed replica of `name` unless this node already serves it; `fragments` keeps it open for fragment reads.
+    async fn subscribe_for(&self, name: &str, fragments: bool) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
         let record = self.record(name).await?;
@@ -261,6 +272,7 @@ impl NodeAgent {
         if let Some(subscription) = self.subscriptions.lock().get_mut(name) {
             if subscription.id == record.id && self.node.catalog().database(name).is_ok() {
                 subscription.last_touch = Instant::now();
+                subscription.fragments |= fragments;
                 return Ok(Response::Subscribed { address: self.address.clone() });
             }
         }
@@ -270,8 +282,21 @@ impl NodeAgent {
         self.stop_running(name).await;
         self.node.database_or_attach(name.to_owned(), configuration).await?
             .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the replica"))?;
-        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Subscriber });
+        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Subscriber, fragments });
         Ok(Response::Subscribed { address: self.address.clone() })
+    }
+
+    /// Reads a fragment of another node's scan of `name`, from the holding or replica this node has of it, opening a replica if it has neither.
+    pub async fn scan_fragment(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<Response> {
+        use base64::Engine;
+        if fragment.database() != name { return Err(Anomaly::incorrect("rtdb.multi/fragment-database", format!("A fragment of {} was sent as one of {name}", fragment.database()))); }
+        let held = self.holdings.lock().contains_key(name);
+        if !held || self.node.catalog().database(name).is_err() { self.subscribe_for(name, true).await?; }
+        self.touch(name);
+        let bytes = self.node.scan_fragment(fragment, self.options.fragments.catch_up, &CancellationToken::new()).await?;
+        let table = fragment.table();
+        *self.fragments_read.lock().entry((name.to_owned(), format!("{}.{}", table.schema, table.table), fragment.prefix.to_string())).or_default() += 1;
+        Ok(Response::Fragment { batches: base64::engine::general_purpose::STANDARD.encode(bytes) })
     }
 
     /// Serves the deployment's reads as of its checkpoint, opening it from object storage alone unless this node already has it open, at that state or a later one.
@@ -292,7 +317,7 @@ impl NodeAgent {
         self.stop_running(name).await;
         self.node.database_or_attach(name.to_owned(), configuration).await?
             .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the snapshot"))?;
-        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Snapshot(checkpoint) });
+        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Snapshot(checkpoint), fragments: false });
         Ok(Response::Subscribed { address: self.address.clone() })
     }
 
@@ -369,7 +394,7 @@ impl NodeAgent {
             let Ok(servers) = Self::servers(&record, &members) else { continue };
             let configuration = database_config(&record, servers, &self.options.storage, Role::Compactor);
             if let Ok(Some(_)) = self.node.database_or_attach(name.clone(), configuration).await {
-                self.subscriptions.lock().insert(name, LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor });
+                self.subscriptions.lock().insert(name, LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor, fragments: false });
             }
         }
     }
@@ -405,10 +430,10 @@ impl NodeAgent {
         }
         if self.options.compaction_worker { self.reconcile_compaction().await; }
         if let Some(limit) = self.options.max_tail_rows { self.bound_tails(limit).await; }
-        let subscribed: Vec<(String, String, Instant, Instant, bool)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role != Role::Compactor)
-            .map(|(name, subscription)| (name.clone(), subscription.id.clone(), subscription.last_touch, subscription.opened, matches!(subscription.role, Role::Snapshot(_)))).collect();
-        for (name, id, last_touch, opened, snapshot) in subscribed {
-            let wanted = matches!(self.directory.deployment(&id).await, Ok(Some(record)) if record.lifecycle == Lifecycle::Live && (snapshot || record.read_width > 1));
+        let subscribed: Vec<(String, String, Instant, Instant, bool, bool)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role != Role::Compactor)
+            .map(|(name, subscription)| (name.clone(), subscription.id.clone(), subscription.last_touch, subscription.opened, matches!(subscription.role, Role::Snapshot(_)), subscription.fragments)).collect();
+        for (name, id, last_touch, opened, snapshot, fragments) in subscribed {
+            let wanted = matches!(self.directory.deployment(&id).await, Ok(Some(record)) if record.lifecycle == Lifecycle::Live && (snapshot || fragments || record.read_width > 1));
             // A snapshot closes before the reaper's grace could erase what it reads.
             let expired = snapshot && opened.elapsed() >= self.options.snapshot_lifetime;
             if draining || !wanted || expired || last_touch.elapsed() >= self.options.unsubscribe_after || self.node.catalog().database(&name).is_err() {
@@ -450,6 +475,7 @@ impl Handler for NodeAgent {
             Request::Snapshot { name } => self.snapshot(&name).await,
             Request::Flush { name } => self.flush(&name).await,
             Request::PublishCompaction { name, notification } => self.publish_compaction(&name, &notification).await,
+            Request::ScanFragment { name, fragment } => self.scan_fragment(&name, &fragment).await,
         };
         result.unwrap_or_else(|error| Response::refused(&error))
     }

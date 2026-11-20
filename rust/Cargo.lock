@@ -4279,6 +4279,7 @@ dependencies = [
  "rtdb-logkeeper",
  "rtdb-node",
  "rtdb-pgwire",
+ "rtdb-query",
  "rtdb-replication",
  "rtdb-server",
  "rtdb-storage",

@@ -10,6 +10,7 @@ pub mod cells;
 pub mod cipher;
 pub mod control;
 pub mod deployment;
+pub mod fragments;
 pub mod gateway;
 pub mod keys;
 pub mod lease;

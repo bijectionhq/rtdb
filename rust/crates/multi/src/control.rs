@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "op")]
 pub enum Request {
     /// Become the deployment's holder, or name who is.
@@ -29,6 +29,8 @@ pub enum Request {
     Flush { name: String },
     /// Publish a compaction a worker produced, as the deployment's holder; the notification is an encoded TriesAdded.
     PublishCompaction { name: String, notification: Vec<u8> },
+    /// Read a fragment of another node's scan of the deployment, at the fragment's basis (`RefineKeyForLargeDeployments`).
+    ScanFragment { name: String, fragment: rtdb_query::ScanFragment },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +44,8 @@ pub enum Response {
     Subscribed { address: String },
     Done,
     Published { position: i64 },
+    /// A fragment's rows: length-prefixed Arrow IPC streams, in base64.
+    Fragment { batches: String },
     Refused { code: String, message: String },
 }
 

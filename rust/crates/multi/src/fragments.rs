@@ -1,0 +1,102 @@
+//! Scan fragments for deployments larger than one node's cache (`RefineKeyForLargeDeployments`).
+//!
+//! A scan of such a deployment splits by trie prefix, and each fragment is read by the node that ranks first for
+//! `{storage identity}/{table}/{prefix}` among the cell's readers, so every node keeps the same slice of the deployment warm.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use base64::Engine;
+use rtdb_directory::{Directory, MemberId, MemberPool, MemberRecord, now_ms};
+use rtdb_query::{FragmentDepth, ScanFragment, ScanFragmenter, TriePrefix};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef};
+
+use crate::control::{self, Request, Response};
+
+#[derive(Clone, Debug)]
+pub struct FragmentOptions {
+    /// Split the scans of a deployment holding more persisted bytes than this; by default, the node's disk cache size.
+    pub above_bytes: Option<u64>,
+    pub depth: FragmentDepth,
+    /// How long a reader may take to answer a fragment, catching up to its basis included.
+    pub timeout: Duration,
+    /// How long a reader waits for its copy of the deployment to reach a fragment's basis.
+    pub catch_up: Duration,
+}
+
+impl Default for FragmentOptions {
+    fn default() -> Self {
+        Self { above_bytes: None, depth: FragmentDepth::new(2).expect("a valid depth"), timeout: Duration::from_secs(30), catch_up: Duration::from_secs(5) }
+    }
+}
+
+/// The affinity key a fragment is placed by.
+pub fn fragment_key(storage_identity: &str, table: &TableRef, prefix: &TriePrefix) -> String {
+    format!("{storage_identity}/{}.{}/{prefix}", table.schema, table.table)
+}
+
+/// The nodes that may read a fragment: every node that may take a placement, compaction workers aside.
+pub fn readers(members: &[MemberRecord]) -> Vec<&MemberRecord> {
+    let now = now_ms();
+    members.iter().filter(|member| member.may_receive_placements(now) && member.pool != MemberPool::Compaction && member.control_address.is_some()).collect()
+}
+
+/// A node's fragmenter: places each fragment of its sessions' scans on the reader it ranks first on.
+pub struct CellFragmenter {
+    directory: Arc<dyn Directory>,
+    member: OnceLock<MemberId>,
+    above_bytes: AtomicU64,
+    depth: FragmentDepth,
+    timeout: Duration,
+    failures: AtomicU64,
+}
+
+impl CellFragmenter {
+    pub fn new(directory: Arc<dyn Directory>, options: &FragmentOptions, cache_bytes: u64) -> Arc<Self> {
+        Arc::new(Self { directory, member: OnceLock::new(), above_bytes: AtomicU64::new(options.above_bytes.unwrap_or(cache_bytes)), depth: options.depth, timeout: options.timeout, failures: AtomicU64::new(0) })
+    }
+
+    /// Names this node once its lease is registered; until then, every fragment is read here.
+    pub fn set_member(&self, member: MemberId) { let _ = self.member.set(member); }
+
+    /// Splits scans of deployments holding more than `bytes` of persisted tries from now on; `u64::MAX` splits none.
+    pub fn split_above(&self, bytes: u64) { self.above_bytes.store(bytes, Ordering::Relaxed); }
+
+    /// How many fragments a reader failed to answer, each of which the coordinator then read itself.
+    pub fn failures(&self) -> u64 { self.failures.load(Ordering::Relaxed) }
+
+    async fn place(&self, fragment: &ScanFragment) -> Result<Option<String>> {
+        let Some(me) = self.member.get() else { return Ok(None) };
+        let record = self.directory.deployment_by_name(fragment.database()).await?
+            .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {}", fragment.database())))?;
+        let members = self.directory.members().await?;
+        let readers = readers(&members);
+        let key = fragment_key(&record.storage_identity(), fragment.table(), &fragment.prefix);
+        let first = rtdb_affinity::rank(&key, &readers, |member| member.id.as_str()).into_iter().next().copied();
+        Ok(first.filter(|first| first.id != *me).and_then(|first| first.control_address.clone()))
+    }
+
+    async fn read_on(&self, control_address: &str, fragment: &ScanFragment) -> Result<Vec<u8>> {
+        let request = Request::ScanFragment { name: fragment.database().to_owned(), fragment: fragment.clone() };
+        match control::call(control_address, &request, self.timeout).await? {
+            Response::Fragment { batches } => base64::engine::general_purpose::STANDARD.decode(batches).map_err(|error| Anomaly::fault("rtdb.multi/fragment-response", error.to_string())),
+            Response::Refused { code, message } => Err(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
+            other => Err(Anomaly::fault("rtdb.multi/fragment-response", format!("A reader answered a fragment with {other:?}"))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ScanFragmenter for CellFragmenter {
+    fn depth(&self, _database: &str, _table: &TableRef, persisted_bytes: u64) -> Option<FragmentDepth> {
+        (persisted_bytes > self.above_bytes.load(Ordering::Relaxed)).then_some(self.depth)
+    }
+
+    async fn dispatch(&self, fragment: &ScanFragment) -> Result<Option<Vec<u8>>> {
+        let Some(control_address) = self.place(fragment).await? else { return Ok(None) };
+        let read = self.read_on(&control_address, fragment).await;
+        if read.is_err() { self.failures.fetch_add(1, Ordering::Relaxed); }
+        read.map(Some)
+    }
+}
