@@ -58,6 +58,8 @@ pub trait RemoteStorageFactory: Send + Sync {
     /// The returned store is scoped to `storage_root`, under the provider's configured prefix.
     /// Retained provider operations belong to the supplied database region, including after caller cancellation.
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>>;
+    /// Wraps the store after the node's disk cache, so that whatever this adds (decryption, say) happens above the cache and the cache holds only what `open` returned.
+    async fn wrap_cached(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> { Ok(cached) }
 }
 
 #[async_trait]
@@ -233,9 +235,10 @@ impl ResourceFactory for NativeResources {
                 Some(database_config::Storage::LocalStorage(storage)) => Arc::new(LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?).join(root.as_str()), Arc::clone(&io))?),
                 Some(database_config::Storage::RemoteStorage(storage)) => {
                     let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
-                    let remote = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?.open(configuration, &root, Arc::clone(&io)).await?;
+                    let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
+                    let remote = factory.open(configuration, &root, Arc::clone(&io)).await?;
                     let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
-                    cache.scope_in(cache_namespace(configuration, storage_epoch)?, remote, Arc::clone(&io))?
+                    factory.wrap_cached(configuration, cache.scope_in(cache_namespace(configuration, storage_epoch)?, remote, Arc::clone(&io))?).await?
                 }
             };
             Ok(DatabaseStorage { store, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
