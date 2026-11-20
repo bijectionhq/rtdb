@@ -230,10 +230,12 @@ impl LiveTable {
             if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
             let schema = previous.arrow().schema();
             let budget = Arc::clone(previous.owned.reservation().budget());
-            let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_add(4096))
+            // A concatenation's buffers can outgrow its inputs' (variable-width columns round and grow theirs), so it is reserved for twice them and shrunk to what it holds.
+            let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_mul(2)).and_then(|bytes| bytes.checked_add(4096))
                 .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
-            let reservation = budget.reserve(bound)?;
+            let mut reservation = budget.reserve(bound)?;
             let merged = arrow_select::concat::concat_batches(&schema, [previous.arrow(), last.arrow()]).map_err(invalid)?;
+            Arc::get_mut(&mut reservation).expect("a fresh reservation is unshared").shrink_to(merged.get_array_memory_size())?;
             let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
             let start = *start;
             self.chunks.truncate(self.chunks.len() - 2);
@@ -659,5 +661,20 @@ mod chunk_tests {
         for id in [0u32, 1, 1023, 1024, 1999] {
             assert_eq!(live.row(id).unwrap().header().unwrap().system_from, Timestamp(i64::from(id)));
         }
+    }
+
+    #[test]
+    fn a_table_written_a_row_per_transaction_with_long_string_ids_merges_its_chunks() {
+        let memory = MemoryBudget::new(1 << 26);
+        let table = TableRef::new("public", "keys");
+        let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+        for id in 0..1000i64 {
+            let key = format!("{id:032x}/0");
+            let event = StoredEvent { iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Utf8(key))])), recency: None };
+            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id))
+                .unwrap_or_else(|error| panic!("row {id}: {error:?}"));
+        }
+        assert!(live.chunks.len() <= 16, "{} chunks", live.chunks.len());
     }
 }
