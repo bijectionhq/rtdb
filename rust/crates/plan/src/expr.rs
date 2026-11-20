@@ -367,9 +367,13 @@ impl Expr {
         columns
     }
 
+    /// Visits this expression and its subexpressions in pre-order, without recursing on the stack.
     pub fn visit(&self, f: &mut impl FnMut(&Self)) {
-        f(self);
-        for child in self.children() { child.visit(f); }
+        let mut pending = vec![self];
+        while let Some(expression) = pending.pop() {
+            f(expression);
+            pending.extend(expression.children().into_iter().rev());
+        }
     }
 
     /// Visits original subexpressions before applying each rewrite.

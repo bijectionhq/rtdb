@@ -26,7 +26,7 @@ impl EmbeddedRegion {
         let parsed = ParsedConfiguration::from_yaml(yaml, &ProcessEnvironment, &bootstrap, false)?.with_object_sort(object_sort);
         let (configuration, memory, configuration_charge) = parsed.into_execution(memory_bytes)?;
         drop(bootstrap);
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|error| Anomaly::fault("rtdb.ffi/runtime", error.to_string()))?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build().map_err(|error| Anomaly::fault("rtdb.ffi/runtime", error.to_string()))?;
         let (server, driver) = runtime.block_on(async {
             match transaction_clock {
                 Some(clock) => ServerDriver::open_with_log_clock(configuration, memory_bytes, memory, clock).await,

@@ -23,7 +23,9 @@ pub(crate) fn call(name: &str) -> bool { ["null_eq", "null-eq", "distinct_from",
 
 /// Validates equality calls in every expression branch, including branches that produce no values.
 /// The caller owns temporary type metadata allocation; this does not evaluate arguments.
-pub fn validate_equality_expression(expression: &Expr) -> Result<()> {
+pub fn validate_equality_expression(root: &Expr) -> Result<()> {
+    let mut pending = vec![root];
+    while let Some(expression) = pending.pop() {
     match expression {
         Expr::Binary { op, left, right } if binary(*op) => validate_equality_types(&left.data_type(), &right.data_type())?,
         Expr::Call { name, args, .. } if call(name) && args.len() == 2 => validate_equality_types(&args[0].data_type(), &args[1].data_type())?,
@@ -31,6 +33,7 @@ pub fn validate_equality_expression(expression: &Expr) -> Result<()> {
         Expr::In { expr, values, .. } => for value in values { validate_equality_types(&expr.data_type(), &value.data_type())?; },
         _ => (),
     }
-    for child in expression.children() { validate_equality_expression(child)?; }
+    pending.extend(expression.children().into_iter().rev());
+    }
     Ok(())
 }

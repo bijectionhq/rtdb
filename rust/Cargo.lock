@@ -4137,6 +4137,7 @@ dependencies = [
  "rtdb-xtql",
  "serde",
  "serde_json",
+ "stacker",
  "tempfile",
  "tokio",
  "tokio-util",

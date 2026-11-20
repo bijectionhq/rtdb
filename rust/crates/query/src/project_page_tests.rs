@@ -89,7 +89,7 @@ async fn filter_prepares_pattern_for_an_empty_child_page() {
     let mut filter = PageFilter {
         input: Box::new(Input { rows: Some(vec![]),memory: Arc::clone(&execution.context.memory) }),
         schema: Schema::new(vec![field(0,LogicalType::Scalar(ScalarType::I64))]).unwrap(),
-        predicate,execution: execution.clone(),
+        stages: vec![(predicate,execution.clone())],_collapsed: execution.context.memory.reserve(0).unwrap(),execution: execution.clone(),
     };
     assert_eq!(filter.next_page().await.err().unwrap().code,"xtdb.expression/illegal-argument-exception");
     drop(filter);assert_eq!(execution.context.memory.used_bytes(),baseline);

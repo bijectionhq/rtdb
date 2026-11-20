@@ -9,32 +9,32 @@ fn read<T: DeserializeOwned>(path: &str) -> Result<T, Box<dyn std::error::Error>
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let arguments: Vec<_> = env::args().skip(1).collect();
     if arguments.len() == 3 && arguments[0] == "backend" {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let execution = runtime.block_on(rtdb_conformance::backend::execute(Path::new(&arguments[1]), Path::new(&arguments[2])))
             .map_err(|error| -> Box<dyn std::error::Error> { error })?;
         println!("{}", serde_json::to_string(&execution)?);
         return Ok(execution["execution_complete"] == true);
     }
     if arguments.len() == 3 && arguments[0] == "recovery" {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let execution = runtime.block_on(rtdb_conformance::history::recovery::execute(Path::new(&arguments[1]), Path::new(&arguments[2])))?;
         println!("{}", serde_json::to_string(&execution)?);
         return Ok(execution["execution_complete"] == true);
     }
     if arguments.len() == 2 && arguments[0] == "observe" {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let execution = runtime.block_on(rtdb_conformance::controls::execute(Path::new(&arguments[1])))?;
         println!("{}", serde_json::to_string(&execution)?);
         return Ok(true);
     }
     if arguments.len() == 3 && arguments[0] == "history" {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let execution = runtime.block_on(rtdb_conformance::history::execute(Path::new(&arguments[1]), Path::new(&arguments[2])))?;
         println!("{}", serde_json::to_string(&execution)?);
         return Ok(execution["execution_complete"] == true);
     }
     if arguments.len() == 2 && matches!(arguments[0].as_str(), "mixed-iid" | "mixed-iid-capture") {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let output = Path::new(&arguments[1]);
         if arguments[0] == "mixed-iid-capture" {
             let execution = runtime.block_on(rtdb_conformance::history::mixed_iid::capture_checkpoint(output))?;
@@ -46,7 +46,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(true);
     }
     if arguments.len() == 3 && arguments[0] == "mixed-iid-replay" {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let execution = runtime.block_on(rtdb_conformance::history::mixed_iid::replay_checkpoint(
             Path::new(&arguments[1]), Path::new(&arguments[2]),
         ))?;
@@ -54,7 +54,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(true);
     }
     if arguments.len() == 3 && arguments[0] == "parser-wire" {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let execution = runtime.block_on(rtdb_conformance::history::parser_wire::execute(
             Path::new(&arguments[1]), Path::new(&arguments[2]),
         ))?;
@@ -62,13 +62,13 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(true);
     }
     if arguments.len() == 3 && arguments[0] == "sql-logic" {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let execution = runtime.block_on(rtdb_conformance::sql_logic::execute(Path::new(&arguments[1]), Path::new(&arguments[2])))?;
         println!("{}", serde_json::to_string(&execution)?);
         return Ok(execution["execution_complete"] == true);
     }
     if arguments.len() == 3 && arguments[0] == "simulation-refused-claim" {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build()?;
         let execution = runtime.block_on(rtdb_conformance::simulation::execute(Path::new(&arguments[1]), Path::new(&arguments[2])))?;
         println!("{}", serde_json::to_string(&execution)?);
         return Ok(execution["execution_complete"] == true);

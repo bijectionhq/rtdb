@@ -33,3 +33,7 @@ mod inspection_render;
 pub use control::{ControlExecutionOptions, ControlFrontend, ControlResult, control_schema, transaction_settings};
 mod operations;
 pub use operations::{CompactorReset, SnapshotExport};
+
+/// The stack each runtime worker gets: a query's operators and expressions nest with the depth of the statement,
+/// and stack overflow aborts the process rather than failing the query. It is reserved, not committed, up front.
+pub const WORKER_STACK_BYTES: usize = 16 << 20;

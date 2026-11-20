@@ -26,6 +26,13 @@ enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType> }, Dml }
 #[derive(Clone)]
 pub struct PreparedSql(Arc<PreparedData>);
 
+/// Binding and planning recurse as deep as the statement's expressions nest, which only long source can reach,
+/// so a long statement is prepared on a stack of its own rather than overflowing the caller's.
+fn deep<T>(source: &str, prepare: impl FnOnce() -> T) -> T {
+    const DEEP_SOURCE_BYTES: usize = 4096;
+    if source.len() < DEEP_SOURCE_BYTES { prepare() } else { stacker::grow(64 << 20, prepare) }
+}
+
 impl PreparedSql {
     pub fn prepare(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
         let source_reservation = admit_source(source, context, &mut options)?;
@@ -37,7 +44,7 @@ impl PreparedSql {
                 return Err(statement_syntax_error(source, error, &context.memory));
             }
         };
-        Self::prepare_parsed(parsed, context, options, policy, false, false, source_reservation)
+        deep(source, || Self::prepare_parsed(parsed, context, options, policy, false, false, source_reservation))
     }
 
     pub fn prepare_postgres(source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
@@ -62,6 +69,11 @@ impl PreparedSql {
     }
 
     fn prepare_postgres_parsed(parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
+        let source = parsed.source();
+        deep(source, || Self::prepare_postgres_parsed_at(parsed, context, search_path, parameter_oids))
+    }
+
+    fn prepare_postgres_parsed_at(parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
         let source = parsed.source();
         if parsed.kind() == StatementKind::Dml {
             let mut options = PrepareOptions { search_path, ..Default::default() };
@@ -139,7 +151,7 @@ impl PreparedSql {
 
     /// Returns the current Arrow signature from supplied physical parameter fields without opening vectors.
     pub fn result_schema(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType]) -> Result<Arc<RuntimeSchema>> {
-        self.bind(context, argument_types, false)?.result_schema(context)
+        deep(self.source(), || self.bind(context, argument_types, false))?.result_schema(context)
     }
 
     pub async fn open_query(&self, context: Arc<QueryContext>, arguments: Vec<Value>) -> Result<QueryCursor> {
@@ -155,7 +167,7 @@ impl PreparedSql {
         if arguments.len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
         arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], &rtdb_columnar::execution_type(ty), &context.timezone)?; }
-        let query = self.bind(&context, types, true)?;
+        let query = deep(self.source(), || self.bind(&context, types, true))?;
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
         let cursor = query.execute_with_text(context, arguments, Some(self.source())).await?;
         if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }

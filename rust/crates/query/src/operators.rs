@@ -51,6 +51,7 @@ fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution, pushdowns:
             Ok(Some((batches,false)))
         }
         RelationNode::Filter { predicate,.. } => {
+            if matches!(runtime.child(0)?.relation().node(), RelationNode::Filter { .. }) { return Ok(None); }
             let Some((batches,projected)) = build_batches(runtime.child(0)?,execution.child(0),pushdowns).await? else { return Ok(None) };
             if projected { return Ok(None); }
             Ok(Some((Box::new(crate::columnar::BatchFilter::new(batches,runtime.child(0)?.schema().clone(),predicate.clone(),execution)) as crate::columnar::BoxBatchCursor,false)))
@@ -135,7 +136,7 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
                     crate::pages::from_rows(Box::new(crate::inspection::InspectionCursor::new(scan.clone(),execution.clone(),&constraints).await?),Arc::clone(&execution.context))
                 } else { crate::pages::from_rows(Box::new(crate::system::SystemCursor::new(scan.clone(),execution.clone())),Arc::clone(&execution.context)) };
                 match predicate {
-                    Some(predicate) => Box::new(PageFilter { input: pages,schema: runtime.schema().clone(),predicate,execution }) as BoxPageCursor,
+                    Some(predicate) => Box::new(PageFilter { input: pages,schema: runtime.schema().clone(),stages: vec![(predicate,execution.clone())],_collapsed: execution.context.memory.reserve(0)?,execution }) as BoxPageCursor,
                     None => pages,
                 }
             } else {
@@ -166,8 +167,24 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         }
         RelationNode::Filter { predicate,.. } => {
             let mut constraints = constraints;constraints.add(predicate);
-            let pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
-            let pages = Box::new(PageFilter { input: pages,schema: runtime.child(0)?.schema().clone(),predicate: predicate.clone(),execution });
+            let schema = runtime.child(0)?.schema().clone();
+            let mut stages = vec![(predicate.clone(),execution.clone())];
+            let (mut child,mut child_execution) = (runtime.child(0)?,execution.child(0));
+            // A run of stacked selections is one cursor applying each in turn, so its depth never nests the cursors.
+            let mut collapsed = 0usize;
+            while execution.analysis.is_none() && execution.context.tracer.is_none() {
+                let RelationNode::Filter { predicate,.. } = child.relation().node() else { break };
+                constraints.add(predicate);
+                collapsed = collapsed.checked_add(crate::runtime_schema::local_allocation_bound(child.relation())?).ok_or_else(||invalid("operator-size","Operator state exceeds addressable memory"))?;
+                stages.push((predicate.clone(),child_execution.clone()));
+                let next = child.child(0)?;
+                child_execution = child_execution.child(0);
+                child = next;
+            }
+            stages.reverse();
+            let collapsed = execution.context.memory.reserve(collapsed)?;
+            let pages = build_pages_constrained(child,child_execution,constraints,pushdowns).await?;
+            let pages = Box::new(PageFilter { input: pages,schema,stages,execution,_collapsed: collapsed });
             let pages = crate::pages::coalesce(pages,Arc::clone(&traced_context));
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -376,21 +393,26 @@ impl PageCursor for PageExtend {
         crate::pages::extend(&page, &self.schema, self.expressions.iter().map(|named| &named.expr), &self.execution).await.map(Some)
     }
 }
-struct PageFilter { input: BoxPageCursor, schema: Schema, predicate: Expr, execution: Execution }
+/// Stacked selections, lowest first; each stage reads only the rows of a page that every stage before it kept.
+struct PageFilter { input: BoxPageCursor, schema: Schema, stages: Vec<(Expr,Execution)>, execution: Execution, _collapsed: Arc<rtdb_columnar::MemoryReservation> }
 #[async_trait]
 impl PageCursor for PageFilter {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         self.execution.context.check_cancelled()?;
-        while let Some(mut page) = self.input.next_page().await? {
-            let metadata_scope = self.execution.scope()?;
-            let invocation = self.execution.prepare_expression(&self.predicate,&self.schema,&metadata_scope)?;
-            let mut output = PageBuilder::new(page.len(),&self.execution.context.memory)?;
-            let scope = self.execution.scope()?;
-            while let Some(row) = page.next() {
-                if is_true(&self.execution.evaluate_invocation(&scope,&invocation,&row.values).await?)? { output.push(row)?; }
-                scope.reset()?;
+        'pages: while let Some(mut page) = self.input.next_page().await? {
+            for (predicate,execution) in &self.stages {
+                let metadata_scope = execution.scope()?;
+                let invocation = execution.prepare_expression(predicate,&self.schema,&metadata_scope)?;
+                let mut output = PageBuilder::new(page.len(),&execution.context.memory)?;
+                let scope = execution.scope()?;
+                while let Some(row) = page.next() {
+                    if is_true(&execution.evaluate_invocation(&scope,&invocation,&row.values).await?)? { output.push(row)?; }
+                    scope.reset()?;
+                }
+                if output.len() == 0 { continue 'pages; }
+                page = output.finish();
             }
-            if output.len() > 0 { return Ok(Some(output.finish())); }
+            return Ok(Some(page));
         }
         Ok(None)
     }

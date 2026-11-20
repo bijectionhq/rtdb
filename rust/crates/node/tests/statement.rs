@@ -794,3 +794,19 @@ async fn a_selection_pushed_beneath_another_drops_its_rows_before_the_other_read
     while let Some(batch) = cursor.next_batch().await.unwrap() { rows += batch.batch().num_rows(); }
     assert_eq!(rows, 0);
 }
+
+#[test]
+fn a_thousand_unpushable_conjuncts_plan_and_run_on_a_worker_stack() {
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(move || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let context = context(None, &MemoryBudget::new(1 << 28));
+            let conjuncts = (0..1000).map(|value| format!("t.v <> {value}")).collect::<Vec<_>>().join(" AND ");
+            let sql = format!("SELECT t.v FROM (VALUES (5000), (7)) t(v) WHERE {conjuncts}");
+            let statement = PreparedSql::prepare(&sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+            let mut cursor = statement.open_query(Arc::clone(&context), vec![]).await.unwrap();
+            let mut rows = 0;
+            while let Some(batch) = cursor.next_batch().await.unwrap() { rows += batch.batch().num_rows(); }
+            assert_eq!(rows, 1);
+        })
+    }).unwrap().join().unwrap();
+}
