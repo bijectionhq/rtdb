@@ -240,6 +240,37 @@ async fn search_score_ranks_rarer_terms_above_common_ones_once_the_corpus_is_ind
 }
 
 #[tokio::test]
+async fn compaction_publishes_each_trie_it_writes_with_its_search_file() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    for id in 0..20 {
+        assert!(session.state_mut().execute_tx(vec![sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'note {}'}}", if id % 2 == 0 { "overdue" } else { "paid" }))], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    let docs = TableRef::new("public", "docs");
+    let catalog = database.trie_catalog();
+    let settled: Vec<_> = catalog.current_tries(&docs).into_iter().filter(|trie| trie.key.level() > 0).collect();
+    assert!(!settled.is_empty());
+    let store = Arc::clone(database.object_store());
+    for trie in settled {
+        let record = trie.artefacts.iter().find(|record| record.kind() == "search").unwrap_or_else(|| panic!("{} was published without its search file", trie.key));
+        let key = rtdb_storage::ObjectKey::new(format!("tables/public$docs/artefacts/{}/search/{}-v{}.bin", trie.key, record.definition_id(), record.definition_version())).unwrap();
+        assert!(store.head(&key).await.is_ok(), "{key} was uploaded before the trie was published");
+    }
+    assert_eq!(ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'overdue')", vec![]).await.unwrap()).await), (0..20).step_by(2).collect::<Vec<_>>());
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_search_file_a_scan_cannot_read_is_rebuilt_to_its_original_bytes() {
     let mut options = options();
     options.file_size_target = 1;

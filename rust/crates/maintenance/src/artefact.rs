@@ -22,12 +22,16 @@ pub struct ArtefactDefinition { pub table: TableRef, pub kind: String, pub id: S
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ArtefactJob { pub definition: ArtefactDefinition, pub trie: TrieKey }
 
+/// Where an artefact is built from: its trie's data file already on this node's disk, as compaction has just written it, or the stored object, which the builder fetches.
+#[derive(Clone, Copy)]
+pub enum ArtefactSource<'a> { Local { data: &'a std::path::Path, size: u64 }, Stored }
+
 #[async_trait]
 pub trait ArtefactBuilder: Send + Sync {
     /// The definitions in force as of the snapshot; jobs are a function of these and the snapshot's catalog.
     async fn definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<ArtefactDefinition>>;
     /// Uploads the artefact under its key and returns its record; an existing identical object is not an error.
-    async fn build(&self, job: &ArtefactJob, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord>;
+    async fn build(&self, job: &ArtefactJob, source: ArtefactSource<'_>, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord>;
     /// Jobs for artefacts already recorded whose files need building again, taken ahead of the snapshot's ordinary jobs.
     async fn repairs(&self, _snapshot: &Arc<PartitionValue>, _cancellation: &CancellationToken) -> Result<Vec<ArtefactJob>> { Ok(Vec::new()) }
     /// Completes when the builder has work the lane would otherwise wait for a block to find.
@@ -57,12 +61,15 @@ pub trait ArtefactPublisher: Send + Sync {
     async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition>;
 }
 
-/// Live tries above level 0 that lack an artefact for a definition, current side first, then higher levels first; historical tries only for a historical definition.
-/// A level-1 current trie below the file size target is rewritten within a block or two, so it is left to the scan.
+/// Whether a definition wants an artefact on a trie: above level 0, other than a level-1 current trie below the file size target, which is rewritten within a block or two, and historical only for a historical definition.
+pub fn wants(definition: &ArtefactDefinition, trie: &TrieKey, size: i64, file_size_target: i64) -> bool {
+    trie.level() > 0 && (definition.historical || trie.recency().is_none()) && !(trie.level() == 1 && trie.recency().is_none() && size < file_size_target)
+}
+
+/// Live tries a definition wants an artefact on and that lack one, current side first, then higher levels first.
 pub fn available_artefact_jobs(catalog: &TrieCatalog, definitions: &[ArtefactDefinition]) -> Vec<ArtefactJob> {
     let mut jobs: Vec<_> = definitions.iter().flat_map(|definition| catalog.current_tries(&definition.table).into_iter()
-        .filter(|trie| trie.state == TrieState::Live && trie.key.level() > 0 && (definition.historical || trie.key.recency().is_none()))
-        .filter(|trie| !(trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < catalog.file_size_target()))
+        .filter(|trie| trie.state == TrieState::Live && wants(definition, &trie.key, trie.data_file_size, catalog.file_size_target()))
         .filter(|trie| trie.artefact(&definition.kind, &definition.id, definition.version).is_none())
         .map(|trie| ArtefactJob { definition: definition.clone(), trie: trie.key.clone() })).collect();
     jobs.sort_by(|left, right| (left.trie.recency().is_some(), std::cmp::Reverse(left.trie.level()), &left.trie, &left.definition)
@@ -217,7 +224,7 @@ impl ArtefactDriver {
                 running.push(async move {
                     let result = async {
                         let snapshot = snapshots.snapshot();
-                        let record = builder.build(&job, &snapshot, &token).await?;
+                        let record = builder.build(&job, ArtefactSource::Stored, &snapshot, &token).await?;
                         let message = ArtefactsAdded {
                             storage_version: Some(storage.0.0), storage_epoch: Some(storage.1.0), table_name: Some(job.definition.table.schema_and_table()),
                             entries: vec![ArtefactEntry { trie_key: Some(job.trie.to_string()), record: Some(record) }], source_msg_id: None,

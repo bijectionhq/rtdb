@@ -41,7 +41,7 @@ struct Builder { built: Mutex<Vec<ArtefactJob>> }
 #[async_trait]
 impl ArtefactBuilder for Builder {
     async fn definitions(&self, _: &Arc<PartitionValue>, _: &CancellationToken) -> Result<Vec<ArtefactDefinition>> { Ok(vec![definition("body")]) }
-    async fn build(&self, job: &ArtefactJob, _: &Arc<PartitionValue>, _: &CancellationToken) -> Result<ArtefactRecord> {
+    async fn build(&self, job: &ArtefactJob, _: rtdb_maintenance::ArtefactSource<'_>, _: &Arc<PartitionValue>, _: &CancellationToken) -> Result<ArtefactRecord> {
         self.built.lock().unwrap().push(job.clone());
         Ok(record(&job.definition.id))
     }

@@ -134,24 +134,27 @@ impl DatabaseFactory {
             replication_options.external_source = configuration.external_source.is_some();
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
+            let builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
+                self.artefact_kinds.iter().map(|kind| {
+                    let clock = Arc::clone(&self.clock);
+                    Ok((Arc::clone(kind), kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), clock: Arc::new(move || clock.now()) })?))
+                }).collect::<Result<Vec<_>>>()?
+            };
             let (compactor, compaction) = if read_only || self.options.compaction_threads == 0 { (None, None) } else {
-                let executor = Arc::new(SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?);
+                let executor = Arc::new(SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?
+                    .with_artefacts(builders.iter().map(|(_, builder)| Arc::clone(builder)).collect()));
                 let publisher = Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() });
                 let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
                 (Some(driver), Some(handle))
             };
             let mut artefact_drivers = Vec::new();
             let mut artefacts = Vec::new();
-            if !read_only && self.options.artefact_threads > 0 {
-                for kind in &self.artefact_kinds {
-                    let clock = Arc::clone(&self.clock);
-                    let builder = kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), clock: Arc::new(move || clock.now()) })?;
-                    let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
-                    let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch), kind.name(), Arc::clone(&resources.store),
-                        self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
-                    artefact_drivers.push(driver);
-                    artefacts.push(handle);
-                }
+            for (kind, builder) in builders {
+                let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
+                let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch), kind.name(), Arc::clone(&resources.store),
+                    self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
+                artefact_drivers.push(driver);
+                artefacts.push(handle);
             }
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
                 match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }

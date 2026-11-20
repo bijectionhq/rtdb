@@ -82,10 +82,10 @@ impl ArtefactBuilder for SearchBuilder {
 
     async fn wait_for_work(&self) { self.runtime.reported(&self.database).await }
 
-    async fn build(&self, job: &ArtefactJob, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
+    async fn build(&self, job: &ArtefactJob, source: rtdb_maintenance::ArtefactSource<'_>, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         let definition = &job.definition;
         let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), trie: job.trie.clone(), artefact_id: definition.id.clone(), version: definition.version };
-        let repairing = self.runtime.is_suspect(&suspect);
+        let repairing = matches!(source, rtdb_maintenance::ArtefactSource::Stored) && self.runtime.is_suspect(&suspect);
         let record = || ArtefactRecord { kind: Some(KIND.into()), definition_id: Some(definition.id.clone()), definition_version: Some(definition.version), stats: None };
         let known = self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned();
         let columns = match known { Some(columns) => columns, None => {
@@ -93,7 +93,7 @@ impl ArtefactBuilder for SearchBuilder {
             self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned().ok_or_else(|| Anomaly::incorrect("rtdb.search/definition-dropped", "The search index definition is no longer in force"))?
         } };
         let entry = snapshot.table_catalog().entry(&definition.table).ok_or_else(|| Anomaly::fault("rtdb.search/unknown-table", "Search job targets a table the catalog does not hold"))?;
-        let trie_size = snapshot.trie_catalog().iter_tries(&definition.table).find(|trie| trie.key == job.trie).map_or(0, |trie| trie.data_file_size);
+
         let identity = format!("{}/{}/{}-v{}", entry.slug.as_str(), job.trie, definition.id, definition.version);
         let key = ObjectKey::new(entry.slug.artefact_key(&job.trie, KIND, &definition.id, definition.version)?)?;
         if repairing {
@@ -113,7 +113,13 @@ impl ArtefactBuilder for SearchBuilder {
             }
         }
         let workdir = tempfile::Builder::new().prefix("rtdb-search-").tempdir().map_err(fault)?;
-        let input = download(self.store.as_ref(), &self.memory, &ObjectKey::new(entry.slug.data_key(&job.trie))?, &workdir.path().join("input.arrow"), cancellation).await?;
+        let (input, trie_size) = match source {
+            rtdb_maintenance::ArtefactSource::Local { data, size } => (std::fs::File::open(data).map_err(fault)?, i64::try_from(size).unwrap_or(i64::MAX)),
+            rtdb_maintenance::ArtefactSource::Stored => {
+                let size = snapshot.trie_catalog().iter_tries(&definition.table).find(|trie| trie.key == job.trie).map_or(0, |trie| trie.data_file_size);
+                (download(self.store.as_ref(), &self.memory, &ObjectKey::new(entry.slug.data_key(&job.trie))?, &workdir.path().join("input.arrow"), cancellation).await?, size)
+            }
+        };
         let indexing = self.memory.reserve(indexing_allowance(trie_size))?;
         let (memory, token, bundle) = (Arc::clone(&self.memory), cancellation.clone(), workdir.path().join("bundle.bin"));
         let (segment, output) = (workdir.path().join("segment"), bundle.clone());

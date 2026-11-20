@@ -43,13 +43,31 @@ pub struct SegmentCompactor {
     version: StorageVersion,
     epoch: StorageEpoch,
     config: MergeConfig,
+    artefacts: Vec<Arc<dyn crate::ArtefactBuilder>>,
 }
 
 impl SegmentCompactor {
     pub fn new(store: Arc<dyn ObjectStore>, snapshots: Arc<dyn SnapshotSource>, memory: Arc<MemoryBudget>,
         version: StorageVersion, epoch: StorageEpoch, config: MergeConfig) -> Result<Self> {
         if config.page_size == 0 || config.temporary_byte_limit == 0 { return Err(crate::invalid("Compaction page size and temporary byte limit must be positive")); }
-        Ok(Self { store, snapshots, memory, version, epoch, config })
+        Ok(Self { store, snapshots, memory, version, epoch, config, artefacts: Vec::new() })
+    }
+
+    /// Builds the artefacts these builders' definitions want on each output trie from its data file before the trie is published, and records them with it.
+    pub fn with_artefacts(mut self, artefacts: Vec<Arc<dyn crate::ArtefactBuilder>>) -> Self { self.artefacts = artefacts; self }
+
+    /// The records of every artefact built on an output; one that fails is left to the artefact lane, which builds whatever a live trie lacks.
+    async fn artefacts_of(&self, snapshot: &Arc<rtdb_index::PartitionValue>, table: &rtdb_types::TableRef, trie: &TrieKey, data: &Path, size: u64, cancellation: &CancellationToken) -> Vec<rtdb_format::log::proto::ArtefactRecord> {
+        let mut records = Vec::new();
+        let size_signed = i64::try_from(size).unwrap_or(i64::MAX);
+        for builder in &self.artefacts {
+            let Ok(definitions) = builder.definitions(snapshot, cancellation).await else { continue };
+            for definition in definitions.into_iter().filter(|definition| &definition.table == table && crate::wants(definition, trie, size_signed, snapshot.trie_catalog().file_size_target())) {
+                let job = crate::ArtefactJob { definition, trie: trie.clone() };
+                if let Ok(record) = builder.build(&job, crate::ArtefactSource::Local { data, size }, snapshot, cancellation).await { records.push(record); }
+            }
+        }
+        records
     }
 }
 
@@ -311,7 +329,8 @@ impl CompactionExecutor for SegmentCompactor {
             let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
             self.store.put_file(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
-            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), ..Default::default() });
+            let artefacts = self.artefacts_of(&snapshot, &job.table, &key, &data_path, size, cancellation).await;
+            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, ..Default::default() });
         }
         Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })
     }

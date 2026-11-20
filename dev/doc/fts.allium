@@ -129,7 +129,10 @@ rule DropSearchIndex {
 -- Jobs run current side first, then higher levels first.
 
 rule SearchJobRuns {
-    -- The job downloads the data file to a temporary file and reads it a page at a time, each page under its memory reservation.
+    -- A search file is built by compaction or by the lane.
+    -- Compaction builds one for every definition in its snapshot that wants its output trie, from the data file it has just written on its own disk, before appending the trie, and records it on the trie's TrieDetails; a build that fails leaves the trie without it.
+    -- The lane builds whatever a live trie lacks: a definition made after its data, a version a new analyzer or format brought, a build compaction left out, or a file to repair.
+    -- The lane downloads the data file to a temporary file; either reads it a page at a time, each page under its memory reservation.
     -- It reserves the segment's indexing heap up front, in proportion to the trie's size, builds the segment on disk, and streams the bundle to the object store.
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     when: job: SearchJob.created
