@@ -555,3 +555,29 @@ async fn a_node_admits_a_capability_only_for_its_deployment_and_the_gateway_neve
     assert_eq!(greeting(&cell.gateway.to_string(), &[("user", "xtdb"), ("database", "shop"), ("rtdb.capability", &genuine)]).await, (b'R', [0, 0, 0, 3]), "through the gateway, a client's capability is dropped and the password asked for");
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_session_reads_the_checkpoint_from_object_storage_on_another_node() {
+    let mut cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    for id in 0..5 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (99, 1)").await.unwrap();
+    for _ in 0..50 {
+        if cell.directory.deployment_by_name("shop").await.unwrap().unwrap().checkpoint.is_some() { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for logkeeper in cell.logkeepers.drain(..) { logkeeper.stop().await.unwrap(); }
+
+    let (snapshot, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port()).user("xtdb").password("cell-test").dbname("shop")
+        .options("-c rtdb.read=snapshot").connect(NoTls).await.unwrap();
+    tokio::spawn(connection);
+    assert_eq!(values(&snapshot, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"], "a snapshot reads the deployment as of its checkpoint, with no logkeeper up");
+    assert!(cell.node(1 - holder).agent.subscribed().contains(&"shop".to_owned()), "on a node that does not hold it");
+    assert!(snapshot.simple_query("INSERT INTO orders (_id, total) VALUES (7, 1)").await.is_err(), "and it never writes");
+    drop((snapshot, client));
+    cell.gateway_cancellation.cancel();
+    for node in cell.nodes.iter_mut().filter_map(Option::take) { node.kill().await.unwrap(); }
+}

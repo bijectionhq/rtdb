@@ -38,19 +38,21 @@ pub struct AgentOptions {
     pub max_tail_rows: Option<u64>,
     /// Whether this node is a compaction worker: it holds nothing, and compacts every held deployment that ranks it first among the cell's workers.
     pub compaction_worker: bool,
+    /// How long a snapshot stays open; it must be shorter than the reaper's grace (`max_snapshot_lifetime`).
+    pub snapshot_lifetime: Duration,
 }
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
         Self { storage, activation_timeout: Duration::from_secs(30), watch_interval: Duration::from_millis(250), park_after: None,
-            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None }
+            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: Duration::from_secs(30 * 60) }
     }
 }
 
 const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
 
 struct LocalHolding { id: String, epoch: u64, last_touch: Instant, linearizable: bool }
-struct LocalSubscription { id: String, last_touch: Instant, role: Role }
+struct LocalSubscription { id: String, last_touch: Instant, opened: Instant, role: Role }
 
 pub struct NodeAgent {
     directory: Arc<dyn Directory>,
@@ -268,7 +270,29 @@ impl NodeAgent {
         self.stop_running(name).await;
         self.node.database_or_attach(name.to_owned(), configuration).await?
             .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the replica"))?;
-        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), role: Role::Subscriber });
+        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Subscriber });
+        Ok(Response::Subscribed { address: self.address.clone() })
+    }
+
+    /// Serves the deployment's reads as of its checkpoint, opening it from object storage alone unless this node already has it open, at that state or a later one.
+    pub async fn snapshot(&self, name: &str) -> Result<Response> {
+        let turn = self.turn(name);
+        let _turn = turn.lock().await;
+        let record = self.record(name).await?;
+        if record.lifecycle != Lifecycle::Live { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/not-live", format!("{name} is not live"))); }
+        if self.holdings.lock().contains_key(name) && self.node.catalog().database(name).is_ok() { return Ok(Response::Subscribed { address: self.address.clone() }); }
+        if let Some(subscription) = self.subscriptions.lock().get_mut(name) {
+            if subscription.id == record.id && self.node.catalog().database(name).is_ok() {
+                subscription.last_touch = Instant::now();
+                return Ok(Response::Subscribed { address: self.address.clone() });
+            }
+        }
+        let checkpoint = record.checkpoint.ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-checkpoint", format!("{name} has published no block to read")))?;
+        let configuration = database_config(&record, Vec::new(), &self.options.storage, Role::Snapshot(checkpoint));
+        self.stop_running(name).await;
+        self.node.database_or_attach(name.to_owned(), configuration).await?
+            .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the snapshot"))?;
+        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Snapshot(checkpoint) });
         Ok(Response::Subscribed { address: self.address.clone() })
     }
 
@@ -281,16 +305,17 @@ impl NodeAgent {
         Ok(Response::Published { position: position.0 })
     }
 
-    /// Trims the deployment's stream below the boundary of its last adopted block, whose records the block now holds (`TrimFollowsPublication`).
+    /// Publishes the holding's last adopted block as the deployment's checkpoint, and trims its stream below that block's boundary, whose records the block now holds (`TrimFollowsPublication`).
     /// The boundary record itself is kept: it names the source position a later holder's intake starts past.
-    /// Publishes the holding's last adopted block as the deployment's checkpoint, and trims its stream below that block's boundary.
     async fn publish_and_trim(&self, name: &str, id: &str, epoch: u64) {
         let Ok(database) = self.node.catalog().database(name) else { return };
-        if let Some(block) = database.status().adopted_block.as_ref().map(|block| block.block_index().0) {
+        let adopted = database.status().adopted_block.as_ref().and_then(|block| Some((block.block_index().0, block.boundary_replica_position()?.offset(), block.latest_source_position())));
+        if let Some((block, boundary, source)) = adopted {
             if let Ok(Some(record)) = self.directory.deployment(id).await {
                 if record.epoch == epoch && record.holder.as_ref() == Some(&self.member()) && record.checkpoint.is_none_or(|checkpoint| checkpoint.block < block) {
                     let mut next = record.clone();
-                    next.checkpoint = Some(rtdb_directory::Checkpoint { block });
+                    let source = source.map_or(-1, |position| position.after_offset(rtdb_types::StorageEpoch(record.log_epoch)));
+                    next.checkpoint = Some(rtdb_directory::Checkpoint { block, boundary, source });
                     let _ = self.directory.replace_deployment(next, record.version).await;
                 }
             }
@@ -344,7 +369,7 @@ impl NodeAgent {
             let Ok(servers) = Self::servers(&record, &members) else { continue };
             let configuration = database_config(&record, servers, &self.options.storage, Role::Compactor);
             if let Ok(Some(_)) = self.node.database_or_attach(name.clone(), configuration).await {
-                self.subscriptions.lock().insert(name, LocalSubscription { id: record.id, last_touch: Instant::now(), role: Role::Compactor });
+                self.subscriptions.lock().insert(name, LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor });
             }
         }
     }
@@ -380,11 +405,13 @@ impl NodeAgent {
         }
         if self.options.compaction_worker { self.reconcile_compaction().await; }
         if let Some(limit) = self.options.max_tail_rows { self.bound_tails(limit).await; }
-        let subscribed: Vec<(String, String, Instant)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role == Role::Subscriber)
-            .map(|(name, subscription)| (name.clone(), subscription.id.clone(), subscription.last_touch)).collect();
-        for (name, id, last_touch) in subscribed {
-            let wanted = matches!(self.directory.deployment(&id).await, Ok(Some(record)) if record.lifecycle == Lifecycle::Live && record.read_width > 1);
-            if draining || !wanted || last_touch.elapsed() >= self.options.unsubscribe_after || self.node.catalog().database(&name).is_err() {
+        let subscribed: Vec<(String, String, Instant, Instant, bool)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role != Role::Compactor)
+            .map(|(name, subscription)| (name.clone(), subscription.id.clone(), subscription.last_touch, subscription.opened, matches!(subscription.role, Role::Snapshot(_)))).collect();
+        for (name, id, last_touch, opened, snapshot) in subscribed {
+            let wanted = matches!(self.directory.deployment(&id).await, Ok(Some(record)) if record.lifecycle == Lifecycle::Live && (snapshot || record.read_width > 1));
+            // A snapshot closes before the reaper's grace could erase what it reads.
+            let expired = snapshot && opened.elapsed() >= self.options.snapshot_lifetime;
+            if draining || !wanted || expired || last_touch.elapsed() >= self.options.unsubscribe_after || self.node.catalog().database(&name).is_err() {
                 let turn = self.turn(&name);
                 let _turn = turn.lock().await;
                 self.stop_running(&name).await;
@@ -420,6 +447,7 @@ impl Handler for NodeAgent {
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
             Request::Ping => Ok(Response::Done),
             Request::Subscribe { name } => self.subscribe(&name).await,
+            Request::Snapshot { name } => self.snapshot(&name).await,
             Request::Flush { name } => self.flush(&name).await,
             Request::PublishCompaction { name, notification } => self.publish_compaction(&name, &notification).await,
         };

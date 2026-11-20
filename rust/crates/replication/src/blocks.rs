@@ -110,6 +110,8 @@ pub enum BlockDiscovery {
     List,
     /// Probes forward from a block known to have been published, one head per block, never listing; a hint naming a block that is gone falls back to listing.
     From(BlockIndex),
+    /// Recovers exactly this block, for a reader of the state as of it.
+    At(BlockIndex),
 }
 
 pub struct BlockStore {
@@ -150,6 +152,8 @@ impl BlockStore {
             }
         };
         let mut latest = match discovery {
+            BlockDiscovery::At(block) if exists(block).await? => return Ok(Some(block)),
+            BlockDiscovery::At(block) => return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone", format!("Block {} is no longer stored", block.0))),
             BlockDiscovery::From(hint) if exists(hint).await? => hint,
             _ => {
                 let directory = ObjectKey::new("blocks")?;

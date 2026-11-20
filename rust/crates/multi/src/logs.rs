@@ -65,6 +65,14 @@ impl LogFactory for LogkeeperLogFactory {
     async fn open(&self, configuration: &Any, access: LogAccess, cancellation: CancellationToken) -> Result<OpenedLogs> {
         let config: LogkeeperLogConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/log-config", format!("Logkeeper log configuration is malformed: {error}")))?;
+        let epoch = StorageEpoch(config.log_epoch);
+        if let Some(checkpoint) = config.frozen_at {
+            // A snapshot's logs are empty and end where its block does: there is nothing to replay, and they never advance.
+            let replica = Arc::new(MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(checkpoint.boundary + 1)));
+            let start = checkpoint.source + 1;
+            let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(start)), consumed: Arc::new(AtomicI64::new(start - 1)), start });
+            return Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, drivers: Vec::new() });
+        }
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
         let quorum: Arc<dyn Log> = match access {
             LogAccess::ReadWrite => {
@@ -85,7 +93,6 @@ impl LogFactory for LogkeeperLogFactory {
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
         let replica: Arc<dyn Log> = Arc::new(SealedLog { inner: quorum, cipher: Arc::new(Cipher::new(&self.keys.key(&config.deployment)?)?), stream: Arc::from(config.replica_stream.as_str()) });
-        let epoch = StorageEpoch(config.log_epoch);
         let next = next_source_offset(replica.as_ref(), epoch).await?;
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
         let trimming = {

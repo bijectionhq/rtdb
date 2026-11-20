@@ -26,6 +26,8 @@ pub enum Role {
     Subscriber,
     /// A log-fed reader that compacts, writing only compaction outputs and publishing them through the holder.
     Compactor,
+    /// A reader of the deployment as of its checkpoint, from object storage alone (`ServeSnapshot`).
+    Snapshot(rtdb_directory::Checkpoint),
 }
 
 /// The logkeeper streams a deployment's database reads and writes, carried in its `DatabaseConfig`.
@@ -44,6 +46,9 @@ pub struct LogkeeperLogConfig {
     pub ensemble: Vec<String>,
     /// The writer epoch a holder opens its streams at; ignored by a subscriber.
     pub epoch: u64,
+    /// A snapshot reader's checkpoint: its logs end there and never advance, so it reads no logkeeper.
+    #[serde(default)]
+    pub frozen_at: Option<rtdb_directory::Checkpoint>,
     /// The namespace of the deployment's log positions.
     #[serde(default)]
     pub log_epoch: i32,
@@ -59,12 +64,13 @@ pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage:
 
 /// The configuration a holder opens `record` with when it moves the stream from `previous` to `servers`, the ensemble `ensemble`.
 pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Option<(Vec<String>, Vec<rtdb_directory::MemberId>)>, storage: &CellStorage, role: Role) -> DatabaseConfig {
-    let mut log = LogkeeperLogConfig { write_quorum: write_quorum(servers.len()), servers, deployment: record.id.clone(), replica_stream: record.stream("replica"), epoch: record.epoch, log_epoch: record.log_epoch, previous_servers: None, ensemble: record.ensemble.iter().map(|id| id.0.clone()).collect() };
+    let mut log = LogkeeperLogConfig { write_quorum: write_quorum(servers.len()), servers, deployment: record.id.clone(), replica_stream: record.stream("replica"), epoch: record.epoch, log_epoch: record.log_epoch, frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None }, previous_servers: None, ensemble: record.ensemble.iter().map(|id| id.0.clone()).collect() };
     if let Some((previous, ensemble)) = moving { log.previous_servers = Some(previous); log.ensemble = ensemble.into_iter().map(|id| id.0).collect(); }
     let storage = match storage {
         CellStorage::Local { root } => {
             let store = crate::store::CellStoreConfig { root: root.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
-                writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor };
+                writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor,
+                snapshot_block: match role { Role::Snapshot(checkpoint) => Some(checkpoint.block), _ => None } };
             database_config::Storage::RemoteStorage(RemoteStorage {
                 object_store: Some(prost_types::Any { type_url: format!("type.googleapis.com/{}", crate::store::CELL_STORAGE_TYPE), value: serde_json::to_vec(&store).expect("a store configuration serializes") }),
                 epoch: Some(0),
@@ -77,7 +83,7 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Op
             value: serde_json::to_vec(&log).expect("a log configuration serializes"),
         })),
         storage: Some(storage),
-        mode: match role { Role::Holder => None, Role::Subscriber | Role::Compactor => Some(1) },
+        mode: match role { Role::Holder => None, Role::Subscriber | Role::Compactor | Role::Snapshot(_) => Some(1) },
         ..Default::default()
     }
 }

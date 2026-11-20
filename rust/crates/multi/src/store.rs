@@ -40,6 +40,9 @@ pub struct CellStoreConfig {
     /// A compaction worker's store, which may write compaction outputs and nothing else.
     #[serde(default)]
     pub compactor: bool,
+    /// A snapshot reader's store, which recovers exactly this block.
+    #[serde(default)]
+    pub snapshot_block: Option<i64>,
 }
 
 pub struct CellStoreFactory {
@@ -67,6 +70,7 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn block_discovery(&self, configuration: &Any) -> Result<rtdb_replication::BlockDiscovery> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
+        if let Some(block) = config.snapshot_block { return Ok(rtdb_replication::BlockDiscovery::At(rtdb_types::BlockIndex(block))); }
         Ok(match self.checkpoint(&config).await? { Some(block) => rtdb_replication::BlockDiscovery::From(rtdb_types::BlockIndex(block)), None => rtdb_replication::BlockDiscovery::List })
     }
 

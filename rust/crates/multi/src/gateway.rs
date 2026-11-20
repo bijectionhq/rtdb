@@ -20,6 +20,7 @@ const GSSENC_REQUEST: i32 = 80877104;
 const CANCEL_REQUEST: i32 = 80877102;
 const PROTOCOL_3: i32 = 196608;
 const MAXIMUM_STARTUP_BYTES: usize = 10_000;
+const SNAPSHOT_PARAMETER: &str = "rtdb.read";
 
 #[derive(Clone)]
 pub struct GatewayOptions {
@@ -52,8 +53,16 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
 struct Startup { bytes: Vec<u8>, parameters: BTreeMap<String, String> }
 
 impl Startup {
+    /// Whether the client asked to read the deployment as of its checkpoint (`rtdb.read=snapshot`, as a parameter or in `options`), which any node may serve from object storage.
+    fn snapshot(&self) -> bool {
+        self.parameters.get(SNAPSHOT_PARAMETER).is_some_and(|value| value == "snapshot")
+            || self.parameters.get("options").is_some_and(|options| options.split_whitespace().any(|option| option.trim_start_matches("-c").split_once('=')
+                .is_some_and(|(key, value)| matches!(key.trim(), SNAPSHOT_PARAMETER | "rtdb_read") && value == "snapshot")))
+    }
+
     /// Whether the client asked for a read-only session, which a log-fed replica may serve.
     fn read_only(&self) -> bool {
+        if self.snapshot() { return true; }
         let on = |value: &str| matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes");
         self.parameters.get("default_transaction_read_only").is_some_and(|value| on(value))
             || self.parameters.get("target_session_attrs").is_some_and(|value| matches!(value.as_str(), "read-only" | "prefer-standby" | "standby"))
@@ -75,7 +84,7 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
             copied = tokio::io::copy_bidirectional(&mut client, &mut forward) => copied.map(|_| ()).map_err(io),
         };
     }
-    let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), read_only: startup.read_only(), options: options.clone() });
+    let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), read_only: startup.read_only(), snapshot: startup.snapshot(), options: options.clone() });
     let (server, control, epoch, deployment) = match router.route_with_record().await {
         Ok(route) => route,
         Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
@@ -111,11 +120,11 @@ async fn elsewhere(directory: &Arc<dyn Directory>, name: &str, options: &Gateway
     map.gateway(&living).await.ok().flatten()
 }
 
-struct GatewayRouter { directory: Arc<dyn Directory>, name: String, read_only: bool, options: GatewayOptions }
+struct GatewayRouter { directory: Arc<dyn Directory>, name: String, read_only: bool, snapshot: bool, options: GatewayOptions }
 
 impl GatewayRouter {
     async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
-        route(&self.directory, &self.name, self.read_only, &self.options).await
+        route(&self.directory, &self.name, self.read_only, self.snapshot, &self.options).await
     }
 }
 
@@ -128,7 +137,7 @@ impl crate::session::Router for GatewayRouter {
 }
 
 /// The open connection to the deployment's holder, and that holder's control address.
-async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>, u64, String)> {
+async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snapshot: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>, u64, String)> {
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
     match record.lifecycle {
@@ -137,6 +146,14 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, opti
         Lifecycle::Deleting | Lifecycle::Deleted => return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} has been deleted"))),
     }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
+    if snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
+        for reader in snapshot_readers(&record, &members) {
+            let Some(control_address) = &reader.control_address else { continue; };
+            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Snapshot { name: name.to_owned() }, options.control_timeout).await {
+                if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
+            }
+        }
+    }
     if read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
         for replica in replicas(&record, &members) {
             let Some(control_address) = &replica.control_address else { continue; };
@@ -160,6 +177,17 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, opti
         }
     }
     Err(last.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
+}
+
+/// The nodes that may serve a snapshot read: every node that may take a placement, in the deployment's affinity order, the holder last, so snapshots spare the writer.
+fn snapshot_readers<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
+    let now = now_ms();
+    let holder = effective_holder(record, members, now).cloned();
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now)).collect();
+    let (mut others, holders): (Vec<&MemberRecord>, Vec<&MemberRecord>) = rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied()
+        .partition(|member| holder.as_ref() != Some(&member.id));
+    others.extend(holders);
+    others
 }
 
 /// The nodes that may serve the deployment's reads beside its holder: the ranks after the holder's, within its read width.

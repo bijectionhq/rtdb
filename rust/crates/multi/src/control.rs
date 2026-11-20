@@ -23,6 +23,8 @@ pub enum Request {
     Touch { name: String },
     /// Serve the deployment's reads from a log-fed replica on this node.
     Subscribe { name: String },
+    /// Serve the deployment's reads as of its checkpoint, from object storage alone.
+    Snapshot { name: String },
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
     Flush { name: String },
     /// Publish a compaction a worker produced, as the deployment's holder; the notification is an encoded TriesAdded.
