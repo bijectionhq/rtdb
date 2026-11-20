@@ -298,6 +298,52 @@ fn scalar_layout(data_type: &DataType) -> bool {
 
 fn size_error() -> rtdb_types::Anomaly { invalid("column-size", "Column page exceeds addressable memory") }
 
+/// The scalar a column's cells read as, where its logical type is one scalar, nullable or not: a nullable column's
+/// cells read as its scalar's or as null, so the kernels treat the two alike.
+fn plain_scalar(logical: &LogicalType) -> Option<&rtdb_types::ScalarType> {
+    match logical {
+        LogicalType::Scalar(scalar) => Some(scalar),
+        LogicalType::Maybe(inner) => match inner.as_ref() { LogicalType::Scalar(scalar) => Some(scalar), _ => None },
+        _ => None,
+    }
+}
+
+/// Scalars whose cells survive a copy through their own Arrow layout unchanged, with no admission or validation on the way.
+fn copyable(scalar: &rtdb_types::ScalarType) -> bool {
+    use rtdb_types::ScalarType as S;
+    matches!(scalar, S::Bool | S::I8 | S::I16 | S::I32 | S::I64 | S::F32 | S::F64 | S::Utf8 | S::FixedSizeBinary(_) | S::Timestamp { .. })
+}
+
+/// The column's array where it already holds exactly what copying its cells into `field`, the layout of `target`,
+/// would build; `None` where the cells must be copied.
+pub(crate) fn conform(column: &Column, target: &LogicalType, field: &ArrowField) -> Option<ArrayRef> {
+    let Column::Arrow { array, logical: Some(logical), .. } = column else { return None };
+    conform_array(array, logical, target, field)
+}
+
+fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, field: &ArrowField) -> Option<ArrayRef> {
+    if !field.is_nullable() && array.null_count() != 0 { return None; }
+    let strip = |logical: &LogicalType| match logical { LogicalType::Maybe(inner) => inner.as_ref().clone(), other => other.clone() };
+    match (strip(logical), strip(target)) {
+        (LogicalType::Scalar(scalar), LogicalType::Scalar(expected)) => {
+            let kept = copyable(&scalar) || scalar == rtdb_types::ScalarType::DateDay;
+            (scalar == expected && kept && array.data_type() == field.data_type()).then(|| Arc::clone(array))
+        }
+        // A copied record's fields take the order of the result's, whatever order the cells came in.
+        (LogicalType::Struct(children), LogicalType::Struct(expected)) => {
+            let (DataType::Struct(fields), Some(structs)) = (field.data_type(), array.as_any().downcast_ref::<StructArray>()) else { return None };
+            if structs.null_count() != 0 || structs.num_columns() != fields.len() || children.len() != fields.len() || expected.len() != fields.len() { return None; }
+            let mut columns = Vec::with_capacity(fields.len());
+            for target_field in fields.iter() {
+                let index = structs.fields().iter().position(|source| source.name() == target_field.name())?;
+                columns.push(conform_array(structs.column(index), children.get(target_field.name())?, expected.get(target_field.name())?, target_field)?);
+            }
+            StructArray::try_new(fields.clone(), columns, None).ok().map(|array| Arc::new(array) as ArrayRef)
+        }
+        _ => None,
+    }
+}
+
 /// A batch source: a scan, or an operator that keeps its input's columns.
 #[async_trait::async_trait]
 pub(crate) trait BatchCursor: Send {
@@ -312,6 +358,19 @@ impl BatchCursor for crate::scan::ScanCursor {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { crate::scan::ScanCursor::next_batch(self).await }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { crate::pages::PageCursor::trace_attributes(self, span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { crate::pages::PageCursor::scan_counts(self) }
+}
+
+pub(crate) fn retain_batch_state(input: BoxBatchCursor, reservation: Arc<MemoryReservation>) -> BoxBatchCursor { Box::new(RetainedBatchState { input, _reservation: reservation }) }
+/// As `pages::retain_page_state`, spending cooperative budget per batch.
+struct RetainedBatchState { input: BoxBatchCursor, _reservation: Arc<MemoryReservation> }
+#[async_trait::async_trait]
+impl BatchCursor for RetainedBatchState {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        tokio::task::consume_budget().await;
+        self.input.next_batch().await
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
 /// Materialises a batch source's rows for row operators.
@@ -389,16 +448,16 @@ mod kernel {
     use arrow_array::{Array, BooleanArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
     use arrow_schema::{DataType, TimeUnit as ArrowUnit};
     use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
-    use rtdb_types::{LogicalType, ScalarType, TimeUnit, Value};
+    use rtdb_types::{ScalarType, TimeUnit, Value};
     use super::{Column, ColumnBatch};
 
     type Truth = Vec<Option<bool>>;
 
     /// A comparable cell; integers and floats compare only where the conversion between them is exact.
     #[derive(Clone, Copy, PartialEq, PartialOrd)]
-    enum Cell<'a> { Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, bool) }
+    enum Cell<'a> { Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, Option<&'a str>) }
 
-    enum Cells<'a> { Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
+    enum Cells<'a> { Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
         /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
         Union { array: &'a arrow_array::UnionArray, legs: Vec<Option<Cells<'a>>> } }
 
@@ -407,7 +466,8 @@ mod kernel {
             match column {
                 Column::Values(values) => Some(Self::Values(values)),
                 Column::Arrow { array, field, logical } => {
-                    let plain = |expected: ScalarType| match logical { Some(LogicalType::Scalar(scalar)) => *scalar == expected, Some(_) => false, None => field.metadata().is_empty() };
+                    let scalar = logical.as_ref().and_then(super::plain_scalar);
+                    let plain = |expected: ScalarType| match logical { Some(_) => scalar == Some(&expected), None => field.metadata().is_empty() };
                     let any = array.as_any();
                     match array.data_type() {
                         DataType::Int64 if plain(ScalarType::I64) => any.downcast_ref().map(Self::Int),
@@ -417,7 +477,15 @@ mod kernel {
                         DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
                         DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
                         DataType::Boolean if plain(ScalarType::Bool) => any.downcast_ref().map(Self::Bool),
-                        DataType::Timestamp(ArrowUnit::Microsecond, _) if matches!(logical, Some(LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, .. })) | None) => any.downcast_ref().map(Self::Micros),
+                        // A cell reads its zone from the column's logical type, or from the layout where it has none.
+                        DataType::Timestamp(ArrowUnit::Microsecond, zone) => {
+                            let zone = match (logical, scalar) {
+                                (Some(_), Some(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone })) => timezone.as_deref(),
+                                (None, _) if field.metadata().is_empty() => zone.as_deref(),
+                                _ => return None,
+                            };
+                            any.downcast_ref().map(|array| Self::Micros(array, zone))
+                        }
                         DataType::Union(fields, arrow_schema::UnionMode::Dense) => {
                             let array: &arrow_array::UnionArray = any.downcast_ref()?;
                             let mut legs: Vec<Option<Self>> = Vec::new();
@@ -458,7 +526,7 @@ mod kernel {
                 Self::Float(array) => valid(*array, row).then(|| Cell::Float(array.value(row))),
                 Self::Text(array) => valid(*array, row).then(|| Cell::Text(array.value(row))),
                 Self::Bool(array) => valid(*array, row).then(|| Cell::Bool(array.value(row))),
-                Self::Micros(array) => valid(*array, row).then(|| Cell::Micros(array.value(row), matches!(array.data_type(), DataType::Timestamp(_, Some(_))))),
+                Self::Micros(array, zone) => valid(*array, row).then(|| Cell::Micros(array.value(row), *zone)),
                 Self::Values(values) => scalar(&values[row])?,
                 Self::Union { array, legs } => {
                     let leg = usize::try_from(array.type_id(row)).ok().and_then(|id| legs.get(id)).and_then(Option::as_ref).ok_or(())?;
@@ -470,7 +538,11 @@ mod kernel {
 
     /// A computed numeric cell, which borrows nothing.
     fn owned(cell: Cell<'_>) -> Option<Cell<'static>> {
-        match cell { Cell::Int(value) => Some(Cell::Int(value)), Cell::Float(value) => Some(Cell::Float(value)), Cell::Bool(value) => Some(Cell::Bool(value)), Cell::Micros(value, zoned) => Some(Cell::Micros(value, zoned)), Cell::Text(_) => None }
+        match cell {
+            Cell::Int(value) => Some(Cell::Int(value)), Cell::Float(value) => Some(Cell::Float(value)), Cell::Bool(value) => Some(Cell::Bool(value)),
+            Cell::Micros(value, None) => Some(Cell::Micros(value, None)), Cell::Micros(value, Some("UTC")) => Some(Cell::Micros(value, Some("UTC"))),
+            Cell::Micros(_, Some(_)) | Cell::Text(_) => None,
+        }
     }
     fn scalar(value: &Value) -> Result<Option<Cell<'_>>, ()> {
         Ok(match value {
@@ -483,7 +555,7 @@ mod kernel {
             Value::F64(value) => Some(Cell::Float(*value)),
             Value::Utf8(value) => Some(Cell::Text(value)),
             Value::Bool(value) => Some(Cell::Bool(*value)),
-            Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone } => Some(Cell::Micros(*value, timezone.is_some())),
+            Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone } => Some(Cell::Micros(*value, timezone.as_deref())),
             _ => return Err(()),
         })
     }
@@ -497,7 +569,7 @@ mod kernel {
         let floats = |a: f64, b: f64| if equality_only { a.partial_cmp(&b).ok_or(()) } else { Ok(a.total_cmp(&b)) };
         match (left, right) {
             (Cell::Int(a), Cell::Int(b)) => Ok(a.cmp(&b)),
-            (Cell::Micros(a, zoned), Cell::Micros(b, other)) if zoned == other => Ok(a.cmp(&b)),
+            (Cell::Micros(a, zoned), Cell::Micros(b, other)) if zoned.is_some() == other.is_some() => Ok(a.cmp(&b)),
             (Cell::Float(a), Cell::Float(b)) => floats(float(a)?, float(b)?),
             (Cell::Int(a), Cell::Float(b)) if a.unsigned_abs() < EXACT as u64 => floats(a as f64, float(b)?),
             (Cell::Float(a), Cell::Int(b)) if b.unsigned_abs() < EXACT as u64 => floats(float(a)?, b as f64),
@@ -525,7 +597,7 @@ mod kernel {
                 Expr::Literal(value) => scalar(value).ok().map(Self::Constant),
                 Expr::Parameter { index, .. } => scalar(parameters.get(*index)?).ok().map(Self::Constant),
                 Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, .. } => {
-                    let column = super::projection::column(expr, schema, batch, parameters).ok()??;
+                    let column = super::projection::column(expr, schema, batch, parameters).ok()?.or_else(|| crate::vector::column(expr, schema, batch, parameters))?;
                     let cells = Cells::of(&column)?;
                     Some(Self::Cells(Cells::Owned((0..batch.len).map(|row| match cells.get(row).ok()? { None => Some(None), Some(cell) => owned(cell).map(Some) }).collect::<Option<_>>()?)))
                 }
@@ -575,10 +647,13 @@ mod kernel {
                     (None, None) => true,
                     (None, Some(_)) | (Some(_), None) => false,
                     (Some(Cell::Int(a)), Some(Cell::Int(b))) => a == b,
-                    (Some(Cell::Float(a)), Some(Cell::Float(b))) => if a.is_nan() || b.is_nan() { return None } else { a == b },
+                    // Floats keep their category but compare by SQL equality, so NaN differs from itself.
+                    (Some(Cell::Float(a)), Some(Cell::Float(b))) => a == b,
                     (Some(Cell::Int(_)), Some(Cell::Float(_))) | (Some(Cell::Float(_)), Some(Cell::Int(_))) => false,
                     (Some(Cell::Text(a)), Some(Cell::Text(b))) => a == b,
                     (Some(Cell::Bool(a)), Some(Cell::Bool(b))) => a == b,
+                    // Timestamps are equal only under the same zone label.
+                    (Some(Cell::Micros(a, zone)), Some(Cell::Micros(b, other))) => zone == other && a == b,
                     _ => return None,
                 }))).collect()
             }
@@ -729,6 +804,182 @@ mod tests {
         }
         assert!(evaluated > 200, "the kernel should take most generated predicates, took {evaluated}");
     }
+
+    mod mutations {
+        //! The shapes an UPDATE lowers to: its strict-equality filter, and the canonical put's `COALESCE`d, cast valid
+        //! times and row-copied document, over cells that include nulls, NaN, signed zeros and zoned timestamps.
+        use super::*;
+        use arrow_array::TimestampMicrosecondArray;
+        use rtdb_plan::CastTarget;
+        use rtdb_types::TimeUnit;
+
+        fn utc() -> ScalarType { ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
+        fn local() -> ScalarType { ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: None } }
+        fn mixed() -> LogicalType {
+            LogicalType::from_legs([LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::F64), LogicalType::Scalar(ScalarType::Utf8), LogicalType::Scalar(utc()), LogicalType::Null])
+        }
+        /// Each column's declared type, and whether its cells read through a nullable logical type.
+        fn types() -> Vec<(LogicalType, bool)> {
+            vec![(LogicalType::Scalar(ScalarType::I64), false), (LogicalType::Scalar(ScalarType::F64), true), (LogicalType::Scalar(ScalarType::Utf8), false),
+                (LogicalType::Scalar(ScalarType::Bool), true), (LogicalType::Scalar(utc()), false), (LogicalType::Scalar(utc()), true),
+                (LogicalType::Scalar(local()), false), (mixed(), false), (LogicalType::Scalar(ScalarType::F64), false), (LogicalType::Scalar(ScalarType::DateDay), true)]
+        }
+        fn schema() -> Schema {
+            Schema::new(types().into_iter().enumerate().map(|(id, (logical, _))| rtdb_plan::Field { id: ColumnId(id as u32), name: format!("c{id}"), qualifier: None, qualified_only: false, unnamed: false, data_type: logical.maybe() }).collect()).unwrap()
+        }
+        fn float(random: &mut Random) -> f64 { [f64::NAN, -0.0, 0.0, 1.5, -2.0, 1.01, f64::INFINITY][random.below(7) as usize] }
+        fn micros(random: &mut Random) -> i64 { [0, 1, -1, 1_000_000, i64::MAX, i64::MIN][random.below(6) as usize] }
+        fn zoned(value: i64, zone: Option<&str>) -> Value { Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: zone.map(Into::into) } }
+
+        fn batch(random: &mut Random, rows: usize, memory: &Arc<MemoryBudget>) -> ColumnBatch {
+            let null = |random: &mut Random| random.below(4) == 0;
+            let arrow = |array: ArrayRef, (logical, maybe): (LogicalType, bool)| Column::Arrow { field: Arc::new(ArrowField::new("c", array.data_type().clone(), true)), array, logical: Some(if maybe { logical.maybe() } else { logical }) };
+            let types = types();
+            let ints: Int64Array = (0..rows).map(|_| (!null(random)).then(|| random.below(5) as i64 - 2)).collect();
+            let floats: Float64Array = (0..rows).map(|_| (!null(random)).then(|| float(random))).collect();
+            let texts: StringArray = (0..rows).map(|_| (!null(random)).then(|| ["a", "b", ""][random.below(3) as usize])).collect();
+            let bools: BooleanArray = (0..rows).map(|_| (!null(random)).then(|| random.below(2) == 0)).collect();
+            let times = |random: &mut Random, nulls: bool| -> Vec<Option<i64>> { (0..rows).map(|_| (!(nulls && null(random))).then(|| micros(random))).collect() };
+            let instants = TimestampMicrosecondArray::from(times(random, false)).with_timezone("UTC");
+            let bounds = TimestampMicrosecondArray::from(times(random, true)).with_timezone("UTC");
+            let locals = TimestampMicrosecondArray::from(times(random, true));
+            let values = (0..rows).map(|_| match random.below(6) {
+                0 => Value::Null, 1 => Value::I64(random.below(5) as i64 - 2), 2 => Value::F64(float(random)), 3 => Value::Utf8("a".into()),
+                4 => zoned(micros(random), Some("UTC")), _ => Value::DateDay(random.below(3) as i32),
+            }).collect();
+            let plain: Float64Array = (0..rows).map(|_| (!null(random)).then(|| float(random))).collect();
+            let dates: arrow_array::Date32Array = (0..rows).map(|_| (!null(random)).then(|| random.below(5) as i32 - 2)).collect();
+            let columns = vec![arrow(Arc::new(ints), types[0].clone()), arrow(Arc::new(floats), types[1].clone()), arrow(Arc::new(texts), types[2].clone()),
+                arrow(Arc::new(bools), types[3].clone()), arrow(Arc::new(instants), types[4].clone()), arrow(Arc::new(bounds), types[5].clone()),
+                arrow(Arc::new(locals), types[6].clone()), Column::Values(values), arrow(Arc::new(plain), types[8].clone()), arrow(Arc::new(dates), types[9].clone())];
+            ColumnBatch::settled(columns, rows, memory.reserve(0).unwrap()).unwrap()
+        }
+
+        fn column(schema: &Schema, id: usize) -> Expr { schema.fields()[id].expression() }
+        fn literal(random: &mut Random) -> Expr {
+            Expr::Literal(match random.below(8) {
+                0 => Value::I64(random.below(5) as i64 - 2), 1 => Value::F64(float(random)), 2 => Value::Utf8("a".into()), 3 => Value::Bool(true),
+                4 => zoned(micros(random), Some("UTC")), 5 => zoned(micros(random), None), 6 => Value::I32(1), _ => Value::Null,
+            })
+        }
+        fn operand(random: &mut Random, schema: &Schema) -> Expr {
+            match random.below(5) {
+                0 | 1 => column(schema, random.below(10) as usize),
+                2 => literal(random),
+                3 => Expr::binary(BinaryOp::Multiply, column(schema, [1, 8][random.below(2) as usize]), Expr::Literal(Value::F64(1.01))),
+                _ => Expr::binary(BinaryOp::Add, column(schema, 0), Expr::Literal(Value::I64(1))),
+            }
+        }
+        fn strict(left: Expr, right: Expr) -> Expr { Expr::Call { name: "===".into(), args: vec![left, right], return_type: LogicalType::Scalar(ScalarType::Bool) } }
+        fn predicate(random: &mut Random, schema: &Schema) -> Expr {
+            let comparison = strict(operand(random, schema), operand(random, schema));
+            match random.below(3) {
+                0 => comparison,
+                1 => Expr::Unary { op: UnaryOp::Not, expr: Box::new(comparison) },
+                _ => Expr::binary(BinaryOp::Or, Expr::Unary { op: UnaryOp::Not, expr: Box::new(comparison) }, Expr::Unary { op: UnaryOp::Not, expr: Box::new(strict(operand(random, schema), operand(random, schema))) }),
+            }
+        }
+        fn coalesce(random: &mut Random, schema: &Schema) -> Expr {
+            let times = [4usize, 5, 5, 6];
+            let args = (0..1 + random.below(3)).map(|_| match random.below(4) {
+                0 | 1 => column(schema, if random.below(3) == 0 { random.below(10) as usize } else { times[random.below(4) as usize] }),
+                2 => Expr::Literal(if random.below(2) == 0 { Value::Null } else { zoned(micros(random), Some("UTC")) }),
+                _ => literal(random),
+            }).collect();
+            if random.below(4) == 0 { Expr::Call { name: "coalesce".into(), args, return_type: LogicalType::Scalar(utc()).maybe() } } else { Expr::Coalesce(args) }
+        }
+        fn projection(random: &mut Random, schema: &Schema) -> Expr {
+            let cast = |inner: Expr, random: &mut Random| {
+                let target = [LogicalType::Scalar(utc()), LogicalType::Scalar(utc()).maybe(), LogicalType::Scalar(local()), LogicalType::Scalar(ScalarType::F64), LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)][random.below(6) as usize].clone();
+                Expr::Cast { expr: Box::new(inner), target: CastTarget::Fixed(target) }
+            };
+            match random.below(5) {
+                0 => coalesce(random, schema),
+                1 => { let inner = coalesce(random, schema); cast(inner, random) }
+                2 => { let inner = operand(random, schema); cast(inner, random) }
+                3 => Expr::Literal(zoned(micros(random), Some("UTC"))),
+                _ => Expr::RowCopy(schema.fields().iter().filter(|_| random.below(2) == 0).cloned().collect()),
+            }
+        }
+
+        /// Equal cells, with floats compared by their bits.
+        fn same(left: &Value, right: &Value) -> bool {
+            match (left, right) {
+                (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+                (Value::Struct(a), Value::Struct(b)) => a.len() == b.len() && a.iter().zip(b.iter()).all(|((an, av), (bn, bv))| an == bn && same(av, bv)),
+                (a, b) => a == b,
+            }
+        }
+
+        #[test]
+        fn column_kernels_agree_with_the_scalar_evaluator_on_every_batch_they_compute() {
+            let memory = MemoryBudget::new(1 << 28);
+            let schema = schema();
+            let mut random = Random(0x853c_49e6_748f_ea9b);
+            let (mut predicates, mut projections, mut conformed) = (0, 0, 0);
+            for round in 0..3000 {
+                let batch = batch(&mut random, 32, &memory);
+                let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+                let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
+                    outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
+                let rows: Vec<Vec<Value>> = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect();
+                if round % 2 == 0 {
+                    let predicate = predicate(&mut random, &schema);
+                    let Some(truth) = kernel::truth(&predicate, &schema, &batch, &[]) else { continue };
+                    predicates += 1;
+                    for (values, expected) in rows.iter().zip(truth) {
+                        let actual = match rtdb_expr::evaluate(&predicate, &schema, values, &context) {
+                            Ok(Value::Bool(value)) => Some(value), Ok(Value::Null) => None,
+                            other => panic!("the kernel computed {predicate:?} where the evaluator returns {other:?} on {values:?}"),
+                        };
+                        assert_eq!(actual, expected, "{predicate:?} on {values:?}");
+                    }
+                } else {
+                    let expression = projection(&mut random, &schema);
+                    assert!(projection::shaped(&expression), "{expression:?}");
+                    if projection::bound(&expression, &schema, &batch).unwrap().is_none() { continue; }
+                    let Some(column) = projection::column(&expression, &schema, &batch, &[]).unwrap() else { continue };
+                    projections += 1;
+                    let cells: Vec<Value> = (0..batch.len).map(|row| column.value(row).unwrap()).collect();
+                    for (values, actual) in rows.iter().zip(&cells) {
+                        let expected = rtdb_expr::evaluate_projection(&expression, &schema, values, &context)
+                            .unwrap_or_else(|error| panic!("the kernel computed {expression:?} where the evaluator raises {error:?} on {values:?}"));
+                        assert!(same(actual, &expected), "{expression:?} on {values:?}: evaluator {expected:?}, kernel {actual:?}");
+                    }
+                    let Column::Arrow { logical: Some(logical), .. } = &column else { continue };
+                    // The result may order a record's fields differently from the copy that produced it.
+                    let reordered = match logical { LogicalType::Struct(fields) => LogicalType::Struct(fields.iter().rev().map(|(name, ty)| (name.clone(), ty.clone().maybe())).collect()), other => other.clone() };
+                    for target in [logical.clone(), logical.clone().maybe(), reordered] {
+                        let field = rtdb_columnar::to_field("value", &target).unwrap();
+                        let Some(kept) = conform(&column, &target, &field) else { continue };
+                        conformed += 1;
+                        let copied = rtdb_columnar::copy_array(&target, &cells).unwrap();
+                        assert_eq!(kept.data_type(), copied.data_type(), "{expression:?} as {target:?}");
+                        for (row, cell) in cells.iter().enumerate() {
+                            let (kept, copied) = (rtdb_columnar::read_value(&field, kept.as_ref(), row).unwrap(), rtdb_columnar::read_value(&field, copied.as_ref(), row).unwrap());
+                            assert!(same(&kept, &copied) && kept.is_null() == cell.is_null(), "{expression:?} as {target:?} at {row}: kept {kept:?}, copied {copied:?}");
+                        }
+                    }
+                }
+            }
+            assert!(predicates > 450 && projections > 500 && conformed > 150, "the kernels should compute most generated expressions: {predicates} predicates, {projections} projections, {conformed} kept");
+        }
+
+        #[test]
+        fn the_canonical_put_of_an_update_runs_entirely_in_the_kernels() {
+            let memory = MemoryBudget::new(1 << 24);
+            let schema = schema();
+            let batch = batch(&mut Random(7), 16, &memory);
+            let instant = |value: Expr| Expr::Cast { expr: Box::new(value), target: CastTarget::fixed(LogicalType::Scalar(utc())) };
+            let now = Expr::Literal(zoned(42, Some("UTC")));
+            let expressions = [instant(Expr::Coalesce(vec![column(&schema, 4), now])), instant(Expr::Coalesce(vec![column(&schema, 5), Expr::Literal(zoned(i64::MAX, Some("UTC")))])),
+                Expr::RowCopy(vec![schema.fields()[0].clone(), schema.fields()[1].clone(), schema.fields()[2].clone()])];
+            for expression in expressions {
+                let column = projection::column(&expression, &schema, &batch, &[]).unwrap();
+                assert!(matches!(column, Some(Column::Arrow { .. })), "{expression:?} should compute to an Arrow column");
+            }
+        }
+    }
 }
 
 /// Reorders, selects or renames a batch's columns, for a projection whose expressions are all input columns.
@@ -763,24 +1014,46 @@ impl Column {
 
 /// Projects batches through expressions computed over whole columns where the kernel's arithmetic is exactly the
 /// evaluator's, and row by row through the evaluator for any expression or batch where it isn't.
-pub(crate) struct BatchExpressions { input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution }
+pub(crate) struct BatchExpressions { input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, clocked: Option<Vec<rtdb_plan::Expr>>, execution: crate::context::Execution }
 impl BatchExpressions {
-    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self { Self { input, schema, expressions, execution } }
+    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self { Self { input, schema, expressions, clocked: None, execution } }
+}
+
+/// The expressions with each read of the query clock replaced by the instant the evaluator reads, for the kernels;
+/// a read the evaluator fails stays a call, which leaves its expression to the evaluator.
+async fn read_clock(expressions: &[rtdb_plan::Expr], execution: &crate::context::Execution) -> Result<Vec<rtdb_plan::Expr>> {
+    let mut reads = Vec::new();
+    for expression in expressions {
+        expression.visit(&mut |expr| if let rtdb_plan::Expr::Call { name, args, .. } = expr && projection::clock(name, args) && !reads.contains(expr) { reads.push(expr.clone()); });
+    }
+    let schema = rtdb_plan::Schema::default();
+    let mut instants = Vec::with_capacity(reads.len());
+    for read in reads {
+        let scope = execution.scope()?;
+        if let Ok(value) = execution.evaluate(&scope, &read, &schema, &[]).await { instants.push((read, value)); }
+    }
+    Ok(expressions.iter().map(|expression| {
+        let mut expression = expression.clone();
+        expression.rewrite(&mut |expr| if let Some((_, value)) = instants.iter().find(|(read, _)| read == expr) { *expr = rtdb_plan::Expr::Literal(value.clone()); });
+        expression
+    }).collect())
 }
 #[async_trait::async_trait]
 impl BatchCursor for BatchExpressions {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
         self.execution.context.check_cancelled()?;
+        if self.clocked.is_none() { self.clocked = Some(read_clock(&self.expressions, &self.execution).await?); }
+        let clocked = self.clocked.as_deref().unwrap_or_default();
         let parameters = self.execution.parameters.values();
         let mut page = None;
         let mut columns = Vec::with_capacity(self.expressions.len());
         let mut reservation = self.execution.context.memory.reserve(256)?;
-        for expression in &self.expressions {
-            if let Some(bound) = projection::bound(expression, &self.schema, &batch)? {
+        for (expression, kernel) in self.expressions.iter().zip(clocked) {
+            if let Some(bound) = projection::bound(kernel, &self.schema, &batch)? {
                 let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
                 lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?)?;
-                if let Some(column) = projection::column(expression, &self.schema, &batch, parameters)? { columns.push(column); continue; }
+                if let Some(column) = projection::column(kernel, &self.schema, &batch, parameters)? { columns.push(column); continue; }
             }
             if let Some(column) = crate::vector::column(expression, &self.schema, &batch, parameters) {
                 // A vectorised column's size is known once computed; it is charged before the next is built.
@@ -812,13 +1085,14 @@ impl BatchCursor for BatchExpressions {
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
-/// Column-at-a-time projection for input columns, scalar constants, `+ - *` over 64-bit integers and floats, and
-/// records of those; `Ok(None)` where the evaluator must compute it, including any integer overflow, so its error is raised.
+/// Column-at-a-time projection for input columns, scalar constants, `+ - *` over 64-bit integers and floats, records of
+/// those, `COALESCE`, casts to a column's own type and row copies; `Ok(None)` where the evaluator must compute it,
+/// including any integer overflow, so its error is raised.
 pub(crate) mod projection {
     use std::sync::Arc;
-    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array};
+    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, StructArray};
     use arrow_schema::{DataType, Field as ArrowField};
-    use rtdb_plan::{BinaryOp, Expr, Schema};
+    use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema};
     use rtdb_types::{LogicalType, Result, ScalarType, StructFields, Value};
     use super::{Column, ColumnBatch};
 
@@ -845,7 +1119,7 @@ pub(crate) mod projection {
         }
     }
     fn numbers<'a>(expr: &Expr, schema: &Schema, batch: &'a ColumnBatch, computed: &'a mut Option<Column>, parameters: &[Value]) -> Result<Option<Numbers<'a>>> {
-        let plain = |logical: &Option<LogicalType>, field: &ArrowField, expected: ScalarType| match logical { Some(LogicalType::Scalar(scalar)) => *scalar == expected, Some(_) => false, None => field.metadata().is_empty() };
+        let plain = |logical: &Option<LogicalType>, field: &ArrowField, expected: ScalarType| match logical { Some(logical) => super::plain_scalar(logical) == Some(&expected), None => field.metadata().is_empty() };
         let array_numbers = |column: &'a Column| -> Option<Numbers<'a>> {
             let Column::Arrow { array, field, logical } = column else { return None };
             match array.data_type() {
@@ -899,20 +1173,27 @@ pub(crate) mod projection {
     /// Whether an expression has a shape the kernel may compute; its cells' types decide per batch.
     pub(crate) fn shaped(expr: &Expr) -> bool {
         match expr {
-            Expr::Column { .. } | Expr::Parameter { .. } => true,
-            Expr::Literal(value) => constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_)),
+            Expr::Column { .. } | Expr::Parameter { .. } | Expr::RowCopy(_) => true,
+            Expr::Literal(value) => literal(value),
             Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => shaped(left) && shaped(right),
             Expr::Struct(fields) => fields.iter().all(|(_, field)| shaped(field)),
+            Expr::Coalesce(args) => args.iter().all(shaped),
+            Expr::Call { name, args, .. } if name == "coalesce" => args.iter().all(shaped),
+            Expr::Call { name, args, .. } if clock(name, args) => true,
+            Expr::Cast { expr: inner, target: CastTarget::Fixed(_) } if shaped(inner) => true,
             expr => crate::vector::lowerable(expr),
         }
     }
+    fn literal(value: &Value) -> bool { constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_) | Value::Timestamp { .. }) }
+    /// The query clock, which `BatchExpressions` reads once and hands the kernels as a literal.
+    pub(crate) fn clock(name: &str, args: &[Expr]) -> bool { args.is_empty() && matches!(name, "current_timestamp" | "current-timestamp" | "now") }
     /// Bounds what `column` allocates for `expr`, or `None` where it would not compute it.
     pub(crate) fn bound(expr: &Expr, schema: &Schema, batch: &ColumnBatch) -> Result<Option<usize>> {
         let rows = batch.len;
         let per_row = |bytes: usize| rows.checked_mul(bytes).and_then(|total| total.checked_add(256)).ok_or_else(super::size_error);
         Ok(Some(match expr {
             Expr::Column { id, .. } => match schema.position(*id) { Some(position) => batch.columns[position].retained_bytes()?, None => return Ok(None) },
-            Expr::Literal(value) if constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_)) => per_row(std::mem::size_of::<Value>().checked_add(value.retained_bytes()?).ok_or_else(super::size_error)?)?,
+            Expr::Literal(value) if literal(value) => per_row(std::mem::size_of::<Value>().checked_add(value.retained_bytes()?).ok_or_else(super::size_error)?)?,
             Expr::Parameter { .. } => 0,
             // The checked path builds `Option<i64>` cells before the array, and each operand may be computed too.
             Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => {
@@ -932,8 +1213,35 @@ pub(crate) mod projection {
                 }
                 total
             }
+            Expr::Coalesce(args) => return coalesce_bound(args, schema, batch),
+            Expr::Call { name, args, .. } if name == "coalesce" => return coalesce_bound(args, schema, batch),
+            Expr::Cast { expr: inner, target: CastTarget::Fixed(_) } => return bound(inner, schema, batch),
+            Expr::RowCopy(fields) => {
+                let mut total = per_row(std::mem::size_of::<Value>().checked_add(256).ok_or_else(super::size_error)?)?;
+                for field in fields {
+                    let Some(position) = schema.position(field.id) else { return Ok(None) };
+                    let cells = (0..rows).try_fold(0usize, |sum, row| sum.checked_add(batch.columns[position].bound(row)?).ok_or_else(super::size_error))?;
+                    total = per_row(field.name.len().checked_add(std::mem::size_of::<Value>() + std::mem::size_of::<String>() + 64).ok_or_else(super::size_error)?)?
+                        .checked_add(cells).and_then(|bytes| bytes.checked_add(total)).ok_or_else(super::size_error)?;
+                }
+                total
+            }
             _ => return Ok(None),
         }))
+    }
+    /// The computed arguments, and one cell of each per row.
+    fn coalesce_bound(args: &[Expr], schema: &Schema, batch: &ColumnBatch) -> Result<Option<usize>> {
+        let rows = batch.len;
+        let mut total = rows.checked_mul(std::mem::size_of::<Value>() + 64).and_then(|bytes| bytes.checked_add(256)).ok_or_else(super::size_error)?;
+        for arg in args {
+            let Some(computed) = bound(arg, schema, batch)? else { return Ok(None) };
+            let cells = match arg {
+                Expr::Column { id, .. } => match schema.position(*id) { Some(position) => (0..rows).try_fold(0usize, |sum, row| sum.checked_add(batch.columns[position].bound(row)?).ok_or_else(super::size_error))?, None => return Ok(None) },
+                _ => computed,
+            };
+            total = total.checked_add(computed).and_then(|bytes| bytes.checked_add(cells)).ok_or_else(super::size_error)?;
+        }
+        Ok(Some(total))
     }
     pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Result<Option<Column>> {
         match expr {
@@ -944,7 +1252,7 @@ pub(crate) mod projection {
                     Column::Values(values) => Column::Values(values.iter().map(|value| { let mut value = value.clone(); value.admit_expression_dates()?; Ok(value) }).collect::<Result<_>>()?),
                 }))
             }
-            Expr::Literal(value) if constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_)) => Ok(Some(Column::Values(vec![value.clone(); batch.len]))),
+            Expr::Literal(value) if literal(value) => Ok(Some(Column::Values(vec![value.clone(); batch.len]))),
             Expr::Binary { .. } => arithmetic(expr, schema, batch, parameters),
             Expr::Struct(fields) => {
                 let mut columns = Vec::with_capacity(fields.len());
@@ -967,7 +1275,102 @@ pub(crate) mod projection {
                 }
                 Ok(Some(Column::Values(values)))
             }
+            Expr::Coalesce(args) => coalesce(args, schema, batch, parameters),
+            Expr::Call { name, args, .. } if name == "coalesce" => coalesce(args, schema, batch, parameters),
+            Expr::Cast { expr: inner, target: CastTarget::Fixed(target) } => {
+                let Some(column) = column(inner, schema, batch, parameters)? else { return Ok(None) };
+                // A cast to the type its cells already have returns each cell as it is.
+                let Column::Arrow { logical: Some(logical), .. } = &column else { return Ok(None) };
+                let target = target.unencoded();
+                let target = match &target { LogicalType::Maybe(inner) => inner.as_ref(), target => target };
+                let identity = super::plain_scalar(logical).is_some_and(|scalar| super::copyable(scalar) && *target == LogicalType::Scalar(scalar.clone()));
+                Ok(identity.then_some(column))
+            }
+            Expr::RowCopy(fields) => row_copy(fields, schema, batch),
             _ => Ok(None),
         }
+    }
+
+    /// The first non-null argument per row. An argument the kernels can't compute, or one that raises an error the
+    /// evaluator might never reach, leaves the whole call to the evaluator.
+    fn coalesce(args: &[Expr], schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Result<Option<Column>> {
+        enum Arg { Constant(Value), Cells(Column) }
+        let mut computed = Vec::with_capacity(args.len());
+        for arg in args {
+            match arg {
+                Expr::Literal(Value::Null | Value::Undefined) => continue,
+                Expr::Literal(value) => { computed.push(Arg::Constant(value.clone())); break; }
+                arg => match column(arg, schema, batch, parameters) { Ok(Some(column)) => computed.push(Arg::Cells(column)), _ => return Ok(None) },
+            }
+        }
+        let Some(last) = computed.iter().rposition(|arg| matches!(arg, Arg::Cells(_))) else { return Ok(None) };
+        // Arguments of one plain scalar layout are interleaved in bulk, a constant as a one-cell array of that layout.
+        let layout = computed.iter().find_map(|arg| match arg { Arg::Cells(Column::Arrow { array, logical: Some(logical), .. }) => Some((array.data_type().clone(), super::plain_scalar(logical)?.clone())), _ => None });
+        if let Some((data_type, scalar)) = layout.filter(|(data_type, scalar)| super::copyable(scalar) && super::scalar_layout(data_type) && *data_type != DataType::Null) {
+            let logical = LogicalType::Scalar(scalar);
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(computed.len());
+            for arg in &computed {
+                let array = match arg {
+                    Arg::Cells(Column::Arrow { array, logical: Some(other), .. }) if array.data_type() == &data_type && super::plain_scalar(other) == super::plain_scalar(&logical) => Some(Arc::clone(array)),
+                    Arg::Constant(value) if value.logical_type() == logical => rtdb_columnar::copy_array(&logical, std::slice::from_ref(value)).ok().filter(|array| array.data_type() == &data_type),
+                    _ => None,
+                };
+                match array { Some(array) => arrays.push(array), None => break }
+            }
+            if arrays.len() == computed.len() {
+                let picks = (0..batch.len).map(|row| match computed.iter().zip(&arrays).position(|(arg, array)| matches!(arg, Arg::Constant(_)) || array.is_valid(row)) {
+                    Some(index) if matches!(computed[index], Arg::Constant(_)) => (index, 0),
+                    Some(index) => (index, row),
+                    None => (last, row),
+                }).collect::<Vec<_>>();
+                let sources: Vec<&dyn Array> = arrays.iter().map(|array| array.as_ref()).collect();
+                let array = arrow_select::interleave::interleave(&sources, &picks).map_err(|error| crate::invalid("column-coalesce", error))?;
+                let field = Arc::new(ArrowField::new("value", data_type, true));
+                return Ok(Some(Column::Arrow { array, field, logical: Some(logical) }));
+            }
+        }
+        let mut values = Vec::with_capacity(batch.len);
+        for row in 0..batch.len {
+            let mut value = Value::Null;
+            for arg in &computed {
+                let cell = match arg { Arg::Constant(value) => value.clone(), Arg::Cells(column) => match column.value(row) { Ok(cell) => cell, Err(_) => return Ok(None) } };
+                if !matches!(cell, Value::Null | Value::Undefined) { value = cell; break; }
+            }
+            if value.admit_expression_dates().is_err() || rtdb_expr::validate_projection_value(&value).is_err() { return Ok(None); }
+            values.push(value);
+        }
+        Ok(Some(Column::Values(values)))
+    }
+
+    /// A record of input columns copied cell for cell: one struct array where every field is a plain scalar column,
+    /// otherwise one record per row, admitted as the evaluator's output is.
+    fn row_copy(fields: &[rtdb_plan::Field], schema: &Schema, batch: &ColumnBatch) -> Result<Option<Column>> {
+        let Some(columns) = fields.iter().map(|field| schema.position(field.id).map(|position| &batch.columns[position])).collect::<Option<Vec<_>>>() else { return Ok(None) };
+        let unique = fields.iter().enumerate().all(|(index, field)| fields[..index].iter().all(|other| other.name != field.name));
+        let mut children = Vec::with_capacity(fields.len());
+        let mut types = StructFields::new();
+        for (field, column) in fields.iter().zip(&columns) {
+            let Column::Arrow { array, field: source, logical: Some(logical) } = column else { break };
+            if !unique || super::plain_scalar(logical).is_none() || !super::scalar_layout(array.data_type()) || array.data_type() == &DataType::Null { break; }
+            let child = ArrowField::new(field.name.clone(), array.data_type().clone(), source.is_nullable() || array.null_count() != 0).with_metadata(source.metadata().clone());
+            children.push((Arc::new(child), Arc::clone(array)));
+            types.insert(field.name.clone(), logical.clone());
+        }
+        let (arrow_fields, arrays): (Vec<_>, Vec<_>) = children.into_iter().unzip();
+        if !fields.is_empty() && arrays.len() == fields.len() && let Ok(array) = StructArray::try_new(arrow_fields.into(), arrays, None) {
+            let field = Arc::new(ArrowField::new("value", array.data_type().clone(), false));
+            return Ok(Some(Column::Arrow { array: Arc::new(array), field, logical: Some(LogicalType::Struct(types)) }));
+        }
+        let mut values = Vec::with_capacity(batch.len);
+        for row in 0..batch.len {
+            let mut document = StructFields::new();
+            for (field, column) in fields.iter().zip(&columns) {
+                match column.value(row) { Ok(value) => { document.insert(field.name.clone(), value); } Err(_) => return Ok(None) }
+            }
+            let mut value = Value::Struct(document);
+            if value.admit_expression_dates().is_err() { return Ok(None); }
+            values.push(value);
+        }
+        Ok(Some(Column::Values(values)))
     }
 }
