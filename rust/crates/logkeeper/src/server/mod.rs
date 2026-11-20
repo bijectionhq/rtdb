@@ -27,12 +27,10 @@ pub struct ServerOptions {
 /// Serves until `cancellation`, then closes every connection and drains the journal.
 /// A failed journal write stops the server, since its later acknowledgements could no longer be trusted.
 pub async fn serve(listener: TcpListener, options: ServerOptions, cancellation: CancellationToken) -> Result<()> {
-    let journal = tokio::task::spawn_blocking(move || -> Result<_> {
-        let journal = Arc::new(Journal::open(&options.data_dir, options.fsync)?);
-        let recovered = journal.recover()?;
-        Ok((journal, recovered))
-    }).await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))?;
-    let (journal, recovered) = journal?;
+    let opened = tokio::task::spawn_blocking(move || Journal::open(&options.data_dir, options.fsync))
+        .await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))?;
+    let (journal, recovered) = opened?;
+    let journal = Arc::new(journal);
     let (queue, work) = mpsc::unbounded_channel();
     let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));
     let mut journal_task = tokio::spawn(journal::run(journal, work));

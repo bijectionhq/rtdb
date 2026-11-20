@@ -1,24 +1,23 @@
 //! Every stream a server holds, and the order in which their mutations reach the journal.
 
-use super::journal::{FileInfo, Journal, Recovered, Work, Write};
+use super::journal::{Captured, Journal, Recovered, Work, Write};
 use super::state::{Decision, StreamState};
 use crate::protocol::{Entries, Failed, RequestBody, ResponseBody};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-const REWRITE_SLACK_BYTES: u64 = 1 << 20;
+const COMPACTION_SLACK_BYTES: u64 = 1 << 20;
 
-/// A stream's state and file; a stream with no waiting reader owns no task and no timer.
+/// A stream's state; a stream with no waiting reader owns no task and no timer.
 pub(crate) struct Slot {
+    /// Names the stream in the journal's records.
+    pub id: u64,
     pub name: String,
-    pub path: PathBuf,
     pub state: Mutex<StreamState>,
-    pub file: Mutex<FileInfo>,
     /// Woken when the commit lsn or trim point moves.
     pub progressed: Notify,
 }
@@ -38,7 +37,7 @@ pub(crate) enum Outcome {
 impl Store {
     pub fn new(journal: Arc<Journal>, recovered: Vec<Recovered>, queue: mpsc::UnboundedSender<Work>) -> Self {
         let streams = recovered.into_iter().map(|stream| {
-            let slot = Slot { name: stream.name.clone(), path: stream.path, state: Mutex::new(stream.state), file: Mutex::new(FileInfo { exists: true, bytes: stream.bytes }), progressed: Notify::new() };
+            let slot = Slot { id: stream.id, name: stream.name.clone(), state: Mutex::new(stream.state), progressed: Notify::new() };
             (stream.name, Arc::new(slot))
         }).collect();
         Self { journal, streams: Mutex::new(streams), queue }
@@ -47,7 +46,7 @@ impl Store {
     fn slot(&self, name: &str) -> Arc<Slot> {
         let mut streams = self.streams.lock();
         if let Some(slot) = streams.get(name) { return Arc::clone(slot); }
-        let slot = Arc::new(Slot { name: name.to_owned(), path: self.journal.path_for(name), state: Mutex::new(StreamState::default()), file: Mutex::new(FileInfo::default()), progressed: Notify::new() });
+        let slot = Arc::new(Slot { id: self.journal.allocate_id(), name: name.to_owned(), state: Mutex::new(StreamState::default()), progressed: Notify::new() });
         streams.insert(name.to_owned(), Arc::clone(&slot));
         slot
     }
@@ -65,22 +64,34 @@ impl Store {
             RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) => return Outcome::Now(failed("not a mutation")),
         };
         let slot = self.slot(&stream);
-        let mut state = slot.state.lock();
-        let before = (state.commit, state.trim);
-        let decision = decide(&mut state);
-        if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
-        let trimmed = state.trim != before.1;
-        let write = if trimmed && slot.file.lock().bytes > 2 * state.retained_bytes() as u64 + REWRITE_SLACK_BYTES {
-            Write::Rewrite(state.clone())
-        } else {
-            Write::Events(decision.events)
+        let (outcome, trimmed) = {
+            let mut state = slot.state.lock();
+            let before = (state.commit, state.trim);
+            let decision = decide(&mut state);
+            if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
+            let (done, durable) = oneshot::channel();
+            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done }).is_err() {
+                return Outcome::Now(failed("the journal has stopped"));
+            }
+            if (state.commit, state.trim) != before { slot.progressed.notify_waiters(); }
+            (Outcome::Durable(durable, decision.reply), state.trim != before.1)
         };
-        let (done, durable) = oneshot::channel();
-        if self.queue.send(Work { slot: Arc::clone(&slot), write, done }).is_err() {
-            return Outcome::Now(failed("the journal has stopped"));
-        }
-        if (state.commit, state.trim) != before { slot.progressed.notify_waiters(); }
-        Outcome::Durable(durable, decision.reply)
+        if trimmed { self.compact_if_mostly_dead(); }
+        outcome
+    }
+
+    /// Queues a compaction once the segments hold more than twice what the streams retain.
+    /// Every stream is captured under its lock, all held together while the compaction is queued, so each capture sits exactly where it belongs in its stream's order.
+    fn compact_if_mostly_dead(&self) {
+        let disk = self.journal.bytes();
+        if disk <= COMPACTION_SLACK_BYTES { return; }
+        let slots: Vec<Arc<Slot>> = self.streams.lock().values().cloned().collect();
+        let live: u64 = slots.iter().map(|slot| slot.state.lock().retained_bytes() as u64).sum();
+        if disk <= 2 * live + COMPACTION_SLACK_BYTES || !self.journal.claim_compaction() { return; }
+        let streams = self.streams.lock();
+        let locked: Vec<_> = streams.values().map(|slot| (slot, slot.state.lock())).collect();
+        let captured = locked.iter().map(|(slot, state)| Captured { id: slot.id, name: slot.name.clone(), state: (**state).clone() }).collect();
+        if self.queue.send(Work { write: Write::Compact(captured), done: oneshot::channel().0 }).is_err() { self.journal.release_compaction(); }
     }
 
     pub fn check(&self, stream: &str, epoch: u64) -> ResponseBody {

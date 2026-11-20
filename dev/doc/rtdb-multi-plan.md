@@ -46,7 +46,8 @@ Update this section as stages land.
   The logkeeper client can move a stream across epochs (`open_writer_on` seals the previous loglet, recovers its tail and copies it onto the new ensemble; `open_reader_on` reads a whole chain), but the directory does not record a chain and no holder moves one.
   A move seals only the chain's last loglet, not every earlier one as `SealPriorLoglets` does: an earlier loglet was sealed by the move that ended it, and no later writer appends to it.
 - **Logkeeper storage.**
-  One journal file per stream rather than per writer, and retained entries held in memory.
+  Every stream on a server shares one sequence of segment files, so a round across streams costs one write and one sync, but the segments are per server rather than per writer member.
+  Retained entries are held in memory, and space is reclaimed by compaction rather than per segment: once the segments hold more than twice what the streams retain, a base segment snapshotting every stream replaces them all, so an untrimmed tail costs copying rather than pinning a segment (`TrimFollowsPublication`).
 - **Linearizable reads are not wired.**
   Acknowledgements announce seals (`SealsAreAnnounced`) and `QuorumLog::confirm_leadership` runs the check `ServeLinearizableReadOnWriter` needs, but no holder calls it before serving a linearizable read.
 - **The gateway splices bytes.**
