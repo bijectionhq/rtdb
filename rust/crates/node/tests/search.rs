@@ -602,3 +602,61 @@ async fn an_index_without_history_answers_past_queries_as_scanning_does_with_no_
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_compaction() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let words = ["invoice", "overdue", "paid", "book", "late", "red"];
+    let mut seed = 41u64;
+    let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
+    let mut last = None;
+    for round in 0..3 {
+        for id in 0..60 {
+            let body: Vec<_> = (0..1 + next() % 5).map(|_| words[next() % words.len()]).collect();
+            let statement = match next() % 8 {
+                0 => format!("DELETE FROM docs WHERE _id = {id}"),
+                1 => format!("INSERT INTO docs RECORDS {{_id: {id}, body: {}}}", next() % 100),
+                2 => format!("INSERT INTO docs RECORDS {{_id: {id}, title: 'untitled'}}"),
+                _ => format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{}'}}", body.join(" ")),
+            };
+            last = Some(session.state_mut().execute_tx(vec![sql(&statement)], AutonomousTxOptions::default()).await.unwrap().tx_key().system_time);
+        }
+        if round < 2 {
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+            if round == 0 { database.compaction().unwrap().compact_all().await.unwrap(); }
+        }
+    }
+    let basis = chrono::DateTime::from_timestamp_micros(last.unwrap().0).unwrap().to_rfc3339();
+    let visible = rows(session.query_sql(&format!("SELECT body FROM docs FOR VALID_TIME AS OF TIMESTAMP '{basis}' FOR SYSTEM_TIME AS OF TIMESTAMP '{basis}'"), vec![]).await.unwrap()).await;
+    let scoring = rtdb_text::Query::parse("invoice overdue");
+    let mut corpus = rtdb_text::Corpus::default();
+    for row in &visible {
+        let tokens = match &row[0] { Value::Null => continue, Value::Utf8(text) => rtdb_text::tokens(text), _ => Vec::new() };
+        corpus.documents += 1;
+        corpus.tokens += u64::from(rtdb_text::stored_length(tokens.len()));
+        for term in scoring.terms() { if tokens.contains(term) { *corpus.frequencies.entry(term.clone()).or_default() += 1; } }
+    }
+    for term in scoring.terms() { corpus.frequencies.entry(term.clone()).or_default(); }
+    let query = "SELECT _id, body, SEARCH_SCORE(body, 'invoice overdue') AS score FROM docs WHERE MATCH(body, 'invoice') ORDER BY _id";
+    let scored = rows(session.query_sql(query, vec![]).await.unwrap()).await;
+    assert!(scored.len() > 5, "{scored:?}");
+    for row in &scored {
+        let Value::Utf8(body) = &row[1] else { panic!("{row:?}") };
+        assert_eq!(row[2], Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens(body), Some(&corpus))), "{row:?} against {corpus:?}");
+    }
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, scored, "the same snapshot scores the same whatever search files exist");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

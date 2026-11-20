@@ -498,6 +498,42 @@ impl SearchFile {
     /// Every event of one entity this file's data holds, system time descending.
     pub fn events(&self, iid: &[u8; 16]) -> Result<Vec<KeyedEvent>> { self.sidecar.rows_of(iid).map(|row| self.sidecar.key(row)).collect() }
 
+    /// Every event of one entity this file's data holds, with its row, system time descending.
+    pub fn rows_of(&self, iid: &[u8; 16]) -> Result<Vec<(u32, KeyedEvent)>> { self.sidecar.rows_of(iid).map(|row| Ok((row, self.sidecar.key(row)?))).collect() }
+
+    /// A row's run in a column: `None` where the row is visible nowhere within the file, `Some(None)` where it is visible with the column null or absent.
+    pub fn run_of(&self, column: &str, row: u32) -> Option<Option<u32>> {
+        match self.column(column).map(|index| self.sidecar.row_doc(index, row)) { Some(RowDoc::Run(doc)) => Some(Some(doc)), Some(RowDoc::Null) => Some(None), _ => None }
+    }
+
+    pub fn rows(&self) -> u32 { self.sidecar.rows }
+
+    /// Each entity the file holds an event of, in IID order.
+    pub fn iids(&self) -> impl Iterator<Item = [u8; 16]> + '_ {
+        (0..self.sidecar.rows).map(|row| <[u8; 16]>::try_from(self.sidecar.row_iid(row)).unwrap_or_default()).scan(None, |last, iid| { let fresh = *last != Some(iid); *last = Some(iid); Some(fresh.then_some(iid)) }).flatten()
+    }
+
+    /// The latest system-from of any of the file's events.
+    pub fn latest_system_from(&self) -> Result<i64> { (0..self.sidecar.rows).map(|row| self.sidecar.key(row).map(|key| key.system_from)).try_fold(i64::MIN, |latest, system| system.map(|system| latest.max(system))) }
+
+    /// A document's length as the index stores it.
+    pub fn stored_length(&self, column: &str, doc: u32) -> Result<u32> {
+        let Some(field) = self.field(column) else { return Ok(0) };
+        let Some(segment) = self.searcher.segment_readers().first() else { return Ok(0) };
+        Ok(segment.get_fieldnorms_reader(field).map_err(fault)?.fieldnorm(doc))
+    }
+
+    /// The documents holding a term in a column, in order.
+    pub fn holding(&self, column: &str, term: &str) -> Result<Vec<u32>> {
+        use tantivy::DocSet;
+        let (Some(field), Some(segment)) = (self.field(column), self.searcher.segment_readers().first()) else { return Ok(Vec::new()) };
+        let Some(mut postings) = segment.inverted_index(field).map_err(fault)?.read_postings(&Term::from_field_text(field, term), IndexRecordOption::Basic).map_err(fault)? else { return Ok(Vec::new()) };
+        let mut docs = Vec::new();
+        let mut doc = postings.doc();
+        while doc != tantivy::TERMINATED { docs.push(doc); doc = postings.advance(); }
+        Ok(docs)
+    }
+
     /// Every query term and phrase as one conjunction over the column.
     fn conjunction(field: Field, query: &Query) -> BooleanQuery {
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = query.terms().iter().map(|term| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)).collect();

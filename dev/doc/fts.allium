@@ -197,14 +197,14 @@ rule RepairUnreadableSearchFile {
 -- Past max_candidates candidates, the scan runs unnarrowed instead.
 -- Past max_unindexed_bytes of tries the lane should have indexed but has not, the node builds none of them: the scan is neither narrowed nor ranked, and only rows of tries with a recorded file take MATCH from it.
 --
--- Each current-side search file the lane recorded, in every partition the query reads, is registered with the query as a corpus source, once however often the scan reopens.
+-- A score's corpus is CorpusAsOfTheSnapshot's, registered with the query once per table and column a MATCH narrows, from every partition the query reads.
 -- A query text's corpus is fixed at its first use, so every score in one query is relative to the same corpus.
 --
 -- A score from the index equals SEARCH_SCORE on the resolved row: both take each term's frequency and the document's length rounded to the index's stored lengths.
 --
 -- A scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, is ranked before it opens, in each partition it reads:
 --
---   0. The table's current-side search files in every partition the query reads are registered as corpus sources, so the corpus a score fixes is the same whichever partition is ranked first.
+--   0. The column's corpus is registered before any partition is ranked, so a score is the same whichever partition fixes it first.
 --
 --   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
 --      Events in live segments are scored from their rows.
@@ -218,7 +218,21 @@ rule RepairUnreadableSearchFile {
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
 -- The scan is left to the unranked narrowing when the matching IIDs exceed max_candidates, or when verification runs past sixteen batches.
--- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every source the query registered; with none, each term's inverse document frequency is 1.
+-- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every corpus the query registered; with none, each term's inverse document frequency is 1.
+
+rule CorpusAsOfTheSnapshot {
+    -- A column's corpus at a snapshot is its values in the rows a scan of the table sees at the snapshot's own instant, its latest transaction's system time, taken as valid time and system time both, across every partition and the live index.
+    -- A row whose column is null or absent is not in it; a value that is not text is, with no tokens.
+    -- Documents counts those rows, tokens sums their stored lengths, and a term's frequency counts the rows holding it.
+    -- It is a function of the snapshot's data, not of which search files exist: a node builds the search file of every trie visible at the instant, whatever max_unindexed_bytes allows narrowing.
+    -- Each file's runs that its own events leave visible at every instant from its latest event on are counted once per file and kept; those visible over a bounded valid interval are checked at the instant.
+    -- An entity with events in more than one file, or in the live index, is resolved across all of them as the scan resolves, live rows first at one instant, and its one visible row replaces what its runs counted file by file.
+    -- A node keeps the corpus for the files and live segments it was made from.
+    when: ScoreAsked(column, snapshot)
+
+    ensures:
+        CorpusOfVisibleRows(column, snapshot)
+}
 
 rule CutByLaterEvents {
     -- A document's rectangles come from its own file's events; an event of the same entity elsewhere in the partition, in a selected trie or live segment, cuts them.
@@ -298,7 +312,7 @@ contract SearchCorrectness {
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.
-        -- SEARCH_SCORE's values are not rows: they depend on the search files a query read (ScoresApproximate).
+        -- SEARCH_SCORE's values are the same too, a function of the snapshot (ScoresFromTheSnapshot).
 
     @invariant CandidatesAreASuperset
         -- Every IID with a visible row satisfying MATCH at the query's valid and system time is in the candidate set.
@@ -334,15 +348,17 @@ surface FullTextSearch {
     @guarantee MatchAtAnyTime
         -- MATCH answers at any valid time and system time the scan accepts, the default as-of-now included.
 
-    @guarantee ScoresApproximate
-        -- Scores rank results within one query.
-        -- They are summed over the search files the query read, across every column and table it narrowed, so they move as compaction and the lane change those files, and with no files each term's inverse document frequency is 1.
+    @guarantee ScoresFromTheSnapshot
+        -- A score is BM25 against CorpusAsOfTheSnapshot: the same snapshot scores the same whatever compaction and the lane have done.
+        -- A query at a past time is scored against its snapshot's corpus, not the past one.
+        -- A query narrowing several columns or tables sums their corpora.
 }
 
 -- Black box helpers used in rule expressions:
 --   search_record(job)                  — the artefact record of a built search file: kind `search`, the definition's artefact id and version
 --   search_candidates(scan, predicate)  — steps 1–4 of the query plan
 --   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the trie's artefact key
+--   CorpusOfVisibleRows(column, snapshot) — CorpusAsOfTheSnapshot's counts (search/src/corpus.rs)
 --   EachCandidateCutByItsEntitysLaterEvents(scan) — CutByLaterEvents' subtraction, before narrowing and ranking
 --   EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate) — MatchEvaluatedByTheScan's evaluation, in the scan, before its filter
 --   retired_records(table)               — the records RetireSearchFiles retires (maintenance/src/artefact.rs: retired_artefacts)

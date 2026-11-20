@@ -104,6 +104,8 @@ pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
     live_keys: Mutex<Bounded<(String, rtdb_types::TableRef, usize), Arc<Mutex<LiveKeys>>>>,
+    open_runs: Mutex<Bounded<(String, String), (std::sync::Weak<SearchFile>, Arc<crate::corpus::OpenRuns>)>>,
+    corpora: Mutex<Bounded<String, Arc<crate::corpus::SnapshotCorpus>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
     built: Mutex<Bounded<(String, String), OpenedFile>>,
     /// Builds in progress, which a second query for the same file awaits rather than repeats.
@@ -117,7 +119,7 @@ pub struct SearchRuntime {
 impl SearchRuntime {
     /// `file_bytes` bounds the recorded search files kept across queries, each keeping its buffer-pool lease so its bytes stay charged to the pool; half as much bounds the files a node builds itself, and 32 times as much the files mapped from this node's disk, of which only the pages a query reads are resident.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), live_keys: Mutex::new(Bounded::new(256)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), live_keys: Mutex::new(Bounded::new(256)), open_runs: Mutex::new(Bounded::new(4096)), corpora: Mutex::new(Bounded::new(64)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -251,7 +253,29 @@ impl SearchRuntime {
 
     /// Every event of an entity a live segment holds, system time descending; a segment's keys are kept and extended by the rows appended since, as its postings are.
     pub fn live_events(&self, database: &str, segment: &rtdb_index::LiveTable, iid: &[u8; 16]) -> Result<Vec<crate::file::KeyedEvent>> {
-        let Some(first) = segment.batches().next() else { return Ok(Vec::new()) };
+        Ok(self.live_rows_of(database, segment, iid)?.into_iter().map(|(_, event)| event).collect())
+    }
+
+    /// The entities a live segment holds an event of.
+    pub fn live_iids(&self, database: &str, segment: &rtdb_index::LiveTable) -> Result<Vec<[u8; 16]>> {
+        let keys = self.live_keys_of(database, segment)?;
+        let visible = segment.row_count();
+        let keys = keys.lock();
+        Ok(keys.events.iter().filter(|(_, events)| events.iter().any(|(row, _)| *row < visible)).map(|(iid, _)| *iid).collect())
+    }
+
+    /// Every event of an entity a live segment holds, with its row, system time descending.
+    pub fn live_rows_of(&self, database: &str, segment: &rtdb_index::LiveTable, iid: &[u8; 16]) -> Result<Vec<(u32, crate::file::KeyedEvent)>> {
+        let keys = self.live_keys_of(database, segment)?;
+        let visible = segment.row_count();
+        let keys = keys.lock();
+        let mut events: Vec<(u32, crate::file::KeyedEvent)> = keys.events.get(iid).map_or_else(Vec::new, |events| events.iter().filter(|(row, _)| *row < visible).copied().collect());
+        events.sort_by_key(|(row, event)| (std::cmp::Reverse(event.system_from), *row));
+        Ok(events)
+    }
+
+    fn live_keys_of(&self, database: &str, segment: &rtdb_index::LiveTable) -> Result<Arc<Mutex<LiveKeys>>> {
+        let Some(first) = segment.batches().next() else { return Ok(Arc::new(Mutex::new(LiveKeys { batches: Vec::new(), rows: 0, events: Default::default() }))) };
         let key = (database.to_string(), segment.table().clone(), Arc::as_ptr(first) as usize);
         let existing = self.live_keys.lock().get(&key);
         let entry = match existing {
@@ -262,14 +286,33 @@ impl SearchRuntime {
                 entry
             }
         };
-        let mut keys = entry.lock();
-        let shared = keys.shared_prefix(segment);
-        if shared < segment.batches().count().min(keys.batches.len()) { *keys = LiveKeys { batches: Vec::new(), rows: 0, events: Default::default() }; }
-        if keys.shared_prefix(segment) == keys.batches.len() && keys.rows < segment.row_count() { keys.extend(segment)?; }
-        let visible = segment.row_count();
-        let mut events: Vec<crate::file::KeyedEvent> = keys.events.get(iid).map_or_else(Vec::new, |events| events.iter().filter(|(row, _)| *row < visible).map(|(_, event)| *event).collect());
-        events.sort_by_key(|event| std::cmp::Reverse(event.system_from));
-        Ok(events)
+        {
+            let mut keys = entry.lock();
+            let shared = keys.shared_prefix(segment);
+            if shared < segment.batches().count().min(keys.batches.len()) { *keys = LiveKeys { batches: Vec::new(), rows: 0, events: Default::default() }; }
+            if keys.shared_prefix(segment) == keys.batches.len() && keys.rows < segment.row_count() { keys.extend(segment)?; }
+        }
+        Ok(entry)
+    }
+
+    /// A file's runs of a column that count where nothing outside the file cuts them, kept for as long as the file is the one held under its identity.
+    pub(crate) fn open_runs(&self, trie: &TrieFile, column: &str) -> Result<Arc<crate::corpus::OpenRuns>> {
+        let key = (trie.identity.clone(), column.to_string());
+        if let Some((file, runs)) = self.open_runs.lock().get(&key) { if file.upgrade().is_some_and(|file| Arc::ptr_eq(&file, &trie.file)) { return Ok(runs); } }
+        let runs = Arc::new(crate::corpus::OpenRuns::of(&trie.file, column)?);
+        self.open_runs.lock().insert(key, (Arc::downgrade(&trie.file), Arc::clone(&runs)), 1);
+        Ok(runs)
+    }
+
+    /// A column's corpus at a snapshot's instant, computed once for the files and live segments it is made from.
+    pub fn snapshot_corpus(&self, database: &str, files: Vec<TrieFile>, segments: &[Arc<rtdb_index::LiveTable>], column: &str, at: i64) -> Result<Arc<crate::corpus::SnapshotCorpus>> {
+        let mut key = format!("{database}\u{0}{column}\u{0}{at}");
+        for trie in &files { key.push('\u{0}'); key.push_str(&trie.identity); }
+        for segment in segments { key.push_str(&format!("\u{0}{:p}:{}", segment.batches().next().map_or(std::ptr::null(), Arc::as_ptr), segment.row_count())); }
+        if let Some(corpus) = self.corpora.lock().get(&key) { return Ok(corpus); }
+        let corpus = Arc::new(crate::corpus::SnapshotCorpus::compute(self, database, files, segments, column, at)?);
+        self.corpora.lock().insert(key, Arc::clone(&corpus), 1);
+        Ok(corpus)
     }
 
     /// Hands a recorded file a scan could not read to the database's lane.

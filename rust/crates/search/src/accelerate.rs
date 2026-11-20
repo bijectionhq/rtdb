@@ -8,7 +8,7 @@ use rtdb_plan::{BinaryOp, Expr};
 use rtdb_query::{MatchAnswers, ScanAccelerator, ScanRequest};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
-use rtdb_types::{Iid, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{KIND, SearchDefinition, SearchFile, runtime::{Suspect, TrieFile}};
 
@@ -174,12 +174,17 @@ impl SearchAccelerator {
     /// The search files of the partition's live tries that can hold a visible event: every such trie's, its recorded one or one this node builds from its data file, unless the tries the lane should have indexed but has not exceed max_unindexed_bytes.
     /// The lane never indexes level 0, the partial level-1 current trie, or history for a definition that excludes it, so those do not count.
     async fn trie_files(&self, request: &ScanRequest<'_>, definition: &SearchDefinition) -> Result<TrieFiles> {
-        let (snapshot, table) = (request.snapshot, &request.scan.table.name.table);
+        self.trie_files_in(request, request.snapshot, definition, request.bounds, Some(self.max_unindexed_bytes)).await
+    }
+
+    /// The search files of a partition's live tries that can hold an event visible in `bounds`; with a `limit`, only the recorded ones once the tries the lane should have indexed but has not exceed it.
+    async fn trie_files_in(&self, request: &ScanRequest<'_>, snapshot: &Snapshot, definition: &SearchDefinition, bounds: TemporalBounds, limit: Option<i64>) -> Result<TrieFiles> {
+        let table = &request.scan.table.name.table;
         let Some(entry) = snapshot.table_entry(table) else { return Ok(TrieFiles::Complete(Vec::new())) };
         let mut files = Vec::new();
         let mut unbuilt = Vec::new();
         let mut unindexed = 0i64;
-        let earliest = request.bounds.valid_time.lower().0.min(request.bounds.system_time.lower().0);
+        let earliest = bounds.valid_time.lower().0.min(bounds.system_time.lower().0);
         // A trie's recency bounds its rows' recency above, so a trie at or before the query's earliest instant holds nothing it can see.
         let visible = |trie: &&rtdb_index::CatalogTrie| trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
         for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).filter(visible) {
@@ -191,24 +196,27 @@ impl SearchAccelerator {
             if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
             unbuilt.push((trie.key.clone(), data));
         }
-        if unindexed > self.max_unindexed_bytes { return Ok(TrieFiles::Recorded(files)); }
+        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Recorded(files)); }
         for (trie, data) in unbuilt { files.push(self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await?); }
         Ok(TrieFiles::Complete(files))
     }
 
-    /// Registers the table's current-side recorded search files in every partition, so the corpus a score fixes is the same whichever partition, or scan, fixes it first.
+    /// Registers the column's corpus at the snapshot's instant, from every partition's search files for the tries visible then and its live segments, once a query.
+    /// A score needs every such trie's file, so the node builds those the lane has not, whatever max_unindexed_bytes allows narrowing.
     async fn register_corpora(&self, request: &ScanRequest<'_>, column: &str, definition: &SearchDefinition) -> Result<()> {
         let table = &request.scan.table.name.table;
+        let name = format!("{}.{}#{column}", table.schema, table.table);
+        if request.corpora.holds(&name) { return Ok(()); }
+        let Some(at) = request.partitions.iter().filter_map(|snapshot| snapshot.tx_basis()).map(|basis| basis.system_time.0).max() else { return Ok(()) };
+        let instant = Interval::from_micros(at, at.saturating_add(1))?;
+        let point = TemporalBounds { valid_time: instant, system_time: instant };
+        let mut files = Vec::new();
+        let mut segments = Vec::new();
         for snapshot in request.partitions {
-            for trie in snapshot.trie_catalog().current_tries(table) {
-                if trie.state != TrieState::Live || trie.key.recency().is_some() { continue; }
-                let Some(key) = Self::recorded_key(snapshot, table, trie, definition)? else { continue };
-                let name = format!("{key}#{column}");
-                if request.corpora.holds(&name) { continue; }
-                let Some((_, file)) = self.recorded(request, key, trie, definition).await? else { continue };
-                request.corpora.register(name, Arc::new(FileCorpus { file, column: column.to_string() }));
-            }
+            match self.trie_files_in(request, snapshot, definition, point, None).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => files.extend(found) }
+            segments.extend(snapshot.iter_segments(table).cloned());
         }
+        request.corpora.register(name, Arc::new(TableCorpus { runtime: Arc::clone(&self.runtime), database: request.database.to_string(), files: parking_lot::Mutex::new(Some(files)), computed: std::sync::OnceLock::new(), segments, column: column.to_string(), at }));
         Ok(())
     }
     fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
@@ -343,11 +351,17 @@ impl SearchAccelerator {
     }
 }
 
-/// A current-side search file a scan opened, counting its column's corpus for whatever terms a score asks about.
-struct FileCorpus { file: Arc<SearchFile>, column: String }
+/// A column's corpus at the snapshot's instant, computed when a score first asks for it.
+struct TableCorpus { runtime: Arc<crate::SearchRuntime>, database: String, files: parking_lot::Mutex<Option<Vec<TrieFile>>>, computed: std::sync::OnceLock<Arc<crate::corpus::SnapshotCorpus>>, segments: Vec<Arc<rtdb_index::LiveTable>>, column: String, at: i64 }
 
-impl rtdb_query::CorpusSource for FileCorpus {
-    fn corpus(&self, query: &Query) -> Result<rtdb_text::Corpus> { self.file.corpus(&self.column, query) }
+impl rtdb_query::CorpusSource for TableCorpus {
+    fn corpus(&self, query: &Query) -> Result<rtdb_text::Corpus> {
+        if let Some(computed) = self.computed.get() { return computed.corpus(query); }
+        let files = self.files.lock().take().unwrap_or_default();
+        let computed = self.runtime.snapshot_corpus(&self.database, files, &self.segments, &self.column, self.at)?;
+        computed.corpus(query)?;
+        self.computed.get_or_init(|| computed).corpus(query)
+    }
 }
 
 #[cfg(test)]

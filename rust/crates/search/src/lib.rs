@@ -2,6 +2,7 @@
 //! Behavioural spec: dev/doc/fts.allium; plan: dev/doc/fts-implementation.adoc.
 
 pub mod accelerate;
+pub mod corpus;
 pub mod definitions;
 pub mod file;
 pub mod lane;
