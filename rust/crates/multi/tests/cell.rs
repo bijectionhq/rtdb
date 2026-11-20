@@ -409,3 +409,37 @@ async fn a_compaction_worker_compacts_a_deployment_its_holder_does_not() {
     drop(client);
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_controller_confirms_a_silent_node_dead_before_its_lease_runs_out() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let status = admin::cell_status(cell.directory.as_ref(), 1).await.unwrap();
+    assert_eq!((status.active, status.parked, status.recommended_nodes), (1, 0, 1));
+
+    let silent = cell.holder("shop").await.unwrap();
+    let silent_id = cell.node(silent).lease.id();
+    let options = admin::ControllerOptions { probe_timeout: Duration::from_millis(100), ..Default::default() };
+    let mut failures = std::collections::BTreeMap::new();
+    assert_eq!(admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap(), 0, "a node that answers is not suspected");
+    // Simulate a hung agent: its probes go unanswered while its lease is still being renewed.
+    let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut record = cell.directory.member(&silent_id).await.unwrap().unwrap();
+    for _ in 0..8 {
+        let mut next = record.clone();
+        next.control_address = Some(hung.local_addr().unwrap().to_string());
+        match cell.directory.replace_member(next, record.version).await.unwrap() { rtdb_directory::Cas::Applied(_) => break, rtdb_directory::Cas::Conflict(current) => record = current.unwrap() }
+    }
+    let mut confirmed = 0;
+    for _ in 0..2 { confirmed += admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap(); }
+    assert_eq!(confirmed, 1, "two unanswered probes confirm it");
+    assert_eq!(cell.directory.member(&silent_id).await.unwrap().unwrap().state, rtdb_directory::MemberState::Dead);
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    assert_ne!(cell.holder("shop").await, Some(silent), "another node took over without waiting out the lease");
+    drop(client);
+    cell.stop().await;
+}

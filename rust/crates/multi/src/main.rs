@@ -22,6 +22,7 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
+       rtdb-multi status --directory DIR [--target-per-node N]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
@@ -153,6 +154,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             let record = admin::create_deployment(directory.as_ref(), arguments.required("name")?, arguments.optional("org").unwrap_or("default"), arguments.number("replicas", 3usize)?).await?;
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
+            Ok(())
+        }
+        "status" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let status = admin::cell_status(directory.as_ref(), arguments.number("target-per-node", 1000usize)?).await?;
+            println!("{}", serde_json::to_string_pretty(&status).expect("a status serializes"));
             Ok(())
         }
         "drain" => {

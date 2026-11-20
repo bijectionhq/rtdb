@@ -218,22 +218,93 @@ pub async fn reap_members(directory: &dyn Directory, grace: Duration) -> Result<
 }
 
 #[derive(Clone, Debug)]
-pub struct ControllerOptions { pub interval: Duration, pub grace: Duration, pub rebalance_moves: usize }
+pub struct ControllerOptions {
+    pub interval: Duration,
+    pub grace: Duration,
+    pub rebalance_moves: usize,
+    /// Consecutive failed probes after which a node is confirmed dead, ahead of its lease.
+    pub suspicion_probes: u32,
+    pub probe_timeout: Duration,
+}
 
 impl Default for ControllerOptions {
-    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0 } }
+    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, suspicion_probes: 2, probe_timeout: Duration::from_millis(300) } }
+}
+
+/// Probes every live node's agent, and confirms dead those that failed `suspicion_probes` probes in a row (`ConfirmSuspicion`).
+/// Safety never depends on the verdict: a wrongly confirmed node's writes are already fenced by the epoch its successor claims.
+pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeMap<MemberId, u32>, options: &ControllerOptions) -> Result<usize> {
+    let now = now_ms();
+    let mut confirmed = 0;
+    for member in directory.members().await? {
+        if member.role != MemberRole::Node || !member.is_live(now) { failures.remove(&member.id); continue; }
+        let Some(address) = &member.control_address else { continue };
+        let answered = matches!(control::call(address, &Request::Ping, options.probe_timeout).await, Ok(Response::Done));
+        if answered { failures.remove(&member.id); continue; }
+        let count = failures.entry(member.id.clone()).or_default();
+        *count += 1;
+        if *count >= options.suspicion_probes {
+            // The suspect may still be renewing its lease, so the confirmation re-reads and retries rather than losing to a renewal.
+            let mut current = member.clone();
+            for _ in 0..8 {
+                if matches!(current.state, MemberState::Dead | MemberState::Retired) { break; }
+                let mut dead = current.clone();
+                dead.state = MemberState::Dead;
+                match directory.replace_member(dead, current.version).await? {
+                    Cas::Applied(_) => { confirmed += 1; break; }
+                    Cas::Conflict(Some(stored)) => current = stored,
+                    Cas::Conflict(None) => break,
+                }
+            }
+            failures.remove(&member.id);
+        }
+    }
+    Ok(confirmed)
 }
 
 pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOptions, cancellation: CancellationToken) {
+    let mut failures = BTreeMap::new();
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(options.interval) => {
                 let _ = reap_members(directory.as_ref(), options.grace).await;
+                if options.suspicion_probes > 0 { let _ = confirm_suspicions(directory.as_ref(), &mut failures, &options).await; }
                 if options.rebalance_moves > 0 { let _ = rebalance(directory.as_ref(), options.rebalance_moves).await; }
             }
         }
     }
+}
+
+/// The cell's load as autoscaling reads it: what each node holds, and how many nodes the active deployments need at `target_per_node`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CellStatus {
+    pub deployments: usize,
+    pub active: usize,
+    pub parked: usize,
+    pub quarantined: usize,
+    pub nodes: BTreeMap<String, usize>,
+    pub logkeepers: usize,
+    pub recommended_nodes: usize,
+}
+
+pub async fn cell_status(directory: &dyn Directory, target_per_node: usize) -> Result<CellStatus> {
+    let members = members(directory).await?;
+    let now = now_ms();
+    let mut nodes: BTreeMap<String, usize> = members.values().filter(|member| member.role == MemberRole::Node && member.is_live(now)).map(|member| (member.id.to_string(), 0)).collect();
+    let deployments = directory.deployments().await?;
+    let mut active = 0;
+    let mut quarantined = 0;
+    for deployment in &deployments {
+        if deployment.lifecycle == Lifecycle::Quarantined { quarantined += 1; }
+        if let Some(holder) = effective_holder(deployment, &members, now) { active += 1; *nodes.entry(holder.to_string()).or_default() += 1; }
+    }
+    let live = deployments.iter().filter(|deployment| matches!(deployment.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)).count();
+    Ok(CellStatus {
+        deployments: live, active, parked: live - active, quarantined, nodes,
+        logkeepers: members.values().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).count(),
+        recommended_nodes: active.div_ceil(target_per_node.max(1)).max(1),
+    })
 }
 
 fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/storage-io", error.to_string()) }

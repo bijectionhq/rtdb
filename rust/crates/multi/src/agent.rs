@@ -334,6 +334,7 @@ impl Handler for NodeAgent {
             Request::Activate { name } => self.activate(&name).await,
             Request::Park { name } => self.park(&name).await,
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
+            Request::Ping => Ok(Response::Done),
             Request::Subscribe { name } => self.subscribe(&name).await,
             Request::Flush { name } => self.flush(&name).await,
             Request::PublishCompaction { name, notification } => self.publish_compaction(&name, &notification).await,

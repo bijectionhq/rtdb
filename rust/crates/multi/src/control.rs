@@ -17,6 +17,8 @@ pub enum Request {
     Activate { name: String },
     /// Flush, release the placement, and stop running the deployment.
     Park { name: String },
+    /// Answers Done while the agent is serving: the controller's liveness probe.
+    Ping,
     /// A client is using the deployment through a gateway.
     Touch { name: String },
     /// Serve the deployment's reads from a log-fed replica on this node.
