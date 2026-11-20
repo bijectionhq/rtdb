@@ -4239,6 +4239,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "bytes",
+ "futures",
  "parking_lot",
  "prost-types",
  "rtdb-affinity",

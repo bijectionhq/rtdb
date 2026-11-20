@@ -30,7 +30,6 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogkeeperLogConfig {
     pub servers: Vec<String>,
-    pub source_stream: String,
     pub replica_stream: String,
     /// The writer epoch a holder opens its streams at; ignored by a subscriber.
     pub epoch: u64,
@@ -41,7 +40,7 @@ pub fn write_quorum(ensemble: usize) -> usize { ensemble / 2 + 1 }
 
 /// The configuration a node opens `record` with, given its ensemble's addresses.
 pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage: &CellStorage, role: Role) -> DatabaseConfig {
-    let log = LogkeeperLogConfig { write_quorum: write_quorum(servers.len()), servers, source_stream: record.stream("source"), replica_stream: record.stream("replica"), epoch: record.epoch };
+    let log = LogkeeperLogConfig { write_quorum: write_quorum(servers.len()), servers, replica_stream: record.stream("replica"), epoch: record.epoch };
     let storage = match storage {
         CellStorage::Local { root } => database_config::Storage::LocalStorage(LocalStorage {
             path: Some(root.join(record.storage_prefix()).to_string_lossy().into_owned()), epoch: Some(0),

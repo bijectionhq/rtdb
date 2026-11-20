@@ -1,27 +1,35 @@
-//! The log factory a node opens a deployment's logkeeper streams through.
+//! The logs a node opens a deployment's database with.
 //!
-//! A holder opens both streams as their writer at its epoch, which seals them: from then on no earlier holder's append is accepted.
-//! A subscriber opens them as a reader.
+//! The replica stream lives on the deployment's logkeeper ensemble: a holder opens it as the writer at its epoch, which seals it, so no earlier holder's append is accepted; a subscriber opens it as a reader.
+//! The source log is the holder's in-process intake: only the holder submits, the holder alone resolves, and a resolved transaction is durable once its replica record commits, so a transaction costs one quorum append.
+//! A submission the holder had not yet resolved when it stopped was never acknowledged, and its client retries it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::FutureExt;
 use prost_types::Any;
+use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_node::{LogAccess, LogFactory, OpenedLogs};
-use rtdb_types::{Anomaly, Result, StorageEpoch};
+use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
+use rtdb_storage::object_store::ReadReservation;
+use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use crate::deployment::LogkeeperLogConfig;
+
+/// How many already-resolved intake records stay retained behind the holder's read position.
+const INTAKE_RETAINED_BEHIND: i64 = 1024;
+const SCAN_WINDOW: i64 = 256;
 
 pub struct LogkeeperLogFactory { pub maximum_message_bytes: usize }
 
 impl LogkeeperLogFactory {
     pub fn new(maximum_message_bytes: usize) -> Arc<Self> { Arc::new(Self { maximum_message_bytes }) }
-
-    fn stream(&self, config: &LogkeeperLogConfig, stream: &str) -> StreamConfig {
-        StreamConfig { servers: config.servers.clone(), stream: stream.to_owned(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes }
-    }
 }
 
 #[async_trait]
@@ -29,17 +37,140 @@ impl LogFactory for LogkeeperLogFactory {
     async fn open(&self, configuration: &Any, access: LogAccess, cancellation: CancellationToken) -> Result<OpenedLogs> {
         let config: LogkeeperLogConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/log-config", format!("Logkeeper log configuration is malformed: {error}")))?;
-        let source = self.stream(&config, &config.source_stream);
-        let replica = self.stream(&config, &config.replica_stream);
-        let (source, replica): (Arc<dyn rtdb_storage::log::Log>, Arc<dyn rtdb_storage::log::Log>) = match access {
-            LogAccess::ReadWrite => (
-                rtdb_logkeeper::open_writer(source, config.epoch, cancellation.clone()).await?,
-                rtdb_logkeeper::open_writer(replica, config.epoch, cancellation).await?,
-            ),
-            LogAccess::ReadOnly => (rtdb_logkeeper::open_reader(source, cancellation.clone()).await?, rtdb_logkeeper::open_reader(replica, cancellation).await?),
+        let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
+        let replica: Arc<dyn Log> = match access {
+            LogAccess::ReadWrite => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
+            LogAccess::ReadOnly => rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?,
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
-                "A deployment's streams have one writer, its holder; submissions reach it through the gateway")),
+                "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
-        Ok(OpenedLogs { source, replica, source_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0), drivers: Vec::new() })
+        let next = next_source_offset(replica.as_ref()).await?;
+        let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)) });
+        let trimming = {
+            let intake = Arc::clone(&intake);
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => intake.trim(),
+                    }
+                }
+            }.boxed()
+        };
+        Ok(OpenedLogs { source: intake, replica, source_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0), drivers: vec![trimming] })
+    }
+}
+
+/// The first source offset no replica record can already have consumed.
+/// Every replica record consumes at most one source position, so the newest one named, plus one per later record, bounds every position assigned before; oversized records, whose position is out of line, are covered by that count.
+pub async fn next_source_offset(replica: &dyn Log) -> Result<i64> {
+    let latest = replica.latest()?.0;
+    let mut end = latest + 1;
+    let mut after_newest = 0i64;
+    while end > 0 {
+        let start = (end - SCAN_WINDOW).max(0);
+        let records = replica.read_range(LogOffset(start), LogOffset(end)).await?;
+        for record in records.iter().rev() {
+            if let Some(position) = source_position(&record.payload)? { return Ok(position + 1 + after_newest); }
+            after_newest += 1;
+        }
+        end = start;
+    }
+    Ok(after_newest)
+}
+
+fn source_position(payload: &[u8]) -> Result<Option<i64>> {
+    let Some(envelope) = ReplicaEnvelope::decode(payload)? else { return Ok(None); };
+    let position = match &envelope.message {
+        ReplicaBody::ResolvedTx(tx) => tx.src_msg_id,
+        ReplicaBody::NoOp(noop) => noop.src_msg_id,
+        ReplicaBody::BlockBoundary(boundary) => boundary.latest_processed_msg_id,
+        ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
+        _ => None,
+    };
+    Ok(position.filter(|position| *position >= 0).map(|position| SourcePosition(position).offset()))
+}
+
+/// The holder's in-process source log: it remembers how far its reader has got, and drops what lies well behind it.
+pub struct IntakeLog { log: MemoryLog, consumed: Arc<AtomicI64> }
+
+impl IntakeLog {
+    fn trim(&self) {
+        let boundary = self.consumed.load(Ordering::Acquire) + 1 - INTAKE_RETAINED_BEHIND;
+        if boundary > self.log.first_retained().0 { let _ = self.log.truncate_before(LogOffset(boundary)); }
+    }
+}
+
+#[async_trait]
+impl Log for IntakeLog {
+    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> { self.log.enqueue(payload, timestamp).await }
+    fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
+    async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
+        Ok(Box::new(IntakeTail { tail: self.log.tail(after).await?, consumed: Arc::clone(&self.consumed) }))
+    }
+    async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> { self.log.range(from, to).await }
+    async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.log.read_range(from, to).await }
+}
+
+struct IntakeTail { tail: Box<dyn LogTail>, consumed: Arc<AtomicI64> }
+
+impl IntakeTail {
+    fn delivered(&self, offset: LogOffset) { self.consumed.fetch_max(offset.0, Ordering::AcqRel); }
+}
+
+#[async_trait]
+impl LogTail for IntakeTail {
+    async fn poll(&mut self, timeout: Duration) -> rtdb_storage::Result<Vec<LogRecord>> {
+        let records = self.tail.poll(timeout).await?;
+        if let Some(last) = records.last() { self.delivered(last.metadata.offset); }
+        Ok(records)
+    }
+    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { if self.tail.replay().is_some() { Some(self) } else { None } }
+}
+
+#[async_trait]
+impl LogReplayTail for IntakeTail {
+    async fn poll_head(&mut self, timeout: Duration) -> rtdb_storage::Result<Option<ReplayHead>> {
+        self.tail.replay().expect("checked when replay was offered").poll_head(timeout).await
+    }
+    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> rtdb_storage::Result<LogRecord> {
+        let record = self.tail.replay().expect("checked when replay was offered").read_head(head, reservation).await?;
+        self.delivered(record.metadata.offset);
+        Ok(record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_format::log::proto;
+    use rtdb_types::Term;
+
+    async fn append(log: &MemoryLog, message: ReplicaBody) {
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: None, message };
+        log.enqueue(Bytes::from(envelope.encode()), Timestamp(0)).await.unwrap().durable().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_intake_starts_beyond_every_source_position_the_replica_stream_may_hold() {
+        let replica = MemoryLog::new(1 << 20);
+        assert_eq!(next_source_offset(&replica).await.unwrap(), 0, "a fresh deployment starts at 0");
+        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        append(&replica, ReplicaBody::ResolvedTx(proto::ResolvedTx { src_msg_id: Some(41), ..Default::default() })).await;
+        assert_eq!(next_source_offset(&replica).await.unwrap(), 42);
+        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        assert_eq!(next_source_offset(&replica).await.unwrap(), 44, "each later record may have consumed one position");
+    }
+
+    #[tokio::test]
+    async fn the_intake_drops_what_lies_well_behind_its_reader() {
+        let intake = IntakeLog { log: MemoryLog::starting_at(1 << 20, LogOffset(10)), consumed: Arc::new(AtomicI64::new(9)) };
+        for _ in 0..(INTAKE_RETAINED_BEHIND + 100) { intake.enqueue(Bytes::from_static(b"x"), Timestamp(0)).await.unwrap().durable().await.unwrap(); }
+        let mut tail = intake.tail(LogOffset(9)).await.unwrap();
+        let mut read = 0;
+        while read < INTAKE_RETAINED_BEHIND + 100 { read += tail.poll(Duration::from_millis(10)).await.unwrap().len() as i64; }
+        intake.trim();
+        assert_eq!(intake.log.first_retained(), LogOffset(10 + 100), "everything but the retained window behind the reader is dropped");
     }
 }
