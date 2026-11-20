@@ -884,3 +884,28 @@ async fn rows_of(mut cursor: rtdb_query::QueryCursor) -> Vec<Vec<Value>> {
     }
     rows
 }
+
+#[tokio::test]
+async fn a_mixed_width_id_column_filters_and_reads_as_the_row_path_does() {
+    let memory = MemoryBudget::new(1 << 28);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(1), system_time: Timestamp(1) }, Arc::clone(&memory)).unwrap();
+    for n in 0..600i64 {
+        let id = match n % 3 { 0 => Value::I16(n as i16), 1 => Value::I32(40_000 + n as i32), _ => Value::I64(n) };
+        buffer.put(TableRef::new("public", "mixed"), StructFields::from([("_id".into(), id), ("v".into(), Value::F64(n as f64))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+    }
+    state.apply(&buffer.stage().unwrap()).unwrap();
+    let context = context(Some(&state), &memory);
+    let run = |sql: &'static str| { let context = Arc::clone(&context); async move {
+        let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        rows_of(statement.open_query(Arc::clone(&context), vec![]).await.unwrap()).await
+    } };
+    let filtered = run("SELECT COUNT(*), SUM(v) FROM mixed WHERE _id < 300").await;
+    let all = run("SELECT _id, v FROM mixed").await;
+    let expected = all.iter().filter(|row| matches!(row[0], Value::I16(_) | Value::I32(_) | Value::I64(_)) && match row[0] { Value::I16(id) => id < 300, Value::I32(id) => id < 300, Value::I64(id) => id < 300, _ => false }).collect::<Vec<_>>();
+    let sum: f64 = expected.iter().map(|row| match row[1] { Value::F64(v) => v, _ => 0.0 }).sum();
+    assert_eq!(filtered, vec![vec![Value::I64(expected.len() as i64), Value::F64(sum)]]);
+    let ordered = run("SELECT _id, v FROM mixed ORDER BY v LIMIT 1000").await;
+    let rows = run("SELECT _id, v FROM mixed ORDER BY v").await;
+    assert_eq!(ordered, rows);
+}

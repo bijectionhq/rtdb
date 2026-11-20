@@ -198,6 +198,11 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
 /// Whether Arrow's interleave copies the layout without validating it: nested layouts are rebuilt and checked, and
 /// stored cells such as nulls under a non-nullable list item fail that check by panicking, so they are read as values.
 pub(crate) fn flat(data_type: &DataType) -> bool {
+    scalar_layout(data_type) || matches!(data_type, DataType::Union(fields, arrow_schema::UnionMode::Dense) if fields.iter().all(|(_, field)| scalar_layout(field.data_type())))
+}
+
+/// Layouts with no child arrays, whose cells interleave without any validation that could reject them.
+fn scalar_layout(data_type: &DataType) -> bool {
     data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) | DataType::Null)
 }
 
@@ -301,7 +306,9 @@ mod kernel {
     #[derive(Clone, Copy, PartialEq, PartialOrd)]
     enum Cell<'a> { Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, bool) }
 
-    enum Cells<'a> { Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>) }
+    enum Cells<'a> { Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
+        /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
+        Union { array: &'a arrow_array::UnionArray, legs: Vec<(i8, Cells<'a>)> } }
 
     impl<'a> Cells<'a> {
         fn of(column: &'a Column) -> Option<Self> {
@@ -319,6 +326,25 @@ mod kernel {
                         DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
                         DataType::Boolean if plain(ScalarType::Bool) => any.downcast_ref().map(Self::Bool),
                         DataType::Timestamp(ArrowUnit::Microsecond, _) if matches!(logical, Some(LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, .. })) | None) => any.downcast_ref().map(Self::Micros),
+                        DataType::Union(fields, arrow_schema::UnionMode::Dense) => {
+                            let array: &arrow_array::UnionArray = any.downcast_ref()?;
+                            let legs = fields.iter().map(|(id, field)| {
+                                if !field.metadata().is_empty() { return None; }
+                                let child = array.child(id);
+                                let leg_any = child.as_any();
+                                Some((id, match child.data_type() {
+                                    DataType::Int64 => Self::Int(leg_any.downcast_ref()?),
+                                    DataType::Int32 => Self::Int32(leg_any.downcast_ref()?),
+                                    DataType::Int16 => Self::Int16(leg_any.downcast_ref()?),
+                                    DataType::Int8 => Self::Int8(leg_any.downcast_ref()?),
+                                    DataType::Float64 => Self::Float(leg_any.downcast_ref()?),
+                                    DataType::Utf8 => Self::Text(leg_any.downcast_ref()?),
+                                    DataType::Boolean => Self::Bool(leg_any.downcast_ref()?),
+                                    _ => return None,
+                                }))
+                            }).collect::<Option<Vec<_>>>()?;
+                            Some(Self::Union { array, legs })
+                        }
                         _ => None,
                     }
                 }
@@ -338,6 +364,11 @@ mod kernel {
                 Self::Bool(array) => valid(*array, row).then(|| Cell::Bool(array.value(row))),
                 Self::Micros(array) => valid(*array, row).then(|| Cell::Micros(array.value(row), matches!(array.data_type(), DataType::Timestamp(_, Some(_))))),
                 Self::Values(values) => scalar(&values[row])?,
+                Self::Union { array, legs } => {
+                    let id = array.type_id(row);
+                    let (_, leg) = legs.iter().find(|(leg, _)| *leg == id).ok_or(())?;
+                    leg.get(array.value_offset(row))?
+                }
             })
         }
     }
