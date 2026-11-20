@@ -478,14 +478,17 @@ impl TransactionBuffer {
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
         self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
     }
-    pub fn append(&mut self, table: TableRef, mut event: StoredEvent) -> Result<()> {
+    pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event) }
+    /// As `append`, copying the table reference only for the table's first write.
+    pub fn append_to(&mut self, table: &TableRef, mut event: StoredEvent) -> Result<()> {
         if event.system_from != self.tx_key.system_time { return Err(invalid("Transaction event has another system time")); }
         if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().for_each(Value::admit_object_dates); }
         let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
-        let bytes = document_bytes.checked_add(4096).and_then(|bytes| bytes.checked_add(table.schema.capacity())).and_then(|bytes| bytes.checked_add(table.table.capacity()))
+        let bytes = document_bytes.checked_add(4096).and_then(|bytes| bytes.checked_add(table.schema.len())).and_then(|bytes| bytes.checked_add(table.table.len()))
             .ok_or_else(|| invalid("Transaction event size overflow"))?;
         let reservation = self.budget.reserve(bytes)?;
-        let pending = self.tables.entry(table).or_default();
+        if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
+        let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
         pending.events.push(event);
         pending.reservations.push(reservation);
         Ok(())

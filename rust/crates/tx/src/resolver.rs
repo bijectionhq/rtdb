@@ -355,7 +355,7 @@ impl<'a> OpenTransaction<'a> {
                     0 => match cell(index("doc")?)? { Value::Struct(document) => StoredOperation::Put(document), _ => return Err(Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document")) },
                     1 => StoredOperation::Delete, _ => StoredOperation::Erase,
                 };
-                self.buffer.append(table.table.clone(), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation, recency: None })?;
+                self.buffer.append_to(&table.table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation, recency: None })?;
             }
         }
         Ok(())
@@ -437,7 +437,7 @@ impl<'a> OpenTransaction<'a> {
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
-            self.buffer.append(table.clone(), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(row_from, row_to)?, operation: StoredOperation::Put(document), recency: None })?;
+            self.buffer.append_to(table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(row_from, row_to)?, operation: StoredOperation::Put(document), recency: None })?;
         }
         if let Some(types) = documents.declared_types().filter(|_| !documents.rows().is_empty()) {
             self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
