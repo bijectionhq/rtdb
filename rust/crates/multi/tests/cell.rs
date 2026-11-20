@@ -681,19 +681,18 @@ async fn a_large_deployments_scans_read_as_fragments_on_the_nodes_their_slices_r
 
     split_above(&cell, 0);
     let holder = cell.holder("big").await.unwrap();
-    let cold = fragment_answers(&client).await;
-    for ((sql, whole), cold) in FRAGMENT_QUERIES.iter().zip(&whole).zip(&cold) { assert_eq!(cold, whole, "{sql}"); }
-    assert!(fragments_read(&cell).iter().all(|read| read.is_empty()), "readers without the deployment open refuse, and the holder reads their slices itself");
-    let refused = cell.node(holder).fragmenter.failures();
-    assert!(refused > 0);
-    // The refusals have the readers open replicas on their next pass.
+    let warming = fragment_answers(&client).await;
+    for ((sql, whole), warming) in FRAGMENT_QUERIES.iter().zip(&whole).zip(&warming) { assert_eq!(warming, whole, "{sql}"); }
+    // A reader without the deployment open refuses and opens a replica on its next pass.
     tokio::time::sleep(Duration::from_millis(1000)).await;
+    let refused = cell.node(holder).fragmenter.failures();
+    let before: Vec<u64> = fragments_read(&cell).iter().map(|read| read.values().sum()).collect();
     let fragmented = fragment_answers(&client).await;
     for ((sql, whole), fragmented) in FRAGMENT_QUERIES.iter().zip(&whole).zip(&fragmented) { assert_eq!(fragmented, whole, "{sql}"); }
     let first = fragments_read(&cell);
     assert!(first[holder].is_empty(), "the coordinating holder reads its own fragments without sending them to itself");
-    assert_eq!(first.iter().filter(|read| !read.is_empty()).count(), 2, "both other nodes read the slices that rank them first: {first:?}");
-    assert_eq!(cell.node(holder).fragmenter.failures(), refused, "once warm, every fragment sent was read at the holder's basis");
+    assert_eq!(first.iter().zip(&before).filter(|(read, before)| read.values().sum::<u64>() > **before).count(), 2, "both other nodes read the slices that rank them first: {first:?}");
+    assert_eq!(cell.node(holder).fragmenter.failures(), refused, "once warm, every fragment sent is read, at or past the holder's basis");
 
     let record = cell.directory.deployment_by_name("big").await.unwrap().unwrap();
     let members = cell.directory.members().await.unwrap();

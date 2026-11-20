@@ -178,7 +178,7 @@ async fn a_fragment_whose_node_fails_is_read_by_the_coordinator() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fragment_is_read_only_at_its_own_basis() {
+async fn a_fragment_reads_as_of_its_basis_on_a_node_at_or_past_it() {
     let (node, driver, fragmenter) = start().await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     populate(&node, &mut session).await;
@@ -186,17 +186,30 @@ async fn a_fragment_is_read_only_at_its_own_basis() {
     let _ = answers(&mut session).await;
     let fragment = fragmenter.last.lock().clone().unwrap();
     let at_basis = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
+    let slices: Vec<_> = (0..4u8).flat_map(|first| (0..4u8).map(move |second| rtdb_query::TriePrefix::new(vec![first, second]).unwrap())).map(|prefix| {
+        let mut slice = fragment.clone();
+        slice.prefix = prefix;
+        slice
+    }).collect();
+    let mut before = Vec::new();
+    for slice in &slices { before.push(node.scan_fragment(slice, Duration::ZERO, &CancellationToken::new()).await.unwrap()); }
 
     let mut ahead = fragment.clone();
     ahead.basis.tx_id = rtdb_types::TxId(fragment.basis.tx_id.0 + 1);
     let error = node.scan_fragment(&ahead, Duration::from_millis(50), &CancellationToken::new()).await.unwrap_err();
     assert_eq!(error.code, "rtdb.node/fragment-basis", "a basis this node has not reached is waited for, then refused");
 
+    // Every row changes, some are deleted and new ones arrive, after the basis.
+    for table in ["orders", "items", "users"] {
+        execute(&mut session, TxOp::Sql { sql: format!("UPDATE {table} SET later = 1"), args: None }).await;
+    }
+    execute(&mut session, TxOp::Sql { sql: "DELETE FROM orders WHERE _id % 3 = 0".into(), args: None }).await;
+    execute(&mut session, TxOp::Sql { sql: "DELETE FROM users".into(), args: None }).await;
     execute(&mut session, put(&node, "users", vec![StructFields::from([("_id".to_owned(), Value::I64(1000)), ("name".to_owned(), Value::Utf8("later".into()))])])).await;
     let _ = rows(session.query_sql("SELECT name FROM users WHERE _id = 1000", vec![]).await.unwrap()).await;
-    match node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await {
-        Ok(later) => assert_eq!(later, at_basis, "a node past the basis reads a fragment only from a snapshot still at it"),
-        Err(error) => assert_eq!(error.code, "rtdb.query/fragment-basis"),
+    assert_eq!(node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap(), at_basis, "a node past the basis reads the fragment as of the basis");
+    for (slice, before) in slices.iter().zip(&before) {
+        assert_eq!(&node.scan_fragment(slice, Duration::ZERO, &CancellationToken::new()).await.unwrap(), before, "slice {} reads as of the basis", slice.prefix);
     }
     stop(&node, driver).await;
 }
