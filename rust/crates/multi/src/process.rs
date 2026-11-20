@@ -27,7 +27,11 @@ pub struct NodeSettings {
     pub availability_zone: String,
     pub agent: AgentOptions,
     pub lease: LeaseOptions,
+    pub pool: rtdb_directory::MemberPool,
     pub claim_wait: Duration,
+    pub keys: Arc<dyn crate::keys::KeyService>,
+    /// Where this node keeps its cache of the cell's objects.
+    pub cache_dir: PathBuf,
 }
 
 /// A running node. Dropping it does not stop it; call `shutdown` or `kill`.
@@ -42,16 +46,24 @@ pub struct RunningNode {
     tasks: JoinSet<Result<()>>,
 }
 
-pub async fn start_node(directory: Arc<dyn Directory>, settings: NodeSettings) -> Result<RunningNode> {
+pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    if settings.configuration.disk_cache.is_none() {
+        settings.configuration.disk_cache = Some(rtdb_server::config::DiskCacheSettings { path: settings.cache_dir.clone(), maximum_bytes: Some(1 << 30), maximum_ratio: 0.5 });
+    }
     let options = settings.configuration.node_options(settings.allocation_limit_bytes)?;
     let memory = MemoryBudget::new(options.execution_memory_bytes);
-    let placed = PlacedOptions { log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES))], claim_wait: settings.claim_wait };
+    let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys), fence_interval: Duration::from_millis(100) });
+    let placed = PlacedOptions {
+        log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys)))],
+        storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
+        claim_wait: settings.claim_wait,
+    };
     let (server, driver) = ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed).await?;
     let pgwire_address = server.addresses().pgwire.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;
     let control = TcpListener::bind(settings.control).await.map_err(io)?;
     let control_address = control.local_addr().map_err(io)?;
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
-        role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone,
+        role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone, pool: settings.pool,
     }, settings.lease).await?;
     let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent);
     let cancellation = CancellationToken::new();
@@ -103,7 +115,7 @@ pub struct RunningLogkeeper {
 pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperSettings) -> Result<RunningLogkeeper> {
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
-    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: address.to_string(), control_address: None, availability_zone: settings.availability_zone }, settings.lease).await?;
+    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: address.to_string(), control_address: None, availability_zone: settings.availability_zone, pool: Default::default() }, settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
     tasks.spawn(rtdb_logkeeper::serve(listener, rtdb_logkeeper::ServerOptions { data_dir: settings.data_dir, fsync: settings.fsync }, cancellation.clone()));

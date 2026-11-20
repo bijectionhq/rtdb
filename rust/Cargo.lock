@@ -4243,6 +4243,7 @@ dependencies = [
  "futures",
  "parking_lot",
  "prost-types",
+ "ring",
  "rtdb-affinity",
  "rtdb-columnar",
  "rtdb-directory",
@@ -4259,6 +4260,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]

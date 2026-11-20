@@ -20,16 +20,18 @@ use rtdb_storage::object_store::ReadReservation;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
 
+use crate::cipher::{Cipher, SEALED_OVERHEAD};
 use crate::deployment::LogkeeperLogConfig;
+use crate::keys::KeyService;
 
 /// How many already-resolved intake records stay retained behind the holder's read position.
 const INTAKE_RETAINED_BEHIND: i64 = 1024;
 const SCAN_WINDOW: i64 = 256;
 
-pub struct LogkeeperLogFactory { pub maximum_message_bytes: usize }
+pub struct LogkeeperLogFactory { pub maximum_message_bytes: usize, pub keys: Arc<dyn KeyService> }
 
 impl LogkeeperLogFactory {
-    pub fn new(maximum_message_bytes: usize) -> Arc<Self> { Arc::new(Self { maximum_message_bytes }) }
+    pub fn new(maximum_message_bytes: usize, keys: Arc<dyn KeyService>) -> Arc<Self> { Arc::new(Self { maximum_message_bytes, keys }) }
 }
 
 #[async_trait]
@@ -38,13 +40,15 @@ impl LogFactory for LogkeeperLogFactory {
         let config: LogkeeperLogConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/log-config", format!("Logkeeper log configuration is malformed: {error}")))?;
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
-        let replica: Arc<dyn Log> = match access {
+        let quorum: Arc<dyn Log> = match access {
             LogAccess::ReadWrite => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
             LogAccess::ReadOnly => rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?,
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
-        let next = next_source_offset(replica.as_ref()).await?;
+        let replica: Arc<dyn Log> = Arc::new(SealedLog { inner: quorum, cipher: Arc::new(Cipher::new(&self.keys.key(&config.deployment)?)?), stream: Arc::from(config.replica_stream.as_str()) });
+        let epoch = StorageEpoch(config.log_epoch);
+        let next = next_source_offset(replica.as_ref(), epoch).await?;
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)) });
         let trimming = {
             let intake = Arc::clone(&intake);
@@ -57,13 +61,13 @@ impl LogFactory for LogkeeperLogFactory {
                 }
             }.boxed()
         };
-        Ok(OpenedLogs { source: intake, replica, source_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0), drivers: vec![trimming] })
+        Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, drivers: vec![trimming] })
     }
 }
 
 /// The first source offset no replica record can already have consumed.
 /// Every replica record consumes at most one source position, so the newest one named, plus one per later record, bounds every position assigned before; oversized records, whose position is out of line, are covered by that count.
-pub async fn next_source_offset(replica: &dyn Log) -> Result<i64> {
+pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Result<i64> {
     let latest = replica.latest()?.0;
     let mut end = latest + 1;
     let mut after_newest = 0i64;
@@ -71,7 +75,7 @@ pub async fn next_source_offset(replica: &dyn Log) -> Result<i64> {
         let start = (end - SCAN_WINDOW).max(0);
         let records = replica.read_range(LogOffset(start), LogOffset(end)).await?;
         for record in records.iter().rev() {
-            if let Some(position) = source_position(&record.payload)? { return Ok(position + 1 + after_newest); }
+            if let Some(position) = source_position(&record.payload, epoch)? { return Ok(position + 1 + after_newest); }
             after_newest += 1;
         }
         end = start;
@@ -79,7 +83,7 @@ pub async fn next_source_offset(replica: &dyn Log) -> Result<i64> {
     Ok(after_newest)
 }
 
-fn source_position(payload: &[u8]) -> Result<Option<i64>> {
+fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Option<i64>> {
     let Some(envelope) = ReplicaEnvelope::decode(payload)? else { return Ok(None); };
     let position = match &envelope.message {
         ReplicaBody::ResolvedTx(tx) => tx.src_msg_id,
@@ -88,7 +92,64 @@ fn source_position(payload: &[u8]) -> Result<Option<i64>> {
         ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
         _ => None,
     };
-    Ok(position.filter(|position| *position >= 0).map(|position| SourcePosition(position).offset()))
+    Ok(position.filter(|position| *position >= 0).map(SourcePosition).filter(|position| position.epoch() == epoch).map(SourcePosition::offset))
+}
+
+/// A log whose payloads are sealed under the deployment's key, so a logkeeper never holds a row in the clear.
+pub struct SealedLog { inner: Arc<dyn Log>, cipher: Arc<Cipher>, stream: Arc<str> }
+
+fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
+    Ok(LogRecord { metadata: record.metadata, payload: cipher.open(stream, &record.payload)? })
+}
+
+#[async_trait]
+impl Log for SealedLog {
+    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
+        self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await
+    }
+    fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
+    async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
+        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }))
+    }
+    async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> {
+        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }))
+    }
+    async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> {
+        self.inner.read_range(from, to).await?.into_iter().map(|record| opened(&self.cipher, &self.stream, record)).collect()
+    }
+}
+
+struct SealedTail { inner: Box<dyn LogTail>, cipher: Arc<Cipher>, stream: Arc<str> }
+
+#[async_trait]
+impl LogTail for SealedTail {
+    async fn poll(&mut self, timeout: Duration) -> rtdb_storage::Result<Vec<LogRecord>> {
+        self.inner.poll(timeout).await?.into_iter().map(|record| opened(&self.cipher, &self.stream, record)).collect()
+    }
+    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { if self.inner.replay().is_some() { Some(self) } else { None } }
+}
+
+#[async_trait]
+impl LogReplayTail for SealedTail {
+    async fn poll_head(&mut self, timeout: Duration) -> rtdb_storage::Result<Option<ReplayHead>> {
+        let head = self.inner.replay().expect("checked when replay was offered").poll_head(timeout).await?;
+        Ok(head.map(|head| ReplayHead { payload_len: head.payload_len.saturating_sub(SEALED_OVERHEAD), ..head }))
+    }
+    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> rtdb_storage::Result<LogRecord> {
+        let sealed = ReplayHead { payload_len: head.payload_len + SEALED_OVERHEAD, ..head };
+        let record = self.inner.replay().expect("checked when replay was offered").read_head(sealed, reservation).await?;
+        opened(&self.cipher, &self.stream, record)
+    }
+}
+
+struct SealedRange { inner: Box<dyn LogRange>, cipher: Arc<Cipher>, stream: Arc<str> }
+
+#[async_trait]
+impl LogRange for SealedRange {
+    fn allocation_bound(&self) -> usize { self.inner.allocation_bound() }
+    async fn next(&mut self, reservation: ReadReservation) -> rtdb_storage::Result<Option<LogRecord>> {
+        self.inner.next(reservation).await?.map(|record| opened(&self.cipher, &self.stream, record)).transpose()
+    }
 }
 
 /// The holder's in-process source log: it remembers how far its reader has got, and drops what lies well behind it.
@@ -154,13 +215,13 @@ mod tests {
     #[tokio::test]
     async fn the_intake_starts_beyond_every_source_position_the_replica_stream_may_hold() {
         let replica = MemoryLog::new(1 << 20);
-        assert_eq!(next_source_offset(&replica).await.unwrap(), 0, "a fresh deployment starts at 0");
+        assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 0, "a fresh deployment starts at 0");
         append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
         append(&replica, ReplicaBody::ResolvedTx(proto::ResolvedTx { src_msg_id: Some(41), ..Default::default() })).await;
-        assert_eq!(next_source_offset(&replica).await.unwrap(), 42);
+        assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42);
         append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
         append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
-        assert_eq!(next_source_offset(&replica).await.unwrap(), 44, "each later record may have consumed one position");
+        assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 44, "each later record may have consumed one position");
     }
 
     #[tokio::test]

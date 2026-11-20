@@ -19,6 +19,10 @@ pub enum Request {
     Park { name: String },
     /// A client is using the deployment through a gateway.
     Touch { name: String },
+    /// Serve the deployment's reads from a log-fed replica on this node.
+    Subscribe { name: String },
+    /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
+    Flush { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +32,8 @@ pub enum Response {
     Held { epoch: u64, address: String },
     /// Another live member holds it; clients reach that one at `address`.
     Redirect { holder: String, address: String },
+    /// This member serves the deployment's reads from a replica; clients reach it at `address`.
+    Subscribed { address: String },
     Done,
     Refused { code: String, message: String },
 }

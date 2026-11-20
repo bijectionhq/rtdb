@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole, effective_holder, now_ms};
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, effective_holder, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -46,12 +46,24 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
 
 struct Startup { bytes: Vec<u8>, parameters: BTreeMap<String, String> }
 
+impl Startup {
+    /// Whether the client asked for a read-only session, which a log-fed replica may serve.
+    fn read_only(&self) -> bool {
+        let on = |value: &str| matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes");
+        self.parameters.get("default_transaction_read_only").is_some_and(|value| on(value))
+            || self.parameters.get("target_session_attrs").is_some_and(|value| matches!(value.as_str(), "read-only" | "prefer-standby" | "standby"))
+            || self.parameters.get("options").is_some_and(|options| options.split_whitespace().any(|option| option.trim_start_matches("-c").split_once('=')
+                .is_some_and(|(key, value)| key.trim() == "default_transaction_read_only" && on(value))))
+    }
+}
+
 async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
     let Some(startup) = read_startup(&mut client).await? else { return Ok(()); };
     let Some(name) = startup.parameters.get("database").or_else(|| startup.parameters.get("user")).cloned() else {
         return refuse(&mut client, "3D000", "The startup message names no database").await;
     };
-    let (mut server, control) = match route(&directory, &name, &options).await {
+    let read_only = startup.read_only();
+    let (mut server, control) = match route(&directory, &name, read_only, &options).await {
         Ok(route) => route,
         Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
     };
@@ -76,10 +88,23 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
 }
 
 /// The open connection to the deployment's holder, and that holder's control address.
-async fn route(directory: &Arc<dyn Directory>, name: &str, options: &GatewayOptions) -> Result<(TcpStream, Option<String>)> {
+async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>)> {
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
+    match record.lifecycle {
+        Lifecycle::Live | Lifecycle::Quarantined => {}
+        Lifecycle::Moving => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/moving", format!("{name} is moving to another cell; retry shortly"))),
+        Lifecycle::Deleting | Lifecycle::Deleted => return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} has been deleted"))),
+    }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
+    if read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
+        for replica in replicas(&record, &members) {
+            let Some(control_address) = &replica.control_address else { continue; };
+            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Subscribe { name: name.to_owned() }, options.control_timeout).await {
+                if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()))); }
+            }
+        }
+    }
     let mut last = None;
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
@@ -90,11 +115,20 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, options: &GatewayOpti
                 return Ok((connect(&address).await?, control));
             }
             Ok(Response::Refused { code, message }) => last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
-            Ok(Response::Done) => {}
+            Ok(Response::Done | Response::Subscribed { .. }) => {}
             Err(error) => last = Some(error),
         }
     }
     Err(last.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
+}
+
+/// The nodes that may serve the deployment's reads beside its holder: the ranks after the holder's, within its read width.
+fn replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
+    let now = now_ms();
+    let holder = effective_holder(record, members, now).cloned();
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now)).collect();
+    rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied()
+        .filter(|member| holder.as_ref() != Some(&member.id)).take(record.read_width.saturating_sub(1) as usize).collect()
 }
 
 /// The holder that counts, then every node that may take a placement, in the deployment's affinity order.

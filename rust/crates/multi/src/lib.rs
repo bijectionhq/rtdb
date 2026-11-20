@@ -5,9 +5,12 @@
 
 pub mod admin;
 pub mod agent;
+pub mod cipher;
 pub mod control;
 pub mod deployment;
 pub mod gateway;
+pub mod keys;
 pub mod lease;
 pub mod logs;
 pub mod process;
+pub mod store;

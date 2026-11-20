@@ -15,12 +15,18 @@ use tokio_util::sync::CancellationToken;
 const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--memory-limit BYTES]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--isolation] [--memory-limit BYTES]\n\
        rtdb-multi gateway --directory DIR --listen ADDR\n\
-       rtdb-multi controller --directory DIR\n\
+       rtdb-multi controller --directory DIR [--rebalance MOVES]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--grace SECONDS]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
-       rtdb-multi drain --directory DIR --member ID\n\n\
+       rtdb-multi drain --directory DIR --member ID\n\
+       rtdb-multi move --directory DIR --name NAME --to MEMBER\n\
+       rtdb-multi read-width --directory DIR --name NAME --width N\n\
+       rtdb-multi unquarantine --directory DIR --name NAME\n\
+       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME\n\
+       rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --name NAME\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n";
 
@@ -86,10 +92,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
             let mut agent = AgentOptions::new(CellStorage::Local { root: PathBuf::from(arguments.required("storage-root")?) });
+            agent.max_active = arguments.optional("max-active").map(|count| count.parse()).transpose().map_err(|_| usage("--max-active must be a number".into()))?;
             agent.park_after = arguments.optional("park-after").map(|seconds| seconds.parse().map(Duration::from_secs)).transpose().map_err(|_| usage("--park-after must be a number of seconds".into()))?;
             let node = process::start_node(directory, process::NodeSettings {
                 configuration, allocation_limit_bytes: arguments.number("memory-limit", 1usize << 30)?, control: arguments.address("control", "127.0.0.1:0")?,
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(), agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(20),
+                pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else { rtdb_directory::MemberPool::General },
+                keys: keys(&arguments)?, cache_dir: PathBuf::from(arguments.required("cache")?),
             }).await?;
             eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
             cancellation.cancelled().await;
@@ -103,7 +112,40 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "controller" => {
             let directory = directory(arguments.required("directory")?).await?;
-            admin::run_controller(directory, Duration::from_secs(1), Duration::from_secs(5), cancellation).await;
+            let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", 0usize)?, ..Default::default() };
+            admin::run_controller(directory, options, cancellation).await;
+            Ok(())
+        }
+        "reaper" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let grace = Duration::from_secs(arguments.number("grace", 3600u64)?);
+            rtdb_multi::store::run_reaper(directory, PathBuf::from(arguments.required("storage-root")?), grace, Duration::from_secs(10), cancellation).await;
+            Ok(())
+        }
+        "move" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            admin::move_deployment(directory.as_ref(), arguments.required("name")?, &rtdb_directory::MemberId(arguments.required("to")?.into())).await
+        }
+        "read-width" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            admin::set_read_width(directory.as_ref(), arguments.required("name")?, arguments.number("width", 1u32)?).await.map(|_| ())
+        }
+        "unquarantine" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            admin::unquarantine(directory.as_ref(), arguments.required("name")?).await.map(|_| ())
+        }
+        "fork" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let storage = CellStorage::Local { root: PathBuf::from(arguments.required("storage-root")?) };
+            let record = admin::fork(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), arguments.required("from")?, arguments.required("name")?).await?;
+            println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
+            Ok(())
+        }
+        "delete" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let storage = CellStorage::Local { root: PathBuf::from(arguments.required("storage-root")?) };
+            let deletion = admin::delete_deployment(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), arguments.required("name")?, 4 << 20).await?;
+            println!("{}", serde_json::to_string_pretty(&deletion).expect("a record serializes"));
             Ok(())
         }
         "create" => {
@@ -125,6 +167,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         other => Err(usage(format!("Unknown command {other}"))),
     }
+}
+
+fn keys(arguments: &Arguments) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(arguments.required("keys")?)?))
 }
 
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {

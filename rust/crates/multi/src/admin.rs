@@ -1,28 +1,198 @@
-//! Cell administration: creating deployments (`CreateDeployment`) and confirming dead members (`ExpireLease`).
+//! Cell administration: creating, moving, rebalancing, forking and deleting deployments, and confirming dead members (`CreateDeployment`, `IntendMove`, `Rebalance`, `Fork`, `BeginDeletion`, `EraseAndProve`, `ExpireLease`).
 
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_directory::{Cas, DeploymentRecord, Directory, MemberRecord, MemberRole, MemberState, now_ms};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
+use rtdb_logkeeper::StreamConfig;
+use rtdb_storage::log::LogOffset;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
+
+use crate::control::{self, Request, Response};
+use crate::deployment::{CellStorage, write_quorum};
+use crate::keys::KeyService;
+
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Creates a deployment, choosing its ensemble from the live logkeepers in its affinity order.
 /// Allocates identity and nothing else: no objects, no log state, no compute.
 pub async fn create_deployment(directory: &dyn Directory, name: &str, org: &str, replicas: usize) -> Result<DeploymentRecord> {
+    let mut record = DeploymentRecord::new(name, org, Vec::new(), now_ms());
+    record.ensemble = choose_ensemble(directory, &record, replicas).await?;
+    directory.create_deployment(record).await
+}
+
+async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
     let now = now_ms();
     let logkeepers: Vec<MemberRecord> = directory.members().await?.into_iter().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).collect();
     if logkeepers.len() < replicas {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/too-few-logkeepers", format!("{replicas} logkeepers are needed and {} are live", logkeepers.len())));
     }
-    let mut record = DeploymentRecord::new(name, org, Vec::new(), now);
     let ranked = rtdb_affinity::rank(&record.storage_identity(), &logkeepers, |member| member.id.as_str());
-    record.ensemble = ranked.into_iter().take(replicas).map(|member| member.id.clone()).collect();
-    directory.create_deployment(record).await
+    Ok(ranked.into_iter().take(replicas).map(|member| member.id.clone()).collect())
+}
+
+async fn members(directory: &dyn Directory) -> Result<BTreeMap<MemberId, MemberRecord>> {
+    Ok(directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect())
+}
+
+async fn record(directory: &dyn Directory, name: &str) -> Result<DeploymentRecord> {
+    directory.deployment_by_name(name).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))
+}
+
+/// Applies `change` to the named deployment's current record until a conditional replace succeeds.
+async fn update(directory: &dyn Directory, name: &str, change: impl Fn(&mut DeploymentRecord) -> Result<()>) -> Result<DeploymentRecord> {
+    for _ in 0..8 {
+        let current = record(directory, name).await?;
+        let mut next = current.clone();
+        change(&mut next)?;
+        if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await? { return Ok(stored); }
+    }
+    Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{name} kept changing while being updated")))
+}
+
+fn control_address(members: &BTreeMap<MemberId, MemberRecord>, member: &MemberId) -> Result<String> {
+    members.get(member).and_then(|member| member.control_address.clone()).ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-control", format!("Member {member} has no control address")))
+}
+
+async fn expect(address: &str, request: Request) -> Result<Response> {
+    match control::call(address, &request, CONTROL_TIMEOUT).await? {
+        Response::Refused { code, message } => Err(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
+        response => Ok(response),
+    }
+}
+
+/// Makes sure the deployment is held, activating it on the first node of its affinity order if not, and returns its holder.
+pub async fn ensure_held(directory: &dyn Directory, name: &str) -> Result<MemberId> {
+    let current = record(directory, name).await?;
+    let members = members(directory).await?;
+    if let Some(holder) = effective_holder(&current, &members, now_ms()) { return Ok(holder.clone()); }
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now_ms())).collect();
+    let mut last = None;
+    for node in rtdb_affinity::rank(&current.storage_identity(), &nodes, |member| member.id.as_str()) {
+        let Some(address) = &node.control_address else { continue };
+        match expect(address, Request::Activate { name: name.to_owned() }).await {
+            Ok(Response::Held { .. }) => return Ok(node.id.clone()),
+            Ok(Response::Redirect { holder, .. }) => return Ok(MemberId(holder)),
+            Ok(_) => {}
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can hold this deployment")))
+}
+
+/// A planned move: reserves the next claim for `target`, has the holder park, and has `target` claim.
+pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId) -> Result<()> {
+    let members = members(directory).await?;
+    if !members.get(target).is_some_and(|member| member.may_receive_placements(now_ms())) {
+        return Err(Anomaly::incorrect("rtdb.multi/not-placeable", format!("{target} may not take placements")));
+    }
+    let intended = update(directory, name, |record| { record.move_intent = Some(target.clone()); Ok(()) }).await?;
+    if let Some(holder) = effective_holder(&intended, &members, now_ms()).filter(|holder| *holder != target) {
+        expect(&control_address(&members, holder)?, Request::Park { name: name.to_owned() }).await?;
+    }
+    match expect(&control_address(&members, target)?, Request::Activate { name: name.to_owned() }).await? {
+        Response::Held { .. } => Ok(()),
+        other => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-failed", format!("The target answered {other:?}"))),
+    }
+}
+
+/// Moves at most `moves` deployments from the most loaded nodes to the least loaded, where their holding counts differ by more than one.
+pub async fn rebalance(directory: &dyn Directory, moves: usize) -> Result<usize> {
+    let members = members(directory).await?;
+    let now = now_ms();
+    let mut load: BTreeMap<MemberId, Vec<String>> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now))
+        .map(|member| (member.id.clone(), Vec::new())).collect();
+    for deployment in directory.deployments().await? {
+        if let Some(holder) = effective_holder(&deployment, &members, now) { if let Some(held) = load.get_mut(holder) { held.push(deployment.name.clone()); } }
+    }
+    let mut moved = 0;
+    while moved < moves {
+        let Some((busiest, busy)) = load.iter().max_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
+        let Some((idlest, idle)) = load.iter().min_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
+        if busy <= idle + 1 { break; }
+        let name = load.get_mut(&busiest).and_then(Vec::pop).expect("the busiest node holds something");
+        move_deployment(directory, &name, &idlest).await?;
+        load.get_mut(&idlest).expect("listed").push(name);
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+pub async fn set_read_width(directory: &dyn Directory, name: &str, width: u32) -> Result<DeploymentRecord> {
+    update(directory, name, |record| { record.read_width = width.max(1); Ok(()) }).await
+}
+
+pub async fn unquarantine(directory: &dyn Directory, name: &str) -> Result<DeploymentRecord> {
+    update(directory, name, |record| { if record.lifecycle == Lifecycle::Quarantined { record.lifecycle = Lifecycle::Live; } record.activation_crashes = 0; Ok(()) }).await
+}
+
+/// Forks `parent` into a new deployment `name` of the same lineage: the parent is flushed so its whole state is in blocks, its objects are copied under the child's prefix, and the child starts on fresh logs in the next log epoch.
+pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str) -> Result<DeploymentRecord> {
+    let holder = ensure_held(directory, parent).await?;
+    let members = members(directory).await?;
+    expect(&control_address(&members, &holder)?, Request::Flush { name: parent.to_owned() }).await?;
+    let source = record(directory, parent).await?;
+    let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
+    child.lineage = source.lineage.clone();
+    child.parent = Some(source.id.clone());
+    child.log_epoch = source.log_epoch + 1;
+    child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
+    match storage {
+        CellStorage::Local { root } => copy_tree(&root.join(source.storage_prefix()), &root.join(child.storage_prefix()))?,
+    }
+    keys.copy(&source.id, &child.id)?;
+    directory.create_deployment(child).await
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to).map_err(io)?;
+    if !from.exists() { return Ok(()); }
+    for entry in std::fs::read_dir(from).map_err(io)? {
+        let entry = entry.map_err(io)?;
+        let target = to.join(entry.file_name());
+        if entry.file_type().map_err(io)?.is_dir() { copy_tree(&entry.path(), &target)?; } else { std::fs::copy(entry.path(), &target).map_err(io)?; }
+    }
+    Ok(())
+}
+
+/// What a deletion did, kept as its record.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DeletionRecord { pub deployment: String, pub name: String, pub key_destroyed_at_ms: i64, pub objects_erased_at_ms: i64, pub verified_empty: bool }
+
+/// Fences every writer, seals and trims the deployment's stream, destroys its key, erases its objects and proves its prefix empty.
+pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<DeletionRecord> {
+    let fenced = update(directory, name, |record| {
+        if matches!(record.lifecycle, Lifecycle::Deleted) { return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} is already deleted"))); }
+        record.lifecycle = Lifecycle::Deleting;
+        record.epoch += 1;
+        record.holder = None;
+        Ok(())
+    }).await?;
+    let members = members(directory).await?;
+    let servers: Vec<String> = fenced.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
+    let last = rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
+    if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
+    keys.destroy(&fenced.id)?;
+    let key_destroyed_at_ms = now_ms();
+    let verified_empty = match storage {
+        CellStorage::Local { root } => {
+            let prefix = root.join(fenced.storage_prefix());
+            if prefix.exists() { std::fs::remove_dir_all(&prefix).map_err(io)?; }
+            !prefix.exists()
+        }
+    };
+    let deletion = DeletionRecord { deployment: fenced.id.clone(), name: name.to_owned(), key_destroyed_at_ms, objects_erased_at_ms: now_ms(), verified_empty };
+    update(directory, name, |record| { record.lifecycle = Lifecycle::Deleted; Ok(()) }).await?;
+    Ok(deletion)
 }
 
 /// Starts scaling a node in: it keeps serving what it holds, receives no new placements, and parks everything it holds so that each deployment's next request activates it elsewhere.
-pub async fn drain(directory: &dyn Directory, member: &rtdb_directory::MemberId) -> Result<()> {
+pub async fn drain(directory: &dyn Directory, member: &MemberId) -> Result<()> {
     for _ in 0..8 {
         let current = directory.member(member).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-member", format!("No member {member}")))?;
         if current.state != MemberState::Eligible { return Ok(()); }
@@ -47,11 +217,23 @@ pub async fn reap_members(directory: &dyn Directory, grace: Duration) -> Result<
     Ok(reaped)
 }
 
-pub async fn run_controller(directory: Arc<dyn Directory>, interval: Duration, grace: Duration, cancellation: CancellationToken) {
+#[derive(Clone, Debug)]
+pub struct ControllerOptions { pub interval: Duration, pub grace: Duration, pub rebalance_moves: usize }
+
+impl Default for ControllerOptions {
+    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0 } }
+}
+
+pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOptions, cancellation: CancellationToken) {
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return,
-            _ = tokio::time::sleep(interval) => { let _ = reap_members(directory.as_ref(), grace).await; }
+            _ = tokio::time::sleep(options.interval) => {
+                let _ = reap_members(directory.as_ref(), options.grace).await;
+                if options.rebalance_moves > 0 { let _ = rebalance(directory.as_ref(), options.rebalance_moves).await; }
+            }
         }
     }
 }
+
+fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/storage-io", error.to_string()) }

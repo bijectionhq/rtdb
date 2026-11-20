@@ -15,6 +15,8 @@ use crate::{config::NodeConfiguration, health::{HealthConfig, HealthDriver, Heal
 pub struct PlacedOptions {
     /// Log factories for the placed databases' logs, by protobuf type name.
     pub log_factories: Vec<(String, Arc<dyn rtdb_node::LogFactory>)>,
+    /// Storage factories for the placed databases' object stores, by protobuf type name.
+    pub storage_factories: Vec<(String, Arc<dyn rtdb_node::RemoteStorageFactory>)>,
     /// How long a placed holder waits on an empty replica read before claiming.
     pub claim_wait: Duration,
 }
@@ -111,7 +113,10 @@ impl ServerDriver {
             Some(clock) => resources.with_log_clock(clock),
             None => resources,
         };
-        for (protobuf_type, factory) in placed.map(|placed| placed.log_factories).unwrap_or_default() { resources = resources.register_log(protobuf_type, factory)?; }
+        if let Some(placed) = placed {
+            for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
+            for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
+        }
         let services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer,
             ..NodeServices::local(auth.clone(), metrics.clone(), auth.clone(), metrics.clone()) };
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;
