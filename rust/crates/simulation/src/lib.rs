@@ -5,10 +5,14 @@
 //! There are no threads, sockets or clocks; a run is a pure function of its seed.
 //!
 //! After every step the checker holds the protocol to `OneEffectiveWriterPerEpoch`, `NoTwoWritersHaveEffect`, `NothingCommittedIsLost`, `SealIsAPromise`, `SystemTimeRises` and `CheckpointNeverAheadOfLog`.
+//!
+//! Two more simulations drive the rest of a cell's real code from a seed: `storage`, deployments' objects through forks, the reaper, deletion and cell moves, and `sessions`, gateway sessions over backends that die or refuse.
 
 mod check;
 mod rng;
 mod server;
+pub mod sessions;
+pub mod storage;
 mod world;
 mod writer;
 
@@ -72,3 +76,13 @@ impl std::error::Error for Violation {}
 pub fn run(seed: u64, steps: usize) -> Result<Summary, Violation> { run_with(Config::new(seed, steps)) }
 
 pub fn run_with(config: Config) -> Result<Summary, Violation> { world::World::new(config).run() }
+
+/// Runs the storage-lifecycle simulation (`storage`), printing the seed and the last events if it finds a violation.
+pub fn run_storage(seed: u64, steps: usize) -> Result<storage::Summary, Violation> {
+    storage::run_with(storage::Config::new(seed, steps)).inspect_err(|violation| eprintln!("{violation}"))
+}
+
+/// Runs the gateway-session simulation (`sessions`), printing the seed and the last events if it finds a violation.
+pub fn run_sessions(seed: u64, steps: usize) -> Result<sessions::Summary, Violation> {
+    sessions::run_with(sessions::Config::new(seed, steps)).inspect_err(|violation| eprintln!("{violation}"))
+}

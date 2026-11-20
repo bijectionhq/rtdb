@@ -4547,10 +4547,17 @@ dependencies = [
 name = "rtdb-simulation"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "rtdb-directory",
+ "rtdb-format",
  "rtdb-logkeeper",
+ "rtdb-multi",
+ "rtdb-node",
+ "rtdb-storage",
+ "rtdb-types",
+ "tokio",
 ]
 
 [[package]]
