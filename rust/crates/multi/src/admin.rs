@@ -242,7 +242,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     arrived.ensemble = choose_ensemble(to.directory, &arrived, fenced.ensemble.len()).await?;
     let arrived = to.directory.create_deployment(arrived).await?;
     if !map.assign(name, to.name, Some(from.name)).await? { return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-raced", format!("{name} was not in {} when the move completed", from.name))); }
-    update(from.directory, name, |record| { record.lifecycle = Lifecycle::Deleted; Ok(()) }).await?;
+    update(from.directory, name, |record| { record.lifecycle = Lifecycle::Deleted; record.moved_at_ms = Some(now_ms()); Ok(()) }).await?;
     Ok(arrived)
 }
 

@@ -340,16 +340,36 @@ pub fn garbage_released_at(name: &str) -> Option<i64> {
     name.strip_prefix(&format!("{GARBAGE_DIRECTORY}/"))?.split('-').next()?.parse().ok()
 }
 
-pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deployment::CellStorage, grace: Duration, interval: Duration, cancellation: tokio_util::sync::CancellationToken) {
+pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deployment::CellStorage, keys: Option<Arc<dyn KeyService>>, grace: Duration, interval: Duration, cancellation: tokio_util::sync::CancellationToken) {
     let Ok(bucket) = storage.bucket(IoRegion::new()).await else { return };
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(interval) => {
-                if let Ok(deployments) = directory.deployments().await { let _ = reaper_pass(bucket.as_ref(), &deployments, wall_clock()(), grace).await; }
+                if let Ok(deployments) = directory.deployments().await {
+                    let now = wall_clock()();
+                    let _ = reaper_pass(bucket.as_ref(), &deployments, now, grace).await;
+                    let _ = finish_moves(bucket.as_ref(), &deployments, now, grace, keys.as_deref()).await;
+                }
             }
         }
     }
+}
+
+/// Erases what deployments that moved to other cells left here, once the grace has passed since they moved: readers that were reading here at the cutover have finished by then.
+/// Their forks here keep what they share, copied into them first, and the key this cell held for each is destroyed, so its sealed log tail here is unreadable too.
+pub async fn finish_moves(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration, keys: Option<&dyn KeyService>) -> Result<usize> {
+    let mut finished = 0;
+    let others: Vec<DeploymentRecord> = deployments.iter().filter(|record| record.moved_at_ms.is_none()).cloned().collect();
+    for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Deleted && record.moved_at_ms.is_some_and(|moved| moved + grace.as_millis() as i64 <= now_ms)) {
+        let prefix = crate::reference::key(&record.storage_prefix())?;
+        if !bucket.list(Some(&prefix)).await?.is_empty() {
+            crate::reference::erase_deployment(bucket, &record.storage_prefix(), &others).await?;
+            finished += 1;
+        }
+        if let Some(keys) = keys { keys.destroy(&record.id)?; }
+    }
+    Ok(finished)
 }
 
 /// One pass of the reaper over a cell's `bucket`, whose deployments are `deployments`, as of `now_ms`: every deployment that is not deleted is reaped, in order, against the references of them all.

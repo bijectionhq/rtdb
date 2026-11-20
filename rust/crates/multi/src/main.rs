@@ -20,7 +20,7 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--grace SECONDS]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--grace SECONDS]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
@@ -153,7 +153,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let grace = Duration::from_secs(arguments.number("grace", 3600u64)?);
             // An open snapshot reads objects its deployment may have released since; the reaper's grace has to outlast it.
             if grace <= rtdb_multi::agent::SNAPSHOT_LIFETIME { return Err(usage("--grace must exceed a snapshot's lifetime of 30 minutes".into())); }
-            rtdb_multi::store::run_reaper(directory, CellStorage::parse(arguments.required("storage-root")?)?, grace, Duration::from_secs(10), cancellation).await;
+            let keys = arguments.optional("keys").map(|path| rtdb_multi::keys::LocalKeyService::new(path).map(|keys| Arc::new(keys) as Arc<dyn rtdb_multi::keys::KeyService>)).transpose()?;
+            rtdb_multi::store::run_reaper(directory, CellStorage::parse(arguments.required("storage-root")?)?, keys, grace, Duration::from_secs(10), cancellation).await;
             Ok(())
         }
         "move" => {

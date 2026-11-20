@@ -430,6 +430,19 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let settled = west.directory.deployment(&arrived.id).await.unwrap().unwrap();
     assert!(settled.move_from.is_none(), "the first holder in the new cell moved the stream onto the new cell's logkeepers");
     assert_eq!(east.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
+
+    let tombstone = east.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    let east_bucket = east.storage().bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+    let left_behind = || async { east_bucket.list(Some(&rtdb_storage::ObjectKey::new(tombstone.storage_prefix()).unwrap())).await.unwrap().len() };
+    assert!(left_behind().await > 0, "the old cell still holds the deployment's objects right after the move");
+    let deployments = east.directory.deployments().await.unwrap();
+    let keys = east.keys();
+    let hour = Duration::from_secs(3600);
+    assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms(), hour, Some(&keys)).await.unwrap(), 0, "and keeps them within the grace");
+    assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms() + hour.as_millis() as i64, hour, Some(&keys)).await.unwrap(), 1);
+    assert_eq!(left_behind().await, 0, "after the grace, the old cell erases what the move left");
+    assert!(!east.data.path().join("keys").join(format!("{}.key", tombstone.id)).exists(), "and destroys its copy of the key");
+    assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"], "while the deployment reads on in its new cell");
     drop((through_east, through_west));
     east.stop().await;
     west.stop().await;
