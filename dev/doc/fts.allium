@@ -160,6 +160,7 @@ rule RepairUnreadableSearchFile {
 ------------------------------------------------------------
 
 -- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer, and every phrase of it (terms between double quotes) as consecutive tokens.
+-- The analyzer splits a word longer than the index's longest token (rtdb_text::MAX_TOKEN_BYTES) into tokens of at most that length, so the index holds every token the analyzer makes.
 -- SEARCH_SCORE(column, query) is the BM25 of that value for the query's terms.
 --
 -- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
@@ -171,7 +172,7 @@ rule RepairUnreadableSearchFile {
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
 --      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
---   6. MATCH is evaluated on each resolved row.
+--   6. MATCH is evaluated on each resolved row, as MatchEvaluatedByTheScan says.
 --
 -- Past max_candidates candidates, or max_unindexed_bytes of tries without a search file, the scan runs unnarrowed instead.
 --
@@ -206,6 +207,18 @@ rule MatchIsAResidualPredicate {
         FilterResolvedRows(scan, predicate)
 }
 
+rule MatchEvaluatedByTheScan {
+    -- A MATCH with a constant query in a predicate the scan filters by, under NOT and IS NULL as much as bare, is a boolean column the scan evaluates on each resolved row.
+    -- The text column is then read only for the rows the scan cannot answer otherwise, and projected only if something else needs it.
+    -- A row whose data file has a search file for a definition covering the column takes MATCH from it: true where the document matches, null where the column is null or absent, and false otherwise.
+    -- Any other row, in a trie without a readable search file or in a live segment, takes MATCH from its own value.
+    -- NOT MATCH, which no candidate set narrows, and count(*) over MATCH thus tokenise no text of indexed rows.
+    when: ScanWithMatch(scan, predicate)
+
+    ensures:
+        EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate)
+}
+
 ------------------------------------------------------------
 -- Contracts
 ------------------------------------------------------------
@@ -227,10 +240,11 @@ contract SearchFileLayout {
     @invariant WindowBoundsAreUpperBounds
         -- Documents fall in windows of 128 consecutive ids.
         -- For each term of a column and each window holding it, the file records the term's highest frequency there and the shortest stored length among the documents holding it, stored for a term in at least 1024 documents and read from its postings otherwise.
-        -- A term's part of BM25 rises with its frequency and falls with the length, so no document in the window scores above the sum of the parts at those, whatever the corpus.
+        -- A term's part of BM25 rises with its frequency and, its inverse document frequency being positive, falls with the length, so no document in the window scores above the sum of the parts at those, whatever the corpus.
 
     @invariant RowsAndNullsAreRecorded
         -- The file records the first document of each data page, and for each column the documents whose value is neither null nor absent.
+        -- A row's page and position within it name its document, so MATCH on any row of the data file, null included, is read from the file alone.
 
     @invariant TokensAreTheResidualsTokens
         -- A search file's terms are the analyzer's tokens of each row's UTF-8 value, the same tokens MATCH evaluates on a resolved row, with their positions, so a phrase matches in the file exactly when it matches the row.
@@ -287,6 +301,7 @@ surface FullTextSearch {
 --   search_record(job)                  — the artefact record of a built search file: kind `search`, the definition's artefact id and version
 --   search_candidates(scan, predicate)  — steps 1–4 of the query plan
 --   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the trie's artefact key
+--   EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate) — MatchEvaluatedByTheScan's evaluation, in the scan, before its filter
 --   StraySearchFilesDeleted(table)      — list the table's artefact objects and delete those SweepStraySearchFiles names (maintenance/src/artefact.rs: stray_artefacts)
 
 ------------------------------------------------------------
@@ -297,4 +312,3 @@ open question "Is the historical side indexed by default, or only on request? As
 
 open question "How does fan-out scale? Every current-side search file is a candidate for every query, one per ~100MB trie; term blooms on the artefact record, and search files spanning a completed partition group, are the levers."
 
-open question "NOT MATCH, and count(*) over MATCH, gain little from narrowing: the first has no candidate superset, the second must resolve every candidate. Both are answered by scanning today."

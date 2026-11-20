@@ -334,7 +334,7 @@ fn count_iids(catalog: &dyn Catalog, join: bool) -> Result<Relation, Error> {
     let field = |id, name: &str, data_type| Field { id: ColumnId(id), name: name.into(), qualifier: None,
         qualified_only: false, unnamed: false, data_type };
     let scan = |id| Relation::scan(Scan { table: table.clone(), columns: vec![field(id, "_iid", iid_type.clone())],
-        valid_time: TemporalFilter::All, system_time: TemporalFilter::All, clamp_valid_time: false, iids: None, predicates: vec![], top_k: None });
+        valid_time: TemporalFilter::All, system_time: TemporalFilter::All, clamp_valid_time: false, iids: None, predicates: vec![], top_k: None, matches: Vec::new() });
     let left = Arc::new(scan(0)?);
     let right = Arc::new(scan(1)?);
     let input = if join {

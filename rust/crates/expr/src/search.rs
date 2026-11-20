@@ -20,3 +20,12 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
         })
     })())
 }
+
+/// MATCH of a value against a parsed query: null where the value is null or absent, and false for a value that is not text.
+pub fn match_value(value: &Value, query: &rtdb_text::Query) -> Value {
+    match value {
+        value if nullish(value) => Value::Null,
+        Value::Utf8(text) => Value::Bool(query.matches(&rtdb_text::tokens(text))),
+        _ => Value::Bool(false),
+    }
+}

@@ -134,7 +134,13 @@ struct PartitionScan {
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
+    matches: Vec<EvaluatedMatch>,
+    /// Parallel to the scan's columns: the match each evaluates, if any.
+    slots: Vec<Option<usize>>,
 }
+
+/// A MATCH the scan evaluates: on its column, for its query (`None` where the query is null, so MATCH is too), with an accelerator's answers for some of the partition's data files.
+struct EvaluatedMatch { column: String, query: Option<rtdb_text::Query>, answers: Option<crate::MatchAnswers> }
 
 use crate::analysis::ScanCounts;
 pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, _reservation: Arc<MemoryReservation> }
@@ -156,6 +162,12 @@ impl ScanCursor {
         }
         let name = scan.table.name.database.clone();
         let source = format!("{}.{}", scan.table.name.table.schema, scan.table.name.table.table);
+        let mut queries = Vec::with_capacity(scan.matches.len());
+        for evaluated in &scan.matches {
+            let constants = crate::accelerate::ExecutionConstants(&execution);
+            queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(rtdb_text::Query::parse(&text)), _ => None });
+        }
+        let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
         let mut partitions = VecDeque::new();
         for snapshot in database_partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
@@ -172,7 +184,20 @@ impl ScanCursor {
                     narrowed.iids = Some(iids);
                 }
             }
-            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(storage), scan: narrowed, execution: execution.clone(), bounds,
+            let mut matches = Vec::with_capacity(scan.matches.len());
+            for (evaluated, query) in scan.matches.iter().zip(&queries) {
+                let mut answers = None;
+                if let Some(query) = query {
+                    let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
+                        current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
+                        corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
+                    for accelerator in execution.context.accelerators.iter() {
+                        if let Some(found) = accelerator.match_answers(&request, &evaluated.column, query).await? { answers = Some(found); break; }
+                    }
+                }
+                matches.push(EvaluatedMatch { column: evaluated.column.clone(), query: query.clone(), answers });
+            }
+            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, slots: slots.clone(), scan: narrowed, execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
                 output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
         }
@@ -470,6 +495,10 @@ impl PartitionScan {
                 if header.iid >= task.range.lower { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal });break; }
             }
         }
+        let sources: Vec<(Option<Arc<IndexBatch>>, Option<(usize, usize)>)> = selected.iter().map(|index| match (&self.loaded[index].rows, &self.pages.entries[*index].source) {
+            (ActiveRows::File(batch), PageSource::File { file, page }) => (Some(Arc::clone(batch)), Some((*file, *page))),
+            _ => (None, None),
+        }).collect();
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         while let Some(head) = heads.pop() {
             self.execution.context.check_cancelled()?;
@@ -487,7 +516,9 @@ impl PartitionScan {
                 let bound = self.scan.columns.iter().try_fold(256usize,|bound,field|bound.checked_add(project_bound(row,&field.name)?).ok_or_else(||invalid("scan-row-size","Scan row allocation exceeds addressable memory")))?;
                 let reservation = self.execution.context.memory.reserve(bound)?;
                 let mut values = Vec::with_capacity(self.scan.columns.len());
-                for field in &self.scan.columns { values.push(project(row,&field.name)?); }
+                for (field, slot) in self.scan.columns.iter().zip(&self.slots) {
+                    values.push(match slot { Some(evaluated) => self.match_value(row, *evaluated, &sources)?, None => project(row,&field.name)? });
+                }
                 groups[head.active].push_growing(OwnedRow::with_reservation(values,reservation)?,&self.execution.context.memory)?;
             }
         }
@@ -495,6 +526,23 @@ impl PartitionScan {
         self.output = groups.into_iter().filter(|page|page.len() > 0).map(PageBuilder::finish).collect();
         self.output_reservation = Some(reservation);
         Ok(())
+    }
+}
+impl PartitionScan {
+    /// The scan's MATCH on a resolved row: from the accelerator's answers where they cover the row's data file, and from the row's own value otherwise.
+    fn match_value(&self, row: &ResolvedRow<RowSource>, evaluated: usize, sources: &[(Option<Arc<IndexBatch>>, Option<(usize, usize)>)]) -> Result<Value> {
+        let state = &self.matches[evaluated];
+        let Some(query) = &state.query else { return Ok(Value::Null) };
+        if let Some(answers) = &state.answers {
+            let source = sources.iter().find(|(batch, _)| batch.as_ref().is_some_and(|batch| Arc::ptr_eq(batch, &row.source.batch))).and_then(|(_, source)| *source);
+            if let Some((file, page)) = source {
+                // An answer the file cannot give for this row is left to the row itself: an index decides cost, never results.
+                if let Some(Ok(value)) = answers.file(&self.files.entries[file].key).map(|matches| matches.value(page, row.source.row)) {
+                    return Ok(value.map_or(Value::Null, Value::Bool));
+                }
+            }
+        }
+        Ok(rtdb_expr::match_value(&project(row, &state.column)?, query))
     }
 }
 fn project_bound(row: &ResolvedRow<RowSource>,name: &str) -> Result<usize> {
@@ -594,6 +642,7 @@ fn may_satisfy_not_null(scan: &Scan, columns: &[Value]) -> bool {
     let Expr::Column { id, .. } = expr.as_ref() else {
         return true;
     };
+    if scan.matches.iter().any(|evaluated| evaluated.id == *id) { return true; }
     let mut fields = scan.columns.iter().filter(|field| field.id == *id);
     let (Some(field), None) = (fields.next(), fields.next()) else {
         return true;
@@ -673,7 +722,7 @@ mod tests {
         let field = Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: binding.columns["v"].clone() };
         let scan = Scan {
             table: binding, columns: vec![field], valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None,
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
         };
         let memory = MemoryBudget::new(1 << 24);
         let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
@@ -1034,7 +1083,7 @@ mod tests {
         }).collect();
         let scan = Scan {
             table: binding, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None,
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
         };
         let root = MemoryBudget::new(1 << 24);
         let memory = root.scope();

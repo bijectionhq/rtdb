@@ -164,7 +164,7 @@ pub fn prepare_patch(table: QualifiedTable, input: Arc<Relation>, valid_time: Te
     columns.insert("_valid_to".into(), instant_type().maybe());
     let fields = columns.into_iter().map(|(name, ty)| binder.field(name, None, ty)).collect::<Result<Vec<_>>>()?;
     let old = match binding {
-        Some(table) => Arc::new(Relation::scan(Scan { table, columns: fields, valid_time: TemporalFilter::FromTo { from: from.clone(), to: to.clone() }, system_time: TemporalFilter::Default, clamp_valid_time: true, iids: None, predicates: Vec::new(), top_k: None })?),
+        Some(table) => Arc::new(Relation::scan(Scan { table, columns: fields, valid_time: TemporalFilter::FromTo { from: from.clone(), to: to.clone() }, system_time: TemporalFilter::Default, clamp_valid_time: true, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new() })?),
         None => Arc::new(Relation::empty(Schema::new(fields)?)),
     };
     let find = |name: &str| old.schema().fields().iter().find(|field| field.name == name).map(Field::expression).ok_or_else(|| invalid("PATCH old column is absent"));

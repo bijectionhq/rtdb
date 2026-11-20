@@ -28,12 +28,15 @@ impl Default for SearchAccelerator {
     fn default() -> Self { Self::with_runtime(crate::SearchRuntime::new(256 << 20)) }
 }
 
-fn match_conjuncts<'a>(expression: &'a Expr, found: &mut Vec<(&'a rtdb_plan::ColumnId, &'a Expr)>) {
+/// The column and query of each MATCH conjunct, whether a predicate calls it or a column the scan evaluates holds it.
+fn match_conjuncts<'a>(scan: &'a rtdb_plan::Scan, expression: &'a Expr, found: &mut Vec<(&'a str, &'a Expr)>) {
+    let name = |id: &rtdb_plan::ColumnId| scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.as_str());
     match expression {
-        Expr::Binary { op: BinaryOp::And, left, right } => { match_conjuncts(left, found); match_conjuncts(right, found); }
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("match") && args.len() == 2 => {
-            if let Expr::Column { id, .. } = &args[0] { found.push((id, &args[1])); }
+        Expr::Binary { op: BinaryOp::And, left, right } => { match_conjuncts(scan, left, found); match_conjuncts(scan, right, found); }
+        Expr::Call { name: function, args, .. } if function.eq_ignore_ascii_case("match") && args.len() == 2 => {
+            if let Some(column) = match &args[0] { Expr::Column { id, .. } => name(id), _ => None } { found.push((column, &args[1])); }
         }
+        Expr::Column { id, .. } => if let Some(evaluated) = scan.matches.iter().find(|evaluated| evaluated.id == *id) { found.push((&evaluated.column, &evaluated.query)); },
         _ => {}
     }
 }
@@ -50,13 +53,13 @@ impl ScanAccelerator for SearchAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
         let scan = request.scan;
         let mut conjuncts = Vec::new();
-        for predicate in &scan.predicates { match_conjuncts(predicate, &mut conjuncts); }
+        for predicate in &scan.predicates { match_conjuncts(scan, predicate, &mut conjuncts); }
         if conjuncts.is_empty() { return Ok(None); }
         let table = &scan.table.name.table;
         let definitions = self.runtime.definitions(request.database, request.partitions, request.storage, request.memory, request.current_time, request.cancellation).await?;
         let mut chosen: Option<(String, Query, &SearchDefinition)> = None;
-        for (id, query) in conjuncts {
-            let Some(column) = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.clone()) else { continue };
+        for (column, query) in conjuncts {
+            let column = column.to_string();
             let Some(Value::Utf8(text)) = request.constants.constant(query).await? else { continue };
             let Some(definition) = definitions.iter().find(|definition| &definition.table == table && definition.columns.contains(&column)) else { continue };
             chosen = Some((column, Query::parse(&text), definition));
@@ -117,6 +120,26 @@ impl ScanAccelerator for SearchAccelerator {
         }
         candidates.extend(self.live_candidates(request, &column, &query)?);
         Ok((candidates.len() <= self.max_candidates).then_some(candidates))
+    }
+
+    async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<Option<rtdb_query::MatchAnswers>> {
+        let table = &request.scan.table.name.table;
+        let definitions = self.runtime.definitions(request.database, request.partitions, request.storage, request.memory, request.current_time, request.cancellation).await?;
+        let Some(definition) = definitions.iter().find(|definition| &definition.table == table && definition.columns.iter().any(|indexed| indexed == column)) else { return Ok(None) };
+        let Some(entry) = request.snapshot.table_entry(table) else { return Ok(None) };
+        let artefact_id = definition.artefact_id();
+        let mut answers = rtdb_query::MatchAnswers::default();
+        for trie in request.snapshot.trie_catalog().current_tries(table) {
+            if trie.state != TrieState::Live || trie.artefact(KIND, &artefact_id, definition.version).is_none() { continue; }
+            let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
+            match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
+                Ok(file) => answers.insert(&ObjectKey::new(entry.slug.data_key(&trie.key))?, self.runtime.match_values(request.database, &key, &file, column, query)?),
+                Err(error) => if error.needs_repair() {
+                    self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version });
+                },
+            }
+        }
+        Ok((!answers.is_empty()).then_some(answers))
     }
 }
 

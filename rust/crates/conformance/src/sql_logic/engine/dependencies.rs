@@ -248,7 +248,7 @@ mod tests {
         binding.columns.remove("_id");
         Arc::new(Relation::scan(Scan { table: binding, columns: vec![field(id, "x", L::Scalar(S::I64))],
             valid_time: TemporalFilter::All, system_time: TemporalFilter::Default, clamp_valid_time: true,
-            iids: None, predicates: Vec::new(), top_k: None }).unwrap())
+            iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new() }).unwrap())
     }
     fn relation(schema: Schema, node: RelationNode) -> Arc<Relation> { Arc::new(Relation::new(schema, node).unwrap()) }
     fn cross(left: Arc<Relation>, right: Arc<Relation>) -> Arc<Relation> {

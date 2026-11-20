@@ -135,7 +135,7 @@ fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tanti
     impacts
 }
 
-/// Page starts, then each column's non-null bitset, then the impacts of every term in at least STORED_IMPACTS documents, by column and term.
+/// Page starts, then each column's non-null bitset, then the impacts of every term in at least STORED_IMPACTS documents, by column and term, then a checksum of the rest.
 fn sidecar(index: &Index, columns: &[Field], page_starts: &[u32], present: &[Vec<u8>]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(page_starts.len() as u32).to_le_bytes());
@@ -164,7 +164,14 @@ fn sidecar(index: &Index, columns: &[Field], page_starts: &[u32], present: &[Vec
         bytes.extend_from_slice(&(impacts.len() as u32).to_le_bytes());
         for impact in impacts { for value in [impact.window, impact.frequency, impact.length] { bytes.extend_from_slice(&value.to_le_bytes()); } }
     }
+    bytes.extend_from_slice(&checksum(&bytes));
     Ok(bytes)
+}
+
+/// Tantivy checks its own files; the sidecar's bounds and nulls decide results, so it is checked too.
+fn checksum(bytes: &[u8]) -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)[..8].try_into().unwrap_or_default()
 }
 
 /// A uuid-shaped name derived from the job's identity, standing in for tantivy's random segment id.
@@ -294,7 +301,9 @@ struct Sidecar { bytes: OwnedBytes, page_starts: Vec<u32>, present: Vec<Range<us
 
 impl Sidecar {
     fn parse(bytes: OwnedBytes, columns: usize, documents: u32) -> Result<Self> {
-        let data = bytes.as_slice();
+        let whole = bytes.as_slice();
+        let (data, sum) = whole.split_at_checked(whole.len().saturating_sub(8)).ok_or_else(|| corrupt("Search file sidecar is truncated"))?;
+        if sum.len() != 8 || checksum(data) != sum { return Err(corrupt("Search file sidecar fails its checksum")); }
         let mut position = 0usize;
         let mut take = |count: usize| -> Result<Range<usize>> {
             let end = position.checked_add(count).filter(|end| *end <= data.len()).ok_or_else(|| corrupt("Search file sidecar is truncated"))?;
@@ -316,7 +325,10 @@ impl Sidecar {
             let length = take(2)?;
             let term = data[take(u16::from_le_bytes(data[length].try_into().unwrap_or_default()) as usize)?].to_vec();
             let windows = u32_at(take(4)?) as usize;
-            impacts.insert((column, term), take(windows.checked_mul(12).ok_or_else(|| corrupt("Search file impacts overflow"))?)?);
+            let range = take(windows.checked_mul(12).ok_or_else(|| corrupt("Search file impacts overflow"))?)?;
+            let ascending = data[range.clone()].chunks_exact(12).map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])).collect::<Vec<_>>().windows(2).all(|pair| pair[0] < pair[1]);
+            if !ascending || column as usize >= columns { return Err(corrupt("Search file impacts are out of order")); }
+            impacts.insert((column, term), range);
         }
         if position != data.len() { return Err(corrupt("Search file sidecar has trailing bytes")); }
         Ok(Self { bytes, page_starts, present, impacts })
@@ -443,7 +455,7 @@ impl SearchFile {
                 }
             }
         }
-        // Each term's part is bounded exactly; the margin covers summing those parts in another order than a document's score does.
+        // A term's part rises with frequency and falls with length exactly, but its rounded value need not; the margin covers that.
         for (bound, _) in &mut bounds { *bound = *bound * (1.0 + 1e-9) + 1e-12; }
         bounds.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
         Ok(Ranked(Some(Windows { searcher, field, matching: matching.clone(), scoring: scoring.clone(), corpus: corpus.cloned(), windows: bounds, next: 0, batch: 4 })))
@@ -491,6 +503,10 @@ impl MatchValues {
     }
     /// The bytes held, for a cache's weight.
     pub fn bytes(&self) -> usize { (self.present.len() + self.matching.len()) * 8 + self.page_starts.len() * 4 }
+}
+
+impl rtdb_query::FileMatches for MatchValues {
+    fn value(&self, page: usize, row: usize) -> Result<Option<bool>> { MatchValues::value(self, page, row) }
 }
 
 /// Scores documents in ascending order from the postings of the scoring terms.
@@ -692,5 +708,31 @@ mod tests {
         }
         assert!(values.value(pages.len(), 0).is_err());
         assert!(file.match_values("title", &query).unwrap().value(0, 0).unwrap().is_none(), "a column no row holds is null everywhere");
+    }
+
+    #[test]
+    fn a_word_longer_than_tantivy_keeps_is_matched_and_scored_as_the_row_is() {
+        let long = format!("{} overdue", "x".repeat(70_000));
+        let rows = vec![row(1, 0, "", &long), row(2, 0, "", "overdue")];
+        let file = SearchFile::open(build_search_file(&columns(), &rows, "job").unwrap(), &columns()).unwrap();
+        for query in [Query::parse(&"x".repeat(70_000)), Query::parse("overdue")] {
+            let corpus = file.corpus("body", &query).unwrap();
+            let expected: Vec<u32> = (0..2).filter(|doc| query.matches(rows[*doc as usize].values[1].as_deref().unwrap())).collect();
+            let scored = file.scored("body", &query, &query, Some(&corpus)).unwrap();
+            assert_eq!(scored.iter().map(|(doc, _)| doc.doc).collect::<Vec<_>>(), expected);
+            for (doc, score) in scored { assert_eq!(score, rtdb_text::bm25(&query, rows[doc.doc as usize].values[1].as_deref().unwrap(), Some(&corpus))); }
+        }
+    }
+
+    #[test]
+    fn a_sidecar_whose_bytes_changed_is_unreadable() {
+        let bytes = build_search_file(&columns(), &corpus_rows(2000, 1), "job").unwrap();
+        let directory = BundleDirectory::open(Source::from(bytes.clone())).unwrap();
+        let range = directory.files[Path::new(SIDECAR)].clone();
+        for offset in [range.start, range.start + range.len() / 2, range.end - 1] {
+            let mut corrupted = bytes.clone();
+            corrupted[offset] ^= 0x10;
+            assert!(SearchFile::open(corrupted, &columns()).is_err(), "byte {offset}");
+        }
     }
 }

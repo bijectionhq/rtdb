@@ -24,9 +24,11 @@ It does not know what a search index is.
 
 | The artefact lane (`maintenance`)
 | A deterministic job per (live trie, definition) lacking an artefact, run like compaction jobs.
+  The lane also deletes its kind's unrecorded objects for definitions no longer in force, which a builder that failed before publishing left behind.
 
 | The scan accelerator (`query`)
 | Before a scan opens, an accelerator may narrow `Scan.iids` to a candidate superset; the scan's resolution and `PageFilter` decide the result.
+  It may also answer a `MATCH` the scan evaluates (`Scan.matches`) for the rows of whole data files, by page and row.
 
 | Scalar functions (`plan`, `expr`, `sql`)
 | `MATCH(column, query)` and `SEARCH_SCORE(column, query)`, evaluated on resolved rows with the analyzer in `rtdb-text`.
@@ -43,8 +45,9 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
 
 * *Index events, not resolved entities.*
   A search file covers exactly one trie data file; a document is one row, and its id is the row's ordinal.
-* *A search file only nominates candidates.*
-  `MATCH` is an ordinary scan predicate; the scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
+* *A search file only nominates candidates, and answers MATCH exactly.*
+  The scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
+  A `MATCH` with a constant query in a scan predicate becomes a column the scan evaluates: from the search file of the row's data file, null included, and from the row's value where there is none.
 * *A missing search file is never an error.*
   The accelerator treats it as absent and brute-forces that trie, which is what makes deleting one always safe.
 * *Tokens are ours, postings are tantivy's.*

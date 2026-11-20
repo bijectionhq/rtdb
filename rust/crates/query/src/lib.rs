@@ -34,7 +34,7 @@ mod cross;
 mod join_storage;
 mod mark;
 
-pub use accelerate::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, CorpusSource, ScanAccelerator, ScanRequest};
+pub use accelerate::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, CorpusSource, FileMatches, MatchAnswers, ScanAccelerator, ScanRequest};
 pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 pub use cursor::{PreparedQuery, QueryCursor};
 pub use settings::unindexed_tx;

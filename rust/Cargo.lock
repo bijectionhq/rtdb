@@ -4335,6 +4335,7 @@ dependencies = [
  "rtdb-search",
  "rtdb-sql",
  "rtdb-storage",
+ "rtdb-text",
  "rtdb-trie",
  "rtdb-tx",
  "rtdb-types",

@@ -157,7 +157,7 @@ fn outer_build_estimates_use_catalog_rows_and_preserve_unknown_live_only_counts(
     let table_name = TableRef::new("public","docs");
     let scan = Arc::new(Relation::scan(Scan {
         table: TableBinding { name: QualifiedTable { database: "xtdb".into(),table: table_name.clone() },oid: None,columns: BTreeMap::from([("c0".into(),LogicalType::Scalar(ScalarType::I64))]) },
-        columns: vec![field(0,LogicalType::Scalar(ScalarType::I64))],valid_time: TemporalFilter::All,system_time: TemporalFilter::All,clamp_valid_time: false,iids: None,predicates: vec![],top_k: None,
+        columns: vec![field(0,LogicalType::Scalar(ScalarType::I64))],valid_time: TemporalFilter::All,system_time: TemporalFilter::All,clamp_valid_time: false,iids: None,predicates: vec![],top_k: None, matches: Vec::new(),
     }).unwrap());
     for (catalog_rows,expected_left) in [(None,false),(Some(1),true),(Some(2),false),(Some(10),false)] {
         let catalog = match catalog_rows {

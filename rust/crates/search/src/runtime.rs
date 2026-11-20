@@ -81,6 +81,7 @@ pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
+    matches: Mutex<Bounded<(String, String, String, rtdb_text::Query), (std::sync::Weak<SearchFile>, Arc<crate::file::MatchValues>)>>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
     reported: Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>,
 }
@@ -88,7 +89,7 @@ pub struct SearchRuntime {
 impl SearchRuntime {
     /// `file_bytes` bounds the opened search files kept across queries; each keeps its buffer-pool lease, so its bytes stay charged to the pool.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), suspects: Default::default(), reported: Default::default() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), matches: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -122,6 +123,17 @@ impl SearchRuntime {
         let file = Arc::new(SearchFile::open(lease, columns).map_err(FileError::Corrupt)?);
         self.files.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), size);
         Ok(file)
+    }
+
+    /// MATCH of a query on every document of an opened file, kept for as long as the file itself is the one this node has open under its key.
+    pub fn match_values(&self, database: &str, key: &rtdb_storage::ObjectKey, file: &Arc<SearchFile>, column: &str, query: &rtdb_text::Query) -> Result<Arc<crate::file::MatchValues>> {
+        let cache_key = (database.to_string(), key.as_str().to_string(), column.to_string(), query.clone());
+        if let Some((opened, values)) = self.matches.lock().get(&cache_key) {
+            if opened.upgrade().is_some_and(|opened| Arc::ptr_eq(&opened, file)) { return Ok(values); }
+        }
+        let values = Arc::new(file.match_values(column, query)?);
+        self.matches.lock().insert(cache_key, (Arc::downgrade(file), Arc::clone(&values)), values.bytes());
+        Ok(values)
     }
 
     pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) { self.files.lock().remove(&(database.to_string(), key.as_str().to_string())); }

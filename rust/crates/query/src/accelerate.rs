@@ -80,10 +80,29 @@ impl rtdb_expr::CorpusLookup for CorpusRegistry {
 
 /// Narrows a scan before it opens.
 /// It returns a superset of the IIDs whose visible row can satisfy the scan's predicates at its bounds, or `None` to leave the scan unnarrowed.
-/// The scan still resolves each candidate's history and re-checks every predicate, so an accelerator decides cost, never results.
+/// The scan still resolves each candidate's history and re-checks every predicate, so narrowing decides cost, never results.
 #[async_trait]
 pub trait ScanAccelerator: Send + Sync {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>>;
+    /// The values of `match(column, query)` on the rows of whichever of the scan's data files the accelerator can answer for, so the scan reads no text there.
+    /// Each answer must equal MATCH evaluated on the row.
+    async fn match_answers(&self, _request: &ScanRequest<'_>, _column: &str, _query: &rtdb_text::Query) -> Result<Option<MatchAnswers>> { Ok(None) }
+}
+
+/// MATCH on the rows of one data file, by page and row within the page: `None` where the column is null or absent, as MATCH is.
+pub trait FileMatches: Send + Sync {
+    fn value(&self, page: usize, row: usize) -> Result<Option<bool>>;
+}
+
+/// The values of a MATCH the scan evaluates, on every row of some of the data files it reads, by the file's object key.
+#[derive(Default)]
+pub struct MatchAnswers { files: std::collections::BTreeMap<String, Arc<dyn FileMatches>> }
+
+impl MatchAnswers {
+    pub fn insert(&mut self, data_file: &rtdb_storage::ObjectKey, matches: Arc<dyn FileMatches>) { self.files.insert(data_file.as_str().to_string(), matches); }
+    pub fn file(&self, data_file: &rtdb_storage::ObjectKey) -> Option<&Arc<dyn FileMatches>> { self.files.get(data_file.as_str()) }
+    pub fn is_empty(&self) -> bool { self.files.is_empty() }
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn FileMatches>)> { self.files.iter().map(|(key, matches)| (key.as_str(), matches)) }
 }
 
 pub(crate) struct ExecutionConstants<'a>(pub(crate) &'a Execution);

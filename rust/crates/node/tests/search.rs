@@ -442,3 +442,84 @@ async fn a_ranked_limit_over_several_partitions_returns_the_same_rows_as_ranking
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+/// Counts the rows a scan's MATCH took from search files rather than from the row's own value.
+struct Answered { inner: Arc<dyn FileMatches>, count: Arc<std::sync::atomic::AtomicUsize> }
+impl FileMatches for Answered {
+    fn value(&self, page: usize, row: usize) -> Result<Option<bool>> { self.count.fetch_add(1, Ordering::Relaxed); self.inner.value(page, row) }
+}
+struct Answering { inner: Arc<rtdb_search::SearchAccelerator>, answered: Arc<std::sync::atomic::AtomicUsize> }
+#[async_trait]
+impl rtdb_query::ScanAccelerator for Answering {
+    async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<std::collections::BTreeSet<rtdb_types::Iid>>> { self.inner.candidate_iids(request).await }
+    async fn match_answers(&self, request: &rtdb_query::ScanRequest<'_>, column: &str, query: &rtdb_text::Query) -> Result<Option<rtdb_query::MatchAnswers>> {
+        let Some(answers) = self.inner.match_answers(request, column, query).await? else { return Ok(None) };
+        let mut counted = rtdb_query::MatchAnswers::default();
+        for (key, matches) in answers.iter() {
+            counted.insert(&rtdb_storage::ObjectKey::new(key).unwrap(), Arc::new(Answered { inner: Arc::clone(matches), count: Arc::clone(&self.answered) }));
+        }
+        Ok(Some(counted))
+    }
+}
+use rtdb_query::FileMatches;
+
+#[tokio::test]
+async fn not_match_count_and_null_matches_return_what_the_unpushed_predicate_returns() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let answering = Arc::new(Answering { inner: Arc::new(rtdb_search::SearchAccelerator::default()), answered: Default::default() });
+    let services = NodeServices { scan_accelerators: vec![answering.clone()], ..services() };
+    let (node, driver) = Node::open(options, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let words = ["invoice", "overdue", "paid", "book", "late", "red"];
+    let mut seed = 5u64;
+    let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
+    let mut systems = Vec::new();
+    for round in 0..3 {
+        for id in 0..120 {
+            let body: Vec<_> = (0..1 + next() % 4).map(|_| words[next() % words.len()]).collect();
+            let year = 2020 + next() % 3;
+            let statement = match next() % 7 {
+                0 => format!("DELETE FROM docs FOR PORTION OF VALID_TIME FROM TIMESTAMP '{year}-01-01Z' TO TIMESTAMP '{}-01-01Z' WHERE _id = {id}", year + 1),
+                1 => format!("INSERT INTO docs RECORDS {{_id: {id}, body: {}, _valid_from: TIMESTAMP '{year}-01-01Z'}}", next() % 100),
+                2 => format!("INSERT INTO docs RECORDS {{_id: {id}, title: 'untitled', _valid_from: TIMESTAMP '{year}-01-01Z'}}"),
+                _ => format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{}', _valid_from: TIMESTAMP '{year}-01-01Z'}}", body.join(" ")),
+            };
+            let result = session.state_mut().execute_tx(vec![sql(&statement)], AutonomousTxOptions::default()).await.unwrap();
+            if id == 0 { systems.push(result.tx_key().system_time); }
+        }
+        if round < 2 {
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+            database.compaction().unwrap().compact_all().await.unwrap();
+            database.build_artefacts().await.unwrap();
+        }
+    }
+    let all = |rows: Vec<Vec<Value>>| { let mut rows: Vec<String> = rows.into_iter().map(|row| format!("{row:?}")).collect(); rows.sort(); rows };
+    let mut nonempty = 0;
+    for query in ["overdue", "invoice paid", "\"late book\"", "absent"] {
+        for valid in ["2020-06-01Z", "2022-06-01Z"] {
+            for system in [None, Some(systems[1])] {
+                let at = format!("FOR VALID_TIME AS OF TIMESTAMP '{valid}'{}", system.map_or(String::new(), |time| format!(" FOR SYSTEM_TIME AS OF TIMESTAMP '{}'", chrono::DateTime::from_timestamp_micros(time.0).unwrap().to_rfc3339())));
+                for (pushed, unpushed) in [
+                    (format!("SELECT _id FROM docs {at} WHERE NOT MATCH(body, '{query}')"), format!("SELECT _id FROM docs {at} WHERE NOT MATCH(body, '{query}') OR _id < -1")),
+                    (format!("SELECT count(*) FROM docs {at} WHERE MATCH(body, '{query}')"), format!("SELECT count(*) FROM docs {at} WHERE MATCH(body, '{query}') OR _id < -1")),
+                    (format!("SELECT count(*) FROM docs {at} WHERE NOT MATCH(body, '{query}')"), format!("SELECT count(*) FROM docs {at} WHERE NOT MATCH(body, '{query}') OR _id < -1")),
+                    (format!("SELECT _id, title FROM docs {at} WHERE MATCH(body, '{query}') IS NULL"), format!("SELECT _id, title FROM docs {at} WHERE MATCH(body, '{query}') IS NULL OR _id < -1")),
+                ] {
+                    let expected = all(rows(session.query_sql(&unpushed, vec![]).await.unwrap()).await);
+                    assert_eq!(all(rows(session.query_sql(&pushed, vec![]).await.unwrap()).await), expected, "{pushed}");
+                    if expected.len() > 1 { nonempty += 1; }
+                }
+            }
+        }
+    }
+    assert!(nonempty > 10, "the queries find rows to compare");
+    assert!(answering.answered.load(Ordering::Relaxed) > 100, "indexed rows were answered from search files");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

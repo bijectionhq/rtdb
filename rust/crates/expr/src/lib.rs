@@ -33,6 +33,7 @@ pub use compare::{compare, compare_in_timezone, equality_allocation_bound, null_
 pub use ordered::{ordered_compare_in_timezone, validate_order_type};
 pub use evaluate::{CompiledExpr, CorpusLookup, EvalContext, EvaluatedList, IndexedListBatches, ListBatch, ListExpression, ExpressionInvocation, OuterRow, expression_type, evaluate_list_async, evaluate, evaluate_async, evaluate_batch, evaluate_projection, evaluate_projection_async, is_true};
 pub use functions::{function_type, scalar_call, scalar_call_async};
+pub use search::match_value;
 pub use numeric::{arithmetic, arithmetic_in_timezone, integer, number};
 pub use timezone::normalize_timezone;
 pub use decimal::{decimal_text, decimal_long_value, decimal_rescale, decimal_to_f64, parse_decimal, decimal_sum, infer_decimal};
