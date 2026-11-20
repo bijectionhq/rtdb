@@ -30,6 +30,9 @@ pub struct PackIndex {
     /// Every pack its writer knew of when writing this one; set on a block's pack.
     #[serde(default)]
     pub previous: Vec<String>,
+    /// When the pack was written, in milliseconds since the epoch: by it a fork at a past block tells which releases came after the block.
+    #[serde(default)]
+    pub written_at_ms: Option<i64>,
 }
 
 /// How a store finds its packs.
@@ -58,9 +61,9 @@ fn is_catalog(key: &str) -> bool { key.starts_with("blocks/b") && key.ends_with(
 fn packed(key: &str) -> bool { held_back(key) || is_catalog(key) }
 
 /// Encodes a pack: the objects back to back, the index as JSON, and the index's length as eight big-endian bytes.
-pub fn encode_pack(objects: &BTreeMap<String, Bytes>, previous: Vec<String>) -> (Bytes, PackIndex) {
+pub fn encode_pack(objects: &BTreeMap<String, Bytes>, previous: Vec<String>, written_at_ms: i64) -> (Bytes, PackIndex) {
     let mut bytes = BytesMut::new();
-    let mut index = PackIndex { entries: BTreeMap::new(), previous };
+    let mut index = PackIndex { entries: BTreeMap::new(), previous, written_at_ms: Some(written_at_ms) };
     for (key, object) in objects {
         index.entries.insert(key.clone(), PackEntry { offset: bytes.len() as u64, length: object.len() as u64 });
         bytes.extend_from_slice(object);
@@ -147,7 +150,7 @@ impl PackingStore {
             Some(catalog) => (key(&block_pack(catalog.as_str()))?, self.state.lock().packs.iter().map(|pack| pack.as_str().to_owned()).collect()),
             None => (key(&format!("{PACK_DIRECTORY}/p{:020}-{}.pack", rtdb_directory::now_ms(), uuid::Uuid::new_v4().simple()))?, Vec::new()),
         };
-        let (bytes, index) = encode_pack(&held, previous);
+        let (bytes, index) = encode_pack(&held, previous, rtdb_directory::now_ms());
         if let Err(error) = self.inner.put(&name, bytes).await {
             // Another store packed the block first: its pack serves, if it holds the same objects.
             if matches!(error, Error::ConflictingObject(_)) && catalog.is_some() && self.same_pack(&name, &held).await? {

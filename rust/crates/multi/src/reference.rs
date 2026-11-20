@@ -1,79 +1,123 @@
 //! Forks by reference (`ForkByReference`): a fork's store names, in a `~base` manifest, the objects it shares with its parent and where each one physically lives, instead of copying them.
 //!
+//! Everything here works on the cell's bucket, one object store holding every deployment's stores, whose keys are relative to the cell's storage root.
 //! - `ReferencingStore` reads a store's own object first and its referenced one otherwise, and lists both.
 //! - Whatever erases a physical object (the reaper, a deletion) first copies it into every store that still references it, so a reference never dangles.
 //! - A fork releasing an object it only references drops the reference; the object itself is its owner's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_directory::{DeploymentRecord, Lifecycle};
-use rtdb_storage::{Error, IoRegion, LocalStore, ObjectKey, ObjectStore, object_store::StoredObject};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_storage::{Error, ObjectKey, ObjectStore, object_store::StoredObject};
+use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
+/// A cell's object storage: every deployment's stores, by keys relative to the cell's storage root.
+pub type Bucket = Arc<dyn ObjectStore>;
+
+/// Where a store's manifests are: each is written once, under the next sequence number, and the highest is the store's.
 pub const BASE_MANIFEST: &str = "~base";
 
-/// A store's references: for each object it shares, the directory, relative to the cell's storage root, that physically holds it under the same key.
+/// A store's references: for each object it shares, the store, relative to the cell's storage root, that physically holds it under the same key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Base { pub objects: BTreeMap<String, String> }
 
+pub(crate) fn key(name: &str) -> rtdb_storage::Result<ObjectKey> { ObjectKey::new(name.to_owned()).map_err(|error| Error::InvalidKey(error.to_string())) }
+
+fn storage(error: Error) -> Anomaly { error.into() }
+
+/// Whether `key`, within a store, is bookkeeping rather than one of its objects.
+fn bookkeeping(key: &str) -> bool { key == crate::store::ROOT_MARKER || key.starts_with(&format!("{BASE_MANIFEST}/")) || key.ends_with(".tmp") }
+
 impl Base {
-    pub fn load(store: &Path) -> Result<Base> {
-        match std::fs::read(store.join(BASE_MANIFEST)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{}: {error}", store.display()))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Base::default()),
-            Err(error) => Err(io(error)),
+    /// The latest manifest of `store`, or none.
+    pub async fn load(bucket: &dyn ObjectStore, store: &str) -> Result<Base> {
+        Ok(match latest_manifest(bucket, store).await? {
+            Some((_, name)) => serde_json::from_slice(&bucket.get(&key(&name)?).await.map_err(storage)?)
+                .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}")))?,
+            None => Base::default(),
+        })
+    }
+
+    /// Writes this as `store`'s manifest, after its latest, and forgets the earlier ones.
+    pub async fn save(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
+        let previous = latest_manifest(bucket, store).await?;
+        let sequence = previous.as_ref().map_or(0, |(sequence, _)| sequence + 1);
+        bucket.put(&key(&format!("{store}/{BASE_MANIFEST}/{sequence:020}"))?, Bytes::from(serde_json::to_vec(self).expect("a manifest serializes"))).await.map_err(storage)?;
+        for object in bucket.list(Some(&key(&format!("{store}/{BASE_MANIFEST}"))?)).await.map_err(storage)? {
+            if manifest_sequence(object.key.as_str()).is_some_and(|earlier| earlier < sequence) { bucket.delete(&object.key).await.map_err(storage)?; }
         }
+        Ok(())
     }
-    pub fn save(&self, store: &Path) -> Result<()> {
-        std::fs::create_dir_all(store).map_err(io)?;
-        let temporary = store.join(format!("{BASE_MANIFEST}.{}.tmp", uuid::Uuid::new_v4().simple()));
-        std::fs::write(&temporary, serde_json::to_vec(self).expect("a manifest serializes")).map_err(io)?;
-        std::fs::rename(&temporary, store.join(BASE_MANIFEST)).map_err(io)
+}
+
+fn manifest_sequence(name: &str) -> Option<u64> { name.rsplit('/').next()?.parse().ok() }
+
+async fn latest_manifest(bucket: &dyn ObjectStore, store: &str) -> Result<Option<(u64, String)>> {
+    let listed = bucket.list(Some(&key(&format!("{store}/{BASE_MANIFEST}"))?)).await.map_err(storage)?;
+    Ok(listed.into_iter().filter_map(|object| manifest_sequence(object.key.as_str()).map(|sequence| (sequence, object.key.as_str().to_owned()))).max())
+}
+
+/// One store within the cell's bucket: its keys, under `prefix`, seen without it.
+pub struct PrefixedStore { bucket: Bucket, prefix: String }
+
+impl PrefixedStore {
+    pub fn new(bucket: Bucket, prefix: impl Into<String>) -> Self { Self { bucket, prefix: prefix.into() } }
+    fn full(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectKey> { self::key(&format!("{}/{}", self.prefix, key.as_str())) }
+}
+
+#[async_trait]
+impl ObjectStore for PrefixedStore {
+    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head(&self.full(key)?).await?.size }) }
+    async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head_fresh(&self.full(key)?).await?.size }) }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get(&self.full(key)?).await }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.bucket.get_range(&self.full(key)?, range).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.bucket.put(&self.full(key)?, bytes).await }
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.bucket.put_file(&self.full(key)?, source).await }
+    async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
+        let under = match directory { Some(directory) => self.full(directory)?, None => self::key(&self.prefix)? };
+        let strip = format!("{}/", self.prefix);
+        self.bucket.list(Some(&under)).await?.into_iter().filter_map(|object| {
+            let relative = object.key.as_str().strip_prefix(&strip)?.to_owned();
+            Some(self::key(&relative).map(|key| StoredObject { key, size: object.size }))
+        }).collect()
     }
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.bucket.delete(&self.full(key)?).await }
 }
 
 /// A store's own objects and the objects its manifest references, read own-first.
-pub struct ReferencingStore { own: LocalStore, root: PathBuf, base: Base, io: Arc<IoRegion> }
+pub struct ReferencingStore { own: Arc<dyn ObjectStore>, bucket: Bucket, base: Base }
 
 impl ReferencingStore {
-    /// Opens `own`, a store under the cell's `root` whose manifest is `base`.
-    pub fn new(own: LocalStore, root: PathBuf, base: Base, io: Arc<IoRegion>) -> Self { Self { own, root, base, io } }
+    /// Opens `own`, a store in the cell's `bucket` whose manifest is `base`.
+    pub fn new(own: Arc<dyn ObjectStore>, bucket: Bucket, base: Base) -> Self { Self { own, bucket, base } }
 
-    fn referenced(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<LocalStore>> {
-        let Some(directory) = self.base.objects.get(key.as_str()) else { return Ok(None) };
-        Ok(Some(LocalStore::open_in(self.root.join(directory), Arc::clone(&self.io)).map_err(|error| Error::Task(error.to_string()))?))
-    }
-
-    /// The store that holds `key`: this one, or the one it references the object in.
-    async fn locate(&self, key: &ObjectKey) -> rtdb_storage::Result<Located<'_>> {
-        match self.own.head(key).await {
-            Err(Error::MissingObject(_)) => Ok(self.referenced(key)?.map_or(Located::Own(&self.own), Located::Referenced)),
-            _ => Ok(Located::Own(&self.own)),
+    /// Where `key` is read from: this store's own object, or the one its manifest references.
+    async fn locate(&self, key: &ObjectKey) -> rtdb_storage::Result<(Arc<dyn ObjectStore>, ObjectKey)> {
+        if let (Err(Error::MissingObject(_)), Some(store)) = (self.own.head(key).await, self.base.objects.get(key.as_str())) {
+            return Ok((Arc::clone(&self.bucket), self::key(&format!("{store}/{}", key.as_str()))?));
         }
+        Ok((Arc::clone(&self.own), key.clone()))
     }
-}
-
-enum Located<'a> { Own(&'a LocalStore), Referenced(LocalStore) }
-
-impl Located<'_> {
-    fn store(&self) -> &LocalStore { match self { Located::Own(store) => store, Located::Referenced(store) => store } }
 }
 
 #[async_trait]
 impl ObjectStore for ReferencingStore {
-    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.locate(key).await?.store().head(key).await }
-    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.locate(key).await?.store().get(key).await }
-    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.locate(key).await?.store().get_range(key, range).await }
+    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        let (store, located) = self.locate(key).await?;
+        Ok(StoredObject { key: key.clone(), size: store.head(&located).await?.size })
+    }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { let (store, located) = self.locate(key).await?; store.get(&located).await }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { let (store, located) = self.locate(key).await?; store.get_range(&located, range).await }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         // Put-if-absent holds across the references: a shared object is already present.
-        if let (Err(Error::MissingObject(_)), Some(referenced)) = (self.own.head(key).await, self.referenced(key)?) {
-            return if referenced.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) };
+        if let (Err(Error::MissingObject(_)), Some(store)) = (self.own.head(key).await, self.base.objects.get(key.as_str())) {
+            return if self.bucket.get(&self::key(&format!("{store}/{}", key.as_str()))?).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) };
         }
         self.own.put(key, bytes).await
     }
@@ -83,9 +127,9 @@ impl ObjectStore for ReferencingStore {
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         let mut listed: BTreeMap<String, StoredObject> = self.own.list(directory).await?.into_iter()
-            .filter(|object| object.key.as_str() != BASE_MANIFEST).map(|object| (object.key.as_str().to_owned(), object)).collect();
+            .filter(|object| !bookkeeping(object.key.as_str())).map(|object| (object.key.as_str().to_owned(), object)).collect();
         for name in self.base.objects.keys() {
-            let key = ObjectKey::new(name.clone()).map_err(|error| Error::InvalidKey(error.to_string()))?;
+            let key = self::key(name)?;
             if listed.contains_key(name) || directory.is_some_and(|directory| !key.is_under(directory)) { continue; }
             // A reference whose object has since been copied in and erased at its source is listed from the copy.
             if let Ok(object) = self.head(&key).await { listed.insert(name.clone(), object); }
@@ -95,176 +139,177 @@ impl ObjectStore for ReferencingStore {
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.own.delete(key).await }
 }
 
-/// The physical files of one store directory, as keys: everything but its bookkeeping.
-pub fn physical_objects(store: &Path) -> Result<Vec<String>> {
-    fn visit(root: &Path, directory: &Path, found: &mut Vec<String>) -> Result<()> {
-        let Ok(entries) = std::fs::read_dir(directory) else { return Ok(()) };
-        for entry in entries {
-            let entry = entry.map_err(io)?;
-            let path = entry.path();
-            if entry.file_type().map_err(io)?.is_dir() {
-                if entry.file_name() != ".tmp" { visit(root, &path, found)?; }
-                continue;
-            }
-            let key = path.strip_prefix(root).expect("under the root").to_string_lossy().replace('\\', "/");
-            if key == crate::store::ROOT_MARKER || key == BASE_MANIFEST || key.ends_with(".tmp") { continue; }
-            found.push(key);
-        }
-        Ok(())
-    }
-    let mut found = Vec::new();
-    visit(store, store, &mut found)?;
-    Ok(found)
+/// The objects one store holds itself, as keys within it: everything but its bookkeeping.
+pub async fn physical_objects(bucket: &dyn ObjectStore, store: &str) -> Result<Vec<String>> {
+    let strip = format!("{store}/");
+    Ok(bucket.list(Some(&key(store)?)).await.map_err(storage)?.into_iter()
+        .filter_map(|object| object.key.as_str().strip_prefix(&strip).map(str::to_owned))
+        .filter(|key| !bookkeeping(key)).collect())
 }
 
-/// The store directories (one per storage version) under a deployment's prefix.
-pub fn stores(prefix: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(prefix).map(|entries| entries.flatten().filter(|entry| entry.path().is_dir()).map(|entry| entry.path()).collect()).unwrap_or_default()
+/// Whether a store holds `key` itself.
+pub async fn holds(bucket: &dyn ObjectStore, store: &str, name: &str) -> Result<bool> {
+    match bucket.head(&key(&format!("{store}/{name}"))?).await { Ok(_) => Ok(true), Err(Error::MissingObject(_)) => Ok(false), Err(error) => Err(error.into()) }
 }
 
-/// Forks the deployment at `parent` (a prefix under `root`) into `child`, referencing every object the parent's stores hold or reference, or, from a past block, only those that existed when it was written.
-pub fn fork(root: &Path, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
-    let cutoff = at_block.map(|block| written_at(root, parent, block)).transpose()?;
-    // A past block's packs are the ones its own pack names; other objects are told by their write times.
-    let packs = at_block.map(|block| block_packs(root, parent, block)).transpose()?;
-    let existed = |key: &str, path: &Path| match (&packs, key.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY))) {
-        (Some(packs), true) => packs.contains(key),
-        _ => cutoff.is_none_or(|cutoff| std::fs::metadata(path).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified <= cutoff)),
+/// The stores (one per storage version) under a deployment's prefix.
+pub async fn stores(bucket: &dyn ObjectStore, prefix: &str) -> Result<Vec<String>> {
+    let strip = format!("{prefix}/");
+    let versions: BTreeSet<String> = bucket.list(Some(&key(prefix)?)).await.map_err(storage)?.into_iter()
+        .filter_map(|object| object.key.as_str().strip_prefix(&strip).and_then(|rest| rest.split_once('/')).map(|(version, _)| version.to_owned())).collect();
+    Ok(versions.into_iter().map(|version| format!("{prefix}/{version}")).collect())
+}
+
+/// Where `name`, an object of `store`, physically is: in the store, or in the one its manifest names.
+async fn located(bucket: &dyn ObjectStore, store: &str, base: &Base, name: &str) -> Result<Option<String>> {
+    if holds(bucket, store, name).await? { return Ok(Some(format!("{store}/{name}"))); }
+    let Some(owner) = base.objects.get(name) else { return Ok(None) };
+    Ok(holds(bucket, owner, name).await?.then(|| format!("{owner}/{name}")))
+}
+
+/// Forks the deployment at `parent` (a prefix in the cell's bucket) into `child`, referencing every object the parent's stores hold or reference, or, from a past block, those it may need.
+/// A past block's packs are the ones its own pack names, and its releases those before it was written; every other object is referenced too, since sealing makes anything the fork writes again the same bytes.
+pub async fn fork(bucket: &dyn ObjectStore, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
+    let past = match at_block { Some(block) => Some((block_packs(bucket, parent, block).await?, written_at_ms(bucket, parent, block).await?)), None => None };
+    let wanted = |name: &str| match &past {
+        None => true,
+        Some((packs, _)) if name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY)) => packs.contains(name),
+        Some((_, written)) => crate::store::garbage_released_at(name).is_none_or(|released| released <= *written),
     };
-    for store in stores(&root.join(parent)) {
-        let version = store.file_name().expect("a store directory has a name").to_string_lossy().into_owned();
-        let mut base = Base::load(&store)?;
-        base.objects.retain(|key, directory| existed(key, &root.join(directory.as_str()).join(key)));
-        let relative = format!("{parent}/{version}");
-        for key in physical_objects(&store)? { if existed(&key, &store.join(&key)) { base.objects.insert(key, relative.clone()); } }
-        base.save(&root.join(child).join(&version))?;
+    for store in stores(bucket, parent).await? {
+        let version = store.rsplit('/').next().expect("a store has a version").to_owned();
+        let mut base = Base::load(bucket, &store).await?;
+        base.objects.retain(|name, _| wanted(name));
+        for name in physical_objects(bucket, &store).await? { if wanted(&name) { base.objects.insert(name, store.clone()); } }
+        base.save(bucket, &format!("{child}/{version}")).await?;
     }
     Ok(())
 }
 
-/// Where `block`'s pack, the one object a flush of it writes, is in `parent`'s stores.
-fn block_pack_path(root: &Path, parent: &str, block: i64) -> Result<PathBuf> {
+/// Where `block`'s pack, the one object a flush of it writes, is among `parent`'s stores.
+async fn block_pack_location(bucket: &dyn ObjectStore, parent: &str, block: i64) -> Result<String> {
     let pack = crate::packing::block_pack(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block))?);
-    for store in stores(&root.join(parent)) {
-        let location = match Base::load(&store)?.objects.get(&pack) { Some(directory) if !store.join(&pack).exists() => root.join(directory).join(&pack), _ => store.join(&pack) };
-        if location.exists() { return Ok(location); }
+    for store in stores(bucket, parent).await? {
+        let base = Base::load(bucket, &store).await?;
+        if let Some(location) = located(bucket, &store, &base, &pack).await? { return Ok(location); }
     }
     Err(Anomaly::incorrect("rtdb.multi/no-such-block", format!("Block {block} has no pack in the deployment's store")))
 }
 
-/// When `block`'s pack was written in `parent`'s stores.
-pub fn written_at(root: &Path, parent: &str, block: i64) -> Result<std::time::SystemTime> {
-    std::fs::metadata(block_pack_path(root, parent, block)?).and_then(|metadata| metadata.modified()).map_err(io)
+/// When `block`'s pack was written in `parent`'s stores, in milliseconds since the epoch, as its index records.
+pub async fn written_at_ms(bucket: &dyn ObjectStore, parent: &str, block: i64) -> Result<i64> {
+    let location = block_pack_location(bucket, parent, block).await?;
+    let index = crate::packing::read_index(bucket, &key(&location)?).await.map_err(storage)?;
+    index.written_at_ms.ok_or_else(|| Anomaly::incorrect("rtdb.multi/pack-unstamped", format!("Block {block}'s pack records no write time")))
 }
 
 /// The packs that existed when `block` was written: its own, and every one its index names.
-fn block_packs(root: &Path, parent: &str, block: i64) -> Result<std::collections::BTreeSet<String>> {
-    let path = block_pack_path(root, parent, block)?;
-    let index = crate::store::read_pack_index(&path).ok_or_else(|| Anomaly::fault("rtdb.multi/pack-index", format!("{} has no readable index", path.display())))?;
+async fn block_packs(bucket: &dyn ObjectStore, parent: &str, block: i64) -> Result<BTreeSet<String>> {
+    let location = block_pack_location(bucket, parent, block).await?;
+    let index = crate::packing::read_index(bucket, &key(&location)?).await.map_err(storage)?;
     let own = crate::packing::block_pack(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block))?);
     Ok(index.previous.into_iter().chain([own]).collect())
 }
 
-/// Every reference in a cell: for each physical object, the store directories that reference it.
+/// Every reference in a cell: for each physical object, the stores that reference it.
 #[derive(Default)]
-pub struct References { by_object: BTreeMap<PathBuf, BTreeSet<PathBuf>> }
+pub struct References { by_object: BTreeMap<String, BTreeSet<String>> }
 
 impl References {
-    /// The references of every deployment in `records` that is not deleted, under `root`.
-    pub fn scan(root: &Path, records: &[DeploymentRecord]) -> Result<Self> {
+    /// The references of every deployment in `records` that is not deleted.
+    pub async fn scan(bucket: &dyn ObjectStore, records: &[DeploymentRecord]) -> Result<Self> {
         let mut references = Self::default();
         for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) {
-            for store in stores(&root.join(record.storage_prefix())) {
-                for (key, directory) in Base::load(&store)?.objects {
-                    if store.join(&key).exists() { continue; }
-                    references.by_object.entry(root.join(directory).join(&key)).or_default().insert(store.clone());
+            for store in stores(bucket, &record.storage_prefix()).await? {
+                for (name, owner) in Base::load(bucket, &store).await?.objects {
+                    if holds(bucket, &store, &name).await? { continue; }
+                    references.by_object.entry(format!("{owner}/{name}")).or_default().insert(store.clone());
                 }
             }
         }
         Ok(references)
     }
 
-    /// Erases the physical object `path` (stored as `key`), first copying it into every store that still references it.
-    pub fn erase(&self, path: &Path, key: &str) -> Result<()> {
-        for store in self.by_object.get(path).into_iter().flatten() { copy_in(path, &store.join(key))?; }
-        std::fs::remove_file(path).map_err(io)
+    /// Erases `name` from `store`, first copying it into every store that still references it there.
+    pub async fn erase(&self, bucket: &dyn ObjectStore, store: &str, name: &str) -> Result<()> {
+        let physical = format!("{store}/{name}");
+        for referrer in self.by_object.get(&physical).into_iter().flatten() { copy_in(bucket, &physical, bucket, &format!("{referrer}/{name}")).await?; }
+        bucket.delete(&key(&physical)?).await.map_err(storage)
     }
 
-    /// Erases every physical object under a store directory, copying the referenced ones out first.
-    pub fn erase_store(&self, store: &Path) -> Result<()> {
-        for key in physical_objects(store)? { self.erase(&store.join(&key), &key)?; }
+    /// Erases everything a store holds, copying the referenced objects out first.
+    pub async fn erase_store(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
+        for name in physical_objects(bucket, store).await? { self.erase(bucket, store, &name).await?; }
+        for object in bucket.list(Some(&key(store)?)).await.map_err(storage)? { bucket.delete(&object.key).await.map_err(storage)?; }
         Ok(())
     }
 }
 
-fn copy_in(from: &Path, to: &Path) -> Result<()> {
-    if to.exists() { return Ok(()); }
-    std::fs::create_dir_all(to.parent().expect("an object has a directory")).map_err(io)?;
-    let temporary = to.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    std::fs::copy(from, &temporary).map_err(io)?;
-    // A copy keeps its original's write time, by which a fork at a past block tells what existed then.
-    let modified = std::fs::metadata(from).and_then(|metadata| metadata.modified()).map_err(io)?;
-    std::fs::File::options().write(true).open(&temporary).and_then(|file| file.set_modified(modified)).map_err(io)?;
-    std::fs::rename(&temporary, to).map_err(io)
+async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
+    let target = key(to)?;
+    match to_bucket.head(&target).await { Ok(_) => return Ok(()), Err(Error::MissingObject(_)) => {}, Err(error) => return Err(error.into()) }
+    to_bucket.put(&target, from_bucket.get(&key(from)?).await.map_err(storage)?).await.map_err(storage)
 }
 
-/// Copies a deployment's stores from `from` to `to` (prefixes under their cells' roots), resolving every reference into an object of its own.
-pub fn materialize(from_root: &Path, from: &str, to_root: &Path, to: &str) -> Result<()> {
-    for store in stores(&from_root.join(from)) {
-        let version = store.file_name().expect("a store directory has a name").to_owned();
-        let target = to_root.join(to).join(&version);
-        for key in physical_objects(&store)? { copy_in(&store.join(&key), &target.join(&key))?; }
-        for (key, directory) in Base::load(&store)?.objects {
-            let source = from_root.join(directory).join(&key);
-            if source.exists() { copy_in(&source, &target.join(&key))?; }
+/// Copies a deployment's stores from `from` in one cell's bucket to `to` in another's, resolving every reference into an object of its own.
+pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
+    for store in stores(from_bucket, from).await? {
+        let version = store.rsplit('/').next().expect("a store has a version").to_owned();
+        let target = format!("{to}/{version}");
+        for name in physical_objects(from_bucket, &store).await? { copy_in(from_bucket, &format!("{store}/{name}"), to_bucket, &format!("{target}/{name}")).await?; }
+        for (name, owner) in Base::load(from_bucket, &store).await?.objects {
+            if holds(from_bucket, &owner, &name).await? { copy_in(from_bucket, &format!("{owner}/{name}"), to_bucket, &format!("{target}/{name}")).await?; }
         }
-        std::fs::create_dir_all(&target).map_err(io)?;
     }
     Ok(())
 }
-
-fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/references", error.to_string()) }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_fork_moved_to_another_cell_owns_everything_it_referenced() {
-        let (here, there) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let parent = here.path().join("p/v06");
-        std::fs::create_dir_all(parent.join("blocks")).unwrap();
-        std::fs::write(parent.join("blocks/b00"), b"parent").unwrap();
-        std::fs::write(parent.join(crate::store::ROOT_MARKER), b"p").unwrap();
-        fork(here.path(), "p", "c", None).unwrap();
-        std::fs::create_dir_all(here.path().join("c/v06/blocks")).unwrap();
-        std::fs::write(here.path().join("c/v06/blocks/b01"), b"child").unwrap();
-        materialize(here.path(), "c", there.path(), "c").unwrap();
-        let mut moved = physical_objects(&there.path().join("c/v06")).unwrap();
+    fn bucket() -> Bucket { Arc::new(rtdb_storage::MemoryStore::default()) }
+    async fn put(bucket: &Bucket, name: &str, bytes: &[u8]) { bucket.put(&key(name).unwrap(), Bytes::copy_from_slice(bytes)).await.unwrap(); }
+
+    #[tokio::test]
+    async fn a_fork_moved_to_another_cell_owns_everything_it_referenced() {
+        let (here, there) = (bucket(), bucket());
+        put(&here, "p/v06/blocks/b00", b"parent").await;
+        put(&here, &format!("p/v06/{}", crate::store::ROOT_MARKER), b"p").await;
+        fork(here.as_ref(), "p", "c", None).await.unwrap();
+        put(&here, "c/v06/blocks/b01", b"child").await;
+        materialize(here.as_ref(), "c", there.as_ref(), "c").await.unwrap();
+        let mut moved = physical_objects(there.as_ref(), "c/v06").await.unwrap();
         moved.sort();
         assert_eq!(moved, ["blocks/b00", "blocks/b01"]);
-        assert!(!there.path().join("c/v06").join(BASE_MANIFEST).exists(), "the moved store references nothing");
-        assert_eq!(std::fs::read(there.path().join("c/v06/blocks/b00")).unwrap(), b"parent");
+        assert_eq!(Base::load(there.as_ref(), "c/v06").await.unwrap(), Base::default(), "the moved store references nothing");
+        assert_eq!(there.get(&key("c/v06/blocks/b00").unwrap()).await.unwrap().as_ref(), b"parent");
     }
 
-    #[test]
-    fn a_fork_at_a_past_block_takes_the_packs_that_blocks_index_names_whatever_their_write_times() {
-        let root = tempfile::tempdir().unwrap();
-        let store = root.path().join("p/v06");
+    #[tokio::test]
+    async fn a_fork_at_a_past_block_takes_the_packs_that_blocks_index_names_and_the_releases_before_it() {
+        let bucket = bucket();
         let pack = |block: i64| crate::packing::block_pack(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block)).unwrap());
-        std::fs::create_dir_all(store.join(crate::packing::PACK_DIRECTORY)).unwrap();
-        let first = crate::packing::encode_pack(&BTreeMap::from([("blocks/b00.binpb".to_owned(), Bytes::from_static(b"zero"))]), Vec::new()).0;
-        std::fs::write(store.join(pack(0)), &first).unwrap();
-        let second = crate::packing::encode_pack(&BTreeMap::from([("blocks/b01.binpb".to_owned(), Bytes::from_static(b"one"))]), vec![pack(0)]).0;
-        std::fs::write(store.join(pack(1)), &second).unwrap();
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::options().write(true).open(store.join(pack(1))).unwrap().set_modified(long_ago).unwrap();
-        fork(root.path(), "p", "c", Some(0)).unwrap();
-        let base = Base::load(&root.path().join("c/v06")).unwrap();
-        assert_eq!(base.objects.keys().cloned().collect::<Vec<_>>(), [pack(0)], "a later block's pack is left out even when its write time says otherwise");
+        let (first, _) = crate::packing::encode_pack(&BTreeMap::from([("blocks/b00.binpb".to_owned(), Bytes::from_static(b"zero"))]), Vec::new(), 1_000);
+        bucket.put(&key(&format!("p/v06/{}", pack(0))).unwrap(), first).await.unwrap();
+        let (second, _) = crate::packing::encode_pack(&BTreeMap::from([("blocks/b01.binpb".to_owned(), Bytes::from_static(b"one"))]), vec![pack(0)], 2_000);
+        bucket.put(&key(&format!("p/v06/{}", pack(1))).unwrap(), second).await.unwrap();
+        put(&bucket, &format!("p/v06/{}/{:020}-early", crate::store::GARBAGE_DIRECTORY, 500), b"{}").await;
+        put(&bucket, &format!("p/v06/{}/{:020}-late", crate::store::GARBAGE_DIRECTORY, 1_500), b"{}").await;
+        put(&bucket, "p/v06/tables/t/data/l01-compacted.arrow", b"compacted").await;
+        fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
+        let referenced: Vec<String> = Base::load(bucket.as_ref(), "c/v06").await.unwrap().objects.into_keys().collect();
+        assert_eq!(referenced, ["tables/t/data/l01-compacted.arrow".to_owned(), format!("{}/{:020}-early", crate::store::GARBAGE_DIRECTORY, 500), pack(0)],
+            "a later block's pack and a release after the block are left out; everything else is referenced");
+    }
 
-        let copied = root.path().join("copy");
-        copy_in(&store.join(pack(1)), &copied).unwrap();
-        assert_eq!(std::fs::metadata(&copied).unwrap().modified().unwrap(), std::fs::metadata(store.join(pack(1))).unwrap().modified().unwrap(), "a copy keeps its original's write time");
+    #[tokio::test]
+    async fn a_store_keeps_one_manifest_whose_latest_is_read() {
+        let bucket = bucket();
+        Base { objects: BTreeMap::from([("a".into(), "p/v06".into())]) }.save(bucket.as_ref(), "c/v06").await.unwrap();
+        let latest = Base { objects: BTreeMap::from([("b".into(), "p/v06".into())]) };
+        latest.save(bucket.as_ref(), "c/v06").await.unwrap();
+        assert_eq!(Base::load(bucket.as_ref(), "c/v06").await.unwrap(), latest);
+        assert_eq!(bucket.list(Some(&key("c/v06/~base").unwrap())).await.unwrap().len(), 1, "an older manifest is forgotten once a newer one is written");
     }
 }

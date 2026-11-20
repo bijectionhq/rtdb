@@ -10,11 +10,47 @@ use serde::{Deserialize, Serialize};
 pub const LOGKEEPER_LOG_TYPE: &str = "rtdb.multi.LogkeeperLog";
 
 /// Where a cell keeps its deployments' objects.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum CellStorage {
     /// A directory every node of the cell can reach, such as a shared volume.
     Local { root: PathBuf },
+    /// An S3 bucket (or one that speaks its protocol), the cell's objects under its configured prefix.
+    S3 { config: rtdb_s3::S3Config },
+}
+
+/// The key under an S3 configuration's prefix that a cell's objects are kept below.
+const S3_CELL_ROOT: &str = "cell";
+
+impl CellStorage {
+    /// The cell's objects as one store, keyed relative to the cell's storage root.
+    pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
+        match self {
+            CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
+            CellStorage::S3 { config } => {
+                let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT).map_err(rtdb_types::Anomaly::from)?;
+                config.open(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
+            }
+        }
+    }
+
+    /// The storage `spec` names: `s3://BUCKET[/PREFIX]`, with `endpoint`, `region` and `path_style` as query parameters, or a local directory.
+    pub fn parse(spec: &str) -> rtdb_types::Result<Self> {
+        let Some(location) = spec.strip_prefix("s3://") else { return Ok(CellStorage::Local { root: PathBuf::from(spec) }) };
+        let (location, query) = location.split_once('?').unwrap_or((location, ""));
+        let (bucket, prefix) = location.split_once('/').unwrap_or((location, ""));
+        let mut config = rtdb_s3::S3Config::new(bucket);
+        config.prefix = (!prefix.trim_matches('/').is_empty()).then(|| prefix.trim_matches('/').to_owned());
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            match pair.split_once('=') {
+                Some(("endpoint", endpoint)) => config.endpoint = Some(endpoint.to_owned()),
+                Some(("region", region)) => config.region = Some(region.to_owned()),
+                Some(("path_style", on)) => config.path_style_access_enabled = on == "true",
+                _ => return Err(rtdb_types::Anomaly::incorrect("rtdb.multi/storage-spec", format!("Unknown S3 storage parameter {pair}"))),
+            }
+        }
+        Ok(CellStorage::S3 { config })
+    }
 }
 
 /// How a node holds a deployment.
@@ -66,17 +102,13 @@ pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage:
 pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Option<(Vec<String>, Vec<rtdb_directory::MemberId>)>, storage: &CellStorage, role: Role) -> DatabaseConfig {
     let mut log = LogkeeperLogConfig { write_quorum: write_quorum(servers.len()), servers, deployment: record.id.clone(), replica_stream: record.stream("replica"), epoch: record.epoch, log_epoch: record.log_epoch, frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None }, previous_servers: None, ensemble: record.ensemble.iter().map(|id| id.0.clone()).collect() };
     if let Some((previous, ensemble)) = moving { log.previous_servers = Some(previous); log.ensemble = ensemble.into_iter().map(|id| id.0).collect(); }
-    let storage = match storage {
-        CellStorage::Local { root } => {
-            let store = crate::store::CellStoreConfig { root: root.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
-                writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor,
-                snapshot_block: match role { Role::Snapshot(checkpoint) => Some(checkpoint.block), _ => None } };
-            database_config::Storage::RemoteStorage(RemoteStorage {
-                object_store: Some(prost_types::Any { type_url: format!("type.googleapis.com/{}", crate::store::CELL_STORAGE_TYPE), value: serde_json::to_vec(&store).expect("a store configuration serializes") }),
-                epoch: Some(0),
-            })
-        }
-    };
+    let store = crate::store::CellStoreConfig { storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
+        writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor,
+        snapshot_block: match role { Role::Snapshot(checkpoint) => Some(checkpoint.block), _ => None } };
+    let storage = database_config::Storage::RemoteStorage(RemoteStorage {
+        object_store: Some(prost_types::Any { type_url: format!("type.googleapis.com/{}", crate::store::CELL_STORAGE_TYPE), value: serde_json::to_vec(&store).expect("a store configuration serializes") }),
+        epoch: Some(0),
+    });
     DatabaseConfig {
         log: Some(database_config::Log::OtherLog(prost_types::Any {
             type_url: format!("type.googleapis.com/{LOGKEEPER_LOG_TYPE}"),

@@ -25,6 +25,7 @@ rtdb-node.workspace = true
 rtdb-query.workspace = true
 rtdb-pgwire.workspace = true
 rtdb-replication.workspace = true
+rtdb-s3.workspace = true
 rtdb-server.workspace = true
 rtdb-storage.workspace = true
 rtdb-types.workspace = true

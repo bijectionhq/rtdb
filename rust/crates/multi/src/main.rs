@@ -96,7 +96,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 Some(path) => NodeConfiguration::from_yaml(&std::fs::read_to_string(path).map_err(io)?)?,
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
-            let mut agent = AgentOptions::new(CellStorage::Local { root: PathBuf::from(arguments.required("storage-root")?) });
+            let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
             agent.max_tail_rows = arguments.optional("max-tail-rows").map(|count| count.parse()).transpose().map_err(|_| usage("--max-tail-rows must be a number".into()))?;
             agent.max_active = arguments.optional("max-active").map(|count| count.parse()).transpose().map_err(|_| usage("--max-active must be a number".into()))?;
             agent.park_after = arguments.optional("park-after").map(|seconds| seconds.parse().map(Duration::from_secs)).transpose().map_err(|_| usage("--park-after must be a number of seconds".into()))?;
@@ -138,8 +138,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "move-cell" => {
             let map = rtdb_multi::cells::RemoteCellMap::new(arguments.required("cell-map")?);
             let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
-            let from_storage = CellStorage::Local { root: PathBuf::from(arguments.required("from-storage-root")?) };
-            let to_storage = CellStorage::Local { root: PathBuf::from(arguments.required("to-storage-root")?) };
+            let from_storage = CellStorage::parse(arguments.required("from-storage-root")?)?;
+            let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
             let from_keys = rtdb_multi::keys::LocalKeyService::new(arguments.required("from-keys")?)?;
             let to_keys = rtdb_multi::keys::LocalKeyService::new(arguments.required("to-keys")?)?;
             let from = admin::CellHandle { name: arguments.required("from")?, directory: from_directory.as_ref(), storage: &from_storage, keys: &from_keys, maximum_deployments: usize::MAX };
@@ -153,7 +153,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let grace = Duration::from_secs(arguments.number("grace", 3600u64)?);
             // An open snapshot reads objects its deployment may have released since; the reaper's grace has to outlast it.
             if grace <= rtdb_multi::agent::SNAPSHOT_LIFETIME { return Err(usage("--grace must exceed a snapshot's lifetime of 30 minutes".into())); }
-            rtdb_multi::store::run_reaper(directory, PathBuf::from(arguments.required("storage-root")?), grace, Duration::from_secs(10), cancellation).await;
+            rtdb_multi::store::run_reaper(directory, CellStorage::parse(arguments.required("storage-root")?)?, grace, Duration::from_secs(10), cancellation).await;
             Ok(())
         }
         "move" => {
@@ -170,7 +170,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "fork" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let storage = CellStorage::Local { root: PathBuf::from(arguments.required("storage-root")?) };
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
             let (from, name) = (arguments.required("from")?, arguments.required("name")?);
             let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
                 (None, Some(time)) => {
@@ -191,7 +191,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "delete" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let storage = CellStorage::Local { root: PathBuf::from(arguments.required("storage-root")?) };
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
             let deletion = admin::delete_deployment(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), arguments.required("name")?, 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&deletion).expect("a record serializes"));
             Ok(())

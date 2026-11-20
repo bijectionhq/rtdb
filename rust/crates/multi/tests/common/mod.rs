@@ -10,8 +10,8 @@ use rtdb_server::config::NodeConfiguration;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
-async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, index: usize, pool: MemberPool, park_after: Option<Duration>, compaction_workers: bool, watch: Option<Duration>) -> process::RunningNode {
-    let mut agent = AgentOptions::new(CellStorage::Local { root: data.join("objects") });
+async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, storage: &CellStorage, index: usize, pool: MemberPool, park_after: Option<Duration>, compaction_workers: bool, watch: Option<Duration>) -> process::RunningNode {
+    let mut agent = AgentOptions::new(storage.clone());
     if let Some(watch) = watch { agent.watch_interval = watch; }
     agent.park_after = park_after;
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
@@ -37,6 +37,7 @@ pub struct Cell {
     pub gateway: std::net::SocketAddr,
     pub gateway_cancellation: CancellationToken,
     pub data: tempfile::TempDir,
+    pub objects: CellStorage,
 }
 
 impl Cell {
@@ -53,8 +54,14 @@ impl Cell {
     }
 
     pub async fn start_full(pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>) -> Self {
+        Self::start_on(None, pools, park_after, watch, cells).await
+    }
+
+    /// A cell keeping its objects in `objects`, or in a directory of its own.
+    pub async fn start_on(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
+        let objects = objects.unwrap_or_else(|| CellStorage::Local { root: data.path().join("objects") });
         let directory: Arc<dyn Directory> = MemoryDirectory::new();
         let mut logkeepers = Vec::new();
         for index in 0..3 {
@@ -64,13 +71,13 @@ impl Cell {
             }).await.unwrap());
         }
         let mut running = Vec::new();
-        for (index, pool) in pools.into_iter().enumerate() { running.push(Some(start_node(&directory, data.path(), index, pool, park_after, compaction_workers, watch).await)); }
+        for (index, pool) in pools.into_iter().enumerate() { running.push(Some(start_node(&directory, data.path(), &objects, index, pool, park_after, compaction_workers, watch).await)); }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = listener.local_addr().unwrap();
         let gateway_cancellation = CancellationToken::new();
         if let Some((map, cell)) = &cells { map.register_cell(cell, &gateway.to_string()).await.unwrap(); }
         tokio::spawn(gateway::serve(listener, Arc::clone(&directory), gateway::GatewayOptions { cells, touch_interval: Duration::from_millis(200), capabilities: Some(secret()), ..Default::default() }, gateway_cancellation.clone()));
-        Self { directory, nodes: running, logkeepers, gateway, gateway_cancellation, data }
+        Self { directory, nodes: running, logkeepers, gateway, gateway_cancellation, data, objects }
     }
 
     /// Starts one more logkeeper.
@@ -85,7 +92,7 @@ impl Cell {
     /// Starts one more general node, as autoscaling or a replacement would.
     pub async fn add_node(&mut self) -> usize {
         let index = self.nodes.len();
-        self.nodes.push(Some(start_node(&self.directory, self.data.path(), index, MemberPool::General, None, false, None).await));
+        self.nodes.push(Some(start_node(&self.directory, self.data.path(), &self.objects, index, MemberPool::General, None, false, None).await));
         index
     }
 
@@ -98,7 +105,7 @@ impl Cell {
         self.nodes.iter().position(|node| node.as_ref().is_some_and(|node| node.lease.id() == holder))
     }
 
-    pub fn storage(&self) -> CellStorage { CellStorage::Local { root: self.data.path().join("objects") } }
+    pub fn storage(&self) -> CellStorage { self.objects.clone() }
     pub fn keys(&self) -> rtdb_multi::keys::LocalKeyService { rtdb_multi::keys::LocalKeyService::new(self.data.path().join("keys")).unwrap() }
     pub fn node(&self, index: usize) -> &process::RunningNode { self.nodes[index].as_ref().unwrap() }
 

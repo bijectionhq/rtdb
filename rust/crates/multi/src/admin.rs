@@ -145,12 +145,9 @@ pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn K
 /// Only a block younger than the reaper's `grace` can be forked from: an object it needs that the parent released since is erased only once the grace has passed.
 pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: std::time::Duration) -> Result<DeploymentRecord> {
     let source = record(directory, parent).await?;
-    match storage {
-        CellStorage::Local { root } => {
-            let age = crate::reference::written_at(root, &source.storage_prefix(), block)?.elapsed().unwrap_or_default();
-            if age >= grace { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age.as_secs(), grace.as_secs()))); }
-        }
-    }
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let age = now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), block).await?;
+    if age >= grace.as_millis() as i64 { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age / 1000, grace.as_secs()))); }
     fork_from(directory, storage, keys, parent, name, Some(block)).await
 }
 
@@ -160,11 +157,9 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
     let source = record(directory, parent).await?;
     let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
     if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
-    match storage {
-        CellStorage::Local { root } => {
-            let age = crate::reference::written_at(root, &source.storage_prefix(), checkpoint.block)?.elapsed().unwrap_or_default();
-            if age >= grace { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace"))); }
-        }
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    if now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), checkpoint.block).await? >= grace.as_millis() as i64 {
+        return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace")));
     }
     let members = members(directory).await?;
     let servers: Vec<String> = source.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
@@ -186,9 +181,7 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: 
     child.log_epoch = source.log_epoch + 1;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
     child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
-    match storage {
-        CellStorage::Local { root } => crate::reference::fork(root, &source.storage_prefix(), &child.storage_prefix(), at_block)?,
-    }
+    crate::reference::fork(storage.bucket(rtdb_storage::IoRegion::new()).await?.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
     keys.copy(&source.id, &child.id)?;
     if !tail.is_empty() {
         // The tail is written at the first writer epoch, so the fork's first holder claims the next and seals it.
@@ -238,9 +231,8 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     let servers: Vec<String> = fenced.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers: servers.clone(), stream: fenced.stream("replica"), maximum_message_bytes };
     rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
-    match (from.storage, to.storage) {
-        (CellStorage::Local { root: source }, CellStorage::Local { root: target }) => crate::reference::materialize(source, &fenced.storage_prefix(), target, &fenced.storage_prefix())?,
-    }
+    let (source, target) = (from.storage.bucket(rtdb_storage::IoRegion::new()).await?, to.storage.bucket(rtdb_storage::IoRegion::new()).await?);
+    crate::reference::materialize(source.as_ref(), &fenced.storage_prefix(), target.as_ref(), &fenced.storage_prefix()).await?;
     to.keys.install(&fenced.id, from.keys.key(&fenced.id)?)?;
     let mut arrived = fenced.clone();
     arrived.lifecycle = Lifecycle::Live;
@@ -274,17 +266,15 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
     keys.destroy(&fenced.id)?;
     let key_destroyed_at_ms = now_ms();
-    let verified_empty = match storage {
-        CellStorage::Local { root } => {
-            let prefix = root.join(fenced.storage_prefix());
-            // Its forks keep what they share with it: those objects are copied into them before it goes.
-            let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-            let references = crate::reference::References::scan(root, &others)?;
-            for store in crate::reference::stores(&prefix) { references.erase_store(&store)?; }
-            if prefix.exists() { std::fs::remove_dir_all(&prefix).map_err(io)?; }
-            !prefix.exists()
-        }
-    };
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let prefix = fenced.storage_prefix();
+    // Its forks keep what they share with it: those objects are copied into them before it goes.
+    let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
+    let references = crate::reference::References::scan(bucket.as_ref(), &others).await?;
+    for store in crate::reference::stores(bucket.as_ref(), &prefix).await? { references.erase_store(bucket.as_ref(), &store).await?; }
+    let remaining = bucket.list(Some(&rtdb_storage::ObjectKey::new(prefix.clone()).map_err(Anomaly::from)?)).await.map_err(Anomaly::from)?;
+    for object in &remaining { bucket.delete(&object.key).await.map_err(Anomaly::from)?; }
+    let verified_empty = bucket.list(Some(&rtdb_storage::ObjectKey::new(prefix).map_err(Anomaly::from)?)).await.map_err(Anomaly::from)?.is_empty();
     let deletion = DeletionRecord { deployment: fenced.id.clone(), name: name.to_owned(), key_destroyed_at_ms, objects_erased_at_ms: now_ms(), verified_empty };
     update(directory, name, |record| { record.lifecycle = Lifecycle::Deleted; Ok(()) }).await?;
     Ok(deletion)
@@ -453,4 +443,3 @@ pub async fn cell_status(directory: &dyn Directory, target_per_node: usize) -> R
     })
 }
 
-fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/storage-io", error.to_string()) }

@@ -204,8 +204,8 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
 
     let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
     assert_eq!((child.lineage.as_str(), child.parent.as_deref()), (parent.lineage.as_str(), Some(parent.id.as_str())));
-    let rtdb_multi::deployment::CellStorage::Local { root } = cell.storage();
-    let own = |prefix: &str| files_under(&root.join(prefix)).into_iter().filter(|path| !path.ends_with(rtdb_multi::reference::BASE_MANIFEST)).count();
+    let root = cell.data.path().join("objects");
+    let own = |prefix: &str| files_under(&root.join(prefix)).into_iter().filter(|path| !path.components().any(|part| part.as_os_str() == rtdb_multi::reference::BASE_MANIFEST)).count();
     assert_eq!(own(&child.storage_prefix()), 0, "a fork copies nothing: it references its parent's objects");
     let preview = cell.connect("shop-preview").await;
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20"], "the fork starts from its parent's state");
@@ -221,7 +221,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
 
     let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
     assert!(deletion.verified_empty);
-    assert!(!root.join(parent.storage_prefix()).exists(), "the parent's objects are erased");
+    assert!(files_under(&root.join(parent.storage_prefix())).is_empty(), "the parent's objects are erased");
     assert!(own(&child.storage_prefix()) > written, "after the fork's shared objects were copied into it");
     assert!(!cell.data.path().join("keys").join(format!("{}.key", parent.id)).exists(), "its key is destroyed");
     assert_eq!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
@@ -282,7 +282,7 @@ async fn a_small_flush_writes_one_pack_and_its_catalog() {
     for table in ["orders", "items", "users"] { client.simple_query(&format!("INSERT INTO {table} (_id, v) VALUES (1, 1)")).await.unwrap(); }
     drop(client);
     cell.node(0).agent.park("shop").await.unwrap();
-    let rtdb_multi::deployment::CellStorage::Local { root } = cell.storage();
+    let root = cell.data.path().join("objects");
     let objects: Vec<String> = files_under(&root.join(record.storage_prefix())).into_iter().map(|path| path.to_string_lossy().into_owned()).collect();
     assert_eq!(objects.iter().filter(|path| path.contains("/~packs/")).count(), 1, "{objects:#?}");
     assert_eq!(objects.iter().filter(|path| path.contains("/tables/")).count(), 0, "no table file is its own object: {objects:#?}");
@@ -301,7 +301,7 @@ async fn a_compaction_worker_compacts_a_deployment_its_holder_does_not() {
         client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({round}, {round})")).await.unwrap();
         cell.node(0).agent.flush("shop").await.unwrap();
     }
-    let rtdb_multi::deployment::CellStorage::Local { root } = cell.storage();
+    let root = cell.data.path().join("objects");
     let compacted = || files_under(&root.join(record.storage_prefix())).iter().any(|path| { let path = path.to_string_lossy(); path.contains("/data/l") && !path.contains("/data/l00-") });
     for _ in 0..200 {
         if compacted() { break; }
