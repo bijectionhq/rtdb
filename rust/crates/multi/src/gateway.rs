@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, effective_holder, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -62,12 +63,11 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
     let Some(name) = startup.parameters.get("database").or_else(|| startup.parameters.get("user")).cloned() else {
         return refuse(&mut client, "3D000", "The startup message names no database").await;
     };
-    let read_only = startup.read_only();
-    let (mut server, control) = match route(&directory, &name, read_only, &options).await {
+    let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), read_only: startup.read_only(), options: options.clone() });
+    let (server, control, epoch, deployment) = match router.route_with_record().await {
         Ok(route) => route,
         Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
     };
-    server.write_all(&startup.bytes).await.map_err(io)?;
     let touching = control.map(|control| {
         let name = name.clone();
         let interval = options.touch_interval;
@@ -79,16 +79,33 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
             }
         })
     });
-    let spliced = tokio::select! {
+    let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment);
+    let outcome = tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
-        copied = tokio::io::copy_bidirectional(&mut client, &mut server) => copied.map(|_| ()).map_err(io),
+        outcome = session.run(client, server, epoch) => outcome,
     };
     if let Some(touching) = touching { touching.abort(); }
-    spliced
+    outcome
+}
+
+struct GatewayRouter { directory: Arc<dyn Directory>, name: String, read_only: bool, options: GatewayOptions }
+
+impl GatewayRouter {
+    async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
+        route(&self.directory, &self.name, self.read_only, &self.options).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::session::Router for GatewayRouter {
+    async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
+        let (stream, control, epoch, _) = self.route_with_record().await?;
+        Ok((stream, control, epoch))
+    }
 }
 
 /// The open connection to the deployment's holder, and that holder's control address.
-async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>)> {
+async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>, u64, String)> {
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
     match record.lifecycle {
@@ -101,7 +118,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, opti
         for replica in replicas(&record, &members) {
             let Some(control_address) = &replica.control_address else { continue; };
             if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Subscribe { name: name.to_owned() }, options.control_timeout).await {
-                if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()))); }
+                if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
             }
         }
     }
@@ -109,10 +126,10 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, opti
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
         match control::call(control_address, &Request::Activate { name: name.to_owned() }, options.control_timeout).await {
-            Ok(Response::Held { address, .. }) => return Ok((connect(&address).await?, Some(control_address.clone()))),
+            Ok(Response::Held { address, epoch }) => return Ok((connect(&address).await?, Some(control_address.clone()), epoch, record.id.clone())),
             Ok(Response::Redirect { holder, address }) => {
                 let control = members.get(&MemberId(holder)).and_then(|member| member.control_address.clone());
-                return Ok((connect(&address).await?, control));
+                return Ok((connect(&address).await?, control, record.epoch, record.id.clone()));
             }
             Ok(Response::Refused { code, message }) => last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
             Ok(Response::Done | Response::Subscribed { .. }) => {}

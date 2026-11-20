@@ -341,3 +341,28 @@ async fn nothing_a_deployment_stores_is_readable_at_rest() {
     }
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_connection_survives_a_planned_move_and_its_holders_death() {
+    let mut cell = Cell::start(3, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let statement = client.prepare("SELECT total FROM orders WHERE _id = 2").await.unwrap();
+
+    let first = cell.holder("shop").await.unwrap();
+    let target = (first + 1) % 3;
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id()).await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"], "the same connection reads on the new holder");
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    let row = client.query_one(&statement, &[]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 20, "a statement prepared before the move still runs after it");
+
+    let holder = cell.holder("shop").await.unwrap();
+    assert_eq!(holder, target);
+    cell.nodes[holder].take().unwrap().kill().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"], "and survives its holder's death while idle");
+    drop(client);
+    cell.stop().await;
+}
