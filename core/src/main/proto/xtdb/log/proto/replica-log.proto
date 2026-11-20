@@ -16,6 +16,7 @@ message ReplicaLogMessage {
         TriesDeleted tries_deleted = 6;
         OversizedMessage oversized_message = 8;
         ArtefactsAdded artefacts_added = 10;
+        ArtefactsRemoved artefacts_removed = 11;
     }
 
     // The leader term that produced this message, for read-side fencing: followers

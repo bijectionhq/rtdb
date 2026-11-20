@@ -155,6 +155,15 @@ fn a_trie_keeps_the_first_artefact_per_definition_version_and_unknown_tries_take
 }
 
 #[test]
+fn removing_an_artefact_drops_its_record_whatever_its_stats_and_leaves_the_rest() {
+    let key: rtdb_format::keys::TrieKey = "l01-rc-b00".parse().unwrap();
+    let recorded = apply(&[("l01-rc-b00", 30)]).with_artefacts(&table(), [(key.clone(), artefact("body", 1, 1)), (key.clone(), artefact("body", 2, 2))]);
+    let removed = recorded.without_artefacts(&table(), [(key.clone(), artefact("body", 1, 7)), (key.clone(), artefact("title", 1, 1)), ("l01-rc-b07".parse().unwrap(), artefact("body", 2, 2))]);
+    assert_eq!(removed.all_tries(&table())[0].artefacts, vec![artefact("body", 2, 2)]);
+    assert_eq!(removed.without_artefacts(&table(), [(key, artefact("body", 1, 1))]).all_tries(&table()), removed.all_tries(&table()), "removing an absent record changes nothing");
+}
+
+#[test]
 fn artefact_records_survive_the_block_file_roundtrip() {
     let catalog = apply(&[("l01-rc-b00", 30), ("l01-rc-b01", 30)]).with_artefacts(&table(), [("l01-rc-b01".parse().unwrap(), artefact("body", 1, 9))]);
     let block = TableBlock::from_parts(BTreeMap::new(), 0, catalog.partitions(&table()).unwrap()).unwrap();

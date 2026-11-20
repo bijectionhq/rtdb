@@ -269,7 +269,7 @@ async fn a_search_file_a_scan_cannot_read_is_rebuilt_to_its_original_bytes() {
 }
 
 #[tokio::test]
-async fn a_search_file_left_unpublished_is_deleted_once_its_definition_leaves_force() {
+async fn a_dropped_index_leaves_no_search_file_and_no_record_behind() {
     let mut options = options();
     options.file_size_target = 1;
     options.automatic_artefacts = false;
@@ -296,7 +296,10 @@ async fn a_search_file_left_unpublished_is_deleted_once_its_definition_leaves_fo
     assert!(artefacts().await.contains(&stray), "the lane looks again only when the table's definitions change");
     assert!(session.state_mut().execute_tx(vec![sql("DROP SEARCH INDEX docs_body")], AutonomousTxOptions::default()).await.unwrap().committed());
     database.build_artefacts().await.unwrap();
-    assert_eq!(artefacts().await, recorded, "the stray is deleted; the dropped definition's recorded files stay with their tries");
+    assert_eq!(artefacts().await, Vec::new(), "the recorded files and the one left unpublished are deleted");
+    let docs = TableRef::new("public", "docs");
+    assert!(database.trie_catalog().current_tries(&docs).iter().all(|trie| trie.artefacts.is_empty()), "and no trie records them");
+    assert_eq!(ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'note')", vec![]).await.unwrap()).await), (0..10).collect::<Vec<_>>());
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

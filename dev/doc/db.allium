@@ -356,7 +356,7 @@ entity SourceMessage {
     -- A failed clock sample rejects the append before assigning a position or publishing a record.
     log_timestamp: Timestamp
     kind: TxMessage | LegacyTxMessage | FlushBlockMessage | TriesAddedMessage
-         | ArtefactsAddedMessage | AttachDbMessage | DetachDbMessage
+         | ArtefactsAddedMessage | ArtefactsRemovedMessage | AttachDbMessage | DetachDbMessage
 }
 
 variant TxMessage : SourceMessage {
@@ -400,6 +400,15 @@ variant ArtefactsAddedMessage : SourceMessage {
     entries: List<ArtefactEntry>
 }
 
+variant ArtefactsRemovedMessage : SourceMessage {
+    -- Recorded artefacts an artefact lane has retired, such as the search files of a dropped index (fts.allium).
+    -- The lane deletes their files once the removal is applied.
+    storage_version: Integer
+    storage_epoch: Integer
+    table: trie_cat/TableRef
+    entries: List<ArtefactEntry>
+}
+
 value ArtefactEntry {
     trie_key: trie_cat/TrieKey
     record: trie_cat/ArtefactRecord
@@ -435,7 +444,7 @@ entity ReplicaMessage {
 
     kind: ResolvedTxMessage | BlockBoundaryMessage | BlockUploadedMessage
          | TriesAddedMessage | TriesDeletedMessage | NoOpMessage
-         | ArtefactsAddedMessage | OversizedMessage
+         | ArtefactsAddedMessage | ArtefactsRemovedMessage | OversizedMessage
 }
 
 variant ResolvedTxMessage : ReplicaMessage {
@@ -489,6 +498,16 @@ variant TriesAddedMessage : ReplicaMessage {
 
 variant ArtefactsAddedMessage : ReplicaMessage {
     -- Artefacts the leader accepted, forwarded from the source log.
+    -- Staleness and the watchers treat source_msg_id as they do a tries-added's.
+    storage_version: Integer
+    storage_epoch: Integer
+    table: trie_cat/TableRef
+    entries: List<ArtefactEntry>
+    source_msg_id: MessageId
+}
+
+variant ArtefactsRemovedMessage : ReplicaMessage {
+    -- Artefact records the leader forwarded from the source log, to be removed from their tries' entries.
     -- Staleness and the watchers treat source_msg_id as they do a tries-added's.
     storage_version: Integer
     storage_epoch: Integer
@@ -681,6 +700,7 @@ config {
 --   resolved transaction: stale if its tx_id is at or below watchers.latest_tx_id
 --   tries added:          stale if its source position is at or below watchers.latest_source_msg_id
 --   artefacts added:      stale if its source position is at or below watchers.latest_source_msg_id
+--   artefacts removed:    stale if its source position is at or below watchers.latest_source_msg_id
 --   block boundary:       stale if its block index is at or below table_catalog.current_block_index
 --   block uploaded:       stale if its block index is at or below table_catalog.current_block_index
 --   no-op:                stale if it carries a source position at or behind watchers.latest_source_msg_id;
@@ -972,6 +992,25 @@ rule LeaderProcessesArtefactsAdded {
         log_processor.last_resolved_src_msg_id = msg.msg_id
 }
 
+rule LeaderProcessesArtefactsRemoved {
+    -- Removals from an artefact lane, forwarded to the replica log, where every node removes the records from its trie catalog, this one included.
+    -- Removing a record that is absent, or whose trie is gone, changes nothing, so the leader checks only the storage version and epoch, and forwards no entry under another.
+    -- See: replication/src/driver.rs
+    when: SourceArtefactsRemovedMessageReceived(msg)
+    requires: log_processor.mode = Leader
+
+    ensures:
+        AppendReplicaMessage(ArtefactsRemovedMessage.created(
+            storage_version: msg.storage_version,
+            storage_epoch: msg.storage_epoch,
+            table: msg.table,
+            entries: if storage_matches(msg): msg.entries else: [],
+            source_msg_id: msg.msg_id
+        ))
+
+        log_processor.last_resolved_src_msg_id = msg.msg_id
+}
+
 -- The trie GC's publish step is a THIRD resolve-side source, alongside the source log and the external source: the GC hands the removal to the leader and awaits it rather than appending itself.
 -- gc.allium owns that rule, including the ordering the append and the removal it publishes have to keep.
 -- Two facts belong here, being properties of this pipeline rather than of the GC:
@@ -1167,6 +1206,19 @@ rule LeaderAppliesOwnArtefactsAdded {
         watchers.notifyMsg(record.source_msg_id)
 }
 
+rule LeaderAppliesOwnArtefactsRemoved {
+    -- The leader reads its own forwarded artefacts-removed back and removes the records from its trie catalog, under the same storage guard every node applies.
+    when: ApplyOwnRecord(record)
+    requires: record.kind = ArtefactsRemovedMessage
+
+    ensures:
+        if record.storage_version = storage_format.storage_version
+           and record.storage_epoch = storage_format.storage_epoch:
+            trie_cat/trie_catalog.withoutArtefacts(record.table, record.entries)
+
+        watchers.notifyMsg(record.source_msg_id)
+}
+
 rule LeaderAppliesOwnNoOp {
     -- Nothing to apply but the durable watermark, which is exactly what makes it lag resolution — and only where the no-op carries one, a term claim having none.
     when: ApplyOwnRecord(record)
@@ -1339,6 +1391,15 @@ rule HandleReplicaMessage {
             if msg.storage_version = storage_format.storage_version
                and msg.storage_epoch = storage_format.storage_epoch:
                 trie_cat/trie_catalog.withArtefacts(msg.table, msg.entries)
+            watchers.notifyMsg(msg.source_msg_id)
+
+        if msg.kind = ArtefactsRemovedMessage:
+            if msg.storage_version = storage_format.storage_version
+               and msg.storage_epoch = storage_format.storage_epoch:
+                trie_cat/trie_catalog.withoutArtefacts(msg.table, msg.entries)
+                -- The lane deletes the objects from the store; each node drops its own cached copies.
+                for entry in msg.entries:
+                    NodeCacheInvalidate(trie_cat/artefact_key(msg.table, entry.trie_key, entry.record.kind, entry.record.definition_id, entry.record.definition_version))
             watchers.notifyMsg(msg.source_msg_id)
 
         if msg.kind = TriesDeletedMessage:
@@ -1703,3 +1764,4 @@ open question "What processing obligations apply to a database opened with index
 --   accepted_artefacts(msg)  — the entries whose trie the leader's durable catalog holds live, under the leader's storage version and epoch
 --   storage_matches(msg)     — whether the message's storage version and epoch are the leader's
 --   ObjectStoreDelete(key)   — as in gc.allium
+--   NodeCacheInvalidate(key) — drop this node's cached copies of the object, leaving the store's untouched (storage/src/cache.rs: BufferPool::invalidate)

@@ -104,7 +104,7 @@ rule DefineSearchIndex {
 }
 
 rule DropSearchIndex {
-    -- DROP SEARCH INDEX deletes the document; the dropped definition's search files stay on their tries' entries and go with those tries.
+    -- DROP SEARCH INDEX deletes the document; the lane then retires the dropped definition's search files (RetireSearchFiles).
     when: SearchIndexDropped(name)
 
     ensures:
@@ -131,16 +131,22 @@ rule SearchJobRuns {
         db/ArtefactsAdded(table: job.table, trie_key: job.trie_key, record: search_record(job)) appended to database.source_log
 }
 
-rule SweepStraySearchFiles {
-    -- A builder that uploads a search file and fails before appending ArtefactsAdded leaves an object no record names.
-    -- While its definition is in force, the job stays available, and the next builder to run it writes the same bytes under the same key and records them.
-    -- Once the definition leaves force, no job will, so the lane deletes it: an unrecorded object of kind `search` under a live trie, for a definition neither in force nor made after the snapshot's basis.
-    -- The lane looks at every table when it starts, at a table whenever its definitions in force change, and again at a table whose last look failed.
+rule RetireSearchFiles {
+    -- A search file is retired once its definition leaves force: dropped, redefined, or superseded by a new analyzer or format version.
+    -- A retired definition is one neither in force nor made after the snapshot's basis, so a definition newer than the snapshot is never retired.
+    -- The lane appends ArtefactsRemoved for the retired records on the table's live tries, and once it is applied deletes their objects.
+    -- It deletes as well every unrecorded object of kind `search` under a live trie for a retired definition: one a builder uploaded and failed to record.
+    -- While a definition is in force, such an object needs no sweep: its job stays available, and the next builder writes the same bytes under the same key and records them.
+    -- The lane looks at every table when it starts, at a table whenever its definitions in force change, and again at a table whose last look, or one of whose jobs, failed; it looks only while no job of its own is running.
     -- An object under a trie that is not live is gc.allium's, deleted with the trie.
+    -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.
+    -- A builder on another node may still record an object a retiring lane deleted; its own lane retires that record at its next look.
+    -- While nodes run different analyzer or format versions, a newer node retires an older version's files and an older node builds them again; the churn ends with the upgrade.
     when: DefinitionsInForceChanged(table)
 
     ensures:
-        StraySearchFilesDeleted(table)
+        db/ArtefactsRemoved(table: table, entries: retired_records(table)) appended to database.source_log
+        RetiredSearchFilesDeleted(table)
 }
 
 rule RepairUnreadableSearchFile {
@@ -302,7 +308,8 @@ surface FullTextSearch {
 --   search_candidates(scan, predicate)  — steps 1–4 of the query plan
 --   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the trie's artefact key
 --   EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate) — MatchEvaluatedByTheScan's evaluation, in the scan, before its filter
---   StraySearchFilesDeleted(table)      — list the table's artefact objects and delete those SweepStraySearchFiles names (maintenance/src/artefact.rs: stray_artefacts)
+--   retired_records(table)               — the records RetireSearchFiles retires (maintenance/src/artefact.rs: retired_artefacts)
+--   RetiredSearchFilesDeleted(table)     — delete the retired records' objects, and list the table's artefact objects to delete the unrecorded ones RetireSearchFiles names (stray_artefacts)
 
 ------------------------------------------------------------
 -- Open Questions

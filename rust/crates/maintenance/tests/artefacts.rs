@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rtdb_format::log::proto::{ArtefactRecord, ArtefactsAdded};
+use rtdb_format::log::proto::{ArtefactRecord, ArtefactsAdded, ArtefactsRemoved};
 use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog, TrieState};
 use rtdb_format::keys::TableSlug;
-use rtdb_maintenance::{ArtefactBuilder, ArtefactDefinition, ArtefactDriver, ArtefactJob, ArtefactPublisher, SnapshotSource, available_artefact_jobs, stray_artefacts};
+use rtdb_maintenance::{ArtefactBuilder, ArtefactDefinition, ArtefactDriver, ArtefactJob, ArtefactPublisher, SnapshotSource, available_artefact_jobs, retired_artefacts, stray_artefacts};
 use rtdb_storage::ObjectKey;
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Result, SourcePosition, StorageEpoch, StorageVersion, TableRef, Timestamp};
@@ -53,6 +53,11 @@ impl ArtefactPublisher for Applying {
         self.0.add_artefacts(&table, message.entries.into_iter().map(|entry| (entry.trie_key.unwrap().parse().unwrap(), entry.record.unwrap())).collect());
         Ok(SourcePosition(1))
     }
+    async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> {
+        let table = rtdb_format::catalog::legacy_table_ref(message.table_name.as_deref().unwrap()).unwrap();
+        self.0.remove_artefacts(&table, message.entries.into_iter().map(|entry| (entry.trie_key.unwrap().parse().unwrap(), entry.record.unwrap())).collect());
+        Ok(SourcePosition(2))
+    }
 }
 
 #[tokio::test]
@@ -89,6 +94,18 @@ fn a_stray_is_an_unrecorded_object_of_a_settled_definition_no_longer_in_force_un
         object("l02-rc-p1-b00", "search", "body~a1f1", 1),
         ObjectKey::new("tables/public$docs/artefacts/l02-rc-p1-b00/search/scratch.tmp").unwrap(),
     ];
-    let strays = stray_artefacts(&catalog, &table(), &slug, "search", &[in_force], 8, &listed);
+    let strays = stray_artefacts(&catalog, &table(), &slug, "search", &[in_force.clone()], 8, &listed);
     assert_eq!(strays, [listed[2].clone(), listed[6].clone()], "recorded, in force, newer than the basis, of another kind, under a superseded trie, or not an artefact key: kept");
+}
+
+#[test]
+fn a_retired_record_is_one_of_the_kind_on_a_live_trie_whose_settled_definition_left_force() {
+    let live: rtdb_format::keys::TrieKey = "l02-rc-p0-b00".parse().unwrap();
+    let with = |id: &str, version: i64| ArtefactRecord { definition_version: Some(version), ..record(id) };
+    let other = ArtefactRecord { kind: Some("other".into()), ..record("gone") };
+    let catalog = catalog().with_artefacts(&table(), [(live.clone(), with("body", 1)), (live.clone(), with("title", 5)), (live.clone(), with("title", 9)), (live.clone(), other),
+        ("l01-rc-b00".parse().unwrap(), with("body", 1))]);
+    let in_force = ArtefactDefinition { version: 5, ..definition("title") };
+    let retired = retired_artefacts(&catalog, &table(), "search", &[in_force], 8);
+    assert_eq!(retired, [(live, with("body", 1))], "in force, newer than the basis, of another kind, or on a superseded trie: kept");
 }

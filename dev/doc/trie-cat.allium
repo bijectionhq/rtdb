@@ -146,6 +146,7 @@ entity TrieCatalog {
     --   Used by read-only followers after a new block appears.
     -- deleteTries(tries): remove garbage entries from the catalog after file deletion.
     -- withArtefacts(table, entries): record artefacts on their tries' entries (rule AddArtefact).
+    -- withoutArtefacts(table, entries): remove artefact records from their tries' entries (rule RemoveArtefact).
     -- holds(table, trie_key): whether any shard of the table holds the trie, as live, nascent or garbage.
     -- artefacts(table, trie_key): the artefact records on the trie's entry.
     -- artefact_prefix(table, trie_key): tables/<slug>/artefacts/<trie_key>, under which every artefact of the trie lives.
@@ -404,6 +405,15 @@ rule AddArtefact {
 
     ensures:
         trie_catalog.artefacts(table, trie_key) = trie_catalog.artefacts(table, trie_key) + [record]
+}
+
+rule RemoveArtefact {
+    -- Removes an artefact's record from its trie's entry, on applying an artefacts-removed record (db.allium: LeaderAppliesOwnArtefactsRemoved, HandleReplicaMessage).
+    -- A record matches on kind, definition id and definition version; with none matching, or no such trie, nothing changes.
+    when: RemoveArtefact(table, trie_key, record)
+
+    ensures:
+        trie_catalog.artefacts(table, trie_key) = trie_catalog.artefacts(table, trie_key).filter(r => not (r.kind = record.kind and r.definition_id = record.definition_id and r.definition_version = record.definition_version))
 }
 
 ------------------------------------------------------------

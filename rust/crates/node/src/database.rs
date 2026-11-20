@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{database::proto::DatabaseConfig, keys::TrieKey, log::proto::{ArtefactsAdded, TriesAdded}};
+use rtdb_format::{database::proto::DatabaseConfig, keys::TrieKey, log::proto::{ArtefactsAdded, ArtefactsRemoved, TriesAdded}};
 use rtdb_index::PartitionState;
 use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionHandle, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
@@ -217,6 +217,7 @@ struct PublishArtefacts { replication: ReplicationHandle, cancellation: Cancella
 #[async_trait]
 impl ArtefactPublisher for PublishArtefacts {
     async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> { self.replication.publish_artefacts(message, &self.cancellation).await }
+    async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> { self.replication.remove_artefacts(message, &self.cancellation).await }
 }
 struct PublishDeletions(TermHandle);
 #[async_trait]

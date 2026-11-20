@@ -16,15 +16,16 @@ It does not know what a search index is.
 | Artefact records on `TrieDetails` (`format`, `index`)
 | A record per search file: kind `search`, the index definition's id and version, and opaque statistics.
 
-| `ArtefactsAdded` source and replica messages (`replication`)
+| `ArtefactsAdded` and `ArtefactsRemoved` source and replica messages (`replication`)
 | The index lane publishes a built search file; the leader accepts it while its trie is live and every node records it.
+  The lane publishes the removal of a retired one's record, and every node removes it.
 
 | Artefact deletion in trie GC (`maintenance`)
 | A garbage trie's artefacts are deleted, by listing its artefact prefix, before its data and meta files.
 
 | The artefact lane (`maintenance`)
 | A deterministic job per (live trie, definition) lacking an artefact, run like compaction jobs.
-  The lane also deletes its kind's unrecorded objects for definitions no longer in force, which a builder that failed before publishing left behind.
+  Once a definition leaves force, the lane retires its artefacts: it publishes `ArtefactsRemoved` for their records, then deletes their objects, unrecorded ones included.
 
 | The scan accelerator (`query`)
 | Before a scan opens, an accelerator may narrow `Scan.iids` to a candidate superset; the scan's resolution and `PageFilter` decide the result.

@@ -227,6 +227,17 @@ impl TrieCatalog {
         }
         next
     }
+    /// A record matches an entry on kind, definition id and definition version alone.
+    pub fn without_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
+        let mut next = self.clone();
+        if let Some(state) = next.tables.get_mut(table) {
+            for (key, record) in entries {
+                let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
+                trie.artefacts.retain(|held| (held.kind(), held.definition_id(), held.definition_version()) != (record.kind(), record.definition_id(), record.definition_version()));
+            }
+        }
+        next
+    }
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<Self> {
         let mut next = self.clone();
         for (table, tries) in replacements {

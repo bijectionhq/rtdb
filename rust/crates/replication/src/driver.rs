@@ -106,6 +106,12 @@ impl ReplicationHandle {
         self.await_source(position, cancellation).await?;
         Ok(position)
     }
+    /// Returns once this node has applied the removal.
+    pub async fn remove_artefacts(&self, message: proto::ArtefactsRemoved, cancellation: &CancellationToken) -> Result<SourcePosition> {
+        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(message)), (self.clock)()).await?;
+        self.await_source(position, cancellation).await?;
+        Ok(position)
+    }
 }
 #[derive(Clone)]
 pub struct TermHandle { handle: ReplicationHandle, term: Term }
@@ -799,7 +805,21 @@ impl ReplicationDriver {
                 }
                 ReplicaBody::ArtefactsAdded(message) => {
                     if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
-                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) { self.partition.add_artefacts(&table, artefact_entries(message)); }
+                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) { self.partition.add_artefacts(&table, artefact_entries(&message.entries)); }
+                    }
+                    self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
+                    self.complete_control(&record);
+                }
+                ReplicaBody::ArtefactsRemoved(message) => {
+                    if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
+                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) {
+                            let entries = artefact_entries(&message.entries);
+                            let slug = self.partition.value().table_catalog().entry(&table).map(|entry| entry.slug.clone());
+                            self.partition.remove_artefacts(&table, entries.clone());
+                            // The lane deletes the objects from the store next; this node's cached copies are its own to drop.
+                            let keys = slug.iter().flat_map(|slug| entries.iter().filter_map(move |(trie, record)| slug.artefact_key(trie, record.kind(), record.definition_id(), record.definition_version()).ok()));
+                            for key in keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<Vec<_>>() { let _ = self.resolve.storage.invalidate(&key).await; }
+                        }
                     }
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
@@ -849,6 +869,7 @@ impl ReplicationDriver {
             ReplicaBody::ResolvedTx(message) => message.tx_id.unwrap_or_default() <= progress.tx_id().0,
             ReplicaBody::TriesAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
             ReplicaBody::ArtefactsAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
+            ReplicaBody::ArtefactsRemoved(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
             ReplicaBody::BlockBoundary(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::BlockUploaded(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::NoOp(message) => message.src_msg_id.is_some_and(|source| source <= progress.source_position.0),
@@ -995,6 +1016,13 @@ impl ReplicationDriver {
                 }
                 None
             }
+            Some(SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(mut message))) => {
+                if message.storage_version != Some(self.logs.storage_version.0) || message.storage_epoch.unwrap_or_default() != self.logs.storage_epoch.0 { message.entries.clear(); }
+                message.source_msg_id = Some(position.0);
+                leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsRemoved(message)), block, None, &self.resolve.memory)?;
+                leader.resolver_mut()?.advance_source(position)?;
+                None
+            }
             Some(SourceMessage::Protobuf(SourceBody::FlushBlock(message))) => {
                 let expected = self.partition.value().table_catalog().block_index().map_or(-1, |index| index.0);
                 leader.resolver_mut()?.advance_source(position)?;
@@ -1111,8 +1139,8 @@ fn cached_objects(value: &rtdb_index::PartitionValue, table: &TableRef, keys: &B
     }).filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect()
 }
 
-fn artefact_entries(message: &proto::ArtefactsAdded) -> Vec<(TrieKey, proto::ArtefactRecord)> {
-    message.entries.iter().filter_map(|entry| Some((entry.trie_key.as_deref()?.parse().ok()?, entry.record.clone()?))).collect()
+fn artefact_entries(entries: &[proto::ArtefactEntry]) -> Vec<(TrieKey, proto::ArtefactRecord)> {
+    entries.iter().filter_map(|entry| Some((entry.trie_key.as_deref()?.parse().ok()?, entry.record.clone()?))).collect()
 }
 
 fn check_db_op(effects: &dyn DatabaseEffects, resolver: &TxResolver, operation: &DbOp) -> Result<()> {

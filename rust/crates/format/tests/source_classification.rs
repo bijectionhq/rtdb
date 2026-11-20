@@ -10,6 +10,7 @@ fn borrowed_transaction_classification_preserves_source_oneof_and_legacy_headers
         (SourceMessage::Protobuf(SourceBody::AttachDatabase(proto::AttachDatabase::default())), false),
         (SourceMessage::Protobuf(SourceBody::DetachDatabase(proto::DetachDatabase::default())), false),
         (SourceMessage::Protobuf(SourceBody::ArtefactsAdded(proto::ArtefactsAdded::default())), false),
+        (SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(proto::ArtefactsRemoved::default())), false),
     ] {
         assert_eq!(SourceMessage::is_transaction_encoded(&message.encode().unwrap()).unwrap(), transaction);
     }

@@ -482,6 +482,12 @@ async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_ent
     assert_eq!(trie.artefacts, vec![record("body")]);
     assert!(store.head(&file(&live, "body")).await.is_ok());
     assert!(store.head(&file(&live, "title")).await.is_ok(), "an entry under another storage version is dropped, and the key this node would compute for it left alone");
+    let removal = |version: i32| proto::ArtefactsRemoved { storage_version: Some(version), storage_epoch: Some(0), table_name: Some(table.schema_and_table()),
+        entries: vec![entry(&live, "body")], source_msg_id: None };
+    handle.remove_artefacts(removal(CURRENT_STORAGE_VERSION.0 + 1), &CancellationToken::new()).await.unwrap();
+    assert_eq!(partition.value().trie_catalog().iter_tries(&table).find(|trie| trie.key == live).unwrap().artefacts, vec![record("body")], "a removal under another storage version removes nothing");
+    handle.remove_artefacts(removal(CURRENT_STORAGE_VERSION.0), &CancellationToken::new()).await.unwrap();
+    assert!(partition.value().trie_catalog().iter_tries(&table).find(|trie| trie.key == live).unwrap().artefacts.is_empty());
     handle.shutdown();
     writer.await.unwrap().unwrap();
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use rtdb_format::{keys::{TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactsAdded}};
+use rtdb_format::{keys::{TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactsAdded, ArtefactsRemoved}};
 use rtdb_index::{PartitionValue, TrieCatalog, TrieState};
 use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, SourcePosition, StorageEpoch, StorageVersion, TableRef};
@@ -52,6 +52,8 @@ pub trait ArtefactKind: Send + Sync {
 pub trait ArtefactPublisher: Send + Sync {
     /// Completes after the source record is durably appended and admitted processing has applied it.
     async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition>;
+    /// Completes after the removal is durably appended and admitted processing has applied it.
+    async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition>;
 }
 
 /// Live tries above level 0 that lack an artefact for a definition, current side first, then higher levels first.
@@ -67,13 +69,23 @@ pub fn available_artefact_jobs(catalog: &TrieCatalog, definitions: &[ArtefactDef
     jobs
 }
 
-/// Objects of `kind` under the table's artefacts that no record names and no job will publish: under a live trie, for a definition neither in force nor newer than the snapshot's basis.
-/// A builder uploaded each and failed before publishing it; one under a trie that is not live is left to the collector.
+/// A definition version no job will build again: neither in force, nor newer than the snapshot's basis and so perhaps in force beyond it.
+fn retired(definitions: &[ArtefactDefinition], table: &TableRef, kind: &str, id: &str, version: i64, basis: i64) -> bool {
+    version <= basis && !definitions.iter().any(|definition| &definition.table == table && definition.kind == kind && definition.id == id && definition.version == version)
+}
+
+/// A trie that is not live is left to the collector.
+pub fn retired_artefacts(catalog: &TrieCatalog, table: &TableRef, kind: &str, definitions: &[ArtefactDefinition], basis: i64) -> Vec<(TrieKey, ArtefactRecord)> {
+    catalog.iter_tries(table).filter(|trie| trie.state == TrieState::Live).flat_map(|trie| trie.artefacts.iter()
+        .filter(|record| record.kind() == kind && retired(definitions, table, kind, record.definition_id(), record.definition_version(), basis))
+        .map(|record| (trie.key.clone(), record.clone()))).collect()
+}
+
+/// Objects of `kind` under the table's live tries that no record names, for a retired definition: a builder uploaded each and failed before publishing it.
 pub fn stray_artefacts<'a>(catalog: &TrieCatalog, table: &TableRef, slug: &TableSlug, kind: &str, definitions: &[ArtefactDefinition], basis: i64, listed: impl IntoIterator<Item = &'a ObjectKey>) -> Vec<ObjectKey> {
     listed.into_iter().filter(|object| {
         let Some((trie, found, id, version)) = slug.parse_artefact_key(object.as_str()) else { return false };
-        found == kind && version <= basis
-            && !definitions.iter().any(|definition| &definition.table == table && definition.kind == kind && definition.id == id && definition.version == version)
+        found == kind && retired(definitions, table, kind, &id, version, basis)
             && catalog.iter_tries(table).any(|candidate| candidate.key == trie && candidate.state == TrieState::Live && candidate.artefact(kind, &id, version).is_none())
     }).cloned().collect()
 }
@@ -102,28 +114,38 @@ pub struct ArtefactDriver {
     automatic: bool,
     signals: mpsc::Receiver<()>,
     requests: mpsc::Receiver<Completion>,
-    strays: StraySweep,
+    retirement: Retirement,
 }
 
-/// Where the lane looks for its kind's stray objects, the definitions in force per table when it last looked (`None` until its first look, which covers every table), and the tables to look at again: their last sweep, or a job of theirs, failed.
-struct StraySweep { kind: String, store: Arc<dyn ObjectStore>, swept: Option<BTreeMap<TableRef, BTreeSet<(String, i64)>>>, failed: BTreeSet<TableRef> }
+/// How the lane retires its kind's artefacts; `looked` is `None` until its first look, which covers every table.
+struct Retirement { kind: String, store: Arc<dyn ObjectStore>, publisher: Arc<dyn ArtefactPublisher>, storage: (StorageVersion, StorageEpoch), looked: Option<BTreeMap<TableRef, BTreeSet<(String, i64)>>>, again: BTreeSet<TableRef> }
 
-impl StraySweep {
-    /// Deletes the stray objects of every table whose definitions changed since the last sweep or that is to be looked at again, or of every table on the first.
-    async fn sweep(&mut self, snapshot: &PartitionValue, definitions: &[ArtefactDefinition]) {
+impl Retirement {
+    /// Retires the artefacts of every table whose definitions changed since the last look or that is to be looked at again, or of every table on the first look.
+    async fn retire(&mut self, snapshot: &PartitionValue, definitions: &[ArtefactDefinition]) {
         let mut current: BTreeMap<TableRef, BTreeSet<(String, i64)>> = BTreeMap::new();
         for definition in definitions { current.entry(definition.table.clone()).or_default().insert((definition.id.clone(), definition.version)); }
         let snapshot = snapshot.snapshot();
-        let tables: BTreeSet<TableRef> = match &self.swept {
+        let tables: BTreeSet<TableRef> = match &self.looked {
             None => snapshot.tables(),
-            Some(swept) => swept.keys().chain(current.keys()).filter(|table| swept.get(*table) != current.get(*table)).chain(&self.failed).cloned().collect(),
+            Some(looked) => looked.keys().chain(current.keys()).filter(|table| looked.get(*table) != current.get(*table)).chain(&self.again).cloned().collect(),
         };
-        self.failed.clear();
+        self.again.clear();
         let basis = snapshot.tx_basis().map_or(i64::MIN, |basis| basis.tx_id.0);
-        let mut swept = self.swept.take().unwrap_or_default();
+        let mut looked = self.looked.take().unwrap_or_default();
         for table in tables {
             let Some(entry) = snapshot.table_entry(&table) else { continue };
             let outcome: Result<()> = async {
+                let records = retired_artefacts(snapshot.trie_catalog(), &table, &self.kind, definitions, basis);
+                if !records.is_empty() {
+                    let keys = records.iter().map(|(trie, record)| entry.slug.artefact_key(trie, record.kind(), record.definition_id(), record.definition_version()).map_err(crate::invalid).and_then(|key| ObjectKey::new(key).map_err(crate::invalid))).collect::<Result<Vec<_>>>()?;
+                    self.publisher.remove(ArtefactsRemoved {
+                        storage_version: Some(self.storage.0.0), storage_epoch: Some(self.storage.1.0), table_name: Some(table.schema_and_table()),
+                        entries: records.into_iter().map(|(trie, record)| ArtefactEntry { trie_key: Some(trie.to_string()), record: Some(record) }).collect(), source_msg_id: None,
+                    }).await?;
+                    // A reader still holding a snapshot that records one treats its missing object as absent.
+                    for key in keys { self.store.delete(&key).await.map_err(crate::invalid)?; }
+                }
                 let prefix = ObjectKey::new(entry.slug.artefacts_prefix()).map_err(crate::invalid)?;
                 let listed = self.store.list(Some(&prefix)).await.map_err(crate::invalid)?;
                 for key in stray_artefacts(snapshot.trie_catalog(), &table, &entry.slug, &self.kind, definitions, basis, listed.iter().map(|object| &object.key)) {
@@ -131,22 +153,22 @@ impl StraySweep {
                 }
                 Ok(())
             }.await;
-            if outcome.is_err() { self.failed.insert(table.clone()); }
-            match current.get(&table) { Some(definitions) => { swept.insert(table, definitions.clone()); } None => { swept.remove(&table); } }
+            if outcome.is_err() { self.again.insert(table.clone()); }
+            match current.get(&table) { Some(definitions) => { looked.insert(table, definitions.clone()); } None => { looked.remove(&table); } }
         }
-        self.swept = Some(swept);
+        self.looked = Some(looked);
     }
 }
 
 impl ArtefactDriver {
-    /// `kind` names the builder's artefacts under `store`, where the lane deletes the ones a failed builder left unpublished.
+    /// `kind` names the builder's artefacts under `store`, where the lane deletes those whose definitions are retired.
     pub fn new(snapshots: Arc<dyn SnapshotSource>, builder: Arc<dyn ArtefactBuilder>, publisher: Arc<dyn ArtefactPublisher>, storage: (StorageVersion, StorageEpoch),
         kind: &str, store: Arc<dyn ObjectStore>, parallelism: usize, request_capacity: usize, automatic: bool) -> Result<(Self, ArtefactHandle)> {
         if parallelism == 0 || request_capacity == 0 { return Err(crate::invalid("Artefact lane concurrency and request capacity must be positive")); }
         let (signals, signal_receiver) = mpsc::channel(1);
         let (requests, request_receiver) = mpsc::channel(request_capacity);
-        let strays = StraySweep { kind: kind.to_string(), store, swept: None, failed: BTreeSet::new() };
-        Ok((Self { snapshots, builder, publisher, observer: Arc::new(StderrCompactionObserver), storage, parallelism, automatic, signals: signal_receiver, requests: request_receiver, strays },
+        let retirement = Retirement { kind: kind.to_string(), store, publisher: Arc::clone(&publisher), storage, looked: None, again: BTreeSet::new() };
+        Ok((Self { snapshots, builder, publisher, observer: Arc::new(StderrCompactionObserver), storage, parallelism, automatic, signals: signal_receiver, requests: request_receiver, retirement },
             ArtefactHandle { signals, requests, capacity: Arc::new(Semaphore::new(request_capacity)) }))
     }
 
@@ -157,12 +179,12 @@ impl ArtefactDriver {
         self.observer.failed(&CompactionFailure::new(&job.definition.table, &job.trie, error));
     }
 
-    /// Strays are swept only while no job runs, since a running job may be uploading an object its definition no longer wants.
+    /// Artefacts are retired only while no job runs, since a running job may be uploading an object its definition no longer wants.
     async fn available(&mut self, cancellation: &CancellationToken, idle: bool) -> Result<Vec<ArtefactJob>> {
         let snapshot = self.snapshots.snapshot();
         let mut jobs = self.builder.repairs(&snapshot, cancellation).await?;
         let definitions = self.builder.definitions(&snapshot, cancellation).await?;
-        if idle { self.strays.sweep(&snapshot, &definitions).await; }
+        if idle { self.retirement.retire(&snapshot, &definitions).await; }
         jobs.extend(available_artefact_jobs(snapshot.trie_catalog(), &definitions));
         Ok(jobs)
     }
@@ -217,8 +239,8 @@ impl ArtefactDriver {
                 _ = cancellation.cancelled() => break Ok(()),
                 Some((job, result)) = running.next(), if !running.is_empty() => {
                     active.remove(&job);
-                    // A job that failed after uploading leaves an object only a sweep of its table can find.
-                    if let Err(error) = result { self.report_failure(&job, &error); self.strays.failed.insert(job.definition.table.clone()); failed.insert(job, error); }
+                    // A job that failed after uploading leaves an object only another look at its table finds.
+                    if let Err(error) = result { self.report_failure(&job, &error); self.retirement.again.insert(job.definition.table.clone()); failed.insert(job, error); }
                 }
                 Some(request) = self.requests.recv() => pending.push(request),
                 // A new block may have healed whatever failed, so failed jobs become eligible again.
