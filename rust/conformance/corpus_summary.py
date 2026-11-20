@@ -10,6 +10,9 @@ environment-unavailable. A failed assertion on the spills a test counts by redef
 function observes JVM operator internals, so it reports jvm-internal, as do the Vars in JVM_INTERNAL_VARS, whose
 assertions hold only through a with-redefs of a JVM implementation var, and a metrics assertion missing only
 JVM-runtime or child-allocator gauges.
+A block-catalog comparison whose expected and actual maps differ only in a data file's byte size reports
+jvm-layout: the reference's union vectors keep a default in their first leg under a null struct depending on how
+its row copiers moved the row, a layout the native writer does not reproduce, and every cell reads back the same.
 """
 
 import argparse
@@ -41,12 +44,35 @@ MISSING_METRICS = re.compile(r'actual: \(not \(empty\? #\{([^}]*)\}\)\)')
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 
 
+DATA_FILE_SIZE = re.compile(r":data-file-size \d+")
+
+
+def only_data_file_sizes_differ(detail):
+    """Whether a failed block-catalog comparison's two maps agree once data file sizes are set aside."""
+    if ".binpb.edn]" not in detail: return False
+    start = detail.find("(not (= ")
+    if start < 0: return False
+    body = detail[start + len("(not (= "):]
+    depth = 0
+    for index, char in enumerate(body):
+        if char == "{": depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                expected, actual = body[:index + 1], body[index + 1:].strip()
+                actual = actual[:actual.rfind("}") + 1]
+                return expected != actual and DATA_FILE_SIZE.sub(":data-file-size _", expected) == DATA_FILE_SIZE.sub(":data-file-size _", actual)
+    return False
+
+
 def outcome(row):
     detail = row.get("detail") or ""
     if row["result"] in ("error", "fail") and BOUNDARY.search(detail):
         return "jvm-api-boundary"
     if row["result"] in ("error", "fail") and ENVIRONMENT.search(detail):
         return "environment-unavailable"
+    if row["result"] in ("error", "fail") and only_data_file_sizes_differ(detail):
+        return "jvm-layout"
     if row["result"] == "fail" and JVM_INTERNAL.search(detail):
         return "jvm-internal"
     if row["result"] in ("error", "fail") and row["var"] in JVM_INTERNAL_VARS:
