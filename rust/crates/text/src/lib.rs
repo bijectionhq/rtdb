@@ -81,16 +81,18 @@ const LENGTHS: [u32; 256] = [
 /// Without a corpus, or for a term the corpus does not hold, the term's inverse document frequency is 1 and the document is taken to be of average length.
 /// The search index and a resolved row both score through here, so the two agree to the bit.
 pub fn score(query: &Query, frequencies: &[u32], length: u32, corpus: Option<&Corpus>) -> f64 {
-    let length = f64::from(length);
+    query.terms.iter().zip(frequencies).map(|(term, frequency)| term_score(term, *frequency, length, corpus)).sum()
+}
+
+/// One term's part of `score`: it rises with the term's frequency, and falls with the document's length when the term's inverse document frequency is positive.
+pub fn term_score(term: &str, frequency: u32, length: u32, corpus: Option<&Corpus>) -> f64 {
+    let (frequency, length) = (f64::from(frequency), f64::from(length));
+    if frequency == 0.0 { return 0.0; }
     let average = corpus.filter(|corpus| corpus.documents > 0 && corpus.tokens > 0).map_or(length, |corpus| corpus.tokens as f64 / corpus.documents as f64);
-    query.terms.iter().zip(frequencies).map(|(term, frequency)| {
-        let frequency = f64::from(*frequency);
-        if frequency == 0.0 { return 0.0; }
-        let idf = corpus.and_then(|corpus| corpus.frequencies.get(term).map(|df| (corpus.documents as f64, *df as f64)))
-            .map_or(1.0, |(documents, df)| (1.0 + (documents - df + 0.5) / (df + 0.5)).ln());
-        let norm = if average > 0.0 { 1.0 - B + B * length / average } else { 1.0 };
-        idf * frequency * (K1 + 1.0) / (frequency + K1 * norm)
-    }).sum()
+    let idf = corpus.and_then(|corpus| corpus.frequencies.get(term).map(|df| (corpus.documents as f64, *df as f64)))
+        .map_or(1.0, |(documents, df)| (1.0 + (documents - df + 0.5) / (df + 0.5)).ln());
+    let norm = if average > 0.0 { 1.0 - B + B * length / average } else { 1.0 };
+    idf * frequency * (K1 + 1.0) / (frequency + K1 * norm)
 }
 
 /// BM25 of a document's tokens for a query, relative to a corpus.

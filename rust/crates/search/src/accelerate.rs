@@ -109,7 +109,7 @@ impl ScanAccelerator for SearchAccelerator {
         for key in unindexed {
             let lease = request.storage.get(&ObjectKey::new(entry.slug.data_key(&key))?).await?;
             for row in search_rows(lease.as_slice(), std::slice::from_ref(&column))? {
-                if query.matches(&row.tokens[0]) && may_be_visible(row.valid_from, row.valid_to, row.system_from, row.recency.unwrap_or(i64::MAX), bounds) {
+                if row.values[0].as_deref().is_some_and(|tokens| query.matches(tokens)) && may_be_visible(row.valid_from, row.valid_to, row.system_from, row.recency.unwrap_or(i64::MAX), bounds) {
                     candidates.insert(Iid(row.iid));
                 }
             }
@@ -123,10 +123,53 @@ impl ScanAccelerator for SearchAccelerator {
 /// A row's ranking key: its score, then its IID, so that ties sort deterministically.
 fn descending(left: &(f64, Iid), right: &(f64, Iid)) -> std::cmp::Ordering { right.0.total_cmp(&left.0).then_with(|| left.1.cmp(&right.1)) }
 
+/// A scored event waiting to be handed out, best score first.
+struct Pending(f64, Iid);
+impl PartialEq for Pending { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
+impl Eq for Pending {}
+impl PartialOrd for Pending { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
+impl Ord for Pending { fn cmp(&self, other: &Self) -> std::cmp::Ordering { descending(&(other.0, other.1), &(self.0, self.1)) } }
+
+/// The IIDs of the matching events that may be visible, each at its best event's score, best first.
+/// Search files are expanded a batch of windows at a time, only while one may hold an event above every event already scored.
+struct Candidates { files: Vec<crate::file::Ranked>, pending: std::collections::BinaryHeap<Pending>, seen: BTreeSet<Iid>, scored: usize, bounds: TemporalBounds }
+
+impl Candidates {
+    fn push(&mut self, iid: Iid, score: f64) { self.scored += 1; self.pending.push(Pending(score, iid)); }
+    fn drop_seen(&mut self) { while self.pending.peek().is_some_and(|top| self.seen.contains(&top.1)) { self.pending.pop(); } }
+    /// The file whose next windows may hold the best event not yet scored.
+    fn best_file(&self) -> Option<(usize, f64)> {
+        self.files.iter().enumerate().filter_map(|(index, file)| file.bound().map(|bound| (index, bound))).max_by(|left, right| left.1.total_cmp(&right.1))
+    }
+    /// No IID not yet handed out has a matching event scoring above this.
+    fn frontier(&mut self) -> f64 {
+        self.drop_seen();
+        let pending = self.pending.peek().map_or(f64::NEG_INFINITY, |top| top.0);
+        self.best_file().map_or(pending, |(_, bound)| bound.max(pending))
+    }
+    fn next(&mut self) -> Result<Option<(f64, Iid)>> {
+        loop {
+            self.drop_seen();
+            match (self.pending.peek().map(|top| top.0), self.best_file()) {
+                (pending, Some((index, bound))) if pending.is_none_or(|score| bound > score) => {
+                    for (doc, score) in self.files[index].expand()? {
+                        if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, self.bounds) { self.push(Iid(doc.iid), score); }
+                    }
+                }
+                _ => {
+                    let Some(Pending(score, iid)) = self.pending.pop() else { return Ok(None) };
+                    self.seen.insert(iid);
+                    return Ok(Some((score, iid)));
+                }
+            }
+        }
+    }
+}
+
 impl SearchAccelerator {
     /// The IIDs that can hold one of the `limit` best-scoring visible rows, or `None` to narrow as an unranked MATCH does.
-    /// Every matching event is scored exactly from the index, and an IID's best event bounds every row it can resolve to.
-    /// IIDs are verified best bound first, in batches, until `limit` verified rows outscore every bound still unverified.
+    /// Every matching event is scored exactly, and an IID's best event bounds every row it can resolve to.
+    /// IIDs are verified best bound first, in batches, until `limit` verified rows outscore every bound still unverified; a search file's events are scored only as far as that takes.
     async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition) -> Result<Option<BTreeSet<Iid>>> {
         let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { return Ok(None) };
         let limit = match request.constants.constant(&top_k.limit).await.ok().flatten() {
@@ -146,7 +189,7 @@ impl SearchAccelerator {
                 Some(_) => {
                     let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
                     match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
-                        Ok(file) => Some((key, file)),
+                        Ok(file) => Some(file),
                         Err(error) => {
                             if error.needs_repair() { self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version }); }
                             None
@@ -156,7 +199,7 @@ impl SearchAccelerator {
                 None => None,
             };
             match file {
-                Some((_, file)) => files.push(file),
+                Some(file) => files.push(file),
                 None => {
                     let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < request.snapshot.trie_catalog().file_size_target());
                     if !by_policy { unindexed_bytes = unindexed_bytes.saturating_add(trie.data_file_size); }
@@ -167,18 +210,14 @@ impl SearchAccelerator {
         }
         self.register_corpora(request, column, definition).await?;
         let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
-        let mut bounds: std::collections::BTreeMap<Iid, f64> = std::collections::BTreeMap::new();
-        let mut bound = |iid: Iid, score: f64| { let best = bounds.entry(iid).or_insert(f64::NEG_INFINITY); *best = best.max(score); };
-        for file in &files {
-            for (doc, score) in file.scored(column, matching, &scoring, corpus.as_ref())? {
-                if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, request.bounds) { bound(Iid(doc.iid), score); }
-            }
-        }
+        let ranked = files.iter().map(|file| file.ranked(column, matching, &scoring, corpus.as_ref())).collect::<Result<Vec<_>>>()?;
+        let mut candidates = Candidates { files: ranked, pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0, bounds: request.bounds };
         for key in unindexed {
             let lease = request.storage.get(&ObjectKey::new(entry.slug.data_key(&key))?).await?;
             for row in search_rows(lease.as_slice(), std::slice::from_ref(&column.to_string()))? {
-                if matching.matches(&row.tokens[0]) && may_be_visible(row.valid_from, row.valid_to, row.system_from, row.recency.unwrap_or(i64::MAX), request.bounds) {
-                    bound(Iid(row.iid), rtdb_text::bm25(&scoring, &row.tokens[0], corpus.as_ref()));
+                let Some(tokens) = row.values[0].as_deref() else { continue };
+                if matching.matches(tokens) && may_be_visible(row.valid_from, row.valid_to, row.system_from, row.recency.unwrap_or(i64::MAX), request.bounds) {
+                    candidates.push(Iid(row.iid), rtdb_text::bm25(&scoring, tokens, corpus.as_ref()));
                 }
             }
         }
@@ -189,28 +228,26 @@ impl SearchAccelerator {
                 let StoredOperation::Put(document) = &event.operation else { continue };
                 let Some(Value::Utf8(value)) = document.get(column) else { continue };
                 let tokens = rtdb_text::tokens(value);
-                if matching.matches(&tokens) { bound(event.iid, rtdb_text::bm25(&scoring, &tokens, corpus.as_ref())); }
+                if matching.matches(&tokens) { candidates.push(event.iid, rtdb_text::bm25(&scoring, &tokens, corpus.as_ref())); }
             }
         }
-        if bounds.len() > self.max_candidates { return Ok(None); }
-        let mut order: Vec<(f64, Iid)> = bounds.into_iter().map(|(iid, score)| (score, iid)).collect();
-        order.sort_by(descending);
         let mut verified: Vec<(f64, Iid)> = Vec::new();
-        let mut next = 0;
         let batch = limit.saturating_mul(2).max(64);
         let mut rounds = 0;
         loop {
             if verified.len() >= limit {
                 verified.sort_by(descending);
-                let kth = verified[limit - 1].0;
-                if order.get(next).is_none_or(|(upper, _)| kth > *upper) { break; }
+                if verified[limit - 1].0 > candidates.frontier() { break; }
             }
-            if next == order.len() { break; }
+            let mut iids = BTreeSet::new();
+            while iids.len() < batch {
+                let Some((_, iid)) = candidates.next()? else { break };
+                iids.insert(iid);
+            }
+            if candidates.scored > self.max_candidates { return Ok(None); }
+            if iids.is_empty() { break; }
             rounds += 1;
             if rounds > 16 { return Ok(None); }
-            let end = next.saturating_add(batch).min(order.len());
-            let iids = order[next..end].iter().map(|(_, iid)| *iid).collect();
-            next = end;
             for (iid, value) in request.verifier.visible(iids, top_k.column).await? {
                 let Value::Utf8(value) = value else { continue };
                 verified.push((rtdb_text::bm25(&scoring, &rtdb_text::tokens(&value), corpus.as_ref()), iid));

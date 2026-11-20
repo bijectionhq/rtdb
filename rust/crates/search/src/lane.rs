@@ -138,45 +138,42 @@ fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie_size.max(0
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/build", error.to_string()) }
 
 fn search_row(event: &rtdb_format::data::StoredEvent, columns: &[String]) -> SearchRow {
-    let tokens = columns.iter().map(|column| match &event.operation {
-        StoredOperation::Put(document) => match document.get(column) { Some(Value::Utf8(text)) => rtdb_text::tokens(text), _ => Vec::new() },
-        _ => Vec::new(),
+    let values = columns.iter().map(|column| match &event.operation {
+        StoredOperation::Put(document) => match document.get(column) {
+            None | Some(Value::Null | Value::Undefined) => None,
+            Some(Value::Utf8(text)) => Some(rtdb_text::tokens(text)),
+            Some(_) => Some(Vec::new()),
+        },
+        _ => None,
     }).collect();
     SearchRow { iid: event.iid.0, system_from: event.system_from.0, valid_from: event.valid_time.lower().0, valid_to: event.valid_time.upper().0,
-        recency: event.recency.map(|recency| recency.0), tokens }
+        recency: event.recency.map(|recency| recency.0), values }
 }
 
-/// A data file's rows in order, one page held at a time under its memory reservation.
-struct PageRows<'a> { reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, page: usize, current: Option<(rtdb_columnar::OwnedBatch, EventBatch, usize)> }
+/// A data file's pages of rows in order, each read under its memory reservation.
+struct PageRows<'a> { reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, page: usize }
 
 impl<'a> PageRows<'a> {
     fn new(reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken) -> Self {
-        Self { reader, columns, memory, cancellation, page: 0, current: None }
+        Self { reader, columns, memory, cancellation, page: 0 }
     }
 }
 
 impl Iterator for PageRows<'_> {
-    type Item = Result<SearchRow>;
-    fn next(&mut self) -> Option<Result<SearchRow>> {
-        loop {
-            if let Some((_, batch, row)) = &mut self.current {
-                if *row < batch.len() {
-                    let event = batch.read_event(*row);
-                    *row += 1;
-                    return Some(event.map(|event| search_row(&event, self.columns)));
-                }
-                self.current = None;
-            }
-            if self.page == self.reader.page_count() { return None; }
-            if self.cancellation.is_cancelled() { return Some(Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled"))); }
-            let page = read_page(&mut self.reader, self.page, self.memory).and_then(|owned| Ok((EventBatch::new(owned.batch().clone())?, owned)));
-            self.page += 1;
-            match page { Ok((batch, owned)) => self.current = Some((owned, batch, 0)), Err(error) => return Some(Err(error)) }
-        }
+    type Item = Result<Vec<SearchRow>>;
+    fn next(&mut self) -> Option<Result<Vec<SearchRow>>> {
+        if self.page == self.reader.page_count() { return None; }
+        if self.cancellation.is_cancelled() { return Some(Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled"))); }
+        let page = self.page;
+        self.page += 1;
+        Some(read_page(&mut self.reader, page, self.memory).and_then(|owned| {
+            let batch = EventBatch::new(owned.batch().clone())?;
+            (0..batch.len()).map(|row| Ok(search_row(&batch.read_event(row)?, self.columns))).collect()
+        }))
     }
 }
 
-/// Every row of a data file in order, with the tokens of each column's UTF-8 value.
+/// Every row of a data file in order, with the tokens of each column's value.
 pub fn search_rows(data: &[u8], columns: &[String]) -> Result<Vec<SearchRow>> {
     let mut file = ArrowFile::open(Arc::from(data), None)?;
     let mut rows = Vec::new();

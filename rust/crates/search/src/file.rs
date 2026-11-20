@@ -19,8 +19,14 @@ use tantivy::{Directory, Index, IndexSettings, TantivyDocument, Term};
 
 const MAGIC: &[u8; 8] = b"RTSRCH01";
 /// Bumped with the bundle layout or the tantivy version, either of which changes a search file's bytes.
-pub const FORMAT_VERSION: i32 = 2;
+pub const FORMAT_VERSION: i32 = 3;
 const WRITER_MEMORY: usize = 32 << 20;
+/// The bundle entry holding what tantivy's segment does not: page starts, each column's non-null rows, and term impacts.
+const SIDECAR: &str = "rtdb.sidecar";
+/// Documents are bounded in windows of this many consecutive ids.
+const WINDOW: u32 = 128;
+/// A term in at least this many documents has its window bounds stored; a rarer term's are computed from its postings when asked.
+const STORED_IMPACTS: u32 = 1024;
 
 /// One data-file row as the search file sees it: its own temporal columns and the tokens of each indexed column.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,8 +36,8 @@ pub struct SearchRow {
     pub valid_from: i64,
     pub valid_to: i64,
     pub recency: Option<i64>,
-    /// Parallel to the file's columns; a row with no text in a column holds no tokens there.
-    pub tokens: Vec<Vec<String>>,
+    /// Parallel to the file's columns: `None` where the column is null or absent, and otherwise the tokens of its UTF-8 value, none for a value of another type.
+    pub values: Vec<Option<Vec<String>>>,
 }
 
 /// A document whose terms satisfied a query, with the row's own temporal columns.
@@ -56,45 +62,109 @@ fn schema(columns: &[String]) -> (Schema, Fields) {
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/file", error.to_string()) }
 fn corrupt(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/corrupt-file", message.to_string()) }
 
-/// Builds the bundled search file over rows in data-file order, in memory.
+/// Builds the bundled search file over rows in data-file order, as one page, in memory.
 pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str) -> Result<Vec<u8>> {
     let mut bundle = Vec::new();
-    write_search_file(columns, rows.iter().cloned().map(Ok), identity, RamDirectory::create(), &mut bundle)?;
+    write_search_file(columns, [Ok(rows.to_vec())], identity, RamDirectory::create(), &mut bundle)?;
     Ok(bundle)
 }
 
-/// Builds the search file over rows in data-file order, building its segment in `directory` and writing the bundle to `output`.
-/// The bytes are a function of the rows, the columns and `identity` alone, wherever the segment is built, so every builder of one job writes the same object.
-pub fn write_search_file<D: Directory + Clone + 'static, W: std::io::Write>(columns: &[String], rows: impl IntoIterator<Item = Result<SearchRow>>, identity: &str, directory: D, output: W) -> Result<()> {
+/// Builds the search file over a data file's pages of rows, in order, building its segment in `directory` and writing the bundle to `output`.
+/// The bytes are a function of the rows, their pages, the columns and `identity` alone, wherever the segment is built, so every builder of one job writes the same object.
+pub fn write_search_file<D: Directory + Clone + 'static, W: std::io::Write>(columns: &[String], pages: impl IntoIterator<Item = Result<Vec<SearchRow>>>, identity: &str, directory: D, output: W) -> Result<()> {
     let (schema, fields) = schema(columns);
     let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
     let mut writer = Index::builder().schema(schema).settings(settings).single_segment_index_writer(directory.clone(), WRITER_MEMORY).map_err(fault)?;
-    for row in rows {
-        let row = row?;
-        let row = &row;
-        if row.tokens.len() != columns.len() { return Err(fault("Search row tokens do not cover the file's columns")); }
-        let mut document = TantivyDocument::new();
-        for (field, tokens) in fields.columns.iter().zip(&row.tokens) {
-            if tokens.is_empty() { continue; }
-            let mut offset = 0;
-            let tokens = tokens.iter().enumerate().map(|(position, text)| {
-                let token = Token { offset_from: offset, offset_to: offset + text.len(), position, text: text.clone(), position_length: 1 };
-                offset += text.len() + 1;
-                token
-            }).collect();
-            document.add_pre_tokenized_text(*field, PreTokenizedString { text: String::new(), tokens });
+    let mut page_starts = Vec::new();
+    let mut present: Vec<Vec<u8>> = vec![Vec::new(); columns.len()];
+    let mut documents = 0u32;
+    for page in pages {
+        page_starts.push(documents);
+        for row in page? {
+            if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the file's columns")); }
+            let mut document = TantivyDocument::new();
+            for (column, (field, value)) in fields.columns.iter().zip(&row.values).enumerate() {
+                let Some(tokens) = value else { continue };
+                let bits = &mut present[column];
+                if bits.len() <= documents as usize / 8 { bits.resize(documents as usize / 8 + 1, 0); }
+                bits[documents as usize / 8] |= 1 << (documents % 8);
+                if tokens.is_empty() { continue; }
+                let mut offset = 0;
+                let tokens = tokens.iter().enumerate().map(|(position, text)| {
+                    let token = Token { offset_from: offset, offset_to: offset + text.len(), position, text: text.clone(), position_length: 1 };
+                    offset += text.len() + 1;
+                    token
+                }).collect();
+                document.add_pre_tokenized_text(*field, PreTokenizedString { text: String::new(), tokens });
+            }
+            let (high, low) = row.iid.split_at(8);
+            document.add_u64(fields.iid_high, u64::from_be_bytes(high.try_into().map_err(fault)?));
+            document.add_u64(fields.iid_low, u64::from_be_bytes(low.try_into().map_err(fault)?));
+            document.add_i64(fields.system_from, row.system_from);
+            document.add_i64(fields.valid_from, row.valid_from);
+            document.add_i64(fields.valid_to, row.valid_to);
+            document.add_i64(fields.recency, row.recency.unwrap_or(i64::MAX));
+            writer.add_document(document).map_err(fault)?;
+            documents = documents.checked_add(1).ok_or_else(|| fault("A search file holds at most u32::MAX documents"))?;
         }
-        let (high, low) = row.iid.split_at(8);
-        document.add_u64(fields.iid_high, u64::from_be_bytes(high.try_into().map_err(fault)?));
-        document.add_u64(fields.iid_low, u64::from_be_bytes(low.try_into().map_err(fault)?));
-        document.add_i64(fields.system_from, row.system_from);
-        document.add_i64(fields.valid_from, row.valid_from);
-        document.add_i64(fields.valid_to, row.valid_to);
-        document.add_i64(fields.recency, row.recency.unwrap_or(i64::MAX));
-        writer.add_document(document).map_err(fault)?;
     }
     writer.finalize().map_err(fault)?;
+    for bits in &mut present { bits.resize(documents.div_ceil(8) as usize, 0); }
+    let sidecar = sidecar(&Index::open(directory.clone()).map_err(fault)?, &fields.columns, &page_starts, &present)?;
+    directory.atomic_write(Path::new(SIDECAR), &sidecar).map_err(fault)?;
     bundle(&directory, &segment_uuid(identity), output)
+}
+
+/// A term's documents within one window: the highest frequency among them, and the shortest stored length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Impact { window: u32, frequency: u32, length: u32 }
+
+/// Every window holding the term, in order, from its postings.
+fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tantivy::fieldnorm::FieldNormReader) -> Vec<Impact> {
+    use tantivy::{DocSet, postings::Postings};
+    let mut impacts: Vec<Impact> = Vec::new();
+    let mut doc = postings.doc();
+    while doc != tantivy::TERMINATED {
+        let (window, frequency, length) = (doc / WINDOW, postings.term_freq(), lengths.fieldnorm(doc));
+        match impacts.last_mut() {
+            Some(last) if last.window == window => { last.frequency = last.frequency.max(frequency); last.length = last.length.min(length); }
+            _ => impacts.push(Impact { window, frequency, length }),
+        }
+        doc = postings.advance();
+    }
+    impacts
+}
+
+/// Page starts, then each column's non-null bitset, then the impacts of every term in at least STORED_IMPACTS documents, by column and term.
+fn sidecar(index: &Index, columns: &[Field], page_starts: &[u32], present: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(page_starts.len() as u32).to_le_bytes());
+    for start in page_starts { bytes.extend_from_slice(&start.to_le_bytes()); }
+    for bits in present { bytes.extend_from_slice(bits); }
+    let reader = index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
+    let searcher = reader.searcher();
+    let mut entries = Vec::new();
+    for segment in searcher.segment_readers() {
+        for (column, field) in columns.iter().enumerate() {
+            let inverted = segment.inverted_index(*field).map_err(fault)?;
+            let lengths = segment.get_fieldnorms_reader(*field).map_err(fault)?;
+            let mut terms = inverted.terms().stream().map_err(fault)?;
+            while terms.advance() {
+                if terms.value().doc_freq < STORED_IMPACTS { continue; }
+                let mut postings = inverted.read_postings_from_terminfo(terms.value(), IndexRecordOption::WithFreqs).map_err(fault)?;
+                entries.push((column as u32, terms.key().to_vec(), impacts_of(&mut postings, &lengths)));
+            }
+        }
+    }
+    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (column, term, impacts) in entries {
+        bytes.extend_from_slice(&column.to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(term.len()).map_err(fault)?.to_le_bytes());
+        bytes.extend_from_slice(&term);
+        bytes.extend_from_slice(&(impacts.len() as u32).to_le_bytes());
+        for impact in impacts { for value in [impact.window, impact.frequency, impact.length] { bytes.extend_from_slice(&value.to_le_bytes()); } }
+    }
+    Ok(bytes)
 }
 
 /// A uuid-shaped name derived from the job's identity, standing in for tantivy's random segment id.
@@ -118,7 +188,7 @@ fn bundle(directory: &dyn Directory, uuid: &str, mut output: impl std::io::Write
         let dashed = |id: &str| format!("{}-{}-{}-{}-{}", &id[..8], &id[8..12], &id[12..16], &id[16..20], &id[20..]);
         meta.replace(&dashed(original), &dashed(uuid)).replace(original, uuid)
     });
-    let mut files: BTreeMap<String, Option<PathBuf>> = BTreeMap::from([("meta.json".to_string(), None)]);
+    let mut files: BTreeMap<String, Option<PathBuf>> = BTreeMap::from([("meta.json".to_string(), None), (SIDECAR.to_string(), Some(PathBuf::from(SIDECAR)))]);
     if let Some(original) = &original {
         for extension in ["idx", "term", "fieldnorm", "fast", "store", "pos"] {
             let path = PathBuf::from(format!("{original}.{extension}"));
@@ -219,45 +289,115 @@ impl Directory for BundleDirectory {
     fn watch(&self, _: WatchCallback) -> tantivy::Result<WatchHandle> { Ok(WatchHandle::empty()) }
 }
 
+/// What the sidecar holds, located within the bundle's bytes.
+struct Sidecar { bytes: OwnedBytes, page_starts: Vec<u32>, present: Vec<Range<usize>>, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
+
+impl Sidecar {
+    fn parse(bytes: OwnedBytes, columns: usize, documents: u32) -> Result<Self> {
+        let data = bytes.as_slice();
+        let mut position = 0usize;
+        let mut take = |count: usize| -> Result<Range<usize>> {
+            let end = position.checked_add(count).filter(|end| *end <= data.len()).ok_or_else(|| corrupt("Search file sidecar is truncated"))?;
+            let range = position..end;
+            position = end;
+            Ok(range)
+        };
+        let u32_at = |range: Range<usize>| u32::from_le_bytes(data[range].try_into().unwrap_or_default());
+        let pages = u32_at(take(4)?) as usize;
+        let page_starts = (0..pages).map(|_| take(4).map(u32_at)).collect::<Result<Vec<_>>>()?;
+        if page_starts.first().is_some_and(|first| *first != 0) || page_starts.windows(2).any(|pair| pair[0] > pair[1]) || page_starts.last().is_some_and(|last| *last > documents) {
+            return Err(corrupt("Search file page starts are out of order"));
+        }
+        let present = (0..columns).map(|_| take(documents.div_ceil(8) as usize)).collect::<Result<Vec<_>>>()?;
+        let entries = u32_at(take(4)?);
+        let mut impacts = BTreeMap::new();
+        for _ in 0..entries {
+            let column = u32_at(take(4)?);
+            let length = take(2)?;
+            let term = data[take(u16::from_le_bytes(data[length].try_into().unwrap_or_default()) as usize)?].to_vec();
+            let windows = u32_at(take(4)?) as usize;
+            impacts.insert((column, term), take(windows.checked_mul(12).ok_or_else(|| corrupt("Search file impacts overflow"))?)?);
+        }
+        if position != data.len() { return Err(corrupt("Search file sidecar has trailing bytes")); }
+        Ok(Self { bytes, page_starts, present, impacts })
+    }
+    fn impacts(&self, column: u32, term: &str) -> Option<Vec<Impact>> {
+        let range = self.impacts.get(&(column, term.as_bytes().to_vec()))?;
+        Some(self.bytes.as_slice()[range.clone()].chunks_exact(12).map(|chunk| {
+            let at = |offset: usize| u32::from_le_bytes([chunk[offset], chunk[offset + 1], chunk[offset + 2], chunk[offset + 3]]);
+            Impact { window: at(0), frequency: at(4), length: at(8) }
+        }).collect())
+    }
+    fn present(&self, column: usize, doc: u32) -> bool {
+        self.present.get(column).and_then(|range| self.bytes.as_slice()[range.clone()].get(doc as usize / 8)).is_some_and(|byte| byte & (1 << (doc % 8)) != 0)
+    }
+}
+
+/// The fast columns a document's temporal fields are read from.
+struct DocColumns { iid_high: tantivy::columnar::Column<u64>, iid_low: tantivy::columnar::Column<u64>, system_from: tantivy::columnar::Column<i64>, valid_from: tantivy::columnar::Column<i64>, valid_to: tantivy::columnar::Column<i64>, recency: tantivy::columnar::Column<i64> }
+
+impl DocColumns {
+    fn open(segment: &tantivy::SegmentReader) -> Result<Self> {
+        let fast = segment.fast_fields();
+        Ok(Self { iid_high: fast.u64("_iid_high").map_err(fault)?, iid_low: fast.u64("_iid_low").map_err(fault)?, system_from: fast.i64("_system_from").map_err(fault)?,
+            valid_from: fast.i64("_valid_from").map_err(fault)?, valid_to: fast.i64("_valid_to").map_err(fault)?, recency: fast.i64("_recency").map_err(fault)? })
+    }
+    fn doc(&self, doc: u32) -> Result<DocMatch> {
+        let missing = || corrupt("Search document has no fast value");
+        let mut iid = [0u8; 16];
+        iid[..8].copy_from_slice(&self.iid_high.first(doc).ok_or_else(missing)?.to_be_bytes());
+        iid[8..].copy_from_slice(&self.iid_low.first(doc).ok_or_else(missing)?.to_be_bytes());
+        Ok(DocMatch { doc, iid, system_from: self.system_from.first(doc).ok_or_else(missing)?, valid_from: self.valid_from.first(doc).ok_or_else(missing)?,
+            valid_to: self.valid_to.first(doc).ok_or_else(missing)?, recency: self.recency.first(doc).ok_or_else(missing)? })
+    }
+}
+
 /// An opened search file.
-pub struct SearchFile { index: Index, columns: Vec<String> }
+pub struct SearchFile { index: Index, columns: Vec<String>, documents: u32, sidecar: Sidecar }
 
 impl SearchFile {
     pub fn open(bytes: impl Into<Source>, columns: &[String]) -> Result<Self> {
-        let index = Index::open(BundleDirectory::open(bytes.into())?).map_err(fault)?;
+        let directory = BundleDirectory::open(bytes.into())?;
+        let sidecar = directory.get_file_handle(Path::new(SIDECAR)).map_err(|_| corrupt("Search file has no sidecar"))?;
+        let sidecar = sidecar.read_bytes(0..sidecar.len()).map_err(fault)?;
+        let index = Index::open(directory).map_err(fault)?;
         let (expected, _) = schema(columns);
         if index.schema() != expected { return Err(corrupt("Search file schema does not match its definition")); }
-        Ok(Self { index, columns: columns.to_vec() })
+        let documents = index.searchable_segment_metas().map_err(fault)?.iter().map(|segment| segment.max_doc()).sum();
+        Ok(Self { sidecar: Sidecar::parse(sidecar, columns.len(), documents)?, index, columns: columns.to_vec(), documents })
     }
 
-    fn field(&self, column: &str) -> Option<Field> {
-        self.columns.iter().position(|candidate| candidate == column).map(|index| Field::from_field_id(index as u32))
+    fn column(&self, column: &str) -> Option<usize> { self.columns.iter().position(|candidate| candidate == column) }
+    fn field(&self, column: &str) -> Option<Field> { self.column(column).map(|index| Field::from_field_id(index as u32)) }
+
+    fn searcher(&self) -> Result<tantivy::Searcher> {
+        let reader: tantivy::IndexReader = self.index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
+        Ok(reader.searcher())
+    }
+
+    /// Every query term and phrase as one conjunction over the column.
+    fn conjunction(field: Field, query: &Query) -> BooleanQuery {
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = query.terms().iter().map(|term| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)).collect();
+        for phrase in query.phrases() {
+            clauses.push((Occur::Must, Box::new(tantivy::query::PhraseQuery::new(phrase.iter().map(|term| Term::from_field_text(field, term)).collect()))));
+        }
+        BooleanQuery::new(clauses)
     }
 
     /// Every document holding all of the query's terms in the column.
     pub fn matches(&self, column: &str, query: &Query) -> Result<Vec<DocMatch>> {
         let Some(field) = self.field(column) else { return Ok(Vec::new()) };
         if query.terms().is_empty() { return Ok(Vec::new()); }
-        let reader = self.index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
-        let searcher = reader.searcher();
-        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = query.terms().iter().map(|term| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)).collect();
-        for phrase in query.phrases() {
-            clauses.push((Occur::Must, Box::new(tantivy::query::PhraseQuery::new(phrase.iter().map(|term| Term::from_field_text(field, term)).collect()))));
-        }
-        let found = searcher.search(&BooleanQuery::new(clauses), &DocSetCollector).map_err(fault)?;
+        let searcher = self.searcher()?;
+        let found = searcher.search(&Self::conjunction(field, query), &DocSetCollector).map_err(fault)?;
         let mut docs: Vec<_> = found.into_iter().collect();
         docs.sort();
         let mut matches = Vec::with_capacity(docs.len());
+        let mut columns: Option<(u32, DocColumns)> = None;
         for address in docs {
-            let segment = searcher.segment_reader(address.segment_ord);
-            let fast = segment.fast_fields();
-            let doc = address.doc_id;
-            let u64_at = |name: &str| -> Result<u64> { fast.u64(name).map_err(fault)?.first(doc).ok_or_else(|| corrupt("Search document has no fast value")) };
-            let i64_at = |name: &str| -> Result<i64> { fast.i64(name).map_err(fault)?.first(doc).ok_or_else(|| corrupt("Search document has no fast value")) };
-            let mut iid = [0u8; 16];
-            iid[..8].copy_from_slice(&u64_at("_iid_high")?.to_be_bytes());
-            iid[8..].copy_from_slice(&u64_at("_iid_low")?.to_be_bytes());
-            matches.push(DocMatch { doc, iid, system_from: i64_at("_system_from")?, valid_from: i64_at("_valid_from")?, valid_to: i64_at("_valid_to")?, recency: i64_at("_recency")? });
+            if columns.as_ref().is_none_or(|(ordinal, _)| *ordinal != address.segment_ord) { columns = Some((address.segment_ord, DocColumns::open(searcher.segment_reader(address.segment_ord))?)); }
+            let Some((_, columns)) = &columns else { continue };
+            matches.push(columns.doc(address.doc_id)?);
         }
         Ok(matches)
     }
@@ -267,31 +407,63 @@ impl SearchFile {
     pub fn scored(&self, column: &str, matching: &Query, scoring: &Query, corpus: Option<&Corpus>) -> Result<Vec<(DocMatch, f64)>> {
         let Some(field) = self.field(column) else { return Ok(Vec::new()) };
         let docs = self.matches(column, matching)?;
-        if docs.is_empty() { return Ok(Vec::new()); }
-        let reader = self.index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
-        let searcher = reader.searcher();
+        let searcher = self.searcher()?;
         let [segment] = searcher.segment_readers() else { return Err(corrupt("A search file holds exactly one segment")) };
-        let lengths = segment.get_fieldnorms_reader(field).map_err(fault)?;
+        let mut scorer = ExactScorer::open(segment, field, scoring, corpus)?;
+        docs.into_iter().map(|doc| Ok((doc, scorer.score(doc.doc)))).collect()
+    }
+
+    /// The documents matching `matching`, best possible score for `scoring` first, a window of documents at a time.
+    pub fn ranked(&self, column: &str, matching: &Query, scoring: &Query, corpus: Option<&Corpus>) -> Result<Ranked> {
+        let searcher = self.searcher()?;
+        let (Some(column), Some(field)) = (self.column(column), self.field(column)) else { return Ok(Ranked(None)) };
+        if matching.terms().is_empty() { return Ok(Ranked(None)); }
+        if searcher.segment_readers().len() != 1 { return Err(corrupt("A search file holds exactly one segment")); }
+        let segment = &searcher.segment_readers()[0];
         let inverted = segment.inverted_index(field).map_err(fault)?;
-        let mut postings = Vec::with_capacity(scoring.terms().len());
-        for term in scoring.terms() { postings.push(inverted.read_postings(&Term::from_field_text(field, term), IndexRecordOption::WithFreqs).map_err(fault)?); }
-        let mut scored = Vec::with_capacity(docs.len());
-        for doc in docs {
-            use tantivy::{DocSet, postings::Postings};
-            let frequencies: Vec<u32> = postings.iter_mut().map(|postings| match postings {
-                Some(postings) => if postings.doc() <= doc.doc && postings.seek(doc.doc) == doc.doc { postings.term_freq() } else { 0 },
-                None => 0,
-            }).collect();
-            scored.push((doc, rtdb_text::score(scoring, &frequencies, lengths.fieldnorm(doc.doc), corpus)));
+        let lengths = segment.get_fieldnorms_reader(field).map_err(fault)?;
+        let impacts = |term: &str| -> Result<Vec<Impact>> {
+            if let Some(impacts) = self.sidecar.impacts(column as u32, term) { return Ok(impacts); }
+            Ok(match inverted.read_postings(&Term::from_field_text(field, term), IndexRecordOption::WithFreqs).map_err(fault)? {
+                Some(mut postings) => impacts_of(&mut postings, &lengths),
+                None => Vec::new(),
+            })
+        };
+        let mut windows: Option<Vec<u32>> = None;
+        for term in matching.terms() {
+            let held: Vec<u32> = impacts(term)?.into_iter().map(|impact| impact.window).collect();
+            windows = Some(match windows { None => held, Some(previous) => previous.into_iter().filter(|window| held.binary_search(window).is_ok()).collect() });
         }
-        Ok(scored)
+        let mut bounds: Vec<(f64, u32)> = windows.unwrap_or_default().into_iter().map(|window| (0.0, window)).collect();
+        for term in scoring.terms() {
+            let impacts = impacts(term)?;
+            for (bound, window) in &mut bounds {
+                if let Ok(index) = impacts.binary_search_by_key(window, |impact| impact.window) {
+                    *bound += rtdb_text::term_score(term, impacts[index].frequency, impacts[index].length, corpus).max(0.0);
+                }
+            }
+        }
+        // Each term's part is bounded exactly; the margin covers summing those parts in another order than a document's score does.
+        for (bound, _) in &mut bounds { *bound = *bound * (1.0 + 1e-9) + 1e-12; }
+        bounds.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+        Ok(Ranked(Some(Windows { searcher, field, matching: matching.clone(), scoring: scoring.clone(), corpus: corpus.cloned(), windows: bounds, next: 0, batch: 4 })))
+    }
+
+    /// Whether MATCH holds on each document: `None` where the column is null or absent, as MATCH is on such a row.
+    pub fn match_values(&self, column: &str, query: &Query) -> Result<MatchValues> {
+        let documents = self.documents;
+        let Some(index) = self.column(column) else { return Ok(MatchValues { present: Vec::new(), matching: Vec::new(), page_starts: self.sidecar.page_starts.clone(), documents }) };
+        let mut present = vec![0u64; documents.div_ceil(64) as usize];
+        for doc in 0..documents { if self.sidecar.present(index, doc) { present[doc as usize / 64] |= 1 << (doc % 64); } }
+        let mut matching = vec![0u64; present.len()];
+        for doc in self.matches(column, query)? { matching[doc.doc as usize / 64] |= 1 << (doc.doc % 64); }
+        Ok(MatchValues { present, matching, page_starts: self.sidecar.page_starts.clone(), documents })
     }
 
     /// The column's corpus statistics for the query's terms: documents, tokens, and each term's document frequency.
     pub fn corpus(&self, column: &str, query: &Query) -> Result<Corpus> {
         let Some(field) = self.field(column) else { return Ok(Corpus::default()) };
-        let reader = self.index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
-        let searcher = reader.searcher();
+        let searcher = self.searcher()?;
         let mut corpus = Corpus::default();
         for segment in searcher.segment_readers() {
             let inverted = segment.inverted_index(field).map_err(fault)?;
@@ -305,13 +477,89 @@ impl SearchFile {
     }
 }
 
+/// MATCH of one query on every document of a search file, by data-file page and row.
+pub struct MatchValues { present: Vec<u64>, matching: Vec<u64>, page_starts: Vec<u32>, documents: u32 }
+
+impl MatchValues {
+    /// MATCH on the row at `row` of data page `page`: `None` where the column is null or absent; an error where the file has no such row.
+    pub fn value(&self, page: usize, row: usize) -> Result<Option<bool>> {
+        let start = *self.page_starts.get(page).ok_or_else(|| corrupt("Search file has no such page"))?;
+        let end = self.page_starts.get(page + 1).copied().unwrap_or(self.documents);
+        let doc = u32::try_from(row).ok().and_then(|row| start.checked_add(row)).filter(|doc| *doc < end).ok_or_else(|| corrupt("Search file has no such row"))?;
+        let bit = |bits: &[u64]| bits.get(doc as usize / 64).is_some_and(|word| word & (1 << (doc % 64)) != 0);
+        Ok(bit(&self.present).then(|| bit(&self.matching)))
+    }
+    /// The bytes held, for a cache's weight.
+    pub fn bytes(&self) -> usize { (self.present.len() + self.matching.len()) * 8 + self.page_starts.len() * 4 }
+}
+
+/// Scores documents in ascending order from the postings of the scoring terms.
+struct ExactScorer { postings: Vec<Option<tantivy::postings::SegmentPostings>>, lengths: tantivy::fieldnorm::FieldNormReader, scoring: Query, corpus: Option<Corpus> }
+
+impl ExactScorer {
+    fn open(segment: &tantivy::SegmentReader, field: Field, scoring: &Query, corpus: Option<&Corpus>) -> Result<Self> {
+        let inverted = segment.inverted_index(field).map_err(fault)?;
+        let postings = scoring.terms().iter().map(|term| inverted.read_postings(&Term::from_field_text(field, term), IndexRecordOption::WithFreqs).map_err(fault)).collect::<Result<_>>()?;
+        Ok(Self { postings, lengths: segment.get_fieldnorms_reader(field).map_err(fault)?, scoring: scoring.clone(), corpus: corpus.cloned() })
+    }
+    fn score(&mut self, doc: u32) -> f64 {
+        use tantivy::{DocSet, postings::Postings};
+        let frequencies: Vec<u32> = self.postings.iter_mut().map(|postings| match postings {
+            Some(postings) => if postings.doc() <= doc && postings.seek(doc) == doc { postings.term_freq() } else { 0 },
+            None => 0,
+        }).collect();
+        rtdb_text::score(&self.scoring, &frequencies, self.lengths.fieldnorm(doc), self.corpus.as_ref())
+    }
+}
+
+/// A search file's matching documents, handed out a batch of windows at a time, best bound first; `None` where nothing in the file can match.
+/// No document left behind scores above `bound`.
+pub struct Ranked(Option<Windows>);
+
+/// The windows holding every matching term, each with the best score a document in it can have, best first, and how far they have been handed out.
+struct Windows { searcher: tantivy::Searcher, field: Field, matching: Query, scoring: Query, corpus: Option<Corpus>, windows: Vec<(f64, u32)>, next: usize, batch: usize }
+
+impl Ranked {
+    /// The highest score any document not yet handed out can have, or `None` once all are.
+    pub fn bound(&self) -> Option<f64> { self.0.as_ref().and_then(|windows| windows.windows.get(windows.next).map(|(bound, _)| *bound)) }
+
+    /// The matching documents of the next windows, with their exact scores; twice as many windows as the time before.
+    pub fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> { self.0.as_mut().map_or(Ok(Vec::new()), Windows::expand) }
+}
+
+impl Windows {
+    fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> {
+        use tantivy::{DocSet, query::Query as _};
+        let end = self.next.saturating_add(self.batch).min(self.windows.len());
+        let mut windows: Vec<u32> = self.windows[self.next..end].iter().map(|(_, window)| *window).collect();
+        self.next = end;
+        self.batch = self.batch.saturating_mul(2);
+        windows.sort_unstable();
+        let segment = &self.searcher.segment_readers()[0];
+        let weight = SearchFile::conjunction(self.field, &self.matching).weight(tantivy::query::EnableScoring::disabled_from_searcher(&self.searcher)).map_err(fault)?;
+        let mut docs = weight.scorer(segment, 1.0).map_err(fault)?;
+        let columns = DocColumns::open(segment)?;
+        let mut scorer = ExactScorer::open(segment, self.field, &self.scoring, self.corpus.as_ref())?;
+        let mut found = Vec::new();
+        for window in windows {
+            let (start, stop) = (window.saturating_mul(WINDOW), window.saturating_add(1).saturating_mul(WINDOW));
+            let mut doc = if docs.doc() < start { docs.seek(start) } else { docs.doc() };
+            while doc < stop && doc != tantivy::TERMINATED {
+                found.push((columns.doc(doc)?, scorer.score(doc)));
+                doc = docs.advance();
+            }
+        }
+        Ok(found)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rtdb_text::tokens;
 
     fn row(id: u8, system_from: i64, title: &str, body: &str) -> SearchRow {
-        SearchRow { iid: [id; 16], system_from, valid_from: 0, valid_to: i64::MAX, recency: None, tokens: vec![tokens(title), tokens(body)] }
+        SearchRow { iid: [id; 16], system_from, valid_from: 0, valid_to: i64::MAX, recency: None, values: vec![Some(tokens(title)), Some(tokens(body))] }
     }
     fn columns() -> Vec<String> { vec!["title".into(), "body".into()] }
     fn rows() -> Vec<SearchRow> {
@@ -330,7 +578,7 @@ mod tests {
     fn a_segment_built_on_disk_bundles_to_the_same_bytes_as_one_built_in_memory() {
         let directory = tempfile::tempdir().unwrap();
         let mut streamed = Vec::new();
-        write_search_file(&columns(), rows().into_iter().map(Ok), "job", tantivy::directory::MmapDirectory::open(directory.path()).unwrap(), &mut streamed).unwrap();
+        write_search_file(&columns(), [Ok(rows())], "job", tantivy::directory::MmapDirectory::open(directory.path()).unwrap(), &mut streamed).unwrap();
         assert_eq!(streamed, build_search_file(&columns(), &rows(), "job").unwrap());
     }
 
@@ -355,10 +603,10 @@ mod tests {
         let scoring = Query::parse("invoice overdue paid absent");
         let corpus = file.corpus("body", &scoring).unwrap();
         for (doc, score) in file.scored("body", &Query::parse("invoice"), &scoring, Some(&corpus)).unwrap() {
-            assert_eq!(score, rtdb_text::bm25(&scoring, &rows[doc.doc as usize].tokens[1], Some(&corpus)), "doc {}", doc.doc);
+            assert_eq!(score, rtdb_text::bm25(&scoring, rows[doc.doc as usize].values[1].as_deref().unwrap(), Some(&corpus)), "doc {}", doc.doc);
         }
         let long: Vec<String> = (0..500).map(|index| if index % 7 == 0 { "invoice".into() } else { format!("w{index}") }).collect();
-        let rows = vec![SearchRow { iid: [9; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, recency: None, tokens: vec![Vec::new(), long.clone()] }];
+        let rows = vec![SearchRow { iid: [9; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, recency: None, values: vec![None, Some(long.clone())] }];
         let file = SearchFile::open(build_search_file(&columns(), &rows, "job").unwrap(), &columns()).unwrap();
         let [(_, score)] = file.scored("body", &Query::parse("invoice"), &Query::parse("invoice"), None).unwrap()[..] else { panic!() };
         assert_eq!(score, rtdb_text::bm25(&Query::parse("invoice"), &long, None), "a long document's stored length is rounded the same way");
@@ -382,5 +630,67 @@ mod tests {
         bytes[length - 1] ^= 1;
         assert!(SearchFile::open(bytes, &columns()).is_err());
         assert!(SearchFile::open(build_search_file(&columns(), &rows(), "job").unwrap(), &["body".to_string()]).is_err(), "a definition with other columns does not read the file");
+    }
+
+    fn corpus_rows(count: usize, seed: u64) -> Vec<SearchRow> {
+        let words = ["invoice", "overdue", "paid", "book", "late", "red", "blue", "green"];
+        let mut state = seed;
+        let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) as usize };
+        (0..count).map(|index| {
+            let body: Vec<String> = (0..1 + next() % 12).map(|_| words[next() % words.len()].to_string()).collect();
+            let value = match index % 17 { 0 => None, 1 => Some(Vec::new()), _ => Some(body) };
+            SearchRow { iid: [(index % 251) as u8; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, recency: None, values: vec![None, value] }
+        }).collect()
+    }
+
+    #[test]
+    fn ranked_windows_bound_every_match_and_hand_each_out_once() {
+        let rows = corpus_rows(5000, 7);
+        let file = SearchFile::open(build_search_file(&columns(), &rows, "job").unwrap(), &columns()).unwrap();
+        assert!(file.sidecar.impacts.keys().any(|(column, _)| *column == 1), "common terms have their impacts stored");
+        for (matching, scoring) in [("invoice", "invoice overdue"), ("red blue", "red"), ("\"paid late\"", "paid late green"), ("absent", "absent")] {
+            let (matching, scoring) = (Query::parse(matching), Query::parse(scoring));
+            let corpus = file.corpus("body", &scoring).unwrap();
+            let mut expected = file.scored("body", &matching, &scoring, Some(&corpus)).unwrap();
+            let mut ranked = file.ranked("body", &matching, &scoring, Some(&corpus)).unwrap();
+            let windows: BTreeMap<u32, f64> = ranked.0.as_ref().map_or_else(BTreeMap::new, |windows| windows.windows.iter().map(|(bound, window)| (*window, *bound)).collect());
+            for (doc, score) in &expected {
+                let bound = windows.get(&(doc.doc / WINDOW)).unwrap_or_else(|| panic!("{matching:?}: doc {} is in no window", doc.doc));
+                assert!(score <= bound, "{matching:?}: doc {} scores {score} above its window's bound {bound}", doc.doc);
+            }
+            let mut handed = Vec::new();
+            let mut expansions = 0;
+            while let Some(bound) = ranked.bound() {
+                let batch = ranked.expand().unwrap();
+                expansions += 1;
+                assert!(batch.iter().all(|(_, score)| *score <= bound), "{matching:?}: a document scored above the bound before it");
+                handed.extend(batch);
+            }
+            assert!(ranked.expand().unwrap().is_empty());
+            handed.sort_by_key(|(doc, _)| doc.doc);
+            expected.sort_by_key(|(doc, _)| doc.doc);
+            assert_eq!(handed, expected, "{matching:?}");
+            if !expected.is_empty() { assert!(expansions > 1, "{matching:?} was handed out in one batch"); }
+        }
+    }
+
+    #[test]
+    fn match_values_tell_a_null_column_from_one_that_does_not_match_by_page_and_row() {
+        let rows = corpus_rows(300, 3);
+        let pages: Vec<Vec<SearchRow>> = rows.chunks(70).map(<[SearchRow]>::to_vec).collect();
+        let mut bytes = Vec::new();
+        write_search_file(&columns(), pages.iter().cloned().map(Ok), "job", RamDirectory::create(), &mut bytes).unwrap();
+        let file = SearchFile::open(bytes, &columns()).unwrap();
+        let query = Query::parse("invoice");
+        let values = file.match_values("body", &query).unwrap();
+        for (page, rows) in pages.iter().enumerate() {
+            for (row, search_row) in rows.iter().enumerate() {
+                let expected = search_row.values[1].as_ref().map(|tokens| query.matches(tokens));
+                assert_eq!(values.value(page, row).unwrap(), expected, "page {page} row {row}");
+            }
+            assert!(values.value(page, rows.len()).is_err() || page + 1 < pages.len(), "past the last row of the last page");
+        }
+        assert!(values.value(pages.len(), 0).is_err());
+        assert!(file.match_values("title", &query).unwrap().value(0, 0).unwrap().is_none(), "a column no row holds is null everywhere");
     }
 }
