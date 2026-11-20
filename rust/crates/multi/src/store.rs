@@ -294,7 +294,7 @@ pub fn reap_local(root: &Path, record: &DeploymentRecord, grace: Duration, refer
     Ok(reaped)
 }
 
-fn read_pack_index(path: &Path) -> Option<crate::packing::PackIndex> {
+pub(crate) fn read_pack_index(path: &Path) -> Option<crate::packing::PackIndex> {
     let bytes = std::fs::read(path).ok()?;
     let length = u64::from_be_bytes(bytes.get(bytes.len().checked_sub(8)?..)?.try_into().ok()?) as usize;
     let start = bytes.len().checked_sub(8 + length)?;

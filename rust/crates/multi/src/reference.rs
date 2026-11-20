@@ -125,27 +125,44 @@ pub fn stores(prefix: &Path) -> Vec<PathBuf> {
 /// Forks the deployment at `parent` (a prefix under `root`) into `child`, referencing every object the parent's stores hold or reference, or, from a past block, only those that existed when it was written.
 pub fn fork(root: &Path, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
     let cutoff = at_block.map(|block| written_at(root, parent, block)).transpose()?;
-    let existed = |path: &Path| cutoff.is_none_or(|cutoff| std::fs::metadata(path).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified <= cutoff));
+    // A past block's packs are the ones its own pack names; other objects are told by their write times.
+    let packs = at_block.map(|block| block_packs(root, parent, block)).transpose()?;
+    let existed = |key: &str, path: &Path| match (&packs, key.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY))) {
+        (Some(packs), true) => packs.contains(key),
+        _ => cutoff.is_none_or(|cutoff| std::fs::metadata(path).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified <= cutoff)),
+    };
     for store in stores(&root.join(parent)) {
         let version = store.file_name().expect("a store directory has a name").to_string_lossy().into_owned();
         let mut base = Base::load(&store)?;
-        base.objects.retain(|key, directory| existed(&root.join(directory.as_str()).join(key)));
+        base.objects.retain(|key, directory| existed(key, &root.join(directory.as_str()).join(key)));
         let relative = format!("{parent}/{version}");
-        for key in physical_objects(&store)? { if existed(&store.join(&key)) { base.objects.insert(key, relative.clone()); } }
+        for key in physical_objects(&store)? { if existed(&key, &store.join(&key)) { base.objects.insert(key, relative.clone()); } }
         base.save(&root.join(child).join(&version))?;
     }
     Ok(())
 }
 
-/// When `block`'s pack, the one object a flush of it writes, was written in `parent`'s stores.
-pub fn written_at(root: &Path, parent: &str, block: i64) -> Result<std::time::SystemTime> {
-    let catalog = rtdb_format::keys::block_key(rtdb_types::BlockIndex(block))?;
-    let pack = crate::packing::block_pack(&catalog);
+/// Where `block`'s pack, the one object a flush of it writes, is in `parent`'s stores.
+fn block_pack_path(root: &Path, parent: &str, block: i64) -> Result<PathBuf> {
+    let pack = crate::packing::block_pack(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block))?);
     for store in stores(&root.join(parent)) {
         let location = match Base::load(&store)?.objects.get(&pack) { Some(directory) if !store.join(&pack).exists() => root.join(directory).join(&pack), _ => store.join(&pack) };
-        if let Ok(modified) = std::fs::metadata(&location).and_then(|metadata| metadata.modified()) { return Ok(modified); }
+        if location.exists() { return Ok(location); }
     }
     Err(Anomaly::incorrect("rtdb.multi/no-such-block", format!("Block {block} has no pack in the deployment's store")))
+}
+
+/// When `block`'s pack was written in `parent`'s stores.
+pub fn written_at(root: &Path, parent: &str, block: i64) -> Result<std::time::SystemTime> {
+    std::fs::metadata(block_pack_path(root, parent, block)?).and_then(|metadata| metadata.modified()).map_err(io)
+}
+
+/// The packs that existed when `block` was written: its own, and every one its index names.
+fn block_packs(root: &Path, parent: &str, block: i64) -> Result<std::collections::BTreeSet<String>> {
+    let path = block_pack_path(root, parent, block)?;
+    let index = crate::store::read_pack_index(&path).ok_or_else(|| Anomaly::fault("rtdb.multi/pack-index", format!("{} has no readable index", path.display())))?;
+    let own = crate::packing::block_pack(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block))?);
+    Ok(index.previous.into_iter().chain([own]).collect())
 }
 
 /// Every reference in a cell: for each physical object, the store directories that reference it.
@@ -185,6 +202,9 @@ fn copy_in(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to.parent().expect("an object has a directory")).map_err(io)?;
     let temporary = to.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
     std::fs::copy(from, &temporary).map_err(io)?;
+    // A copy keeps its original's write time, by which a fork at a past block tells what existed then.
+    let modified = std::fs::metadata(from).and_then(|metadata| metadata.modified()).map_err(io)?;
+    std::fs::File::options().write(true).open(&temporary).and_then(|file| file.set_modified(modified)).map_err(io)?;
     std::fs::rename(&temporary, to).map_err(io)
 }
 
@@ -225,5 +245,26 @@ mod tests {
         assert_eq!(moved, ["blocks/b00", "blocks/b01"]);
         assert!(!there.path().join("c/v06").join(BASE_MANIFEST).exists(), "the moved store references nothing");
         assert_eq!(std::fs::read(there.path().join("c/v06/blocks/b00")).unwrap(), b"parent");
+    }
+
+    #[test]
+    fn a_fork_at_a_past_block_takes_the_packs_that_blocks_index_names_whatever_their_write_times() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("p/v06");
+        let pack = |block: i64| crate::packing::block_pack(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block)).unwrap());
+        std::fs::create_dir_all(store.join(crate::packing::PACK_DIRECTORY)).unwrap();
+        let first = crate::packing::encode_pack(&BTreeMap::from([("blocks/b00.binpb".to_owned(), Bytes::from_static(b"zero"))]), Vec::new()).0;
+        std::fs::write(store.join(pack(0)), &first).unwrap();
+        let second = crate::packing::encode_pack(&BTreeMap::from([("blocks/b01.binpb".to_owned(), Bytes::from_static(b"one"))]), vec![pack(0)]).0;
+        std::fs::write(store.join(pack(1)), &second).unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(store.join(pack(1))).unwrap().set_modified(long_ago).unwrap();
+        fork(root.path(), "p", "c", Some(0)).unwrap();
+        let base = Base::load(&root.path().join("c/v06")).unwrap();
+        assert_eq!(base.objects.keys().cloned().collect::<Vec<_>>(), [pack(0)], "a later block's pack is left out even when its write time says otherwise");
+
+        let copied = root.path().join("copy");
+        copy_in(&store.join(pack(1)), &copied).unwrap();
+        assert_eq!(std::fs::metadata(&copied).unwrap().modified().unwrap(), std::fs::metadata(store.join(pack(1))).unwrap().modified().unwrap(), "a copy keeps its original's write time");
     }
 }
