@@ -105,6 +105,9 @@ The follow-up runner records the first wrong result, subsequent counts and proto
 - `4da15e2ba` reads compaction inputs directly from node-local backing storage.
   A real local compaction matched the fallback output bytes under a temporary disk budget smaller than the input.
   The storage and maintenance suites passed all 131 tests.
+- `ff72d7394` skips the same-system-time compaction pass for ordered L0 pages with distinct IIDs and ordinary put or delete intervals.
+  The maintenance suite passed all 38 tests.
+  Both compaction changes need matched throughput and memory measurements.
 
 ## Current branch measurements
 
@@ -136,7 +139,23 @@ The slower RTDB Flight run took 17.0 s against 8.9 s for the faster run, while c
 Both had zero CPU quota throttles during Flight ingest.
 The slower run charged up to 3,815 MiB to the cgroup during Flight ingest, versus 3,519 MiB in the faster run.
 Allocator and compaction comparisons are needed to explain the timing spread.
-The direct local-file compaction change landed after these images were built.
+Both compaction changes landed after these images were built.
+
+Reusing `435e56acc` with default jemalloc gave these two-run medians.
+
+| Metric | 100k RTDB, default jemalloc | 1M RTDB, default jemalloc | 1M XTDB |
+| --- | ---: | ---: | ---: |
+| pgwire ingest | 54.3k rows/s | 39.8k rows/s | 53.6k rows/s |
+| Flight prepared INSERT | 131.4k rows/s | 89.6k rows/s | 139.0k rows/s |
+| Peak working set during pgwire | 173 MiB | 879 MiB | 721 MiB |
+| Peak working set during Flight | 261 MiB | 875 MiB | 793 MiB |
+| pgwire UPDATE of 10% of orders | 50 ms | 690 ms | 621 ms |
+
+At 100,000 rows the only ratio below 1 in this set was Flight full-scan p95, with a 0.5% difference and overlapping observed ranges.
+At 1,000,000 rows default jemalloc lowered memory and narrowed the update gap.
+Flight ingest remained well behind XTDB, and pgwire ingest was slower than with glibc in this sample.
+The system was shared with other Docker and host work during portions of these measurements.
+The next comparison uses a dedicated Colima profile and retains the same limits inside each container.
 
 ## Verification
 
