@@ -349,7 +349,7 @@ mod tests {
     use rtdb_types::Iid;
 
     #[test]
-    fn same_time_compaction_admits_the_ceiling_before_cloning_an_output_row() {
+    fn same_time_compaction_resolves_a_lone_event_with_only_its_output_row() {
         let input = [StoredEvent {
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
@@ -357,22 +357,38 @@ mod tests {
             operation: StoredOperation::Delete,
             recency: None,
         }];
-        let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
-        let limit = ceiling - 1;
-        let memory = MemoryBudget::new(limit);
+        let output = row_bytes(&input[0]).unwrap() * 2;
+        let memory = MemoryBudget::new(output - 1);
         let error = resolve_same_time(&input, &memory).err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
-        let expected = format!("Cannot reserve {ceiling} bytes from budget {limit} with 0 retained");
-        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
         assert_eq!(memory.used_bytes(), 0);
 
-        let output = row_bytes(&input[0]).unwrap() * 2;
-        let memory = MemoryBudget::new(ceiling + output);
+        let memory = MemoryBudget::new(output);
         let (rows, charges) = resolve_same_time(&input, &memory).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].header(), input[0].header());
         assert_eq!(memory.used_bytes(), output);
         drop((rows, charges));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn same_time_compaction_admits_the_ceiling_before_cloning_a_second_events_row() {
+        let event = |lower, upper| StoredEvent {
+            iid: Iid([1; 16]),
+            system_from: Timestamp(100),
+            valid_time: Interval::from_micros(lower, upper).unwrap(),
+            operation: StoredOperation::Delete,
+            recency: None,
+        };
+        let input = [event(10, 20), event(30, 40)];
+        let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
+        let output = row_bytes(&input[0]).unwrap() * 2;
+        let limit = output + ceiling - 1;
+        let memory = MemoryBudget::new(limit);
+        let error = resolve_same_time(&input, &memory).err().unwrap();
+        let expected = format!("Cannot reserve {ceiling} bytes from budget {limit} with {output} retained");
+        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
         assert_eq!(memory.used_bytes(), 0);
     }
 }

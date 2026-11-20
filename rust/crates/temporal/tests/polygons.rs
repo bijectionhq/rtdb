@@ -227,7 +227,7 @@ fn ceiling_growth_reserves_both_buffers_before_visiting_and_can_retry() {
         assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp::MAX)]);
         Ok(())
     }).unwrap().unwrap();
-    assert_eq!(budget.used_bytes(), previous);
+    assert_eq!(budget.used_bytes(), 0, "an entity's first event defers its ceiling to the entity's next event");
     let pressure = root.reserve(1).unwrap();
     let denied = calculator.visit(&put, |_| -> rtdb_types::Result<()> { panic!("refused ceiling growth reached the visitor") }).unwrap_err();
     assert_eq!(denied.code, "rtdb/memory-budget-exceeded");
@@ -255,49 +255,54 @@ fn ceiling_growth_reserves_both_buffers_before_visiting_and_can_retry() {
     assert_eq!(root.used_bytes(), 0);
 
     calculator.visit(&delete, |_| Ok(())).unwrap().unwrap();
-    assert_eq!(root.used_bytes(), previous);
+    assert_eq!(root.used_bytes(), 0);
     drop(calculator);
     assert_eq!(budget.used_bytes(), 0);
     assert_eq!(root.used_bytes(), 0);
 }
 
 #[test]
-fn visitor_failure_consumes_the_event_and_the_next_iid_reuses_its_ceiling_without_admitting_more() {
-    let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
-    let root = MemoryBudget::new(2 * ceiling);
+fn an_entitys_first_event_resolves_from_the_initial_ceiling_without_admitting_memory() {
+    let root = MemoryBudget::new(0);
     let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&root));
-    let failure = Anomaly::incorrect("test/visitor", "Cannot emit ranges");
-    let first = event(1, 200, 10, 20, EventOp::Delete);
-    assert_eq!(calculator.visit(&first, |_| Err::<(), _>(failure.clone())).unwrap_err(), failure);
-    assert_eq!(root.used_bytes(), ceiling);
-
-    let pressure = root.reserve(ceiling).unwrap();
-    let next_iid = event(2, 100, 10, 20, EventOp::Put);
-    calculator.visit(&next_iid, |view| {
-        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp::MAX)]);
-        Ok(())
-    }).unwrap().unwrap();
-    assert_eq!(root.used_bytes(), 2 * ceiling);
-    drop(pressure);
-    assert_eq!(root.used_bytes(), ceiling);
+    for iid in 1..=3 {
+        calculator.visit(&event(iid, 100, 10, 20, EventOp::Put), |view| {
+            assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp::MAX)]);
+            Ok(())
+        }).unwrap().unwrap();
+    }
+    assert_eq!(root.peak_bytes(), 0);
 }
 
 #[test]
-fn a_refused_iid_rollover_keeps_the_current_entity() {
-    let root = MemoryBudget::new(4096);
+fn visitor_failure_consumes_the_event_it_was_given() {
+    let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
+    let root = MemoryBudget::new(ceiling);
     let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&root));
-    let empty = event(1, 200, 10, 10, EventOp::Put);
-    calculator.visit(&empty, |_| Ok(())).unwrap();
+    let failure = Anomaly::incorrect("test/visitor", "Cannot emit ranges");
+    assert_eq!(calculator.visit(&event(1, 200, 10, 20, EventOp::Delete), |_| Err::<(), _>(failure.clone())).unwrap_err(), failure);
+    calculator.visit(&event(1, 199, 10, 20, EventOp::Put), |view| {
+        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp(200))]);
+        Ok(())
+    }).unwrap().unwrap();
+    assert_eq!(root.used_bytes(), ceiling);
+    calculator.reset();
     assert_eq!(root.used_bytes(), 0);
+}
 
-    let pressure = root.reserve(4096).unwrap();
-    let next_iid = event(2, 100, 10, 20, EventOp::Put);
-    let refused = calculator.visit(&next_iid, |_| -> rtdb_types::Result<()> { panic!("refused IID reached the visitor") }).unwrap_err();
+#[test]
+fn a_refused_ceiling_leaves_the_event_unconsumed() {
+    let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
+    let root = MemoryBudget::new(ceiling);
+    let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&root));
+    calculator.visit(&event(1, 200, 10, 20, EventOp::Put), |_| Ok(())).unwrap();
+    let pressure = root.reserve(ceiling).unwrap();
+    let second = event(1, 199, 10, 20, EventOp::Put);
+    let refused = calculator.visit(&second, |_| -> rtdb_types::Result<()> { panic!("a refused event reached the visitor") }).unwrap_err();
     assert_eq!(refused.code, "rtdb/memory-budget-exceeded");
     drop(pressure);
-    let current_iid = event(1, 199, 10, 20, EventOp::Put);
-    calculator.visit(&current_iid, |view| {
-        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp::MAX)]);
+    calculator.visit(&second, |view| {
+        assert_eq!(view.ranges().collect::<Vec<_>>(), [(Timestamp(10), Timestamp(20), Timestamp(200))]);
         Ok(())
     }).unwrap().unwrap();
 }

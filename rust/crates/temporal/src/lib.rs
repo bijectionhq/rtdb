@@ -246,16 +246,19 @@ fn ceiling_size() -> Anomaly {
 /// Resolves events in order and retains the current ceiling's storage on the supplied budget.
 pub struct AdmittedPolygonCalculator {
     state: CalculatorState<AdmittedCeiling>,
+    /// The current entity's first applied event while it has no ceiling of its own.
+    pending: Option<(Timestamp, Interval)>,
+    spare: Option<AdmittedCeiling>,
     memory: Arc<MemoryBudget>,
 }
 
 impl AdmittedPolygonCalculator {
     pub fn new(bounds: Option<TemporalBounds>, memory: Arc<MemoryBudget>) -> Self {
-        Self { state: CalculatorState::new(bounds), memory }
+        Self { state: CalculatorState::new(bounds), pending: None, spare: None, memory }
     }
 
     /// Clears the event position and releases the retained ceiling.
-    pub fn reset(&mut self) { self.state.entity = None; }
+    pub fn reset(&mut self) { self.state.entity = None; self.pending = None; self.spare = None; }
 
     /// Visits the pre-event ranges of each eligible event, including an event with an empty valid-time interval.
     /// Uses the event order defined by [`PolygonCalculator::calculate`].
@@ -266,29 +269,40 @@ impl AdmittedPolygonCalculator {
     pub fn visit<T>(&mut self, header: &EventHeader, visitor: impl for<'a> FnOnce(PolygonView<'a>) -> Result<T>) -> Result<Option<T>> {
         let step = self.state.classify(header)?;
         if !step.applies {
+            if !step.same_entity { self.retire(); }
             self.state.advance(header, step);
             return Ok(None);
         }
-
-        // A new entity starts from the initial ceiling, so it takes the previous entity's buffers when they are large
-        // enough; they are only taken once it is certain they are reused, so a refused event leaves the entity current.
-        let recyclable = !step.same_entity && !header.valid_time.is_empty() && match self.state.entity.as_ref().and_then(|entity| entity.ceiling.as_ref()) {
-            Some(ceiling) => ceiling.capacity >= AdmittedCeiling::required(INITIAL_VALID_TIMES, INITIAL_SYSTEM_TIME_CEILINGS, header.valid_time)?,
-            None => false,
-        };
-        let recycled = if recyclable { self.state.entity.as_mut().and_then(|entity| entity.ceiling.take()) } else { None };
-        let current = self.state.entity.as_ref().filter(|_| step.same_entity).and_then(|entity| entity.ceiling.as_ref());
+        if !step.same_entity {
+            // An entity's first event sees the initial ceiling; it is applied to a ceiling only if the entity has another.
+            let result = visitor(PolygonView::new(INITIAL_VALID_TIMES, INITIAL_SYSTEM_TIME_CEILINGS, header.valid_time));
+            self.retire();
+            self.state.advance(header, step);
+            self.pending = (!header.valid_time.is_empty()).then_some((header.system_from, header.valid_time));
+            return result.map(Some);
+        }
+        if let Some((system_from, interval)) = self.pending && self.state.entity.as_ref().is_some_and(|entity| entity.ceiling.is_none()) {
+            let mut ceiling = match self.spare.take() {
+                Some(mut spare) if spare.capacity >= AdmittedCeiling::required(INITIAL_VALID_TIMES, INITIAL_SYSTEM_TIME_CEILINGS, interval)? => {
+                    spare.ceiling.valid_times.clear(); spare.ceiling.valid_times.extend_from_slice(INITIAL_VALID_TIMES);
+                    spare.ceiling.system_time_ceilings.clear(); spare.ceiling.system_time_ceilings.extend_from_slice(INITIAL_SYSTEM_TIME_CEILINGS);
+                    spare
+                }
+                spare => {
+                    self.spare = spare;
+                    AdmittedCeiling::replacement(INITIAL_VALID_TIMES, INITIAL_SYSTEM_TIME_CEILINGS, 0, interval, &self.memory)?
+                        .ok_or_else(|| Anomaly::fault("rtdb/temporal-ceiling", "A pending event has an empty interval"))?
+                }
+            };
+            ceiling.ceiling.apply_event(system_from, interval);
+            if let Some(entity) = self.state.entity.as_mut() { entity.ceiling = Some(ceiling); }
+            self.pending = None;
+        }
+        let current = self.state.entity.as_ref().and_then(|entity| entity.ceiling.as_ref());
         let (valid, system, capacity) = current.map_or((INITIAL_VALID_TIMES, INITIAL_SYSTEM_TIME_CEILINGS, 0), |current| {
             (current.ceiling.valid_times(), current.ceiling.system_time_ceilings(), current.capacity)
         });
-        let replacement = match recycled {
-            Some(mut recycled) => {
-                recycled.ceiling.valid_times.clear(); recycled.ceiling.valid_times.extend_from_slice(INITIAL_VALID_TIMES);
-                recycled.ceiling.system_time_ceilings.clear(); recycled.ceiling.system_time_ceilings.extend_from_slice(INITIAL_SYSTEM_TIME_CEILINGS);
-                Some(recycled)
-            }
-            _ => AdmittedCeiling::replacement(valid, system, capacity, header.valid_time, &self.memory)?,
-        };
+        let replacement = AdmittedCeiling::replacement(valid, system, capacity, header.valid_time, &self.memory)?;
         let result = visitor(PolygonView::new(valid, system, header.valid_time));
         let entity = self.state.advance(header, step);
         if let Some(replacement) = replacement { entity.ceiling = Some(replacement); }
@@ -296,6 +310,12 @@ impl AdmittedPolygonCalculator {
             admitted.ceiling.apply_event(header.system_from, header.valid_time);
         }
         result.map(Some)
+    }
+
+    /// Ends the current entity, keeping its ceiling's buffers for the next entity that needs one.
+    fn retire(&mut self) {
+        self.pending = None;
+        if let Some(ceiling) = self.state.entity.as_mut().and_then(|entity| entity.ceiling.take()) { self.spare = Some(ceiling); }
     }
 }
 
