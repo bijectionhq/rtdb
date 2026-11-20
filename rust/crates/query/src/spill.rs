@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use rtdb_columnar::MemoryBudget;
@@ -8,9 +8,15 @@ use tempfile::{NamedTempFile, TempDir, TempPath};
 
 use crate::{cursor::OwnedRow, invalid};
 
-pub(crate) struct SpillRegion { directory: TempDir, limit: u64, retained: AtomicU64, peak: AtomicU64 }
+/// A query's spill files, in a directory created by the first of them: most queries never spill.
+pub(crate) struct SpillRegion { directory: std::sync::OnceLock<TempDir>, limit: u64, retained: AtomicU64, peak: AtomicU64 }
 impl SpillRegion {
-    pub fn new(limit: u64) -> Result<Self> { Ok(Self { directory: TempDir::new().map_err(io_error)?, limit, retained: AtomicU64::new(0), peak: AtomicU64::new(0) }) }
+    pub fn new(limit: u64) -> Result<Self> { Ok(Self { directory: std::sync::OnceLock::new(), limit, retained: AtomicU64::new(0), peak: AtomicU64::new(0) }) }
+    fn directory(&self) -> Result<&std::path::Path> {
+        if let Some(directory) = self.directory.get() { return Ok(directory.path()); }
+        let created = TempDir::new().map_err(io_error)?;
+        Ok(self.directory.get_or_init(|| created).path())
+    }
     pub fn retained_bytes(&self) -> u64 { self.retained.load(Ordering::Acquire) }
     pub fn peak_bytes(&self) -> u64 { self.peak.load(Ordering::Relaxed) }
     fn reserve(&self, bytes: u64) -> Result<()> {
@@ -20,8 +26,8 @@ impl SpillRegion {
         Ok(())
     }
     pub fn create(self: &Arc<Self>) -> Result<SpillWriter> {
-        let (file, path) = NamedTempFile::new_in(self.directory.path()).map_err(io_error)?.into_parts();
-        Ok(SpillWriter { file, retained: Arc::new(SpillFile { path, region: Arc::clone(self), bytes: AtomicU64::new(0) }) })
+        let (file, path) = NamedTempFile::new_in(self.directory()?).map_err(io_error)?.into_parts();
+        Ok(SpillWriter { file: BufWriter::new(file), position: 0, retained: Arc::new(SpillFile { path, region: Arc::clone(self), bytes: AtomicU64::new(0) }) })
     }
 }
 
@@ -32,13 +38,13 @@ impl Drop for SpillFile {
 impl SpillFile {
     pub fn reader(self: &Arc<Self>, memory: Arc<MemoryBudget>) -> Result<SpillReader> {
         let file = File::open(&self.path).map_err(io_error)?;
-        Ok(SpillReader { file, retained: Arc::clone(self), memory })
+        Ok(SpillReader { file: BufReader::new(file), retained: Arc::clone(self), memory })
     }
 }
 
-pub(crate) struct SpillWriter { file: File, retained: Arc<SpillFile> }
+pub(crate) struct SpillWriter { file: BufWriter<File>, position: u64, retained: Arc<SpillFile> }
 impl SpillWriter {
-    pub fn position(&mut self) -> Result<u64> { self.file.stream_position().map_err(io_error) }
+    pub fn position(&mut self) -> Result<u64> { Ok(self.position) }
     pub fn reader(&mut self, memory: Arc<MemoryBudget>) -> Result<SpillReader> {
         self.file.flush().map_err(io_error)?;
         self.retained.reader(memory)
@@ -51,7 +57,9 @@ impl SpillWriter {
         self.retained.region.reserve(count)?;
         self.retained.bytes.fetch_add(count, Ordering::Relaxed);
         self.file.write_all(&(bytes.len() as u64).to_le_bytes()).map_err(io_error)?;
-        self.file.write_all(&bytes).map_err(io_error)
+        self.file.write_all(&bytes).map_err(io_error)?;
+        self.position += count;
+        Ok(())
     }
     pub fn finish(mut self) -> Result<Arc<SpillFile>> {
         self.file.flush().map_err(io_error)?;
@@ -59,7 +67,7 @@ impl SpillWriter {
     }
 }
 
-pub(crate) struct SpillReader { file: File, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
+pub(crate) struct SpillReader { file: BufReader<File>, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
 impl SpillReader {
     pub fn seek(&mut self, offset: u64) -> Result<()> {
         if offset > self.retained.bytes.load(Ordering::Relaxed) { return Err(invalid("invalid-spill","Spill offset exceeds its file")); }
@@ -78,7 +86,10 @@ impl SpillReader {
         let mut bytes = vec![0; length];
         self.file.read_exact(&mut bytes).map_err(io_error)?;
         let values = serde_json::from_slice::<Vec<Value>>(&bytes).map_err(io_error)?;
-        OwnedRow::with_reservation(values, reservation).map(Some)
+        drop(bytes);
+        let row = OwnedRow::new(values, &self.memory)?;
+        drop(reservation);
+        Ok(Some(row))
     }
 }
 

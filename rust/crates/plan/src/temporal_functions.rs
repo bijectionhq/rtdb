@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use crate::{BinaryOp, Expr};
 use rtdb_types::{Anomaly, IntervalUnit, LogicalType as L, Result, ScalarType as S, TimeUnit, Value, ZoneId};
 use rtdb_types::transit_value::TransitValue as T;
@@ -83,7 +84,7 @@ fn arity(name: &str) -> Anomaly { Anomaly::incorrect("xtdb/invalid-function-arit
 
 /// Returns RANGE_BINS cell metadata: microsecond UTC `_from`/`_to` and double `_weight`.
 pub fn range_bin_element_type() -> L {
-    L::Struct(std::collections::BTreeMap::from([
+    L::Struct(StructFields::from([
         ("_from".into(),L::Scalar(S::Timestamp { unit: TimeUnit::Microsecond,timezone: Some("UTC".into()) })),
         ("_to".into(),L::Scalar(S::Timestamp { unit: TimeUnit::Microsecond,timezone: Some("UTC".into()) })),
         ("_weight".into(),L::Scalar(S::F64)),

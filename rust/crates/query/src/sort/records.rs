@@ -119,6 +119,28 @@ impl RecordStore {
         }
         selected.finish()
     }
+    /// Each record's first `width` values: borrowed from memory, or read from the spill in one pass and charged until dropped.
+    pub fn key_prefixes(&self,width: usize) -> Result<KeyPrefixes<'_>> {
+        self.context.check_cancelled()?;
+        match &self.backing {
+            RecordBacking::Memory(rows) => Ok(KeyPrefixes { width,backing: PrefixBacking::Memory(rows.rows()) }),
+            RecordBacking::Disk { file,offsets } => {
+                let mut reader = file.reader(Arc::clone(&self.context.memory))?;
+                let mut keys = Vec::new();
+                keys.try_reserve_exact(offsets.values.len()).map_err(|_|invalid("sort-size","Sort key capacity exceeds addressable memory"))?;
+                let mut bytes = offsets.values.len().checked_mul(std::mem::size_of::<OwnedRow>()).ok_or_else(||invalid("sort-size","Sort key capacity overflow"))?;
+                while let Some(row) = reader.next()? {
+                    self.context.check_cancelled()?;
+                    let prefix = &row.values[..width.min(row.values.len())];
+                    bytes = prefix.iter().try_fold(bytes,|bytes,value| bytes.checked_add(value.retained_bytes()?).ok_or_else(||invalid("sort-size","Sort key bytes overflow")))?;
+                    keys.push(prefix.to_vec());
+                }
+                if keys.len() != offsets.values.len() { return Err(invalid("invalid-spill","Sort spill row count differs from its offsets")); }
+                let reservation = self.context.memory.reserve(bytes)?;
+                Ok(KeyPrefixes { width,backing: PrefixBacking::Disk { keys,_reservation: reservation } })
+            }
+        }
+    }
     pub fn into_cursor(self) -> Result<RecordCursor> {
         self.context.check_cancelled()?;
         let backing = match self.backing {
@@ -129,6 +151,17 @@ impl RecordStore {
             }
         };
         Ok(RecordCursor { context: self.context,backing: Some(backing) })
+    }
+}
+
+pub(crate) struct KeyPrefixes<'store> { width: usize,backing: PrefixBacking<'store> }
+enum PrefixBacking<'store> { Memory(&'store [OwnedRow]),Disk { keys: Vec<Vec<Value>>,_reservation: Arc<MemoryReservation> } }
+impl KeyPrefixes<'_> {
+    pub fn get(&self,index: usize) -> Result<&[Value]> {
+        match &self.backing {
+            PrefixBacking::Memory(rows) => { let row = &rows.get(index).ok_or_else(record_index)?.values; Ok(&row[..self.width.min(row.len())]) }
+            PrefixBacking::Disk { keys,.. } => keys.get(index).map(Vec::as_slice).ok_or_else(record_index),
+        }
     }
 }
 

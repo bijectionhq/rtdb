@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use prost_types::Any;
 use rtdb_kafka::connect::{ConnectConfig, ConnectData, PluginRegistry, ResumeToken, SinkRecord, SourceConfig, SOURCE_TYPE};
@@ -264,7 +265,7 @@ async fn flatten_propagates_ancestor_optional_defaults_and_preserves_arrays() {
     let value = converter.decode("events", Some(br#"{"schema":{"type":"struct","fields":[{"field":"nested","type":"struct","optional":true,"fields":[{"field":"n","type":"int64","default":9},{"field":"xs","type":"array","items":{"type":"string"}}]}]},"payload":{"nested":{"n":null,"xs":["a","b"]}}}"#), &mut context).await.unwrap();
     let mut chain = PluginRegistry::default().chain_with_environment(&config,environment()).unwrap();
     let record = chain.apply(SinkRecord::new("events".into(), 0, 1, ConnectData::null(), value)).unwrap().unwrap();
-    assert_eq!(record.value.value, Value::Struct(BTreeMap::from([("nested.n".into(), Value::I64(9)), ("nested.xs".into(), Value::List(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]))])));
+    assert_eq!(record.value.value, Value::Struct(StructFields::from([("nested.n".into(), Value::I64(9)), ("nested.xs".into(), Value::List(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]))])));
     let schema = record.value.schema.unwrap(); assert!(schema.field("nested.n").unwrap().schema.optional); assert_eq!(schema.field("nested.n").unwrap().schema.default, Some(Value::I64(9)));
 }
 
@@ -314,7 +315,7 @@ async fn confluent_avro_registry_lookup_is_cached_and_null_tombstones_do_not_fet
     assert_eq!(converter.decode("events", None, &mut context).await.unwrap(), ConnectData::null());
     let mut payload = vec![0, 0, 0, 0, 7]; payload.push(14);
     let first = converter.decode("events", Some(&payload), &mut context).await.unwrap();
-    assert_eq!(first.value, Value::Struct(BTreeMap::from([("id".into(), Value::I64(7))])));
+    assert_eq!(first.value, Value::Struct(StructFields::from([("id".into(), Value::I64(7))])));
     assert_eq!(first.schema.as_ref().unwrap().version, Some(3));
     let requests = server.await.unwrap(); assert!(requests[0].starts_with("GET /schemas/ids/7 ")); assert!(requests[1].starts_with("POST /subjects/events-value?normalize=false&deleted=true "));
     assert_eq!(converter.decode("events", Some(&payload), &mut context).await.unwrap(), first);

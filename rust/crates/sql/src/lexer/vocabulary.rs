@@ -73,7 +73,7 @@ pub(super) fn punctuation(source: &str) -> Option<(Punctuation, usize)> {
 }
 
 #[cfg(test)]
-pub(super) fn spellings() -> impl Iterator<Item = (&'static str, &'static str)> {
+pub(crate) fn spellings() -> impl Iterator<Item = (&'static str, &'static str)> {
     KEYWORDS.iter().map(|name| (*name, *name)).chain(ALIASES.iter().copied())
         .chain(PUNCTUATION.iter().map(|(spelling, kind)| (*spelling, kind.name())))
 }

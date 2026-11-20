@@ -140,6 +140,10 @@ impl Context<'_> {
     }
 
     pub(crate) fn admit_expression_literals(&mut self, expression: &ast::Expr) -> Result<()> {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.admit_expression_literals_at(expression))
+    }
+
+    fn admit_expression_literals_at(&mut self, expression: &ast::Expr) -> Result<()> {
         match expression {
             ast::Expr::Interval(interval) => { self.interval_literal(interval)?; }
             ast::Expr::TypedString(value) => {

@@ -7,6 +7,8 @@ mod tests;
 use std::{fmt::Write, sync::Arc};
 use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, Result};
 pub(crate) use vocabulary::{Keyword, Punctuation, keyword};
+#[cfg(test)]
+pub(crate) use vocabulary::spellings;
 pub(crate) use stream::{IndexedLexeme, StreamError, TokenStream};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

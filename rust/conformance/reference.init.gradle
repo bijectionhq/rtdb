@@ -46,7 +46,8 @@ gradle.projectsEvaluated {
         task.environment(test.environment)
         task.environment("XTDB_REE_IIDS", "false")
         task.environment("XTDB_WITHIN_FILE_RECENCY_BRANCHING", "false")
-        task.workingDir(root.file(root.providers.gradleProperty("rtdb.mixedIidWorkspace").get()))
+        def workspace = root.providers.gradleProperty("rtdb.mixedIidWorkspace")
+        task.doFirst { task.workingDir(root.file(workspace.get())) }
         task.mainClass.set("clojure.main")
         task.outputs.upToDateWhen { false }
     }

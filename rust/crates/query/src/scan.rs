@@ -3,21 +3,22 @@ use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray, UnionArray};
+use arrow_array::{Array, StructArray};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
-use rtdb_format::{ipc::{ArrowFile, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
-use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, RowSource, Snapshot, TrieState};
+use rtdb_format::{ipc::{ArrowFile, FileLayout, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
+use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
-use rtdb_storage::{ObjectKey, cache::BufferPool};
+use rtdb_storage::{ObjectKey, cache::{BufferPool, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
-use rtdb_types::{Anomaly, EventHeader, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, EventHeader, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
-use crate::{context::Execution, cursor::OwnedRow, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
+use crate::{context::Execution, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
-enum DataState { Unopened, Open { reader: ArrowFile, _reservation: Arc<MemoryReservation> } }
+/// A data file read whole from the buffer pool, or, where the pool no longer holds it but its layout is known, a page at a time.
+enum DataState { Unopened, Open { reader: ArrowFile, _reservation: Arc<MemoryReservation> }, Ranged { reader: ArrowFile, file: rtdb_format::ipc::SparseFile, _reservation: Arc<MemoryReservation> } }
 struct DataFile { storage: Arc<BufferPool>, key: ObjectKey, state: DataState }
 
 #[derive(Default)]
@@ -38,7 +39,7 @@ impl FileDescriptors {
     }
 }
 
-enum PageSource { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File { file: usize, page: usize } }
+enum PageSource { Live { table: Arc<LiveTable>, rows: Arc<LocatedRows> }, File { file: usize, page: usize } }
 struct Page { lower: Iid, upper: Iid, priority: usize, source: PageSource, summary: PageSummary, content_matches: bool }
 
 #[derive(Default)]
@@ -99,12 +100,23 @@ fn summary_bytes(count: usize) -> Result<usize> {
         .ok_or_else(|| invalid("scan-summary-size", "Scan summary capacity exceeds addressable memory"))
 }
 
-enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File(Arc<IndexBatch>) }
-struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation> }
+/// A loaded page's rows.
+enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<LocatedRows> }, File(Arc<IndexBatch>) }
+struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation>, _charge: Option<Arc<MemoryReservation>> }
 impl ActiveRows {
-    fn len(&self) -> usize { match self { Self::Live { rows, .. } => rows.len(), Self::File(batch) => batch.len() } }
+    fn len(&self) -> usize { match self { Self::Live { rows, .. } => rows.located.len(), Self::File(batch) => batch.len() } }
     fn row(&self, index: usize) -> Result<RowSource> {
-        match self { Self::Live { table, rows } => table.row(rows[index]), Self::File(batch) => Ok(RowSource { batch: Arc::clone(batch), row: index }) }
+        match self { Self::Live { table, rows } => table.row_at(rows.located[index]), Self::File(batch) => Ok(RowSource { batch: Arc::clone(batch), row: index }) }
+    }
+    /// The batch holding row `index`, the slot that names it within this page, and the row's position in it.
+    fn batch(&self, index: usize) -> Result<(usize, &Arc<IndexBatch>, u32)> {
+        match self {
+            Self::Live { table, rows } => { let at = rows.located[index]; let (batch, row) = table.batch_at(at)?; Ok((at.0 as usize, batch, row)) }
+            Self::File(batch) => Ok((0, batch, u32::try_from(index).map_err(|_| invalid("page-size", "A page row exceeds u32 addressing"))?)),
+        }
+    }
+    fn header(&self, index: usize) -> Result<EventHeader> {
+        match self { Self::Live { rows, .. } => Ok(rows.headers[index]), Self::File(batch) => batch.header(index) }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +141,7 @@ struct PartitionScan {
     pages: PageDescriptors,
     tasks: Option<ScanTaskPlan>,
     loaded: BTreeMap<usize, LoadedPage>,
-    output: VecDeque<OwnedPage>,
+    output: VecDeque<crate::columnar::ColumnBatch>,
     output_reservation: Option<Arc<MemoryReservation>>,
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
@@ -141,7 +153,33 @@ struct PartitionScan {
 }
 
 use crate::analysis::ScanCounts;
-pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, _reservation: Arc<MemoryReservation> }
+
+/// The IIDs an `_id` predicate selects, as the reference's scan narrows to them: `_id = v`, or an OR of such, with every
+/// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name one IID — `_id = 7.0` still
+/// matches the integer ID 7 — so the scan reads every IID; the predicate itself is applied either way.
+fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::BTreeSet<Iid>> {
+    let id = scan.columns.iter().find(|field| field.name == "_id")?.id;
+    let eid = |expr: &Expr| -> Option<Iid> {
+        let value = match expr { Expr::Literal(value) => value, Expr::Parameter { index, .. } => parameters.get(*index)?, _ => return None };
+        value.entity_id().ok().map(|entity| entity.iid())
+    };
+    let equality = |expr: &Expr| -> Option<Iid> {
+        let Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } = expr else { return None };
+        match (left.as_ref(), right.as_ref()) {
+            (Expr::Column { id: column, .. }, value) | (value, Expr::Column { id: column, .. }) if *column == id => eid(value),
+            _ => None,
+        }
+    };
+    fn disjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr { Expr::Binary { op: rtdb_plan::BinaryOp::Or, left, right } => { disjuncts(left, out); disjuncts(right, out); } other => out.push(other) }
+    }
+    scan.predicates.iter().filter(|predicate| predicate.referenced_columns() == std::collections::BTreeSet::from([id])).find_map(|predicate| {
+        let mut clauses = Vec::new();
+        disjuncts(predicate, &mut clauses);
+        clauses.into_iter().map(equality).collect::<Option<std::collections::BTreeSet<_>>>()
+    })
+}
+pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, memory: Arc<MemoryBudget>, _reservation: Arc<MemoryReservation> }
 impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
@@ -149,7 +187,9 @@ impl ScanCursor {
         Self::over(scan, execution, pushdowns, &database.partitions, &database.storage).await
     }
     /// A scan of the given partitions of its database, which share `storage`.
-    async fn over(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>) -> Result<Self> {
+    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>) -> Result<Self> {
+        let fixed_iids = scan.iids.is_some();
+        if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
         let canonical_entity_iids = scan.iids.is_none()
@@ -171,7 +211,7 @@ impl ScanCursor {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             let mut narrowed = scan.clone();
             let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage };
-            for accelerator in execution.context.accelerators.iter().filter(|_| scan.iids.is_none()) {
+            for accelerator in execution.context.accelerators.iter().filter(|_| !fixed_iids) {
                 let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                     current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
                     corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
@@ -199,7 +239,18 @@ impl ScanCursor {
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
                 output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
         }
-        Ok(Self { partitions, completed: ScanCounts::default(), database: name, source, _reservation: reservation })
+        Ok(Self { partitions, completed: ScanCounts::default(), database: name, source, memory: Arc::clone(&execution.context.memory), _reservation: reservation })
+    }
+}
+
+impl ScanCursor {
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        while let Some(partition) = self.partitions.front_mut() {
+            if let Some(batch) = partition.next_batch().await? { return Ok(Some(batch)); }
+            self.completed.add(partition.counts);
+            self.partitions.pop_front();
+        }
+        Ok(None)
     }
 }
 
@@ -242,12 +293,8 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
 #[async_trait]
 impl PageCursor for ScanCursor {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        while let Some(partition) = self.partitions.front_mut() {
-            if let Some(page) = partition.next_page().await? { return Ok(Some(page)); }
-            self.completed.add(partition.counts);
-            self.partitions.pop_front();
-        }
-        Ok(None)
+        let Some(batch) = self.next_batch().await? else { return Ok(None) };
+        batch.rows(&self.memory).map(Some)
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
         let mut counts = self.completed; for partition in &self.partitions { counts.add(partition.counts); }
@@ -279,6 +326,7 @@ impl PartitionScan {
             self.initialized = true;
             return Ok(());
         }
+        let page_test = crate::page_metadata::PageTest::for_scan(&self.scan, &self.execution).await?;
         let table = &self.scan.table.name.table;
         let catalog = self.snapshot.trie_catalog();
         let current_tries = || catalog.iter_tries(table).filter(|trie| trie.state == TrieState::Live);
@@ -313,8 +361,8 @@ impl PartitionScan {
             segment.trie().try_visit_leaves(|leaf| {
                 let (lower, upper) = path_range(leaf.path().as_slice())?;
                 if !self.path_matches(lower, upper) { return Ok(()); }
-                let rows = leaf.sorted_rows(segment.as_ref())?;
-                let temporal = summarize_rows(rows.iter().map(|row| segment.row(*row)))?;
+                let rows = segment.located_rows(leaf)?;
+                let temporal = summarize_headers(rows.headers.iter().copied());
                 pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true,
                     summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)
             })?;
@@ -373,11 +421,22 @@ impl PartitionScan {
             if !self.path_matches(lower, upper) { continue; }
             let slug = slug.as_ref().ok_or_else(|| invalid("missing-table-slug", "Persisted trie has no recorded table registry entry"))?;
             let key = ObjectKey::new(slug.metadata_key(&trie.key))?;
-            let lease = self.storage.get(&key).await?;
-            let mut cursor = Cursor::new(lease);
-            let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
-            let _reservation = self.execution.context.memory.reserve(layout.full_allocation_bound()?)?;
-            let metadata = MetadataFile::read_reader(cursor)?;
+            let (metadata, _reservation) = match self.storage.view::<CachedMetadata>(&key, View::File) {
+                Some(cached) => (Arc::clone(&cached.metadata), self.execution.context.memory.reserve(cached.bound)?),
+                None => {
+                    let lease = self.storage.get_or(&key, &self.execution.context.memory).await?;
+                    let mut cursor = Cursor::new(lease);
+                    let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
+                    let bound = layout.full_allocation_bound()?;
+                    let reservation = self.execution.context.memory.reserve(bound)?;
+                    let metadata = Arc::new(MetadataFile::read_reader(cursor)?);
+                    if let Some(retained) = self.storage.admit(metadata.stored_bytes())
+                        && self.storage.insert_view(&key, View::File, Arc::new(CachedMetadata { metadata: Arc::clone(&metadata), bound, _reservation: retained })) {
+                        self.storage.evict(&key);
+                    }
+                    (metadata, reservation)
+                }
+            };
             files.admit(file_count, &self.execution.context.memory)?;
             let file = files.entries.len();
             files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, state: DataState::Unopened });
@@ -404,11 +463,11 @@ impl PartitionScan {
                     MetadataNode::RecencyBranch(children) => for (upper, node) in children.iter().rev() {
                         pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
                     },
-                    MetadataNode::Leaf { data_page_index, columns } => pages.push(Page { lower, upper, priority: live_segment_count + index,
+                    MetadataNode::Leaf { data_page_index, columns } => { let columns = &*columns.values()?; pages.push(Page { lower, upper, priority: live_segment_count + index,
                         content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
-                            && may_satisfy_not_null(&self.scan, columns),
+                            && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?,
                         source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
-                            recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?,
+                            recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)? }
                 }
             }
         }
@@ -427,29 +486,76 @@ impl PartitionScan {
         if self.loaded.contains_key(&index) { return Ok(()); }
         let reservation = self.execution.context.memory.reserve(std::mem::size_of::<LoadedPage>() + 256)?;
         let page = &self.pages.entries[index];
-        let rows = match &page.source {
-            PageSource::Live { table, rows } => ActiveRows::Live { table: Arc::clone(table),rows: Arc::clone(rows) },
-            PageSource::File { file, page: page_index } => {
+        let mut charge = None;
+        let mut cached = false;
+        let mut admitted: Option<(Arc<IndexBatch>, usize)> = None;
+        let hit = match &page.source {
+            PageSource::File { file, page: page_index } => self.files.entries[*file].storage.view::<CachedPage>(&self.files.entries[*file].key, View::Page(*page_index)),
+            PageSource::Live { .. } => None,
+        };
+        let rows = match (&page.source, hit) {
+            (PageSource::Live { table, rows }, _) => ActiveRows::Live { table: Arc::clone(table), rows: Arc::clone(rows) },
+            (PageSource::File { .. }, Some(held)) => {
+                charge = Some(self.execution.context.memory.reserve(held.bound)?);
+                cached = true;
+                ActiveRows::File(Arc::clone(&held.batch))
+            }
+            (PageSource::File { file, page: page_index }, None) => {
                 let data = &mut self.files.entries[*file];
+                if matches!(&data.state, DataState::Unopened) && let Some(cached) = data.storage.view::<CachedLayout>(&data.key, View::Layout) {
+                    let footer = cached.length.checked_sub(u64::try_from(cached.layout.footer_encoded_bytes).map_err(|_| invalid("file-size", "Arrow footer exceeds its file"))?)
+                        .ok_or_else(|| invalid("file-size", "Arrow footer exceeds its file"))?;
+                    let file = rtdb_format::ipc::SparseFile::new(cached.length);
+                    file.add(footer, Arc::new(data.storage.get_range_or(&data.key, footer..cached.length, &self.execution.context.memory).await?));
+                    let reservation = self.execution.context.memory.reserve(cached.layout.opening_allocation_bound()?)?;
+                    data.state = DataState::Ranged { reader: ArrowFile::from_inspected_reader(file.clone(), None, cached.layout.clone())?, file, _reservation: reservation };
+                }
                 if matches!(&data.state, DataState::Unopened) {
-                    let lease = data.storage.get(&data.key).await?;
+                    let lease = data.storage.get_or(&data.key, &self.execution.context.memory).await?;
+                    let length = lease.as_slice().len() as u64;
                     let mut cursor = Cursor::new(lease);
                     let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
+                    if let Some(retained) = data.storage.admit(layout_bytes(&layout)?)
+                        && data.storage.insert_view(&data.key, View::Layout, Arc::new(CachedLayout { length, layout: layout.clone(), _reservation: retained })) {
+                        data.storage.evict(&data.key);
+                    }
                     let reservation = self.execution.context.memory.reserve(layout.opening_allocation_bound()?)?;
                     data.state = DataState::Open { reader: ArrowFile::from_inspected_reader(cursor, None, layout)?, _reservation: reservation };
                 }
-                let DataState::Open { reader, .. } = &mut data.state else { return Err(invalid("file-state", "Data file failed to open")); };
+                let reader = match &mut data.state {
+                    DataState::Open { reader, .. } => reader,
+                    DataState::Ranged { reader, file, .. } => {
+                        let range = reader.page_range(*page_index)?;
+                        let bytes = data.storage.get_range_or(&data.key, range.clone(), &self.execution.context.memory).await?;
+                        file.retain_from(0);
+                        file.add(range.start, Arc::new(bytes));
+                        reader
+                    }
+                    DataState::Unopened => return Err(invalid("file-state", "Data file failed to open")),
+                };
                 let mut bound = reader.page_allocation_bound(*page_index)?;
                 for field in reader.schema().fields() {
                     bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?).ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
                 }
-                let reservation = self.execution.context.memory.reserve(bound)?;
-                let batch = IndexBatch::from_owned(OwnedBatch::with_reservation(reader.read_page(*page_index)?, reservation)?)?;
+                let charged = self.execution.context.memory.reserve(bound)?;
+                let page = reader.read_page(*page_index)?;
+                let headers = IndexBatch::header_bytes(page.num_rows())?;
+                let batch = match data.storage.admit(bound).zip(data.storage.admit(headers)) {
+                    Some((reservation, headers)) => {
+                        let batch = IndexBatch::from_owned_with_headers(OwnedBatch::with_reservation(page, reservation)?, headers)?;
+                        admitted = Some((Arc::clone(&batch), bound));
+                        charge = Some(charged);
+                        batch
+                    }
+                    None => IndexBatch::from_owned(OwnedBatch::with_reservation(page, charged)?)?,
+                };
                 ActiveRows::File(batch)
             }
         };
         let mut previous: Option<EventHeader> = None;
-        for index in 0..rows.len() {
+        // A live page is a slice of this process's own trie, ordered as it was built; a file page is checked when first decoded.
+        let validated = if matches!(rows, ActiveRows::Live { .. }) || cached { 0 } else { rows.len() };
+        for index in 0..validated {
             let source = rows.row(index)?;
             let header = source.header()?;
             if header.iid < page.lower || header.iid > page.upper { return Err(invalid("page-path", "Data page contains an IID outside its metadata path")); }
@@ -458,10 +564,14 @@ impl PartitionScan {
             }
             previous = Some(header);
         }
-        self.loaded.insert(index,LoadedPage { rows,_reservation: reservation });
+        if let (Some((batch, bound)), PageSource::File { file, page: page_index }) = (admitted, &page.source) {
+            let data = &self.files.entries[*file];
+            data.storage.insert_view(&data.key, View::Page(*page_index), Arc::new(CachedPage { batch, bound }));
+        }
+        self.loaded.insert(index,LoadedPage { rows,_reservation: reservation,_charge: charge });
         Ok(())
     }
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         if !self.initialized { self.initialize().await?; }
         loop {
             self.execution.context.check_cancelled()?;
@@ -481,79 +591,116 @@ impl PartitionScan {
         self.counts.pages_used = self.counts.pages_used.saturating_add(selected.len() as u64);
         selected.sort_by_key(|index| (matches!(self.pages.entries[*index].source,PageSource::Live { .. }),self.pages.entries[*index].priority,*index));
         let mut groups = Vec::with_capacity(selected.len());
+        let mut group_reservations = Vec::with_capacity(selected.len());
         let mut heads = BinaryHeap::with_capacity(selected.len());
         for (group,index) in selected.iter().copied().enumerate() {
             self.load(index).await?;
             let rows = &self.loaded[&index].rows;
             self.counts.rows_read = self.counts.rows_read.saturating_add(rows.len() as u64);
-            groups.push(PageBuilder::new(0,&self.execution.context.memory)?);
-            for ordinal in 0..rows.len() {
-                let header = rows.row(ordinal)?.header()?;
-                if header.iid > task.range.upper { break; }
-                if header.iid >= task.range.lower { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal });break; }
+            groups.push(Vec::new());
+            group_reservations.push(self.execution.context.memory.reserve(256)?);
+            let (mut low, mut high) = (0, rows.len());
+            while low < high {
+                let middle = (low + high) / 2;
+                if rows.header(middle)?.iid < task.range.lower { low = middle + 1; } else { high = middle; }
+            }
+            if low < rows.len() {
+                let header = rows.header(low)?;
+                if header.iid <= task.range.upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
             }
         }
-        let sources: Vec<(Option<Arc<IndexBatch>>, Option<(usize, usize)>)> = selected.iter().map(|index| match (&self.loaded[index].rows, &self.pages.entries[*index].source) {
-            (ActiveRows::File(batch), PageSource::File { file, page }) => (Some(Arc::clone(batch)), Some((*file, *page))),
-            _ => (None, None),
-        }).collect();
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
-        while let Some(head) = heads.pop() {
-            self.execution.context.check_cancelled()?;
-            let rows = &self.loaded[&selected[head.active]].rows;
-            let source = rows.row(head.ordinal)?;
+        let mut visited = 0usize;
+        let active: Vec<&ActiveRows> = selected.iter().map(|index| &self.loaded[index].rows).collect();
+        // Resolved rows name their batch by its place here, so a row costs no handle on its batch.
+        let mut batches: Vec<Arc<IndexBatch>> = Vec::new();
+        let mut handles: Vec<Vec<u32>> = vec![Vec::new(); active.len()];
+        let mut next = heads.pop();
+        while let Some(head) = next.take() {
+            self.execution.context.check_cancelled_at(visited)?;
+            visited += 1;
+            let rows = active[head.active];
             let ordinal = head.ordinal + 1;
-            if ordinal < rows.len() {
-                let header = rows.row(ordinal)?.header()?;
-                if header.iid <= task.range.upper { heads.push(Head { header,ordinal,..head }); }
-            }
+            let following = if ordinal < rows.len() {
+                let header = rows.header(ordinal)?;
+                (header.iid <= task.range.upper).then_some(Head { header,ordinal,..head })
+            } else { None };
+            // A page's next row that still precedes every other page's head is taken without passing through the heap.
+            next = match following {
+                Some(following) if heads.peek().is_none_or(|top| following > *top) => Some(following),
+                Some(following) => { heads.push(following); heads.pop() }
+                None => heads.pop(),
+            };
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
-            let history = resolver.resolve_in(&head.header, source, &self.execution.context.memory)?;
-            for row in history.as_slice() {
-                let bound = self.scan.columns.iter().try_fold(256usize,|bound,field|bound.checked_add(project_bound(row,&field.name)?).ok_or_else(||invalid("scan-row-size","Scan row allocation exceeds addressable memory")))?;
-                let reservation = self.execution.context.memory.reserve(bound)?;
-                let mut values = Vec::with_capacity(self.scan.columns.len());
-                for (field, slot) in self.scan.columns.iter().zip(&self.slots) {
-                    values.push(match slot { Some(evaluated) => self.match_value(row, *evaluated, &sources)?, None => project(row,&field.name)? });
+            let (slot, batch, row) = rows.batch(head.ordinal)?;
+            let page = &mut handles[head.active];
+            if page.len() <= slot { page.resize(slot + 1, u32::MAX); }
+            if page[slot] == u32::MAX { batches.push(Arc::clone(batch)); page[slot] = u32::try_from(batches.len() - 1).map_err(|_| invalid("scan-row-size", "A task reads more batches than u32 names"))?; }
+            let source = (page[slot], row);
+            let group: &mut Vec<_> = &mut groups[head.active];
+            let memory = &self.execution.context.memory;
+            resolver.resolve_fragments(&head.header, |valid_time, system_time| {
+                if group.len() == group.capacity() {
+                    let capacity = group.capacity().saturating_mul(2).max(64);
+                    let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<(u32, u32)>>()).ok_or_else(|| invalid("scan-row-size", "Scan rows exceed addressable memory"))?;
+                    group_reservations.push(memory.reserve(bytes)?);
+                    group.reserve_exact(capacity - group.len());
                 }
-                groups[head.active].push_growing(OwnedRow::with_reservation(values,reservation)?,&self.execution.context.memory)?;
-            }
+                group.push(ResolvedRow { source, valid_time, system_time });
+                Ok(())
+            })?;
         }
         self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper);
-        self.output = groups.into_iter().filter(|page|page.len() > 0).map(PageBuilder::finish).collect();
+        self.output = groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()).map(|(group, rows)| {
+            let page = &self.pages.entries[selected[group]].source;
+            crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory, |position| {
+                self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches)).transpose()
+            })
+        }).collect::<Result<_>>()?;
+        drop(group_reservations);
         self.output_reservation = Some(reservation);
         Ok(())
     }
-}
-impl PartitionScan {
-    /// The scan's MATCH on a resolved row: from the accelerator's answers where they cover the row's data file, and from the row's own value otherwise.
-    fn match_value(&self, row: &ResolvedRow<RowSource>, evaluated: usize, sources: &[(Option<Arc<IndexBatch>>, Option<(usize, usize)>)]) -> Result<Value> {
-        let (Some(query), answers) = &self.matches[evaluated] else { return Ok(Value::Null) };
-        if let Some(answers) = answers {
-            let source = sources.iter().find(|(batch, _)| batch.as_ref().is_some_and(|batch| Arc::ptr_eq(batch, &row.source.batch))).and_then(|(_, source)| *source);
-            if let Some((file, page)) = source {
-                // An answer the file cannot give for this row is left to the row itself: an index decides cost, never results.
-                if let Some(Ok(value)) = answers.file(&self.files.entries[file].key).map(|matches| matches.value(page, row.source.row)) {
+
+    fn match_column(&self, evaluated: usize, source: &PageSource, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
+        let (Some(query), answers) = &self.matches[evaluated] else {
+            return Ok(crate::columnar::Column::Values(vec![Value::Null; rows.len()]));
+        };
+        let page_answers = match (answers, source) {
+            (Some(answers), PageSource::File { file, page }) => answers.file(&self.files.entries[*file].key).map(|matches| (matches, *page)),
+            _ => None,
+        };
+        let name = &self.scan.matches[evaluated].column;
+        rows.iter().map(|row| {
+            let position = row.source.1 as usize;
+            if let Some((matches, page)) = page_answers {
+                if let Ok(value) = matches.value(page, position) {
                     return Ok(value.map_or(Value::Null, Value::Bool));
                 }
             }
-        }
-        Ok(rtdb_expr::match_value(&project(row, &self.scan.matches[evaluated].column)?, query))
+            let value = match name.as_str() {
+                "_valid_to" if row.valid_time.upper() == Timestamp::MAX => Value::Null,
+                "_system_to" if row.system_time.upper() == Timestamp::MAX => Value::Null,
+                "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => return Ok(Value::Bool(false)),
+                _ => read_match_input(&batches[row.source.0 as usize], position, name)?,
+            };
+            Ok(rtdb_expr::match_value(&value, query))
+        }).collect::<Result<_>>().map(crate::columnar::Column::Values)
     }
 }
-fn project_bound(row: &ResolvedRow<RowSource>,name: &str) -> Result<usize> {
-    if matches!(name,"_valid_from" | "_valid_to" | "_system_from" | "_system_to" | "_iid") { return Ok(std::mem::size_of::<Value>() + 128); }
-    let batch = row.source.batch.arrow();
-    let schema = batch.schema();
-    let op_index = schema.index_of("op").map_err(|error|invalid("event-schema",error))?;
-    let op = batch.column(op_index).as_any().downcast_ref::<UnionArray>().ok_or_else(||invalid("event-schema","Operation is not a union"))?;
-    let put = op.child(op.type_id(row.source.row)).as_any().downcast_ref::<StructArray>().ok_or_else(||invalid("event-schema","Visible event is not a put struct"))?;
-    let DataType::Struct(fields) = put.data_type() else { return Err(invalid("event-schema","Put has no struct fields")); };
-    let Some(index) = fields.iter().position(|field|field.name() == name) else { return Ok(std::mem::size_of::<Value>()); };
-    let (field, column, offset) = (&fields[index], put.column(index).as_ref(), op.value_offset(row.source.row));
-    if row.source.batch.put_field_type(index).is_some() { rtdb_columnar::estimate_read_cell_bytes(field, column, offset) }
-    else { rtdb_columnar::estimate_read_value_bytes(field, column, offset) }
+
+fn read_match_input(batch: &IndexBatch, row: usize, name: &str) -> Result<Value> {
+    let op = batch.view().operations()?;
+    let put = op.child(op.type_id(row)).as_any().downcast_ref::<StructArray>()
+        .ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?;
+    let DataType::Struct(fields) = put.data_type() else { return Err(invalid("event-schema", "Put has no struct fields")); };
+    let Some(index) = fields.iter().position(|field| field.name() == name) else { return Ok(Value::Null) };
+    let (field, array, offset) = (&fields[index], put.column(index).as_ref(), op.value_offset(row));
+    match batch.put_field_type(index) {
+        Some(logical) => rtdb_columnar::read_execution_value_as(logical, field, array, offset),
+        None => rtdb_columnar::read_execution_value(field, array, offset),
+    }
 }
 
 async fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Result<TemporalBounds> {
@@ -581,32 +728,36 @@ async fn dimension(filter: &TemporalFilter, default: rtdb_types::Instant, execut
     match filter {
         TemporalFilter::Default => point(default.as_micros()?), TemporalFilter::All => Ok(Interval::ALL),
         TemporalFilter::At(at) => point(value(at, execution.context.current_time, execution, &scope).await?),
-        TemporalFilter::FromTo { from, to } => Interval::new(value(from, Timestamp::MIN.into(), execution, &scope).await?, value(to, Timestamp::MAX.into(), execution, &scope).await?),
-        TemporalFilter::Between { from, to } => Interval::between(value(from, Timestamp::MIN.into(), execution, &scope).await?, value(to, Timestamp::MAX.into(), execution, &scope).await?),
+        TemporalFilter::FromTo { from, to } => {
+            let from = value(from, Timestamp::MIN.into(), execution, &scope).await?;
+            Interval::new(from, value(to, Timestamp::MAX.into(), execution, &scope).await?.max(from))
+        }
+        TemporalFilter::Between { from, to } => {
+            let from = value(from, Timestamp::MIN.into(), execution, &scope).await?;
+            let to = value(to, Timestamp::MAX.into(), execution, &scope).await?;
+            if to < from { Interval::new(from, from) } else { Interval::between(from, to) }
+        }
     }
 }
-fn project(row: &ResolvedRow<RowSource>, name: &str) -> Result<Value> {
-    let time = |time: Timestamp, upper: bool| if upper && time == Timestamp::MAX { Value::Null }
-        else { Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } };
-    match name {
-        "_valid_from" => return Ok(time(row.valid_time.lower(), false)), "_valid_to" => return Ok(time(row.valid_time.upper(), true)),
-        "_system_from" => return Ok(time(row.system_time.lower(), false)), "_system_to" => return Ok(time(row.system_time.upper(), true)),
-        "_iid" => return Ok(Value::FixedSizeBinary(row.source.header()?.iid.0.to_vec())), _ => {}
-    }
-    let batch = row.source.batch.arrow();
-    let schema = batch.schema();
-    let op_index = schema.index_of("op").map_err(|error| invalid("event-schema", error))?;
-    let op = batch.column(op_index).as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("event-schema", "Operation is not a union"))?;
-    let id = op.type_id(row.source.row);
-    let put = op.child(id).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?;
-    let DataType::Struct(fields) = put.data_type() else { return Err(invalid("event-schema", "Put has no struct fields")); };
-    let Some(index) = fields.iter().position(|field| field.name() == name) else { return Ok(Value::Null); };
-    let value = match row.source.batch.put_field_type(index) {
-        Some(logical) => rtdb_columnar::read_execution_value_as(logical, &fields[index], put.column(index).as_ref(), op.value_offset(row.source.row)),
-        None => rtdb_columnar::read_execution_value(&fields[index], put.column(index).as_ref(), op.value_offset(row.source.row)),
-    };
-    value.map(|value| if matches!(value, Value::Undefined) { Value::Null } else { value })
+/// Decoded trie metadata, shared by every scan of a storage: a trie file never changes once written, and a point
+/// lookup otherwise spends most of its time decoding the same files again. A query still admits the decoded size of
+/// every file it reads. Bounded by file count and decoded size.
+/// A decoded trie metadata file, and the bound a query admits for it, as it would to decode it.
+struct CachedMetadata { metadata: Arc<MetadataFile>, bound: usize, _reservation: Arc<MemoryReservation> }
+impl Cached for CachedMetadata { fn in_use(&self) -> bool { Arc::strong_count(&self.metadata) > 1 } }
+
+/// A data file's length and inspected IPC layout, which a scan otherwise re-derives by reading the whole file.
+struct CachedLayout { length: u64, layout: FileLayout, _reservation: Arc<MemoryReservation> }
+impl Cached for CachedLayout {}
+fn layout_bytes(layout: &FileLayout) -> Result<usize> {
+    layout.page_encoded_bytes.len().checked_add(layout.page_decoding_bounds.len()).and_then(|count| count.checked_mul(std::mem::size_of::<usize>()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CachedLayout>() + 256)).ok_or_else(|| invalid("file-layout-size", "File layout exceeds addressable memory"))
 }
+
+/// A decoded data page, whose batch retains the pool's reservation, and the bound a query admits for it.
+struct CachedPage { batch: Arc<IndexBatch>, bound: usize }
+impl Cached for CachedPage { fn in_use(&self) -> bool { Arc::strong_count(&self.batch) > 1 } }
+
 fn invalid_iid_path() -> Anomaly { invalid("iid-path", "Trie path exceeds 64 base-four buckets") }
 fn path_range(path: &[u8]) -> Result<(Iid, Iid)> {
     if path.len() > MAX_IID_DEPTH || path.iter().any(|bucket| *bucket > 3) { return Err(invalid_iid_path()); }
@@ -622,15 +773,14 @@ fn path_range(path: &[u8]) -> Result<(Iid, Iid)> {
 fn recency(date: Option<rtdb_types::CivilDate>) -> Result<Timestamp> {
     date.map(|date| date.epoch_day().checked_mul(86_400_000_000).map(Timestamp).ok_or_else(|| invalid("recency", "Trie recency exceeds microsecond range"))).unwrap_or(Ok(Timestamp::MAX))
 }
-fn summarize_rows(rows: impl IntoIterator<Item = Result<RowSource>>) -> Result<Option<TemporalSummary>> {
+fn summarize_headers(headers: impl IntoIterator<Item = EventHeader>) -> Option<TemporalSummary> {
     let mut result: Option<TemporalSummary> = None;
-    for row in rows {
-        let event = row?.header()?;
+    for event in headers {
         let summary = result.get_or_insert(TemporalSummary { min_valid_from: event.valid_time.lower(), max_valid_to: event.valid_time.upper(), min_system_from: event.system_from, max_system_from: event.system_from });
         summary.min_valid_from = summary.min_valid_from.min(event.valid_time.lower()); summary.max_valid_to = summary.max_valid_to.max(event.valid_time.upper());
         summary.min_system_from = summary.min_system_from.min(event.system_from); summary.max_system_from = summary.max_system_from.max(event.system_from);
     }
-    Ok(result)
+    result
 }
 fn may_satisfy_not_null(scan: &Scan, columns: &[Value]) -> bool {
     let [Expr::Unary { op: UnaryOp::IsNotNull, expr }] = scan.predicates.as_slice() else {
@@ -678,6 +828,7 @@ fn page_temporal(columns: &[Value]) -> Option<TemporalSummary> {
 
 #[cfg(test)]
 mod tests {
+    use rtdb_types::StructFields;
     use super::*;
     use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::OuterRows, parameters::BoundParameters};
     use rtdb_format::{block::proto as pb, catalog::BlockCatalog, data::{StoredEvent, StoredOperation, build_event_batch},
@@ -686,8 +837,26 @@ mod tests {
     use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable};
     use rtdb_storage::{MemoryStore, ObjectStore};
     use rtdb_trie::TrieConfig;
-    use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TransactionKey, TxId};
+    use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TimeUnit, TransactionKey, TxId};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn an_id_equality_or_disjunction_narrows_the_scan_only_when_every_value_names_one_iid() {
+        let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+        let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
+        let scan = |predicate: Expr| Scan { table: table.clone(), columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates: vec![predicate], top_k: None, matches: Vec::new() };
+        let equals = |value: Expr| Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), value);
+        let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) };
+        let iid = |value: Value| value.entity_id().unwrap().iid();
+        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::I64(7)))), &[]), Some([iid(Value::I64(7))].into()));
+        let either = Expr::binary(rtdb_plan::BinaryOp::Or, equals(Expr::Literal(Value::I64(7))), Expr::binary(rtdb_plan::BinaryOp::Eq, parameter.clone(), id.expression()));
+        assert_eq!(id_selection(&scan(either.clone()), &[Value::Utf8("seven".into())]), Some([iid(Value::I64(7)), iid(Value::Utf8("seven".into()))].into()));
+        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::F64(7.0)))), &[]), None, "7.0 still matches the integer ID 7");
+        assert_eq!(id_selection(&scan(either), &[Value::Null]), None);
+        let range = Expr::binary(rtdb_plan::BinaryOp::Lt, id.expression(), Expr::Literal(Value::I64(7)));
+        assert_eq!(id_selection(&scan(range), &[]), None);
+    }
 
     fn live_table() -> (PartitionState, TableRef, Vec<StoredEvent>) {
         let state = PartitionState::empty(TrieConfig::new(1, 1).unwrap()).unwrap();
@@ -701,7 +870,7 @@ mod tests {
                 iid: Iid([prefix; 16]),
                 system_from: key.system_time,
                 valid_time: Interval::ALL,
-                operation: StoredOperation::Put(BTreeMap::from([("_id".into(), value.clone()), ("v".into(), value)])),
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), value.clone()), ("v".into(), value)])),
                 recency: None,
             }
         }).collect::<Vec<_>>();
@@ -730,8 +899,9 @@ mod tests {
         (scan, execution, memory)
     }
 
-    async fn assert_descriptor_lifetime(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>, persisted: Option<(usize, usize)>) {
-        let (metadata_size, metadata_charge) = persisted.unwrap_or_default();
+    async fn assert_descriptor_lifetime(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>, persisted: Option<usize>) {
+        let metadata_charge = persisted.unwrap_or_default();
+        let mut held = 0;
         let files_used = usize::from(persisted.is_some());
         let storage = Arc::new(BufferPool::new(store, 1 << 20));
         let (scan, execution, memory) = descriptor_scan(snapshot, table, Arc::clone(&storage));
@@ -796,7 +966,8 @@ mod tests {
             assert!(partition.files._reservation.is_none());
             assert!(partition.tasks.is_none());
             assert!(partition.loaded.is_empty());
-            assert_eq!(storage.retained_bytes(), metadata_size);
+            held = storage.retained_bytes();
+            assert!(held > 0, "the pool holds the decoded metadata file");
             assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
             drop((cursor, pressure));
             assert_eq!(memory.used_bytes(), before_cursor);
@@ -818,7 +989,7 @@ mod tests {
             assert!(partition.tasks.is_none());
             assert!(partition.loaded.is_empty());
             assert!(partition.output.is_empty());
-            assert_eq!(storage.retained_bytes(), metadata_size);
+            assert_eq!(storage.retained_bytes(), held);
             assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
             drop(pressure);
             assert_eq!(memory.used_bytes(), cursor_open);
@@ -839,7 +1010,7 @@ mod tests {
         assert!(partition.loaded.is_empty());
         assert!(partition.files.entries.is_empty());
         assert!(partition.files._reservation.is_none());
-        assert_eq!(storage.retained_bytes(), metadata_size);
+        assert_eq!(storage.retained_bytes(), held);
         assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
         drop((cursor, pressure));
         assert_eq!(memory.used_bytes(), before_cursor);
@@ -893,7 +1064,12 @@ mod tests {
         assert_descriptor_lifetime(snapshot, table, Arc::new(MemoryStore::default()), None).await;
     }
 
-    async fn persisted_page_fixture() -> (PartitionState, TableRef, Vec<StoredEvent>, Arc<MemoryStore>, (usize, usize)) {
+    async fn persisted_page_fixture() -> (PartitionState, TableRef, Vec<StoredEvent>, Arc<MemoryStore>, usize) {
+        persisted_pages(false).await
+    }
+
+    /// Persists one page per event; `misplaced` writes the second event's page in the first one's place too.
+    async fn persisted_pages(misplaced: bool) -> (PartitionState, TableRef, Vec<StoredEvent>, Arc<MemoryStore>, usize) {
         let (state, table, events) = live_table();
         let captured = state.value();
         let table_entry = captured.table_catalog().entry(&table).unwrap();
@@ -910,8 +1086,8 @@ mod tests {
         builder.write_iid_branch(children).unwrap();
         let (metadata, statistics) = builder.finish().unwrap();
         let meta = metadata.write().unwrap();
+        if misplaced { pages[0] = pages[1].clone(); }
         let data = write_file(pages[0].schema().as_ref(), &pages).unwrap();
-        let metadata_size = meta.len();
         let probe = MemoryBudget::new(1 << 24);
         let layout = inspect_file_reserved(&mut Cursor::new(meta.as_slice()), |bytes| probe.reserve(bytes)).unwrap();
         let metadata_charge = layout.full_allocation_bound().unwrap();
@@ -924,7 +1100,62 @@ mod tests {
         store.put(&ObjectKey::new(table_entry.slug.metadata_key(&trie)).unwrap(), meta.into()).await.unwrap();
         store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
-        (state, table, events, store, (metadata_size, metadata_charge))
+        (state, table, events, store, metadata_charge)
+    }
+
+    #[tokio::test]
+    async fn a_data_page_outside_its_metadata_path_fails_every_scan_that_reads_it() {
+        let (state, table, _, store, _) = persisted_pages(true).await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        for scan_number in 0..2 {
+            let (scan, execution, _) = descriptor_scan(state.value().snapshot(), table.clone(), Arc::clone(&storage));
+            let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+            let error = loop {
+                match cursor.next_page().await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => panic!("scan {scan_number} served the misplaced page"),
+                    Err(error) => break error,
+                }
+            };
+            assert!(error.code.ends_with("page-path"), "scan {scan_number}: {error:?}");
+        }
+    }
+
+    async fn scanned_values(snapshot: Snapshot, table: TableRef, storage: &Arc<BufferPool>) -> Vec<Value> {
+        let (scan, execution, _) = descriptor_scan(snapshot, table, Arc::clone(storage));
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let mut values = Vec::new();
+        while let Some(page) = cursor.next_page().await.unwrap() { values.extend(page.rows().iter().map(|row| row.values[0].clone())); }
+        values
+    }
+
+    #[tokio::test]
+    async fn a_rescan_reads_the_decoded_metadata_and_pages_from_the_pool_without_its_objects() {
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(Arc::clone(&store) as Arc<dyn ObjectStore>, 1 << 20));
+        let expected = [Value::I64(1), Value::I64(2), Value::I64(3)];
+        assert_eq!(scanned_values(state.value().snapshot(), table.clone(), &storage).await, expected);
+        let objects = store.list(None).await.unwrap();
+        assert!(objects.iter().all(|object| !storage.holds(&object.key)), "the pool keeps decoded forms rather than the raw objects");
+        assert!(storage.retained_bytes() > 0);
+        for object in objects { store.delete(&object.key).await.unwrap(); }
+        assert_eq!(scanned_values(state.value().snapshot(), table, &storage).await, expected);
+    }
+
+    #[tokio::test]
+    async fn scans_succeed_on_pools_sharing_a_cache_smaller_than_their_files() {
+        let budget = rtdb_storage::cache::CacheBudget::new(64);
+        let mut fixtures = Vec::new();
+        for _ in 0..2 {
+            let (state, table, _, store, _) = persisted_page_fixture().await;
+            fixtures.push((state, table, Arc::new(BufferPool::with_budget(store, Arc::clone(&budget)))));
+        }
+        for _ in 0..2 {
+            for (state, table, storage) in &fixtures {
+                assert_eq!(scanned_values(state.value().snapshot(), table.clone(), storage).await, [Value::I64(1), Value::I64(2), Value::I64(3)]);
+                assert!(budget.retained_bytes() <= budget.limit_bytes());
+            }
+        }
     }
 
     #[tokio::test]
@@ -969,7 +1200,7 @@ mod tests {
             let key = TransactionKey { tx_id: TxId(tx_id), system_time: basis.system_time };
             let mut write = TransactionBuffer::new(snapshot, key, Arc::clone(&memory)).unwrap();
             let mut event = events[1].clone();
-            event.operation = StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(2)), ("v".into(), Value::I64(value))]));
+            event.operation = StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(2)), ("v".into(), Value::I64(value))]));
             write.append(table.clone(), event).unwrap();
             write.snapshot().unwrap()
         };
@@ -1005,7 +1236,7 @@ mod tests {
             iid: Iid([0xc0; 16]),
             system_from: key.system_time,
             valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(4)), ("v".into(), Value::I64(4))])),
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(4)), ("v".into(), Value::I64(4))])),
             recency: None,
         }).unwrap();
         let mixed = write.snapshot().unwrap();
@@ -1053,7 +1284,7 @@ mod tests {
         let write_memory = MemoryBudget::new(1 << 20);
         let put = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
         let mut write = TransactionBuffer::new(state.value().snapshot(), put, Arc::clone(&write_memory)).unwrap();
-        write.put(table.clone(), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(9))]), Interval::from_micros(0, 30).unwrap()).unwrap();
+        write.put(table.clone(), StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(9))]), Interval::from_micros(0, 30).unwrap()).unwrap();
         state.apply(&write.stage().unwrap()).unwrap();
         let delete = TransactionKey { tx_id: TxId(1), system_time: Timestamp(200) };
         let mut write = TransactionBuffer::new(state.value().snapshot(), delete, write_memory).unwrap();
@@ -1095,12 +1326,10 @@ mod tests {
         let timestamp_bytes = std::mem::size_of::<Timestamp>();
         let previous_ceiling = (2 * 3 + 1) * timestamp_bytes + 256;
         let replacement_ceiling = (2 * 6 + 1) * timestamp_bytes + 256;
-        let slot = std::mem::size_of::<ResolvedRow<RowSource>>();
-        let previous_history = 2 * slot + 256;
-        let replacement_history = 4 * slot + 256;
+        let history = 64 * std::mem::size_of::<ResolvedRow<(u32, u32)>>();
         for (requested, charged) in [
             (replacement_ceiling, scratch + previous_ceiling),
-            (replacement_history, scratch + previous_ceiling + replacement_ceiling + previous_history),
+            (history, scratch + previous_ceiling + replacement_ceiling),
         ] {
             let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
             let partition = cursor.partitions.front_mut().unwrap();

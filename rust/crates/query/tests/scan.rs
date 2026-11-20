@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use rtdb_types::{EntityId, Iid, Interval, LogicalType, Result, ScalarType, Table
 use tokio_util::sync::CancellationToken;
 
 fn table() -> TableRef { TableRef::new("public", "docs") }
-fn document(id: i64, value: Value) -> BTreeMap<String, Value> { BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), value)]) }
+fn document(id: i64, value: Value) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), value)]) }
 fn tx(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64, system: i64) -> TransactionBuffer {
     TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(id), system_time: Timestamp(system) }, Arc::clone(budget)).unwrap()
 }
@@ -23,7 +24,7 @@ async fn live_unsigned_cells_open_signed_while_native_metadata_rejects_unsigned_
     let budget = MemoryBudget::new(1 << 27);
     let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
     let mut transaction = tx(&state, &budget, 0, 0);
-    transaction.put(table(), document(1, Value::Struct(BTreeMap::from([("scalar".into(), Value::U64(u64::MAX)), ("list".into(), Value::List(vec![Value::U8(255)]))]))), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+    transaction.put(table(), document(1, Value::Struct(StructFields::from([("scalar".into(), Value::U64(u64::MAX)), ("list".into(), Value::List(vec![Value::U8(255)]))]))), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
     state.apply(&transaction.stage().unwrap()).unwrap();
     let physical = state.value().snapshot().column_types(&table())["v"].clone();
     let store = Arc::new(MemoryStore::default());
@@ -39,7 +40,7 @@ async fn live_unsigned_cells_open_signed_while_native_metadata_rejects_unsigned_
         assert_eq!(cursor.schema().fields()[0].data_type, physical);
         assert_eq!(cursor.runtime_schema().fields()[0].data_type, rtdb_columnar::execution_type(&physical));
         let page = cursor.next_batch().await.unwrap().unwrap();
-        assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::Struct(BTreeMap::from([("scalar".into(), Value::I64(-1)), ("list".into(), Value::List(vec![Value::I8(-1)]))])));
+        assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::Struct(StructFields::from([("scalar".into(), Value::I64(-1)), ("list".into(), Value::List(vec![Value::I8(-1)]))])));
     }
     assert_eq!(state.value().snapshot().column_types(&table())["v"], physical);
 }
@@ -132,10 +133,10 @@ async fn live_catalog_shows_staged_columns_before_applied_columns_and_respects_l
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let memory = MemoryBudget::new(1 << 27);
     let mut applied = tx(&state, &memory, 0, 10);
-    applied.put(table(), BTreeMap::from([("_id".into(), Value::I64(1)), ("applied".into(), Value::I64(10))]), Interval::ALL).unwrap();
+    applied.put(table(), StructFields::from([("_id".into(), Value::I64(1)), ("applied".into(), Value::I64(10))]), Interval::ALL).unwrap();
     state.apply(&applied.stage().unwrap()).unwrap();
     let mut pending = tx(&state, &memory, 1, 20);
-    pending.put(table(), BTreeMap::from([("_id".into(), Value::I64(2)), ("staged".into(), Value::I64(20))]), Interval::ALL).unwrap();
+    pending.put(table(), StructFields::from([("_id".into(), Value::I64(2)), ("staged".into(), Value::I64(20))]), Interval::ALL).unwrap();
     let staged = [Arc::new(pending.stage().unwrap())];
     let uncovered = state.value().snapshot().with_staged(&staged).unwrap();
     let key = TrieKey::l0(uncovered.block_index()).unwrap();
@@ -164,7 +165,7 @@ async fn live_catalog_omits_tables_whose_live_rows_are_all_flushed() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let memory = MemoryBudget::new(1 << 27);
     let mut applied = tx(&state, &memory, 0, 10);
-    applied.put(table(), BTreeMap::from([("_id".into(), Value::I64(1)), ("applied".into(), Value::I64(10))]), Interval::ALL).unwrap();
+    applied.put(table(), StructFields::from([("_id".into(), Value::I64(1)), ("applied".into(), Value::I64(10))]), Interval::ALL).unwrap();
     state.apply(&applied.stage().unwrap()).unwrap();
     let covering = CatalogTrie::notification(TrieKey::l0(state.value().snapshot().block_index()).unwrap(), 0, None).unwrap();
     state.add_tries(&BTreeMap::from([(table(), vec![covering])]), Timestamp(30)).unwrap();
@@ -538,6 +539,7 @@ async fn persisted_root_count(snapshot: &Snapshot, store: &MemoryStore, block: &
     let [MetadataNode::Leaf { columns, .. }] = metadata.nodes() else {
         panic!("Expected one metadata leaf for the persisted block");
     };
+    let columns = columns.values().unwrap();
     let column = columns.iter().find(|column| {
         matches!(column.field("col-name"), Some(Value::Utf8(column_name)) if column_name.as_str() == name)
             && column.field("root-col?") == Some(&Value::Bool(true))
@@ -592,7 +594,7 @@ async fn is_not_null_prunes_a_known_zero_root_through_direct_columns_and_identit
 
     let mut second = tx(&state, &budget, 1, 200);
     for id in [2, 6] {
-        second.put(table(), BTreeMap::from([("_id".into(), Value::I64(id))]), valid).unwrap();
+        second.put(table(), StructFields::from([("_id".into(), Value::I64(id))]), valid).unwrap();
     }
     state.apply(&second.stage().unwrap()).unwrap();
     let (missing, _) = persist(&state, &store).await;
@@ -699,4 +701,40 @@ async fn is_not_null_keeps_zero_count_pages_that_correct_delete_or_erase_matchin
             }
         }
     }
+}
+
+#[tokio::test]
+async fn an_inverted_temporal_range_matches_nothing() {
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let mut transaction = tx(&state, &budget, 0, 10);
+    transaction.put(table(), document(1, Value::I64(1)), Interval::ALL).unwrap();
+    state.apply(&transaction.stage().unwrap()).unwrap();
+    let context = query_context(state.value().snapshot(), Arc::new(MemoryStore::default()), false);
+    for valid_time in [
+        TemporalFilter::FromTo { from: Expr::Literal(timestamp(500)), to: Expr::Literal(timestamp(100)) },
+        TemporalFilter::Between { from: Expr::Literal(timestamp(500)), to: Expr::Literal(timestamp(100)) },
+    ] {
+        assert_eq!(collect(scan(&context, &["v"], valid_time, TemporalFilter::All, None), Arc::clone(&context)).await.unwrap(), Vec::<Vec<Value>>::new());
+    }
+}
+
+#[tokio::test]
+async fn a_nonmatching_page_overlapping_no_emitted_version_in_valid_time_is_pruned() {
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let budget = MemoryBudget::new(1 << 27); let store = Arc::new(MemoryStore::default());
+    for (index, (system, v, from, to)) in [(100, 1, 100, 200), (200, 2, 300, 400), (300, 1, 500, 700), (400, 3, 600, 800)].into_iter().enumerate() {
+        let mut transaction = tx(&state, &budget, index as i64, system);
+        transaction.put(table(), document(1, Value::I64(v)), Interval::from_micros(from, to).unwrap()).unwrap();
+        state.apply(&transaction.stage().unwrap()).unwrap();
+        persist_with_blooms(&state, &store, true).await;
+    }
+    let context = query_context(state.value().snapshot(), store, false);
+    let source = scan(&context, &["v", "_valid_from", "_valid_to"], TemporalFilter::All, at(1_000), None);
+    let v = source.schema().fields()[0].clone();
+    let filter = Arc::new(source.filter(Expr::binary(BinaryOp::Eq, v.expression(), Expr::Literal(Value::I64(1)))).unwrap());
+    let (mut rows, (_, pruned, _)) = collect_with_scan_counts(filter, context).await;
+    rows.sort_by_key(|row| match row[1] { Value::Timestamp { value, .. } => value, _ => 0 });
+    assert_eq!(rows, [vec![Value::I64(1), timestamp(100), timestamp(200)], vec![Value::I64(1), timestamp(500), timestamp(600)]]);
+    assert_eq!(pruned, 1);
 }

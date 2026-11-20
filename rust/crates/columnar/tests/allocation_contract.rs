@@ -1,8 +1,9 @@
+use rtdb_types::StructFields;
 use rtdb_columnar::{MemoryBudget, OwnedBatch, build_array, estimate_builder_bytes, to_field};
 use rtdb_types::{ListKind, LogicalType, RunEndWidth, ScalarType, Value};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 fn retains_within_bound(logical: LogicalType, values: Vec<Value>) {
     let bound = estimate_builder_bytes(&logical, &values).unwrap();
@@ -70,7 +71,7 @@ fn builder_bounds_cover_variable_data_and_run_end_children() {
 #[test]
 fn builder_bounds_include_fixed_children_hidden_under_null_parents() {
     let fixed = LogicalType::List { kind: ListKind::FixedSizeList(4096), element: Box::new(LogicalType::Scalar(ScalarType::I64)) };
-    let logical = LogicalType::Struct(BTreeMap::from([("items".into(), fixed)])).maybe();
+    let logical = LogicalType::Struct(StructFields::from([("items".into(), fixed)])).maybe();
     retains_within_bound(logical, vec![Value::Null; 3]);
 }
 
@@ -111,8 +112,8 @@ fn selected_cell_read_bound_ignores_unselected_variable_payloads_and_union_legs(
 fn selected_nested_and_run_end_cells_fit_the_read_bound() {
     use rtdb_columnar::{estimate_read_value_bytes, read_value};
     let values = vec![
-        Value::Struct(BTreeMap::from([("list".into(), Value::List(vec![Value::Utf8("abc".into()), Value::Null])), ("map".into(), Value::Map { entries: vec![(Value::Utf8("key".into()), Value::Binary(vec![1; 8192]))], sorted: false })])),
-        Value::Struct(BTreeMap::from([("list".into(), Value::List(vec![])), ("map".into(), Value::Map { entries: vec![], sorted: false })])),
+        Value::Struct(StructFields::from([("list".into(), Value::List(vec![Value::Utf8("abc".into()), Value::Null])), ("map".into(), Value::Map { entries: vec![(Value::Utf8("key".into()), Value::Binary(vec![1; 8192]))], sorted: false })])),
+        Value::Struct(StructFields::from([("list".into(), Value::List(vec![])), ("map".into(), Value::Map { entries: vec![], sorted: false })])),
     ];
     let ty = values[0].logical_type().join(&values[1].logical_type());
     for ty in [ty.clone(), LogicalType::RunEndEncoded { width: RunEndWidth::I16, value: Box::new(ty) }] {
@@ -160,7 +161,7 @@ fn columnar_and_foundation_budgets_share_the_same_lease_type_and_charge() {
 #[test]
 fn wide_sparse_nested_documents_estimate_their_builders_once_per_type_node() {
     let scalar = |seed: usize| match seed % 3 { 0 => Value::I64(seed as i64), 1 => Value::Utf8(format!("v{seed}")), _ => Value::Bool(seed % 2 == 0) };
-    let nested = |seed: usize, depth: usize| (0..depth).fold(scalar(seed), |value, level| Value::Struct(BTreeMap::from([(format!("n{}_{level}", seed % 7), value)])));
+    let nested = |seed: usize, depth: usize| (0..depth).fold(scalar(seed), |value, level| Value::Struct(StructFields::from([(format!("n{}_{level}", seed % 7), value)])));
     let values: Vec<_> = (0..40).map(|doc| Value::Struct((0..12).map(|field| (format!("f{}", (doc * 7 + field) % 60), nested(doc + field, 1 + (doc + field) % 5))).collect())).collect();
     let logical = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
     let bound = estimate_builder_bytes(&logical, &values).unwrap();

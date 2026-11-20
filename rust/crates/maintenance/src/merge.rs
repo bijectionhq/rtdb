@@ -1,6 +1,7 @@
 mod layout;
 mod planner;
 
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -10,7 +11,7 @@ use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
 use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
-use rtdb_format::{data::{EventBatch, StoredEvent, copy_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
+use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, copy_encoded_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
@@ -86,11 +87,11 @@ struct MergeFile {
     leaves: Vec<layout::Leaf>,
 }
 
-struct OutputSchema { put: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool }
+struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool }
 
 impl OutputSchema {
-    fn batch(&self, events: &[StoredEvent]) -> Result<arrow_array::RecordBatch> {
-        copy_event_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency)
+    fn batch(&self, events: &[PageEvent]) -> Result<arrow_array::RecordBatch> {
+        copy_encoded_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency)
     }
     fn schema(&self) -> Result<SchemaRef> { Ok(self.batch(&[])?.schema()) }
 }
@@ -99,18 +100,12 @@ fn create_file(path: &Path) -> Result<File> {
     OpenOptions::new().create_new(true).write(true).read(true).open(path).map_err(crate::invalid)
 }
 
-fn row_bytes(event: &StoredEvent) -> Result<usize> {
-    let bytes = match &event.operation {
-        rtdb_format::data::StoredOperation::Put(document) => document.iter().try_fold(0usize, |total, (key, value)| {
-            let value_bytes = value.retained_bytes()?;
-            total.checked_add(key.len()).and_then(|bytes| bytes.checked_add(96)).and_then(|bytes| bytes.checked_add(value_bytes)).ok_or_else(|| crate::invalid("Compaction row size overflow"))
-        })?,
-        _ => 0,
-    };
-    bytes.checked_add(std::mem::size_of::<StoredEvent>() + 128).ok_or_else(|| crate::invalid("Compaction row size overflow"))
+/// What encoding an event may hold at once: its document's decoded cells, and the event itself.
+fn row_bytes(event: &PageEvent) -> Result<usize> {
+    event.document_bytes()?.checked_add(std::mem::size_of::<PageEvent>() + 128).ok_or_else(|| crate::invalid("Compaction row size overflow"))
 }
 
-fn event_reservation(memory: &Arc<MemoryBudget>, events: &[StoredEvent], multiplier: usize) -> Result<Arc<MemoryReservation>> {
+fn event_reservation(memory: &Arc<MemoryBudget>, events: &[PageEvent], multiplier: usize) -> Result<Arc<MemoryReservation>> {
     let size = events.iter().try_fold(65_536usize, |size, event| size.checked_add(row_bytes(event)?).ok_or_else(|| crate::invalid("Compaction row size overflow")))?;
     memory.reserve(size.checked_mul(multiplier).ok_or_else(|| crate::invalid("Compaction allocation bound overflow"))?)
 }
@@ -175,7 +170,7 @@ fn decoded_bound(batch: &arrow_array::RecordBatch) -> Result<usize> {
     Ok(bytes)
 }
 
-fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<BTreeMap<String, LogicalType>>> {
+fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<LogicalType>>> {
     let mut puts = Vec::new();
     for input in inputs {
         let schema = input.reader.schema();
@@ -190,7 +185,7 @@ fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<BTreeMap<String, 
     Ok(Some(fields))
 }
 
-fn resolve_same_time(events: &[StoredEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<StoredEvent>, Vec<Arc<MemoryReservation>>)> {
+fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Vec<Arc<MemoryReservation>>)> {
     let mut result = Vec::new();
     let mut charges = Vec::new();
     let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(memory));
@@ -274,8 +269,7 @@ impl CompactionExecutor for SegmentCompactor {
                 let input = &mut inputs[page.segment];
                 let batch = read_page(&mut input.reader, page.page, &self.memory)?;
                 let _decoded = self.memory.reserve(decoded_bound(batch.batch())?)?;
-                let events = EventBatch::new(batch.batch().clone())?;
-                let mut events = (0..events.len()).map(|row| events.read_event(row)).collect::<Result<Vec<_>>>()?;
+                let mut events = EventBatch::new(batch.batch().clone())?.page_events()?;
                 if input.key.level() == 0 {
                     let (resolved, reservations) = resolve_same_time(&events, &self.memory)?;
                     events = resolved;
@@ -288,7 +282,7 @@ impl CompactionExecutor for SegmentCompactor {
             }
             let mut heap = planner::RowHeap::new(&rows)?;
             let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory));
-            let mut buckets: BTreeMap<usize, Vec<StoredEvent>> = BTreeMap::new();
+            let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
             while let Some((stream, row)) = heap.next(&rows) {
                 let event = &rows[stream][row];
@@ -341,13 +335,13 @@ impl CompactionExecutor for SegmentCompactor {
 }
 
 impl MergeFile {
-    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<StructFields<LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency };
         let directory = path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
         Ok(Self { path, part: part.to_vec(), recency, carries_recency, writer: Some(writer), leaves: Vec::new() })
     }
-    fn write(&mut self, events: &[StoredEvent], path: Vec<u8>, put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig) -> Result<()> {
+    fn write(&mut self, events: &[PageEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig) -> Result<()> {
         if events.is_empty() { return Ok(()); }
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency };
         let writer = self.writer.as_mut().ok_or_else(|| crate::invalid("Merge file already ended"))?;
@@ -368,33 +362,52 @@ impl MergeFile {
 mod tests {
     use super::*;
     use rtdb_format::data::StoredOperation;
+    use rtdb_format::data::{StoredEvent, build_event_batch};
     use rtdb_types::Iid;
 
+    fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
+
     #[test]
-    fn same_time_compaction_admits_the_ceiling_before_cloning_an_output_row() {
-        let input = [StoredEvent {
+    fn same_time_compaction_resolves_a_lone_event_with_only_its_output_row() {
+        let input = page(&[StoredEvent {
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
             valid_time: Interval::from_micros(10, 20).unwrap(),
             operation: StoredOperation::Delete,
             recency: None,
-        }];
-        let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
-        let limit = ceiling - 1;
-        let memory = MemoryBudget::new(limit);
+        }]);
+        let output = row_bytes(&input[0]).unwrap() * 2;
+        let memory = MemoryBudget::new(output - 1);
         let error = resolve_same_time(&input, &memory).err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
-        let expected = format!("Cannot reserve {ceiling} bytes from budget {limit} with 0 retained");
-        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
         assert_eq!(memory.used_bytes(), 0);
 
-        let output = row_bytes(&input[0]).unwrap() * 2;
-        let memory = MemoryBudget::new(ceiling + output);
+        let memory = MemoryBudget::new(output);
         let (rows, charges) = resolve_same_time(&input, &memory).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].header(), input[0].header());
         assert_eq!(memory.used_bytes(), output);
         drop((rows, charges));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn same_time_compaction_admits_the_ceiling_before_cloning_a_second_events_row() {
+        let event = |lower, upper| StoredEvent {
+            iid: Iid([1; 16]),
+            system_from: Timestamp(100),
+            valid_time: Interval::from_micros(lower, upper).unwrap(),
+            operation: StoredOperation::Delete,
+            recency: None,
+        };
+        let input = page(&[event(10, 20), event(30, 40)]);
+        let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
+        let output = row_bytes(&input[0]).unwrap() * 2;
+        let limit = output + ceiling - 1;
+        let memory = MemoryBudget::new(limit);
+        let error = resolve_same_time(&input, &memory).err().unwrap();
+        let expected = format!("Cannot reserve {ceiling} bytes from budget {limit} with {output} retained");
+        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
         assert_eq!(memory.used_bytes(), 0);
     }
 }

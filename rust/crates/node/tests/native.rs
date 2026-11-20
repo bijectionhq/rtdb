@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}};
 use std::time::Duration;
@@ -74,7 +75,7 @@ async fn stop(node: &Node, driver: tokio::task::JoinHandle<Result<()>>) {
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
 fn put(node: &Node, id: i64, value: i64) -> TxOp {
-    TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(id)), ("value".into(), Value::I64(value))])], node.memory()).unwrap(), valid_from: None, valid_to: None }
+    TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![StructFields::from([("_id".into(), Value::I64(id)), ("value".into(), Value::I64(value))])], node.memory()).unwrap(), valid_from: None, valid_to: None }
 }
 
 #[tokio::test]
@@ -172,11 +173,11 @@ async fn native_logical_queries_execute_bound_relations_with_named_arguments() {
     let token = session.state().cancellation().child_token();
     let empty_columns = "[:select {:predicate (== ?ap_n 2)} [:table {:rows [{} {} {}]}]]";
     let arguments = BTreeMap::from([("ap-n".into(), Value::I64(2))]);
-    let cursor = session.query_ra(empty_columns, arguments, &token).await.unwrap();
+    let cursor = session.query_ra(empty_columns, arguments.into(), &token).await.unwrap();
     assert_eq!(rows(cursor).await, [vec![], vec![], vec![]]);
 
     let ordered = "[:sort {:order-specs [[a {:direction :desc :null-ordering :nulls-last}]] :skip 1 :limit 1} [:table {:rows [{:a 7} {} {:a 2}]}]]";
-    let cursor = session.query_ra(ordered, BTreeMap::new(), &token).await.unwrap();
+    let cursor = session.query_ra(ordered, StructFields::new(), &token).await.unwrap();
     assert_eq!(rows(cursor).await, [vec![Value::I64(2)]]);
     stop(&node, driver).await;
 }
@@ -197,7 +198,7 @@ async fn native_logical_query_checks_named_argument_admission_before_binding() {
 
     let arguments = || BTreeMap::from([("param".into(), Value::Utf8("x".repeat(64 << 10)))]);
     let pressure = memory.reserve(memory.limit_bytes() - baseline - context_bytes - (256 << 10)).unwrap();
-    let Err(error) = session.query_ra("@", arguments(), &operation).await else {
+    let Err(error) = session.query_ra("@", arguments().into(), &operation).await else {
         panic!("expected a failed parameter reservation");
     };
     assert_eq!(error.code, "rtdb/memory-budget-exceeded");
@@ -205,7 +206,7 @@ async fn native_logical_query_checks_named_argument_admission_before_binding() {
     drop(pressure);
 
     let source = "[:table {:rows [{:value 1}]}]";
-    let cursor = session.query_ra(source, arguments(), &operation).await.unwrap();
+    let cursor = session.query_ra(source, arguments().into(), &operation).await.unwrap();
     assert_eq!(rows(cursor).await, [vec![Value::I64(1)]]);
     drop(session);
     driver.close_without_run().await.unwrap();
@@ -217,7 +218,7 @@ async fn native_logical_queries_preserve_explicit_page_boundaries() {
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let token = session.state().cancellation().child_token();
     let plan = "[:literal-pages {:pages [[{:a 1}] [] [{:a 2} {:a 3}]]}]";
-    let mut cursor = session.query_ra(plan, BTreeMap::new(), &token).await.unwrap();
+    let mut cursor = session.query_ra(plan, StructFields::new(), &token).await.unwrap();
     for expected in [1, 0, 2] {
         let page = cursor.next_batch().await.unwrap().unwrap();
         assert_eq!(page.batch().num_rows(), expected);
@@ -1282,7 +1283,7 @@ async fn source_log_uri_values_render_as_nfc_ascii_without_changing_stored_text(
         let (node, driver) = running(options(), services()).await;
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         let original = "HTTP://host/e\u{301}";
-        let operation = TxOp::PutDocs { table: TableRef::new("public","docs"), documents: Documents::new(vec![BTreeMap::from([
+        let operation = TxOp::PutDocs { table: TableRef::new("public","docs"), documents: Documents::new(vec![StructFields::from([
             ("_id".into(),Value::I64(1)),("uri".into(),Value::Uri(original.into())),
         ])],node.memory()).unwrap(),valid_from: None,valid_to: None };
         session.state_mut().execute_operation(operation).await.unwrap();
@@ -1535,9 +1536,9 @@ async fn a_table_of_wide_heterogeneous_documents_stays_queryable_within_its_budg
         _ => Value::Keyword(rtdb_types::Keyword::from_name(&format!("k{i}"))),
     };
     for i in 0..60 {
-        let nested = Value::Struct(BTreeMap::from([(format!("f{}", i % 7), leaf(i)), ("l".into(), Value::List((0..(i % 5)).map(|j| leaf(i + j)).collect()))]));
+        let nested = Value::Struct(StructFields::from([(format!("f{}", i % 7), leaf(i)), ("l".into(), Value::List((0..(i % 5)).map(|j| leaf(i + j)).collect()))]));
         let document = BTreeMap::from([("_id".into(), Value::I64(1)), (format!("c{}", i % 9), Value::List(vec![nested, leaf(i + 1)]))]);
-        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document], node.memory()).unwrap(), valid_from: None, valid_to: None };
+        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document.into()], node.memory()).unwrap(), valid_from: None, valid_to: None };
         assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
     }
     assert_eq!(rows(session.query_sql("SELECT * FROM docs FOR VALID_TIME ALL", vec![]).await.unwrap()).await.len(), 60);
@@ -1562,7 +1563,7 @@ async fn a_left_join_through_an_argument_subquery_takes_the_dependent_binding() 
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     for (id, b) in [(1, 1), (2, 3), (3, 0)] {
         let document = BTreeMap::from([("_id".into(), Value::I64(id)), ("a".into(), Value::I64(2)), ("b".into(), Value::I64(b))]);
-        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document], node.memory()).unwrap(), valid_from: None, valid_to: None };
+        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document.into()], node.memory()).unwrap(), valid_from: None, valid_to: None };
         assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
     }
     let query = "(-> (unify (from :docs [{:xt/id id} a b]) (left-join [(fn [a] (rel [{:b a}] [b])) (+ a 1)] [b])) (order-by id) (return id b))";
@@ -1594,8 +1595,8 @@ async fn wide_heterogeneous_documents_flush_and_delete_across_blocks() {
         0 => Value::I64(i), 1 => Value::Utf8(format!("s{i}")), 2 => Value::F64(i as f64 / 3.0), 3 => Value::Bool(i % 4 == 0),
         _ => Value::Timestamp { value: i * 1_000_000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some(format!("+{:02}:00", i % 12)) },
     };
-    let nested = |i: i64| (0..3).fold(leaf(i), |inner, depth| Value::Struct(BTreeMap::from([(format!("f{i}_{depth}"), inner), (format!("g{i}_{depth}"), Value::List(vec![leaf(i + depth), leaf(i + depth + 1)]))])));
-    let documents = (0..80).map(|i| BTreeMap::from([
+    let nested = |i: i64| (0..3).fold(leaf(i), |inner, depth| Value::Struct(StructFields::from([(format!("f{i}_{depth}"), inner), (format!("g{i}_{depth}"), Value::List(vec![leaf(i + depth), leaf(i + depth + 1)]))])));
+    let documents = (0..80).map(|i| StructFields::from([
         ("_id".into(), Value::I64(i)),
         (format!("c{i}"), Value::List(vec![nested(i), leaf(i + 1)])),
     ])).collect::<Vec<_>>();
@@ -1618,10 +1619,77 @@ async fn a_left_join_without_arguments_keeps_the_outer_binding() {
     for (id, parent) in [(1, None), (2, Some(1))] {
         let mut document = BTreeMap::from([("_id".into(), Value::I64(id))]);
         if let Some(parent) = parent { document.insert("parent".into(), Value::I64(parent)); }
-        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document], node.memory()).unwrap(), valid_from: None, valid_to: None };
+        let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document.into()], node.memory()).unwrap(), valid_from: None, valid_to: None };
         assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
     }
     let query = "(-> (unify (from :docs [{:xt/id e}]) (left-join (from :docs [{:xt/id c :parent e}]) [e c])) (order-by e c) (return e c))";
     assert_eq!(rows(session.query_xtql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1), Value::I64(2)], vec![Value::I64(2), Value::Null]]);
     stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn executing_a_transaction_without_an_indexer_fails_and_queries_still_run() {
+    let mut config = options(); config.replication.enabled = false;
+    let (node, driver) = running(config, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default())).await.unwrap().unwrap_err();
+    assert_eq!((error.category, error.message.as_deref()), (rtdb_types::AnomalyCategory::Fault, Some("log processor not initialised")));
+    assert_eq!(rows(session.query_sql("SELECT 1 AS v", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+    drop(session); stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn a_put_error_names_its_table_and_a_patch_error_does_not() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let TxOp::PutDocs { table, documents, .. } = put(&node, 1, 10) else { unreachable!() };
+    let inverted = TxOp::PutDocs { table: table.clone(), documents, valid_from: Some(rtdb_types::Timestamp(2_000)), valid_to: Some(rtdb_types::Timestamp(1_000)) };
+    let result = session.state_mut().execute_tx(vec![inverted], AutonomousTxOptions::default()).await.unwrap();
+    let error = result.error().expect("the inverted valid time aborts the transaction");
+    assert_eq!(error.code, "xtdb.indexer/invalid-valid-times");
+    assert_eq!(rtdb_format::transit::from_json_value(&error.context["table"]).unwrap(), rtdb_format::transit::TransitValue::table_ref(&table));
+    let TxOp::PutDocs { table, documents, .. } = put(&node, 1, 10) else { unreachable!() };
+    let patch = TxOp::PatchDocs { table, documents, valid_from: Some(rtdb_types::Timestamp(2_000)), valid_to: Some(rtdb_types::Timestamp(1_000)) };
+    let result = session.state_mut().execute_tx(vec![patch], AutonomousTxOptions::default()).await.unwrap();
+    let error = result.error().expect("the inverted valid time aborts the patch");
+    assert_eq!(error.code, "xtdb.indexer/invalid-valid-times");
+    assert!(!error.context.contains_key("table"), "the reference's patch path adds no table: {:?}", error.context);
+    drop(session); stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn a_stored_struct_reads_back_with_its_fields_in_written_order() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let data = Value::Struct(StructFields::from([("foo".into(), Value::I64(1)), ("bar".into(), Value::I64(2))]));
+    let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::I64(1)), ("data".into(), data.clone())])], node.memory()).unwrap();
+    let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents, valid_from: None, valid_to: None };
+    assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
+    let insert = TxOp::Sql { sql: "INSERT INTO sql_docs (_id, data) VALUES (1, OBJECT(foo: 1, bar: 2))".into(), args: None };
+    assert!(session.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap().committed());
+    for table in ["docs", "sql_docs"] {
+        let cursor = session.query_sql(&format!("SELECT data FROM {table}"), vec![]).await.unwrap();
+        let Value::Struct(fields) = &rows(cursor).await[0][0] else { panic!("Expected a struct") };
+        assert_eq!(fields.keys().collect::<Vec<_>>(), ["foo", "bar"], "{table}");
+    }
+    let equal = rows(session.query_sql("SELECT OBJECT(a: 1, b: 2) = OBJECT(b: 2, a: 1), OBJECT(a: 1) = OBJECT(a: 1, b: 2)", vec![]).await.unwrap()).await;
+    assert_eq!(equal, [vec![Value::Bool(true), Value::Bool(false)]], "structs compare as maps whatever their field order");
+    drop(session); stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn each_argument_row_of_a_batched_update_reads_what_the_rows_before_it_wrote() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let insert = TxOp::Sql { sql: "INSERT INTO docs (_id, value) VALUES (?, ?)".into(), args: Some(SqlArguments::from_rows(vec![vec![Value::I64(1), Value::I64(10)], vec![Value::I64(2), Value::I64(20)]], node.memory()).unwrap()) };
+        assert!(session.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap().committed());
+        let arguments = vec![vec![Value::I64(5), Value::I64(1)], vec![Value::I64(7), Value::I64(2)], vec![Value::I64(100), Value::I64(1)]];
+        let update = TxOp::Sql { sql: "UPDATE docs SET added = ?, value = value + 1 WHERE _id = ?".into(), args: Some(SqlArguments::from_rows(arguments, node.memory()).unwrap()) };
+        let updated = session.state_mut().execute_tx(vec![update], AutonomousTxOptions::default()).await.unwrap();
+        assert!(updated.committed(), "{:?}", updated.error());
+        assert_eq!(rows(session.query_sql("SELECT _id, value, added FROM docs ORDER BY _id", vec![]).await.unwrap()).await,
+            vec![vec![Value::I64(1), Value::I64(12), Value::I64(100)], vec![Value::I64(2), Value::I64(21), Value::I64(7)]]);
+        stop(&node, driver).await;
+    }).await.unwrap();
 }

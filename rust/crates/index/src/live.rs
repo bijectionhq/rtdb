@@ -1,3 +1,4 @@
+use rtdb_types::{OrderedSet, StructFields};
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
@@ -13,11 +14,13 @@ use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column
 pub struct IndexBatch {
     owned: OwnedBatch,
     events: EventBatch,
-    put_types: BTreeMap<String, LogicalType>,
+    put_types: StructFields<LogicalType>,
     /// The exact logical type of each put struct child, in field order, for reading cells without re-deriving it.
     put_field_types: Vec<LogicalType>,
     system_times: Option<(Timestamp, Timestamp)>,
     canonical_iids: OnceLock<bool>,
+    /// Every row's header, decoded once with the batch: a scan reads each row's several times, and a batch is shared by every query.
+    headers: (Box<[EventHeader]>, Arc<MemoryReservation>),
 }
 
 #[derive(Clone, Copy)]
@@ -28,6 +31,15 @@ impl IndexBatch {
         Self::from_owned(OwnedBatch::new(batch, budget)?)
     }
     pub fn from_owned(owned: OwnedBatch) -> Result<Arc<Self>> {
+        let headers = owned.reservation().budget().reserve(Self::header_bytes(owned.batch().num_rows())?)?;
+        Self::from_owned_with_headers(owned, headers)
+    }
+    /// The bytes `from_owned` charges for the decoded headers of a batch of `rows` events.
+    pub fn header_bytes(rows: usize) -> Result<usize> {
+        rows.checked_mul(std::mem::size_of::<EventHeader>()).ok_or_else(|| invalid("Event headers exceed addressable memory"))
+    }
+    /// As `from_owned`, with the headers charged to a reservation the caller already holds for `header_bytes`.
+    pub fn from_owned_with_headers(owned: OwnedBatch, header_reservation: Arc<MemoryReservation>) -> Result<Arc<Self>> {
         let events = EventBatch::new(owned.batch().clone())?;
         let schema = owned.batch().schema();
         let index = schema.index_of("op").map_err(invalid)?;
@@ -41,26 +53,29 @@ impl IndexBatch {
             _ => Vec::new(),
         };
         let mut system_times: Option<(Timestamp, Timestamp)> = None;
+        let mut headers = Vec::with_capacity(events.len());
         for row in 0..events.len() {
-            let time = events.header(row)?.system_from;
+            let header = events.header(row)?;
+            let time = header.system_from;
             system_times = Some(system_times.map_or((time, time), |(first, last)| (first.min(time), last.max(time))));
+            headers.push(header);
         }
-        Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new() }))
+        Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new(), headers: (headers.into_boxed_slice(), header_reservation) }))
     }
-    pub fn from_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    pub fn from_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::Write, budget)
     }
     /// Copies typed event cells, joining their exact types with declarations without numeric coercion.
     /// Raw decimal coefficients retain their parameters; returned arrays retain their reservation independently.
-    pub fn copy_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    pub fn copy_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::CopyInferred, budget)
     }
     /// Reconstructs stored event rows with the captured put schema and unchanged decimal parameters and coefficients.
     /// The returned arrays retain their reservation independently of this index batch.
-    pub fn copy_events_with_put_schema(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    pub fn copy_events_with_put_schema(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::CopyCaptured, budget)
     }
-    fn build_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    fn build_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let mut schema_bytes = 4096usize;
         for (name, ty) in declared {
             schema_bytes = schema_bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(ty.retained_bytes().ok()?)).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
@@ -76,7 +91,7 @@ impl IndexBatch {
         for event in events {
             if let StoredOperation::Put(document) = &event.operation {
                 if !matches!(mode, EventBuild::CopyCaptured) {
-                    documents.push(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect::<BTreeMap<_, _>>());
+                    documents.push(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect::<StructFields<_>>());
                 }
                 has_put = true;
             }
@@ -114,10 +129,13 @@ impl IndexBatch {
         Some(true)
     }
     pub fn view(&self) -> &EventBatch { &self.events }
+    pub fn header(&self, row: usize) -> Result<EventHeader> {
+        self.headers.0.get(row).copied().ok_or_else(|| Anomaly::incorrect("rtdb.index/event-row", "Event row exceeds batch length"))
+    }
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
     pub fn len(&self) -> usize { self.events.len() }
     pub fn is_empty(&self) -> bool { self.events.is_empty() }
-    pub fn put_types(&self) -> &BTreeMap<String, LogicalType> { &self.put_types }
+    pub fn put_types(&self) -> &StructFields<LogicalType> { &self.put_types }
     /// The logical type of the put struct's `index`th child field, as `from_field` derives it.
     pub fn put_field_type(&self, index: usize) -> Option<&LogicalType> { self.put_field_types.get(index) }
 }
@@ -125,7 +143,7 @@ impl IndexBatch {
 #[derive(Clone, Debug)]
 pub struct RowSource { pub batch: Arc<IndexBatch>, pub row: usize }
 impl RowSource {
-    pub fn header(&self) -> Result<EventHeader> { self.batch.view().header(self.row) }
+    pub fn header(&self) -> Result<EventHeader> { self.batch.header(self.row) }
     pub fn event(&self) -> Result<StoredEvent> { self.batch.view().read_event(self.row) }
 }
 
@@ -135,23 +153,78 @@ pub struct LiveTable {
     block_index: BlockIndex,
     chunks: Vec<(u32, Arc<IndexBatch>)>,
     row_count: u32,
-    column_types: BTreeMap<String, LogicalType>,
+    column_types: StructFields<LogicalType>,
     trie: MemoryHashTrie,
     last_system_time: Option<Timestamp>,
     canonical_entity_iids: bool,
+    located: LocatedLeaves,
 }
+
+/// A trie leaf's rows in iid order, each located in its table's chunks with its header copied out.
+#[derive(Debug)]
+pub struct LocatedRows { pub located: Vec<(u32, u32)>, pub headers: Vec<EventHeader>, _reservation: Option<Arc<MemoryReservation>> }
+
+/// The leaves a snapshot's scans have located, keyed by the leaf's address in the snapshot's own trie.
+/// A row's location depends on the chunk layout, which every append can change, so a cloned table starts empty.
+#[derive(Debug, Default)]
+struct LocatedLeaves(std::sync::Mutex<std::collections::HashMap<usize, Arc<LocatedRows>>>);
+impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: BTreeMap::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn row_count(&self) -> u32 { self.row_count }
-    pub fn column_types(&self) -> &BTreeMap<String, LogicalType> { &self.column_types }
+    pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
+    /// The chunk holding `row`, and the row's position within it.
+    pub fn locate(&self, row: u32) -> Result<(u32, u32)> {
+        if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
+        let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
+        Ok((index as u32, row - self.chunks[index].0))
+    }
+    /// `leaf`'s rows located and their headers copied, once per snapshot; `leaf` is one of this table's trie leaves.
+    pub fn located_rows(&self, leaf: &rtdb_trie::Leaf) -> Result<Arc<LocatedRows>> {
+        let key = leaf as *const rtdb_trie::Leaf as usize;
+        if let Some(rows) = self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.get(&key) { return Ok(Arc::clone(rows)); }
+        let rows = leaf.sorted_rows(self)?;
+        let bytes = rows.len().checked_mul(std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<EventHeader>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| invalid("Located leaf rows exceed addressable memory"))?;
+        let _reservation = self.chunks.first().map(|(_, batch)| batch.owned.reservation().budget().reserve(bytes)).transpose()?;
+        let mut located = Vec::with_capacity(rows.len());
+        let mut headers = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let at = self.locate(*row)?;
+            headers.push(self.header_at(at)?);
+            located.push(at);
+        }
+        let rows = Arc::new(LocatedRows { located, headers, _reservation });
+        Ok(Arc::clone(self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.entry(key).or_insert(rows)))
+    }
+    /// The header of a row `locate` found.
+    pub fn header_at(&self, (chunk, offset): (u32, u32)) -> Result<EventHeader> {
+        self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?.1.header(offset as usize)
+    }
+    /// The batch and position of the row `locate` found, without taking a handle on the batch.
+    pub fn batch_at(&self, (chunk, offset): (u32, u32)) -> Result<(&Arc<IndexBatch>, u32)> {
+        Ok((&self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?.1, offset))
+    }
+    /// The row `locate` found.
+    pub fn row_at(&self, (chunk, offset): (u32, u32)) -> Result<RowSource> {
+        let (_, batch) = self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?;
+        Ok(RowSource { batch: Arc::clone(batch), row: offset as usize })
+    }
+    /// The header of `row`, without taking a handle on its batch.
+    pub fn header(&self, row: u32) -> Result<EventHeader> {
+        if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
+        let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
+        let (start, batch) = &self.chunks[index];
+        batch.header((row - start) as usize)
+    }
     pub fn row(&self, row: u32) -> Result<RowSource> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
         let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
@@ -172,9 +245,33 @@ impl LiveTable {
             next.row_count = start.checked_add(count).ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
             next.chunks.push((start, Arc::clone(batch)));
             next.trie = self.trie.add_range(&next, start, count)?;
+            next.merge_small_chunks()?;
         }
         next.last_system_time = Some(system_time);
         Ok(next)
+    }
+    /// Merges the newest chunk into the one before it while it is at least as large, they share a layout and together
+    /// stay small, so a table written a row per transaction is read from chunks of up to `MERGED_CHUNK_ROWS` rows.
+    /// Chunks keep their row addresses, since a merged chunk starts where the earlier one did.
+    fn merge_small_chunks(&mut self) -> Result<()> {
+        const MERGED_CHUNK_ROWS: usize = 8192;
+        while let [.., (start, previous), (_, last)] = self.chunks.as_slice() {
+            if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
+            let schema = previous.arrow().schema();
+            let budget = Arc::clone(previous.owned.reservation().budget());
+            let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_add(4096))
+                .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
+            let mut reservation = budget.reserve(bound)?;
+            let merged = arrow_select::concat::concat_batches(&schema, [previous.arrow(), last.arrow()]).map_err(invalid)?;
+            // Concatenating a dense union sizes every leg for all of its rows, so the merge can outgrow its inputs.
+            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
+            lease.grow_to(lease.bytes().max(merged.get_array_memory_size()))?;
+            let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
+            let start = *start;
+            self.chunks.truncate(self.chunks.len() - 2);
+            self.chunks.push((start, merged));
+        }
+        Ok(())
     }
     pub fn ordered_events(&self) -> Result<Vec<EventRow<RowSource>>> {
         self.trie.sorted_rows(self)?.into_iter().map(|row| {
@@ -205,10 +302,7 @@ impl LiveTable {
 }
 
 impl IidReader for LiveTable {
-    fn iid(&self, row: u32) -> Result<Iid> {
-        let source = self.row(row)?;
-        source.batch.view().iid(source.row)
-    }
+    fn iid(&self, row: u32) -> Result<Iid> { self.header(row).map(|header| header.iid) }
 }
 
 pub struct BlockPages<'a> {
@@ -259,13 +353,13 @@ impl BlockPages<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub struct TableWrite { column_types: BTreeMap<String, LogicalType>, batch: Option<Arc<IndexBatch>> }
+pub struct TableWrite { column_types: StructFields<LogicalType>, batch: Option<Arc<IndexBatch>> }
 impl TableWrite {
-    pub fn new(column_types: BTreeMap<String, LogicalType>, batch: Option<Arc<IndexBatch>>) -> Self {
+    pub fn new(column_types: StructFields<LogicalType>, batch: Option<Arc<IndexBatch>>) -> Self {
         let column_types = match &batch { Some(batch) => declare_column_types(batch.put_types(), &column_types), None => column_types };
         Self { column_types, batch }
     }
-    pub fn column_types(&self) -> &BTreeMap<String, LogicalType> { &self.column_types }
+    pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
     pub fn batch(&self) -> Option<&Arc<IndexBatch>> { self.batch.as_ref() }
     pub fn row_count(&self) -> usize { self.batch.as_ref().map_or(0, |batch| batch.len()) }
 }
@@ -332,19 +426,21 @@ impl LiveIndex {
 }
 
 #[derive(Default)]
-struct PendingTable { declared: BTreeMap<String, LogicalType>, events: Vec<StoredEvent>, reservations: Vec<Arc<MemoryReservation>> }
+struct PendingTable { declared: StructFields<LogicalType>, events: Vec<StoredEvent>, reservations: Vec<Arc<MemoryReservation>> }
 
 pub struct TransactionBuffer {
     base: Snapshot,
     tx_key: TransactionKey,
     budget: Arc<MemoryBudget>,
     tables: BTreeMap<TableRef, PendingTable>,
+    /// Each table's transaction segment as last read, with the events and declarations it holds; a read appends only what was written since.
+    segments: std::sync::Mutex<BTreeMap<TableRef, (Arc<LiveTable>, usize, StructFields<LogicalType>)>>,
 }
 
 impl TransactionBuffer {
     pub fn new(base: Snapshot, tx_key: TransactionKey, budget: Arc<MemoryBudget>) -> Result<Self> {
         StagedWrite::new(tx_key, base.tx_basis(), base.block_index(), BTreeMap::new())?;
-        Ok(Self { base, tx_key, budget, tables: BTreeMap::new() })
+        Ok(Self { base, tx_key, budget, tables: BTreeMap::new(), segments: Default::default() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.tx_key }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> {
@@ -372,7 +468,7 @@ impl TransactionBuffer {
         }
         Ok(())
     }
-    pub fn put(&mut self, table: TableRef, document: BTreeMap<String, Value>, valid_time: Interval) -> Result<()> {
+    pub fn put(&mut self, table: TableRef, document: StructFields<Value>, valid_time: Interval) -> Result<()> {
         let id = document.get("_id").ok_or_else(|| invalid("Put document has no _id"))?.entity_id()?;
         self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Put(document), recency: None })
     }
@@ -382,20 +478,43 @@ impl TransactionBuffer {
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
         self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
     }
-    pub fn append(&mut self, table: TableRef, mut event: StoredEvent) -> Result<()> {
+    pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event) }
+    /// As `append`, copying the table reference only for the table's first write.
+    pub fn append_to(&mut self, table: &TableRef, mut event: StoredEvent) -> Result<()> {
         if event.system_from != self.tx_key.system_time { return Err(invalid("Transaction event has another system time")); }
         if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().for_each(Value::admit_object_dates); }
         let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
-        let bytes = document_bytes.checked_add(4096).and_then(|bytes| bytes.checked_add(table.schema.capacity())).and_then(|bytes| bytes.checked_add(table.table.capacity()))
+        let bytes = document_bytes.checked_add(4096).and_then(|bytes| bytes.checked_add(table.schema.len())).and_then(|bytes| bytes.checked_add(table.table.len()))
             .ok_or_else(|| invalid("Transaction event size overflow"))?;
         let reservation = self.budget.reserve(bytes)?;
-        let pending = self.tables.entry(table).or_default();
+        if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
+        let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
         pending.events.push(event);
         pending.reservations.push(reservation);
         Ok(())
     }
-    pub fn snapshot(&self) -> Result<Snapshot> { self.base.with_staged(&[Arc::new(self.materialize()?)]) }
-    pub fn stage(self) -> Result<StagedWrite> { self.materialize() }
+    /// The snapshot the transaction started from, without its own writes, for a statement that reads no table.
+    pub fn base_snapshot(&self) -> Snapshot { self.base.clone() }
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
+        for (table, pending) in &self.tables {
+            let (segment, done, declared) = match segments.get(table) {
+                Some((segment, done, declared)) => (Arc::clone(segment), *done, Some(declared)),
+                None => (Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())), 0, None),
+            };
+            if done == pending.events.len() && declared == Some(&pending.declared) { continue; }
+            let batch = (done < pending.events.len()).then(|| IndexBatch::copy_events(&pending.events[done..], &pending.declared, &self.budget)).transpose()?;
+            let segment = Arc::new(segment.append(&TableWrite::new(pending.declared.clone(), batch), self.tx_key.system_time)?);
+            segments.insert(table.clone(), (segment, pending.events.len(), pending.declared.clone()));
+        }
+        let current = segments.iter().map(|(table, (segment, ..))| (table.clone(), Arc::clone(segment))).collect();
+        self.base.with_transaction_segments(self.tx_key, &current)
+    }
+    pub fn stage(mut self) -> Result<StagedWrite> {
+        // The segments only served the transaction's own reads; the staged write supersedes them.
+        if let Ok(segments) = self.segments.get_mut() { segments.clear(); }
+        self.materialize()
+    }
     fn materialize(&self) -> Result<StagedWrite> {
         let tables = self.tables.iter().map(|(table, pending)| {
             let batch = Some(IndexBatch::copy_events(&pending.events, &pending.declared, &self.budget)?);
@@ -416,7 +535,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
         iid: EntityId::Integer(id).iid(),
         system_from: Timestamp(time),
         valid_time: Interval::ALL,
-        operation: StoredOperation::Put(BTreeMap::from([
+        operation: StoredOperation::Put(StructFields::from([
             ("_id".into(), Value::I64(id)),
             ("value".into(), if text { Value::Utf8(id.to_string()) } else { Value::I64(id) }),
         ])),
@@ -425,7 +544,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
     let first = rows(0, 1, false);
     for layout_changes in [false, true] {
         let second = rows(2, 2, layout_changes);
-        let write = |events: &[StoredEvent]| TableWrite::new(BTreeMap::new(), Some(IndexBatch::copy_events(events, &BTreeMap::new(), &memory).unwrap()));
+        let write = |events: &[StoredEvent]| TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(events, &StructFields::new(), &memory).unwrap()));
         let live = LiveTable::new(table.clone(), BlockIndex(0), TrieConfig::default())
             .append(&write(&first), Timestamp(1)).unwrap()
             .append(&write(&second), Timestamp(2)).unwrap();
@@ -443,7 +562,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
 fn event_batches_build_wide_document_columns_with_bounded_scratch() {
     let memory = MemoryBudget::new(128 << 20);
     let events = (0..100).map(|id| {
-        let mut doc = BTreeMap::from([("_id".into(), Value::I64(id))]);
+        let mut doc = StructFields::from([("_id".into(), Value::I64(id))]);
         for key in 0..10 { doc.insert(format!("field_{id}_{key}"), Value::I64(id + key)); }
         StoredEvent {
             iid: EntityId::Integer(id).iid(),
@@ -453,7 +572,7 @@ fn event_batches_build_wide_document_columns_with_bounded_scratch() {
             recency: None,
         }
     }).collect::<Vec<_>>();
-    let batch = IndexBatch::copy_events(&events, &BTreeMap::new(), &memory).unwrap();
+    let batch = IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
     assert_eq!(batch.len(), 100);
     assert_eq!(batch.put_types().len(), 1001);
     let StoredOperation::Put(doc) = batch.view().read_event(99).unwrap().operation else { panic!("Expected put"); };
@@ -469,10 +588,10 @@ fn staged_batches_release_event_builder_scratch_before_they_enter_the_live_index
         iid: EntityId::Integer(id).iid(),
         system_from: Timestamp(1),
         valid_time: Interval::ALL,
-        operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(id))])),
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])),
         recency: None,
     }).collect::<Vec<_>>();
-    let batches = (0..32).map(|_| IndexBatch::copy_events(&events, &BTreeMap::new(), &memory).unwrap()).collect::<Vec<_>>();
+    let batches = (0..32).map(|_| IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap()).collect::<Vec<_>>();
     assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 32_768);
     assert!(memory.used_bytes() < 4 << 20);
     let arrow = batches[0].arrow().clone();
@@ -492,10 +611,10 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
             iid: EntityId::Uuid(id).iid(),
             system_from,
             valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::Uuid(id))])),
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Uuid(id))])),
             recency: None,
         };
-        TableWrite::new(BTreeMap::new(), Some(IndexBatch::from_events(&[event], &BTreeMap::new(), &memory).unwrap()))
+        TableWrite::new(StructFields::new(), Some(IndexBatch::from_events(&[event], &StructFields::new(), &memory).unwrap()))
     };
     let first_time = Timestamp(1);
     let second_time = Timestamp(2);
@@ -519,11 +638,11 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
 
 /// Joins every document's column types once per column, which equals folding `merge_column_types` over the documents
 /// in order: each document lacking a column contributes its own absence.
-fn row_column_types(documents: &[BTreeMap<String, LogicalType>]) -> Option<BTreeMap<String, LogicalType>> {
+fn row_column_types(documents: &[StructFields<LogicalType>]) -> Option<StructFields<LogicalType>> {
     let (first, rest) = documents.split_first()?;
     if rest.iter().all(|document| document == first) { return Some(first.clone()); }
     let absences: Vec<_> = documents.iter().map(absent_type).collect();
-    let names: std::collections::BTreeSet<&String> = documents.iter().flat_map(BTreeMap::keys).collect();
+    let names: OrderedSet<&String> = documents.iter().flat_map(|document| document.keys()).collect();
     Some(names.into_iter().map(|name| {
         let joined = LogicalType::join_all(documents.iter().zip(&absences).map(|(document, absent)| document.get(name).unwrap_or(absent)));
         (name.clone(), joined)
@@ -540,7 +659,7 @@ mod row_column_type_tests {
         let scalar = |scalar| LogicalType::Scalar(scalar);
         let list = |element| LogicalType::List { kind: ListKind::List, element: Box::new(element) };
         let structure = |fields: &[(&str, LogicalType)]| LogicalType::Struct(fields.iter().map(|(name, ty)| ((*name).into(), ty.clone())).collect());
-        let document = |fields: &[(&str, LogicalType)]| fields.iter().map(|(name, ty)| ((*name).to_owned(), ty.clone())).collect::<BTreeMap<_, _>>();
+        let document = |fields: &[(&str, LogicalType)]| fields.iter().map(|(name, ty)| ((*name).to_owned(), ty.clone())).collect::<StructFields<_>>();
         let documents = vec![
             document(&[("_id", scalar(ScalarType::I64)), ("a", list(scalar(ScalarType::Utf8)))]),
             document(&[("_id", scalar(ScalarType::I64)), ("b", structure(&[("x", scalar(ScalarType::Bool))]))]),
@@ -550,7 +669,87 @@ mod row_column_type_tests {
         ];
         let folded = documents.iter().cloned().reduce(|left, right| if left == right { left } else { merge_column_types(&left, &right) });
         assert_eq!(row_column_types(&documents), folded);
+        assert_eq!(row_column_types(&documents).unwrap().keys().map(String::as_str).collect::<Vec<_>>(), ["_id", "a", "b", "c"], "columns keep the order they were first seen");
+        let LogicalType::Union(ids) = &row_column_types(&documents).unwrap()["_id"] else { panic!("_id joins two types") };
+        assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), [scalar(ScalarType::I64), scalar(ScalarType::Utf8)]);
         assert_eq!(row_column_types(&documents[..1]), Some(documents[0].clone()));
         assert_eq!(row_column_types(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+    use rtdb_types::EntityId;
+
+    #[test]
+    fn a_table_written_a_row_per_transaction_is_held_in_merged_chunks_with_its_rows_in_place() {
+        let memory = MemoryBudget::new(1 << 26);
+        let table = TableRef::new("public", "docs");
+        let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+        for id in 0..10_000i64 {
+            let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::F64(id as f64))])), recency: None };
+            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id)).unwrap();
+        }
+        assert!(live.chunks.len() <= 8, "{} chunks", live.chunks.len());
+        for id in [0u32, 1, 1023, 1024, 8191, 8192, 9999] {
+            assert_eq!(live.row(id).unwrap().header().unwrap().system_from, Timestamp(i64::from(id)));
+        }
+    }
+
+    fn put(id: i64, memory: &Arc<MemoryBudget>) -> TableWrite {
+        let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])), recency: None };
+        TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), memory).unwrap()))
+    }
+
+    #[test]
+    fn chunks_of_a_column_written_at_several_widths_merge_within_their_charge() {
+        let memory = MemoryBudget::new(1 << 28);
+        let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+        for tx in 0..128i64 {
+            let events = (tx * 64..tx * 64 + 64).map(|n| {
+                let id = match (n - tx * 64) % 3 { 0 => Value::I16(n as i16), 1 => Value::I32(n as i32), _ => Value::I64(n) };
+                StoredEvent { iid: EntityId::Integer(n).iid(), system_from: Timestamp(tx), valid_time: Interval::ALL,
+                    operation: StoredOperation::Put(StructFields::from([("_id".into(), id), ("sku".into(), Value::Utf8(format!("sku-{n}")))])), recency: None }
+            }).collect::<Vec<_>>();
+            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap())), Timestamp(tx)).unwrap();
+        }
+        assert!(live.chunks.len() <= 4, "{} chunks", live.chunks.len());
+        assert_eq!(live.row_count, 8192);
+    }
+
+    #[test]
+    fn a_snapshot_locates_a_leaf_once_and_a_later_append_relocates_it() {
+        let memory = MemoryBudget::new(1 << 26);
+        let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+        for id in 0..3 { live = live.append(&put(id, &memory), Timestamp(id)).unwrap(); }
+        let leaf = live.trie().leaves()[0];
+        let located = live.located_rows(leaf).unwrap();
+        assert!(Arc::ptr_eq(&located, &live.located_rows(leaf).unwrap()));
+        assert_eq!(located.headers.iter().map(|header| header.system_from).collect::<OrderedSet<_>>(), (0..3).map(Timestamp).collect());
+        let appended = live.append(&put(3, &memory), Timestamp(3)).unwrap();
+        let relocated = appended.located_rows(appended.trie().leaves()[0]).unwrap();
+        assert!(!Arc::ptr_eq(&located, &relocated));
+        assert_eq!(relocated.headers.len(), 4);
+        for (at, header) in relocated.located.iter().zip(&relocated.headers) { assert_eq!(appended.header_at(*at).unwrap(), *header); }
+        drop((located, relocated, live, appended));
+        assert_eq!(memory.used_bytes(), 0, "located rows are released with the table that holds them");
+    }
+
+    #[test]
+    fn a_table_written_a_row_per_transaction_with_long_string_ids_merges_its_chunks() {
+        let memory = MemoryBudget::new(1 << 26);
+        let table = TableRef::new("public", "keys");
+        let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+        for id in 0..1000i64 {
+            let key = format!("{id:032x}/0");
+            let event = StoredEvent { iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Utf8(key))])), recency: None };
+            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id))
+                .unwrap_or_else(|error| panic!("row {id}: {error:?}"));
+        }
+        assert!(live.chunks.len() <= 16, "{} chunks", live.chunks.len());
     }
 }

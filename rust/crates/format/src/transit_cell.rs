@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use num_bigint::BigInt;
 use rtdb_types::transit_value::{MAX_DEPTH, TransitValue as T};
 use rtdb_types::{Anomaly, Result, TimeUnit, Value, format_iso_duration};
@@ -67,9 +67,9 @@ fn cell(value: &Value, depth: usize) -> Result<T> {
 }
 
 /// Converts document fields without copying the logical row.
-pub fn document_to_transit(fields: &BTreeMap<String, Value>) -> Result<T> { document(fields, 0) }
+pub fn document_to_transit(fields: &StructFields<Value>) -> Result<T> { document(fields, 0) }
 
-fn document(fields: &BTreeMap<String, Value>, depth: usize) -> Result<T> {
+fn document(fields: &StructFields<Value>, depth: usize) -> Result<T> {
     Ok(T::Map(fields.iter().map(|(key, value)| Ok((T::String(key.clone()), cell(value, depth + 1)?))).collect::<Result<_>>()?))
 }
 

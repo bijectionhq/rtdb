@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use rtdb_plan::{ApplyKind, BinaryOp, Catalog, Expr as PlanExpr, QualifiedTable, Relation, RelationNode, Statement, TableBinding};
 use rtdb_types::{LogicalType, Result, ScalarType, TableRef, Value};
 use rtdb_xtql::{CompileOptions, EdnKind, Expr, Query, compile, parse_query, read};
@@ -9,7 +10,7 @@ impl Catalog for FixtureCatalog {
     fn default_database(&self) -> &str { "xtdb" }
     fn databases(&self) -> BTreeSet<String> { BTreeSet::from(["xtdb".into()]) }
     fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> {
-        Ok(Some(TableBinding { name: name.clone(), oid: None, columns: BTreeMap::from([
+        Ok(Some(TableBinding { name: name.clone(), oid: None, columns: StructFields::from([
             ("_id".into(), LogicalType::Scalar(ScalarType::Keyword)),
             ("first_name".into(), LogicalType::Scalar(ScalarType::Utf8)),
             ("last_name".into(), LogicalType::Scalar(ScalarType::Utf8)),

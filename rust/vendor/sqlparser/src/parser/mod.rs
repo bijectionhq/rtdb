@@ -4528,7 +4528,12 @@ impl<'a> Parser<'a> {
             });
         }
         self.expect_token(&Token::LParen)?;
-        let in_op = match self.maybe_parse(|p| p.parse_query())? {
+        // A parenthesised query is only a subquery when it fills the parentheses: `IN ((SELECT ...), 1)` is a list.
+        let in_op = match self.maybe_parse(|p| {
+            let query = p.parse_query()?;
+            if p.peek_token_ref().token != Token::RParen { return p.expected_ref(")", p.peek_token_ref()); }
+            Ok(query)
+        })? {
             Some(subquery) => Expr::InSubquery {
                 expr: Box::new(expr),
                 subquery,

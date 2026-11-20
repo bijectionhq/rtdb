@@ -35,7 +35,7 @@ impl ConnectionDriver {
         if let Some(observer) = self.node.execution_observer() { observer.connection_event(rtdb_plan::ConnectionEvent::Opened); }
         let mut protocol = crate::protocol::ProtocolSession::new(session, self.node, self.config.clone(), settings, Arc::clone(&registration.slot));
         let (read, write) = tokio::io::split(stream);
-        let mut reader = Reader::new(read, Arc::clone(&memory)); let mut writer = Writer::new(write, memory);
+        let mut reader = Reader::new(read, Arc::clone(&memory)); let mut writer = Writer::new(tokio::io::BufWriter::with_capacity(64 * 1024, write), memory);
         let reader_stop = self.cancellation.child_token();
         let (sender, mut receiver) = mpsc::channel(64);
         let reader_token = reader_stop.clone(); let slot = Arc::clone(&registration.slot); let limit = self.config.maximum_message_bytes;

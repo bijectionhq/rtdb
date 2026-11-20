@@ -8,7 +8,8 @@ use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, Catalog
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TransactionAuthorization, TxOp};
 use rtdb_types::{Anomaly, Result, TableRef, Timestamp, Value};
-use std::{collections::BTreeMap, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
+use rtdb_types::StructFields;
+use std::{sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 
 struct Identity;
 impl TransactionAuthorization for Identity {
@@ -79,7 +80,7 @@ async fn lost_source_acknowledgement_recovers_the_original_write_exactly_once() 
     let (node, driver) = Node::open(options(directory.path()), services(clock.clone(), schedule.clone())).await.unwrap();
     let owner = tokio::spawn(driver.run());
     let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
-    let documents = Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(1)), ("value".into(), Value::I64(42))])], node.memory()).unwrap();
+    let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::I64(1)), ("value".into(), Value::I64(42))])], node.memory()).unwrap();
     let write = session.state_mut().execute_tx(vec![TxOp::PutDocs { table: TableRef::new("public", "docs"), documents,
         valid_from: None, valid_to: None }], AutonomousTxOptions::default()).await;
     assert!(write.is_err());

@@ -1,6 +1,6 @@
+use crate::StructFields;
 use crate::{Anomaly, CalendarDate, CivilDate, DateUnit, EntityId, IntervalUnit, Keyword, ListKind, LogicalType, Result, ScalarType, TimeUnit};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecimalValue {
@@ -40,7 +40,7 @@ pub enum Value {
     Keyword(Keyword), Uuid([u8; 16]), Uri(String), Transit(Vec<u8>), Oid(i32), RegClass(i32), RegProc(i32),
     List(Vec<Value>), Set(Vec<Value>), Map { entries: Vec<(Value, Value)>, sorted: bool },
     FixedSizeList(Vec<Value>), TimestampTzRange { lower: i64, upper: i64 },
-    Struct(BTreeMap<String, Value>),
+    Struct(StructFields<Value>),
 }
 
 mod float32_bits {
@@ -159,11 +159,11 @@ impl Value {
         Ok(total)
     }
 
-    pub fn document_retained_bytes(fields: &BTreeMap<String, Self>) -> Result<usize> {
-        let per_node = std::mem::size_of::<(String, Self)>().checked_mul(16).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_overflow)?;
-        fields.iter().try_fold(std::mem::size_of::<BTreeMap<String, Self>>(), |bytes, (name, value)| {
+    pub fn document_retained_bytes(fields: &StructFields<Self>) -> Result<usize> {
+        let table = fields.table_bytes_bound().and_then(|bytes| bytes.checked_add(std::mem::size_of::<StructFields<Self>>())).ok_or_else(size_overflow)?;
+        fields.iter().try_fold(table, |bytes, (name, value)| {
             let heap = value.heap_bytes()?;
-            bytes.checked_add(per_node).and_then(|bytes| bytes.checked_add(name.capacity())).and_then(|bytes| bytes.checked_add(heap)).ok_or_else(size_overflow)
+            bytes.checked_add(name.capacity()).and_then(|bytes| bytes.checked_add(heap)).ok_or_else(size_overflow)
         })
     }
 
@@ -217,7 +217,7 @@ impl Value {
             Self::Map { entries, sorted } => {
                 let keys: Vec<_> = entries.iter().map(|(key, _)| key.logical_type()).collect();
                 let values: Vec<_> = entries.iter().map(|(_, value)| value.logical_type()).collect();
-                let element = LogicalType::Struct(BTreeMap::from([
+                let element = LogicalType::Struct(StructFields::from([
                     ("key".to_owned(), LogicalType::join_all(&keys)),
                     ("value".to_owned(), LogicalType::join_all(&values)),
                 ]));

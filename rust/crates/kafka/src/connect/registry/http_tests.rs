@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -64,7 +65,7 @@ async fn stock_avro_converter_parses_fetched_schema_strings_with_avros_comment_p
     let mut context = ConversionContext::new(Arc::clone(&memory));
     let data = tokio::time::timeout(std::time::Duration::from_secs(5), converter.decode("events", Some(&[0, 0, 0, 0, 17, 14]), &mut context))
         .await.unwrap().unwrap();
-    assert_eq!(data.value, rtdb_types::Value::Struct(BTreeMap::from([("id".into(), rtdb_types::Value::I64(7))])));
+    assert_eq!(data.value, rtdb_types::Value::Struct(StructFields::from([("id".into(), rtdb_types::Value::I64(7))])));
     assert_eq!(data.schema.as_ref().unwrap().version, Some(3));
     converter.close().await.unwrap();
     server.await.unwrap();

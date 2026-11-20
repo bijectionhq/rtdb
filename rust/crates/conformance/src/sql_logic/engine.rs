@@ -15,6 +15,7 @@ use sqlparser::{ast, dialect::GenericDialect, parser::Parser};
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+use rtdb_types::StructFields;
 use super::{Error, Options, Record, format};
 
 mod dependencies;
@@ -158,7 +159,7 @@ impl Engine {
         for row in &values.rows {
             let expressions = row.expressions();
             if expressions.len() == 1 && columns.len() != 1 { return Err(Anomaly::incorrect("rtdb.conformance/slt-assertion", "Single-expression insert requires exactly one synthetic column")); }
-            let mut document = BTreeMap::from([("_id".into(), Value::Uuid(*uuid::Uuid::new_v4().as_bytes()))]);
+            let mut document = StructFields::from([("_id".into(), Value::Uuid(*uuid::Uuid::new_v4().as_bytes()))]);
             for (column, expression) in columns.iter().zip(expressions) { document.insert(Identifier::unquoted(column).normalized(), literal(expression)?); }
             documents.push(document);
         }
@@ -194,23 +195,22 @@ impl Engine {
             let batch = batch.batch();
             for row in 0..batch.num_rows() {
                 if rows.len() >= options.max_rows { return Err(gap("SLT result exceeded configured row retention limit")); }
-                let mut bound = 1024usize;
-                for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
-                    bound = bound.checked_add(estimate_read_value_bytes(field, array.as_ref(), row)?.checked_mul(8).ok_or_else(|| gap("SLT row size overflow"))?).ok_or_else(|| gap("SLT row size overflow"))?;
-                }
-                bytes = bytes.checked_add(bound).ok_or_else(|| gap("SLT result size overflow"))?;
-                if bytes > options.max_result_bytes { return Err(gap("SLT result exceeded configured byte retention limit")); }
-                charges.push(context.memory.reserve(bound)?);
-                let mut output = Vec::new();
+                let mut output = Vec::with_capacity(types.len().min(batch.num_columns()));
+                let mut retained = output.capacity().checked_mul(std::mem::size_of::<String>()).and_then(|bytes| bytes.checked_add(64)).ok_or_else(|| gap("SLT row size overflow"))?;
                 actual_values += batch.num_columns();
                 for ((kind, field), array) in types.iter().zip(batch.schema().fields()).zip(batch.columns()) {
+                    // Reading and formatting are charged for the cell alone; only its formatted text is retained.
+                    let _read = context.memory.reserve(estimate_read_value_bytes(field, array.as_ref(), row)?.checked_mul(8).ok_or_else(|| gap("SLT row size overflow"))?)?;
                     let value = read_value(field, array.as_ref(), row)?;
-                    let bound = format::allocation_bound(*kind, &value)?.checked_mul(4).ok_or_else(|| gap("SLT formatted size overflow"))?;
-                    bytes = bytes.checked_add(bound).ok_or_else(|| gap("SLT result size overflow"))?;
-                    if bytes > options.max_result_bytes { return Err(gap("SLT result exceeded configured byte retention limit")); }
-                    charges.push(context.memory.reserve(bound)?);
-                    output.push(format::cell(*kind, &value, bound / 4)?);
+                    let bound = format::allocation_bound(*kind, &value)?;
+                    let _formatting = context.memory.reserve(bound.checked_mul(4).ok_or_else(|| gap("SLT formatted size overflow"))?)?;
+                    let text = format::cell(*kind, &value, bound)?;
+                    retained = retained.checked_add(text.capacity()).ok_or_else(|| gap("SLT result size overflow"))?;
+                    output.push(text);
                 }
+                bytes = bytes.checked_add(retained).ok_or_else(|| gap("SLT result size overflow"))?;
+                if bytes > options.max_result_bytes { return Err(gap("SLT result exceeded configured byte retention limit")); }
+                charges.push(context.memory.reserve(retained)?);
                 rows.push(output);
             }
         }
@@ -256,7 +256,7 @@ fn literal(expression: &ast::Expr) -> Result<Value> {
             match literal(expr)? { Value::I64(value) => value.checked_neg().map(Value::I64).ok_or_else(|| gap("Synthetic negation overflow")), Value::F64(value) => Ok(Value::F64(-value)), _ => Err(expression_data_error()) }
         }
         ast::Expr::Array(array) => array.elem.iter().map(literal).collect::<Result<Vec<_>>>().map(Value::List),
-        ast::Expr::Dictionary(fields) => fields.iter().map(|field| Ok((Identifier { text: field.key.value.clone(), quoted: field.key.quote_style.is_some() }.normalized(), literal(&field.value)?))).collect::<Result<BTreeMap<_, _>>>().map(Value::Struct),
+        ast::Expr::Dictionary(fields) => fields.iter().map(|field| Ok((Identifier { text: field.key.value.clone(), quoted: field.key.quote_style.is_some() }.normalized(), literal(&field.value)?))).collect::<Result<StructFields<_>>>().map(Value::Struct),
         ast::Expr::TypedString(value) => {
             let data_type = match value.data_type.to_string().to_uppercase().as_str() {
                 "DATE" => ScalarType::DateDay,

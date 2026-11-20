@@ -41,8 +41,23 @@ impl PageBuilder {
     pub fn finish(self) -> OwnedPage { OwnedPage { rows: self.rows.into_iter(), _reservation: self.reservation } }
 }
 
-pub(crate) async fn project<'a>(page: &OwnedPage,schema: &Schema,expressions: impl ExactSizeIterator<Item=&'a Expr> + Send,execution: &crate::context::Execution) -> Result<OwnedPage> {
+pub(crate) async fn project<'a>(page: &OwnedPage,schema: &Schema,expressions: impl ExactSizeIterator<Item=&'a Expr> + Clone + Send,execution: &crate::context::Execution) -> Result<OwnedPage> {
     let mut output = PageBuilder::new(page.len(),&execution.context.memory)?;
+    let positions: Option<Vec<usize>> = expressions.clone().map(|expression| match expression { Expr::Column { id, .. } => schema.position(*id), _ => None }).collect();
+    if let Some(positions) = positions {
+        let mut slab = crate::cursor::RowSlab::new(&execution.context.memory);
+        for row in page.rows() {
+            execution.context.check_cancelled()?;
+            let mut values = Vec::with_capacity(positions.len());
+            for &position in &positions {
+                let mut value = row.values.get(position).cloned().ok_or_else(|| invalid("row-width", "Projected column is outside its row"))?;
+                value.admit_expression_dates()?;
+                values.push(value);
+            }
+            output.push(OwnedRow::in_slab(values, &mut slab)?)?;
+        }
+        return Ok(output.finish());
+    }
     for _ in 0..page.len() { output.push(OwnedRow::copy_parts(&[],0,expressions.len(),&execution.context.memory)?)?; }
     evaluate_columns(page, &mut output, 0, schema, expressions, execution).await?;
     Ok(output.finish())
@@ -61,12 +76,21 @@ pub(crate) async fn extend<'a>(page: &OwnedPage, schema: &Schema, expressions: i
 
 async fn evaluate_columns<'a>(page: &OwnedPage, output: &mut PageBuilder, first: usize, schema: &Schema, expressions: impl Iterator<Item = &'a Expr> + Send, execution: &crate::context::Execution) -> Result<()> {
     for (column,expression) in (first..).zip(expressions) {
+        if let Expr::Column { id, .. } = expression && let Some(position) = schema.position(*id) {
+            for (input,row) in page.rows().iter().zip(output.rows_mut()) {
+                let mut value = input.values.get(position).cloned().ok_or_else(|| invalid("row-width", "Projected column is outside its row"))?;
+                value.admit_expression_dates()?;
+                row.replace_value(column,value,&execution.context.memory)?;
+            }
+            continue;
+        }
         let metadata_scope = execution.scope()?;
         let invocation = execution.prepare_expression(expression,schema,&metadata_scope)?;
+        let scope = execution.scope()?;
         for (input,row) in page.rows().iter().zip(output.rows_mut()) {
-            let scope = execution.scope()?;
             let value = execution.evaluate_invocation(&scope,&invocation,&input.values).await?;
             row.replace_value(column,value,&execution.context.memory)?;
+            scope.reset()?;
         }
     }
     Ok(())
@@ -125,7 +149,12 @@ pub(crate) fn retain_page_state(input: BoxPageCursor, reservation: Arc<MemoryRes
 struct RetainedPageState { input: BoxPageCursor, _reservation: Arc<MemoryReservation> }
 #[async_trait]
 impl PageCursor for RetainedPageState {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> { self.input.next_page().await }
+    /// Each page spends cooperative budget, so a pipeline whose operators never wait on I/O still returns to the
+    /// scheduler, which only then polls the I/O driver - a cancel request's connection included.
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        tokio::task::consume_budget().await;
+        self.input.next_page().await
+    }
     fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> { self.input.skip_complete_pages(rows) }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }

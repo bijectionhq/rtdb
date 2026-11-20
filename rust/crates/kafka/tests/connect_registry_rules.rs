@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_kafka::connect::{ConnectData, ConversionContext, Converter, PluginRegistry, PluginSpec};
@@ -55,7 +56,7 @@ async fn read_ignored_rules_are_cached_and_subject_lookup_preserves_metadata() {
     let (mut converter, server) = registry(schema, "AVRO", rules.clone()).await;
     let memory = MemoryBudget::new(1 << 26);
     let value = converter.decode("events", Some(&framed(&[14])), &mut context(&memory)).await.unwrap();
-    assert_eq!(value.value, Value::Struct(BTreeMap::from([("id".into(), Value::I64(7))])));
+    assert_eq!(value.value, Value::Struct(StructFields::from([("id".into(), Value::I64(7))])));
     let requests = server.await.unwrap();
     assert_eq!(requests[1].1["metadata"], json!({"properties":{"application":"ledger"}}));
     assert_eq!(requests[1].1["ruleSet"], rules);

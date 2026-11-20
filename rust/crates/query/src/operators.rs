@@ -8,7 +8,6 @@ use rtdb_types::{Result, Value};
 
 use crate::context::Execution;
 use crate::cursor::{BoxCursor, OwnedRow};
-use crate::spill::{SpillReader, SpillWriter};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
 use crate::{invalid, QueryContext};
 use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
@@ -25,6 +24,7 @@ pub(crate) struct DeferredInput {
     constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
 }
 impl DeferredInput {
+    pub fn new(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Self { Self { runtime, execution, constraints, pushdowns } }
     pub async fn open_pages(self, own: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<BoxPageCursor> {
         let pushdowns = crate::pushdown::Pushdowns::merge(self.pushdowns.as_ref(), own, &self.execution.context.memory)?;
         build_pages_constrained(self.runtime, self.execution, self.constraints, pushdowns).await
@@ -36,6 +36,82 @@ fn build_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constr
     let pages = build_pages_constrained(runtime, execution, constraints, pushdowns).await?;
     Ok(crate::pages::rows(pages, context))
 }) }
+
+/// Builds a scan, its filters and column-only projections as a batch source, or `None` where the subtree has another shape.
+/// The boolean reports whether the batches passed through a projection.
+pub(crate) fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> { Box::pin(async move {
+    let relation = Arc::clone(runtime.relation());
+    match relation.node() {
+        RelationNode::Scan(scan) if !crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none() => {
+            let batches: crate::columnar::BoxBatchCursor = Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?);
+            let batches = match scan.predicates.iter().cloned().reduce(|left,right|Expr::binary(rtdb_plan::BinaryOp::And,left,right)) {
+                Some(predicate) => Box::new(crate::columnar::BatchFilter::new(batches,runtime.schema().clone(),predicate,execution)) as crate::columnar::BoxBatchCursor,
+                None => batches,
+            };
+            Ok(Some((batches,false)))
+        }
+        RelationNode::Filter { predicate,.. } => {
+            if matches!(runtime.child(0)?.relation().node(), RelationNode::Filter { .. }) { return Ok(None); }
+            let Some((batches,projected)) = build_batches(runtime.child(0)?,execution.child(0),pushdowns).await? else { return Ok(None) };
+            if projected { return Ok(None); }
+            Ok(Some((Box::new(crate::columnar::BatchFilter::new(batches,runtime.child(0)?.schema().clone(),predicate.clone(),execution)) as crate::columnar::BoxBatchCursor,false)))
+        }
+        RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
+            let child = runtime.child(0)?;
+            let positions = expressions.iter().map(|named| match &named.expr { Expr::Column { id,.. } => child.schema().position(*id), _ => None }).collect::<Option<Vec<_>>>();
+            if positions.is_none() && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
+            let schema = child.schema().clone();
+            let pushdowns = pushdowns.map(|filters|filters.project(expressions,&execution.context.memory)).transpose()?;
+            let Some((batches,_)) = build_batches(child,execution.child(0),pushdowns).await? else { return Ok(None) };
+            let batches: crate::columnar::BoxBatchCursor = match positions {
+                Some(positions) => Box::new(crate::columnar::BatchProject::new(batches,positions,Arc::clone(&execution.context.memory))),
+                None => Box::new(crate::columnar::BatchExpressions::new(batches,schema,expressions.iter().map(|named|named.expr.clone()).collect(),execution)),
+            };
+            Ok(Some((batches,true)))
+        }
+        RelationNode::Join { left,right,kind: rtdb_plan::JoinKind::Inner,condition: Some(condition) } if execution.analysis.is_none() && execution.context.tracer.is_none() => {
+            let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?)?,batch_shape(&runtime.child(1)?)?) else { return Ok(None) };
+            if build_projected != probe_projected || !crate::join::build_left(left,right,rtdb_plan::JoinKind::Inner,&execution)? { return Ok(None); }
+            // The left input is built unless it would spill and the right one fits, in which case the right one is built
+            // and the output keeps its left-then-right columns: a spilled build orders its output differently anyway.
+            let threshold = execution.context.options.join_build_rows;
+            let swapped = crate::join::rows_at_most(left,&execution)? > threshold && crate::join::rows_at_most(right,&execution)? <= threshold;
+            let (build_side,probe_side,build_relation,probe_relation) = if swapped { (1,0,right,left) } else { (0,1,left,right) };
+            let mut layout = crate::join_key::JoinLayout::new(build_relation,probe_relation,Some(condition),&execution.context.memory)?;
+            layout.resolve_types(runtime.child(build_side)?.schema(),runtime.child(probe_side)?.schema(),&execution)?;
+            let Some(order) = crate::batch_join::key_order(&layout) else { return Ok(None) };
+            let Some((build,projected)) = build_batches(runtime.child(build_side)?,execution.child(build_side),pushdowns.clone()).await? else { return Ok(None) };
+            if projected != build_projected { return Ok(None); }
+            let probe = crate::batch_join::ProbeInput { runtime: runtime.child(probe_side)?,execution: execution.child(probe_side),pushdowns };
+            let unswapped = if swapped {
+                let mut layout = crate::join_key::JoinLayout::new(left,right,Some(condition),&execution.context.memory)?;
+                layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
+                Some(layout)
+            } else { None };
+            Ok(Some((Box::new(crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution).swapped(unswapped)) as crate::columnar::BoxBatchCursor,projected)))
+        }
+        _ => Ok(None),
+    }
+}) }
+
+/// Whether `build_batches` opens this subtree as batches, and if so whether they pass through a projection.
+fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
+    let relation = Arc::clone(runtime.relation());
+    Ok(match relation.node() {
+        RelationNode::Scan(scan) => (!crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none()).then_some(false),
+        RelationNode::Filter { .. } => {
+            if matches!(runtime.child(0)?.relation().node(), RelationNode::Filter { .. }) { return Ok(None); }
+            match batch_shape(&runtime.child(0)?)? { Some(false) => Some(false), _ => None }
+        }
+        RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
+            let child = runtime.child(0)?;
+            let columns = expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id,.. } if child.schema().position(*id).is_some()));
+            if !columns && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
+            batch_shape(&child)?.map(|_| true)
+        }
+        _ => None,
+    })
+}
 
 fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<crate::pages::BoxPageCursor>> { Box::pin(async move {
     execution.context.check_cancelled()?;
@@ -52,6 +128,14 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         let pages = Box::new(crate::patch::PatchGaps::new(input_pages, input.schema(), [*iid, *valid_from, *valid_to, *document], from, to, execution).await?);
         let pages = crate::pages::retain_page_state(pages, state_reservation);
         return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
+    }
+    if let RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } = relation.node()
+        && execution.analysis.is_none() && execution.context.tracer.is_none()
+        && !expressions.iter().all(|named| matches!(named.expr, Expr::Column { .. })) && expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr))
+        && let Some((batches,_)) = build_batches(Arc::clone(&runtime),execution.clone(),pushdowns.clone()).await? {
+        let pages: BoxPageCursor = Box::new(crate::columnar::BatchRows::new(batches,Arc::clone(&execution.context.memory)));
+        let pages = crate::pages::retain_page_state(pages,state_reservation);
+        return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
     }
     match relation.node() {
         RelationNode::Join { kind: rtdb_plan::JoinKind::Cross,.. } => {
@@ -86,14 +170,22 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         }
         RelationNode::Scan(scan) => {
             let mut constraints = constraints;for predicate in &scan.predicates { constraints.add(predicate); }
-            let pages: BoxPageCursor = if crate::inspection::is_inspection(&scan.table.name.table) {
-                crate::pages::from_rows(Box::new(crate::inspection::InspectionCursor::new(scan.clone(),execution.clone(),&constraints).await?),Arc::clone(&execution.context))
-            } else if crate::system_schema::definition(&scan.table.name.table).is_some() {
-                crate::pages::from_rows(Box::new(crate::system::SystemCursor::new(scan.clone(),execution.clone())),Arc::clone(&execution.context))
-            } else { Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?) };
-            let pages = match scan.predicates.iter().cloned().reduce(|left,right|Expr::binary(rtdb_plan::BinaryOp::And,left,right)) {
-                Some(predicate) => Box::new(PageFilter { input: pages,schema: runtime.schema().clone(),predicate,execution }) as BoxPageCursor,
-                None => pages,
+            let predicate = scan.predicates.iter().cloned().reduce(|left,right|Expr::binary(rtdb_plan::BinaryOp::And,left,right));
+            let pages: BoxPageCursor = if crate::inspection::is_inspection(&scan.table.name.table) || crate::system_schema::definition(&scan.table.name.table).is_some() {
+                let pages = if crate::inspection::is_inspection(&scan.table.name.table) {
+                    crate::pages::from_rows(Box::new(crate::inspection::InspectionCursor::new(scan.clone(),execution.clone(),&constraints).await?),Arc::clone(&execution.context))
+                } else { crate::pages::from_rows(Box::new(crate::system::SystemCursor::new(scan.clone(),execution.clone())),Arc::clone(&execution.context)) };
+                match predicate {
+                    Some(predicate) => Box::new(PageFilter { input: pages,schema: runtime.schema().clone(),stages: vec![(predicate,execution.clone())],_collapsed: execution.context.memory.reserve(0)?,execution }) as BoxPageCursor,
+                    None => pages,
+                }
+            } else {
+                let batches: crate::columnar::BoxBatchCursor = Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?);
+                let batches = match predicate {
+                    Some(predicate) => Box::new(crate::columnar::BatchFilter::new(batches,runtime.schema().clone(),predicate,execution.clone())) as crate::columnar::BoxBatchCursor,
+                    None => batches,
+                };
+                Box::new(crate::columnar::BatchRows::new(batches,Arc::clone(&execution.context.memory)))
             };
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -115,8 +207,24 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         }
         RelationNode::Filter { predicate,.. } => {
             let mut constraints = constraints;constraints.add(predicate);
-            let pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
-            let pages = Box::new(PageFilter { input: pages,schema: runtime.child(0)?.schema().clone(),predicate: predicate.clone(),execution });
+            let schema = runtime.child(0)?.schema().clone();
+            let mut stages = vec![(predicate.clone(),execution.clone())];
+            let (mut child,mut child_execution) = (runtime.child(0)?,execution.child(0));
+            // A run of stacked selections is one cursor applying each in turn, so its depth never nests the cursors.
+            let mut collapsed = 0usize;
+            while execution.analysis.is_none() && execution.context.tracer.is_none() {
+                let RelationNode::Filter { predicate,.. } = child.relation().node() else { break };
+                constraints.add(predicate);
+                collapsed = collapsed.checked_add(crate::runtime_schema::local_allocation_bound(child.relation())?).ok_or_else(||invalid("operator-size","Operator state exceeds addressable memory"))?;
+                stages.push((predicate.clone(),child_execution.clone()));
+                let next = child.child(0)?;
+                child_execution = child_execution.child(0);
+                child = next;
+            }
+            stages.reverse();
+            let collapsed = execution.context.memory.reserve(collapsed)?;
+            let pages = build_pages_constrained(child,child_execution,constraints,pushdowns).await?;
+            let pages = Box::new(PageFilter { input: pages,schema,stages,execution,_collapsed: collapsed });
             let pages = crate::pages::coalesce(pages,Arc::clone(&traced_context));
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -139,13 +247,26 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         RelationNode::SortLimit { order_by,offset,fetch,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
-            let mut pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
+            let schema = runtime.child(0)?.schema().clone();
+            let batches = if !order_by.is_empty() && execution.analysis.is_none() && execution.context.tracer.is_none() && crate::sort::SortCursor::batch_eligible(&schema,order_by,0) {
+                build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await?
+            } else { None };
+            let input = match batches {
+                Some(batches) => Ok(batches),
+                None => Err(build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?),
+            };
             let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
             let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            if !order_by.is_empty() {
-                let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
-                pages = Box::new(crate::sort::SortCursor::with_row_limit(pages,runtime.child(0)?.schema().clone(),order_by.clone(),row_limit,execution.clone()));
-            }
+            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
+            let mut pages: BoxPageCursor = match input {
+                Ok((batches,projected)) if crate::sort::SortCursor::batch_eligible(&schema,order_by,row_limit) =>
+                    Box::new(crate::sort::SortCursor::top_batches(batches,projected,schema,order_by.clone(),row_limit,execution.clone())),
+                Ok((batches,projected)) => {
+                    let pages: BoxPageCursor = Box::new(crate::columnar::BatchRows::new(batches,Arc::clone(&execution.context.memory)).admitting_dates(projected));
+                    Box::new(crate::sort::SortCursor::with_row_limit(pages,schema,order_by.clone(),row_limit,execution.clone()))
+                }
+                Err(pages) => if order_by.is_empty() { pages } else { Box::new(crate::sort::SortCursor::with_row_limit(pages,schema,order_by.clone(),row_limit,execution.clone())) },
+            };
             if offset.is_some() || fetch.is_some() { pages = Box::new(Limit { input: Some(pages),offset: offset_value,remaining,execution }); }
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -218,8 +339,16 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
         RelationNode::Aggregate { groups,aggregates,.. } => {
-            let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
-            let pages = Box::new(crate::aggregate::AggregateCursor::new(input,runtime.child(0)?.schema().clone(),groups.clone(),aggregates.clone(),Arc::clone(&runtime),execution)?);
+            let schema = runtime.child(0)?.schema().clone();
+            let columnar = execution.analysis.is_none() && execution.context.tracer.is_none() && crate::aggregate::AggregateCursor::reads_columns(&schema,groups,aggregates).is_some();
+            let batches = if columnar { build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await? } else { None };
+            let pages: Box<crate::aggregate::AggregateCursor> = match batches {
+                Some((batches,projected)) => Box::new(crate::aggregate::AggregateCursor::from_batches(batches,projected,schema,groups.clone(),aggregates.clone(),Arc::clone(&runtime),execution)?),
+                None => {
+                    let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
+                    Box::new(crate::aggregate::AggregateCursor::new(input,schema,groups.clone(),aggregates.clone(),Arc::clone(&runtime),execution)?)
+                }
+            };
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
@@ -284,6 +413,12 @@ impl PageCursor for PageProject {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         self.execution.context.check_cancelled()?;
         let Some(page) = self.input.next_page().await? else { return Ok(None); };
+        // Projecting every input column in place copies each cell unchanged unless admitting it rewrites a date.
+        let identity = self.expressions.len() == self.schema.len()
+            && self.expressions.iter().enumerate().all(|(index,named)| matches!(&named.expr, Expr::Column { id, .. } if self.schema.position(*id) == Some(index)));
+        if identity && page.rows().iter().all(|row| row.values.iter().all(|value| !matches!(value, Value::Date(_) | Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Struct(_) | Value::Map { .. }))) {
+            return Ok(Some(page));
+        }
         crate::pages::project(&page,&self.schema,self.expressions.iter().map(|expression|&expression.expr),&self.execution).await.map(Some)
     }
 
@@ -304,20 +439,26 @@ impl PageCursor for PageExtend {
         crate::pages::extend(&page, &self.schema, self.expressions.iter().map(|named| &named.expr), &self.execution).await.map(Some)
     }
 }
-struct PageFilter { input: BoxPageCursor, schema: Schema, predicate: Expr, execution: Execution }
+/// Stacked selections, lowest first; each stage reads only the rows of a page that every stage before it kept.
+struct PageFilter { input: BoxPageCursor, schema: Schema, stages: Vec<(Expr,Execution)>, execution: Execution, _collapsed: Arc<rtdb_columnar::MemoryReservation> }
 #[async_trait]
 impl PageCursor for PageFilter {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         self.execution.context.check_cancelled()?;
-        while let Some(mut page) = self.input.next_page().await? {
-            let metadata_scope = self.execution.scope()?;
-            let invocation = self.execution.prepare_expression(&self.predicate,&self.schema,&metadata_scope)?;
-            let mut output = PageBuilder::new(page.len(),&self.execution.context.memory)?;
-            while let Some(row) = page.next() {
-                let scope = self.execution.scope()?;
-                if is_true(&self.execution.evaluate_invocation(&scope,&invocation,&row.values).await?)? { output.push(row)?; }
+        'pages: while let Some(mut page) = self.input.next_page().await? {
+            for (predicate,execution) in &self.stages {
+                let metadata_scope = execution.scope()?;
+                let invocation = execution.prepare_expression(predicate,&self.schema,&metadata_scope)?;
+                let mut output = PageBuilder::new(page.len(),&execution.context.memory)?;
+                let scope = execution.scope()?;
+                while let Some(row) = page.next() {
+                    if is_true(&execution.evaluate_invocation(&scope,&invocation,&row.values).await?)? { output.push(row)?; }
+                    scope.reset()?;
+                }
+                if output.len() == 0 { continue 'pages; }
+                page = output.finish();
             }
-            if output.len() > 0 { return Ok(Some(output.finish())); }
+            return Ok(Some(page));
         }
         Ok(None)
     }
@@ -395,32 +536,56 @@ pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory
     }
     Ok(true)
 }
-pub(crate) struct SeenRows { writer: SpillWriter, runtime: Arc<RuntimeSchema>, context: Arc<QueryContext> }
-impl SeenRows {
-    pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeSchema>) -> Result<Self> { Ok(Self { writer: context.spill.create()?, runtime, context: Arc::clone(context) }) }
-    pub fn insert(&mut self, values: &[Value]) -> Result<bool> {
-        for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
-        let mut reader = self.writer.reader(Arc::clone(&self.context.memory))?;
-        while let Some(row) = reader.next()? {
-            self.context.check_cancelled()?;
-            if rows_equal(values, &row.values, &self.context.timezone, &self.context.memory)? { return Ok(false); }
+/// A hash that rows equal under `rows_equal` share.
+/// A date or timestamp equals one of another unit or zone once the session zone localizes it, so it hashes as the
+/// wall-clock time it reads as there; date-times nested in a container hash alike, and `rows_equal` tells them apart.
+fn equality_hash(values: &[Value], timezone: &str) -> u32 {
+    fn temporal(value: &Value) -> bool {
+        match value {
+            Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
+            Value::List(values) | Value::FixedSizeList(values) | Value::Set(values) => values.iter().any(temporal),
+            Value::Struct(fields) => fields.values().any(temporal),
+            Value::Map { entries, .. } => entries.iter().any(|(key, value)| temporal(key) || temporal(value)),
+            _ => false,
         }
-        self.writer.write(values, &self.context.memory)?;
+    }
+    values.iter().fold(0u32, |hash, value| {
+        let cell = match value {
+            Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) => rtdb_expr::local_micros(value, timezone)
+                .and_then(|micros| rtdb_columnar::hash_value(&Value::I64(micros), 0).ok()).map_or(0x7e3a_11c5, |cell| (cell as u32) ^ 0x7e3a_11c5),
+            value if temporal(value) => 0x7e3a_11c5,
+            value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
+        };
+        (hash ^ cell.wrapping_mul(0xcc9e_2d51).rotate_left(15)).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64)
+    })
+}
+/// The distinct rows seen so far, found through an index from their hash to the rows that share it.
+pub(crate) struct SeenRows { rows: Vec<OwnedRow>, index: std::collections::HashMap<u32, Vec<usize>>, validated: bool, runtime: Arc<RuntimeSchema>, context: Arc<QueryContext>, _reservation: Option<Arc<rtdb_columnar::MemoryReservation>> }
+impl SeenRows {
+    pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeSchema>) -> Result<Self> { Ok(Self { rows: Vec::new(), index: Default::default(), validated: false, runtime, context: Arc::clone(context), _reservation: None }) }
+    pub fn insert(&mut self, values: &[Value]) -> Result<bool> {
+        if !self.validated {
+            for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
+            self.validated = true;
+        }
+        let hash = equality_hash(values, &self.context.timezone);
+        if let Some(candidates) = self.index.get(&hash) {
+            for &candidate in candidates {
+                if rows_equal(values, &self.rows[candidate].values, &self.context.timezone, &self.context.memory)? { return Ok(false); }
+            }
+        }
+        let row = OwnedRow::copy_parts(&[values], 0, 0, &self.context.memory)?;
+        if self.rows.len() == self.rows.capacity() {
+            let capacity = self.rows.capacity().saturating_mul(2).max(16);
+            let bytes = capacity.checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>())
+                .ok_or_else(|| invalid("distinct-size", "Distinct rows exceed addressable memory"))?;
+            self._reservation = Some(self.context.memory.reserve(bytes)?);
+            self.rows.reserve_exact(capacity - self.rows.len());
+        }
+        self.index.entry(hash).or_default().push(self.rows.len());
+        self.rows.push(row);
         Ok(true)
     }
-}
-pub(crate) struct OrdinalSet { writer: SpillWriter, context: Arc<QueryContext> }
-impl OrdinalSet {
-    pub fn new(context: &Arc<QueryContext>) -> Result<Self> { Ok(Self { writer: context.spill.create()?, context: Arc::clone(context) }) }
-    pub fn contains(&mut self, ordinal: u64) -> Result<bool> {
-        let mut reader = self.writer.reader(Arc::clone(&self.context.memory))?;
-        while let Some(row) = reader.next()? {
-            self.context.check_cancelled()?;
-            if row.values.first() == Some(&Value::U64(ordinal)) { return Ok(true); }
-        }
-        Ok(false)
-    }
-    pub fn insert(&mut self, ordinal: u64) -> Result<()> { self.writer.write(&[Value::U64(ordinal)], &self.context.memory) }
 }
 struct Distinct { input: BoxPageCursor, seen: SeenRows, execution: Execution }
 #[async_trait]
@@ -439,19 +604,28 @@ impl PageCursor for Distinct {
     }
 }
 
-struct SetCursor { left: BoxPageCursor, right: Option<BoxPageCursor>, reader: Option<SpillReader>, operator: SetOperator, all: bool, consumed: OrdinalSet, seen: SeenRows, runtime: Arc<EmittedRelation>, execution: Execution }
+struct SetCursor { left: BoxPageCursor, right: Option<BoxPageCursor>, built: Option<RightRows>, operator: SetOperator, all: bool, seen: SeenRows, runtime: Arc<EmittedRelation>, execution: Execution }
+/// The right input, indexed by the hash rows equal under `rows_equal` share, and which of its rows an ALL operator consumed.
+struct RightRows { rows: Vec<OwnedRow>, index: std::collections::HashMap<u32, Vec<usize>>, consumed: Vec<bool>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl SetCursor {
     fn new(left: BoxPageCursor, right: BoxPageCursor, operator: SetOperator, all: bool, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
-        Ok(Self { left, right: Some(right), reader: None, operator, all, consumed: OrdinalSet::new(&execution.context)?, seen: SeenRows::new(&execution.context, runtime.child(0)?.output())?, runtime, execution })
+        Ok(Self { left, right: Some(right), built: None, operator, all, seen: SeenRows::new(&execution.context, runtime.child(0)?.output())?, runtime, execution })
     }
 }
 #[async_trait]
 impl PageCursor for SetCursor {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         if let Some(mut right) = self.right.take() {
-            let mut writer = self.execution.context.spill.create()?;
-            while let Some(mut page) = right.next_page().await? { while let Some(row) = page.next() { self.execution.context.check_cancelled()?;writer.write(&row.values,&self.execution.context.memory)?; } }
-            self.reader = Some(writer.finish()?.reader(Arc::clone(&self.execution.context.memory))?);
+            let memory = &self.execution.context.memory;
+            let mut rows = Vec::new();
+            while let Some(mut page) = right.next_page().await? { while let Some(row) = page.next() { self.execution.context.check_cancelled()?; rows.push(OwnedRow::copy_parts(&[&row.values], 0, 0, memory)?); } }
+            let bytes = rows.len().checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>() + 1)
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| invalid("set-size", "Set rows exceed addressable memory"))?;
+            let reservation = memory.reserve(bytes)?;
+            let mut index: std::collections::HashMap<u32, Vec<usize>> = Default::default();
+            for (ordinal, row) in rows.iter().enumerate() { index.entry(equality_hash(&row.values, &self.execution.context.timezone)).or_default().push(ordinal); }
+            let consumed = vec![false; rows.len()];
+            self.built = Some(RightRows { rows, index, consumed, _reservation: reservation });
         }
         while let Some(mut page) = self.left.next_page().await? {
           let mut output = PageBuilder::new(page.len(),&self.execution.context.memory)?;
@@ -460,18 +634,17 @@ impl PageCursor for SetCursor {
             let left_types = self.runtime.child(0)?;let right_types = self.runtime.child(1)?;
             for (left, right) in left_types.schema().fields().iter().zip(right_types.schema().fields()) { rtdb_plan::validate_equality_types(&left.data_type, &right.data_type)?; }
             if !self.all && !self.seen.insert(&left.values)? { continue; }
-            let reader = self.reader.as_mut().ok_or_else(|| invalid("set-state", "Set input was not spooled"))?;
-            reader.rewind()?;
-            let mut ordinal = 0u64;
+            let built = self.built.as_mut().ok_or_else(|| invalid("set-state", "Set input was not built"))?;
             let mut matched = false;
-            while let Some(right) = reader.next()? {
-                self.execution.context.check_cancelled()?;
-                if rows_equal(&left.values, &right.values, &self.execution.context.timezone, &self.execution.context.memory)? && (!self.all || !self.consumed.contains(ordinal)?) {
-                    if self.all { self.consumed.insert(ordinal)?; }
-                    matched = true;
-                    break;
+            if let Some(candidates) = built.index.get(&equality_hash(&left.values, &self.execution.context.timezone)) {
+                for &ordinal in candidates {
+                    if self.all && built.consumed[ordinal] { continue; }
+                    if rows_equal(&left.values, &built.rows[ordinal].values, &self.execution.context.timezone, &self.execution.context.memory)? {
+                        if self.all { built.consumed[ordinal] = true; }
+                        matched = true;
+                        break;
+                    }
                 }
-                ordinal = ordinal.checked_add(1).ok_or_else(|| invalid("row-count", "Set row count overflow"))?;
             }
             if matched == (self.operator == SetOperator::Intersect) { output.push(left)?; }
           }
@@ -525,7 +698,7 @@ impl PageCursor for Unnest {
 struct Apply { input: BoxPageCursor, schema: Schema, dependent: Arc<EmittedRelation>, arguments: Vec<(usize, Expr)>, kind: ApplyKind, execution: Execution }
 impl Apply {
     fn document(&self, row: &OwnedRow) -> Value {
-        Value::Struct(self.dependent.relation().schema().fields().iter().zip(&row.values).map(|(field, value)| (field.name.clone(), value.clone())).collect::<BTreeMap<_, _>>())
+        Value::Struct(self.dependent.relation().schema().fields().iter().zip(&row.values).map(|(field, value)| (field.name.clone(), value.clone())).collect::<BTreeMap<_, _>>().into())
     }
     fn document_bound(&self, row: &OwnedRow) -> Result<usize> {
         self.dependent.relation().schema().fields().iter().try_fold(row.bytes(), |bytes, field| bytes.checked_add(field.name.len()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("row-size", "Apply document allocation overflow")))

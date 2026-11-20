@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use super::super::super::test_support as support;
 use super::super::super::logical::FactoryOutcome;
@@ -128,7 +129,7 @@ fn borrowed_java_text_datum_entry_retains_source_after_input_and_creation_contex
     assert!(canonical.view().node().doc.as_ref().unwrap().view().units().eq("A😀".encode_utf16()));
     let mut next = ConversionContext::new(Arc::clone(&budget));
     let converted = connect.decode(&[14], &mut next).unwrap();
-    assert_eq!(converted.value, rtdb_types::Value::Struct(BTreeMap::from([("x".into(), rtdb_types::Value::I32(7))])));
+    assert_eq!(converted.value, rtdb_types::Value::Struct(StructFields::from([("x".into(), rtdb_types::Value::I32(7))])));
     assert_eq!(converted.schema.as_ref().unwrap().version, Some(3));
     drop(canonical);
     drop(datum);

@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use crate::compare::{null_eq_scoped,sql_eq_scoped};
 use crate::{EvalContext, cast, compare_in_timezone};
 use crate::compare::nullish;
@@ -85,7 +86,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             let Value::Struct(right) = &args[1] else { return Err(inapplicable("_patch", &[&args[0], &args[1]])); };
             let mut fields = match &args[0] {
                 Value::Struct(left) => left.clone(),
-                Value::Null | Value::Undefined => std::collections::BTreeMap::new(),
+                Value::Null | Value::Undefined => StructFields::new(),
                 _ => return Err(inapplicable("_patch", &[&args[0], &args[1]])),
             };
             for (name, value) in right {

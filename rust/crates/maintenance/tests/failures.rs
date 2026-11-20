@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, ops::Range, path::Path, sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}};
+use rtdb_types::StructFields;
+use std::{ops::Range, path::Path, sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_columnar::MemoryBudget;
@@ -240,8 +241,8 @@ async fn actual_metadata_upload_failure_preserves_storage_anomaly_and_emits_the_
         let data_key = ObjectKey::new(slug.data_key(&output)).unwrap(); let metadata_key = ObjectKey::new(slug.metadata_key(&output)).unwrap();
         let store = Arc::new(DenyUpload { inner: MemoryStore::default(), denied: metadata_key.clone(), local, uploads: Mutex::new(Vec::new()) });
         let rows = [StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("value".into(), Value::I64(1))])), recency: None }];
-        let data = build_event_batch(&rows, Some(BTreeMap::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None).unwrap();
+            operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(1))])), recency: None }];
+        let data = build_event_batch(&rows, Some(StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None).unwrap();
         let mut metadata = MetadataBuilder::new(false, true); metadata.write_leaf(&data).unwrap();
         let (metadata, _) = metadata.finish().unwrap();
         store.put(&ObjectKey::new(slug.data_key(&input)).unwrap(), Bytes::from(write_file(&data.schema(), &[data]).unwrap())).await.unwrap();

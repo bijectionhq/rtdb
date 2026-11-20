@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -182,7 +183,7 @@ fn basis_tokens_keep_partition_order_and_nanoseconds() {
 
 #[test]
 fn nested_column_types_keep_bottom_null_and_missing_distinct() {
-    let ty = LogicalType::Struct(BTreeMap::from([
+    let ty = LogicalType::Struct(StructFields::from([
         ("bottom".into(), LogicalType::Nothing),
         ("nullable".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
         ("null".into(), LogicalType::Null),
@@ -192,7 +193,7 @@ fn nested_column_types_keep_bottom_null_and_missing_distinct() {
     let encoded = columns::column_from_type(&ty, Some(vec![1, 2, 3])).unwrap();
     assert_eq!(columns::logical_type(&encoded).unwrap(), ty);
     assert_eq!(encoded.hll.as_deref(), Some([1, 2, 3].as_slice()));
-    let block = TableBlock::from_parts(BTreeMap::from([("doc".into(), encoded)]), 3, Vec::new()).unwrap();
+    let block = TableBlock::from_parts(BTreeMap::from([("doc".into(), encoded)]), &Default::default(), 3, Vec::new()).unwrap();
     let decoded = TableBlock::decode(&block.encode()).unwrap();
     assert_eq!(decoded.column_types().unwrap()["doc"], ty);
     assert_eq!(decoded.column_hlls()["doc"], [1, 2, 3]);
@@ -202,8 +203,8 @@ fn events() -> Vec<StoredEvent> {
     vec![
         StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(3), valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None },
         StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(2), valid_time: Interval::from_micros(10, 20).unwrap(), operation: StoredOperation::Delete, recency: None },
-        StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(BTreeMap::from([("price".into(), Value::I64(12))])), recency: None },
-        StoredEvent { iid: Iid([2; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(BTreeMap::from([("price".into(), Value::I64(7))])), recency: None },
+        StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(12))])), recency: None },
+        StoredEvent { iid: Iid([2; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(7))])), recency: None },
     ]
 }
 
@@ -211,7 +212,7 @@ fn events() -> Vec<StoredEvent> {
 fn every_iid_run_row_survives_arrow_file_and_stream_roundtrips() {
     let events = events();
     for encoding in [None, Some(RunEndWidth::I16), Some(RunEndWidth::I32), Some(RunEndWidth::I64)] {
-        let batch = build_event_batch(&events, Some(BTreeMap::from([("price".into(), LogicalType::Scalar(ScalarType::I64))])), encoding).unwrap();
+        let batch = build_event_batch(&events, Some(StructFields::from([("price".into(), LogicalType::Scalar(ScalarType::I64))])), encoding).unwrap();
         let bytes = ipc::write_file(batch.schema().as_ref(), &[batch.clone()]).unwrap();
         let mut file = ipc::ArrowFile::open(bytes.into(), None).unwrap();
         let decoded = EventBatch::new(file.read_page(0).unwrap()).unwrap();
@@ -285,10 +286,10 @@ fn uuid_columns_round_trip_through_arrow_file_and_stream() {
 #[test]
 fn uuid_put_documents_are_read_back_through_the_event_schema() {
     let uuid = Value::Uuid(std::array::from_fn(|index| 0xa0 | index as u8));
-    let put = |iid: u8, id: Value| StoredEvent { iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(BTreeMap::from([("ref".into(), id)])), recency: None };
+    let put = |iid: u8, id: Value| StoredEvent { iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("ref".into(), id)])), recency: None };
     let events = vec![put(1, uuid), put(2, Value::Null), put(3, Value::Uuid([0; 16]))];
     let fields = BTreeMap::from([("ref".into(), LogicalType::Scalar(ScalarType::Uuid).maybe())]);
-    let batch = build_event_batch(&events, Some(fields), None).unwrap();
+    let batch = build_event_batch(&events, Some(fields.into()), None).unwrap();
     let bytes = ipc::write_file(batch.schema().as_ref(), &[batch]).unwrap();
     let mut file = ipc::ArrowFile::open(bytes.into(), None).unwrap();
     let uuids: Vec<_> = file.schema().fields().iter().flat_map(|field| uuid_fields(field)).collect();
@@ -296,4 +297,37 @@ fn uuid_put_documents_are_read_back_through_the_event_schema() {
     assert_jvm_uuid_field(&uuids[0]);
     let decoded = EventBatch::new(file.read_page(0).unwrap()).unwrap();
     for (row, event) in events.iter().enumerate() { assert_eq!(&decoded.read_event(row).unwrap(), event); }
+}
+
+fn operation_legs(batch: &arrow_array::RecordBatch) -> Vec<String> {
+    let arrow_schema::DataType::Union(legs, _) = batch.schema().field_with_name("op").unwrap().data_type().clone() else { panic!("op is a union") };
+    legs.iter().map(|(_, leg)| leg.name().clone()).collect()
+}
+
+#[test]
+fn live_pages_carry_the_put_leg_last_and_only_once_a_document_is_written() {
+    let memory = rtdb_types::MemoryBudget::new(1 << 24);
+    let fields = || Some(StructFields::from([("price".into(), LogicalType::Scalar(ScalarType::I64))]));
+    let live = rtdb_format::data::owned_event_batch(&events(), fields(), false, &memory).unwrap();
+    assert_eq!(operation_legs(live.batch()), ["delete", "erase", "put"]);
+    let decoded = EventBatch::new(live.batch().clone()).unwrap();
+    for (row, event) in events().iter().enumerate() { assert_eq!(&decoded.read_event(row).unwrap(), event); }
+
+    let deletes: Vec<_> = events().into_iter().filter(|event| !matches!(event.operation, StoredOperation::Put(_))).collect();
+    let without_puts = rtdb_format::data::owned_event_batch(&deletes, Some(StructFields::new()), false, &memory).unwrap();
+    assert_eq!(operation_legs(without_puts.batch()), ["delete", "erase"]);
+
+    assert_eq!(operation_legs(&build_event_batch(&events(), fields(), None).unwrap()), ["put", "delete", "erase"], "compacted pages declare put first");
+}
+
+#[test]
+fn put_columns_keep_the_order_their_fields_were_first_seen() {
+    let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("system_time".into(), LogicalType::Scalar(ScalarType::I64)), ("committed".into(), LogicalType::Scalar(ScalarType::Bool))]);
+    let put = StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1)), ("system_time".into(), Value::I64(2)), ("committed".into(), Value::Bool(true))])) };
+    let batch = build_event_batch(&[put], Some(fields), None).unwrap();
+    let arrow_schema::DataType::Union(legs, _) = batch.schema().field_with_name("op").unwrap().data_type().clone() else { panic!("op is a union") };
+    let (_, put) = legs.iter().find(|(_, leg)| leg.name() == "put").unwrap();
+    let arrow_schema::DataType::Struct(columns) = put.data_type() else { panic!("put is a struct") };
+    assert_eq!(columns.iter().map(|column| column.name().as_str()).collect::<Vec<_>>(), ["_id", "system_time", "committed"]);
 }

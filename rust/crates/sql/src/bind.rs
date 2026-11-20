@@ -733,6 +733,10 @@ impl Context<'_> {
             .collect::<Result<Vec<_>>>()?;
         for (index, &group) in groups.iter().enumerate() {
             let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
+            if let Some(existing) = named_groups.iter().find(|named: &&NamedExpr| named.expr == expr) {
+                replacements.insert(ReplacementKey::Expression(group.to_string()), existing.field.clone());
+                continue;
+            }
             let source = match &expr {
                 Expr::Column { id, .. } => input.schema().get(*id),
                 _ => None,
@@ -746,6 +750,8 @@ impl Context<'_> {
             replacements.insert(ReplacementKey::Expression(group.to_string()), field.clone());
             named_groups.push(NamedExpr { field, expr });
         }
+        let position = |named: &NamedExpr| match &named.expr { Expr::Column { id, .. } => input.schema().fields().iter().position(|field| field.id == *id).unwrap_or(usize::MAX), _ => usize::MAX };
+        named_groups.sort_by_key(|named| position(named));
         let mut aggregates = Vec::new();
         for (key, function) in aggregate_calls {
             let aggregate = self.aggregate(&function, &mut input, aggregates.len())?;

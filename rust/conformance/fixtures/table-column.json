@@ -117,12 +117,12 @@
       "expected": {
         "data_type": {
           "Union": [
+            {
+              "Scalar": "F64"
+            },
             "Null",
             {
               "Scalar": "I64"
-            },
-            {
-              "Scalar": "F64"
             }
           ]
         },

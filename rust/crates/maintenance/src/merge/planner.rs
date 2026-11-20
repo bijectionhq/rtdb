@@ -1,4 +1,4 @@
-use rtdb_format::{data::StoredEvent, metadata::MetadataNode};
+use rtdb_format::{data::PageEvent, metadata::MetadataNode};
 use rtdb_types::{Iid, Result};
 use super::InputSegment;
 
@@ -56,7 +56,7 @@ pub(super) fn plan(inputs: &[InputSegment], part: &[u8]) -> Result<Vec<Task>> {
 pub(super) struct RowHeap { heads: Vec<(usize, usize)> }
 
 impl RowHeap {
-    pub fn new(streams: &[Vec<StoredEvent>]) -> Result<Self> {
+    pub fn new(streams: &[Vec<PageEvent>]) -> Result<Self> {
         let mut heads = Vec::new();
         for (index, rows) in streams.iter().enumerate() {
             for pair in rows.windows(2) {
@@ -71,12 +71,12 @@ impl RowHeap {
         Ok(heap)
     }
 
-    fn precedes(left: (usize, usize), right: (usize, usize), streams: &[Vec<StoredEvent>]) -> bool {
+    fn precedes(left: (usize, usize), right: (usize, usize), streams: &[Vec<PageEvent>]) -> bool {
         let (left, right) = (&streams[left.0][left.1], &streams[right.0][right.1]);
         left.iid < right.iid || (left.iid == right.iid && left.system_from > right.system_from)
     }
 
-    fn sift(&mut self, mut index: usize, streams: &[Vec<StoredEvent>]) {
+    fn sift(&mut self, mut index: usize, streams: &[Vec<PageEvent>]) {
         let node = self.heads[index];
         loop {
             let mut child = 2 * index + 1;
@@ -89,7 +89,7 @@ impl RowHeap {
         self.heads[index] = node;
     }
 
-    pub fn next(&mut self, streams: &[Vec<StoredEvent>]) -> Option<(usize, usize)> {
+    pub fn next(&mut self, streams: &[Vec<PageEvent>]) -> Option<(usize, usize)> {
         let result = *self.heads.first()?;
         if result.1 + 1 == streams[result.0].len() {
             let last = self.heads.pop()?;

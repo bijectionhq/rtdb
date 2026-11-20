@@ -85,6 +85,10 @@ def source_name(descriptor):
     return descriptor.get("clojure_var")
 
 
+CLASSIFICATION_KINDS = ("engine-internal", "jvm-api-boundary", "jvm-internal", "environment-unavailable")
+PASSING_NATIVE_OUTCOMES = ("pass", "pass-wire", "no-assertions", "SUCCESSFUL")
+
+
 def case_key(identity):
     return tuple(identity.get(key) for key in ("reference_revision", "source", "qualified_name", "parameter_fixture", "configuration"))
 
@@ -154,8 +158,19 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=(), external
             discovered_by_name[name].append(case)
     mappings = defaultdict(list)
     mappings_by_identity = {}
+    classified = {}
     for mapping in ledger["cases"]:
         identity = mapping["identity"]
+        classification = mapping.get("classification")
+        if classification is not None:
+            if classification.get("kind") not in CLASSIFICATION_KINDS or not str(classification.get("reason") or "").strip():
+                errors.append(f"ledger case classification lacks a known kind or a reason: {identity}")
+            elif mapping.get("counterparts"):
+                errors.append(f"classified ledger case also names native counterparts: {identity}")
+            else:
+                classified[case_key(identity)] = classification["kind"]
+        elif not mapping.get("counterparts"):
+            errors.append(f"ledger case has neither native counterparts nor a classification: {identity}")
         mappings[(identity["source"], identity["qualified_name"])].append(mapping)
         key = case_key(identity)
         if key in mappings_by_identity:
@@ -163,6 +178,8 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=(), external
         mappings_by_identity[key] = mapping
     native_tests = native.get("tests", [])
     native_ids = {(case["counterpart"], case.get("configuration")) for case in native_tests}
+    native_outcomes = {(case["counterpart"], case.get("configuration")): case.get("outcome") for case in native_tests}
+    counterpart_results = {}
     if len(native_ids) != len(native_tests):
         errors.append("native inventory contains duplicate counterpart/configuration identities")
     if not native.get("complete", False) or not native_ids:
@@ -198,7 +215,7 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=(), external
                       if candidate["identity"]["source"] == identity["source"]
                       and candidate["identity"]["name"] == name
                       and (name.replace("/", ".", 1) if candidate["kind"] == "junit_template_candidate" else name) == identity["qualified_name"]]
-        if len(candidates) != 1:
+        if len({(candidate["identity"]["source"], candidate["identity"]["name"]) for candidate in candidates}) != 1:
             errors.append(f"invocation binding does not identify one source candidate: {key}")
             continue
         configuration = binding.get("native_configuration")
@@ -209,12 +226,19 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=(), external
         if missing:
             errors.append(f"invocation native counterparts missing in configuration {configuration}: {key}: {missing}")
             missing_native_by_group[group].update(missing)
+        for counterpart in mapping["counterparts"]:
+            outcome = native_outcomes.get((counterpart, configuration))
+            if (counterpart, configuration) in native_ids and outcome is not None:
+                counterpart_results[(counterpart, configuration)] = outcome
         bound_groups.add(group)
         case["binding"] = binding
     for key in bindings.keys() - observed_invocations:
         errors.append(f"invocation binding has no recorded runtime case: {key}")
-    for group in mappings_by_identity.keys() - bound_groups:
+    for group in mappings_by_identity.keys() - bound_groups - classified.keys():
         errors.append(f"ledger case has no bound runtime invocation: {group}")
+    failing_counterparts = sorted(f"{counterpart} ({outcome})" for (counterpart, _), outcome in counterpart_results.items()
+                                  if outcome not in PASSING_NATIVE_OUTCOMES)
+    errors.extend(f"native counterpart did not pass: {failure}" for failure in failing_counterparts)
     candidate_results, matched_names = [], set()
     for candidate in source["candidates"]:
         identity = candidate["identity"]
@@ -230,7 +254,10 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=(), external
         execution = runtime_by_name.get(name, [])
         discovery = discovered_by_name.get(name, [])
         missing_counterparts = sorted({counterpart for mapping in matches for counterpart in missing_native_by_group[case_key(mapping["identity"])]})
-        status = "mapped" if matches and not missing_counterparts else "unmapped"
+        if matches and all(case_key(mapping["identity"]) in classified for mapping in matches):
+            status = "classified"
+        else:
+            status = "mapped" if matches and not missing_counterparts else "unmapped"
         if execution or discovery:
             matched_names.add(name)
         candidate_results.append({"source_candidate": candidate["id"], "identity": identity,
@@ -250,13 +277,20 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=(), external
     external = [file for file in source["files"] if (file["lane"] in ("sql_logic", "language_client")
                 or file["path"].startswith("src/test/resources/xtdb/sql/logic_test/") and file["path"].endswith(".test"))
                 and file["path"] not in external_result["resolved_files"]]
-    unreconciled = [value for value in candidate_results if value["mapping"] != "mapped" or value["runtime_status"] != "observed"]
+    unreconciled = [value for value in candidate_results
+                    if value["mapping"] != "classified" and (value["mapping"] != "mapped" or value["runtime_status"] != "observed")]
     complete = not errors and not unreconciled and not unmapped_runtime and not unmapped_discovery and not external and bool(candidate_results)
-    assertions_passed = complete and external_result["all_passed"] and all(case["outcome"].get("event") == "execution_finished"
+    assertions_passed = complete and external_result["all_passed"] and not failing_counterparts and all(case["outcome"].get("event") == "execution_finished"
         and case["outcome"].get("status") == "SUCCESSFUL" for case in runtime_cases)
+    classified_by_kind = defaultdict(int)
+    for kind in classified.values():
+        classified_by_kind[kind] += 1
     return {"schema_version": 1, "reference_revision": source["reference"], "complete": complete,
             "all_assertions_passed": assertions_passed, "external_cases": external_result["cases"],
-            "assertion_denominator": len(ledger["cases"]) if complete else None,
+            "assertion_denominator": len(ledger["cases"]) - len(classified) if complete else None,
+            "classified_case_count": len(classified), "classified_by_kind": dict(sorted(classified_by_kind.items())),
+            "native_counterparts_passing": sum(1 for outcome in counterpart_results.values() if outcome in PASSING_NATIVE_OUTCOMES),
+            "native_counterparts_failing": failing_counterparts,
             "errors": errors, "selections": selections, "candidates": candidate_results,
             "unmapped_runtime": unmapped_runtime,
             "unmapped_discovery": unmapped_discovery,

@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use crate::{Edn, EdnKind};
 use rtdb_plan::{ExplainMode, MaterializedBinding, PercentileFraction, PercentileKind, WindowExpr, WindowFunction};
@@ -176,7 +177,7 @@ impl Importer<'_, '_, '_> {
         let name = QualifiedTable { database: database.clone(), table: crate::ast::table_ref(required(options, "table")?, true)? };
         let table = self.compiler.catalog.table(&name)?;
         let missing = table.is_none();
-        let table = table.unwrap_or(TableBinding { name, oid: None, columns: BTreeMap::new() });
+        let table = table.unwrap_or(TableBinding { name, oid: None, columns: StructFields::new() });
         let mut columns = Vec::new();
         let mut variables = BTreeMap::new();
         let mut predicates = Vec::new();

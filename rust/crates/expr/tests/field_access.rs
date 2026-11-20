@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use rtdb_columnar::MemoryBudget;
 use rtdb_expr::{EvalContext,EvaluationScope,evaluate,evaluate_async,scalar_call};
 use rtdb_format::transit::{TransitValue as T,decode_msgpack,encode_json,encode_msgpack};
@@ -30,7 +30,7 @@ fn transit_fields_use_keyword_then_string_lookup_and_suppress_false_values() {
     }
     assert_eq!(selected(transit(&T::Array(vec![T::Integer(1)])),"a"),V::Null);
     assert_eq!(selected(V::I64(1),"a"),V::Null);
-    assert_eq!(selected(V::Struct(BTreeMap::from([("a".into(),V::Bool(false))])),"a"),V::Bool(false));
+    assert_eq!(selected(V::Struct(StructFields::from([("a".into(),V::Bool(false))])),"a"),V::Bool(false));
     assert_eq!(field_type(&L::Scalar(S::Transit),"a"),L::Scalar(S::Transit).maybe());
 }
 
@@ -133,7 +133,7 @@ async fn field_access_discards_scalar_payloads_but_forces_controls_struct_constr
 fn generic_field_calls_keep_absent_metadata_and_transit_budget_contracts() {
     let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     let context = EvalContext { allocation: Some(&default_allocation),..Default::default() };
-    assert_eq!(scalar_call("get_field",&[V::Struct(BTreeMap::from([("".into(),V::I64(9))]))],&context).unwrap(),V::I64(9));
+    assert_eq!(scalar_call("get_field",&[V::Struct(StructFields::from([("".into(),V::I64(9))]))],&context).unwrap(),V::I64(9));
     assert_eq!(scalar_call("get-field",&[V::I64(1)],&context).unwrap(),V::Null);
     let nil_key = transit(&T::Map(vec![(T::Null,T::Integer(8))]));
     assert_eq!(unpack(scalar_call("get_field",&[nil_key],&context).unwrap()),T::Integer(8));

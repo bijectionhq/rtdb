@@ -16,6 +16,7 @@ use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, BTreeSet}, fs, io::Write, path::Path, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 use store::Reads;
+use rtdb_types::StructFields;
 use support::{FixtureClock, Identity, RunningNode};
 
 type Error = Box<dyn std::error::Error>;
@@ -76,7 +77,7 @@ async fn submit(node: &Node, clock: &FixtureClock, transaction: &Transaction) ->
     let table = TableRef::new("public", "products");
     let operation = match &transaction.operation {
         Operation::Put { prices, valid_from, valid_to } => TxOp::PutDocs { table,
-            documents: Documents::new(prices.iter().map(|(id, price)| BTreeMap::from([("_id".into(), Value::Utf8(id.clone())), ("price".into(), Value::I64(*price))])).collect(), node.memory())?,
+            documents: Documents::new(prices.iter().map(|(id, price)| StructFields::from([("_id".into(), Value::Utf8(id.clone())), ("price".into(), Value::I64(*price))])).collect(), node.memory())?,
             valid_from: Some(instant(valid_from)?), valid_to: valid_to.as_deref().map(instant).transpose()? },
         Operation::Delete { id, valid_from } => TxOp::DeleteDocs { table, ids: EntityIds::new(vec![EntityId::String(id.clone())], node.memory())?, valid_from: Some(instant(valid_from)?), valid_to: None },
         Operation::Erase { id } => TxOp::EraseDocs { table, ids: EntityIds::new(vec![EntityId::String(id.clone())], node.memory())? },
@@ -273,10 +274,10 @@ pub async fn execute(fixture: &Path, output: &Path) -> Result<Json, Error> {
 
 #[cfg(test)]
 mod join_iid_tests {
-    use super::{AutonomousTxOptions, BTreeMap, Documents, Duration, Error, FixtureClock, Identity, Node,
+    use super::{AutonomousTxOptions, Documents, Duration, Error, FixtureClock, Identity, Node,
         PreparedQuery, Reads, RunningNode, TableRef, Timestamp, TxOp, Value, combine, flush, read_value};
     use rtdb_format::transit::{TransitValue, decode_msgpack};
-    use rtdb_types::{Keyword, TransactionKey};
+    use rtdb_types::{Keyword, StructFields, TransactionKey};
     use std::sync::{Arc, atomic::AtomicI64};
 
     const TABLES: [&str; 3] = ["mixed_ids", "keyword_ids", "raw_ids"];
@@ -286,8 +287,8 @@ mod join_iid_tests {
     const RAW_JOIN: &str = "SELECT l._iid AS build_key, r._iid AS probe_key
         FROM raw_ids l JOIN raw_ids r ON l._iid = r._iid";
 
-    fn document(id: Value, label: &str) -> BTreeMap<String, Value> {
-        BTreeMap::from([("_id".into(), id), ("label".into(), Value::Utf8(label.into()))])
+    fn document(id: Value, label: &str) -> StructFields<Value> {
+        StructFields::from([("_id".into(), id), ("label".into(), Value::Utf8(label.into()))])
     }
 
     fn keyword(value: &str) -> Value { Value::Keyword(Keyword::from_name(value)) }

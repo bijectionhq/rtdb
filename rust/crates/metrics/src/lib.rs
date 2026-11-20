@@ -18,7 +18,7 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, ConnectionEvent, ExecutionError, ExecutionObserver, ExecutionTimer};
 use rtdb_types::{Anomaly, Result, TableRef};
 
-const TIMERS: [ExecutionTimer; 5] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction];
+const TIMERS: [ExecutionTimer; 7] = [ExecutionTimer::Query, ExecutionTimer::TxAwait, ExecutionTimer::TxSubmit, ExecutionTimer::TxExecute, ExecutionTimer::PgwireTransaction, ExecutionTimer::TxOp, ExecutionTimer::CompactorJob];
 struct Counters { query_errors: step::Counter, transaction_errors: step::Counter, collection_errors: step::Counter, kafka_warnings: [step::Counter; 5], connections: [step::Counter; 3] }
 impl Counters {
     fn roll(&mut self, now: i64, closing: bool) {
@@ -68,7 +68,7 @@ impl Registry {
 }
 impl ExecutionObserver for Registry {
     fn record_duration(&self, timer: ExecutionTimer, elapsed: Duration) {
-        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4 };
+        let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6 };
         self.state.lock().timers[index].record(elapsed, wall_time_millis());
     }
     fn record_error(&self, error: ExecutionError) {
@@ -127,6 +127,8 @@ impl Registry {
         drop(state);
         rows.push(self.gauge("xtdb.allocator.root.memory.allocated", allocated as f64));
         rows.push(self.gauge("xtdb.allocator.root.memory.limit", self.memory.limit_bytes() as f64));
+        let processors = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        rows.push(CatalogMetric::Gauge { name: "system.cpu.count".into(), tags: self.tags(), unit: None, value: processors as f64 });
         #[cfg(feature = "kafka")]
         sources.append_rows(&mut rows, &self.node_id, step);
         for metric in provided.iter().flat_map(|rows| rows.rows()) {
@@ -183,6 +185,22 @@ mod tests {
             drop(registry);
             assert_eq!(memory.used_bytes(), 0);
         }).unwrap().join().unwrap();
+    }
+    #[test]
+    fn the_processor_count_is_a_gauge() {
+        let registry = Registry::new("node-1", MemoryBudget::new(1 << 22)).unwrap();
+        assert!(registry.metrics().unwrap().rows().iter().any(|row| matches!(row, CatalogMetric::Gauge { name, value, .. } if name == "system.cpu.count" && *value >= 1.0)));
+    }
+    #[test]
+    fn reference_timers_are_listed_before_their_first_observation() {
+        let registry = Registry::new("node-1", MemoryBudget::new(1 << 22)).unwrap();
+        let rows = registry.metrics().unwrap();
+        for expected in ["query.timer", "tx.op.timer", "compactor.job.timer"] {
+            assert!(rows.rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 0, .. } if name == expected)), "{expected}");
+        }
+        drop(rows);
+        registry.record_duration(ExecutionTimer::CompactorJob, Duration::from_nanos(10));
+        assert!(registry.metrics().unwrap().rows().iter().any(|row| matches!(row, CatalogMetric::Timer { name, count: 1, .. } if name == "compactor.job.timer")));
     }
     #[tokio::test]
     async fn closing_step_preserves_cumulative_catalog_totals_and_timer_percentiles() {

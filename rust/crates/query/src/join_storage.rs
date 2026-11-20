@@ -4,10 +4,12 @@ use rtdb_types::{Result,Value};
 use crate::{QueryContext,cursor::OwnedRow,invalid,pages::{OwnedPage,PageBuilder},spill::{SpillFile,SpillReader,SpillWriter}};
 
 pub(crate) fn hash_values<'a>(values: impl IntoIterator<Item=&'a Value>) -> Result<u32> {
-    values.into_iter().try_fold(0u32,|hash,value| {
-        let cell = (rtdb_columnar::hash_value(value,0)? as u32).wrapping_mul(0xcc9e_2d51).rotate_left(15).wrapping_mul(0x1b87_3593);
-        Ok((hash ^ cell).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64))
-    })
+    values.into_iter().try_fold(0u32,|hash,value| Ok(combine_cell_hash(hash,rtdb_columnar::hash_value(value,0)?)))
+}
+/// Folds one cell's `hash_value` into a row hash, as `hash_values` does for each of a row's cells in turn.
+pub(crate) fn combine_cell_hash(hash: u32,cell: i32) -> u32 {
+    let cell = (cell as u32).wrapping_mul(0xcc9e_2d51).rotate_left(15).wrapping_mul(0x1b87_3593);
+    (hash ^ cell).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64)
 }
 
 pub(crate) enum BuildInput { Memory(OwnedPage),Spilled(BlockSpool) }
@@ -155,7 +157,7 @@ fn partition_count(blocks: usize,minimum: usize) -> Result<usize> {
 enum Slot { Empty,Occupied { hash: u32,row: usize } }
 pub(crate) struct HashIndex { slots: Vec<Slot>,mask: usize,_reservation: Arc<MemoryReservation> }
 impl HashIndex {
-    fn new(hashes: &[u32],memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub(crate) fn new(hashes: &[u32],memory: &Arc<MemoryBudget>) -> Result<Self> {
         if hashes.len() > i32::MAX as usize { return Err(size_error()); }
         let expected = (hashes.len() as f64 / 0.6) as u64;
         let capacity = 1usize.checked_shl(u64::BITS - expected.leading_zeros()).ok_or_else(size_error)?;

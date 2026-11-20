@@ -194,7 +194,8 @@ impl ProtocolSession {
             PreparedShape { kind: PreparedKind::Empty, columns: None, parameter_count: 0 }
         } else if legacy_keyword_probe(source) {
             keyword_shape()
-        } else if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.node.memory())? {
+        } else if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.node.memory())
+            .map_err(|error| extended_syntax_error(source, original, error, self.node.memory()))? {
             self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?)
         } else {
             let context = self.session.prepare_context(&self.token()).await?;
@@ -260,7 +261,13 @@ impl ProtocolSession {
         let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, _bind_storage: None };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
-            (Some(PreparedKind::Query(query)), _) => { let checked = !self.session.state().is_read_write(); let context = self.session.query_context_with(&token, checked).await?; Some(query.open_query(context, std::mem::take(&mut portal.arguments)).await?) },
+            (Some(PreparedKind::Query(query)), _) => {
+                let _active = self.cancellations.enter(&token);
+                let checked = !self.session.state().is_read_write();
+                let context = self.session.query_context_with(&token, checked).await?;
+                Some(token.run_until_cancelled(query.open_query(context, std::mem::take(&mut portal.arguments))).await.ok_or_else(cancelled)?
+                    .map_err(|error| if token.is_cancelled() { cancelled() } else { error })?)
+            },
             (_, Some(statement @ ControlStatement::Show { .. })) => match self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? { ControlResult::Rows(cursor) => Some(cursor), _ => return Err(protocol("SHOW did not produce rows")) },
             (_, Some(statement @ ControlStatement::Execute { .. })) => {
                 let ControlResult::Execute { name, arguments, reservation, allocation: _allocation } = self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? else { return Err(protocol("EXECUTE did not produce arguments")); };
@@ -310,6 +317,7 @@ impl ProtocolSession {
                 }
                 let token = portal.cancellation.clone(); let _active = self.cancellations.enter(&token);
                 token.run_until_cancelled(self.stream(portal, source, limit, writer)).await.ok_or_else(cancelled)?
+                    .map_err(|error| if token.is_cancelled() { cancelled() } else { error })
             }
             (PreparedKind::Dml(statement), _) => {
                 if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "DML is not allowed on the READ ONLY server")); }
@@ -362,6 +370,8 @@ impl ProtocolSession {
         let columns = portal.columns.as_deref().ok_or_else(|| protocol("Query portal has no column descriptors"))?;
         let PortalState::Query(query) = &mut portal.state else { return Err(protocol("Query portal has no cursor")); };
         let environment = self.environment()?; let mut emitted = 0;
+        let memory = self.node.query_memory();
+        let mut body = Vec::new();
         while limit == 0 || emitted < limit {
             if query.batch.as_ref().is_none_or(|batch| query.row == batch.batch().num_rows()) {
                 loop { query.batch = query.cursor.next_batch().await?; query.row = 0; if query.batch.as_ref().is_none_or(|batch| batch.batch().num_rows() != 0) { break; } }
@@ -370,13 +380,24 @@ impl ProtocolSession {
             let Some(batch) = &query.batch else { break; };
             let schema = batch.batch().schema();
             let row = query.row;
-            let memory = Arc::clone(self.node.memory());
             let consumption: Result<()> = async {
                 let bound = (0..columns.len()).try_fold(columns.len() * 128 + 4096, |bound, column| bound.checked_add(rtdb_columnar::estimate_read_cell_bytes(schema.field(column), batch.batch().column(column).as_ref(), row)?).ok_or_else(|| protocol("Result row allocation overflow")))?;
                 let _scratch = memory.reserve(bound)?;
-                let mut values = Vec::with_capacity(columns.len());
-                for (index, column) in columns.iter().enumerate() { let value = rtdb_columnar::read_value_as(&query.types[index], schema.field(index), batch.batch().column(index).as_ref(), row)?; values.push(rtdb_pg_codec::encode(column.ty, column.format, &value, &environment, &memory)?); }
-                writer.row(&values).await
+                body.clear();
+                body.extend_from_slice(&u16::try_from(columns.len()).map_err(|_| protocol("Too many columns"))?.to_be_bytes());
+                for (index, column) in columns.iter().enumerate() {
+                    let array = batch.batch().column(index).as_ref();
+                    if direct_cell(column.ty, column.format, schema.field(index), array, row, &environment, &mut body)? { continue; }
+                    let value = rtdb_columnar::read_value_as(&query.types[index], schema.field(index), array, row)?;
+                    match rtdb_pg_codec::encode(column.ty, column.format, &value, &environment, &memory)? {
+                        None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+                        Some(encoded) => {
+                            body.extend_from_slice(&i32::try_from(encoded.as_slice().len()).map_err(|_| protocol("Value too large"))?.to_be_bytes());
+                            body.extend_from_slice(encoded.as_slice());
+                        }
+                    }
+                }
+                writer.row_body(&body).await
             }.await;
             if let Err(error) = consumption { query.cursor.record_consumer_error(); return Err(error); }
             query.row += 1; query.sent = query.sent.checked_add(1).ok_or_else(|| protocol("Result row count overflow"))?; emitted += 1;
@@ -673,6 +694,51 @@ fn admit_rewrite_syntax(original_bytes: usize, rewritten_bytes: usize, memory: &
     let original = rtdb_sql::statement_syntax_estimate(original_bytes).ok_or_else(too_large)?;
     let rewritten = rtdb_sql::statement_syntax_estimate(rewritten_bytes).ok_or_else(too_large)?;
     Ok(Some(memory.reserve(rewritten - original)?))
+}
+
+/// Appends a cell's length and PostgreSQL encoding straight from its array, where the array is a plain integer, float,
+/// boolean or string layout and the column's type is the one it encodes as, exactly as `rtdb_pg_codec::encode_value`
+/// encodes the cell's value. Returns false, leaving `out` as it was, for a cell that takes the value path.
+fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, environment: &SessionEnvironment, out: &mut Vec<u8>) -> Result<bool> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type, Float64Type};
+    use arrow_schema::DataType;
+    if !field.metadata().is_empty() { return Ok(false); }
+    let binary = format == Format::Binary;
+    let fits = match (array.data_type(), ty) {
+        (DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64, PgType::Int2 | PgType::Int4 | PgType::Int8) => true,
+        (DataType::Float64, PgType::Float8) | (DataType::Boolean, PgType::Bool) | (DataType::Utf8, PgType::Text | PgType::VarChar) => true,
+        _ => false,
+    };
+    if !fits { return Ok(false); }
+    if array.is_null(row) { out.extend_from_slice(&(-1i32).to_be_bytes()); return Ok(true); }
+    let mut cell = |bytes: &[u8]| -> Result<()> {
+        out.extend_from_slice(&i32::try_from(bytes.len()).map_err(|_| protocol("Value too large"))?.to_be_bytes());
+        out.extend_from_slice(bytes);
+        Ok(())
+    };
+    match array.data_type() {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            let value = match array.data_type() {
+                DataType::Int8 => i64::from(array.as_primitive::<Int8Type>().value(row)),
+                DataType::Int16 => i64::from(array.as_primitive::<Int16Type>().value(row)),
+                DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
+                _ => array.as_primitive::<Int64Type>().value(row),
+            };
+            if binary { match ty { PgType::Int2 => cell(&(value as i16).to_be_bytes())?, PgType::Int4 => cell(&(value as i32).to_be_bytes())?, _ => cell(&value.to_be_bytes())? } }
+            else { cell(value.to_string().as_bytes())? }
+        }
+        DataType::Float64 => {
+            let value = array.as_primitive::<Float64Type>().value(row);
+            if binary { cell(&value.to_be_bytes())? } else { cell(&rtdb_pg_codec::encode_value(ty, format, &Value::F64(value), environment)?)? }
+        }
+        DataType::Boolean => {
+            let value = array.as_boolean().value(row);
+            if binary { cell(&[u8::from(value)])? } else { cell(if value { b"t" } else { b"f" })? }
+        }
+        _ => cell(array.as_string::<i32>().value(row).as_bytes())?,
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

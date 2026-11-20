@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_kafka::connect::{ConnectConfig, ConnectData, ConnectField, ConnectSchema, ConversionContext, Converter, ConverterFactory, DateEnvironment, DateEnvironmentInput, PluginRegistry, PluginSpec, SchemaKind, SinkRecord, TransformChain};
@@ -35,14 +36,14 @@ fn date_field() -> Arc<ConnectSchema> {
     Arc::new(ConnectSchema::new(SchemaKind::Struct(vec![ConnectField { name: "when".into(), schema: logical_date(0) }])))
 }
 
-fn date_row(millis: i64) -> Value { Value::Struct(BTreeMap::from([("when".into(), date(millis))])) }
+fn date_row(millis: i64) -> Value { Value::Struct(StructFields::from([("when".into(), date(millis))])) }
 
 #[test]
 fn timestamp_converter_rejects_non_struct_rows_before_parsing_schema_defaults() {
     let memory = MemoryBudget::new(256 << 20);
     let mut chain = chain("TimestampConverter", &[("field", "when"), ("target.type", "Timestamp"), ("format", "yyyy")], &memory);
     let mut schema = ConnectSchema::new(SchemaKind::Struct(vec![ConnectField { name: "when".into(), schema: Arc::new(ConnectSchema::new(SchemaKind::String)) }]));
-    schema.default = Some(Value::Struct(BTreeMap::from([("when".into(), Value::Utf8("invalid".into()))])));
+    schema.default = Some(Value::Struct(StructFields::from([("when".into(), Value::Utf8("invalid".into()))])));
     let schema = Arc::new(schema);
     let baseline = memory.used_bytes();
     for value in [Value::I64(7), Value::Map { entries: vec![(Value::Utf8("when".into()), Value::Utf8("1970".into()))], sorted: false }] {
@@ -63,14 +64,14 @@ fn timestamp_converter_converts_schema_defaults_for_null_rows_and_reuses_them() 
     let mut chain = chain("TimestampConverter", &[("field", "when"), ("target.type", "Timestamp"), ("format", "yyyy")], &memory);
     let mut schema = ConnectSchema::new(SchemaKind::Struct(vec![ConnectField { name: "when".into(), schema: Arc::new(ConnectSchema::new(SchemaKind::String)) }]));
     schema.optional = true;
-    schema.default = Some(Value::Struct(BTreeMap::from([("when".into(), Value::Utf8("1970".into()))])));
+    schema.default = Some(Value::Struct(StructFields::from([("when".into(), Value::Utf8("1970".into()))])));
     let schema = Arc::new(schema);
     let first = chain.apply(record(&schema, Value::Null)).unwrap().unwrap();
     let retained = memory.used_bytes();
     let next = chain.apply(record(&schema, Value::Null)).unwrap().unwrap();
     assert_eq!(memory.used_bytes(), retained);
     assert_eq!(first.value.value, Value::Null);
-    assert_eq!(first.value.schema.as_ref().unwrap().default, Some(Value::Struct(BTreeMap::from([("when".into(), date(0))]))));
+    assert_eq!(first.value.schema.as_ref().unwrap().default, Some(Value::Struct(StructFields::from([("when".into(), date(0))]))));
     assert!(Arc::ptr_eq(first.value.schema.as_ref().unwrap(), next.value.schema.as_ref().unwrap()));
     drop(chain);
     assert!(memory.used_bytes() > 0);
@@ -90,7 +91,7 @@ fn cast_converts_all_schema_defaults_before_any_row_fields() {
         ConnectField { name: "when".into(), schema: logical_date(1) },
     ])));
     let baseline = memory.used_bytes();
-    let value = Value::Struct(BTreeMap::from([("number".into(), Value::Utf8("invalid".into())), ("when".into(), date(0))]));
+    let value = Value::Struct(StructFields::from([("number".into(), Value::Utf8("invalid".into())), ("when".into(), date(0))]));
     assert_eq!(chain.apply(record(&schema, value)).err().unwrap().message.as_deref(), Some("Connect Date contains nonzero time fields"));
     assert_eq!(memory.used_bytes(), baseline);
     drop(chain);
@@ -120,7 +121,7 @@ fn cast_schema_cache_reuses_evicts_and_keeps_record_allocations_alive() {
     let retained = memory.used_bytes();
     let next = chain.apply(record(&schema, date_row(0))).unwrap().unwrap();
     assert_eq!(memory.used_bytes(), retained);
-    assert_eq!(first.value.value, Value::Struct(BTreeMap::from([("when".into(), Value::Utf8("00:00:00.000Z".into()))])));
+    assert_eq!(first.value.value, Value::Struct(StructFields::from([("when".into(), Value::Utf8("00:00:00.000Z".into()))])));
     assert_eq!(first.value.schema.as_ref().unwrap().field("when").unwrap().schema.default, Some(Value::Utf8("00:00:00.000Z".into())));
     assert!(Arc::ptr_eq(first.value.schema.as_ref().unwrap(), next.value.schema.as_ref().unwrap()));
     drop(next);
@@ -150,7 +151,7 @@ fn cast_keeps_a_complete_cached_schema_after_row_failure() {
     assert!(chain.apply(record(&schema, date_row(1))).is_err());
     assert_eq!(memory.used_bytes(), retained);
     let next = chain.apply(record(&schema, date_row(0))).unwrap().unwrap();
-    assert_eq!(next.value.value, Value::Struct(BTreeMap::from([("when".into(), Value::I64(0))])));
+    assert_eq!(next.value.value, Value::Struct(StructFields::from([("when".into(), Value::I64(0))])));
     drop((next, chain));
     assert_eq!(memory.used_bytes(), 0);
 }
@@ -182,7 +183,7 @@ fn date_field_transforms_validate_required_nulls_after_default_replacement_selec
         ] {
             options.push(("replace.null.with.default", replace));
             let mut chain = chain(class, &options, &memory);
-            let result = chain.apply(record(&schema, Value::Struct(BTreeMap::new())));
+            let result = chain.apply(record(&schema, Value::Struct(StructFields::new())));
             if replace == "true" { assert!(result.is_ok()); }
             else { assert_eq!(result.err().unwrap().message.as_deref(), Some("Value does not match its Connect schema")); }
         }
@@ -195,7 +196,7 @@ fn date_schema_cache_allocation_failure_releases_partial_state_and_allows_retry(
     let memory = MemoryBudget::new(256 << 20);
     let timestamp = Arc::new(ConnectSchema::new(SchemaKind::Struct(vec![ConnectField { name: "when".into(), schema: Arc::new(ConnectSchema::new(SchemaKind::String)) }])));
     for (class, schema, value, options) in [
-        ("TimestampConverter", timestamp, Value::Struct(BTreeMap::from([("when".into(), Value::Utf8("1970".into()))])), vec![("field", "when"), ("target.type", "Timestamp"), ("format", "yyyy")]),
+        ("TimestampConverter", timestamp, Value::Struct(StructFields::from([("when".into(), Value::Utf8("1970".into()))])), vec![("field", "when"), ("target.type", "Timestamp"), ("format", "yyyy")]),
         ("Cast", date_field(), date_row(0), vec![("spec", "when:string")]),
     ] {
         let mut chain = chain(class, &options, &memory);
@@ -239,7 +240,7 @@ fn schema_caches_treat_absent_and_explicit_null_defaults_as_equal_recursively() 
         for (first_schema, next_schema) in [(&absent, &explicit), (&explicit, &absent)] {
             let memory = MemoryBudget::new(256 << 20);
             let mut chain = chain(class, &options, &memory);
-            let value = || Value::Struct(BTreeMap::from([("when".into(), Value::Utf8("1970".into()))]));
+            let value = || Value::Struct(StructFields::from([("when".into(), Value::Utf8("1970".into()))]));
             let first = chain.apply(record(first_schema, value())).unwrap().unwrap();
             let retained = memory.used_bytes();
             let next = chain.apply(record(next_schema, value())).unwrap().unwrap();
@@ -339,7 +340,7 @@ impl Converter for NanDefaultsConverter {
         let f64_schema = scalar(SchemaKind::F64, None);
         let mut entries = vec![(double.clone(), single.clone()), (Value::F64(1.0), Value::F32(2.0))];
         if !first { entries.reverse(); }
-        let nested = scalar(SchemaKind::Struct(vec![ConnectField { name: "n".into(), schema: Arc::clone(&f64_schema) }]), Some(Value::Struct(BTreeMap::from([("n".into(), double.clone())]))));
+        let nested = scalar(SchemaKind::Struct(vec![ConnectField { name: "n".into(), schema: Arc::clone(&f64_schema) }]), Some(Value::Struct(StructFields::from([("n".into(), double.clone())]))));
         let schema = ConnectSchema::new(SchemaKind::Struct(vec![
             ConnectField { name: "when".into(), schema: scalar(SchemaKind::String, None) },
             ConnectField { name: "single".into(), schema: scalar(SchemaKind::F32, Some(single.clone())) },
@@ -348,10 +349,10 @@ impl Converter for NanDefaultsConverter {
             ConnectField { name: "map".into(), schema: scalar(SchemaKind::Map(f64_schema, f32_schema), Some(Value::Map { entries, sorted: false })) },
             ConnectField { name: "nested".into(), schema: nested },
         ]));
-        Ok(ConnectData { schema: Some(Arc::new(schema)), value: Value::Struct(BTreeMap::from([
+        Ok(ConnectData { schema: Some(Arc::new(schema)), value: Value::Struct(StructFields::from([
             ("when".into(), Value::Utf8("1970".into())), ("single".into(), Value::F32(1.0)), ("double".into(), Value::F64(1.0)),
             ("array".into(), Value::List(vec![Value::F64(1.0)])), ("map".into(), Value::Map { entries: vec![(Value::F64(1.0), Value::F32(1.0))], sorted: false }),
-            ("nested".into(), Value::Struct(BTreeMap::from([("n".into(), Value::F64(1.0))]))),
+            ("nested".into(), Value::Struct(StructFields::from([("n".into(), Value::F64(1.0))]))),
         ])) })
     }
 }

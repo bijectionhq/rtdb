@@ -391,4 +391,3 @@ surface FullTextSearch {
 ------------------------------------------------------------
 
 open question "How far does fan-out scale? A completed partition group can share one search file across four sibling tries. At what table size would files spanning several partition groups be useful?"
-

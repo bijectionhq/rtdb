@@ -170,8 +170,8 @@ async fn external_sort_finishes_input_before_comparing_different_runs() {
     assert_eq!(execution.context.spill_bytes(), 0);
 }
 
-#[test]
-fn merge_pass_releases_consumed_groups_within_the_spill_quota() {
+#[tokio::test]
+async fn merge_pass_releases_consumed_groups_within_the_spill_quota() {
     let unit_bytes = {
         let execution = execution();
         let plan = plan(&execution, LogicalType::Scalar(ScalarType::I64), i64::MAX as u64);
@@ -194,7 +194,7 @@ fn merge_pass_releases_consumed_groups_within_the_spill_quota() {
                 runs.push(run, &plan).unwrap();
             }
             assert_eq!(execution.context.spill_bytes(), unit_bytes * 8);
-            let result = plan.merge_pass(runs);
+            let result = plan.merge_pass(runs).await;
             assert!(files.iter().all(|file| file.upgrade().is_none()));
             if quota_units == 12 {
                 let next = result.unwrap();

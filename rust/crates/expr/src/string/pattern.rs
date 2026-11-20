@@ -24,7 +24,11 @@ struct Flags { insensitive: bool, unicode_case: bool, unicode_class: bool, multi
 struct Translation { pattern: String, names: Vec<Option<String>>, supplementary: bool }
 struct Translator<'a> { source: &'a PatternInput<'a>, position: usize, flags: Flags, scopes: Vec<Flags>, output: String, names: Vec<Option<String>>, literals: Vec<u32>, supplementary: bool, predicate_bmp: bool, syntax_prefix_verified: bool, syntax: Option<Syntax<'a>> }
 pub(crate) struct Pattern { regex: Regex, names: Vec<Option<String>> }
-pub(crate) struct LikePattern { pattern: Pattern, binary: bool }
+/// A LIKE pattern matched as its reference translation `^...\z` matches under Java's Pattern, without compiling a regex:
+/// `_` and `%` match one or any number of characters other than line terminators.
+pub(crate) struct LikePattern { tokens: Vec<LikeToken>, insensitive: bool, binary: bool }
+#[derive(Clone, Copy)]
+enum LikeToken { Literal(char), One, Any }
 
 /// Compiled Java Pattern for independent whole-region matches on exact UTF-16 text.
 /// The owner covers compilation and one active matcher, with each input charged to the same budget.
@@ -582,16 +586,16 @@ pub(crate) fn compile_like(needle: &Value,escape: Option<char>,insensitive: bool
         }
         _ => return Err(crate::numeric::inapplicable(if insensitive { "ilike" } else { "like" },&[needle])),
     };
-    let mut regex = String::from("^");
+    if needle.len() > PATTERN_BYTES { return Err(limit("Pattern exceeds 64 KiB")); }
+    let mut tokens = Vec::with_capacity(needle.len());
     let mut chars = needle.chars();
     while let Some(character) = chars.next() {
         if Some(character) == escape {
             let escaped = chars.next().ok_or_else(|| Anomaly::incorrect("xtdb/invalid-like-pattern","LIKE pattern ends with its escape character"))?;
-            regex.push_str(&regex::escape(&escaped.to_string()));
-        } else { match character { '%' => regex.push_str(".*"),'_' => regex.push('.'),_ => regex.push_str(&regex::escape(&character.to_string())) } }
+            tokens.push(LikeToken::Literal(escaped));
+        } else { tokens.push(match character { '%' => LikeToken::Any,'_' => LikeToken::One,_ => LikeToken::Literal(character) }); }
     }
-    regex.push_str("\\z");
-    Ok(LikePattern { pattern: compile(&regex,if insensitive { "i" } else { "" },context)?,binary })
+    Ok(LikePattern { tokens,insensitive,binary })
 }
 
 impl LikePattern {
@@ -603,18 +607,55 @@ impl LikePattern {
             Value::Binary(source) | Value::FixedSizeBinary(source) if self.binary => { source_hex = hex(source);source_hex.as_str() }
             _ => return Err(crate::numeric::inapplicable("like",&[value])),
         };
-        Ok(Value::Bool(self.pattern.search(source,context)? != negated))
+        context.reserve(self.tokens.len().checked_add(1).and_then(|positions| positions.checked_mul(2)).ok_or_else(overflow)?)?;
+        Ok(Value::Bool(self.matches(source) != negated))
+    }
+
+    /// Simulates the pattern's automaton: `active[i]` holds when the input read so far can leave the first `i` tokens matched.
+    fn matches(&self,source: &str) -> bool {
+        let terminator = |c: char| matches!(c,'\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}');
+        let width = self.tokens.len() + 1;
+        let mut active = vec![false; width];
+        let mut next = vec![false; width];
+        let close = |states: &mut [bool]| for index in 0..self.tokens.len() { if states[index] && matches!(self.tokens[index],LikeToken::Any) { states[index + 1] = true; } };
+        active[0] = true;
+        close(&mut active);
+        for character in source.chars() {
+            next.iter_mut().for_each(|state| *state = false);
+            for (index,token) in self.tokens.iter().enumerate() {
+                if !active[index] { continue; }
+                match *token {
+                    LikeToken::Any => if !terminator(character) { next[index] = true; },
+                    LikeToken::One => if !terminator(character) { next[index + 1] = true; },
+                    LikeToken::Literal(literal) => if literal == character || (self.insensitive && fancy_regex::java_case_equivalent(literal,character)) { next[index + 1] = true; },
+                }
+            }
+            close(&mut next);
+            std::mem::swap(&mut active,&mut next);
+            if !active.iter().any(|state| *state) { return false; }
+        }
+        active[self.tokens.len()]
     }
 }
 
 pub(crate) fn like(value: &Value,needle: &Value,escape: Option<char>,insensitive: bool,negated: bool,context: &EvalContext<'_>) -> Result<Value> {
     if crate::compare::nullish(value) || crate::compare::nullish(needle) { return Ok(Value::Null); }
-    compile_like(needle,escape,insensitive,context)?.search(value,negated,context)
+    with_scratch(context, |context| compile_like(needle,escape,insensitive,context)?.search(value,negated,context))
 }
 
 pub(crate) fn matches(args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
-    let pattern = compile(text(&args[1])?,text(&args[2])?,context)?;
-    pattern.search(text(&args[0])?,context).map(Value::Bool)
+    with_scratch(context, |context| {
+        let pattern = compile(text(&args[1])?,text(&args[2])?,context)?;
+        pattern.search(text(&args[0])?,context).map(Value::Bool)
+    })
+}
+
+/// Charges a boolean match's compilation and search to a child scope released with the pattern,
+/// so a row-by-row evaluation retains none of them.
+fn with_scratch(context: &EvalContext<'_>, evaluate: impl FnOnce(&EvalContext<'_>) -> Result<Value>) -> Result<Value> {
+    let Some(allocation) = context.allocation else { return evaluate(context); };
+    let scratch = allocation.scratch();
+    evaluate(&EvalContext { allocation: Some(&scratch), ..*context })
 }
 
 pub(crate) fn replace(args: &[Value], context: &EvalContext<'_>) -> Result<Value> {

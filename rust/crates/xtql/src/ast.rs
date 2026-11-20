@@ -67,11 +67,15 @@ pub fn parse_query_in(form: &Edn, memory: &std::sync::Arc<MemoryBudget>) -> Resu
     parse_query_with(form, FormAllocation::Tracked(memory))
 }
 
-pub(crate) fn parse_query_with(form: &Edn, forms: FormAllocation<'_>) -> Result<Query> { Syntax { forms }.parse_query(form) }
+pub(crate) fn parse_query_with(form: &Edn, forms: FormAllocation<'_>) -> Result<Query> { Syntax { forms, dialect: Dialect::Xtql }.parse_query(form) }
 
-pub(crate) fn parse_expr_in(form: &Edn, memory: &std::sync::Arc<MemoryBudget>) -> Result<Expr> { Syntax { forms: FormAllocation::Tracked(memory) }.parse_expr(form) }
+/// Parses a logical-plan scalar expression, under the reference expression parser's rules rather than XTQL's.
+pub(crate) fn parse_expr_in(form: &Edn, memory: &std::sync::Arc<MemoryBudget>) -> Result<Expr> { Syntax { forms: FormAllocation::Tracked(memory), dialect: Dialect::Ra }.parse_expr(form) }
 
-struct Syntax<'a> { forms: FormAllocation<'a> }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialect { Xtql, Ra }
+
+struct Syntax<'a> { forms: FormAllocation<'a>, dialect: Dialect }
 
 impl Syntax<'_> {
 fn parse_query(&self, form: &Edn) -> Result<Query> {
@@ -139,6 +143,11 @@ fn parse_expr(&self, form: &Edn) -> Result<Expr> {
                     if !(1..=2).contains(&args.len()) { return Err(error("xtdb.expression/arity-error", "Temporal cast requires an expression and optional cast options")); }
                     let target = if matches!(op,"cast-tstz" | "cast_tstz") { crate::cast::session_timestamp(args.get(1))? } else { crate::cast::interval_alias(args.get(1))? };
                     Expr::Cast { expr: Box::new(self.parse_expr(&args[0])?), target }
+                }
+                "." if self.dialect == Dialect::Ra => {
+                    if args.len() != 2 { return Err(error("xtdb.expression/arity-error", "'.' expects 2 args")); }
+                    let field = args[1].symbol().or_else(|| args[1].keyword()).ok_or_else(|| error("xtdb.expression/arity-error", "'.' expects symbol or keyword fields"))?;
+                    Expr::Get { object: Box::new(self.parse_expr(&args[0])?), field: field.into() }
                 }
                 "." => {
                     if args.len() != 2 || matches!(args[0].kind,EdnKind::Nil | EdnKind::Bool(false)) || args[1].symbol().is_none() { return Err(error("xtql/malformed-get", "Malformed get")); }

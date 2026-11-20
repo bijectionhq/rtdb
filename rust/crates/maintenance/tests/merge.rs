@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use bytes::Bytes;
@@ -19,8 +20,8 @@ async fn l0_merge_splits_recency_retries_identically_and_removes_temporary_files
     let store = Arc::new(MemoryStore::default());
     let fields = BTreeMap::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
     let rows: Vec<_> = (1..=7).rev().map(|time| StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(time), valid_time: Interval::new(Timestamp(0), Timestamp::MAX).unwrap(),
-        operation: StoredOperation::Put(BTreeMap::from([("value".into(), Value::I64(time))])), recency: None }).collect();
-    let data = build_event_batch(&rows, Some(fields), None).unwrap();
+        operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(time))])), recency: None }).collect();
+    let data = build_event_batch(&rows, Some(fields.into()), None).unwrap();
     let mut metadata = MetadataBuilder::new(false, true);
     metadata.write_leaf(&data).unwrap();
     let (metadata, _) = metadata.finish().unwrap();
@@ -62,8 +63,8 @@ async fn compressed_data_and_metadata_compact_with_identical_retry_bytes() {
         let temporary = tempfile::tempdir().unwrap();
         let table = TableRef::new("public", "compressed"); let slug = TableSlug::for_unrecorded_table(&table).unwrap();
         let input = TrieKey::l0(BlockIndex(0)).unwrap(); let store = Arc::new(MemoryStore::default());
-        let rows = vec![StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, operation: StoredOperation::Put(BTreeMap::from([("value".into(), Value::I64(42))])), recency: None }];
-        let data = build_event_batch(&rows, Some(BTreeMap::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None).unwrap();
+        let rows = vec![StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(42))])), recency: None }];
+        let data = build_event_batch(&rows, Some(StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None).unwrap();
         let mut metadata = MetadataBuilder::new(false, true); metadata.write_leaf(&data).unwrap(); let (metadata, _) = metadata.finish().unwrap();
         for (key, bytes) in [(ObjectKey::new(slug.data_key(&input)).unwrap(), write_file(&data.schema(), &[data]).unwrap()), (ObjectKey::new(slug.metadata_key(&input)).unwrap(), metadata.write().unwrap())] {
             let mut reader = ArrowFile::open(bytes.into(), None).unwrap();
@@ -131,9 +132,9 @@ async fn compaction_preserves_raw_decimal_coefficients_in_current_and_historical
     let fields = BTreeMap::from([("value".into(), ty)]);
     let events: Vec<_> = [123i128, 456].into_iter().enumerate().map(|(index, coefficient)| StoredEvent {
         iid: Iid([0; 16]), system_from: Timestamp(20 - index as i64), valid_time: Interval::ALL,
-        operation: StoredOperation::Put(BTreeMap::from([("value".into(), Value::Decimal(DecimalValue::new(coefficient.to_be_bytes().to_vec(), -1, i32::MAX, 128).unwrap()))])), recency: None,
+        operation: StoredOperation::Put(StructFields::from([("value".into(), Value::Decimal(DecimalValue::new(coefficient.to_be_bytes().to_vec(), -1, i32::MAX, 128).unwrap()))])), recency: None,
     }).collect();
-    let data = copy_event_batch(&events, Some(fields), None).unwrap();
+    let data = copy_event_batch(&events, Some(fields.into()), None).unwrap();
     let mut metadata = MetadataBuilder::new(false, true);
     metadata.write_leaf(&data).unwrap();
     let (metadata, _) = metadata.finish().unwrap();

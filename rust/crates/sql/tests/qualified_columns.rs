@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, read_value};
@@ -17,10 +18,10 @@ fn context(transaction_scoped: bool) -> Arc<QueryContext> {
         let state = PartitionState::empty(Default::default()).unwrap();
         let mut tx = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) }, Arc::clone(&memory)).unwrap();
         for (schema, table, value) in [("public", "foo", number), ("other", "foo", number + 20)] {
-            let payload = Value::Struct(BTreeMap::from([("leaf".into(), Value::I64(7)), ("child".into(), Value::Struct(BTreeMap::from([("leaf".into(), Value::I64(8))])))]));
-            tx.put(TableRef::new(schema, table), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("payload".into(), payload)]), Interval::ALL).unwrap();
+            let payload = Value::Struct(StructFields::from([("leaf".into(), Value::I64(7)), ("child".into(), Value::Struct(StructFields::from([("leaf".into(), Value::I64(8))])))]));
+            tx.put(TableRef::new(schema, table), StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("payload".into(), payload)]), Interval::ALL).unwrap();
         }
-        tx.put(TableRef::new("CaseSchema", "CaseTable"), BTreeMap::from([("_id".into(), Value::I64(1)), ("CaseColumn".into(), Value::I64(40))]), Interval::ALL).unwrap();
+        tx.put(TableRef::new("CaseSchema", "CaseTable"), StructFields::from([("_id".into(), Value::I64(1)), ("CaseColumn".into(), Value::I64(40))]), Interval::ALL).unwrap();
         state.apply(&tx.stage().unwrap()).unwrap();
         databases.insert(database.into(), DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) });
     }
@@ -123,7 +124,7 @@ async fn complete_column_chains_and_explicit_field_access_remain_distinct() {
 #[tokio::test]
 async fn qualification_survives_grouping_join_period_and_correlated_lateral_scopes() {
     assert_eq!(query("SELECT public.foo.v, COUNT(*) FROM public.foo GROUP BY public.foo.v HAVING xtdb.public.foo.v=10 ORDER BY xtdb.public.foo.v").await.unwrap(), [vec![Value::I64(10), Value::I64(1)]]);
-    assert_eq!(query("SELECT public.f.v AS first_value, other.g.v AS second_value FROM public.foo f JOIN other.foo g ON xtdb.public.f._id=xtdb.other.g._id").await.unwrap(), [vec![Value::I64(10), Value::I64(30)]]);
+    assert_eq!(query("SELECT public.f.v AS first_v, other.g.v AS second_v FROM public.foo f JOIN other.foo g ON xtdb.public.f._id=xtdb.other.g._id").await.unwrap(), [vec![Value::I64(10), Value::I64(30)]]);
     assert_eq!(query("SELECT xtdb.public.foo.v, (SELECT archive.public.foo.v FROM archive.public.foo WHERE archive.public.foo._id=xtdb.public.foo._id) FROM public.foo").await.unwrap(), [vec![Value::I64(10), Value::I64(20)]]);
     assert_eq!(query("SELECT d.v FROM public.foo f, LATERAL (SELECT xtdb.public.f.v) AS d").await.unwrap(), [vec![Value::I64(10)]]);
     assert_eq!(query("SELECT public.foo.v, ROW_NUMBER() OVER (PARTITION BY public.foo.v ORDER BY xtdb.public.foo._id) AS n FROM public.foo").await.unwrap(), [vec![Value::I64(10), Value::I64(1)]]);

@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, sync::Arc};
+use rtdb_types::StructFields;
+use std::sync::Arc;
 use rtdb_types::{Result, Value};
 use super::{ConnectData, ConnectField, ConnectSchema, SchemaKind, SinkRecord, Transform, error, string_map};
 
@@ -15,7 +16,7 @@ impl Transform for Flatten {
         let data = if self.key { &mut record.key } else { &mut record.value };
         super::resolve_record_schema(data);
         if data.value == Value::Null { return Ok(Some(record)); }
-        let mut output = BTreeMap::new();
+        let mut output = StructFields::new();
         if let Some(schema) = &data.schema {
             let mut fields = Vec::new();
             flatten_schema(schema, "", &self.delimiter, schema.optional, schema.default.as_ref(), &mut fields, 0)?;
@@ -32,7 +33,7 @@ impl Transform for Flatten {
 }
 fn name(prefix: &str, field: &str, delimiter: &str) -> String { if prefix.is_empty() { field.into() } else { format!("{prefix}{delimiter}{field}") } }
 fn check_depth(depth: usize) -> Result<()> { if depth > 128 { Err(error("transform-error", "Flatten nesting limit exceeded")) } else { Ok(()) } }
-fn flatten_map(value: &Value, prefix: &str, delimiter: &str, output: &mut BTreeMap<String, Value>, depth: usize) -> Result<()> {
+fn flatten_map(value: &Value, prefix: &str, delimiter: &str, output: &mut StructFields<Value>, depth: usize) -> Result<()> {
     check_depth(depth)?;
     let Value::Map { entries, .. } = value else { return Err(error("transform-error", "Schemaless Flatten requires a Map")); };
     for (key, value) in entries {
@@ -68,7 +69,7 @@ fn flatten_schema(schema: &ConnectSchema, prefix: &str, delimiter: &str, optiona
     }
     Ok(())
 }
-fn flatten_struct(schema: &ConnectSchema, value: &Value, prefix: &str, delimiter: &str, output: &mut BTreeMap<String, Value>, depth: usize) -> Result<()> {
+fn flatten_struct(schema: &ConnectSchema, value: &Value, prefix: &str, delimiter: &str, output: &mut StructFields<Value>, depth: usize) -> Result<()> {
     check_depth(depth)?;
     if *value == Value::Null { return Ok(()); }
     let schema = schema.resolved();

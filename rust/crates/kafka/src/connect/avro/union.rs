@@ -14,7 +14,7 @@ pub(super) fn convert(variants: &[Schema], selected: &Schema, value: Avro, names
         let destination = fields.iter().find(|field| field.name == destination_name).ok_or_else(|| error("avro-decode", "Converted union field is absent from its schema"))?;
         let value = metadata::coerce(super::convert(member, value, names, options, &candidate, depth)?, &candidate)?;
         let value = into_destination(value, &candidate, &destination.schema, depth)?;
-        let mut values = fields.iter().map(|field| (field.name.clone(), Value::Null)).collect::<BTreeMap<_, _>>();
+        let mut values = fields.iter().map(|field| (field.name.clone(), Value::Null)).collect::<StructFields<_>>();
         values.insert(destination_name, value);
         return Ok(Value::Struct(values));
     }

@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -140,9 +141,14 @@ impl TableBlock {
 
     pub fn retain_charge(&self) -> Option<Arc<MemoryReservation>> { self.charge.clone() }
 
-    pub fn from_parts(columns: BTreeMap<String, cpb::ColumnMeta>, row_count: i64, partitions: Vec<pb::Partition>) -> Result<Self> {
+    /// `types` supplies the Arrow schema's field types in their first-seen leg order, as the reference's block schema keeps them;
+    /// the column metadata orders union legs by name. A column absent from `types` takes its metadata's type.
+    pub fn from_parts(columns: BTreeMap<String, cpb::ColumnMeta>, types: &rtdb_types::StructFields<rtdb_types::LogicalType>, row_count: i64, partitions: Vec<pb::Partition>) -> Result<Self> {
         if row_count < 0 { return Err(invalid("Table row count is negative")); }
-        let schema = Schema::new(columns.iter().map(|(name, column)| rtdb_columnar::to_field(name, &crate::columns::logical_type(column)?)).collect::<Result<Vec<_>>>()?);
+        let schema = Schema::new(columns.iter().map(|(name, column)| {
+            let ty = match types.get(name) { Some(ty) => ty.clone(), None => crate::columns::logical_type(column)? };
+            rtdb_columnar::to_field(name, &ty)
+        }).collect::<Result<Vec<_>>>()?);
         let arrow_schema = crate::ipc::write_schema_message(&schema)?;
         let column_name_to_hll = columns.iter().filter_map(|(name, column)| column.hll.as_ref().map(|hll| (name.clone(), hll.clone()))).collect();
         Ok(Self { wire: Arc::new(pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns }), charge: None })
@@ -153,7 +159,7 @@ impl TableBlock {
     pub fn row_count(&self) -> i64 { self.wire.row_count.unwrap_or_default() }
     pub fn partitions(&self) -> &[pb::Partition] { &self.wire.partitions }
 
-    pub fn column_types(&self) -> Result<BTreeMap<String, LogicalType>> {
+    pub fn column_types(&self) -> Result<StructFields<LogicalType>> {
         if !self.wire.columns.is_empty() {
             self.wire.columns.iter().map(|(name, column)| Ok((name.clone(), crate::columns::logical_type(column)?))).collect()
         } else {

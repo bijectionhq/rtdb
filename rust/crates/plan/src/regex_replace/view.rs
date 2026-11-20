@@ -1,4 +1,6 @@
-use std::{collections::{BTreeMap, btree_map}, iter::FusedIterator, ops::Range, slice};
+use rtdb_types::StructFields;
+use rtdb_types::StructFieldsIter;
+use std::{iter::FusedIterator, ops::Range, slice};
 use rtdb_types::Value;
 use super::storage::{FormId, LiteralId, FormStorage, RawKind, LiteralKind};
 
@@ -161,7 +163,7 @@ cursor!(RegexLiteralIter, RegexLiterals, RegexLiteralView<'a>);
 cursor!(RegexLiteralPairIter, RegexLiteralPairs, (RegexLiteralView<'a>, RegexLiteralView<'a>));
 
 #[derive(Clone, Copy)]
-enum FieldSource<'a> { Legacy(&'a BTreeMap<String, Value>), Stored(&'a FormStorage, &'a [super::storage::FieldRow]) }
+enum FieldSource<'a> { Legacy(&'a StructFields<Value>), Stored(&'a FormStorage, &'a [super::storage::FieldRow]) }
 /// UTF8-sorted struct fields borrowed from their actual source.
 #[derive(Clone, Copy)]
 pub struct RegexFields<'a>(FieldSource<'a>);
@@ -171,7 +173,7 @@ impl<'a> RegexFields<'a> {
     pub fn iter(self) -> RegexFieldIter<'a> { RegexFieldIter(match self.0 { FieldSource::Legacy(values) => FieldCursor::Legacy(values.iter()), FieldSource::Stored(storage, values) => FieldCursor::Stored(storage, values.iter()) }) }
 }
 #[derive(Clone)]
-enum FieldCursor<'a> { Legacy(btree_map::Iter<'a, String, Value>), Stored(&'a FormStorage, slice::Iter<'a, super::storage::FieldRow>) }
+enum FieldCursor<'a> { Legacy(StructFieldsIter<'a, Value>), Stored(&'a FormStorage, slice::Iter<'a, super::storage::FieldRow>) }
 /// An independent sorted-field cursor retaining its original source lifetime.
 #[derive(Clone)]
 pub struct RegexFieldIter<'a>(FieldCursor<'a>);

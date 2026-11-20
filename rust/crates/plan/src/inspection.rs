@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 
 use async_trait::async_trait;
 use rtdb_types::{Result, Value};
 
 use crate::CatalogRows;
 
-pub type InspectionRow = BTreeMap<String, Value>;
+pub type InspectionRow = StructFields<Value>;
 
 #[derive(Clone, Debug)]
 pub enum InspectionRequest {

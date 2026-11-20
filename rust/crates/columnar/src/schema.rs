@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use rtdb_types::{OrderedSet, StructFields};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, UnionFields, UnionMode};
@@ -230,7 +231,7 @@ fn plain_field_type(field: &Field) -> Result<LogicalType> {
             arrow_schema::IntervalUnit::MonthDayNano => IntervalUnit::MonthDayNano,
         }),
         Struct(children) => {
-            let mut fields = BTreeMap::new();
+            let mut fields = StructFields::new();
             for child in children {
                 if fields.insert(child.name().clone(), from_field(child)?).is_some() {
                     return Err(Anomaly::incorrect("rtdb/duplicate-struct-field", format!("Duplicate struct field {}", child.name())));
@@ -245,7 +246,7 @@ fn plain_field_type(field: &Field) -> Result<LogicalType> {
             return Ok(LogicalType::List { kind: ListKind::Map { sorted: *sorted }, element: Box::new(from_field(child)?) });
         }
         Union(children, UnionMode::Dense) => {
-            let mut legs = BTreeSet::new();
+            let mut legs = OrderedSet::new();
             for (_, child) in children.iter() {
                 let leg = from_field(child)?;
                 if leg.unencoded() != leg {

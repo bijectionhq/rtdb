@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 
 use arrow_array::{Array, FixedSizeListArray, ListArray, RecordBatch, RunArray, StructArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
@@ -15,7 +16,7 @@ impl Mask {
 
 #[derive(Default)]
 struct Statistics {
-    fields: BTreeMap<String, Value>,
+    fields: StructFields<Value>,
     numeric: BTreeMap<&'static str, (f64, f64)>,
     bytes_seen: bool,
     bloom: Option<BloomFilter>,
@@ -51,16 +52,22 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     let mut statistics = Statistics::default();
     let with_bloom = calculate_blooms || (root && field.name() == "_iid");
     fold(field, array, mask, with_bloom, calculate_blooms, output, &mut statistics, depth)?;
-    let mut count = 0i64;
     let reader = rtdb_columnar::ColumnReader::new(field)?;
-    for row in 0..array.len() {
-        if mask.includes(row) && !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) { count += 1; }
-    }
+    let count = match present_cells(field, array, mask) {
+        Some(count) => i64::try_from(count).map_err(invalid)?,
+        None => {
+            let mut count = 0i64;
+            for row in 0..array.len() {
+                if mask.includes(row) && !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) { count += 1; }
+            }
+            count
+        }
+    };
     statistics.fields.insert("col-name".into(), Value::Utf8(field.name().clone()));
     statistics.fields.insert("root-col?".into(), Value::Bool(root));
     statistics.fields.insert("count".into(), Value::I64(count));
     for (name, (min, max)) in statistics.numeric {
-        let fields = BTreeMap::from([
+        let fields = StructFields::from([
             ("min".into(), if min == f64::INFINITY { Value::Null } else { Value::F64(min) }),
             ("max".into(), if max == f64::NEG_INFINITY { Value::Null } else { Value::F64(max) }),
         ]);
@@ -68,7 +75,7 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     }
     if statistics.bytes_seen {
         let bloom = match statistics.bloom { Some(bloom) => Value::Binary(bloom.to_bytes()?), None => Value::Null };
-        statistics.fields.insert("bytes".into(), Value::Struct(BTreeMap::from([("bloom".into(), bloom)])));
+        statistics.fields.insert("bytes".into(), Value::Struct(StructFields::from([("bloom".into(), bloom)])));
     }
     let index = output.len();
     i32::try_from(index).map_err(invalid)?;
@@ -143,7 +150,9 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         statistics.bytes_seen = true;
         if with_bloom {
             let bloom = statistics.bloom.get_or_insert_with(BloomFilter::default);
-            for row in 0..array.len() { if mask.includes(row) { bloom.insert_cell(field, array, row)?; } }
+            if !bloom.insert_byte_cells(array, (0..array.len()).filter(|row| mask.includes(*row))) {
+                for row in 0..array.len() { if mask.includes(row) { bloom.insert_cell(field, array, row)?; } }
+            }
         }
         return Ok(());
     }
@@ -155,6 +164,15 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         _ => return Err(Anomaly::unsupported("rtdb.format/metadata-flavour", format!("Unsupported column metadata type: {:?}", field.data_type()))),
     };
     let bounds = statistics.numeric.entry(group).or_insert((f64::INFINITY, f64::NEG_INFINITY));
+    if field.metadata().is_empty() && let Some(cells) = numeric_cells(array) {
+        for row in 0..array.len() {
+            if !mask.includes(row) || array.is_null(row) { continue; }
+            let value = cells(row);
+            if value.is_nan() || bounds.0.is_nan() { bounds.0 = f64::NAN; } else { bounds.0 = bounds.0.min(value); }
+            if value.is_nan() || bounds.1.is_nan() { bounds.1 = f64::NAN; } else { bounds.1 = bounds.1.max(value); }
+        }
+        return Ok(());
+    }
     let reader = rtdb_columnar::ColumnReader::new(field)?;
     for row in 0..array.len() {
         if !mask.includes(row) { continue; }
@@ -165,6 +183,56 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         if value.is_nan() || bounds.1.is_nan() { bounds.1 = f64::NAN; } else { bounds.1 = bounds.1.max(value); }
     }
     Ok(())
+}
+
+/// How many of a flat array's selected cells read as neither null nor undefined, counted from its validity.
+fn present_cells(field: &Field, array: &dyn Array, mask: &Mask) -> Option<usize> {
+    let data_type = array.data_type();
+    let flat = data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_));
+    if !flat || field.data_type() != data_type || !field.metadata().is_empty() { return None; }
+    Some(match mask {
+        Mask::All => array.len() - array.null_count(),
+        Mask::Selected(rows) => (0..array.len()).filter(|row| rows[*row] && array.is_valid(*row)).count(),
+    })
+}
+
+/// A plain signed integer, float or temporal array's cells as `numeric_value` takes them of each cell's value, read in place.
+fn numeric_cells(array: &dyn Array) -> Option<Box<dyn Fn(usize) -> f64 + '_>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::*;
+    use arrow_schema::TimeUnit as Unit;
+    let per_second = |unit: &Unit| match unit { Unit::Second => 1.0, Unit::Millisecond => 1e3, Unit::Microsecond => 1e6, Unit::Nanosecond => 1e9 };
+    Some(match array.data_type() {
+        DataType::Int8 => { let array = array.as_primitive::<Int8Type>(); Box::new(move |row| f64::from(array.value(row))) }
+        DataType::Int16 => { let array = array.as_primitive::<Int16Type>(); Box::new(move |row| f64::from(array.value(row))) }
+        DataType::Int32 => { let array = array.as_primitive::<Int32Type>(); Box::new(move |row| f64::from(array.value(row))) }
+        DataType::Int64 => { let array = array.as_primitive::<Int64Type>(); Box::new(move |row| array.value(row) as f64) }
+        DataType::Float32 => { let array = array.as_primitive::<Float32Type>(); Box::new(move |row| f64::from(array.value(row))) }
+        DataType::Float64 => { let array = array.as_primitive::<Float64Type>(); Box::new(move |row| array.value(row)) }
+        DataType::Date32 => { let array = array.as_primitive::<Date32Type>(); Box::new(move |row| i64::from(array.value(row)).wrapping_mul(86_400) as f64) }
+        DataType::Date64 => { let array = array.as_primitive::<Date64Type>(); Box::new(move |row| (array.value(row) / 86_400_000).wrapping_mul(86_400) as f64) }
+        DataType::Timestamp(unit, _) => {
+            let scale = per_second(unit);
+            let values: Box<dyn Fn(usize) -> i64 + '_> = match unit {
+                Unit::Second => { let array = array.as_primitive::<TimestampSecondType>(); Box::new(move |row| array.value(row)) }
+                Unit::Millisecond => { let array = array.as_primitive::<TimestampMillisecondType>(); Box::new(move |row| array.value(row)) }
+                Unit::Microsecond => { let array = array.as_primitive::<TimestampMicrosecondType>(); Box::new(move |row| array.value(row)) }
+                Unit::Nanosecond => { let array = array.as_primitive::<TimestampNanosecondType>(); Box::new(move |row| array.value(row)) }
+            };
+            Box::new(move |row| values(row) as f64 / scale)
+        }
+        DataType::Duration(unit) => {
+            let scale = per_second(unit);
+            let values: Box<dyn Fn(usize) -> i64 + '_> = match unit {
+                Unit::Second => { let array = array.as_primitive::<DurationSecondType>(); Box::new(move |row| array.value(row)) }
+                Unit::Millisecond => { let array = array.as_primitive::<DurationMillisecondType>(); Box::new(move |row| array.value(row)) }
+                Unit::Microsecond => { let array = array.as_primitive::<DurationMicrosecondType>(); Box::new(move |row| array.value(row)) }
+                Unit::Nanosecond => { let array = array.as_primitive::<DurationNanosecondType>(); Box::new(move |row| array.value(row)) }
+            };
+            Box::new(move |row| values(row) as f64 / scale)
+        }
+        _ => return None,
+    })
 }
 
 fn numeric_value(value: &Value) -> Result<f64> {

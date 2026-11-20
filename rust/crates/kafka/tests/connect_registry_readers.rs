@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use rtdb_columnar::MemoryBudget;
 use rtdb_kafka::connect::{ConversionContext, Converter, PluginRegistry, PluginSpec};
@@ -104,7 +105,7 @@ async fn avro_reader_projects_defaults_aliases_and_keeps_writer_version() {
     let (mut converter,server) = registry("AVRO",vec![get("/schemas/ids/7",writer),lookup(1),get("/subjects/events-value/versions/latest",reader)],latest()).await;
     let memory = MemoryBudget::new(1 << 27);
     let result = converter.decode("events",Some(&framed(&[14])),&mut context(&memory)).await.unwrap();
-    assert_eq!(result.value,Value::Struct(BTreeMap::from([("identifier".into(),Value::I64(7)),("label".into(),Value::Utf8("added".into()))])));
+    assert_eq!(result.value,Value::Struct(StructFields::from([("identifier".into(),Value::I64(7)),("label".into(),Value::Utf8("added".into()))])));
     assert_eq!(result.schema.as_ref().unwrap().name.as_deref(),Some("New")); assert_eq!(result.schema.as_ref().unwrap().version,Some(1));
     server.await.unwrap();
     assert_eq!(converter.decode("events",Some(&framed(&[14])),&mut context(&memory)).await.unwrap(),result);
@@ -181,7 +182,7 @@ async fn avro_explicit_date_name_is_installed_after_default_conversion() {
     let memory = MemoryBudget::new(1 << 27);
     let result = converter.decode("events", Some(&framed(&[2,2,2])), &mut context(&memory)).await.unwrap();
     let date = Value::Timestamp { value: 86_400_000, unit: rtdb_types::TimeUnit::Millisecond, timezone: Some("UTC".into()) };
-    assert_eq!(result.value, Value::Struct(BTreeMap::from([("explicit".into(), date.clone()), ("physical".into(), date.clone()), ("configured".into(), date.clone())])));
+    assert_eq!(result.value, Value::Struct(StructFields::from([("explicit".into(), date.clone()), ("physical".into(), date.clone()), ("configured".into(), date.clone())])));
     let schema = result.schema.as_ref().unwrap();
     assert_eq!(schema.field("explicit").unwrap().schema.default, Some(Value::I32(1)));
     assert_eq!(schema.field("physical").unwrap().schema.default, Some(date));

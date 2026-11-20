@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, QueryBasis, ResourceFactory, Session, SessionIdentity, SessionService, SystemClock,
     catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory}, statement::prepare_query};
+
 
 #[derive(Clone)]
 pub struct NodeServices {
@@ -147,6 +149,8 @@ impl Node {
     }
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> { &self.catalog }
     pub fn memory(&self) -> &Arc<MemoryBudget> { &self.factory.memory }
+    /// The budget a query or a result stream reserves from, as the node's query options shape it.
+    pub fn query_memory(&self) -> Arc<MemoryBudget> { self.factory.options.query.query_memory(&self.factory.memory) }
     pub fn cache_budget(&self) -> &Arc<CacheBudget> { &self.factory.cache }
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.
@@ -190,9 +194,14 @@ impl Node {
         self.ensure_open()?;
         self.catalog.open_databases().into_iter().map(|(name, database)| Ok((name, vec![database.logs.latest_source_position()?]))).collect()
     }
+    /// Awaiting indexed progress fails on a node whose indexer is disabled, as the reference's awaits do.
+    fn ensure_indexing(&self) -> Result<()> {
+        if self.factory.options.replication.enabled { Ok(()) } else { Err(Anomaly::fault("xtdb/log-processor-not-initialised", "log processor not initialised")) }
+    }
     pub async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         self.ensure_open()?;
         let Some(basis) = basis else { return Ok(()); };
+        if basis.databases.values().any(|positions| !positions.is_empty()) { self.ensure_indexing()?; }
         let databases = self.catalog.open_databases();
         let waits = databases.into_iter().filter_map(|(name, database)| basis.databases.get(&name).and_then(|positions| positions.first()).copied().map(|position| async move {
             database.replication.await_source(SourcePosition(position.0), cancellation).await
@@ -247,7 +256,7 @@ impl Node {
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot.with_system_time_cap(cap)?], storage: Arc::clone(&database.storage) });
         }
         let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())));
-        QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+        QueryContext::with_owner(catalog, self.factory.options.query.query_memory(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
             .with_accelerators(Arc::clone(&self.factory.accelerators))
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
     }
@@ -267,6 +276,7 @@ impl Node {
     }
     pub async fn await_transaction(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        self.ensure_indexing()?;
         let db = self.catalog.database(database)?;
         if let Some(result) = db.replication.await_tx(tx_id, cancellation).await? { return Ok(result.as_ref().clone()); }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
@@ -438,7 +448,7 @@ impl NativeSession {
 
     /// Opens a logical relation against the same transaction read basis as SQL and XTQL.
     /// The operation token belongs to this session's cancellation tree.
-    pub async fn query_ra(&mut self, source: &str, arguments: BTreeMap<String, Value>, cancellation: &CancellationToken) -> Result<QueryCursor> {
+    pub async fn query_ra(&mut self, source: &str, arguments: StructFields<Value>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let database = self.state.database().to_owned();
         let context = self.query_context_for(&database, cancellation).await?;
         let overflow = || Anomaly::incorrect("rtdb.query/parameter-size", "Logical relation parameter metadata exceeds addressable memory");

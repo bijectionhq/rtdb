@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use crate::{Binding, Clause, Expr, FormAllocation, From, Query, RelationInput, SubqueryKind, Tail, TemporalFilter, error, read};
 use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, Binder, Catalog, Expr as PExpr, Field, Identifier, JoinKind, NamedExpr, PreparedStatement, QualifiedTable, Relation, RelationNode, Scan, Schema, SetOperator, SortExpr, Statement, TableBinding, TemporalFilter as PTemporal, UnaryOp};
 use rtdb_types::{Anomaly, ListKind, LogicalType, MemoryBudget, Result, ScalarType, TimeUnit, Value};
@@ -187,7 +188,7 @@ impl Compiler<'_, '_> {
         let database = from.database.clone().unwrap_or_else(|| self.catalog.default_database().into());
         if !self.catalog.databases().contains(&database) { return Err(error("xtdb/unknown-db", format!("Unknown database: {database}"))); }
         let name = QualifiedTable { database, table: from.table.clone() };
-        let table = self.catalog.table(&name)?.unwrap_or(TableBinding { name, oid: None, columns: BTreeMap::new() });
+        let table = self.catalog.table(&name)?.unwrap_or(TableBinding { name, oid: None, columns: StructFields::new() });
         let star_names: BTreeSet<_> = table.columns.keys().cloned().collect();
         let mut names: BTreeSet<String> = from.bindings.iter().map(|binding| normal(&binding.name)).collect();
         if from.star { names.extend(table.columns.keys().cloned()); }
@@ -272,7 +273,7 @@ impl Compiler<'_, '_> {
         let bound = match input {
             RelationInput::Documents(documents) => {
                 let names: BTreeSet<_> = documents.iter().flat_map(|doc| doc.iter().map(|(name, _)| normal(name))).chain(requested).collect();
-                let mut types: BTreeMap<String, LogicalType> = names.iter().map(|name| (name.clone(), LogicalType::Nothing)).collect();
+                let mut types: StructFields<LogicalType> = names.iter().map(|name| (name.clone(), LogicalType::Nothing)).collect();
                 let mut rows = Vec::new();
                 for document in documents {
                     let document: BTreeMap<_, _> = document.iter().map(|(name, value)| (normal(name), value)).collect();
@@ -542,7 +543,11 @@ impl Compiler<'_, '_> {
             let expression = self.rewrite_aggregates(&binding.expression, &mut bound, parameters, &mut aggregates)?;
             let mut required = BTreeSet::new();
             required_expr(&expression, parameters, &mut required);
-            if required.iter().any(|name| !name.starts_with("xt$aggregate$") && !groups.contains_key(name)) {
+            let ungrouped = || required.iter().filter(|name| !name.starts_with("xt$aggregate$") && !groups.contains_key(*name));
+            if ungrouped().any(|name| !bound.variables.contains_key(name)) {
+                return Err(error("xtql/invalid-expression", "Not all variables in expression are in scope"));
+            }
+            if ungrouped().next().is_some() {
                 return Err(error("xtql/invalid-expression", "Variables outside of aggregate expressions must be grouping columns"));
             }
             outputs.push(Binding { name: binding.name.clone(), expression });

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use rtdb_columnar::MemoryBudget;
 use rtdb_expr::{EvalContext, EvaluationScope, equality_allocation_bound, evaluate, evaluate_async, function_type, scalar_call, sql_eq, strict_eq};
 use rtdb_format::transit::{TransitValue as T, encode_json, encode_msgpack};
@@ -63,7 +63,7 @@ fn transit_children_use_decoded_equality_inside_native_lists_and_structs() {
     let right = stored(&T::Integer(7), true);
     for (left, right) in [
         (V::List(vec![left.clone()]), V::List(vec![right.clone()])),
-        (V::Struct(BTreeMap::from([("value".into(), left)])), V::Struct(BTreeMap::from([("value".into(), right)]))),
+        (V::Struct(StructFields::from([("value".into(), left)])), V::Struct(StructFields::from([("value".into(), right)]))),
     ] {
         assert_eq!(equality_allocation_bound(&left, &right).unwrap(), 0);
         assert_eq!(sql_eq(&left, &right, &equality_scope()).unwrap(), Some(true));

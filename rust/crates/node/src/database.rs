@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{database::proto::DatabaseConfig, keys::TrieKey, log::proto::{ArtefactsAdded, ArtefactsRemoved, TriesAdded}};
+use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::TrieKey, log::proto::{ArtefactsAdded, ArtefactsRemoved, TriesAdded}};
 use rtdb_index::PartitionState;
-use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionHandle, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
+use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionHandle, CompactionJob, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
@@ -132,6 +132,7 @@ impl DatabaseFactory {
             let mut replication_options = self.options.replication.clone();
             replication_options.may_lead &= !read_only;
             replication_options.external_source = configuration.external_source.is_some();
+            replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
             let builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
@@ -141,8 +142,9 @@ impl DatabaseFactory {
                 }).collect::<Result<Vec<_>>>()?
             };
             let (compactor, compaction) = if read_only || self.options.compaction_threads == 0 { (None, None) } else {
-                let executor = Arc::new(SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?
-                    .with_artefacts(builders.iter().map(|(_, builder)| Arc::clone(builder)).collect()));
+                let executor = SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?
+                    .with_artefacts(builders.iter().map(|(_, builder)| Arc::clone(builder)).collect());
+                let executor = Arc::new(TimedCompaction { executor, observer: self.execution_observer.clone() });
                 let publisher = Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() });
                 let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
                 (Some(driver), Some(handle))
@@ -212,6 +214,18 @@ impl DatabaseDriver {
 }
 
 struct PublishCompaction { replication: ReplicationHandle, cancellation: CancellationToken }
+/// Times each completed compaction job into `compactor.job.timer`; the reference stops its job timer only once the job returns.
+struct TimedCompaction { executor: SegmentCompactor, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>> }
+#[async_trait]
+impl CompactionExecutor for TimedCompaction {
+    async fn execute(&self, job: &CompactionJob, cancellation: &CancellationToken) -> Result<TriesAdded> {
+        let started = std::time::Instant::now();
+        let added = self.executor.execute(job, cancellation).await?;
+        if let Some(observer) = &self.observer { observer.record_duration(rtdb_plan::ExecutionTimer::CompactorJob, started.elapsed()); }
+        Ok(added)
+    }
+}
+
 #[async_trait]
 impl CompactionPublisher for PublishCompaction {
     async fn publish(&self, notification: TriesAdded) -> Result<SourcePosition> { self.replication.publish_compaction(notification, &self.cancellation).await }
@@ -315,3 +329,26 @@ fn component_exit(result: Option<std::result::Result<Result<()>, tokio::task::Jo
     match result { Some(result) => joined(result).err().unwrap_or_else(|| Anomaly::fault("rtdb.node/driver-ended", "A database driver ended before shutdown")), None => Anomaly::fault("rtdb.node/driver-missing", "A database has no running drivers") }
 }
 fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/database-closed", "Database is closed") }
+
+/// As the reference's election driver times assertions off the log: a remote log's append-to-visibility time
+/// needs ten times an in-process log's interval.
+fn assertion_interval(log: Option<&database_config::Log>, in_process: std::time::Duration) -> std::time::Duration {
+    match log {
+        None | Some(database_config::Log::InMemoryLog(_) | database_config::Log::LocalLog(_)) => in_process,
+        Some(_) => in_process.saturating_mul(10),
+    }
+}
+
+#[cfg(test)]
+mod assertion_interval_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn remote_logs_assert_ten_times_less_often_than_in_process_logs() {
+        let base = Duration::from_millis(100);
+        assert_eq!(assertion_interval(None, base), base);
+        assert_eq!(assertion_interval(Some(&database_config::Log::InMemoryLog(Default::default())), base), base);
+        assert_eq!(assertion_interval(Some(&database_config::Log::LocalLog(Default::default())), base), base);
+        assert_eq!(assertion_interval(Some(&database_config::Log::OtherLog(Default::default())), base), Duration::from_secs(1));
+    }
+}

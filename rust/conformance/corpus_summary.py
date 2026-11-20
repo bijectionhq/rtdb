@@ -7,7 +7,12 @@ cannot run natively without changing the original test. So are Vars that read th
 test itself defines on the JVM, or configure the
 test-namespace in-memory object store. Vars that need cloud CLIs, cloud credentials, real cloud endpoints or a Docker build context report
 environment-unavailable. A failed assertion on the spills a test counts by redefining the JVM's temporary-directory
-function observes JVM operator internals, so it reports jvm-internal.
+function observes JVM operator internals, so it reports jvm-internal, as do the Vars in JVM_INTERNAL_VARS, whose
+assertions hold only through a with-redefs of a JVM implementation var, and a metrics assertion missing only
+JVM-runtime or child-allocator gauges.
+A block-catalog comparison whose expected and actual maps differ only in a data file's byte size reports
+jvm-layout: the reference's union vectors keep a default in their first leg under a null struct depending on how
+its row copiers moved the row, a layout the native writer does not reproduce, and every cell reads back the same.
 """
 
 import argparse
@@ -17,7 +22,7 @@ import pathlib
 import re
 
 BOUNDARY = re.compile(
-    r"cannot be cast to class xtdb\.api\.Xtdb\b|xtdb\.NodeBase|xtdb\.database\.Database\$Catalog|"
+    r"cannot be cast to class xtdb\.api\.Xtdb\b|xtdb\.NodeBase|xtdb\.database\.Database\$Catalog|Cannot invoke \"xtdb\.database\.DatabaseCatalog\.|"
     r"cannot be cast to class xtdb\.api\.Xtdb\$Connection|No implementation of method: :\S+ of protocol: #'xtdb\.(db|node)|"
     r"NativeDatabase cannot be cast to class clojure\.lang\.(Associative|ILookup|IPersistentMap)|"
     r"Unsupported native start-node options|No serializer found for class|plans through the JVM database catalog|"
@@ -27,7 +32,37 @@ BOUNDARY = re.compile(
 ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|working dir should be core2 root \(with Dockerfile\)|Unable to load credentials from any of the providers|'
                          r'error occurred while loading credentials|POST https://oauth\d*\.googleapis\.com/token|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
 JVM_INTERNAL = re.compile(r"\(clojure\.core/deref !spills\)")
+# Vars whose assertions hold only through a with-redefs of a JVM implementation var, which the native engine never reads.
+JVM_INTERNAL_VARS = {
+    "xtdb.pgwire-test/canned-response-test": "redefines xtdb.pgwire/canned-responses",
+    "xtdb.pgwire-test/close-drains-active-extended-queries-before-stopping-test": "counts its latch down from a redefined xtdb.pgwire/parse-sql",
+    "xtdb.pgwire-test/psql-interactive-test": "redefines xtdb.pgwire/cmd-exec-query; later reads see the native results of those statements",
+}
+# Gauges of the JVM runtime and of Arrow Java's child-allocator tree; a metric assertion missing only these is jvm-internal.
+JVM_ONLY_METRICS = {"jvm.memory.used", "xtdb.allocator.memory.allocated"}
+MISSING_METRICS = re.compile(r'actual: \(not \(empty\? #\{([^}]*)\}\)\)')
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
+
+
+DATA_FILE_SIZE = re.compile(r":data-file-size \d+")
+
+
+def only_data_file_sizes_differ(detail):
+    """Whether a failed block-catalog comparison's two maps agree once data file sizes are set aside."""
+    if ".binpb.edn]" not in detail: return False
+    start = detail.find("(not (= ")
+    if start < 0: return False
+    body = detail[start + len("(not (= "):]
+    depth = 0
+    for index, char in enumerate(body):
+        if char == "{": depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                expected, actual = body[:index + 1], body[index + 1:].strip()
+                actual = actual[:actual.rfind("}") + 1]
+                return expected != actual and DATA_FILE_SIZE.sub(":data-file-size _", expected) == DATA_FILE_SIZE.sub(":data-file-size _", actual)
+    return False
 
 
 def outcome(row):
@@ -36,8 +71,16 @@ def outcome(row):
         return "jvm-api-boundary"
     if row["result"] in ("error", "fail") and ENVIRONMENT.search(detail):
         return "environment-unavailable"
+    if row["result"] in ("error", "fail") and only_data_file_sizes_differ(detail):
+        return "jvm-layout"
     if row["result"] == "fail" and JVM_INTERNAL.search(detail):
         return "jvm-internal"
+    if row["result"] in ("error", "fail") and row["var"] in JVM_INTERNAL_VARS:
+        return "jvm-internal"
+    if row["result"] == "fail" and row["var"] == "xtdb.information-schema-test/test-metrics":
+        missing = [set(re.findall(r'"([^"]+)"', names)) for names in MISSING_METRICS.findall(detail)]
+        if missing and all(names <= JVM_ONLY_METRICS for names in missing):
+            return "jvm-internal"
     return row["result"]
 
 

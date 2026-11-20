@@ -226,7 +226,7 @@ impl LocalStore {
             fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             std::io::copy(&mut input.file, &mut upload).map_err(|error| Error::io(upload.path(), error))?;
-            upload.as_file().sync_all().map_err(|error| Error::io(upload.path(), error))?;
+            crate::sync_file(upload.as_file()).map_err(|error| Error::io(upload.path(), error))?;
             match upload.persist_noclobber(&path) {
                 Ok(_) => (),
                 Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -247,7 +247,7 @@ fn open_object(path: &Path, key: &ObjectKey) -> Result<File> {
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path).and_then(|file| file.sync_all()).map_err(|error| Error::io(path, error))
+    File::open(path).and_then(|file| crate::sync_file(&file)).map_err(|error| Error::io(path, error))
 }
 
 fn sync_parents(path: &Path, root: &Path) -> Result<()> {
@@ -328,7 +328,7 @@ impl ObjectStore for LocalStore {
             fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             upload.write_all(&bytes).map_err(|error| Error::io(upload.path(), error))?;
-            upload.as_file().sync_all().map_err(|error| Error::io(upload.path(), error))?;
+            crate::sync_file(upload.as_file()).map_err(|error| Error::io(upload.path(), error))?;
             match upload.persist_noclobber(&path) {
                 Ok(_) => (),
                 Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {

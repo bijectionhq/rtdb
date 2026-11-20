@@ -1,4 +1,5 @@
-use std::{cell::Cell, collections::BTreeMap, fmt};
+use rtdb_types::StructFields;
+use std::{cell::Cell, fmt};
 use rtdb_plan::{RegexForm as F, RegexReplacement};
 use rtdb_types::{CalendarDate, CivilDate, DateUnit, DecimalValue, Keyword, TimeUnit, Value as V};
 use serde::{Serialize, Serializer, ser::{SerializeMap, SerializeSeq}};
@@ -206,7 +207,7 @@ fn all_forty_one_literal_variants_keep_generic_serde_shapes_widths_and_bit_paylo
         (V::Map { entries: vec![(V::Null, V::Bool(true))], sorted: true }, vec![StructVariant("Value", 37, "Map", 2), VariantField("entries"), CollectSeq, Seq(Some(1)), SeqElement, Tuple(2), TupleElement, UnitVariant("Value", 1, "Null"), TupleElement, NewtypeVariant("Value", 2, "Bool"), Bool(true), TupleEnd, SeqEnd, VariantField("sorted"), Bool(true), StructVariantEnd]),
         (V::FixedSizeList(vec![V::Bool(false)]), vec![NewtypeVariant("Value", 38, "FixedSizeList"), CollectSeq, Seq(Some(1)), SeqElement, NewtypeVariant("Value", 2, "Bool"), Bool(false), SeqEnd]),
         (V::TimestampTzRange { lower: -1, upper: 2 }, vec![StructVariant("Value", 39, "TimestampTzRange", 2), VariantField("lower"), I64(-1), VariantField("upper"), I64(2), StructVariantEnd]),
-        (V::Struct(BTreeMap::from([("z".into(), V::Null), ("a".into(), V::Bool(true))])), vec![NewtypeVariant("Value", 40, "Struct"), CollectMap, Map(Some(2)), MapEntry, s("a"), NewtypeVariant("Value", 2, "Bool"), Bool(true), MapEntry, s("z"), UnitVariant("Value", 1, "Null"), MapEnd]),
+        (V::Struct(StructFields::from([("z".into(), V::Null), ("a".into(), V::Bool(true))])), vec![NewtypeVariant("Value", 40, "Struct"), CollectMap, Map(Some(2)), MapEntry, s("a"), NewtypeVariant("Value", 2, "Bool"), Bool(true), MapEntry, s("z"), UnitVariant("Value", 1, "Null"), MapEnd]),
     ];
     assert_eq!(cases.len(), 41);
     for (value, body) in cases {
@@ -367,7 +368,7 @@ fn generic_json_strings_reject_isolated_reversed_and_mismatched_surrogate_escape
 fn physical_structs_keep_the_last_duplicate_and_utf8_key_order() {
     let input = r#"{"Literal":{"Struct":{"z":{"I64":1},"a":{"I64":2},"z":{"I64":3},"😀":"Null","\ue000":"Undefined"}}}"#;
     let form = serde_json::from_str::<F>(input).unwrap();
-    let expected = raw_literal(V::Struct(BTreeMap::from([("a".into(), V::I64(2)), ("z".into(), V::I64(3)), ("\u{e000}".into(), V::Undefined), ("😀".into(), V::Null)])));
+    let expected = raw_literal(V::Struct(StructFields::from([("a".into(), V::I64(2)), ("z".into(), V::I64(3)), ("\u{e000}".into(), V::Undefined), ("😀".into(), V::Null)])));
     assert_eq!(form, expected);
     assert_eq!(serde_json::to_string(&form).unwrap(), "{\"Literal\":{\"Struct\":{\"a\":{\"I64\":2},\"z\":{\"I64\":3},\"\u{e000}\":\"Undefined\",\"😀\":\"Null\"}}}");
 }

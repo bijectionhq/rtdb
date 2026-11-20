@@ -36,6 +36,13 @@ async fn temporal_precision_survives_sql_binding_and_arrow_execution() {
 }
 
 #[tokio::test]
+async fn a_date_has_no_time_cast() {
+    let error = query("SELECT CAST(DATE '2020-01-05' AS TIME) AS ts", "UTC").await.unwrap_err();
+    assert_eq!(error.code, "xtdb.expression/cast-error");
+    assert!(error.message.as_deref().unwrap().starts_with("Unsupported cast: "), "{error:?}");
+}
+
+#[tokio::test]
 async fn explicit_date_casts_and_implicit_timestamp_and_date_comparisons_report_invalid_text() {
     let mut errors = Vec::new();
     for sql in [

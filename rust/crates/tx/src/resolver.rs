@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -142,6 +143,7 @@ impl TxResolver {
     }
 
     pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
         let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
         context.check_cancelled()?;
         let base = self.resolving_snapshot(durable)?;
@@ -163,6 +165,10 @@ impl TxResolver {
                     break;
                 }
                 if let Err(error) = tx.apply(operation).await {
+                    let error = match document_table(operation) {
+                        Some(table) if !error.context.contains_key("table") => error.with_transit_context("table", &T::table_ref(table))?,
+                        _ => error,
+                    };
                     outcome = Err(error.with_context("tx-op-idx", index.into()).with_context("tx-key", tx_key_context(key)?));
                     break;
                 }
@@ -273,12 +279,16 @@ impl<'a> OpenTransaction<'a> {
     }
 
     pub async fn execute_sql(&mut self, sql: &str, arguments: Option<&[Value]>) -> Result<()> {
-        self.execute_sql_typed(sql, arguments, None).await
+        self.execute_sql_typed(sql, arguments, None, &mut None).await
     }
 
-    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<&[Value]>, types: Option<&[rtdb_types::LogicalType]>) -> Result<()> {
+    /// `planned` carries one operation's mutation from each argument row to the next, which reuses it while the
+    /// transaction's catalog answers the planning's lookups the same.
+    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<&[Value]>, types: Option<&[rtdb_types::LogicalType]>, planned: &mut Option<PlannedMutation>) -> Result<()> {
         self.context.check_cancelled()?;
-        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        // A statement whose plan reads no table can't see the transaction's own writes, so it skips extending the snapshot with them.
+        let snapshot = if planned.as_ref().is_some_and(|planned| !planned.reads) { self.buffer.base_snapshot() } else { self.snapshot()? };
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let parameter_types = match types {
             Some(types) => types.iter().map(rtdb_columnar::execution_type).enumerate().collect(),
             None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
@@ -286,7 +296,19 @@ impl<'a> OpenTransaction<'a> {
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let with_sql = |error: Anomaly| error.with_context("sql", sql.into());
         let syntax = admit_sql_syntax(sql, &context.memory).map_err(with_sql)?;
-        let mutation = rtdb_sql::prepare_tx_in(sql, &context.catalog, &options, &context.memory).map_err(with_sql)?;
+        let reused = match planned.as_ref().filter(|planned| planned.options == options) {
+            Some(planned) if planned.lookups.replay(&context.catalog).map_err(with_sql)? => Some(planned.mutation.clone()),
+            _ => None,
+        };
+        let mutation = match reused {
+            Some(mutation) => mutation,
+            None => {
+                let recording = rtdb_plan::RecordingCatalog::new(&context.catalog);
+                let mutation = rtdb_sql::prepare_tx_in(sql, &recording, &options, &context.memory).map_err(with_sql)?;
+                *planned = recording.finish().map(|lookups| PlannedMutation { options, lookups, reads: reads_tables(&mutation), mutation: mutation.clone() });
+                mutation
+            }
+        };
         self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
     }
 
@@ -305,7 +327,7 @@ impl<'a> OpenTransaction<'a> {
             Mutation::CreateSearchIndex { name, table, columns, history } => {
                 if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A search index cannot cover another database's table")); }
                 check_search_index_name(&name)?;
-                let document = BTreeMap::from([
+                let document = rtdb_types::StructFields::from([
                     ("_id".into(), Value::Utf8(name)), ("schema_name".into(), Value::Utf8(table.table.schema.clone())), ("table_name".into(), Value::Utf8(table.table.table.clone())),
                     ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())), ("analyzer".into(), Value::Utf8(rtdb_text::SIMPLE_ANALYZER.into())),
                     ("version".into(), Value::I64(self.tx_key().tx_id.0)), ("history".into(), Value::Bool(history)),
@@ -327,7 +349,7 @@ impl<'a> OpenTransaction<'a> {
                 hash.update(role.as_bytes());
                 let digest = hash.finalize();
                 let iid = Iid::from_slice(&digest[..16])?;
-                let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(BTreeMap::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
+                let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(StructFields::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
                 return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
             }
         };
@@ -347,7 +369,7 @@ impl<'a> OpenTransaction<'a> {
                     0 => match cell(index("doc")?)? { Value::Struct(document) => StoredOperation::Put(document), _ => return Err(Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document")) },
                     1 => StoredOperation::Delete, _ => StoredOperation::Erase,
                 };
-                self.buffer.append(table.table.clone(), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation, recency: None })?;
+                self.buffer.append_to(&table.table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation, recency: None })?;
             }
         }
         Ok(())
@@ -369,13 +391,18 @@ impl<'a> OpenTransaction<'a> {
         self.context.check_cancelled()?;
         match operation {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
-                Some(arguments) => { for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types())).await.map_err(|error| error.with_context("arg-idx", index.into()))?; } Ok(()) }
+                Some(arguments) => {
+                    let mut planned = None;
+                    for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types()), &mut planned).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                    Ok(())
+                }
                 None => self.execute_sql(sql, None).await,
             },
             Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
                 if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
                 let arguments = decode_arguments(arg_bytes.as_slice(), &self.context.memory)?;
-                for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types())).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                let mut planned = None;
+                for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types()), &mut planned).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
                 Ok(())
             }
             Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to),
@@ -392,7 +419,7 @@ impl<'a> OpenTransaction<'a> {
             Operation::Removed(name) => Err(Anomaly::unsupported(if name == "xtql" { "xtdb/xtql-dml-removed" } else { "xtdb/tx-fns-removed" }, if name == "xtql" { "XTQL DML is no longer supported, as of 2.0.0-beta7. Please use SQL DML statements instead - see the release notes for more information." } else { "tx-fns are no longer supported, as of 2.0.0-beta7. Please use ASSERTs and SQL DML statements instead - see the release notes for more information." })),
         }
     }
-    async fn patch_documents(&mut self, table: &TableRef, documents: &[BTreeMap<String, Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+    async fn patch_documents(&mut self, table: &TableRef, documents: &[StructFields<Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         use rtdb_plan::{Binder, Expr, Relation, RelationNode, Schema, QualifiedTable, TemporalFilter};
         use rtdb_types::{LogicalType, ScalarType};
         if iids.is_some_and(|iids| iids.len() != documents.len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
@@ -400,7 +427,7 @@ impl<'a> OpenTransaction<'a> {
         let bytes = documents.iter().try_fold(65_536usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?.checked_mul(8).ok_or_else(overflow)?).ok_or_else(overflow))?;
         let _reservation = self.context.memory.reserve(bytes)?;
         let mut rows = Vec::with_capacity(documents.len());
-        let mut document_type = LogicalType::Struct(BTreeMap::new());
+        let mut document_type = LogicalType::Struct(StructFields::new());
         for (index, document) in documents.iter().enumerate() {
             let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
             let document = Value::Struct(document.clone());
@@ -424,7 +451,7 @@ impl<'a> OpenTransaction<'a> {
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
-            self.buffer.append(table.clone(), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(row_from, row_to)?, operation: StoredOperation::Put(document), recency: None })?;
+            self.buffer.append_to(table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(row_from, row_to)?, operation: StoredOperation::Put(document), recency: None })?;
         }
         if let Some(types) = documents.declared_types().filter(|_| !documents.rows().is_empty()) {
             self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
@@ -439,14 +466,14 @@ impl<'a> OpenTransaction<'a> {
         let table = TableRef::new("xt", "txs");
         let error_column = "error".to_owned();
         let metadata_column = "user_metadata".to_owned();
-        let document = BTreeMap::from([
+        let document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
             ("committed".into(), Value::Bool(result.committed())),
             (metadata_column.clone(), metadata.map(|metadata| metadata.value().clone()).unwrap_or(Value::Null)),
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
-        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &LogicalType::Struct(BTreeMap::new()).maybe())])
+        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &LogicalType::Struct(StructFields::new()).maybe())])
     }
 }
 
@@ -457,6 +484,22 @@ fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {
 
 fn admit_sql_syntax(sql: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {
     memory.reserve(rtdb_sql::statement_syntax_estimate(sql.len()).ok_or_else(overflow)?)
+}
+
+/// A mutation planned for one argument row, and what its planning read from the catalog.
+struct PlannedMutation { options: rtdb_sql::PrepareOptions, lookups: rtdb_plan::CatalogLookups, reads: bool, mutation: rtdb_sql::Mutation }
+
+/// Whether a mutation's input may read a table: anything but literal rows and the expressions over them may.
+fn reads_tables(mutation: &rtdb_sql::Mutation) -> bool {
+    fn reads(relation: &rtdb_plan::Relation) -> bool {
+        use rtdb_plan::RelationNode as N;
+        !matches!(relation.node(), N::Values { .. } | N::LiteralPages { .. } | N::Project { .. } | N::Extend { .. } | N::Rename { .. } | N::Filter { .. })
+            || relation.children().into_iter().any(|child| reads(child))
+    }
+    match mutation {
+        rtdb_sql::Mutation::Put { input, .. } | rtdb_sql::Mutation::Delete { input, .. } | rtdb_sql::Mutation::Erase { input, .. } => reads(input),
+        _ => true,
+    }
 }
 
 async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
@@ -483,6 +526,16 @@ fn validate_document_operation(operation: &Operation) -> Result<()> {
     Err(Anomaly::incorrect("xtdb/forbidden-columns", format!("Cannot {verb} documents with columns: [{}]", forbidden.join(", ")))
         .with_transit_context("table", &T::table_ref(table))?
         .with_context("forbidden-cols", serde_json::json!(forbidden)))
+}
+
+/// The table a put, delete or erase writes; the reference's crash-log wrapper around those adds it to any error they raise.
+/// Its patch path has no such wrapper.
+fn document_table(operation: &Operation) -> Option<&TableRef> {
+    match operation {
+        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::PutIids { table, .. } => Some(table),
+        _ => None,
+    }
 }
 
 fn check_table(table: &TableRef) -> Result<()> {

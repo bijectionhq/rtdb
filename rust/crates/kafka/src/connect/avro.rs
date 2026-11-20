@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use apache_avro::Schema;
 use rtdb_types::{Anomaly, DecimalValue, Result, Value};
@@ -521,9 +522,9 @@ mod tests {
             assert_eq!(plan.connect.name.as_deref(), Some("connect.name-with spaces"));
             assert_eq!(plan.connect.field("nested").unwrap().schema.resolved().name.as_deref(), Some("1 child"));
             let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
-            assert_eq!(plan.decode(&[14, 2, b'x'], &mut context).unwrap().value, Value::Struct(BTreeMap::from([
+            assert_eq!(plan.decode(&[14, 2, b'x'], &mut context).unwrap().value, Value::Struct(StructFields::from([
                 ("field_1".into(), Value::I64(7)),
-                ("nested".into(), Value::Struct(BTreeMap::from([("_value".into(), Value::Utf8("x".into()))]))),
+                ("nested".into(), Value::Struct(StructFields::from([("_value".into(), Value::Utf8("x".into()))]))),
             ])));
         }
     }
@@ -533,7 +534,7 @@ mod tests {
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
         let Value::Struct(value) = plan.decode(&[2, 2, 4, 0], &mut context).unwrap().value else { panic!("expected Struct") };
         assert_eq!(value["value"], Value::I64(1));
-        assert_eq!(value["next"], Value::Struct(BTreeMap::from([("value".into(), Value::I64(2)), ("next".into(), Value::Null)])));
+        assert_eq!(value["next"], Value::Struct(StructFields::from([("value".into(), Value::I64(2)), ("next".into(), Value::Null)])));
         let next = plan.connect.field("next").unwrap().schema; drop(plan);
         assert!(next.optional); assert_eq!(next.field("value").unwrap().schema.resolved().kind, SchemaKind::I64);
     }
@@ -544,7 +545,7 @@ mod tests {
         let plan = AvroPlan::parse_version(schema, &[], &BTreeMap::from([("enhanced.avro.schema.support".into(), "true".into())]), None).unwrap();
         assert!(plan.connect.field("a.Item").is_some()); assert!(plan.connect.field("b.Item").is_some());
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
-        assert_eq!(plan.decode(&[2], &mut context).unwrap().value, Value::Struct(BTreeMap::from([("a.Item".into(), Value::Null), ("b.Item".into(), Value::Struct(BTreeMap::new()))])));
+        assert_eq!(plan.decode(&[2], &mut context).unwrap().value, Value::Struct(StructFields::from([("a.Item".into(), Value::Null), ("b.Item".into(), Value::Struct(StructFields::new()))])));
     }
     #[test]
     fn generalized_avro_unions_count_null_positions_and_share_converter_numbering() {
@@ -556,7 +557,7 @@ mod tests {
         let second = AvroPlan::parse_version_index(r#"["long"]"#, &[], &options, None, &mut index).unwrap();
         assert_eq!(second.connect.name.as_deref(), Some("connect_union_6"));
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
-        assert_eq!(second.decode(&[0, 84], &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::I64(42))])));
+        assert_eq!(second.decode(&[0, 84], &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::I64(42))])));
         let enumeration = AvroPlan::parse_version(r#"{"type":"enum","name":"Letter","symbols":["A","B"]}"#, &[], &options, None).unwrap();
         assert_eq!(enumeration.connect.parameters["org.apache.kafka.connect.data.Enum.B"], "1");
     }
@@ -569,8 +570,8 @@ mod tests {
         assert!(before.decode(&[2, 84], &mut context).is_err());
         assert!(before.decode(&[4, 2, b'x'], &mut context).is_err());
         let after = AvroPlan::parse_version(r#"["int","string","null"]"#, &[], &options, None).unwrap();
-        assert_eq!(after.decode(&[0, 84], &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::I32(42)), ("connect_union_field_1".into(), Value::Null)])));
-        assert_eq!(after.decode(&[2, 2, b'x'], &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::Null), ("connect_union_field_1".into(), Value::Utf8("x".into()))])));
+        assert_eq!(after.decode(&[0, 84], &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::I32(42)), ("connect_union_field_1".into(), Value::Null)])));
+        assert_eq!(after.decode(&[2, 2, b'x'], &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::Null), ("connect_union_field_1".into(), Value::Utf8("x".into()))])));
         let pair = AvroPlan::parse_version(r#"["null","int"]"#, &[], &options, None).unwrap();
         assert_eq!(pair.decode(&[2, 84], &mut context).unwrap().value, Value::I32(42));
     }
@@ -580,17 +581,17 @@ mod tests {
         let schema = r#"["null",{"type":"enum","name":"Letter","symbols":["A"]},"string"]"#;
         let plan = AvroPlan::parse_version(schema, &[], &options, None).unwrap();
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
-        assert_eq!(plan.decode(&[4, 2, b'x'], &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_1".into(), Value::Utf8("x".into())), ("connect_union_field_2".into(), Value::Null)])));
+        assert_eq!(plan.decode(&[4, 2, b'x'], &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_1".into(), Value::Utf8("x".into())), ("connect_union_field_2".into(), Value::Null)])));
         let schema = r#"[{"type":"fixed","name":"A","size":1},"null",{"type":"fixed","name":"B","size":2}]"#;
         let plan = AvroPlan::parse_version(schema, &[], &options, None).unwrap();
-        assert_eq!(plan.decode(&[4, 7, 8], &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::Binary(vec![7, 8])), ("connect_union_field_2".into(), Value::Null)])));
+        assert_eq!(plan.decode(&[4, 7, 8], &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::Binary(vec![7, 8])), ("connect_union_field_2".into(), Value::Null)])));
     }
     #[test]
     fn enhanced_avro_fixed_unions_match_full_names_before_converting_values() {
         let schema = r#"[{"type":"fixed","name":"a.Value","size":1},{"type":"fixed","name":"b.Value","size":2}]"#;
         let plan = AvroPlan::parse_version(schema, &[], &BTreeMap::from([("enhanced.avro.schema.support".into(), "true".into())]), None).unwrap();
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
-        assert_eq!(plan.decode(&[2, 7, 8], &mut context).unwrap().value, Value::Struct(BTreeMap::from([("a.Value".into(), Value::Null), ("b.Value".into(), Value::Binary(vec![7, 8]))])));
+        assert_eq!(plan.decode(&[2, 7, 8], &mut context).unwrap().value, Value::Struct(StructFields::from([("a.Value".into(), Value::Null), ("b.Value".into(), Value::Binary(vec![7, 8]))])));
     }
     #[test]
     fn avro_narrow_integer_unions_only_convert_when_flattened() {
@@ -618,7 +619,7 @@ mod tests {
         let record = AvroPlan::parse(r#"{"type":"record","name":"R","connect.default":{},"fields":[{"name":"required","type":"string","default":"x"}]}"#, &[]).unwrap();
         assert!(record.connect.default.is_none());
         let nested = AvroPlan::parse(r#"{"type":"record","name":"R","fields":[{"name":"nested","type":{"type":"record","name":"N","fields":[{"name":"required","type":"string","default":"x"}]},"default":{}}]}"#, &[]).unwrap();
-        assert_eq!(nested.connect.field("nested").unwrap().schema.default, Some(Value::Struct(BTreeMap::from([("required".into(), Value::Utf8("x".into()))]))));
+        assert_eq!(nested.connect.field("nested").unwrap().schema.default, Some(Value::Struct(StructFields::from([("required".into(), Value::Utf8("x".into()))]))));
     }
     #[test]
     fn nested_avro_records_nullable_union_and_logical_types_decode_with_bounded_preflight() {

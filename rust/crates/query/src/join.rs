@@ -36,16 +36,36 @@ impl JoinPlan {
         let input = if left { &self.layout.left } else { &self.layout.right };
         OwnedRow::copy_parts(&[input.output(row)],if left { 0 } else { self.layout.left.original.len() },if left { self.layout.right.original.len() } else { 0 },&self.execution.context.memory)
     }
-    fn output(&self,build: &OwnedRow,probe: &OwnedRow) -> Result<OwnedRow> {
+    fn output(&self,build: &OwnedRow,probe: &OwnedRow,slab: &mut crate::cursor::RowSlab) -> Result<OwnedRow> {
         let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
-        OwnedRow::copy_parts(&[self.layout.left.output(left),self.layout.right.output(right)],0,0,&self.execution.context.memory)
+        OwnedRow::copy_parts_in(&[self.layout.left.output(left),self.layout.right.output(right)],0,0,slab)
     }
     fn probe_output(&self,probe: &OwnedRow) -> Result<OwnedRow> {
         OwnedRow::copy_parts(&[self.probe_layout().output(probe)],0,0,&self.execution.context.memory)
     }
-    async fn accepted(&self,comparisons: &[ExpressionInvocation<'_>],build: &OwnedRow,probe: &OwnedRow) -> Result<bool> {
+    /// The joined-row positions of a comparison that is an equality between two columns, which compares their cells directly.
+    fn direct_equalities(&self) -> Vec<Option<(usize,usize)>> {
+        self.layout.comparisons.iter().enumerate().map(|(index,expression)| {
+            let schema = if index < self.build_layout().key_count() { &self.layout.schema } else { &self.layout.theta_schema };
+            match expression {
+                rtdb_plan::Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } => match (left.as_ref(),right.as_ref()) {
+                    // The evaluator rejects some declared type pairs before comparing any cells; those keep its path.
+                    (rtdb_plan::Expr::Column { id: left, data_type: left_type },rtdb_plan::Expr::Column { id: right, data_type: right_type })
+                        if rtdb_plan::validate_equality_types(left_type,right_type).is_ok() => Some((schema.position(*left)?,schema.position(*right)?)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }).collect()
+    }
+    fn cell<'a>(&self,build: &'a OwnedRow,probe: &'a OwnedRow,position: usize) -> Result<&'a Value> {
+        let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
+        if position < left.values.len() { Ok(&left.values[position]) }
+        else { right.values.get(position - left.values.len()).ok_or_else(|| invalid("join-row","Joined column is outside both rows")) }
+    }
+    async fn accepted(&self,comparisons: &[ExpressionInvocation<'_>],direct: &[Option<(usize,usize)>],equality: &rtdb_expr::EvaluationScope,build: &OwnedRow,probe: &OwnedRow) -> Result<bool> {
         if comparisons.is_empty() { return Ok(true); }
-        let joined = self.joined(build,probe)?;
+        let joined = if direct.iter().all(Option::is_some) { None } else { Some(self.joined(build,probe)?) };
         let mut unknown = false;
         for (index,comparison) in comparisons.iter().enumerate() {
             if self.preserve_probe() && index < self.build_layout().key_count() {
@@ -56,7 +76,18 @@ impl JoinPlan {
                     continue;
                 }
             }
+            if let Some((left,right)) = direct[index] {
+                let equal = rtdb_expr::sql_eq_in_timezone(self.cell(build,probe,left)?,self.cell(build,probe,right)?,&self.execution.context.timezone,equality)?;
+                equality.reset()?;
+                match equal {
+                    None => unknown = true,
+                    Some(false) => return Ok(false),
+                    Some(true) => {}
+                }
+                continue;
+            }
             let scope = self.execution.scope()?;
+            let joined = joined.as_ref().ok_or_else(|| invalid("join-row","Joined row was not built for an evaluated comparison"))?;
             let value = self.execution.evaluate_invocation(&scope,comparison,&joined.values).await?;
             if matches!(value,Value::Null | Value::Undefined) { unknown = true; }
             else if !is_true(&value)? { return Ok(false); }
@@ -71,6 +102,9 @@ impl JoinPlan {
             let schema = if index < self.build_layout().key_count() { &self.layout.schema } else { &self.layout.theta_schema };
             comparisons.push(self.execution.prepare_expression(expression,schema,&metadata)?);
         }
+        let direct = self.direct_equalities();
+        let equality = self.execution.scope()?;
+        let mut slab = crate::cursor::RowSlab::new(&self.execution.context.memory);
         let mut output = PageBuilder::new(0,&self.execution.context.memory)?;
         let _hash_scratch = self.execution.context.memory.reserve(4096)?;
         let BuildTable { rows,index,unmatched,.. } = table;
@@ -79,17 +113,17 @@ impl JoinPlan {
             let mut matched = false;
             if self.kind == JoinKind::Anti {
                 for build in rows.page.rows() {
-                    if self.accepted(&comparisons,build,probe).await? { matched = true;break; }
+                    if self.accepted(&comparisons,&direct,&equality,build,probe).await? { matched = true;break; }
                 }
             } else {
                 for build_index in index.candidates(self.probe_layout().hash(probe)?) {
                     let build = &rows.page.rows()[build_index];
-                    if !self.accepted(&comparisons,build,probe).await? { continue; }
+                    if !self.accepted(&comparisons,&direct,&equality,build,probe).await? { continue; }
                     if matched && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
                     matched = true;
                     if let Some(unmatched) = unmatched { unmatched[build_index] = 0; }
                     if self.kind == JoinKind::Semi { break; }
-                    append(&mut output,self.output(build,probe)?,&self.execution)?;
+                    append(&mut output,self.output(build,probe,&mut slab)?,&self.execution)?;
                 }
             }
             if self.kind == JoinKind::Semi && matched || self.kind == JoinKind::Anti && !matched {
@@ -210,3 +244,25 @@ fn row_count(relation: &Relation,execution: &Execution) -> Result<i64> {
 #[cfg(test)]
 #[path = "join_empty_page_tests.rs"]
 mod empty_page_tests;
+
+/// The rows a join input holds at most: its tables' flushed block rows and live rows, or `i64::MAX` where it can't tell.
+pub(crate) fn rows_at_most(relation: &Relation,execution: &Execution) -> Result<i64> {
+    match relation.node() {
+        RelationNode::Scan(scan) => {
+            let partitions = &execution.context.catalog.database(&scan.table.name.database)?.partitions;
+            if partitions.is_empty() { return Ok(i64::MAX); }
+            let mut rows = 0i64;
+            for partition in partitions {
+                let table = &scan.table.name.table;
+                let flushed = partition.table_catalog().metadata(table).map(|meta| meta.row_count);
+                let live = partition.iter_segments(table).map(|segment| i64::from(segment.row_count())).sum::<i64>();
+                if flushed.is_none() && live == 0 { return Ok(i64::MAX); }
+                rows = rows.checked_add(flushed.unwrap_or(0)).and_then(|rows| rows.checked_add(live)).ok_or_else(size_error)?;
+            }
+            Ok(rows)
+        }
+        RelationNode::Project { input,.. } | RelationNode::Extend { input,.. } | RelationNode::Rename { input,.. } | RelationNode::Filter { input,.. } => rows_at_most(input,execution),
+        RelationNode::Values { rows } => i64::try_from(rows.len()).map_err(|_|size_error()),
+        _ => Ok(i64::MAX),
+    }
+}

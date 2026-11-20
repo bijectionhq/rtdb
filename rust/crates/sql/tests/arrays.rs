@@ -57,3 +57,9 @@ async fn sql_trim_count_continuations_preserve_competing_failure_order() {
     }
     assert_eq!(query("SELECT TRIM_ARRAY(TRIM_ARRAY(ARRAY[],-2147483648),CASE WHEN TRUE THEN NULL ELSE 1/0 END)").await.unwrap(),[vec![V::Null]]);
 }
+
+#[tokio::test]
+async fn list_concatenation_is_not_a_matching_concat_clause() {
+    let error = query("SELECT [1, 2] || [3]").await.unwrap_err();
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.error/illegal-arg", Some("No matching clause: [<List> <Int(64, true)>]")));
+}

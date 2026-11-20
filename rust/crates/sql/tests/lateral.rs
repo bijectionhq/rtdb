@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_index::{PartitionState, TransactionBuffer};
@@ -26,7 +27,7 @@ fn context() -> Arc<QueryContext> {
             ("films", Value::List(films.into_iter().map(|film| Value::Utf8(film.into())).collect())),
         ]).collect()),
         ("docs", vec![vec![("_id", Value::I64(1)), ("xs", Value::List(vec![Value::I64(2)])), ("ys", Value::List(vec![Value::I64(3)]))]]),
-        ("foo", vec![vec![("_id", Value::I64(1)), ("vs", Value::List((1..=2).map(|i| Value::Struct(BTreeMap::from([
+        ("foo", vec![vec![("_id", Value::I64(1)), ("vs", Value::List((1..=2).map(|i| Value::Struct(StructFields::from([
             ("t".into(), Value::I64(i)), ("v".into(), Value::I64(i)),
         ]))).collect()))]]),
     ] {

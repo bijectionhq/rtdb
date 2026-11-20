@@ -56,6 +56,7 @@ impl JsonPlan {
 }
 #[cfg(test)]
 mod tests {
+    use rtdb_types::StructFields;
     use super::*;
     use rtdb_types::{TimeUnit, Value};
     #[test]
@@ -63,7 +64,7 @@ mod tests {
         let plan = JsonPlan::parse(r##"{"type":"object","title":"Node","properties":{"value":{"type":"integer"},"next":{"oneOf":[{"type":"null"},{"$ref":"#"}]}}}"##, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
         let Value::Struct(value) = plan.decode(br#"{"value":1,"next":{"value":2,"next":null}}"#, &mut context).unwrap().value else { panic!("expected Struct") };
-        assert_eq!(value["next"], Value::Struct(BTreeMap::from([("value".into(), Value::I64(2)), ("next".into(), Value::Null)])));
+        assert_eq!(value["next"], Value::Struct(StructFields::from([("value".into(), Value::I64(2)), ("next".into(), Value::Null)])));
         let next = plan.schema.field("next").unwrap().schema; drop(plan);
         assert!(next.optional); assert!(next.field("value").is_some());
         assert_eq!(next.parameters["io.confluent.connect.json.Id"], "#id1");
@@ -74,9 +75,9 @@ mod tests {
         let plan = JsonPlan::parse(r#"{"oneOf":[{"type":"null"},{"type":"integer"},{"type":"string"}]}"#, &BTreeMap::new(), &options).unwrap();
         assert_eq!(plan.schema.parameters["org.apache.kafka.connect.data.Union"], "connect_union_0");
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
-        assert_eq!(plan.decode(b"42", &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::I64(42)), ("connect_union_field_1".into(), Value::Null)])));
+        assert_eq!(plan.decode(b"42", &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::I64(42)), ("connect_union_field_1".into(), Value::Null)])));
         let singleton = JsonPlan::parse(r#"{"oneOf":[{"type":"string"}]}"#, &BTreeMap::new(), &options).unwrap();
-        assert_eq!(singleton.decode(br#""text""#, &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::Utf8("text".into()))])));
+        assert_eq!(singleton.decode(br#""text""#, &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::Utf8("text".into()))])));
         let enumeration = JsonPlan::parse(r#"{"enum":["A","B",null]}"#, &BTreeMap::new(), &options).unwrap();
         assert_eq!(enumeration.schema.parameters["org.apache.kafka.connect.data.Enum.B"], "1");
         assert_eq!(enumeration.schema.parameters["org.apache.kafka.connect.data.Enum.<NULL>"], "2");
@@ -86,11 +87,11 @@ mod tests {
         let options = BTreeMap::from([("generalized.sum.type.support".into(), "true".into())]);
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
         let numbers = JsonPlan::parse(r#"{"oneOf":[{"type":"integer"},{"type":"number"}]}"#, &BTreeMap::new(), &options).unwrap();
-        assert_eq!(numbers.decode(b"1.5", &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::Null), ("connect_union_field_1".into(), Value::F64(1.5))])));
+        assert_eq!(numbers.decode(b"1.5", &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::Null), ("connect_union_field_1".into(), Value::F64(1.5))])));
         let text = JsonPlan::parse(r#"{"oneOf":[{"type":"string","connect.type":"bytes"},{"type":"string"}]}"#, &BTreeMap::new(), &options).unwrap();
-        assert_eq!(text.decode(br#""YQ==""#, &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::Null), ("connect_union_field_1".into(), Value::Utf8("YQ==".into()))])));
+        assert_eq!(text.decode(br#""YQ==""#, &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::Null), ("connect_union_field_1".into(), Value::Utf8("YQ==".into()))])));
         let map = JsonPlan::parse(r#"{"oneOf":[{"type":"array","connect.type":"map","items":{"type":"object","properties":{"key":{"type":"integer"},"value":{"type":"string"}}}},{"type":"string"}]}"#, &BTreeMap::new(), &options).unwrap();
-        assert_eq!(map.decode(br#"[{"key":1,"value":"x"}]"#, &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::Map { entries: vec![(Value::I64(1), Value::Utf8("x".into()))], sorted: false }), ("connect_union_field_1".into(), Value::Null)])));
+        assert_eq!(map.decode(br#"[{"key":1,"value":"x"}]"#, &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::Map { entries: vec![(Value::I64(1), Value::Utf8("x".into()))], sorted: false }), ("connect_union_field_1".into(), Value::Null)])));
     }
     #[test]
     fn registry_big_integer_conversion_and_union_selection_retain_integral_nodes() {
@@ -101,8 +102,8 @@ mod tests {
         let narrow = JsonPlan::parse(r#"{"type":"integer","connect.type":"int32"}"#, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert_eq!(narrow.decode(b"4294967297", &mut context).unwrap().value, Value::I32(1));
         let union = JsonPlan::parse(r#"{"oneOf":[{"type":"integer"},{"type":"number"}]}"#, &BTreeMap::new(), &BTreeMap::from([("generalized.sum.type.support".into(), "true".into())])).unwrap();
-        assert_eq!(union.decode(b"18446744073709551617", &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::I64(1)), ("connect_union_field_1".into(), Value::Null)])));
-        assert_eq!(union.decode(b"1.0", &mut context).unwrap().value, Value::Struct(BTreeMap::from([("connect_union_field_0".into(), Value::Null), ("connect_union_field_1".into(), Value::F64(1.0))])));
+        assert_eq!(union.decode(b"18446744073709551617", &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::I64(1)), ("connect_union_field_1".into(), Value::Null)])));
+        assert_eq!(union.decode(b"1.0", &mut context).unwrap().value, Value::Struct(StructFields::from([("connect_union_field_0".into(), Value::Null), ("connect_union_field_1".into(), Value::F64(1.0))])));
         for annotation in ["2147483648", "18446744073709551617", "1.0"] {
             assert!(JsonPlan::parse(&format!(r#"{{"type":"integer","connect.version":{annotation}}}"#), &BTreeMap::new(), &BTreeMap::new()).is_err());
             assert!(JsonPlan::parse(&format!(r#"{{"type":"object","properties":{{"x":{{"type":"integer","connect.index":{annotation}}}}}}}"#), &BTreeMap::new(), &BTreeMap::new()).is_err());
@@ -136,13 +137,13 @@ mod tests {
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
         let Value::Struct(value) = plan.decode(br#"{"child":{"b":2}}"#, &mut context).unwrap().value else { panic!("expected union Struct") };
         assert_eq!(value["connect_union_field_0"], Value::Null);
-        assert_eq!(value["connect_union_field_1"], Value::Struct(BTreeMap::from([("child".into(), Value::Struct(BTreeMap::from([("b".into(), Value::I64(2))])))])));
+        assert_eq!(value["connect_union_field_1"], Value::Struct(StructFields::from([("child".into(), Value::Struct(StructFields::from([("b".into(), Value::I64(2))])))])));
     }
     #[test]
     fn json_parent_defaults_observe_completed_child_defaults() {
         let plan = JsonPlan::parse(r#"{"type":"object","default":{},"properties":{"child":{"type":"string","default":"x"}}}"#, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
-        assert_eq!(plan.decode(b"null", &mut context).unwrap().value, Value::Struct(BTreeMap::from([("child".into(), Value::Utf8("x".into()))])));
+        assert_eq!(plan.decode(b"null", &mut context).unwrap().value, Value::Struct(StructFields::from([("child".into(), Value::Utf8("x".into()))])));
     }
     #[test]
     fn json_default_structs_and_arrays_reject_required_null_values() {

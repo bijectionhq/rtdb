@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use rtdb_types::OrderedSet;
+use rtdb_types::StructFields;
 use rtdb_columnar::{admit_execution_value, copy_array, execution_field_type, execution_type, from_field, read_execution_value, read_value, to_field};
 use rtdb_types::{ListKind, LogicalType as T, RunEndWidth, ScalarType as S, Value as V};
 
@@ -28,23 +29,23 @@ fn unsigned_storage_bits_remain_lossless_and_execution_reads_signed_widths() {
 
 #[test]
 fn execution_types_retain_nested_layouts_and_merge_collapsed_union_legs() {
-    let union = T::Union(BTreeSet::from([T::Scalar(S::U64), T::Scalar(S::I64), T::Null]));
+    let union = T::Union(OrderedSet::from([T::Scalar(S::U64), T::Scalar(S::I64), T::Null]));
     assert_eq!(execution_type(&union), T::Scalar(S::I64).maybe());
-    let nested = T::Struct(BTreeMap::from([
+    let nested = T::Struct(StructFields::from([
         ("values".into(), T::List { kind: ListKind::FixedSizeList(2), element: Box::new(union) }),
         ("encoded".into(), T::Scalar(S::U8).maybe().run_end_encoded(RunEndWidth::I16).unwrap()),
     ]));
-    let expected = T::Struct(BTreeMap::from([
+    let expected = T::Struct(StructFields::from([
         ("values".into(), T::List { kind: ListKind::FixedSizeList(2), element: Box::new(T::Scalar(S::I64).maybe()) }),
         ("encoded".into(), T::Scalar(S::I8).maybe().run_end_encoded(RunEndWidth::I16).unwrap()),
     ]));
     assert_eq!(execution_type(&nested), expected);
-    let mut value = V::Struct(BTreeMap::from([
+    let mut value = V::Struct(StructFields::from([
         ("values".into(), V::FixedSizeList(vec![V::U64(u64::MAX), V::Null])),
         ("encoded".into(), V::U8(255)),
     ]));
     admit_execution_value(&mut value);
-    assert_eq!(value, V::Struct(BTreeMap::from([
+    assert_eq!(value, V::Struct(StructFields::from([
         ("values".into(), V::FixedSizeList(vec![V::I64(-1), V::Null])),
         ("encoded".into(), V::I8(-1)),
     ])));

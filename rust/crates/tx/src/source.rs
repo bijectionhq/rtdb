@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -153,12 +154,12 @@ impl SourceTransaction {
 }
 
 struct SourceOperation<'a> {
-    body: BTreeMap<String, Value>,
+    body: StructFields<Value>,
     documents: Option<(String, &'a Documents)>,
 }
 
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
-    let mut body = BTreeMap::new();
+    let mut body = StructFields::new();
     let mut docs = None;
     let tag = match operation {
         Operation::Public(TxOp::Sql { sql, args }) => {
@@ -202,7 +203,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
     Ok((tag.into(), SourceOperation { body, documents: docs }))
 }
 
-pub(crate) fn document_id(document: &BTreeMap<String, Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
+pub(crate) fn document_id(document: &StructFields<Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
     if let Some(id) = document.get("_id").filter(|id| !matches!(id, Value::Null | Value::Undefined)) {
         return id.entity_id();
     }
@@ -254,20 +255,29 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) ->
         }
     }
     if let Some(ty) = types.get_mut("iids") { *ty = LogicalType::list(LogicalType::Scalar(ScalarType::FixedSizeBinary(16))); }
-    if let Some(ty) = types.get_mut("args") { *ty = LogicalType::Scalar(ScalarType::Binary).maybe(); }
+    // The reference's argument vector is non-nullable until an operation without arguments writes it a null.
+    if let Some(ty) = types.get_mut("args") {
+        let binary = LogicalType::Scalar(ScalarType::Binary);
+        *ty = if *ty == binary { binary } else { binary.maybe() };
+    }
     let mut fields = Vec::new();
     let mut columns = Vec::new();
+    // The reference's document writers declare `documents` straight after `iids`, ahead of the valid-time columns.
+    let mut documents = documents.iter().any(Option::is_some).then_some(documents);
     for (name, ty) in types {
         let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
         let bound = estimate_builder_bytes_refs(&ty, cells())?;
         columns.push(arrays.column(bound, || copy_array(&ty, &cells().cloned().collect::<Vec<_>>()))?);
         fields.push(Arc::new(to_field(&name, &ty)?));
+        if name == "iids" {
+            if let Some(documents) = documents.take() {
+                let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
+                fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
+                columns.push(documents);
+            }
+        }
     }
-    if documents.iter().any(Option::is_some) {
-        let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
-        fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
-        columns.push(documents);
-    }
+    if documents.is_some() { return Err(invalid("Document operation has no iids")); }
     rtdb_columnar::build_struct_array(fields.into(), &columns, values.len(), None).map_err(|error| invalid(error.to_string()))
 }
 
@@ -304,6 +314,8 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
     for name in order {
         let (ty, present) = fields.remove(name).expect("ordered document column has a type");
         let ty = if present < length || present == 0 { ty.maybe() } else { ty };
+        let cells = lists.iter().flat_map(|list| list.rows()).map(|document| document.get(name).map_or(WriterCell::Null, WriterCell::of)).collect::<Vec<_>>();
+        let ty = backfilled_nullability(ty, &cells);
         let values = || lists.iter().flat_map(|list| list.rows()).map(|document| struct_field_cell(document, name, &ty));
         let estimate = estimate_builder_bytes_refs(&ty, values())?;
         let array = arrays.column(estimate, || copy_array(&ty, &values().cloned().collect::<Vec<_>>()))?;
@@ -313,6 +325,49 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
     let structs = rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))?;
     let field = Arc::new(Field::new("$data$", structs.data_type().clone(), false));
     Ok(Arc::new(ListArray::try_new(field, OffsetBuffer::new(ScalarBuffer::from(offsets)), structs, None).map_err(|error| invalid(error.to_string()))?))
+}
+
+/// One row of a document column as the reference's struct writers see it.
+#[derive(Clone, Copy)]
+enum WriterCell<'a> { Undefined, Null, Value(&'a Value) }
+
+impl<'a> WriterCell<'a> {
+    fn of(value: &'a Value) -> Self { match value { Value::Null => Self::Null, Value::Undefined => Self::Undefined, value => Self::Value(value) } }
+    fn fields(&self) -> Option<&'a StructFields<Value>> { match self { Self::Value(Value::Struct(fields)) => Some(fields), _ => None } }
+}
+
+/// The reference's writer backfills a struct key first written at row `r` into the struct's earlier rows: undefined where
+/// `isNull` holds, null otherwise, and a null makes the field nullable. A non-nullable struct's undefined rows - written
+/// because its own parent was null there - do not report `isNull`, so a key first seen after them becomes nullable although
+/// its rows only lacked it (xtdb #4988). Union legs start empty and so have nothing to backfill; only single-typed struct
+/// chains are adjusted, and only ever towards nullable.
+fn backfilled_nullability(ty: LogicalType, cells: &[WriterCell<'_>]) -> LogicalType {
+    let (nullable, inner) = match ty { LogicalType::Maybe(inner) => (true, *inner), other => (false, other) };
+    let LogicalType::Struct(children) = inner else { return if nullable { inner.maybe() } else { inner }; };
+    if !cells.iter().all(|cell| !matches!(cell, WriterCell::Value(value) if !matches!(value, Value::Struct(_)))) {
+        let inner = LogicalType::Struct(children);
+        return if nullable { inner.maybe() } else { inner };
+    }
+    let adjusted = children.into_iter().map(|(name, child)| {
+        let first = cells.iter().position(|cell| cell.fields().is_some_and(|fields| fields.contains_key(&name)));
+        let child_cells = match first {
+            None => return (name, child),
+            Some(first) => {
+                let parent_nullable = cells[..first].iter().any(|cell| matches!(cell, WriterCell::Null));
+                cells.iter().enumerate().map(|(row, cell)| match (row < first, cell) {
+                    (_, WriterCell::Value(Value::Struct(fields))) => fields.get(&name).map_or(WriterCell::Null, WriterCell::of),
+                    (true, WriterCell::Undefined) if !parent_nullable => WriterCell::Null,
+                    (_, WriterCell::Undefined | WriterCell::Null) => WriterCell::Undefined,
+                    (_, WriterCell::Value(_)) => WriterCell::Undefined,
+                }).collect::<Vec<_>>()
+            }
+        };
+        let child = backfilled_nullability(child, &child_cells);
+        let child = if child_cells.iter().any(|cell| matches!(cell, WriterCell::Null)) && !matches!(child, LogicalType::Maybe(_)) { child.maybe() } else { child };
+        (name, child)
+    }).collect();
+    let inner = LogicalType::Struct(adjusted);
+    if nullable { inner.maybe() } else { inner }
 }
 
 struct SourceOperationReader<'a> {
@@ -396,7 +451,7 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
     for (index, ty) in arguments.types().iter().enumerate() {
-        fields.push(to_field(&format!("${}", index + 1), ty)?);
+        fields.push(to_field(&format!("?_{index}"), ty)?);
         arrays.push(copy_array(ty, &arguments.rows().map(|row| row[index].clone()).collect::<Vec<_>>())?);
     }
     let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(arguments.row_count()));
@@ -465,7 +520,7 @@ fn iids(value: Value) -> Result<Vec<Iid>> {
     let Value::List(values) = value else { return Err(invalid("IIDs must be a list")); };
     values.into_iter().map(|value| match value { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes), _ => Err(invalid("IID must be fixed-size binary")) }).collect()
 }
-fn time_fields(body: &mut BTreeMap<String, Value>, from: Option<Timestamp>, to: Option<Timestamp>) {
+fn time_fields(body: &mut StructFields<Value>, from: Option<Timestamp>, to: Option<Timestamp>) {
     let time = |time: Option<Timestamp>| time.map(|time| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).unwrap_or(Value::Null);
     body.insert("_valid_from".into(), time(from)); body.insert("_valid_to".into(), time(to));
 }
@@ -506,15 +561,34 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_struct_key_first_written_after_its_struct_was_undefined_is_nullable() {
+        let memory = budget();
+        let put = |row: StructFields<Value>| TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![row], &memory).unwrap(), valid_from: None, valid_to: None };
+        let quux = StructFields::from([("_id".to_owned(), Value::I64(2)), ("struct".to_owned(), Value::Struct(StructFields::from([
+            ("a".to_owned(), Value::Bool(true)),
+            ("b".to_owned(), Value::Struct(StructFields::from([("c".to_owned(), Value::Utf8("c".into())), ("d".to_owned(), Value::Utf8("d".into()))]))),
+        ])))]);
+        let source = SourceTransaction::new(vec![put(StructFields::from([("_id".to_owned(), Value::I64(1))])), put(quux)], SubmitOptions::default(), &memory).unwrap();
+        let decoded = roundtrip(&source);
+        let Operation::PutIids { documents, .. } = &decoded.operations[0] else { panic!("put"); };
+        let utf8 = LogicalType::Scalar(ScalarType::Utf8);
+        let expected = LogicalType::Struct(StructFields::from([
+            ("a".to_owned(), LogicalType::Scalar(ScalarType::Bool)),
+            ("b".to_owned(), LogicalType::Struct(StructFields::from([("c".to_owned(), utf8.clone().maybe()), ("d".to_owned(), utf8.maybe())]))),
+        ])).maybe();
+        assert_eq!(documents.declared_types().unwrap()["struct"], expected);
+    }
+
+    #[test]
     fn document_union_keeps_first_seen_column_order_per_table_through_replay() {
         let memory = budget();
         let operation = |table, id, names: &[&str], cells: &[(&str, Value)]| {
-            let mut row = BTreeMap::from([("_id".to_owned(), Value::I64(id))]);
+            let mut row = StructFields::from([("_id".to_owned(), Value::I64(id))]);
             row.extend(cells.iter().map(|(name, value)| ((*name).to_owned(), value.clone())));
             let columns = names.iter().map(|name| (*name).to_owned()).collect();
             TxOp::PutDocs {
                 table: TableRef::new("public", table),
-                documents: Documents::with_column_order(vec![row], columns, &memory).unwrap(),
+                documents: Documents::with_column_order(vec![row.into()], columns, &memory).unwrap(),
                 valid_from: None,
                 valid_to: None,
             }
@@ -548,7 +622,7 @@ mod tests {
     fn source_writes_sparse_document_columns_with_one_column_of_builder_scratch() {
         let memory = MemoryBudget::new(1 << 27);
         let rows = (0..100).map(|id| {
-            let mut row = BTreeMap::from([("_id".into(), Value::I64(id))]);
+            let mut row = StructFields::from([("_id".into(), Value::I64(id))]);
             for index in 0..10 {
                 row.insert(format!("field_{id}_{index}"), Value::Utf8("value".into()));
             }
@@ -569,13 +643,13 @@ mod tests {
     fn source_reads_sparse_documents_with_one_row_of_decode_scratch() {
         let memory = MemoryBudget::new(1 << 25);
         let operations = (0..100).map(|id| {
-            let mut row = BTreeMap::from([("_id".into(), Value::I64(id))]);
+            let mut row = StructFields::from([("_id".into(), Value::I64(id))]);
             for index in 0..10 {
                 row.insert(format!("field_{id}_{index}"), Value::Utf8(format!("value_{id}_{index}")));
             }
             TxOp::PutDocs {
                 table: TableRef::new("public", "wide_docs"),
-                documents: Documents::new(vec![row], &memory).unwrap(),
+                documents: Documents::new(vec![row.into()], &memory).unwrap(),
                 valid_from: None,
                 valid_to: None,
             }
@@ -597,7 +671,7 @@ mod tests {
     fn ordered_documents_reject_duplicate_columns_and_unrepresented_fields() {
         let memory = budget();
         for names in [vec!["a", "a"], vec!["b"]] {
-            let rows = vec![BTreeMap::from([("a".into(), Value::I64(1))])];
+            let rows = vec![StructFields::from([("a".into(), Value::I64(1))])];
             let columns = names.into_iter().map(str::to_owned).collect();
             let error = Documents::with_column_order(rows, columns, &memory).unwrap_err();
             assert_eq!(error.code, "rtdb.tx/document-schema");
@@ -608,7 +682,7 @@ mod tests {
     #[test]
     fn replay_keeps_explicit_put_and_patch_iids_even_when_the_document_id_hash_differs() {
         let memory = budget();
-        let documents = Documents::new(vec![BTreeMap::from([("_id".into(), Value::Utf8("different-id".into()))])], &memory).unwrap();
+        let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::Utf8("different-id".into()))])], &memory).unwrap();
         let table = TableRef::new("public", "docs");
         let iid = Iid([42; 16]);
         assert_ne!(iid, EntityId::String("different-id".into()).iid());
@@ -669,7 +743,7 @@ mod tests {
     #[test]
     fn empty_metadata_bytes_are_absent_and_present_metadata_keeps_its_types() {
         let memory = budget();
-        let value = Value::Struct(BTreeMap::from([("source".into(), Value::Utf8("client".into())), ("attempt".into(), Value::I64(2))]));
+        let value = Value::Struct(StructFields::from([("source".into(), Value::Utf8("client".into())), ("attempt".into(), Value::I64(2))]));
         let source = SourceTransaction::new(vec![], SubmitOptions { user_metadata: Some(UserMetadata::new(value.clone(), &memory).unwrap()), ..SubmitOptions::default() }, &memory).unwrap();
         assert_eq!(roundtrip(&source).options.user_metadata.unwrap().value(), &value);
         let mut message = SourceMessage::decode(source.encode().unwrap().as_slice()).unwrap().unwrap();

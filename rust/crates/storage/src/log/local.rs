@@ -160,9 +160,9 @@ impl LocalLog {
             .map_err(|error| Error::io(path, error))?;
         file.try_lock_exclusive().map_err(|error| Error::io(path, error))?;
         let latest = inspect(&mut file, path, options.maximum_message_bytes)?;
-        file.sync_all().map_err(|error| Error::io(path, error))?;
+        crate::sync_file(&file).map_err(|error| Error::io(path, error))?;
         if let Some(parent) = path.parent() {
-            File::open(parent).and_then(|directory| directory.sync_all()).map_err(|error| Error::io(parent, error))?;
+            File::open(parent).and_then(|directory| crate::sync_file(&directory)).map_err(|error| Error::io(parent, error))?;
         }
         let path = Arc::new(path.to_path_buf());
         let progress = Arc::new(Progress::new(latest));
@@ -196,11 +196,11 @@ impl Writer {
                 self.file.write_all(&bytes).map_err(|error| Error::io(self.path.as_ref(), error))?;
                 metadata.push(LogMetadata { offset: LogOffset(offset as i64), timestamp });
             }
-            self.file.sync_all().map_err(|error| Error::io(self.path.as_ref(), error))?;
+            crate::sync_file(&self.file).map_err(|error| Error::io(self.path.as_ref(), error))?;
             Ok(metadata)
         })();
         if result.is_err() {
-            if let Err(rollback) = self.file.set_len(start).and_then(|_| self.file.sync_all()) {
+            if let Err(rollback) = self.file.set_len(start).and_then(|_| crate::sync_file(&self.file)) {
                 return Err(corrupt(&self.path, start, format!("append failed: {}; rollback failed: {rollback}", result.as_ref().unwrap_err())));
             }
         }

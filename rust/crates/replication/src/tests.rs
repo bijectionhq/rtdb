@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use rtdb_types::StructFields;
 use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
 use std::time::Duration;
 
@@ -70,7 +71,7 @@ fn upload(index: i64, source: i64) -> ReplicaBody {
 }
 
 #[tokio::test]
-async fn log_records_retain_encoded_bytes_after_releasing_codec_scratch() {
+async fn appended_log_records_release_their_encoding_charges() {
     let memory = MemoryBudget::new(1 << 20);
     let source = Arc::new(MemoryLog::new(1 << 20));
     let replica = Arc::new(MemoryLog::new(1 << 20));
@@ -87,11 +88,10 @@ async fn log_records_retain_encoded_bytes_after_releasing_codec_scratch() {
     assert!(memory.used_bytes() < 1 << 18);
     assert_eq!(source.latest().unwrap(), LogOffset(255));
     assert_eq!(replica.latest().unwrap(), LogOffset(255));
+    assert_eq!(memory.used_bytes(), 0, "the in-memory logs own their records outside the execution budget");
     drop(logs);
-    assert_ne!(memory.used_bytes(), 0);
     drop(source);
     drop(replica);
-    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[tokio::test]
@@ -341,7 +341,7 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
     let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&fixture.memory)).unwrap();
     let table = TableRef::new("public", "docs");
-    for id in 0..8 { write.put(table.clone(), BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(id))]), Interval::ALL).unwrap(); }
+    for id in 0..8 { write.put(table.clone(), StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(id))]), Interval::ALL).unwrap(); }
     state.apply(&write.stage().unwrap()).unwrap();
     fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key })), None).unwrap();
     fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
@@ -431,7 +431,7 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     let handle = fixture.handle.clone();
     let blocks = Arc::clone(&fixture.blocks);
     let writer = tokio::spawn(fixture.driver.run());
-    let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("value".into()))])], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
+    let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("value".into()))])], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
     let position = handle.submit_source_encoded(transaction.encode().unwrap().into_bytes(), Timestamp(100)).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), handle.await_tx(TxId(position.0), &CancellationToken::new())).await.unwrap().unwrap();
     let mut status = handle.watch_status();
@@ -516,7 +516,7 @@ async fn next_local_record(tail: &mut dyn rtdb_storage::log::LogTail) -> LogReco
 }
 
 async fn submit_recovery_row(handle: &ReplicationHandle, memory: &Arc<MemoryBudget>, id: i64, time: i64) -> SourcePosition {
-    let documents = Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(id))])], memory).unwrap();
+    let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::I64(id))])], memory).unwrap();
     let tx = SourceTransaction::new(vec![TxOp::PutDocs {
         table: TableRef::new("public", "docs"), documents, valid_from: Some(Timestamp(0)), valid_to: None,
     }], SubmitOptions::default(), memory).unwrap();
@@ -1636,4 +1636,37 @@ fn a_group_objects_file_is_deleted_or_dropped_from_caches_only_with_the_groups_l
     assert!(!cached_objects(&recorded, &table, &one).contains(&object("l02-rc-p0-b00")));
     let all: BTreeSet<TrieKey> = members.iter().map(|key| key.parse().unwrap()).collect();
     assert_eq!(cached_objects(&recorded, &table, &all).iter().filter(|key| **key == object("l02-rc-p0-b00")).count(), 1);
+}
+
+#[tokio::test]
+async fn a_promotion_that_inherits_a_flushed_block_resumes_the_source_after_the_flush() {
+    let config = ReplicationConfig { assertion_interval: Duration::from_millis(10), ..Default::default() };
+    let fixture = fixture(config, 1 << 27).await;
+    let first = submit_recovery_row(&fixture.handle, &fixture.memory, 1, 100).await;
+    let flush = fixture.logs.append_source(&SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(-1) })), Timestamp(200)).await.unwrap();
+    // The previous leader read back its transaction and cut the flush's boundary, then died before uploading the block.
+    for record in [
+        raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })),
+        raw(1, 1, 1, resolved(first.0, first.0)),
+        raw(2, 1, 2, boundary(0, flush.0)),
+    ] {
+        fixture.replica.enqueue(record.payload, record.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    }
+    let next = submit_recovery_row(&fixture.handle, &fixture.memory, 2, 300).await;
+
+    let handle = fixture.handle.clone();
+    let driver = tokio::spawn(fixture.driver.run());
+    let result = tokio::time::timeout(Duration::from_secs(5), handle.await_tx(TxId(next.0), &CancellationToken::new())).await.unwrap().unwrap().unwrap();
+    assert_eq!(result.tx_key().tx_id, TxId(next.0));
+    assert!(handle.status().adopted_block.is_some());
+    handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+
+    let replica = fixture.replica.read_range(LogOffset(3), LogOffset(fixture.replica.latest().unwrap().0 + 1)).await.unwrap();
+    let later_sources: Vec<_> = replica.iter().filter_map(|record| match ReplicaEnvelope::decode(&record.payload).unwrap().unwrap().message {
+        ReplicaBody::ResolvedTx(message) => message.src_msg_id,
+        ReplicaBody::NoOp(message) => message.src_msg_id,
+        _ => None,
+    }).collect();
+    assert_eq!(later_sources, vec![next.0], "the new term resolves each later source message once and nothing at or before the flush");
 }

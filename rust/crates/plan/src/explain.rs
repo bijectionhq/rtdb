@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use serde::{Deserialize, Serialize};
 use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit};
 use crate::{ColumnId, Field, Schema};
@@ -11,7 +11,7 @@ pub fn explain_analyze_schema() -> Result<Schema> {
     let duration = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Microsecond));
     let int = LogicalType::Scalar(ScalarType::I64);
     let string = LogicalType::Scalar(ScalarType::Utf8);
-    let attributes = LogicalType::Struct(BTreeMap::from([
+    let attributes = LogicalType::Struct(StructFields::from([
         ("scan_db".into(), string.clone()), ("scan_source".into(), string.clone()),
         ("scan_files_pruned".into(), int.clone()), ("scan_files_used".into(), int.clone()),
         ("scan_pages_pruned".into(), int.clone()), ("scan_pages_used".into(), int.clone()), ("scan_rows_read".into(), int.clone()),

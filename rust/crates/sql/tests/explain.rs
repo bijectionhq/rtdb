@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_index::{PartitionState, TransactionBuffer};
@@ -13,7 +14,7 @@ fn context(batch_rows: usize) -> Arc<QueryContext> {
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
     QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(0), "UTC", QueryOptions { batch_rows, ..Default::default() }, &CancellationToken::new()).unwrap()
 }
-async fn query(context: &Arc<QueryContext>, sql: &str) -> Result<Vec<BTreeMap<String, Value>>> {
+async fn query(context: &Arc<QueryContext>, sql: &str) -> Result<Vec<StructFields<Value>>> {
     let prepared = prepare(sql, &context.catalog, &PrepareOptions::default())?;
     let query = PreparedQuery::from_prepared(prepared, &context.memory)?;
     let mut cursor = query.execute(Arc::clone(context), vec![]).await?;
@@ -53,7 +54,7 @@ async fn explain_temporal_casts_retain_requested_precision_and_interval_fields()
     }
 }
 fn duration(value: &Value) -> i64 { let Value::Duration { value, unit: TimeUnit::Microsecond } = value else { panic!("Expected duration in microseconds") }; *value }
-fn depth(row: &BTreeMap<String, Value>) -> usize { let Value::Utf8(value) = &row["depth"] else { panic!("Expected depth") }; value.len() }
+fn depth(row: &StructFields<Value>) -> usize { let Value::Utf8(value) = &row["depth"] else { panic!("Expected depth") }; value.len() }
 
 #[derive(Default)]
 struct Samples(AtomicUsize);
@@ -116,7 +117,7 @@ async fn optimized_scan_predicate_runs_after_latest_visible_version_resolution()
     let state = PartitionState::empty(Default::default()).unwrap();
     for (tx, value) in [(0, 1), (1, 2)] {
         let mut transaction = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx + 1) }, Arc::clone(&memory)).unwrap();
-        transaction.put(TableRef::new("public", "history"), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value))]), Interval::ALL).unwrap();
+        transaction.put(TableRef::new("public", "history"), StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value))]), Interval::ALL).unwrap();
         state.apply(&transaction.stage().unwrap()).unwrap();
     }
     let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
@@ -131,7 +132,7 @@ async fn api_test_explain_projection_rename_and_scan_predicate_describe_executed
     let memory = MemoryBudget::new(1 << 27);
     let state = PartitionState::empty(Default::default()).unwrap();
     let mut transaction = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time: Timestamp(1) }, Arc::clone(&memory)).unwrap();
-    transaction.put(TableRef::new("public", "foo"), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("one".into())), ("unused".into(), Value::I64(99))]), Interval::ALL).unwrap();
+    transaction.put(TableRef::new("public", "foo"), StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("one".into())), ("unused".into(), Value::I64(99))]), Interval::ALL).unwrap();
     state.apply(&transaction.stage().unwrap()).unwrap();
     let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
@@ -144,6 +145,9 @@ async fn api_test_explain_projection_rename_and_scan_predicate_describe_executed
     assert_eq!(scan["table"], Value::Utf8("xtdb.public.foo".into()));
     assert_eq!(scan["columns"], Value::List(vec![Value::Utf8("v".into()), Value::Utf8("_id".into())]));
     assert_eq!(scan["predicates"], Value::List(vec![Value::Utf8("(== _id 1)".into())]));
+    let present = |explain: &StructFields<Value>| explain.iter().filter(|(_, value)| !matches!(value, Value::Null | Value::Undefined)).map(|(name, _)| name.clone()).collect::<Vec<_>>();
+    assert_eq!(present(project), ["project", "append?"], "keys follow each operator's reference map literal");
+    assert_eq!(present(scan), ["columns", "table", "predicates"], "a key every rename declares precedes the scan's own");
     let measured = query(&context, "EXPLAIN ANALYZE SELECT v FROM foo WHERE _id = 1").await.unwrap();
     assert!(measured.iter().all(|row| row["row_count"] == Value::I64(1)));
     let Value::Struct(attributes) = &measured[2]["attributes"] else { panic!("Expected actual scan counters") };

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -53,7 +53,7 @@ impl CopyInput {
                     let mut bound = 8192usize;
                     for row in 0..batch.num_rows() { for column in 0..batch.num_columns() { bound = bound.checked_add(estimate_read_value_bytes(schema.field(column), batch.column(column).as_ref(), row)?).ok_or_else(|| protocol("COPY row allocation overflow"))?; } }
                     let _values = node.memory().reserve(bound)?;
-                    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), rtdb_columnar::read_execution_value(field, batch.column(column).as_ref(), row)?))).collect::<Result<BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
+                    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), rtdb_columnar::read_execution_value(field, batch.column(column).as_ref(), row)?))).collect::<Result<StructFields<_>>>()).collect::<Result<Vec<_>>>()?;
                     count = count.checked_add(rows.len() as u64).ok_or_else(|| protocol("COPY row count overflow"))?;
                     self.submit(rows, session, node, cancellation).await?;
                 }
@@ -61,7 +61,7 @@ impl CopyInput {
             }
         }
     }
-    async fn submit(&self, rows: Vec<BTreeMap<String, Value>>, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
+    async fn submit(&self, rows: Vec<StructFields<Value>>, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
         let owns_transaction = session.state().status() == TransactionStatus::Idle;
         if owns_transaction { session.state_mut().begin_with(TransactionSettings { access: Some(AccessSettings::ReadWrite(Default::default())), ..Default::default() })?; }
         let work = async {

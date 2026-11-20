@@ -1,6 +1,6 @@
+use rtdb_types::StructFields;
 use rtdb_plan::{QualifiedTable, TableBinding};
 use rtdb_types::{ListKind, LogicalType as L, ScalarType as S, TableRef, TimeUnit, pg_table_oid};
-use std::collections::BTreeMap;
 
 pub(crate) struct Definition { pub schema: &'static str, pub name: &'static str, fields: &'static str }
 pub(crate) fn allocation_bound(database: &str) -> rtdb_types::Result<usize> {
@@ -59,7 +59,7 @@ pub(crate) const DEFINITIONS: &[Definition] = &[
 
 pub(crate) fn definition(table: &TableRef) -> Option<&'static Definition> { DEFINITIONS.iter().find(|entry| entry.schema == table.schema && entry.name == table.table) }
 impl Definition {
-    pub fn columns(&self) -> BTreeMap<String, L> {
+    pub fn columns(&self) -> StructFields<L> {
         self.fields.split_ascii_whitespace().map(|field| {
             let (name, ty) = field.split_once(':').expect("catalog field delimiter");
             let base = ty.strip_suffix('?').unwrap_or(ty);
@@ -69,7 +69,7 @@ impl Definition {
                 "li" => L::list(L::Scalar(S::I32)), "ls" => L::list(L::Scalar(S::Utf8)),
                 "date" => L::Scalar(S::DateDay), "duration" => L::Scalar(S::Duration(TimeUnit::Nanosecond)),
                 "instant" => instant(),
-                "tags" => L::List { kind: ListKind::Map { sorted: false }, element: Box::new(L::Struct(BTreeMap::from([("key".into(), L::Scalar(S::Utf8)), ("value".into(), L::Scalar(S::Utf8))]))) },
+                "tags" => L::List { kind: ListKind::Map { sorted: false }, element: Box::new(L::Struct(StructFields::from([("key".into(), L::Scalar(S::Utf8)), ("value".into(), L::Scalar(S::Utf8))]))) },
                 "temporal" => L::Struct(["min_valid_from", "max_valid_from", "min_valid_to", "max_valid_to", "min_system_from", "max_system_from"].into_iter().map(|name| (name.into(), instant())).collect()),
                 _ => unreachable!("catalog field type"),
             };

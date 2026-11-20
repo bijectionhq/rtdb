@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap,BTreeSet};
+use rtdb_types::StructFields;
+use std::collections::BTreeSet;
 use rtdb_expr::{EvalContext,evaluate_async};
 use rtdb_format::transit::{TransitValue as T,decode_msgpack,encode_msgpack};
 use rtdb_plan::{Catalog,QualifiedTable,RelationNode,Statement,TableBinding};
@@ -30,7 +31,7 @@ async fn xtql_named_fields_and_generic_calls_preserve_their_distinct_field_metad
         ("(get-field (/ 1 0))",V::Null),
     ] { assert_eq!(project(source,V::Null,&scope).await.unwrap(),expected,"{source}"); }
     assert_eq!(project("(. {:a (/ 1 0)} absent)",V::Null,&scope).await.unwrap_err().code,"xtdb.expression/division-by-zero");
-    assert_eq!(project("(get_field x)",V::Struct(BTreeMap::from([("".into(),V::I64(4))])),&scope).await.unwrap(),V::I64(4));
+    assert_eq!(project("(get_field x)",V::Struct(StructFields::from([("".into(),V::I64(4))])),&scope).await.unwrap(),V::I64(4));
     assert_eq!(project("(. {:Foo-Bar 7} Foo-Bar)",V::Null,&scope).await.unwrap(),V::Null);
     assert_eq!(project("(. {:Foo-Bar 7} foo_bar)",V::Null,&scope).await.unwrap(),V::I64(7));
     for source in ["(get-field)","(get-field x x)"] { assert!(project(source,V::Null,&scope).await.is_err(),"{source}"); }

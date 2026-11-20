@@ -10,12 +10,17 @@ pub struct MemoryBudget {
     used_bytes: AtomicUsize,
     peak_bytes: AtomicUsize,
     parent: Option<Arc<MemoryBudget>>,
+    /// For a quantized budget, the bytes its parent has admitted for it, which cover its used bytes in whole quanta.
+    quantized: Option<Quantized>,
 }
+
+#[derive(Debug)]
+struct Quantized { quantum: usize, granted: std::sync::Mutex<usize> }
 
 impl MemoryBudget {
     /// Creates a root budget with a byte limit; zero permits only zero-byte reservations.
     pub fn new(limit_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: None })
+        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: None, quantized: None })
     }
 
     /// Tracks a region's retained and peak bytes while charging every reservation to the shared parent limit.
@@ -27,15 +32,62 @@ impl MemoryBudget {
     /// Opens a child with its own byte ceiling and the parent's existing admission limits.
     /// The effective ceiling cannot exceed this budget's byte limit.
     pub fn scope_with_limit(self: &Arc<Self>, limit_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes: limit_bytes.min(self.limit_bytes), used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)) })
+        Arc::new(Self { limit_bytes: limit_bytes.min(self.limit_bytes), used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)), quantized: None })
+    }
+
+    /// A child that admits its reservations against this budget a `quantum` of bytes at a time, so that its many small
+    /// reservations touch this budget, and the ancestors it shares with other children, only once per quantum.
+    /// This budget sees whole quanta: up to two quanta more than the child uses, which it returns as it frees them.
+    pub fn quantized(self: &Arc<Self>, quantum: usize) -> Arc<Self> {
+        Arc::new(Self { limit_bytes: self.limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)),
+            quantized: Some(Quantized { quantum: quantum.max(1), granted: std::sync::Mutex::new(0) }) })
     }
 
     /// Reserves bytes without waiting; release occurs when the last reservation handle drops.
     /// Exceeding this budget or an ancestor limit, including size overflow, returns an error.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
-        let parent = self.parent.as_ref().map(|parent| parent.reserve(bytes)).transpose()?;
-        self.acquire(bytes)?;
-        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, parent }))
+        self.acquire_chain(bytes)?;
+        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes }))
+    }
+
+    /// Admits bytes at the root first and at this budget last, releasing the ancestors' admission if this one refuses.
+    fn acquire_chain(&self, bytes: usize) -> Result<()> {
+        if let (Some(quantized), Some(parent)) = (&self.quantized, &self.parent) {
+            let mut granted = quantized.granted.lock().map_err(|_| Anomaly::fault("rtdb/memory-budget-poisoned", "A quantized budget's grant is poisoned"))?;
+            self.acquire(bytes)?;
+            let used = self.used_bytes.load(Ordering::Acquire);
+            if used > *granted {
+                let quanta = (used - *granted).div_ceil(quantized.quantum);
+                let more = quanta.checked_mul(quantized.quantum).ok_or_else(|| Anomaly::incorrect("rtdb/allocation-overflow", "Quantized grant exceeds range"))?;
+                if let Err(error) = parent.acquire_chain(more) {
+                    self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    return Err(error);
+                }
+                *granted += more;
+            }
+            return Ok(());
+        }
+        if let Some(parent) = &self.parent { parent.acquire_chain(bytes)?; }
+        if let Err(error) = self.acquire(bytes) {
+            if let Some(parent) = &self.parent { parent.release_chain(bytes); }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn release_chain(&self, bytes: usize) {
+        if let (Some(quantized), Some(parent)) = (&self.quantized, &self.parent) {
+            let Ok(mut granted) = quantized.granted.lock() else { self.used_bytes.fetch_sub(bytes, Ordering::AcqRel); return };
+            let used = self.used_bytes.fetch_sub(bytes, Ordering::AcqRel) - bytes;
+            let keep = used.div_ceil(quantized.quantum).saturating_add(1).saturating_mul(quantized.quantum);
+            if *granted > keep.saturating_add(quantized.quantum) {
+                parent.release_chain(*granted - keep);
+                *granted = keep;
+            }
+            return;
+        }
+        self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        if let Some(parent) = &self.parent { parent.release_chain(bytes); }
     }
 
     /// Counts the reservation controls created by a successful `reserve`, including this budget and every ancestor.
@@ -72,12 +124,20 @@ impl MemoryBudget {
     pub fn limit_bytes(&self) -> usize { self.limit_bytes }
 }
 
-/// Retained byte charge keeping its budget and ancestor leases alive.
+impl Drop for MemoryBudget {
+    fn drop(&mut self) {
+        if let (Some(quantized), Some(parent)) = (&mut self.quantized, &self.parent) {
+            let granted = quantized.granted.get_mut().map(|granted| std::mem::take(granted)).unwrap_or(0);
+            if granted > 0 { parent.release_chain(granted); }
+        }
+    }
+}
+
+/// Retained byte charge on its budget and every ancestor, keeping the budget chain alive.
 #[derive(Debug)]
 pub struct MemoryReservation {
     budget: Arc<MemoryBudget>,
     bytes: usize,
-    parent: Option<Arc<MemoryReservation>>,
 }
 
 impl MemoryReservation {
@@ -90,15 +150,7 @@ impl MemoryReservation {
     pub fn grow_to(&mut self, bytes: usize) -> Result<()> {
         let additional = bytes.checked_sub(self.bytes)
             .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-shrink", "Reservation growth requires at least the held bytes"))?;
-        if let Some(parent) = &mut self.parent {
-            Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").grow_to(bytes)?;
-        }
-        if let Err(error) = self.budget.acquire(additional) {
-            if let Some(parent) = &mut self.parent {
-                Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").release_to(self.bytes);
-            }
-            return Err(error);
-        }
+        self.budget.acquire_chain(additional)?;
         self.bytes = bytes;
         Ok(())
     }
@@ -115,13 +167,12 @@ impl MemoryReservation {
     }
 
     fn release_to(&mut self, bytes: usize) {
-        if let Some(parent) = &mut self.parent { Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").release_to(bytes); }
         let released = self.bytes - bytes;
         self.bytes = bytes;
-        self.budget.used_bytes.fetch_sub(released, Ordering::AcqRel);
+        self.budget.release_chain(released);
     }
 }
 
 impl Drop for MemoryReservation {
-    fn drop(&mut self) { self.budget.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel); }
+    fn drop(&mut self) { self.budget.release_chain(self.bytes); }
 }

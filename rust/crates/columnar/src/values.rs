@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rtdb_types::StructFields;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, ListArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
@@ -136,7 +136,7 @@ fn covers(plain: &LogicalType, value: &Value) -> bool {
 /// Resolves a struct field's cell in its declared layout.
 /// A missing bottom-typed field returns `Value::Undefined`.
 /// Other missing fields return `Value::Null`.
-pub fn struct_field_cell<'a>(fields: &'a BTreeMap<String, Value>, name: &str, logical: &LogicalType) -> &'a Value {
+pub fn struct_field_cell<'a>(fields: &'a StructFields<Value>, name: &str, logical: &LogicalType) -> &'a Value {
     fields.get(name).unwrap_or(match logical {
         LogicalType::Nothing => &Value::Undefined,
         _ => &Value::Null,
@@ -347,7 +347,7 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
             }
             Value::Map { entries, .. } => for (key, value) in entries {
                 if matches!(key, Value::Null | Value::Undefined) { return Err(Anomaly::incorrect("rtdb/null-map-key", "Arrow map keys cannot be null")); }
-                flat.push(Value::Struct(BTreeMap::from([("key".to_owned(), key.clone()), ("value".to_owned(), value.clone())])));
+                flat.push(Value::Struct(StructFields::from([("key".to_owned(), key.clone()), ("value".to_owned(), value.clone())])));
             },
             _ => if let Some(size) = fixed { flat.extend((0..size).map(|_| Value::Undefined)); },
         }
@@ -489,7 +489,7 @@ fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> 
         LogicalType::Struct(children) => {
             let array = downcast::<StructArray>(array)?;
             let DataType::Struct(fields) = field.data_type() else { return Err(layout_error()); };
-            let mut values = BTreeMap::new();
+            let mut values = StructFields::new();
             for (i, child) in fields.iter().enumerate() {
                 let child_type = children.get(child.name()).ok_or_else(layout_error)?;
                 let value = if matches!(child_type, LogicalType::Nothing) { Value::Undefined }

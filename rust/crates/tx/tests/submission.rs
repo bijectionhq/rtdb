@@ -238,7 +238,7 @@ fn separate_puts_of_heterogeneous_documents_mark_absent_union_columns_nullable()
     shapes.push(vec![("a", Value::Null), ("e", Value::I64(0)), ("b", Value::Null)]);
     let operations = shapes.into_iter().enumerate().map(|(day, fields)| TxOp::PutDocs {
         table: rtdb_types::TableRef::new("public", "docs"),
-        documents: Documents::new(vec![doc(fields)], &memory).unwrap(),
+        documents: Documents::new(vec![doc(fields).into()], &memory).unwrap(),
         valid_from: Some(rtdb_types::Timestamp(1_546_300_800_000_000 + day as i64 * 86_400_000_000)),
         valid_to: None,
     }).collect();

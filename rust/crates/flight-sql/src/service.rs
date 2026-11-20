@@ -72,7 +72,12 @@ impl Service {
     pub fn sweep(&self) { self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.publish(); }
     pub fn close(&self) { self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close(); self.publish(); }
     pub fn publish(&self) {
-        self.0.status.send_modify(|status| { status.sessions = self.0.sessions.len(); status.transactions = self.0.transactions.len(); status.prepared_statements = self.0.prepared.len(); });
+        let counts = (self.0.sessions.len(), self.0.transactions.len(), self.0.prepared.len());
+        self.0.status.send_if_modified(|status| {
+            let changed = (status.sessions, status.transactions, status.prepared_statements) != counts;
+            (status.sessions, status.transactions, status.prepared_statements) = counts;
+            changed
+        });
     }
     pub async fn call<T>(&self, request: &Request<T>, body_bytes: usize) -> Result<Call, Status> {
         if self.0.cancellation.is_cancelled() { return Err(cancelled()); }

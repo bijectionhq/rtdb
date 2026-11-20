@@ -1,8 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc};
+use rtdb_types::StructFields;
+use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::transit::{TransitValue as T, encode_json};
 use rtdb_node::AutonomousTxOptions;
-use rtdb_tx::{Documents, EntityIds, SqlArguments, TxOp, UserMetadata};
+use rtdb_tx::{Documents, SqlArguments, TxOp, UserMetadata};
 use rtdb_types::{Result, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 use crate::statement::SessionHandle;
@@ -46,20 +47,20 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
     let TransactionInput { value, reservation: _reservation } = input;
     let mut request = fields(value)?;
     let asynchronous = match request.remove("asynchronous").unwrap_or(Value::Bool(false)) { Value::Bool(value) => value, _ => return Err(crate::invalid("asynchronous must be boolean")) };
-    let mut options = fields(request.remove("options").unwrap_or_else(|| Value::Struct(BTreeMap::new())))?;
+    let mut options = fields(request.remove("options").unwrap_or_else(|| Value::Struct(StructFields::new())))?;
     let timezone = optional_string(options.remove("default_timezone"))?;
     let database = optional_string(options.remove("database"))?;
     let system_time = optional_time(options.remove("system_time"), timezone.as_deref().unwrap_or("UTC"))?;
     let user_metadata = options.remove("metadata").filter(|value| !matches!(value, Value::Null)).map(|value| UserMetadata::new(value, memory)).transpose()?;
     if !options.is_empty() { return Err(crate::invalid("Unknown transaction option")); }
     let operations = list(request.remove("operations").ok_or_else(|| crate::invalid("operations is required"))?)?;
-    let operations = operations.into_iter().map(|operation| operation_value(operation, memory)).collect::<Result<Vec<_>>>()?;
+    let operations = operations.into_iter().filter_map(|operation| operation_value(operation, memory).transpose()).collect::<Result<Vec<_>>>()?;
     if !request.is_empty() { return Err(crate::invalid("Unknown transaction request field")); }
     session.region.run(async {
         let mut state = session.state.lock();
         let options = AutonomousTxOptions { database, default_timezone: timezone, system_time, user_metadata };
         token.run_until_cancelled(async {
-            let mut values = BTreeMap::new();
+            let mut values = StructFields::new();
             if asynchronous {
                 let submitted = state.state_mut().submit_tx(operations, options).await?;
                 values.insert("tx_id".into(), Value::I64(submitted.tx_id.0));
@@ -75,15 +76,19 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
         }).await.ok_or_else(crate::cancelled)?
     })
 }
-fn operation_value(value: Value, memory: &Arc<MemoryBudget>) -> Result<TxOp> {
+/// Deletes and erases are submitted as SQL DML, as the reference Clojure client submits them over ADBC,
+/// so an empty or inverted valid-time range deletes nothing rather than aborting the transaction.
+fn operation_value(value: Value, memory: &Arc<MemoryBudget>) -> Result<Option<TxOp>> {
     let mut value = fields(value)?;
     let kind = string(value.remove("op").ok_or_else(|| crate::invalid("Transaction operation requires op"))?)?;
     if kind == "sql" {
         let sql = string(value.remove("sql").ok_or_else(|| crate::invalid("SQL operation requires sql"))?)?;
         let arguments = value.remove("arguments").filter(|value| !matches!(value, Value::Null));
-        let args = arguments.map(|value| list(value)?.into_iter().map(list).collect::<Result<Vec<_>>>()).transpose()?.map(|rows| SqlArguments::from_rows(rows, memory)).transpose()?;
+        let rows = arguments.map(|value| list(value)?.into_iter().map(list).collect::<Result<Vec<_>>>()).transpose()?;
         if !value.is_empty() { return Err(crate::invalid("Unknown SQL operation field")); }
-        return Ok(TxOp::Sql { sql, args });
+        if rows.as_ref().is_some_and(Vec::is_empty) { return Ok(None); }
+        let args = rows.map(|rows| SqlArguments::from_rows(rows, memory)).transpose()?;
+        return Ok(Some(TxOp::Sql { sql, args }));
     }
     let schema = optional_string(value.remove("schema"))?.unwrap_or_else(|| "public".into());
     let table = TableRef::new(schema, string(value.remove("table").ok_or_else(|| crate::invalid("Document operation requires table"))?)?);
@@ -96,15 +101,26 @@ fn operation_value(value: Value, memory: &Arc<MemoryBudget>) -> Result<TxOp> {
             if kind == "put-docs" { TxOp::PutDocs { table, documents, valid_from, valid_to } } else { TxOp::PatchDocs { table, documents, valid_from, valid_to } }
         }
         "delete-docs" | "erase-docs" => {
-            let ids = EntityIds::new(list(value.remove("ids").ok_or_else(|| crate::invalid("Document operation requires ids"))?)?.iter().map(Value::entity_id).collect::<Result<_>>()?, memory)?;
-            if kind == "delete-docs" { TxOp::DeleteDocs { table, ids, valid_from, valid_to } } else { TxOp::EraseDocs { table, ids } }
+            let ids = list(value.remove("ids").ok_or_else(|| crate::invalid("Document operation requires ids"))?)?;
+            if !value.is_empty() { return Err(crate::invalid("Unknown document operation field")); }
+            for id in &ids { id.entity_id()?; }
+            if ids.is_empty() { return Ok(None); }
+            let name = format!("{}.{}", quoted(&table.schema), quoted(&table.table));
+            let bounded = valid_from.is_some() || valid_to.is_some();
+            let sql = if kind == "erase-docs" { format!("ERASE FROM {name} WHERE _id = ?") }
+                else if bounded { format!("DELETE FROM {name} FOR VALID_TIME FROM ? TO ? WHERE _id = ?") }
+                else { format!("DELETE FROM {name} WHERE _id = ?") };
+            let time = |time: Option<Timestamp>| time.map_or(Value::Null, |time| Value::Timestamp { value: time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+            let rows = ids.into_iter().map(|id| if bounded && kind == "delete-docs" { vec![time(valid_from), time(valid_to), id] } else { vec![id] }).collect();
+            return Ok(Some(TxOp::Sql { sql, args: Some(SqlArguments::from_rows(rows, memory)?) }));
         }
         _ => return Err(crate::invalid("Unknown transaction operation")),
     };
     if !value.is_empty() { return Err(crate::invalid("Unknown document operation field")); }
-    Ok(operation)
+    Ok(Some(operation))
 }
-fn fields(value: Value) -> Result<BTreeMap<String, Value>> { match value { Value::Struct(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit map")) } }
+fn quoted(identifier: &str) -> String { format!("\"{}\"", identifier.replace('"', "\"\"")) }
+fn fields(value: Value) -> Result<StructFields<Value>> { match value { Value::Struct(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit map")) } }
 fn list(value: Value) -> Result<Vec<Value>> { match value { Value::List(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit array")) } }
 fn string(value: Value) -> Result<String> { match value { Value::Utf8(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit string")) } }
 fn optional_string(value: Option<Value>) -> Result<Option<String>> { value.filter(|value| !matches!(value, Value::Null)).map(string).transpose() }
@@ -120,7 +136,26 @@ fn transaction_input_releases_transit_scratch_before_submission() {
     let input = TransactionInput::decode(&payload, &memory).unwrap();
     assert_eq!(memory.used_bytes(), input.value.retained_bytes().unwrap() + 8192);
     assert!(memory.used_bytes() < memory.peak_bytes());
-    assert_eq!(input.value, Value::Struct(BTreeMap::from([("operations".into(), Value::List(vec![Value::Utf8("SELECT 1".into())]))])));
+    assert_eq!(input.value, Value::Struct(StructFields::from([("operations".into(), Value::List(vec![Value::Utf8("SELECT 1".into())]))])));
     drop(input);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn deletes_and_erases_are_submitted_as_sql_dml() {
+    let memory = MemoryBudget::new(1 << 20);
+    let time = Value::Timestamp { value: 1_000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    let op = |kind: &str, ids: Vec<Value>, bounds: bool| {
+        let mut fields = StructFields::from([("op".into(), Value::Utf8(kind.into())), ("table".into(), Value::Utf8("docs".into())), ("ids".into(), Value::List(ids))]);
+        if bounds { fields.insert("valid_from".into(), time.clone()); }
+        operation_value(Value::Struct(fields), &memory).unwrap()
+    };
+    let Some(TxOp::Sql { sql, args: Some(args) }) = op("delete-docs", vec![Value::I64(1)], true) else { panic!("expected SQL") };
+    assert_eq!(sql, "DELETE FROM \"public\".\"docs\" FOR VALID_TIME FROM ? TO ? WHERE _id = ?");
+    assert_eq!(args.rows().collect::<Vec<_>>(), [&[time.clone(), Value::Null, Value::I64(1)][..]]);
+    let Some(TxOp::Sql { sql, .. }) = op("delete-docs", vec![Value::I64(1)], false) else { panic!("expected SQL") };
+    assert_eq!(sql, "DELETE FROM \"public\".\"docs\" WHERE _id = ?");
+    let Some(TxOp::Sql { sql, .. }) = op("erase-docs", vec![Value::I64(1)], false) else { panic!("expected SQL") };
+    assert_eq!(sql, "ERASE FROM \"public\".\"docs\" WHERE _id = ?");
+    assert!(op("delete-docs", vec![], false).is_none());
 }

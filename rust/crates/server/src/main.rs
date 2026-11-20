@@ -3,7 +3,7 @@ use rtdb_server::{ServerDriver, ServerHandle, cli::{self, Command}};
 use rtdb_types::{Anomaly, Result};
 
 fn main() -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => { eprintln!("{error}"); return ExitCode::FAILURE; }
     };

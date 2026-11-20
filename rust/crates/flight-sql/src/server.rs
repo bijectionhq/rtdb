@@ -40,7 +40,7 @@ impl ServerDriver {
         let listener = self.listener.take().expect("unstarted Flight driver");
         let cancellation = self.service.0.cancellation.clone();
         let incoming_cancel = cancellation.clone();
-        let incoming = TcpListenerStream::new(listener).map(move |result| result.map(|stream| ConnectionIo { stream, cancellation: Box::pin(incoming_cancel.clone().cancelled_owned()) }));
+        let incoming = TcpListenerStream::new(listener).map(move |result| result.and_then(|stream| { stream.set_nodelay(true)?; Ok(ConnectionIo { stream, cancellation: Box::pin(incoming_cancel.clone().cancelled_owned()) }) }));
         let server = FlightServiceServer::new(self.service.clone()).max_decoding_message_size(self.service.0.config.maximum_message_bytes).max_encoding_message_size(self.service.0.config.maximum_message_bytes);
         let serving = tonic::transport::Server::builder().http2_max_header_list_size(8192).add_service(server).serve_with_incoming_shutdown(incoming, cancellation.clone().cancelled_owned());
         tokio::pin!(serving);

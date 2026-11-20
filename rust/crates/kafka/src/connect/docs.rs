@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, sync::Arc};
+use rtdb_types::StructFields;
+use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_columnar::MemoryReservation;
 use rtdb_format::data::{StoredEvent, StoredOperation};
@@ -69,7 +70,7 @@ fn convert_document(value: Value) -> Result<Value> {
     Ok(match value {
         Value::Struct(fields) => Value::Struct(fields.into_iter().map(|(key, value)| Ok((key, convert_document(value)?))).collect::<Result<_>>()?),
         Value::Map { entries, .. } => {
-            let mut fields = BTreeMap::new();
+            let mut fields = StructFields::new();
             for (key, value) in entries { fields.insert(map_key(key)?, convert_document(value)?); }
             Value::Struct(fields)
         }
@@ -101,7 +102,7 @@ fn convert_schema_value(value: Value, schema: Option<&super::ConnectSchema>, dep
     }
     match (value, schema.map(|schema| &schema.kind)) {
         (Value::Struct(mut values), Some(SchemaKind::Struct(fields))) => {
-            let mut result = BTreeMap::new();
+            let mut result = StructFields::new();
             for field in fields {
                 let value = values.remove(&field.name).filter(|value| *value != Value::Null).or_else(|| field.schema.default.clone()).unwrap_or(Value::Null);
                 result.insert(field.name.clone(), convert_schema_value(value, Some(&field.schema), depth + 1)?);
@@ -110,7 +111,7 @@ fn convert_schema_value(value: Value, schema: Option<&super::ConnectSchema>, dep
         }
         (Value::List(values), Some(SchemaKind::Array(element))) => Ok(Value::List(values.into_iter().map(|value| convert_schema_value(value, Some(element), depth + 1)).collect::<Result<_>>()?)),
         (Value::Map { entries, .. }, Some(SchemaKind::Map(_, value_schema))) => {
-            let mut result = BTreeMap::new();
+            let mut result = StructFields::new();
             for (key, value) in entries { result.insert(map_key(key)?, convert_schema_value(value, Some(value_schema), depth + 1)?); }
             Ok(Value::Struct(result))
         }
@@ -142,17 +143,17 @@ mod tests {
     fn record(key: ConnectData, value: Value) -> SinkRecord { SinkRecord::new("events".into(), 0, 2, key, ConnectData::schemaless(value)) }
     #[test]
     fn id_comes_only_from_key_and_single_field_struct_unwraps() {
-        let key = ConnectData { schema: Some(Arc::new(ConnectSchema::new(SchemaKind::Struct(vec![ConnectField { name: "key".into(), schema: Arc::new(ConnectSchema::new(SchemaKind::I64)) }])))), value: Value::Struct(BTreeMap::from([("key".into(), Value::I64(8))])) };
+        let key = ConnectData { schema: Some(Arc::new(ConnectSchema::new(SchemaKind::Struct(vec![ConnectField { name: "key".into(), schema: Arc::new(ConnectSchema::new(SchemaKind::I64)) }])))), value: Value::Struct(StructFields::from([("key".into(), Value::I64(8))])) };
         assert_eq!(resolve_id(&record(key, Value::Null)).unwrap(), Value::I64(8));
-        assert!(resolve_id(&record(ConnectData::schemaless(Value::Struct(BTreeMap::from([("key".into(), Value::I64(8))]))), Value::Null)).unwrap_err().code.ends_with("docs-invalid-key"));
-        assert!(resolve_id(&record(ConnectData::null(), Value::Struct(BTreeMap::from([("_id".into(), Value::I64(8))])))).unwrap_err().code.ends_with("docs-no-key"));
+        assert!(resolve_id(&record(ConnectData::schemaless(Value::Struct(StructFields::from([("key".into(), Value::I64(8))]))), Value::Null)).unwrap_err().code.ends_with("docs-invalid-key"));
+        assert!(resolve_id(&record(ConnectData::null(), Value::Struct(StructFields::from([("_id".into(), Value::I64(8))])))).unwrap_err().code.ends_with("docs-no-key"));
     }
     #[test]
     fn docs_reject_scalar_value_and_accept_tombstones_before_submission() {
         let indexer = DocsIndexer::new(TableRef::parse("events").unwrap());
         assert!(indexer.writer(record(ConnectData::schemaless(Value::I64(8)), Value::I64(9))).is_err());
         assert!(indexer.writer(record(ConnectData::schemaless(Value::I64(8)), Value::Null)).is_ok());
-        assert_eq!(convert_document(Value::Map { entries: vec![(Value::I32(7), Value::Bool(true))], sorted: false }).unwrap(), Value::Struct(BTreeMap::from([("7".into(), Value::Bool(true))])));
+        assert_eq!(convert_document(Value::Map { entries: vec![(Value::I32(7), Value::Bool(true))], sorted: false }).unwrap(), Value::Struct(StructFields::from([("7".into(), Value::Bool(true))])));
     }
     fn logical(name: &str) -> super::super::ConnectSchema {
         let mut schema = super::super::ConnectSchema::new(if name == "Timestamp" { SchemaKind::I64 } else { SchemaKind::I32 });

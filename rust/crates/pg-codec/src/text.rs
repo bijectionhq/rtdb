@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
 use crate::interval::parse as interval;
@@ -113,7 +114,7 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
         T::Null => Value::Null, T::Bool(value) => Value::Bool(value), T::Integer(value) => Value::I64(value), T::Float(value) => Value::F64(value), T::String(value) => Value::Utf8(value), T::Keyword(value) => Value::Keyword(rtdb_types::Keyword::from_name(&value)), T::Bytes(value) => Value::Binary(value), T::Array(values) => Value::List(values.into_iter().map(transit).collect::<Result<_>>()?),
         T::Float32(value) => Value::F64(f64::from(value)),
         T::Map(entries) => {
-            let mut fields = BTreeMap::new();
+            let mut fields = StructFields::new();
             for (key, value) in entries { let key = match key { T::String(key) => key, T::Keyword(key) => normalize_keyword(&key), _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-map-key", "Source maps require string or keyword keys")) }; fields.insert(key, transit(value)?); }
             Value::Struct(fields)
         }

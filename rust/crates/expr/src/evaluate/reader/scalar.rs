@@ -39,6 +39,12 @@ fn retained_type(ty: &LogicalType,frame: &EvaluationFrame<'_>) -> Result<Logical
     Ok(ty.unencoded())
 }
 pub(super) fn emitted_type(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalType> {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || match frame.replacements {
+        Some(invocation) => invocation.emitted_type(expr,|| emitted_type_at(expr,frame)),
+        None => emitted_type_at(expr,frame),
+    })
+}
+fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalType> {
     let child = |expr: &Expr| emitted_type(expr,frame);
     Ok(match expr {
         Expr::Literal(value) => { frame.context.reserve(value_type_bound(value)?.checked_mul(8).ok_or_else(overflow)?)?;value.logical_type() }
@@ -264,9 +270,11 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 if pattern.is_null() { return nil(frame); }
                 deferred(ty,async move {
                     let pattern = pattern.demand().await?;
-                    let pattern = crate::string::pattern::compile_like(scalar_ref(&pattern)?,*escape,*case_insensitive,frame.context)?;
+                    let scratch = frame.context.allocation.map(crate::EvaluationScope::scratch);
+                    let context = crate::EvalContext { allocation: scratch.as_ref().or(frame.context.allocation), ..*frame.context };
+                    let pattern = crate::string::pattern::compile_like(scalar_ref(&pattern)?,*escape,*case_insensitive,&context)?;
                     let input = input.demand().await?;
-                    pattern.search(scalar_ref(&input)?,*negated,frame.context).map(scalar)
+                    pattern.search(scalar_ref(&input)?,*negated,&context).map(scalar)
                 },frame)
             }
             Expr::Literal(_) | Expr::DurationLiteral(_) | Expr::In {..} => deferred(ty,async move { evaluate(expr,frame)?.await },frame),
@@ -411,9 +419,11 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
             let input = arguments.pop().ok_or_else(||invalid(&name))?;
             return deferred(ty,async move {
                 let pattern = pattern.demand().await?;
-                let pattern = crate::string::pattern::compile_like(scalar_ref(&pattern)?,None,name == "ilike",frame.context)?;
+                let scratch = frame.context.allocation.map(crate::EvaluationScope::scratch);
+                let context = crate::EvalContext { allocation: scratch.as_ref().or(frame.context.allocation), ..*frame.context };
+                let pattern = crate::string::pattern::compile_like(scalar_ref(&pattern)?,None,name == "ilike",&context)?;
                 let input = input.demand().await?;
-                pattern.search(scalar_ref(&input)?,false,frame.context).map(scalar)
+                pattern.search(scalar_ref(&input)?,false,&context).map(scalar)
             },frame);
         }
         if matches!(name.as_str(),"array_lower" | "array_upper" | "array_length") {

@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use super::super::{AvroOutput, SchemaKind};
 use rtdb_columnar::MemoryBudget;
@@ -125,7 +126,7 @@ fn logical_metadata_is_applied_after_physical_reader_resolution() {
     let raw = writer.decode_datum(&[2], &mut context).unwrap(); assert_eq!(raw.value, record(&[("x", Avro::Int(1))]));
     let value = AvroResolution::compile(&writer, &reader, &mut context).unwrap().resolve(raw, &mut context).unwrap();
     let output = reader.connect_plan(None, Some(4), &mut 0, &mut context).unwrap();
-    assert_eq!(output.convert(value, &mut 0, &mut context).unwrap().value, Value::Struct(BTreeMap::from([("x".into(), Value::I64(1))])));
+    assert_eq!(output.convert(value, &mut 0, &mut context).unwrap().value, Value::Struct(StructFields::from([("x".into(), Value::I64(1))])));
 }
 
 #[test]
@@ -134,7 +135,7 @@ fn writer_fields_with_no_connect_mapping_can_be_projected_away() {
     let reader = plan(r#"{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}"#);
     let mut context = context(); let value = writer.decode_datum(&[2], &mut context).unwrap();
     let value = AvroResolution::compile(&writer, &reader, &mut context).unwrap().resolve(value, &mut context).unwrap();
-    assert_eq!(reader.connect_plan(None, None, &mut 0, &mut context).unwrap().convert(value, &mut 0, &mut context).unwrap().value, Value::Struct(BTreeMap::from([("x".into(), Value::I32(1))])));
+    assert_eq!(reader.connect_plan(None, None, &mut 0, &mut context).unwrap().convert(value, &mut 0, &mut context).unwrap().value, Value::Struct(StructFields::from([("x".into(), Value::I32(1))])));
 }
 
 #[test]

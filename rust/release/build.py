@@ -236,8 +236,11 @@ def build(args):
                 metadata.update(capabilities=jvm["capabilities"], gradle_task=jvm["gradle_task"], docker_variant=jvm["docker_variant"])
             write_json(source_directory / "release-input.json", metadata)
             image_file = output / "image.id"
+            # The build's own tag names the loaded image on either image store; with the containerd store the
+            # inspectable image ID is the manifest digest, not the config digest --iidfile records.
+            tag = "rtdb-release-build:" + uuid.uuid4().hex
             command = ["docker", "buildx", "build", "--load", "--provenance=false", "--platform", args.platform,
-                       "--iidfile", str(image_file), "--build-arg", "SOURCE_DATE_EPOCH=" + epoch]
+                       "--iidfile", str(image_file), "--tag", tag, "--build-arg", "SOURCE_DATE_EPOCH=" + epoch]
             if args.engine == "rust":
                 command += ["--file", str(source_directory / "rust/release/Dockerfile"),
                             "--build-arg", "RUST_IMAGE=" + args.builder_image, "--build-arg", "RUNTIME_IMAGE=" + args.runtime_image,
@@ -261,10 +264,10 @@ def build(args):
                             "--build-arg", "XTDB_VERSION=" + version]
             command.append(str(source_directory))
             commands.run("server-image-build", command)
-            identifier = image_file.read_text().strip()
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", identifier):
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_file.read_text().strip()):
                 raise ValueError("image build did not emit one immutable image ID")
-            image = image_record(commands, identifier, "server")
+            image = image_record(commands, tag, "server")
+            identifier = image["Id"]
             expected_arch = args.platform.split("/")[1]
             if image["Os"] != "linux" or image["Architecture"] != expected_arch:
                 raise ValueError("packaged image architecture differs from requested platform")

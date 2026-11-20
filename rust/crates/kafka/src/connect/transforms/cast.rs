@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
 use base64::Engine;
 use rtdb_types::{Result, Value};
@@ -76,7 +77,7 @@ impl Transform for Cast {
                 let SchemaKind::Struct(fields) = &schema.kind else { return Err(error("transform-error", "Field Cast requires a Struct")); };
                 let Some((output, _)) = &cached else { unreachable!() };
                 let SchemaKind::Struct(output_fields) = &output.kind else { unreachable!() };
-                let mut result = BTreeMap::new();
+                let mut result = StructFields::new();
                 for (field, output_field) in fields.iter().zip(output_fields) {
                     let value = values.remove(&field.name).unwrap_or(Value::Null);
                     let value = match self.fields.get(&field.name) { Some(target) => cast_with_schema(&value, Some(&field.schema), *target, &self.environment)?, None => value };

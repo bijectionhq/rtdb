@@ -124,6 +124,7 @@ async fn array_query_requires_one_column_and_a_subquery_scope() {
     for (source, message) in [
         ("SELECT ARRAY(SELECT 1, 2)", "Subquery arity error: expected a single column, got 2"),
         ("SELECT 1 WHERE 1 IN (ARRAY(SELECT 1))", "Subqueries are not allowed in this context"),
+        ("SELECT 1 WHERE 1 IN ((SELECT 1), 1)", "Subqueries are not allowed in this context"),
     ] {
         let error = query(source, vec![]).await.unwrap_err();
         assert_eq!(error.message.as_deref(), Some(message), "{source}");

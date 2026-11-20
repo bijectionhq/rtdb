@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use crate::{ColumnId, Expr};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TableRef, TimeUnit};
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ pub struct QualifiedTable { pub database: String, pub table: TableRef }
 pub struct TableBinding {
     pub name: QualifiedTable,
     pub oid: Option<i32>,
-    pub columns: BTreeMap<String, LogicalType>,
+    pub columns: StructFields<LogicalType>,
 }
 
 impl TableBinding {
@@ -205,4 +206,67 @@ impl Binder {
         Expr::Parameter { index, data_type }
     }
     pub fn parameter_types(&self) -> &BTreeMap<usize, LogicalType> { &self.parameter_types }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Lookup {
+    DefaultDatabase(String),
+    Databases(BTreeSet<String>),
+    Table(QualifiedTable, Option<TableBinding>),
+    Tables(String, Vec<TableBinding>),
+    TransactionScoped(bool),
+}
+
+/// What a planning read from its catalog: a later catalog that answers each lookup the same plans the statement the same way.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogLookups(Vec<Lookup>);
+impl CatalogLookups {
+    pub fn replay(&self, catalog: &dyn Catalog) -> Result<bool> {
+        for lookup in &self.0 {
+            let same = match lookup {
+                Lookup::DefaultDatabase(database) => catalog.default_database() == database,
+                Lookup::Databases(databases) => catalog.databases() == *databases,
+                Lookup::Table(name, binding) => catalog.table(name)? == *binding,
+                Lookup::Tables(database, tables) => catalog.tables(database)? == *tables,
+                Lookup::TransactionScoped(scoped) => catalog.transaction_scoped() == *scoped,
+            };
+            if !same { return Ok(false); }
+        }
+        Ok(true)
+    }
+}
+
+/// A catalog that records each answer it gives; a lookup that fails leaves nothing to replay, so `finish` returns none.
+pub struct RecordingCatalog<'a> { catalog: &'a dyn Catalog, lookups: std::cell::RefCell<Option<Vec<Lookup>>> }
+impl<'a> RecordingCatalog<'a> {
+    pub fn new(catalog: &'a dyn Catalog) -> Self { Self { catalog, lookups: std::cell::RefCell::new(Some(Vec::new())) } }
+    pub fn finish(self) -> Option<CatalogLookups> { self.lookups.into_inner().map(CatalogLookups) }
+    fn record(&self, lookup: Lookup) { if let Some(lookups) = self.lookups.borrow_mut().as_mut() { lookups.push(lookup); } }
+    fn recorded<T>(&self, answer: Result<T>, lookup: impl FnOnce(&T) -> Lookup) -> Result<T> {
+        match &answer { Ok(value) => self.record(lookup(value)), Err(_) => *self.lookups.borrow_mut() = None }
+        answer
+    }
+}
+impl Catalog for RecordingCatalog<'_> {
+    fn default_database(&self) -> &str {
+        let database = self.catalog.default_database();
+        self.record(Lookup::DefaultDatabase(database.to_owned()));
+        database
+    }
+    fn databases(&self) -> BTreeSet<String> {
+        let databases = self.catalog.databases();
+        self.record(Lookup::Databases(databases.clone()));
+        databases
+    }
+    fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> {
+        self.recorded(self.catalog.table(name), |binding| Lookup::Table(name.clone(), binding.clone()))
+    }
+    fn tables(&self, database: &str) -> Result<Vec<TableBinding>> {
+        self.recorded(self.catalog.tables(database), |tables| Lookup::Tables(database.to_owned(), tables.clone()))
+    }
+    fn transaction_scoped(&self) -> bool {
+        let scoped = self.catalog.transaction_scoped();
+        self.record(Lookup::TransactionScoped(scoped));
+        scoped
+    }
 }

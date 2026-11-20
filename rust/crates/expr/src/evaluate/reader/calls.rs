@@ -45,7 +45,10 @@ pub(super) fn binary_values<'a>(op: BinaryOp,left: EvalValue<'a>,right: EvalValu
                 let order = compare::order(left,right,frame)?.await?;
                 Ok(scalar(Value::Bool(match op { B::Lt => order == Ordering::Less,B::LtEq => order != Ordering::Greater,B::Gt => order == Ordering::Greater,_ => order != Ordering::Less })))
             }
-            B::Concat if matches!((&left,&right),(EvalValue::List(Kind::List,_),EvalValue::List(Kind::List,_))) => make_list(Kind::List,ListReader::Concat(left,right),frame),
+            B::Concat if matches!((&left,&right),(EvalValue::List(Kind::List,_),EvalValue::List(Kind::List,_))) => {
+                let data_type = value_type(&left,frame)?.join(&value_type(&right,frame)?);
+                Err(rtdb_types::Anomaly::incorrect("xtdb.error/illegal-arg", format!("No matching clause: {}", crate::evaluate::vector_type_text(&data_type))))
+            }
             _ => Err(invalid("binary operation")),
         }
     },frame)
@@ -177,7 +180,7 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
         if name == "_patch" {
             let left = values.remove(0);let right = values.remove(0);
             let EvalValue::Struct(right) = right else { return Err(invalid("_patch")); };
-            let mut fields = BTreeMap::new();
+            let mut fields = rtdb_types::StructFields::new();
             if let EvalValue::Struct(left) = &left {
                 for (key,value) in left.iter() {
                     frame.context.reserve(key.len().checked_add(4096).ok_or_else(overflow)?)?;

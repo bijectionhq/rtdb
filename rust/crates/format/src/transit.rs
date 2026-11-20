@@ -626,6 +626,38 @@ fn stringable(value: &TransitValue) -> bool {
     }
 }
 
+/// Where a keyword key falls in a Clojure `PersistentHashMap`'s iteration: its `hasheq` read in 5-bit digits from the least
+/// significant, the trie's branching order. The reference's anomalies hold their data in such a map (`Anomaly.dataFromMap`),
+/// so that order is the order their Transit form writes.
+fn hash_map_position(key: &str) -> [u32; 7] {
+    let hash = clojure_keyword_hash(key) as u32;
+    std::array::from_fn(|digit| (hash >> (5 * digit)) & 31)
+}
+
+/// Clojure's `Keyword.hasheq`: the symbol's `hashCombine` of Murmur3 over the name's UTF-16 units and the namespace's
+/// `String.hashCode`, plus the golden-ratio constant.
+fn clojure_keyword_hash(key: &str) -> i32 {
+    let (namespace, name) = match key.split_once('/') { Some((namespace, name)) if !namespace.is_empty() && !name.is_empty() => (Some(namespace), name), _ => (None, key) };
+    let namespace_hash = namespace.map_or(0i32, |namespace| namespace.encode_utf16().fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(i32::from(unit))));
+    let seed = murmur3_unencoded_chars(name);
+    let symbol = seed ^ namespace_hash.wrapping_add(0x9e37_79b9_u32 as i32).wrapping_add(seed << 6).wrapping_add(seed >> 2);
+    symbol.wrapping_add(0x9e37_79b9_u32 as i32)
+}
+
+fn murmur3_unencoded_chars(text: &str) -> i32 {
+    let mix_k1 = |k: u32| k.wrapping_mul(0xcc9e_2d51).rotate_left(15).wrapping_mul(0x1b87_3593);
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut h1 = 0u32;
+    for pair in units.chunks_exact(2) {
+        h1 ^= mix_k1(u32::from(pair[0]) | (u32::from(pair[1]) << 16));
+        h1 = h1.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
+    }
+    if let [.., last] = units.as_slice() { if units.len() % 2 == 1 { h1 ^= mix_k1(u32::from(*last)); } }
+    h1 ^= (2 * units.len()) as u32;
+    h1 ^= h1 >> 16; h1 = h1.wrapping_mul(0x85eb_ca6b); h1 ^= h1 >> 13; h1 = h1.wrapping_mul(0xc2b2_ae35); h1 ^= h1 >> 16;
+    h1 as i32
+}
+
 pub fn encode_anomaly(error: &Anomaly) -> Result<Vec<u8>> {
     let category = match error.category {
         AnomalyCategory::Incorrect => "incorrect", AnomalyCategory::Unsupported => "unsupported",
@@ -634,7 +666,9 @@ pub fn encode_anomaly(error: &Anomaly) -> Result<Vec<u8>> {
         AnomalyCategory::Unavailable => "unavailable", AnomalyCategory::Interrupted => "interrupted",
         AnomalyCategory::Fault => "fault",
     };
-    let context = error.context.iter().map(|(key, value)| Ok((TransitValue::Keyword(key.clone()), from_json_value(value)?))).collect::<Result<_>>()?;
+    let mut keys: Vec<&String> = error.context.keys().collect();
+    keys.sort_by_key(|key| hash_map_position(key));
+    let context = keys.into_iter().map(|key| Ok((TransitValue::Keyword(key.clone()), from_json_value(&error.context[key])?))).collect::<Result<_>>()?;
     encode_msgpack(&TransitValue::Tagged { tag: "xt/error".into(), representation: Box::new(TransitValue::Array(vec![
         TransitValue::Keyword(category.into()), if error.code.is_empty() { TransitValue::Null } else { TransitValue::Keyword(error.code.clone()) },
         error.message.as_ref().map_or(TransitValue::Null, |message| TransitValue::String(message.clone())), TransitValue::Map(context),

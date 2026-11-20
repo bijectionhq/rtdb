@@ -182,7 +182,9 @@ fn column_rows(tables: &[TableBinding], mut row: impl FnMut(&TableBinding, &str,
             for name in ["_system_from", "_valid_from"] { columns.entry(name.into()).or_insert_with(instant); }
             for name in ["_system_to", "_valid_to"] { columns.entry(name.into()).or_insert_with(|| instant().maybe()); }
         }
-        let ordered = columns.iter().filter(|(name, _)| name.starts_with('_')).chain(columns.iter().filter(|(name, _)| !name.starts_with('_')));
+        let mut sorted: Vec<_> = columns.iter().collect();
+        sorted.sort_by(|left, right| left.0.cmp(right.0));
+        let ordered = sorted.iter().copied().filter(|(name, _)| name.starts_with('_')).chain(sorted.iter().copied().filter(|(name, _)| !name.starts_with('_')));
         for (index, (name, ty)) in ordered.enumerate() { rows.push(row(table, name, ty, i32::try_from(index + 1).map_err(|_| size_error())?)?); }
     }
     Ok(rows)

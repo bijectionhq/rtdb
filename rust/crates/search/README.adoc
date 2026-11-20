@@ -12,8 +12,9 @@ The node configuration's `search: {enabled, threads}` switches the lane and the 
 == Pieces
 
 `file`::
-A search file: one single-segment tantivy index over one data file, bundled into one object with names derived from the job, so every builder writes identical bytes.
-Documents are the data file's rows, in order, carrying each row's own IID and temporal columns as fast fields.
+A search file holds one Tantivy segment for a trie or an eligible partition group.
+Each document covers an entity's text run in one column and records its bitemporal visibility.
+The sidecar maps documents and row positions to the group's members.
 
 `definitions`::
 Reads the definitions in force from `xt.search_indexes` at a snapshot.
@@ -22,7 +23,8 @@ Reads the definitions in force from `xt.search_indexes` at a snapshot.
 The `search` artefact kind: a builder per database that the core artefact lane drives.
 
 `accelerate`::
-The scan accelerator: candidate IIDs from search files, data files and live segments, ruled out only by each event's own intervals, and the corpus sources `SEARCH_SCORE` sums.
+The scan accelerator narrows candidate IIDs, accounts for events in other sources and supplies indexed `MATCH` answers.
+The query's `SEARCH_SCORE` corpus comes from the rows visible at its snapshot.
 
 == Ownership
 

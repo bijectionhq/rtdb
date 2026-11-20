@@ -6,9 +6,18 @@ mod host;
 struct Replacement<'a> { expression: &'a Expr,compiled: CompiledReplacement }
 struct PendingBinding<'a> { expression: &'a Expr,recipe: &'a rtdb_plan::RegexReplacement,program: host::Program<'a> }
 
-pub(super) struct Replacements<'a> { entries: Vec<Replacement<'a>> }
+pub(super) struct Replacements<'a> { entries: Vec<Replacement<'a>>, types: std::sync::Mutex<std::collections::HashMap<usize,LogicalType>> }
 
 impl Replacements<'_> {
+    /// An emitted type depends on the invocation's fixed schema and parameter types, never on a row, so each subexpression's is derived once.
+    pub(super) fn emitted_type(&self,expression: &Expr,derive: impl FnOnce() -> Result<LogicalType>) -> Result<LogicalType> {
+        let address = expression as *const Expr as usize;
+        if let Some(ty) = self.types.lock().map_err(|_|Anomaly::fault("rtdb.expr/type-cache","Expression type cache was poisoned"))?.get(&address) { return Ok(ty.clone()); }
+        let ty = derive()?;
+        self.types.lock().map_err(|_|Anomaly::fault("rtdb.expr/type-cache","Expression type cache was poisoned"))?.insert(address,ty.clone());
+        Ok(ty)
+    }
+
     pub(super) fn get(&self,expression: &Expr) -> Result<&CompiledReplacement> {
         let address = expression as *const Expr as usize;
         self.entries.binary_search_by_key(&address,|entry|entry.expression as *const Expr as usize)
@@ -35,7 +44,7 @@ impl<'expr> ExpressionInvocation<'expr> {
         let mut pending = Vec::new();
         prepare(expression,schema,context,&mut pending)?;
         context.reserve(pending.len().checked_mul(std::mem::size_of::<Replacement<'_>>()).ok_or_else(overflow)?)?;
-        let mut replacements = Replacements { entries: Vec::with_capacity(pending.len()) };
+        let mut replacements = Replacements { entries: Vec::with_capacity(pending.len()), types: Default::default() };
         for PendingBinding { expression,recipe,program } in pending {
             let pattern = program.pattern(context)?;
             let compiled = compile_replacement_pattern(pattern.view(),recipe.replacement_text()?,&recipe.flag_text()?,context)?;

@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use arrow_array::Array;
 use async_trait::async_trait;
 use rtdb_expr::{cast, compare_in_timezone, is_true, number, sql_eq_in_timezone};
 use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileFraction, PercentileKind, Schema};
@@ -10,9 +11,46 @@ use crate::context::Execution;
 use crate::cursor::{BoxCursor, OwnedRow, RowCursor};
 use crate::operators::rows_equal;
 use crate::pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor};
-use crate::spill::{SpillReader, SpillWriter};
 use crate::runtime_schema::{EmissionMode, EmittedRelation};
 use crate::{invalid, sort::SortCursor};
+
+/// The rows an aggregate reads: a page, or the cells of the positions it reads, taken column by column from a batch.
+#[derive(Clone, Copy)]
+enum Rows<'a> { Page(&'a OwnedPage), Columns(&'a ColumnValues) }
+/// One materialised column per input position an aggregate reads; positions it doesn't read are absent.
+struct ColumnValues { columns: Vec<Option<Vec<Value>>>, len: usize, _reservation: Arc<rtdb_columnar::MemoryReservation> }
+static NULL: Value = Value::Null;
+impl<'a> Rows<'a> {
+    fn len(&self) -> usize { match self { Self::Page(page) => page.len(), Self::Columns(columns) => columns.len } }
+    fn value(&self, row: usize, position: Option<usize>) -> &'a Value {
+        let Some(position) = position else { return &NULL };
+        match self {
+            Self::Page(page) => &page.rows()[row].values[position],
+            Self::Columns(columns) => columns.columns.get(position).and_then(Option::as_ref).map_or(&NULL, |column| &column[row]),
+        }
+    }
+    fn page(&self) -> Result<&'a OwnedPage> { match self { Self::Page(page) => Ok(page), Self::Columns(_) => Err(invalid("aggregate-input", "This aggregate reads whole rows")) } }
+}
+impl ColumnValues {
+    fn new(batch: &crate::columnar::ColumnBatch, positions: &[usize], admit_dates: bool, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<Self> {
+        let mut bytes = 256usize;
+        for &position in positions { for row in 0..batch.len { bytes = bytes.checked_add(batch.columns[position].bound(row)?).ok_or_else(||invalid("aggregate-size","Aggregate input exceeds addressable memory"))?; } }
+        let reservation = memory.reserve(bytes)?;
+        let mut columns: Vec<Option<Vec<Value>>> = (0..batch.columns.len()).map(|_| None).collect();
+        for &position in positions {
+            if columns[position].is_some() { continue; }
+            columns[position] = Some((0..batch.len).map(|row| {
+                let mut value = batch.columns[position].value(row)?;
+                if admit_dates { value.admit_expression_dates()?; }
+                Ok(value)
+            }).collect::<Result<_>>()?);
+        }
+        Ok(Self { columns, len: batch.len, _reservation: reservation })
+    }
+}
+
+/// Where an aggregate's input comes from; batches skip materialising rows when every aggregate reads only its argument.
+enum AggregateInput { Pages(BoxPageCursor), Batches { batches: crate::columnar::BoxBatchCursor, projected: bool } }
 
 pub(crate) struct AggregateTypes { input: LogicalType, declared_output: LogicalType, output: LogicalType }
 
@@ -72,11 +110,18 @@ impl AggregateTypes {
 }
 
 pub(crate) struct AggregateCursor {
-    input: Option<BoxPageCursor>, schema: Schema, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>,
+    input: Option<AggregateInput>, schema: Schema, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>,
     runtime: Arc<EmittedRelation>, execution: Execution,
 }
 impl AggregateCursor {
-    pub fn new(input: BoxPageCursor, schema: Schema, groups: Vec<NamedExpr>, mut aggregates: Vec<AggregateExpr>, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
+    pub fn new(input: BoxPageCursor, schema: Schema, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
+        Self::with_input(AggregateInput::Pages(input), schema, groups, aggregates, runtime, execution)
+    }
+    /// `projected` when the batches passed through a column projection, which admits each cell's dates as it copies it.
+    pub fn from_batches(input: crate::columnar::BoxBatchCursor, projected: bool, schema: Schema, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
+        Self::with_input(AggregateInput::Batches { batches: input, projected }, schema, groups, aggregates, runtime, execution)
+    }
+    fn with_input(input: AggregateInput, schema: Schema, groups: Vec<NamedExpr>, mut aggregates: Vec<AggregateExpr>, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
         if runtime.aggregates()?.len() != aggregates.len() { return Err(invalid("runtime-plan", "Aggregate factories disagree with their expressions")); }
         for aggregate in &mut aggregates {
             aggregate.function = aggregate.function.canonical();
@@ -96,28 +141,85 @@ impl AggregateCursor {
         }
         Ok(Self { input: Some(input), schema, groups, aggregates, runtime, execution })
     }
+    fn column_positions(&self) -> Option<Vec<usize>> { Self::reads_columns(&self.schema, &self.groups, &self.aggregates) }
+    /// The input positions every aggregate and group reads, when each reads only its argument or key column.
+    pub fn reads_columns(schema: &Schema, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Option<Vec<usize>> {
+        let mut positions = Vec::new();
+        for group in groups {
+            let rtdb_plan::Expr::Column { id, .. } = &group.expr else { return None };
+            positions.push(schema.position(*id)?);
+        }
+        for aggregate in aggregates {
+            if aggregate.filter.is_some() || aggregate.distinct || !aggregate.order_by.is_empty() { return None; }
+            if matches!(aggregate.function.canonical(), AggregateFunction::ArrayAgg | AggregateFunction::VecAgg | AggregateFunction::Percentile { .. }) { return None; }
+            if let Some(argument) = &aggregate.argument { positions.push(argument_position(argument, schema).ok()?); }
+        }
+        Some(positions)
+    }
 
-    async fn aggregate(&mut self, mut input: BoxPageCursor) -> Result<Option<OwnedPage>> {
+    async fn aggregate(&mut self, mut input: AggregateInput) -> Result<Option<OwnedPage>> {
         let memory = &self.execution.context.memory;
-        let mut keys = GroupKeys::new(self.groups.is_empty(),&self.execution)?;
+        let mut keys = GroupKeys::new(self.groups.is_empty())?;
         let _columns = memory.reserve(self.aggregates.len().checked_mul(std::mem::size_of::<AggregateColumn>()).ok_or_else(||invalid("aggregate-size","Aggregate column container overflow"))?)?;
         let mut columns = self.aggregates.iter().map(|aggregate|AggregateColumn::new(aggregate,&self.execution)).collect::<Result<Vec<_>>>()?;
-        while let Some(page) = input.next_page().await? {
+        let positions = self.column_positions();
+        let mut typed_groups = TypedGroups::default();
+        loop {
+            let (page, values);
+            let rows = match &mut input {
+                AggregateInput::Pages(pages) => { let Some(next) = pages.next_page().await? else { break }; page = next; Rows::Page(&page) }
+                AggregateInput::Batches { batches, projected } => {
+                    let Some(batch) = batches.next_batch().await? else { break };
+                    if let Some(positions) = &positions && self.typed_batch(&batch,positions,&mut keys,&mut columns,&mut typed_groups)? { continue; }
+                    match &positions {
+                        Some(positions) => { values = ColumnValues::new(&batch, positions, *projected, memory)?; Rows::Columns(&values) }
+                        None => return Err(invalid("aggregate-input", "A batch input reached an aggregate that reads whole rows")),
+                    }
+                }
+            };
             self.execution.context.check_cancelled()?;
             let scope = self.execution.scope()?;
-            let projected = crate::pages::project(&page,&self.schema,self.groups.iter().map(|group|&group.expr),&self.execution).await?;
-            for field in &self.runtime.schema().fields()[..self.groups.len()] { rtdb_plan::validate_equality_types(&field.data_type,&field.data_type)?; }
-            scope.reserve(page.len().checked_mul(std::mem::size_of::<usize>()).ok_or_else(||invalid("aggregate-size","Group mapping overflow"))?)?;
-            let mut mapping = Vec::with_capacity(page.len());
-            for key in projected.rows() { mapping.push(keys.insert(&key.values,&self.execution)?); }
+            scope.reserve(rows.len().checked_mul(std::mem::size_of::<usize>()).ok_or_else(||invalid("aggregate-size","Group mapping overflow"))?)?;
+            let mapping = if self.groups.is_empty() { vec![0; rows.len()] } else {
+                for field in &self.runtime.schema().fields()[..self.groups.len()] { rtdb_plan::validate_equality_types(&field.data_type,&field.data_type)?; }
+                let mut mapping = Vec::with_capacity(rows.len());
+                match rows {
+                    Rows::Page(page) => {
+                        let projected = crate::pages::project(page,&self.schema,self.groups.iter().map(|group|&group.expr),&self.execution).await?;
+                        for key in projected.rows() { mapping.push(keys.insert(&key.values,&self.execution)?); }
+                    }
+                    Rows::Columns(_) => {
+                        let key_positions = &positions.as_ref().expect("column rows have positions")[..self.groups.len()];
+                        let mut key = Vec::with_capacity(key_positions.len());
+                        for row in 0..rows.len() {
+                            // A single key cell that admitting would leave as it is groups in place, without a copy.
+                            if let [position] = key_positions {
+                                let value = rows.value(row, Some(*position));
+                                if !matches!(value, Value::Date(_) | Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Struct(_) | Value::Map { .. }) {
+                                    mapping.push(keys.insert(std::slice::from_ref(value),&self.execution)?);
+                                    continue;
+                                }
+                            }
+                            key.clear();
+                            for position in key_positions {
+                                let mut value = rows.value(row, Some(*position)).clone();
+                                value.admit_expression_dates()?;
+                                key.push(value);
+                            }
+                            mapping.push(keys.insert(&key,&self.execution)?);
+                        }
+                    }
+                }
+                mapping
+            };
             for ((column,aggregate),types) in columns.iter_mut().zip(&self.aggregates).zip(self.runtime.aggregates()?) {
-                column.aggregate(&page,&mapping,keys.count,aggregate,types,&self.schema,&self.execution).await?;
+                column.aggregate(rows,&mapping,keys.count,aggregate,types,&self.schema,&self.execution).await?;
             }
         }
         let mut output = PageBuilder::new(keys.count,memory)?;
-        let mut reader = keys.rows.reader(Arc::clone(memory))?;
-        while let Some(key) = reader.next()? {
-            self.execution.context.check_cancelled()?;
+        if keys.global { output.push(OwnedRow::copy_parts(&[],0,self.aggregates.len(),memory)?)?; }
+        for (index,key) in keys.keys.iter().enumerate() {
+            self.execution.context.check_cancelled_at(index)?;
             output.push(OwnedRow::copy_parts(&[&key.values[2..]],0,self.aggregates.len(),memory)?)?;
         }
         for (index,((column,aggregate),types)) in columns.into_iter().zip(&self.aggregates).zip(self.runtime.aggregates()?).enumerate() {
@@ -135,34 +237,160 @@ impl PageCursor for AggregateCursor {
     }
 }
 
-struct GroupKeys { rows: SpillWriter, count: usize, global: bool }
+/// Group ids already found for a single integer or string key, by the key read straight from its array.
+/// A key absent here is found through `GroupKeys` and remembered, so the groups and their first-seen keys are its.
+#[derive(Default)]
+struct TypedGroups { ints: std::collections::HashMap<i64, usize>, strings: std::collections::HashMap<String, usize>, null: Option<usize> }
+
+/// A batch column an aggregate reads straight from its array.
+enum TypedColumn<'a> { Int(Vec<Option<i64>>), Utf8(&'a arrow_array::StringArray) }
+impl<'a> TypedColumn<'a> {
+    fn of(column: &'a crate::columnar::Column) -> Option<Self> {
+        let crate::columnar::Column::Arrow { array, field, .. } = column else { return None };
+        if !field.metadata().is_empty() { return None; }
+        if let Some(strings) = array.as_any().downcast_ref::<arrow_array::StringArray>() { return Some(Self::Utf8(strings)); }
+        crate::batch_join::int_cells(array.as_ref()).map(Self::Int)
+    }
+}
+
+/// A plain float column, or a plain column whose nulls the array marks, as typed aggregates read them.
+fn float_column(column: &crate::columnar::Column) -> Option<&arrow_array::Float64Array> {
+    let crate::columnar::Column::Arrow { array, field, .. } = column else { return None };
+    if !field.metadata().is_empty() { return None; }
+    array.as_any().downcast_ref::<arrow_array::Float64Array>()
+}
+fn marked_nulls(column: &crate::columnar::Column) -> Option<&dyn arrow_array::Array> {
+    let crate::columnar::Column::Arrow { array, field, .. } = column else { return None };
+    (field.metadata().is_empty() && !matches!(array.data_type(), arrow_schema::DataType::Union(..) | arrow_schema::DataType::Null)).then_some(array.as_ref())
+}
+
+impl AggregateCursor {
+    /// Aggregates a batch straight from its arrays where its single group key is an integer or string column and every
+    /// aggregate is a count or a float sum or average; otherwise leaves the batch for the value path and returns false.
+    fn typed_batch(&self,batch: &crate::columnar::ColumnBatch,positions: &[usize],keys: &mut GroupKeys,columns: &mut [AggregateColumn],typed: &mut TypedGroups) -> Result<bool> {
+        use AggregateFunction as A;
+        let key = match self.groups.len() {
+            0 => None,
+            1 => match TypedColumn::of(&batch.columns[positions[0]]) { Some(column) => Some(column), None => return Ok(false) },
+            _ => return Ok(false),
+        };
+        let types = self.runtime.aggregates()?;
+        let float = LogicalType::Scalar(ScalarType::F64);
+        for (aggregate,types) in self.aggregates.iter().zip(types) {
+            let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,&self.schema)).transpose()?;
+            let fits = match (&aggregate.function,argument) {
+                (A::CountStar,_) => true,
+                (A::Count,Some(position)) => marked_nulls(&batch.columns[position]).is_some(),
+                (A::Sum | A::Average,Some(position)) => float_column(&batch.columns[position]).is_some()
+                    && without_nullability(&types.input) == &float && without_nullability(types.output_type()) == &float,
+                _ => false,
+            };
+            if !fits { return Ok(false); }
+        }
+        let memory = &self.execution.context.memory;
+        let mapping = match &key {
+            None => vec![0; batch.len],
+            Some(key) => {
+                for field in &self.runtime.schema().fields()[..1] { rtdb_plan::validate_equality_types(&field.data_type,&field.data_type)?; }
+                let _mapping = memory.reserve(batch.len.checked_mul(std::mem::size_of::<usize>()).ok_or_else(||invalid("aggregate-size","Group mapping overflow"))?)?;
+                let mut mapping = Vec::with_capacity(batch.len);
+                for row in 0..batch.len {
+                    self.execution.context.check_cancelled_at(row)?;
+                    let known = match key {
+                        TypedColumn::Int(cells) => match cells[row] { Some(cell) => typed.ints.get(&cell).copied(), None => typed.null },
+                        TypedColumn::Utf8(strings) => if strings.is_null(row) { typed.null } else { typed.strings.get(strings.value(row)).copied() },
+                    };
+                    let group = match known {
+                        Some(group) => group,
+                        None => {
+                            let value = batch.columns[positions[0]].value(row)?;
+                            let group = keys.insert(std::slice::from_ref(&value),&self.execution)?;
+                            match key {
+                                TypedColumn::Int(cells) => match cells[row] { Some(cell) => { typed.ints.insert(cell,group); } None => typed.null = Some(group) },
+                                TypedColumn::Utf8(strings) => if strings.is_null(row) { typed.null = Some(group) } else { typed.strings.insert(strings.value(row).to_owned(),group); },
+                            }
+                            group
+                        }
+                    };
+                    mapping.push(group);
+                }
+                mapping
+            }
+        };
+        let group_count = keys.count;
+        for ((column,aggregate),types) in columns.iter_mut().zip(&self.aggregates).zip(types) {
+            validate_aggregate_input(aggregate,types)?;
+            let Accumulation::Scalar(states) = &mut column.accumulation else { return Err(invalid("aggregate-input","A typed aggregate collects its rows")) };
+            states.ensure(group_count,&self.execution)?;
+            let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,&self.schema)).transpose()?;
+            match (&aggregate.function,argument) {
+                (A::CountStar,_) => for group in &mapping { states.values[*group].count = states.values[*group].count.wrapping_add(1); },
+                (A::Count,Some(position)) => {
+                    let array = marked_nulls(&batch.columns[position]).ok_or_else(||invalid("aggregate-input","A typed count lost its column"))?;
+                    for (row,group) in mapping.iter().enumerate() { if !array.is_null(row) { states.values[*group].count = states.values[*group].count.wrapping_add(1); } }
+                }
+                (A::Sum | A::Average,Some(position)) => {
+                    let array = float_column(&batch.columns[position]).ok_or_else(||invalid("aggregate-input","A typed sum lost its column"))?;
+                    // Each group's sum folds this batch's cells onto its running sum in row order, as `SumFactory::add` does.
+                    let mut sums: Vec<Option<f64>> = states.values.iter().map(|state| match state.accumulator.as_ref().map(|row|&row.values[0]) { Some(Value::F64(sum)) => Some(*sum), _ => None }).collect();
+                    let mut touched = vec![false; group_count];
+                    for (row,group) in mapping.iter().enumerate() {
+                        if array.is_null(row) { continue; }
+                        let value = array.value(row);
+                        sums[*group] = Some(sums[*group].map_or(value,|sum| sum + value));
+                        touched[*group] = true;
+                        if aggregate.function == A::Average { states.values[*group].count = states.values[*group].count.wrapping_add(1); }
+                    }
+                    for (group,sum) in sums.into_iter().enumerate() {
+                        let (true, Some(sum)) = (touched[group], sum) else { continue };
+                        match &mut states.values[group].accumulator {
+                            Some(accumulator) => accumulator.values[0] = Value::F64(sum),
+                            accumulator => *accumulator = Some(OwnedRow::new(vec![Value::F64(sum)],memory)?),
+                        }
+                    }
+                }
+                _ => return Err(invalid("aggregate-input","A typed aggregate has no typed accumulator")),
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Group keys in first-seen order, with an index from key hash to the groups that share it.
+struct GroupKeys { count: usize, global: bool, index: std::collections::HashMap<u32, Vec<usize>>, keys: Vec<OwnedRow>, _index_reservation: Option<Arc<rtdb_columnar::MemoryReservation>>, inserts: usize }
 impl GroupKeys {
-    fn new(global: bool,execution: &Execution) -> Result<Self> {
-        let mut rows = execution.context.spill.create()?;
-        if global { rows.write(&[Value::U64(0),Value::U32(0)],&execution.context.memory)?; }
-        Ok(Self { rows,count: usize::from(global),global })
+    fn new(global: bool) -> Result<Self> {
+        Ok(Self { count: usize::from(global),global,index: Default::default(),keys: Vec::new(),_index_reservation: None,inserts: 0 })
     }
     fn insert(&mut self,values: &[Value],execution: &Execution) -> Result<usize> {
-        execution.context.check_cancelled()?;
+        self.inserts = self.inserts.wrapping_add(1);
+        execution.context.check_cancelled_at(self.inserts - 1)?;
         if self.global { return Ok(0); }
-        let _scratch = execution.context.memory.reserve(4096)?;
         let hash = crate::join_storage::hash_values(values)?;
-        let mut reader = self.rows.reader(Arc::clone(&execution.context.memory))?;
-        while let Some(previous) = reader.next()? {
-            execution.context.check_cancelled()?;
-            if previous.values.get(1) == Some(&Value::U32(hash)) && rows_equal(values,&previous.values[2..],&execution.context.timezone,&execution.context.memory)? {
-                return group_id(&previous.values);
+        if let Some(candidates) = self.index.get(&hash) {
+            for &id in candidates {
+                if rows_equal(values,&self.keys[id].values[2..],&execution.context.timezone,&execution.context.memory)? { return Ok(id); }
             }
         }
         let id = self.count;
         self.count = self.count.checked_add(1).filter(|count|*count <= i32::MAX as usize).ok_or_else(||invalid("group-count","Aggregate group count exceeds the reference vector limit"))?;
         let key = OwnedRow::copy_parts(&[&[Value::U64(id as u64),Value::U32(hash)],values],0,0,&execution.context.memory)?;
-        self.rows.write(&key.values,&execution.context.memory)?;
+        if self.keys.len() == self.keys.capacity() {
+            let capacity = self.keys.capacity().saturating_mul(2).max(16);
+            let bytes = capacity.checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>())
+                .ok_or_else(||invalid("group-count","Aggregate group index exceeds addressable memory"))?;
+            self._index_reservation = Some(execution.context.memory.reserve(bytes)?);
+            self.keys.reserve_exact(capacity - self.keys.len());
+        }
+        self.keys.push(key);
+        self.index.entry(hash).or_default().push(id);
         Ok(id)
     }
 }
 
-struct AggregateColumn { accumulation: Accumulation, distinct: Option<SpillWriter> }
+struct AggregateColumn { accumulation: Accumulation, distinct: Option<DistinctSeen> }
+/// The distinct arguments each group has taken so far, by the group and the hash of the argument.
+struct DistinctSeen { index: std::collections::HashMap<(usize, u32), Vec<usize>>, values: Vec<OwnedRow> }
 enum Accumulation { Scalar(ScalarGroups), Collected(PageBuilder) }
 impl AggregateColumn {
     fn new(aggregate: &AggregateExpr,execution: &Execution) -> Result<Self> {
@@ -170,16 +398,16 @@ impl AggregateColumn {
             AggregateFunction::ArrayAgg | AggregateFunction::VecAgg | AggregateFunction::Percentile { .. } => Accumulation::Collected(PageBuilder::new(0,&execution.context.memory)?),
             _ => Accumulation::Scalar(ScalarGroups::new(execution)?),
         };
-        let distinct = if aggregate.distinct && !matches!(aggregate.function,AggregateFunction::Min | AggregateFunction::Max) { Some(execution.context.spill.create()?) } else { None };
+        let distinct = if aggregate.distinct && !matches!(aggregate.function,AggregateFunction::Min | AggregateFunction::Max) { Some(DistinctSeen { index: Default::default(), values: Vec::new() }) } else { None };
         Ok(Self { accumulation,distinct })
     }
-    async fn aggregate(&mut self,page: &OwnedPage,mapping: &[usize],group_count: usize,aggregate: &AggregateExpr,types: &AggregateTypes,schema: &Schema,execution: &Execution) -> Result<()> {
+    async fn aggregate(&mut self,input: Rows<'_>,mapping: &[usize],group_count: usize,aggregate: &AggregateExpr,types: &AggregateTypes,schema: &Schema,execution: &Execution) -> Result<()> {
         let scope = execution.scope()?;
-        scope.reserve(page.len())?;
-        let mut mask = vec![true;page.len()];
+        scope.reserve(input.len())?;
+        let mut mask = vec![true;input.len()];
         if let Some(filter) = &aggregate.filter {
             let invocation = execution.prepare_expression(filter,schema,&scope)?;
-            for (row,selected) in page.rows().iter().zip(&mut mask) {
+            for (row,selected) in input.page()?.rows().iter().zip(&mut mask) {
                 let row_scope = execution.scope()?;
                 *selected = is_true(&execution.evaluate_invocation(&row_scope,&invocation,&row.values).await?)?;
             }
@@ -187,33 +415,31 @@ impl AggregateColumn {
         let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,schema)).transpose()?;
         if let Some(seen) = &mut self.distinct {
             let mut admitted = false;
-            for ((row,group),selected) in page.rows().iter().zip(mapping).zip(&mut mask) {
+            for ((row,group),selected) in input.page()?.rows().iter().zip(mapping).zip(&mut mask) {
                 execution.context.check_cancelled()?;
                 if !*selected { continue; }
                 if !admitted { rtdb_plan::validate_equality_types(&types.input,&types.input)?; admitted = true; }
                 let value = argument.map(|position|&row.values[position]).unwrap_or(&Value::Null);
-                let _scratch = execution.context.memory.reserve(4096)?;
                 let hash = crate::join_storage::hash_values(std::iter::once(value))?;
-                let mut reader = seen.reader(Arc::clone(&execution.context.memory))?;
-                while let Some(previous) = reader.next()? {
-                    execution.context.check_cancelled()?;
-                    if group_id(&previous.values)? != *group || previous.values.get(1) != Some(&Value::U32(hash)) { continue; }
-                    let allocation = rtdb_expr::EvaluationScope::new(&execution.context.memory)?;
-                    if sql_eq_in_timezone(value,&previous.values[2],&execution.context.timezone,&allocation)? == Some(true) { *selected = false; break; }
+                if let Some(candidates) = seen.index.get(&(*group, hash)) {
+                    for &candidate in candidates {
+                        let allocation = rtdb_expr::EvaluationScope::new(&execution.context.memory)?;
+                        if sql_eq_in_timezone(value,&seen.values[candidate].values[0],&execution.context.timezone,&allocation)? == Some(true) { *selected = false; break; }
+                    }
                 }
                 if *selected {
-                    let key = OwnedRow::copy_parts(&[&[Value::U64(*group as u64),Value::U32(hash)],std::slice::from_ref(value)],0,0,&execution.context.memory)?;
-                    seen.write(&key.values,&execution.context.memory)?;
+                    seen.index.entry((*group, hash)).or_default().push(seen.values.len());
+                    seen.values.push(OwnedRow::copy_parts(&[std::slice::from_ref(value)],0,0,&execution.context.memory)?);
                 }
             }
         }
         validate_aggregate_input(aggregate,types)?;
         match &mut self.accumulation {
             Accumulation::Scalar(states) => {
-                states.aggregate(page,mapping,&mask,group_count,argument,aggregate,types,&scope,execution)?;
+                states.aggregate(input,mapping,&mask,group_count,argument,aggregate,types,&scope,execution)?;
             }
             Accumulation::Collected(rows) => {
-                for ((row,group),selected) in page.rows().iter().zip(mapping).zip(mask) {
+                for ((row,group),selected) in input.page()?.rows().iter().zip(mapping).zip(mask) {
                     execution.context.check_cancelled()?;
                     let row = OwnedRow::copy_parts(&[&row.values,&[Value::U64(*group as u64),Value::Bool(selected)]],0,0,&execution.context.memory)?;
                     rows.push_growing(row,&execution.context.memory)?;
@@ -254,14 +480,21 @@ impl AggregateColumn {
                 let mut input: BoxCursor = if aggregate.function == AggregateFunction::ArrayAgg && !aggregate.order_by.is_empty() {
                     Box::new(SortCursor::from_pages(input,stored_schema,aggregate.order_by.clone(),execution.clone()))
                 } else { crate::pages::rows(input,Arc::clone(&execution.context)) };
-                let mut ordered = execution.context.spill.create()?;
-                while let Some(row) = input.next().await? { execution.context.check_cancelled()?;ordered.write(&row.values,&execution.context.memory)?; }
+                // One pass splits the ordered rows into each group's selected arguments, in order.
+                let argument = argument_position(aggregate.argument.as_ref().ok_or_else(||invalid("aggregate-state","Collected aggregate argument is absent"))?,schema)?;
+                let width = schema.len();
+                let mut buckets: Vec<std::collections::VecDeque<OwnedRow>> = (0..output.len()).map(|_| std::collections::VecDeque::new()).collect();
+                while let Some(row) = input.next().await? {
+                    execution.context.check_cancelled()?;
+                    if row.values.get(width + 1) != Some(&Value::Bool(true)) { continue; }
+                    let Some(bucket) = buckets.get_mut(group_id(&row.values[width..])?) else { continue };
+                    bucket.push_back(OwnedRow::copy_parts(&[std::slice::from_ref(&row.values[argument])],0,0,&execution.context.memory)?);
+                }
                 drop(input);
-                let ordered = ordered.finish()?;
-                for (group,row) in output.rows_mut().iter_mut().enumerate() {
+                for (row,bucket) in output.rows_mut().iter_mut().zip(buckets) {
                     execution.context.check_cancelled()?;
                     let scope = execution.scope()?;
-                    let selected = CollectedRows { reader: ordered.reader(Arc::clone(&execution.context.memory))?,group,width: schema.len(),argument: argument_position(aggregate.argument.as_ref().ok_or_else(||invalid("aggregate-state","Collected aggregate argument is absent"))?,schema)?,execution: execution.clone() };
+                    let selected = CollectedRows(bucket);
                     let value = if let AggregateFunction::Percentile { kind,fraction: PercentileFraction::Literal(fraction),descending } = &aggregate.function {
                         percentile(Box::new(selected),*kind,*fraction,*descending,&scope,execution).await?
                     } else {
@@ -292,17 +525,11 @@ struct CollectedPage(Option<OwnedPage>);
 impl PageCursor for CollectedPage {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> { Ok(self.0.take()) }
 }
-struct CollectedRows { reader: SpillReader, group: usize, width: usize, argument: usize, execution: Execution }
+/// One group's selected arguments, in order.
+struct CollectedRows(std::collections::VecDeque<OwnedRow>);
 #[async_trait]
 impl RowCursor for CollectedRows {
-    async fn next(&mut self) -> Result<Option<OwnedRow>> {
-        while let Some(row) = self.reader.next()? {
-            self.execution.context.check_cancelled()?;
-            if group_id(&row.values[self.width..])? != self.group || row.values.get(self.width + 1) != Some(&Value::Bool(true)) { continue; }
-            return OwnedRow::copy_parts(&[std::slice::from_ref(&row.values[self.argument])],0,0,&self.execution.context.memory).map(Some);
-        }
-        Ok(None)
-    }
+    async fn next(&mut self) -> Result<Option<OwnedRow>> { Ok(self.0.pop_front()) }
 }
 fn argument_position(argument: &rtdb_plan::Expr,schema: &Schema) -> Result<usize> {
     match argument { rtdb_plan::Expr::Column { id,.. } => schema.position(*id).ok_or_else(||invalid("aggregate-column","Aggregate argument column is absent")),_ => Err(invalid("aggregate-column","Aggregate argument must be projected before aggregation")) }
@@ -320,7 +547,7 @@ impl ScalarGroups {
         self.reservation = reservation;
         Ok(())
     }
-    fn aggregate(&mut self,page: &OwnedPage,mapping: &[usize],mask: &[bool],group_count: usize,argument: Option<usize>,aggregate: &AggregateExpr,types: &AggregateTypes,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<()> {
+    fn aggregate(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],group_count: usize,argument: Option<usize>,aggregate: &AggregateExpr,types: &AggregateTypes,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<()> {
         use AggregateFunction as A;
         match aggregate.function {
             A::Sum | A::Average => {
@@ -350,10 +577,10 @@ impl ScalarGroups {
             }
             _ => {
                 self.ensure(group_count,execution)?;
-                for ((row,group),selected) in page.rows().iter().zip(mapping).zip(mask) {
-                    execution.context.check_cancelled()?;
+                for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
+                    execution.context.check_cancelled_at(row)?;
                     if *selected {
-                        let value = argument.map(|position|&row.values[position]).unwrap_or(&Value::Null);
+                        let value = page.value(row,argument);
                         self.values[*group].step(value,aggregate,types,execution)?;
                     }
                 }
@@ -361,23 +588,27 @@ impl ScalarGroups {
         }
         Ok(())
     }
-    fn sum_page(&mut self,page: &OwnedPage,mapping: &[usize],mask: &[bool],argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
-        for (index,((row,group),selected)) in page.rows().iter().zip(mapping).zip(mask).enumerate() {
-            execution.context.check_cancelled()?;
+    fn sum_page(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
+        let _scratch = execution.context.memory.reserve(4096)?;
+        for (index,(group,selected)) in mapping.iter().zip(mask).enumerate() {
+            execution.context.check_cancelled_at(index)?;
             if !*selected { continue; }
-            let value = argument.map(|position|&row.values[position]).unwrap_or(&Value::Null);
+            let value = page.value(index,argument);
             let state = &mut self.values[*group];
-            let _scratch = execution.context.memory.reserve(4096)?;
             if let Some(next) = summer.add(state.accumulator.as_ref().map(|row|&row.values[0]),value,index)? {
-                state.accumulator = Some(OwnedRow::new(vec![next],&execution.context.memory)?);
+                match &mut state.accumulator {
+                    // A sum that retains what the previous one did reuses its cell and charge.
+                    Some(accumulator) if accumulator.values[0].retained_bytes()? == next.retained_bytes()? => accumulator.values[0] = next,
+                    accumulator => *accumulator = Some(OwnedRow::new(vec![next],&execution.context.memory)?),
+                }
             }
         }
         Ok(())
     }
-    fn count_page(&mut self,page: &OwnedPage,mapping: &[usize],mask: &[bool],argument: Option<usize>,all: bool,execution: &Execution) -> Result<()> {
-        for ((row,group),selected) in page.rows().iter().zip(mapping).zip(mask) {
-            execution.context.check_cancelled()?;
-            let value = argument.map(|position|&row.values[position]).unwrap_or(&Value::Null);
+    fn count_page(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],argument: Option<usize>,all: bool,execution: &Execution) -> Result<()> {
+        for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
+            execution.context.check_cancelled_at(row)?;
+            let value = page.value(row,argument);
             if *selected && (all || !matches!(value,Value::Null | Value::Undefined)) {
                 let state = &mut self.values[*group];
                 state.count = state.count.wrapping_add(1);
@@ -454,7 +685,7 @@ async fn percentile(selected: BoxCursor, kind: PercentileKind, fraction: f64, de
     let values = values.finish()?;
     let count = i32::try_from(values.len()).map_err(|_|invalid("percentile-size","Percentile input exceeds the reference vector row limit"))?;
     if count == 0 { return Ok(Value::Null); }
-    let indices = crate::sort::sort_records(&values,&execution.context,|left,right| {
+    let indices = crate::sort::sort_records(&values,&execution.context,1,|left,right| {
         let (left,right) = if descending { (right,left) } else { (left,right) };
         rtdb_expr::ordered_compare_in_timezone(&left[0],&right[0],false,&execution.context.timezone)
     })?;
@@ -624,15 +855,15 @@ fn vector_double(value: &Value) -> Result<f64> {
 }
 fn sum_state() -> rtdb_types::Anomaly { invalid("aggregate-state","SUM cell does not match its admitted vector factory") }
 
-fn square_column(page: &OwnedPage,argument: Option<usize>,input: &LogicalType,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<Vec<Option<f64>>> {
+fn square_column(page: Rows<'_>,argument: Option<usize>,input: &LogicalType,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<Vec<Option<f64>>> {
     if !matches!(without_nullability(input),LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64 | ScalarType::F64)) {
         return Err(rtdb_types::Anomaly::unsupported("rtdb.query/variance-input","Reference variance requires an IntVector, LongVector or DoubleVector"));
     }
     scope.reserve(page.len().checked_mul(std::mem::size_of::<Option<f64>>()).ok_or_else(||invalid("aggregate-size","Variance square column capacity overflow"))?)?;
     let mut squares = Vec::with_capacity(page.len());
-    for row in page.rows() {
+    for row in 0..page.len() {
         execution.context.check_cancelled()?;
-        let value = argument.map(|position|&row.values[position]).unwrap_or(&Value::Null);
+        let value = page.value(row,argument);
         squares.push(if matches!(value,Value::Null | Value::Undefined) { None } else { let value = vector_double(value)?;Some(value * value) });
     }
     Ok(squares)

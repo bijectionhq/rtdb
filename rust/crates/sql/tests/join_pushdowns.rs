@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_format::transit::{TransitValue, decode_msgpack};
@@ -15,7 +16,7 @@ fn context() -> Arc<QueryContext> {
     let mut tx = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time: Timestamp(1) }, memory).unwrap();
     for (table, column, values) in [("foo", "v", vec!["x", "y"]), ("bar", "w", vec!["x", "z", "y"])] {
         for (index, value) in values.iter().enumerate() {
-            tx.put(TableRef::new("public", table), BTreeMap::from([("_id".into(), id(index as u8 + 1)), (column.into(), Value::Utf8((*value).into()))]), Interval::ALL).unwrap();
+            tx.put(TableRef::new("public", table), StructFields::from([("_id".into(), id(index as u8 + 1)), (column.into(), Value::Utf8((*value).into()))]), Interval::ALL).unwrap();
         }
     }
     state.apply(&tx.stage().unwrap()).unwrap();
@@ -23,7 +24,7 @@ fn context() -> Arc<QueryContext> {
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
     QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(2), "UTC", QueryOptions { batch_rows: 1, ..Default::default() }, &CancellationToken::new()).unwrap()
 }
-async fn rows(context: &Arc<QueryContext>, sql: &str) -> Result<Vec<BTreeMap<String, Value>>> {
+async fn rows(context: &Arc<QueryContext>, sql: &str) -> Result<Vec<StructFields<Value>>> {
     let prepared = PreparedQuery::from_prepared(prepare(sql, &context.catalog, &PrepareOptions::default())?, &context.memory)?;
     let mut cursor = prepared.execute(Arc::clone(context), vec![]).await?;
     let mut rows = Vec::new();
@@ -34,14 +35,14 @@ async fn rows(context: &Arc<QueryContext>, sql: &str) -> Result<Vec<BTreeMap<Str
     }
     Ok(rows)
 }
-fn scan<'a>(rows: &'a [BTreeMap<String, Value>], name: &str) -> &'a BTreeMap<String, Value> {
+fn scan<'a>(rows: &'a [StructFields<Value>], name: &str) -> &'a StructFields<Value> {
     rows.iter().find(|row| row["op"] == Value::Keyword(Keyword::from_name("scan")) && row["attributes"].field("scan_source") == Some(&Value::Utf8(format!("public.{name}")))).unwrap()
 }
 fn entry<'a>(value: &'a TransitValue, key: &str) -> Option<&'a TransitValue> {
     let TransitValue::Map(entries) = value else { panic!("Expected Transit map") };
     entries.iter().find_map(|(name, value)| (name == &TransitValue::Keyword(key.into())).then_some(value))
 }
-fn filters(row: &BTreeMap<String, Value>) -> Vec<TransitValue> {
+fn filters(row: &StructFields<Value>) -> Vec<TransitValue> {
     let Value::Transit(bytes) = &row["pushdowns"] else { panic!("Expected actual scan pushdowns") };
     let TransitValue::Array(values) = decode_msgpack(bytes).unwrap() else { panic!("Expected pushdown vector") }; values
 }

@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use super::super::{FixedBytesLimit, TokenBuffer, TokenRecycler};
 use crate::connect::registry::reader_symbols::{FactoryProfile, Profile, SymbolName};
@@ -202,7 +203,7 @@ fn exact_utf16_datum_survives_runtime_input_and_construction_context_drop() {
     assert_eq!(schema.parameters["io.confluent.connect.avro.record.doc"], "😀");
     let mut next = ConversionContext::new(Arc::clone(&budget));
     let converted = connect.decode(&[14], &mut next).unwrap();
-    assert_eq!(converted.value, Value::Struct(BTreeMap::from([("x".into(), Value::I32(7))])));
+    assert_eq!(converted.value, Value::Struct(StructFields::from([("x".into(), Value::I32(7))])));
     drop(converted);
     drop(datum);
     drop(connect);

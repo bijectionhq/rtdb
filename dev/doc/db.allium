@@ -188,6 +188,10 @@ variant Leader : LogProcessor {
     -- Resolution is PAUSED while true, so no transaction interleaves between the boundary and the adopt that closes its block, and the buffer of held records stays empty.
     -- True from promotion where the term inherits a block to produce, so such a term resolves nothing until it has adopted that block.
     block_in_progress: Boolean
+
+    -- Whether this term reads the source log yet.
+    -- False from promotion where the term inherits a block, until it adopts that block: the adopt can move the durable watermark past the last applied transaction, and the source is read from the watermark the adopt leaves.
+    source_delivery_resumed: Boolean
 }
 
 variant Follower : LogProcessor {
@@ -636,8 +640,8 @@ config {
 -- That upload is this term's own: an outgoing leader's upload of the same block sits below the high-water by the time it is read, and is discarded.
 -- The block stays held across the cutover, and the records the follower was holding drain at the adopt.
 --
--- Such a term resumes the source log at the last applied transaction, so it re-reads whatever the held boundary covered: the flush that triggered the cut, and nothing at all where the row gauge cut it, the boundary there carrying the preceding transaction's position.
--- Resolution is paused until the adopt, so the re-offered batch waits; and by the time the flush is re-resolved the adopt has advanced the current block index, so its CAS fails and it becomes a no-op.
+-- Such a term opens the source log only once it has adopted that block, after the source position the block covers, and seeds its resolver there too.
+-- The boundary can cover a position past the last applied transaction: the flush that triggered the cut, which the outgoing leader resolved without appending anything for it.
 
 -- == The block cycle ==
 --
@@ -730,7 +734,7 @@ rule TransitionToLeader {
         let pending_block = log_processor.pending_block
 
         -- Take the leader role.
-        -- It resumes the SOURCE log from the durable watermark, and the replica read continues on this node from where the follower left off.
+        -- It resumes the SOURCE log from the durable watermark — for a term that inherits a block, the one its adopt leaves — and the replica read continues on this node from where the follower left off.
         -- Its resolver is seeded at the durable head, and it cuts on the rows already in the open block, so it cuts this block where the previous leader would have.
         log_processor.mode = Leader.created(
             -- The database's own source, borrowed for the length of this term, so this leader is externally fed iff the database is.
@@ -741,7 +745,8 @@ rule TransitionToLeader {
             last_resolved_src_msg_id: watchers.latest_source_msg_id,
             last_resolved_ext_token: watchers.external_source_token,
             -- True where this term inherits a block to produce: resolution stays paused until it has adopted it.
-            block_in_progress: pending_block != null
+            block_in_progress: pending_block != null,
+            source_delivery_resumed: pending_block = null
         )
         TxResolver.created(
             latest_completed_tx: live_index.latest_completed_tx
@@ -755,7 +760,9 @@ rule TransitionToLeader {
         if pending_block != null:
             ProduceBlock(log_processor, pending_block)
 
-        SourceDeliveryResumed(after: watchers.latest_source_msg_id)
+        -- Where this term inherits a block, delivery resumes at its adopt (LeaderAdoptsOwnBlock).
+        if pending_block = null:
+            SourceDeliveryResumed(after: watchers.latest_source_msg_id)
 
     @guidance
         -- ReplayEquivalence: the live index state after a promotion is identical regardless of how much work the follower had already done.
@@ -1157,6 +1164,12 @@ rule LeaderAdoptsOwnBlock {
         log_processor.pending_block = null
         for held in buffered:
             HandleReplicaMessage(held)
+
+        -- A term that inherited this block has read no source message yet, and starts here, after the watermark the adopt and the drain leave.
+        -- Its resolver resumes at that same position, so the first message it resolves is the one after everything the block and the held records cover.
+        if not log_processor.source_delivery_resumed:
+            log_processor.source_delivery_resumed = true
+            SourceDeliveryResumed(after: watchers.latest_source_msg_id)
 }
 
 rule LeaderFaultsOnUnmatchedBlockUpload {

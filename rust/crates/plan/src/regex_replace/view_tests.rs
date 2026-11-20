@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use super::*;
 use crate::RegexForm;
 use rtdb_types::{CalendarDate, CivilDate, DateUnit, DecimalValue, Keyword, TimeUnit};
@@ -83,7 +84,7 @@ fn all_forty_one_physical_kinds_have_exactly_thirty_four_borrowed_leaves() {
         (Value::List(vec![Value::I64(1)]), "list"), (Value::Set(vec![Value::Null]), "set"),
         (Value::Map { entries: vec![(Value::Null, Value::Bool(true))], sorted: true }, "map"),
         (Value::FixedSizeList(vec![Value::Bool(false)]), "fixed-size-list"),
-        (Value::TimestampTzRange { lower: -1, upper: 2 }, "leaf"), (Value::Struct(BTreeMap::new()), "struct"),
+        (Value::TimestampTzRange { lower: -1, upper: 2 }, "leaf"), (Value::Struct(StructFields::new()), "struct"),
     ];
     assert_eq!(cases.len(), 41);
     let mut leaves = 0;
@@ -116,7 +117,7 @@ fn child_and_text_borrows_outlive_temporary_views_and_cursors() {
     let Value::List(children) = &values else { panic!("expected list") };
     let Value::Utf8(source) = &children[0] else { panic!("expected text") };
     assert_eq!(text(value).as_ptr(), source.as_ptr());
-    let fields = Value::Struct(BTreeMap::from([("field".into(), Value::I64(1))]));
+    let fields = Value::Struct(StructFields::from([("field".into(), Value::I64(1))]));
     let (name, value) = first_field(&fields).unwrap();
     let Value::Struct(source) = &fields else { panic!("expected struct") };
     let (source_name, source_value) = source.first_key_value().unwrap();
@@ -265,8 +266,8 @@ fn physical_sequence_and_pair_cursors_borrow_exact_children() {
 }
 
 #[test]
-fn field_cursors_preserve_btree_order_and_borrow_names_and_values() {
-    let source = Value::Struct(BTreeMap::from([("z".into(), Value::Utf8("last".into())), ("a".into(), Value::Utf8("first".into()))]));
+fn field_cursors_preserve_insertion_order_and_borrow_names_and_values() {
+    let source = Value::Struct(StructFields::from([("a".into(), Value::Utf8("first".into())), ("z".into(), Value::Utf8("last".into()))]));
     let RegexLiteralKind::Struct(fields) = RegexLiteralView::new(&source).kind() else { panic!("expected fields") };
     assert_eq!(fields.len(), 2);
     assert!(!fields.is_empty());
@@ -303,7 +304,7 @@ fn empty_physical_containers_have_exact_exhausted_cursors() {
     assert_eq!(cursor.len(), 0);
     assert!(cursor.next().is_none());
     assert!(cursor.next_back().is_none());
-    let fields = Value::Struct(BTreeMap::new());
+    let fields = Value::Struct(StructFields::new());
     let RegexLiteralKind::Struct(fields) = RegexLiteralView::new(&fields).kind() else { panic!("expected fields") };
     assert!(fields.is_empty());
     assert_eq!(fields.len(), 0);

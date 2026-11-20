@@ -148,6 +148,51 @@ async fn sql_parse_failures_return_anomaly_details_and_an_idle_connection() {
     running.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_request_stops_a_large_sorted_query() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("", "FROM GENERATE_SERIES(1,10000000) AS system(_id) ORDER BY _id", &[]).await;
+    client.bind("", "").await;
+    let mut describe = vec![b'P']; describe.extend_from_slice(&cstring("")); client.send(b'D', &describe).await;
+    client.execute("", 0).await; client.send(b'S', &[]).await;
+    let (address, process) = (running.server.address(), client.process);
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket.write_i32(16).await.unwrap(); socket.write_i32(80877102).await.unwrap(); socket.write_i32(process).await.unwrap(); socket.write_i32(0).await.unwrap(); socket.flush().await.unwrap();
+    });
+    let started = std::time::Instant::now();
+    let frames = client.through(b'Z').await;
+    canceller.await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10), "cancellation took {:?}", started.elapsed());
+    let error = frames.iter().find(|frame| frame.0 == b'E').expect("an error");
+    assert!(error.1.split(|&byte| byte == 0).any(|field| field == b"C57014"), "{}", String::from_utf8_lossy(&error.1));
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn begin_syntax_errors_report_the_grammar_diagnostic() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for (sql, expected) in [
+        ("BEGIN not valid sql!", "line 1:6 mismatched input 'not'"),
+        ("BEGIN SERIALIZABLE", "line 1:6 extraneous input 'SERIALIZABLE'"),
+    ] {
+        let frames = client.query(sql).await;
+        assert_eq!(tags(&frames), b"EZ", "{sql}");
+        let (_, message, _) = error_fields(&frames[0].1);
+        assert!(message.contains(expected), "{sql}: {message}");
+        client.parse("", sql, &[]).await; client.send(b'S', &[]).await;
+        let frames = client.through(b'Z').await;
+        assert_eq!(tags(&frames), b"EZ", "extended {sql}");
+        let (_, message, _) = error_fields(&frames[0].1);
+        assert!(message.contains(expected), "extended {sql}: {message}");
+    }
+    drop(client);
+    running.stop().await;
+}
+
 #[tokio::test]
 async fn first_simple_query_report_preserves_an_open_transaction_and_json_ld_detail() {
     let running = Running::start(ServerConfig::default(), None).await;
@@ -371,6 +416,25 @@ async fn binary_bind_parameters_and_result_formats_use_declared_oids() {
     client.send(b'B', &bind).await; client.execute("p", 0).await; client.send(b'S', &[]).await;
     let frames = client.through(b'Z').await; assert_eq!(tags(&frames), b"12DCZ");
     assert_eq!(rows(&frames), vec![vec![Some(42i32.to_be_bytes().to_vec())]]);
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn numeric_parameters_keep_numeric_result_types_through_integer_arithmetic() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("numeric", "SELECT $1 AS d, $2 + 1 AS e, 1 AS i", &[1700, 1700]).await;
+    let mut description = vec![b'S']; description.extend_from_slice(&cstring("numeric"));
+    client.send(b'D', &description).await; client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), vec![b'1', b't', b'T', b'Z']);
+    let fields = &frames[2].1;
+    let mut offset = 2; let mut oids = Vec::new();
+    for _ in 0..u16::from_be_bytes(fields[..2].try_into().unwrap()) {
+        offset += fields[offset..].iter().position(|&byte| byte == 0).unwrap() + 1 + 6;
+        oids.push(i32::from_be_bytes(fields[offset..offset + 4].try_into().unwrap())); offset += 12;
+    }
+    assert_eq!(oids, [1700, 1700, 20]);
     drop(client); running.stop().await;
 }
 

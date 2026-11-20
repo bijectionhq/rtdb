@@ -1599,3 +1599,26 @@ Next steps:
 
 Environment: colima provides Docker (DOCKER_HOST=unix://$HOME/.colima/default/docker.sock, TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock), JAVA_HOME is Temurin 25.0.5, and the parity library is rtdb-ffi built in release with --features all-backends.
 Homebrew's rustc may be linked against a newer LLVM than it was built for; use the rustup toolchain.
+
+== Handoff: Phase 2 corpus parity, second pass, 2026-11-19
+
+The round-4 corpus left 31 failing Vars; this pass fixed or classified all but the Arrow-file layout cluster.
+Classifier additions are reasons the original test cannot run natively: the renamed `DatabaseCatalog`, with-redefs of JVM pgwire functions (canned responses, parse-sql, cmd-exec-query), and a metrics assertion missing only JVM-runtime and Arrow child-allocator gauges.
+
+Behaviour brought to the reference:
+
+* Struct fields and union legs keep first-seen order (`StructFields`, `OrderedSet`), so EXPLAIN, error details and golden files follow the reference's order; catalog columns are sorted explicitly as the reference sorts them.
+* Source-log transactions encode byte-identically to the reference's Java Arrow writer, so tx-ids and message ids match.
+* delete-docs and erase-docs submit as SQL DML, as the Clojure client does; an inverted temporal range matches nothing.
+* SQL: non-reserved keyword tiers for aliases, parenthesised subqueries in IN lists, BEGIN diagnostics through the ported grammar, date-to-time casts, null-leg arithmetic typing, list `||` as the reference's unmatched concat clause.
+* XTQL and RA: aggregate scope errors, keyword fields in logical-plan gets, and queries of tables absent at preparation.
+* Scans prune pages whose metadata disproves a column-constant comparison, after the reference's metadata selector.
+* Metrics: `tx.op.timer`, `compactor.job.timer`, `system.cpu.count`.
+* An indexer-disabled node fails its awaits, as the reference's log-processor check does.
+
+Resource findings, each of which made a reference test time out or exhaust its budget:
+
+* Query pipelines never yielded: a CPU-bound sort ran inside one poll, so Tokio never polled its I/O driver and a cancel request's connection went unread; pages now spend cooperative budget.
+* Sort blocks spilled their records and then read two records from the spill per comparison; keys are now held in memory and spill I/O is buffered.
+* Rows read back from a spill kept their decoding bound as their charge, struct values were charged a B-tree node per field, and LIKE compiled a regex whose bounds grew with pattern length; LIKE is now a direct wildcard matcher with the translation's Java semantics.
+* On macOS, `sync_all` is `F_FULLFSYNC`, about a hundred times slower than the `fsync` that Java's `force` issues there; local stores and logs now `fsync` on Apple platforms and keep `sync_all` elsewhere.

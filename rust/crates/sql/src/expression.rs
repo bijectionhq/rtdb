@@ -23,7 +23,8 @@ impl Context<'_> {
     }
 
     pub(crate) fn expr_bound(&mut self, expression: &ast::Expr, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
-        self.expr_inner(expression, input, replacements).map_err(|anomaly| {
+        // Binding recurses once per expression level; the parser admits deeper nesting than a worker thread's stack holds.
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.expr_inner(expression, input, replacements)).map_err(|anomaly| {
             if anomaly.context.contains_key("span") { anomaly }
             else { let span = crate::parse::source_span(self.source, expression.span()); anomaly.with_context("span", serde_json::json!({"start":span.start,"end":span.end})).with_context("position", serde_json::json!(span.start + 1)) }
         })
@@ -95,8 +96,8 @@ impl Context<'_> {
                         let admitted = self.literals.temporal(value.value.span, Temporal::Time, text);
                         Expr::Cast { expr: Box::new(Expr::Literal(admitted)), target: self.cast_target(&value.data_type)? }
                     }
-                    (_, Value::Utf8(text)) if let Some(kind) = CustomStringLiteral::from_type(&value.data_type) => {
-                        match kind {
+                    (_, Value::Utf8(text)) if CustomStringLiteral::from_type(&value.data_type).is_some() => {
+                        match CustomStringLiteral::from_type(&value.data_type).expect("guarded custom literal type") {
                             CustomStringLiteral::Uri => {
                                 rtdb_types::UriParts::parse(text).map_err(|failure| error(format!("Cannot parse uri: {}", failure.message.as_deref().unwrap_or("null"))))?;
                                 Expr::Literal(Value::Uri(text.clone()))

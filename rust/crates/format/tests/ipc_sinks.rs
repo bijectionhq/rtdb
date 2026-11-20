@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch};
@@ -42,12 +43,12 @@ fn file_and_stream_decoding_admit_logical_nulls_in_nested_dense_unions() {
             iid: EntityId::Integer(index as i64).iid(),
             system_from: Timestamp(100),
             valid_time: Interval::ALL,
-            operation: StoredOperation::Put(BTreeMap::from([("v".into(), value)])),
+            operation: StoredOperation::Put(StructFields::from([("v".into(), value)])),
             recency: None,
         }).collect::<Vec<_>>();
     let field_type = LogicalType::from_legs([LogicalType::Null, LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)]);
     let fields = BTreeMap::from([("v".into(), field_type)]);
-    let batch = build_event_batch(&events, Some(fields), None).unwrap();
+    let batch = build_event_batch(&events, Some(fields.into()), None).unwrap();
     let schema = batch.schema();
     let DataType::Union(operations, _) = schema.field_with_name("op").unwrap().data_type() else { panic!("event operations") };
     let put = operations.iter().find(|(_, field)| field.name() == "put").unwrap().1;
@@ -104,7 +105,11 @@ fn incremental_sinks_match_buffered_jvm_end_markers() {
     let mut actual = Vec::new();
     file.read_to_end(&mut actual).unwrap();
     assert_eq!(actual, expected);
-    assert_eq!(write_stream_to(&batch.schema(), [&batch], Vec::new()).unwrap(), write_stream(&batch.schema(), &[batch]).unwrap());
+    let streamed = write_stream_to(&batch.schema(), [&batch], Vec::new()).unwrap();
+    assert_eq!(&streamed[streamed.len() - 4..], [0; 4], "the stream ends with the reference's single zero word");
+    let mut decoded = rtdb_format::ipc::ArrowStream::open(streamed.into(), None).unwrap();
+    assert_eq!(decoded.next().unwrap().unwrap(), batch);
+    assert!(decoded.next().is_none());
 }
 
 #[test]

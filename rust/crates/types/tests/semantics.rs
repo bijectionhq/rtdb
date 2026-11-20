@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use rtdb_types::{EntityId, Iid, Interval, Keyword, ListKind, LogicalType as T, RunEndWidth, ScalarType as S, SourcePosition, ReplicaPosition, StorageEpoch, TableRef, Timestamp, TxBasis, TxId, Value};
 use std::collections::BTreeMap;
 
@@ -219,7 +220,7 @@ fn unsigned_integers_promote_with_floats_but_not_other_integer_types() {
 fn deeply_nested_union_types_unencode_and_validate_in_linear_time() {
     let mut ty = scalar(S::I64);
     for depth in 0..64 {
-        let other = if depth % 2 == 0 { scalar(S::Utf8) } else { T::Struct(BTreeMap::from([("v".into(), scalar(S::Bool))])) };
+        let other = if depth % 2 == 0 { scalar(S::Utf8) } else { T::Struct(StructFields::from([("v".into(), scalar(S::Bool))])) };
         ty = T::list(T::from_legs([ty, other, T::Null]));
     }
     let started = std::time::Instant::now();
@@ -227,4 +228,31 @@ fn deeply_nested_union_types_unencode_and_validate_in_linear_time() {
     assert_eq!(ty.clone().maybe().unencoded(), ty.clone().maybe());
     ty.validate().unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+}
+
+#[test]
+fn joins_keep_legs_and_struct_fields_in_first_seen_order() {
+    let instant = scalar(S::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+    let joined = T::join_all(&[scalar(S::Utf8), scalar(S::I64), scalar(S::Keyword)]);
+    let T::Union(legs) = &joined else { panic!("expected a union: {joined:?}") };
+    assert_eq!(legs.iter().cloned().collect::<Vec<_>>(), [scalar(S::Utf8), scalar(S::I64), scalar(S::Keyword)]);
+    assert_eq!(joined, T::join_all(&[scalar(S::I64), scalar(S::Keyword), scalar(S::Utf8)]), "legs compare as a set");
+
+    let list = |element| T::List { kind: ListKind::List, element: Box::new(element) };
+    let lists = T::join(&list(scalar(S::F64).join(&scalar(S::Utf8))), &list(instant.join(&scalar(S::Bool))));
+    let T::List { element, .. } = &lists else { panic!("expected a list: {lists:?}") };
+    let T::Union(elements) = element.as_ref() else { panic!("expected union elements") };
+    assert_eq!(elements.iter().cloned().collect::<Vec<_>>(), [scalar(S::F64), scalar(S::Utf8), instant, scalar(S::Bool)]);
+
+    let merged = T::join(&structure(&[("b", scalar(S::I64)), ("a", scalar(S::Utf8))]), &structure(&[("c", scalar(S::Bool)), ("a", scalar(S::Utf8))]));
+    let T::Struct(fields) = &merged else { panic!("expected a struct: {merged:?}") };
+    assert_eq!(fields.keys().map(String::as_str).collect::<Vec<_>>(), ["b", "a", "c"]);
+}
+
+#[test]
+fn struct_values_keep_document_order_and_compare_as_maps() {
+    let document = Value::Struct(StructFields::from([("id".into(), Value::I64(1)), ("a".into(), Value::I64(2))]));
+    let T::Struct(fields) = document.logical_type() else { panic!("expected a struct type") };
+    assert_eq!(fields.keys().map(String::as_str).collect::<Vec<_>>(), ["id", "a"]);
+    assert_eq!(document, Value::Struct(StructFields::from([("a".into(), Value::I64(2)), ("id".into(), Value::I64(1))])));
 }

@@ -111,7 +111,7 @@ impl ReplicaAppender {
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
                     match observe_enqueue(self.logs.enqueue_replica(&envelope, request.write.block, (self.clock)()), &self.cancellation, &mut receipts).await {
-                        Ok(Some(receipt)) => receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable)),
+                        Ok(Some(receipt)) => { receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable)); timer.reset(); }
                         Ok(None) => { request.write.finish(Err(term_ended())); if let Some(sender) = request.durable { let _ = sender.send(Err(term_ended())); } break Ok(()); }
                         Err(error) => { request.write.finish(Err(error.clone())); if let Some(sender) = request.durable { let _ = sender.send(Err(error.clone())); } break Err(error); }
                     }
@@ -223,5 +223,28 @@ mod tests {
         let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(observe_enqueue(enqueue, &cancellation, &mut receipts), cancel) }).await.unwrap();
         assert!(result.unwrap().is_none());
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn a_leader_with_traffic_appends_no_heartbeats_and_an_idle_one_appends_after_the_interval() {
+        let memory = MemoryBudget::new(1 << 24);
+        let store = Arc::new(MemoryStore::default());
+        let cache = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let replica = Arc::new(MemoryLog::new(1 << 20));
+        let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 20)), replica.clone(), StorageEpoch(0), StorageEpoch(0), rtdb_format::keys::CURRENT_STORAGE_VERSION, StorageEpoch(0), store, cache, Arc::clone(&memory)).unwrap();
+        let cancellation = CancellationToken::new();
+        let (handle, appender) = ReplicaAppender::new(logs, Arc::clone(&memory), Term(1), Duration::from_millis(200), cancellation.clone(), Arc::new(now));
+        let pump = tokio::spawn(appender.run(None));
+        for source in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let write = PendingWrite::new(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(source) })), BlockIndex(0), None, &memory).unwrap();
+            handle.enqueue(write).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(replica.latest().unwrap(), LogOffset(19), "only the 20 writes were appended");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(replica.latest().unwrap(), LogOffset(20), "one heartbeat after the idle interval");
+        cancellation.cancel();
+        pump.await.unwrap().unwrap();
     }
 }

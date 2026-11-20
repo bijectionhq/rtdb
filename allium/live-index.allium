@@ -204,6 +204,7 @@ entity StagedTxTable {
     -- One transaction's rows for one table, imported into the matching durable LiveTable when the transaction is applied.
     -- Staging retains the completed rows and their schema.
     -- A staged put preserves its declared column types, including columns with only null cells.
+    -- A table's columns, a struct's fields and a union's legs keep the order they were first written in; types compare without regard to that order.
     -- Temporary memory used during construction is released before staging.
     staged_tx: StagedTx
     table_ref: TableRef

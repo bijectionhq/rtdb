@@ -1,3 +1,4 @@
+use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         let pages = crate::ipc::decode(bytes, memory)?;
         if pages.len() != 1 { return Err(invalid("Resolved transaction table must contain exactly one record batch")); }
         let batch = IndexBatch::from_owned(pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?)?;
-        tables.insert(TableRef::new(schema, table), TableWrite::new(BTreeMap::new(), Some(batch)));
+        tables.insert(TableRef::new(schema, table), TableWrite::new(StructFields::new(), Some(batch)));
     }
     Ok((StagedWrite::new(key, predecessor, block, tables)?, result))
 }

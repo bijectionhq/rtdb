@@ -115,6 +115,9 @@ pub(crate) fn schema_bound(schema: &Schema) -> Result<usize> {
     schema.fields().iter().try_fold(4096, |bytes, field| add(bytes, field_bound(field)?))
 }
 pub(crate) fn expression_bound(expr: &Expr) -> Result<usize> {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || expression_bound_at(expr))
+}
+fn expression_bound_at(expr: &Expr) -> Result<usize> {
     let mut bytes = 2048;
     match expr {
         Expr::Literal(value) => bytes = add(bytes, multiply(value.retained_bytes()?, 4)?)?,
@@ -212,6 +215,10 @@ pub(crate) fn allocation_bound(relation: &Relation) -> Result<usize> {
 
 fn field_type(field: &Field, data_type: L) -> Field { let mut field = field.clone(); field.data_type = data_type; field }
 fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc<EmittedRelation>> {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || relation_types_at(relation, emitter))
+}
+
+fn relation_types_at(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc<EmittedRelation>> {
     let type_of = |expr: &Expr, input: &Schema| expression_type(expr, input, emitter);
     let mut children = Vec::new();
     let mut aggregates = Vec::new();
@@ -379,6 +386,9 @@ fn coalesce_type(args: &[Expr], input: &Schema, emitter: &Emitter<'_>) -> Result
 
 fn typed(data_type: L) -> Expr { Expr::column(ColumnId(0), data_type) }
 fn expression_type(expr: &Expr, input: &Schema, emitter: &Emitter<'_>) -> Result<L> {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || expression_type_at(expr, input, emitter))
+}
+fn expression_type_at(expr: &Expr, input: &Schema, emitter: &Emitter<'_>) -> Result<L> {
     let child = |expr: &Expr| expression_type(expr, input, emitter);
     Ok(match expr {
         Expr::Literal(value) => value.logical_type(),

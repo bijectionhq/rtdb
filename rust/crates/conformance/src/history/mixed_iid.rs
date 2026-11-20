@@ -14,6 +14,7 @@ use rtdb_tx::{Documents, EntityIds, TxOp};
 use rtdb_types::{EntityId, LogicalType, RunEndWidth, ScalarType, StorageEpoch, TableRef, TimeUnit, Timestamp, TransactionKey, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
+use rtdb_types::StructFields;
 use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File}, io::Write, ops::Range, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 
 const SOURCE_SHA256: &str = "7cdd0bf680e9311f9d814c4c0b07fd6db2282995528d80510ebc5b7f80fe9d39";
@@ -53,7 +54,7 @@ async fn ingest(node: &Node, clock: &FixtureClock, ticks: Range<i64>) -> Result<
     let mut committed = Vec::new();
     for tick in ticks {
         let time = Timestamp(start.0 + tick * 6 * HOUR_MICROS);
-        let documents = (0..30).map(|id| BTreeMap::from([
+        let documents = (0..30).map(|id| StructFields::from([
             ("_id".into(), Value::I64(id)), ("value".into(), Value::I64(tick)),
         ])).collect();
         let mut operations = vec![TxOp::PutDocs {

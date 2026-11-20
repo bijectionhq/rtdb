@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, sync::{Arc, Mutex}, time::{Duration, Instant}};
+use rtdb_types::StructFields;
+use std::{sync::{Arc, Mutex}, time::{Duration, Instant}};
 use async_trait::async_trait;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{Relation, RelationNode};
@@ -57,7 +58,7 @@ impl AnalysisNode {
         })?;
         let attributes = match &self.attributes {
             Attributes::None => Value::Null,
-            Attributes::Scan { database, source } => Value::Struct(BTreeMap::from([
+            Attributes::Scan { database, source } => Value::Struct(StructFields::from([
                 ("scan_db".into(), Value::Utf8(database.clone())), ("scan_source".into(), Value::Utf8(source.clone())),
                 ("scan_files_pruned".into(), integer(counts.scan.files_pruned)), ("scan_files_used".into(), integer(counts.scan.files_used)),
                 ("scan_pages_pruned".into(), integer(counts.scan.pages_pruned)), ("scan_pages_used".into(), integer(counts.scan.pages_used)),

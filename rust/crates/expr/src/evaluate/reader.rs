@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
+use rtdb_types::StructFields;
+use std::{future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, Value};
 use super::{EvalContext, boolean, integer, nullish, overflow};
@@ -15,7 +16,7 @@ enum Kind { List, Set, Fixed }
 #[derive(Clone)]
 enum EvalValue<'a> {
     Scalar(Value),
-    Struct(Arc<BTreeMap<String,EvalValue<'a>>>),
+    Struct(Arc<StructFields<EvalValue<'a>>>),
     List(Kind,Arc<ListReader<'a>>),
 }
 
@@ -23,7 +24,6 @@ enum ListReader<'a> {
     Expressions(&'a [Expr]),
     Values(Vec<Value>),
     Cast { input: EvalValue<'a>, element: Target<'a> },
-    Concat(EvalValue<'a>,EvalValue<'a>),
     Trim { input: EvalValue<'a>, size: i64 },
     IntegerSeries(crate::series::IntegerSeries),
     RangeBins(crate::temporal_functions::RangeBins),
@@ -60,6 +60,9 @@ fn value_type_bound(value: &Value) -> Result<usize> {
 }
 
 fn expression_type_bound(expr: &Expr) -> Result<usize> {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || expression_type_bound_at(expr))
+}
+fn expression_type_bound_at(expr: &Expr) -> Result<usize> {
     let mut bytes = 512usize;
     let mut add = |value: usize| -> Result<()> { bytes = bytes.checked_add(value).ok_or_else(overflow)?;Ok(()) };
     match expr {
@@ -103,7 +106,7 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
     Ok(match value {
         EvalValue::Scalar(value) => { frame.context.reserve(value.retained_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;value.logical_type() }
         EvalValue::Struct(fields) => {
-            let mut types = BTreeMap::new();
+            let mut types = StructFields::new();
             for (name,value) in fields.iter() { frame.context.reserve(name.len().checked_add(4096).ok_or_else(overflow)?)?;types.insert(name.clone(),value_type(value,frame)?); }
             LogicalType::Struct(types)
         }
@@ -129,12 +132,6 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
                         Target::Fixed(ty) => { frame.context.reserve(ty.retained_bytes()?)?;(*ty).clone() }
                     }
                 }
-                ListReader::Concat(left,right) => {
-                    let LogicalType::List { element: a,.. } = value_type(left,frame)? else { return Err(invalid("concat type")); };
-                    let LogicalType::List { element: b,.. } = value_type(right,frame)? else { return Err(invalid("concat type")); };
-                    frame.context.reserve(a.retained_bytes()?.checked_add(b.retained_bytes()?).and_then(|n|n.checked_mul(8)).ok_or_else(overflow)?)?;
-                    LogicalType::join_all(&[*a,*b])
-                }
                 ListReader::Trim { input,.. } => {
                     let LogicalType::List { element,.. } = value_type(input,frame)? else { return Err(invalid("trim type")); };
                     *element
@@ -149,7 +146,18 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
 
 fn boxed<'a,T>(future: impl Future<Output=Result<T>> + Send + 'a, frame: &EvaluationFrame<'_>) -> Result<Pending<'a,T>> {
     frame.context.reserve(std::mem::size_of_val(&future).checked_add(256).ok_or_else(overflow)?)?;
-    Ok(Box::pin(future))
+    Ok(Box::pin(GrowStack(future)))
+}
+
+/// Polls its future with stack to spare: each expression level nests one poll inside its parent's.
+struct GrowStack<F>(F);
+impl<F: Future> Future for GrowStack<F> {
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
+        // SAFETY: the inner future is structurally pinned; it is never moved out of or replaced.
+        let inner = unsafe { self.map_unchecked_mut(|grow| &mut grow.0) };
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || inner.poll(cx))
+    }
 }
 
 fn invalid(name: &str) -> Anomaly { Anomaly::incorrect("xtdb/invalid-argument-types",format!("{name} is not applicable to these collection values")) }
@@ -288,7 +296,7 @@ fn from_value<'a>(value: Value,frame: &EvaluationFrame<'_>) -> Result<EvalValue<
         Value::Set(values) => make_list(Kind::Set,ListReader::Values(values),frame),
         Value::FixedSizeList(values) => make_list(Kind::Fixed,ListReader::Values(values),frame),
         Value::Struct(fields) => {
-            let mut cells = BTreeMap::new();
+            let mut cells = StructFields::new();
             for (name,value) in fields { frame.context.reserve(4096)?;cells.insert(name,box_cell(from_value(value,frame)?)?); }
             frame.context.reserve(256)?;
             Ok(EvalValue::Struct(Arc::new(cells)))
@@ -311,7 +319,6 @@ fn len(value: &EvalValue<'_>) -> Result<usize> {
     match reader.as_ref() {
         ListReader::Expressions(items) => Ok(items.len()), ListReader::Values(items) => Ok(items.len()),
         ListReader::Cast { input, .. } => len(input),
-        ListReader::Concat(left,right) => len(left)?.checked_add(len(right)?).ok_or_else(overflow),
         ListReader::Trim { size,.. } => crate::collection::view_size(*size),
         ListReader::IntegerSeries(series) => Ok(series.len()),
         ListReader::RangeBins(bins) => bins.len(),
@@ -331,10 +338,6 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
                     value
                 } else { cast_value(value,*element,frame)?.await? }
             }
-            ListReader::Concat(left,right) => {
-                let left_len = len(left)?;
-                if index < left_len { nth(clone_value(left,frame)?,index,frame)?.await? } else { nth(clone_value(right,frame)?,index - left_len,frame)?.await? }
-            }
             ListReader::Trim { input,.. } => nth(clone_value(input,frame)?,index,frame)?.await?,
             ListReader::IntegerSeries(series) => scalar(series.nth(index)),
             ListReader::RangeBins(bins) => { frame.context.reserve(4096)?;from_value(bins.nth(index),frame)? }
@@ -348,7 +351,7 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
         match value {
             EvalValue::Scalar(value) => Ok(value),
             EvalValue::Struct(fields) => {
-                let mut result = BTreeMap::new();
+                let mut result = StructFields::new();
                 for (name,value) in fields.iter() {
                     frame.context.reserve(name.len().checked_add(4096).ok_or_else(overflow)?)?;
                     result.insert(name.clone(),materialize(clone_value(value,frame)?,frame)?.await?);
@@ -435,7 +438,7 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
         match expr {
             Expr::List(items) => make_list(Kind::List,ListReader::Expressions(items),frame),
             Expr::Struct(fields) => {
-                let mut values = BTreeMap::new();
+                let mut values = StructFields::new();
                 for (name,expr) in fields {
                     frame.context.reserve(name.len().checked_add(4096).ok_or_else(overflow)?)?;
                     values.insert(name.clone(),box_cell(evaluate(expr,frame)?.await?)?);
