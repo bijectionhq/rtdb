@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use prost_types::Any;
-use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, storage_root}};
+use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, StorageRoot}};
 use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_storage::disk_cache::DiskCache;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
@@ -218,7 +218,7 @@ impl ResourceFactory for NativeResources {
             }
             None => 0,
         };
-        storage_root(CURRENT_STORAGE_VERSION, StorageEpoch(epoch), 0, 1)?;
+        StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(epoch))?;
         Ok(())
     }
 
@@ -233,7 +233,7 @@ impl ResourceFactory for NativeResources {
                 None => None,
             }.unwrap_or(0);
             let storage_epoch = StorageEpoch(epoch);
-            let root = ObjectKey::new(storage_root(CURRENT_STORAGE_VERSION, storage_epoch, 0, 1)?)?;
+            let root = ObjectKey::new(StorageRoot::new(CURRENT_STORAGE_VERSION, storage_epoch)?.key())?;
             let mut blocks = rtdb_replication::BlockDiscovery::List;
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
