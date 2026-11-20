@@ -32,6 +32,8 @@ pub struct NodeSettings {
     pub keys: Arc<dyn crate::keys::KeyService>,
     /// Where this node keeps its cache of the cell's objects.
     pub cache_dir: PathBuf,
+    /// Whether this node's holders compact their own deployments; off when the cell has compaction workers.
+    pub local_compaction: bool,
 }
 
 /// A running node. Dropping it does not stop it; call `shutdown` or `kill`.
@@ -50,6 +52,8 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     if settings.configuration.disk_cache.is_none() {
         settings.configuration.disk_cache = Some(rtdb_server::config::DiskCacheSettings { path: settings.cache_dir.clone(), maximum_bytes: Some(1 << 30), maximum_ratio: 0.5 });
     }
+    if !settings.local_compaction && settings.pool != rtdb_directory::MemberPool::Compaction { settings.configuration.compactor.threads = 0; }
+    settings.agent.compaction_worker = settings.pool == rtdb_directory::MemberPool::Compaction;
     let options = settings.configuration.node_options(settings.allocation_limit_bytes)?;
     let memory = MemoryBudget::new(options.execution_memory_bytes);
     let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys), fence_interval: Duration::from_millis(100) });
@@ -57,6 +61,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys)))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
         claim_wait: settings.claim_wait,
+        compaction_relay: (settings.pool == rtdb_directory::MemberPool::Compaction).then(|| Arc::new(crate::relay::HolderRelay { directory: Arc::clone(&directory) }) as Arc<dyn rtdb_node::CompactionRelay>),
     };
     let (server, driver) = ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed).await?;
     let pgwire_address = server.addresses().pgwire.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;

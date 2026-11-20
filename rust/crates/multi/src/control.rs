@@ -23,6 +23,8 @@ pub enum Request {
     Subscribe { name: String },
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
     Flush { name: String },
+    /// Publish a compaction a worker produced, as the deployment's holder; the notification is an encoded TriesAdded.
+    PublishCompaction { name: String, notification: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +37,7 @@ pub enum Response {
     /// This member serves the deployment's reads from a replica; clients reach it at `address`.
     Subscribed { address: String },
     Done,
+    Published { position: i64 },
     Refused { code: String, message: String },
 }
 

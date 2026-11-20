@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--isolation] [--memory-limit BYTES]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES]\n\
        rtdb-multi gateway --directory DIR --listen ADDR\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--grace SECONDS]\n\
@@ -97,7 +97,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let node = process::start_node(directory, process::NodeSettings {
                 configuration, allocation_limit_bytes: arguments.number("memory-limit", 1usize << 30)?, control: arguments.address("control", "127.0.0.1:0")?,
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(), agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(20),
-                pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else { rtdb_directory::MemberPool::General },
+                pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
+                local_compaction: !arguments.present("no-local-compaction"),
                 keys: keys(&arguments)?, cache_dir: PathBuf::from(arguments.required("cache")?),
             }).await?;
             eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);

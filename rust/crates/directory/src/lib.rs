@@ -87,6 +87,8 @@ pub enum MemberPool {
     #[default]
     General,
     Isolation,
+    /// Compaction workers: they hold nothing, and compact the deployments that rank them first.
+    Compaction,
 }
 
 impl MemberRecord {

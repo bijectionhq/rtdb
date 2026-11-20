@@ -30,6 +30,7 @@ async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 prost-types.workspace = true
 ring = "0.17"
 uuid.workspace = true

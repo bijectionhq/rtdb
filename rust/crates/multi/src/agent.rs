@@ -34,17 +34,19 @@ pub struct AgentOptions {
     pub max_active: Option<usize>,
     /// Activation failures after which a deployment is quarantined to the isolation pool.
     pub quarantine_after: u32,
+    /// Whether this node is a compaction worker: it holds nothing, and compacts every held deployment that ranks it first among the cell's workers.
+    pub compaction_worker: bool,
 }
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
         Self { storage, activation_timeout: Duration::from_secs(30), watch_interval: Duration::from_millis(250), park_after: None,
-            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2 }
+            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false }
     }
 }
 
 struct LocalHolding { id: String, epoch: u64, last_touch: Instant }
-struct LocalSubscription { id: String, last_touch: Instant }
+struct LocalSubscription { id: String, last_touch: Instant, role: Role }
 
 pub struct NodeAgent {
     directory: Arc<dyn Directory>,
@@ -224,8 +226,48 @@ impl NodeAgent {
         self.stop_running(name).await;
         self.node.database_or_attach(name.to_owned(), configuration).await?
             .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the replica"))?;
-        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now() });
+        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), role: Role::Subscriber });
         Ok(Response::Subscribed { address: self.address.clone() })
+    }
+
+    /// Publishes a worker's compaction as the deployment's holder.
+    pub async fn publish_compaction(&self, name: &str, notification: &[u8]) -> Result<Response> {
+        use prost::Message;
+        if !self.holdings.lock().contains_key(name) { return Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node does not hold {name}"))); }
+        let notification = rtdb_format::log::proto::TriesAdded::decode(notification).map_err(|error| Anomaly::incorrect("rtdb.multi/compaction", error.to_string()))?;
+        let position = self.node.catalog().database(name)?.publish_compaction(notification, &CancellationToken::new()).await?;
+        Ok(Response::Published { position: position.0 })
+    }
+
+    /// A compaction worker opens, as a compacting replica, every held deployment that ranks it first among the cell's live workers, and closes the rest.
+    async fn reconcile_compaction(&self) {
+        let (Ok(deployments), Ok(members)) = (self.directory.deployments().await, self.members().await) else { return };
+        let now = now_ms();
+        let workers: Vec<&MemberRecord> = members.values().filter(|member| member.pool == rtdb_directory::MemberPool::Compaction && member.is_live(now)).collect();
+        let me = self.member();
+        let mut wanted = BTreeMap::new();
+        for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Live && effective_holder(record, &members, now).is_some()) {
+            let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &workers, |member| member.id.as_str());
+            if ranked.first().is_some_and(|first| first.id == me) { wanted.insert(record.name.clone(), record.clone()); }
+        }
+        let current: Vec<(String, String)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role == Role::Compactor).map(|(name, subscription)| (name.clone(), subscription.id.clone())).collect();
+        for (name, id) in current {
+            if wanted.get(&name).is_none_or(|record| record.id != id) || self.node.catalog().database(&name).is_err() {
+                let turn = self.turn(&name);
+                let _turn = turn.lock().await;
+                self.stop_running(&name).await;
+            }
+        }
+        for (name, record) in wanted {
+            if self.subscriptions.lock().contains_key(&name) { continue; }
+            let turn = self.turn(&name);
+            let _turn = turn.lock().await;
+            let Ok(servers) = Self::servers(&record, &members) else { continue };
+            let configuration = database_config(&record, servers, &self.options.storage, Role::Compactor);
+            if let Ok(Some(_)) = self.node.database_or_attach(name.clone(), configuration).await {
+                self.subscriptions.lock().insert(name, LocalSubscription { id: record.id, last_touch: Instant::now(), role: Role::Compactor });
+            }
+        }
     }
 
     pub fn touch(&self, name: &str) {
@@ -253,7 +295,9 @@ impl NodeAgent {
             let over = self.options.max_active.is_some_and(|limit| rank >= limit);
             if draining || over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
         }
-        let subscribed: Vec<(String, String, Instant)> = self.subscriptions.lock().iter().map(|(name, subscription)| (name.clone(), subscription.id.clone(), subscription.last_touch)).collect();
+        if self.options.compaction_worker { self.reconcile_compaction().await; }
+        let subscribed: Vec<(String, String, Instant)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role == Role::Subscriber)
+            .map(|(name, subscription)| (name.clone(), subscription.id.clone(), subscription.last_touch)).collect();
         for (name, id, last_touch) in subscribed {
             let wanted = matches!(self.directory.deployment(&id).await, Ok(Some(record)) if record.lifecycle == Lifecycle::Live && record.read_width > 1);
             if draining || !wanted || last_touch.elapsed() >= self.options.unsubscribe_after || self.node.catalog().database(&name).is_err() {
@@ -292,6 +336,7 @@ impl Handler for NodeAgent {
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
             Request::Subscribe { name } => self.subscribe(&name).await,
             Request::Flush { name } => self.flush(&name).await,
+            Request::PublishCompaction { name, notification } => self.publish_compaction(&name, &notification).await,
         };
         result.unwrap_or_else(|error| Response::refused(&error))
     }

@@ -14,5 +14,6 @@ pub mod lease;
 pub mod logs;
 pub mod packing;
 pub mod process;
+pub mod relay;
 pub mod session;
 pub mod store;

@@ -24,6 +24,8 @@ pub enum Role {
     Holder,
     /// A log-fed reader that never writes.
     Subscriber,
+    /// A log-fed reader that compacts, writing only compaction outputs and publishing them through the holder.
+    Compactor,
 }
 
 /// The logkeeper streams a deployment's database reads and writes, carried in its `DatabaseConfig`.
@@ -50,7 +52,7 @@ pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage:
     let storage = match storage {
         CellStorage::Local { root } => {
             let store = crate::store::CellStoreConfig { root: root.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
-                writer_epoch: (role == Role::Holder).then_some(record.epoch) };
+                writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor };
             database_config::Storage::RemoteStorage(RemoteStorage {
                 object_store: Some(prost_types::Any { type_url: format!("type.googleapis.com/{}", crate::store::CELL_STORAGE_TYPE), value: serde_json::to_vec(&store).expect("a store configuration serializes") }),
                 epoch: Some(0),
@@ -63,7 +65,7 @@ pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage:
             value: serde_json::to_vec(&log).expect("a log configuration serializes"),
         })),
         storage: Some(storage),
-        mode: match role { Role::Holder => None, Role::Subscriber => Some(1) },
+        mode: match role { Role::Holder => None, Role::Subscriber | Role::Compactor => Some(1) },
         ..Default::default()
     }
 }

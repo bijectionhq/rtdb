@@ -4242,6 +4242,7 @@ dependencies = [
  "bytes",
  "futures",
  "parking_lot",
+ "prost",
  "prost-types",
  "ring",
  "rtdb-affinity",

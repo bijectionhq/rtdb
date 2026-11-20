@@ -37,6 +37,9 @@ pub struct CellStoreConfig {
     pub deployment: String,
     /// The epoch a holder opened the store at; absent for a reader, which never writes.
     pub writer_epoch: Option<u64>,
+    /// A compaction worker's store, which may write compaction outputs and nothing else.
+    #[serde(default)]
+    pub compactor: bool,
 }
 
 pub struct CellStoreFactory {
@@ -60,9 +63,10 @@ impl RemoteStorageFactory for CellStoreFactory {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let encrypted = EncryptingStore::new(cached, &self.keys.key(&config.deployment)?)?;
-        let fence = match config.writer_epoch {
-            Some(epoch) => Fence::Writer { epoch, record: rtdb_directory::watch_deployment(Arc::clone(&self.directory), config.deployment.clone(), self.fence_interval) },
-            None => Fence::Reader,
+        let fence = match (config.writer_epoch, config.compactor) {
+            (Some(epoch), _) => Fence::Writer { epoch, record: rtdb_directory::watch_deployment(Arc::clone(&self.directory), config.deployment.clone(), self.fence_interval) },
+            (None, true) => Fence::Compactor,
+            (None, false) => Fence::Reader,
         };
         Ok(Arc::new(FencedStore { inner: Arc::new(encrypted), fence }))
     }
@@ -70,7 +74,14 @@ impl RemoteStorageFactory for CellStoreFactory {
 
 enum Fence {
     Writer { epoch: u64, record: watch::Receiver<Option<DeploymentRecord>> },
+    /// May write a compaction output, whose name its job fixes and whose effect waits on the holder's adoption.
+    Compactor,
     Reader,
+}
+
+/// Whether `key` is a compaction output: a trie data or metadata file above level 0.
+pub fn compaction_output(key: &str) -> bool {
+    key.starts_with("tables/") && (key.contains("/data/l") || key.contains("/meta/l")) && !key.contains("/data/l00-") && !key.contains("/meta/l00-")
 }
 
 pub struct FencedStore { inner: Arc<dyn ObjectStore>, fence: Fence }
@@ -79,6 +90,8 @@ impl FencedStore {
     fn check(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         match &self.fence {
             Fence::Reader => Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))),
+            Fence::Compactor if compaction_output(key.as_str()) => Ok(()),
+            Fence::Compactor => Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))),
             Fence::Writer { epoch, record } => match &*record.borrow() {
                 Some(current) if current.epoch != *epoch || current.lifecycle != Lifecycle::Live && current.lifecycle != Lifecycle::Quarantined =>
                     Err(Error::Deposed { epoch: *epoch, promised: current.epoch }),
@@ -97,7 +110,11 @@ impl ObjectStore for FencedStore {
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.check(key)?; self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.check(key)?; self.inner.put_file(key, source).await }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
-    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.check(key)?; self.inner.delete(key).await }
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        if matches!(self.fence, Fence::Compactor) { return Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))); }
+        self.check(key)?;
+        self.inner.delete(key).await
+    }
 }
 
 pub struct EncryptingStore { inner: Arc<dyn ObjectStore>, cipher: Cipher }

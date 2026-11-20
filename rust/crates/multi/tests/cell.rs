@@ -24,6 +24,7 @@ impl Cell {
     async fn start(nodes: usize, park_after: Option<Duration>) -> Self { Self::start_with(vec![MemberPool::General; nodes], park_after).await }
 
     async fn start_with(pools: Vec<MemberPool>, park_after: Option<Duration>) -> Self {
+        let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
         let directory: Arc<dyn Directory> = MemoryDirectory::new();
         let mut logkeepers = Vec::new();
@@ -41,7 +42,7 @@ impl Cell {
             running.push(Some(process::start_node(Arc::clone(&directory), process::NodeSettings {
                 configuration: NodeConfiguration::from_yaml("server:\n  port: 0\n").unwrap(), allocation_limit_bytes: 1 << 30,
                 control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), agent, lease: lease(), claim_wait: Duration::from_millis(20), pool,
-                keys, cache_dir: data.path().join(format!("cache-{index}")),
+                keys, cache_dir: data.path().join(format!("cache-{index}")), local_compaction: !compaction_workers,
             }).await.unwrap()));
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -382,6 +383,29 @@ async fn a_small_flush_writes_one_pack_and_its_catalog() {
     assert_eq!(objects.iter().filter(|path| path.contains("/tables/")).count(), 0, "no table file is its own object: {objects:#?}");
     let client = cell.connect("shop").await;
     assert_eq!(values(&client, "SELECT v FROM items").await, ["1"], "a packed block reads back after the park");
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compaction_worker_compacts_a_deployment_its_holder_does_not() {
+    let cell = Cell::start_with(vec![MemberPool::General, MemberPool::Compaction], None).await;
+    let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    for round in 0..6 {
+        client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({round}, {round})")).await.unwrap();
+        cell.node(0).agent.flush("shop").await.unwrap();
+    }
+    let rtdb_multi::deployment::CellStorage::Local { root } = cell.storage();
+    let compacted = || files_under(&root.join(record.storage_prefix())).iter().any(|path| { let path = path.to_string_lossy(); path.contains("/data/l") && !path.contains("/data/l00-") });
+    for _ in 0..200 {
+        if compacted() { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(compacted(), "the worker wrote compaction outputs");
+    assert_eq!(cell.node(1).agent.subscribed(), ["shop"], "the worker holds a compacting replica");
+    assert!(cell.node(1).agent.held().is_empty(), "and holds no deployment");
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["0", "1", "2", "3", "4", "5"]);
     drop(client);
     cell.stop().await;
 }
