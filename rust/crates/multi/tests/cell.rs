@@ -827,3 +827,38 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
     drop(fork);
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_publishes_and_trims_only_after_adopting_a_block_from_its_own_log() {
+    use rtdb_storage::log::{Log, LogOffset};
+
+    let cell = Cell::start_watching(vec![rtdb_directory::MemberPool::General], None, Some(Duration::from_secs(60))).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let parent = cell.connect("shop").await;
+    for id in 0..8 {
+        parent.simple_query(&format!("INSERT INTO orders (_id) VALUES ({id})")).await.unwrap();
+    }
+    let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    let preview = cell.connect("shop-preview").await;
+    preview.simple_query("INSERT INTO orders (_id) VALUES (8)").await.unwrap();
+    let holder = cell.holder("shop-preview").await.unwrap();
+    let agent = &cell.node(holder).agent;
+    agent.reconcile().await;
+    assert!(cell.directory.deployment(&child.id).await.unwrap().unwrap().checkpoint.is_none());
+    let members: std::collections::BTreeMap<_, _> = cell.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
+    let servers = child.ensemble.iter().map(|id| members[id].address.clone()).collect();
+    let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
+        write_quorum: 2, servers, stream: child.stream("replica"), maximum_message_bytes: 4 << 20,
+    }, Default::default()).await.unwrap();
+    assert_eq!(reader.read_range(LogOffset(0), LogOffset(1)).await.unwrap().len(), 1);
+
+    agent.flush("shop-preview").await.unwrap();
+    agent.reconcile().await;
+    let checkpoint = cell.directory.deployment(&child.id).await.unwrap().unwrap().checkpoint.unwrap();
+    assert!(checkpoint.boundary > 0 && checkpoint.source >= 0);
+    assert!(matches!(reader.read_range(LogOffset(0), LogOffset(1)).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })));
+    assert_eq!(reader.read_range(LogOffset(checkpoint.boundary), LogOffset(checkpoint.boundary + 1)).await.unwrap().len(), 1);
+    assert_eq!(values(&preview, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5", "6", "7", "8"]);
+    drop((parent, preview));
+    cell.stop().await;
+}

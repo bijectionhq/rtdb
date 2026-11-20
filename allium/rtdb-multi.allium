@@ -6,7 +6,6 @@
 -- Every cost a deployment imposes is proportional to its activity and its stored bytes; a deployment nobody is using is a directory record and objects in storage.
 --
 -- Status: target design, ahead of the implementation.
--- Nothing in this spec is implemented yet.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
 -- Where this spec and an existing spec describe the same mechanism, the existing spec describes the code as it stands and this one describes where it is going:
 --   - election and the term fence: log-processor-lifecycle.allium
@@ -415,6 +414,7 @@ contract LogService {
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
+        -- The boundary must belong to this deployment's log, including when its first readable block came from a parent.
         -- A physical segment is reclaimed once every deployment's records in it are trimmed.
         -- A deployment whose tail pins a segment past log_max_retention is force-flushed (FlushOnRetention).
 
