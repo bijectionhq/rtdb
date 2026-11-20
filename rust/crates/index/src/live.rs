@@ -254,15 +254,18 @@ impl LiveTable {
     /// stay small, so a table written a row per transaction is read from chunks of up to `MERGED_CHUNK_ROWS` rows.
     /// Chunks keep their row addresses, since a merged chunk starts where the earlier one did.
     fn merge_small_chunks(&mut self) -> Result<()> {
-        const MERGED_CHUNK_ROWS: usize = 1024;
+        const MERGED_CHUNK_ROWS: usize = 8192;
         while let [.., (start, previous), (_, last)] = self.chunks.as_slice() {
             if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
             let schema = previous.arrow().schema();
             let budget = Arc::clone(previous.owned.reservation().budget());
             let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_add(4096))
                 .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
-            let reservation = budget.reserve(bound)?;
+            let mut reservation = budget.reserve(bound)?;
             let merged = arrow_select::concat::concat_batches(&schema, [previous.arrow(), last.arrow()]).map_err(invalid)?;
+            // Concatenating a dense union sizes every leg for all of its rows, so the merge can outgrow its inputs.
+            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
+            lease.grow_to(lease.bytes().max(merged.get_array_memory_size()))?;
             let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
             let start = *start;
             self.chunks.truncate(self.chunks.len() - 2);
@@ -679,13 +682,13 @@ mod chunk_tests {
         let memory = MemoryBudget::new(1 << 26);
         let table = TableRef::new("public", "docs");
         let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
-        for id in 0..2000i64 {
+        for id in 0..10_000i64 {
             let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::F64(id as f64))])), recency: None };
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id)).unwrap();
         }
-        assert!(live.chunks.len() <= 16, "{} chunks", live.chunks.len());
-        for id in [0u32, 1, 1023, 1024, 1999] {
+        assert!(live.chunks.len() <= 8, "{} chunks", live.chunks.len());
+        for id in [0u32, 1, 1023, 1024, 8191, 8192, 9999] {
             assert_eq!(live.row(id).unwrap().header().unwrap().system_from, Timestamp(i64::from(id)));
         }
     }
@@ -694,6 +697,22 @@ mod chunk_tests {
         let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])), recency: None };
         TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), memory).unwrap()))
+    }
+
+    #[test]
+    fn chunks_of_a_column_written_at_several_widths_merge_within_their_charge() {
+        let memory = MemoryBudget::new(1 << 28);
+        let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+        for tx in 0..128i64 {
+            let events = (tx * 64..tx * 64 + 64).map(|n| {
+                let id = match (n - tx * 64) % 3 { 0 => Value::I16(n as i16), 1 => Value::I32(n as i32), _ => Value::I64(n) };
+                StoredEvent { iid: EntityId::Integer(n).iid(), system_from: Timestamp(tx), valid_time: Interval::ALL,
+                    operation: StoredOperation::Put(StructFields::from([("_id".into(), id), ("sku".into(), Value::Utf8(format!("sku-{n}")))])), recency: None }
+            }).collect::<Vec<_>>();
+            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap())), Timestamp(tx)).unwrap();
+        }
+        assert!(live.chunks.len() <= 4, "{} chunks", live.chunks.len());
+        assert_eq!(live.row_count, 8192);
     }
 
     #[test]
