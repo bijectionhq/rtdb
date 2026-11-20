@@ -31,6 +31,78 @@ impl StoredEvent {
     }
 }
 
+/// An event an event batch encodes: its header and recency, and the cells of its put document.
+pub trait EncodedEvent {
+    fn header(&self) -> EventHeader;
+    fn recency(&self) -> Option<Timestamp>;
+    /// Whether every column the event's put document holds is among `fields`.
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool;
+    /// The put document's `name` cell under the column type `ty`, as `struct_field_cell` takes it of the decoded document.
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>>;
+}
+
+impl EncodedEvent for StoredEvent {
+    fn header(&self) -> EventHeader { StoredEvent::header(self) }
+    fn recency(&self) -> Option<Timestamp> { self.recency }
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool {
+        match &self.operation { StoredOperation::Put(document) => document.keys().all(|name| fields.contains_key(name)), _ => true }
+    }
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
+        match &self.operation {
+            StoredOperation::Put(document) => Ok(std::borrow::Cow::Borrowed(struct_field_cell(document, name, ty))),
+            _ => Err(invalid("Only a put event has document cells")),
+        }
+    }
+}
+
+/// An event read in place from its page: its header and recency, and the offset of its document in the page's put leg,
+/// whose cells it reads only as an event batch encodes them.
+#[derive(Clone, Debug)]
+pub struct PageEvent {
+    page: Arc<EventPage>,
+    offset: usize,
+    pub iid: Iid,
+    pub system_from: Timestamp,
+    pub valid_time: Interval,
+    pub op: EventOp,
+    pub recency: Option<Timestamp>,
+}
+
+#[derive(Debug)]
+struct EventPage { put: Option<(arrow_array::StructArray, arrow_schema::Fields, StructFields<LogicalType>)> }
+
+impl PageEvent {
+    /// The bytes the event's document decodes to at most, which encoding its cells may hold at once.
+    pub fn document_bytes(&self) -> Result<usize> {
+        match (&self.page.put, self.op) {
+            (Some((array, fields, _)), EventOp::Put) => fields.iter().enumerate().try_fold(0usize, |bytes, (index, field)| {
+                bytes.checked_add(rtdb_columnar::estimate_read_cell_bytes(field, array.column(index).as_ref(), self.offset)?).ok_or_else(event_size)
+            }),
+            _ => Ok(0),
+        }
+    }
+}
+
+impl EncodedEvent for PageEvent {
+    fn header(&self) -> EventHeader { EventHeader { iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: self.op } }
+    fn recency(&self) -> Option<Timestamp> { self.recency }
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool {
+        match (&self.page.put, self.op) { (Some((_, columns, _)), EventOp::Put) => columns.iter().all(|column| fields.contains_key(column.name())), _ => true }
+    }
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
+        let (Some((array, fields, types)), EventOp::Put) = (&self.page.put, self.op) else { return Err(invalid("Only a put event has document cells")) };
+        // As reading the document struct does: a column it stores reads under its own type, and one it lacks falls back
+        // as `struct_field_cell` falls back for a key the document has no value for.
+        Ok(std::borrow::Cow::Owned(match fields.iter().position(|field| field.name() == name) {
+            Some(index) => match types.get(name).ok_or_else(|| invalid("Put column has no logical type"))? {
+                LogicalType::Nothing => Value::Undefined,
+                stored => rtdb_columnar::read_value_as(stored, &fields[index], array.column(index).as_ref(), self.offset)?,
+            },
+            None => match ty { LogicalType::Nothing => Value::Undefined, _ => Value::Null },
+        }))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EventBatch {
     batch: RecordBatch,
@@ -78,6 +150,26 @@ impl EventBatch {
     }
 
     pub fn arrow(&self) -> &RecordBatch { &self.batch }
+    /// The page's events read in place, each reading its document's cells only as an event batch encodes them.
+    pub fn page_events(&self) -> Result<Vec<PageEvent>> {
+        let union = self.operations()?;
+        let DataType::Union(legs, _) = union.data_type() else { return Err(invalid("Missing operation union fields")); };
+        let put = match legs.iter().find(|(_, leg)| leg.name() == "put") {
+            Some((id, leg)) => {
+                let array = union.child(id).as_any().downcast_ref::<arrow_array::StructArray>().ok_or_else(|| invalid("Put operations must contain document structs"))?.clone();
+                let DataType::Struct(fields) = leg.data_type() else { return Err(invalid("Put operations must contain document structs")) };
+                let LogicalType::Struct(types) = rtdb_columnar::from_field(leg)? else { return Err(invalid("A put operation must contain a document struct")) };
+                Some((array, fields.clone(), types))
+            }
+            None => None,
+        };
+        let page = Arc::new(EventPage { put });
+        (0..self.len()).map(|row| {
+            let header = self.header(row)?;
+            Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), iid: header.iid, system_from: header.system_from, valid_time: header.valid_time,
+                op: header.op, recency: self.recency.map(|index| self.timestamp(index, row)).transpose()? })
+        }).collect()
+    }
     /// The dense union of each row's operation, whose put leg holds its document.
     pub fn operations(&self) -> Result<&UnionArray> {
         self.batch.column(self.op).as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Event operation array type changed"))
@@ -168,25 +260,26 @@ pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<StructFields
 }
 
 /// A batch has a `put` leg when it holds a put or declares document columns, as the reference's relation gains one.
-fn event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>, put_leg: PutLeg) -> Result<RecordBatch> {
+fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>, put_leg: PutLeg) -> Result<RecordBatch> {
     let mut puts = Vec::new();
     let mut deletes = 0usize;
     let mut erases = 0usize;
     let mut ids = Vec::with_capacity(events.len());
     let mut offsets = Vec::with_capacity(events.len());
-    let put_fields = put_fields.filter(|fields| !fields.is_empty() || events.iter().any(|event| matches!(event.operation, StoredOperation::Put(_))));
+    let put_fields = put_fields.filter(|fields| !fields.is_empty() || events.iter().any(|event| event.header().op == EventOp::Put));
     let has_put = put_fields.is_some();
     let (put_id, delete_id, erase_id) = match (has_put, put_leg) { (true, PutLeg::First) => (0, 1, 2), (true, PutLeg::Last) => (2, 0, 1), (false, _) => (0, 0, 1) };
-    for event in events {
-        let (id, offset) = match &event.operation {
-            StoredOperation::Put(document) => {
+    let headers: Vec<EventHeader> = events.iter().map(EncodedEvent::header).collect();
+    for (event, header) in events.iter().zip(&headers) {
+        let (id, offset) = match header.op {
+            EventOp::Put => {
                 if !has_put { return Err(invalid("Put event has no declared put schema")); }
                 let offset = puts.len();
-                puts.push(document);
+                puts.push(event);
                 (put_id, offset)
             }
-            StoredOperation::Delete => { let offset = deletes; deletes += 1; (delete_id, offset) }
-            StoredOperation::Erase => { let offset = erases; erases += 1; (erase_id, offset) }
+            EventOp::Delete => { let offset = deletes; deletes += 1; (delete_id, offset) }
+            EventOp::Erase => { let offset = erases; erases += 1; (erase_id, offset) }
         };
         ids.push(id);
         offsets.push(i32::try_from(offset).map_err(invalid)?);
@@ -201,7 +294,7 @@ fn event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalTy
     }
     let op_fields = UnionFields::new(0..op_fields.len() as i8, op_fields);
     let op: ArrayRef = Arc::new(UnionArray::try_new(op_fields.clone(), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
-    let iids: Vec<_> = events.iter().map(|event| event.iid).collect();
+    let iids: Vec<_> = headers.iter().map(|header| header.iid).collect();
     let iids = build_iids(&iids, iid_encoding)?;
     let time_type = DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()));
     let mut fields = vec![
@@ -212,35 +305,35 @@ fn event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalTy
         Field::new("op", DataType::Union(op_fields, UnionMode::Dense), false),
     ];
     let times = |values: Vec<i64>| Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
-    let mut columns = vec![iids, times(events.iter().map(|event| event.system_from.0).collect()),
-        times(events.iter().map(|event| event.valid_time.lower().0).collect()), times(events.iter().map(|event| event.valid_time.upper().0).collect()), op];
-    if events.iter().any(|event| event.recency.is_some()) {
-        let recencies = events.iter().map(|event| event.recency.map(|time| time.0).ok_or_else(|| invalid("Mixed recency presence in one event batch"))).collect::<Result<Vec<_>>>()?;
+    let mut columns = vec![iids, times(headers.iter().map(|header| header.system_from.0).collect()),
+        times(headers.iter().map(|header| header.valid_time.lower().0).collect()), times(headers.iter().map(|header| header.valid_time.upper().0).collect()), op];
+    if events.iter().any(|event| event.recency().is_some()) {
+        let recencies = events.iter().map(|event| event.recency().map(|time| time.0).ok_or_else(|| invalid("Mixed recency presence in one event batch"))).collect::<Result<Vec<_>>>()?;
         fields.push(Field::new("_recency", time_type, false));
         columns.push(times(recencies));
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)
 }
 
-fn put_columns(
-    documents: &[&StructFields<Value>],
+fn put_columns<E: EncodedEvent>(
+    documents: &[&E],
     fields: StructFields<LogicalType>,
     copy: bool,
     mut builder: Option<&mut BatchBuilder>,
 ) -> Result<ArrayRef> {
-    if documents.iter().any(|doc| doc.keys().any(|name| !fields.contains_key(name))) {
+    if documents.iter().any(|doc| !doc.put_within(&fields)) {
         return Err(Anomaly::incorrect("rtdb/column-type-mismatch", "Document has a field outside its declared layout"));
     }
     let mut schema = Vec::with_capacity(fields.len());
     let mut columns = Vec::with_capacity(fields.len());
     for (name, ty) in fields {
-        let values = || documents.iter().map(|doc| struct_field_cell(doc, &name, &ty));
+        let cells = documents.iter().map(|doc| doc.put_cell(&name, &ty)).collect::<Result<Vec<_>>>()?;
         let build = || {
-            let values = values().cloned().collect::<Vec<_>>();
+            let values = cells.iter().map(|cell| cell.as_ref().clone()).collect::<Vec<_>>();
             if copy { copy_array(&ty, &values) } else { build_array(&ty, &values) }
         };
         let column = match builder.as_deref_mut() {
-            Some(builder) => builder.column(estimate_builder_bytes_refs(&ty, values())?, build)?,
+            Some(builder) => builder.column(estimate_builder_bytes_refs(&ty, cells.iter().map(|cell| cell.as_ref()))?, build)?,
             None => build()?,
         };
         schema.push(Arc::new(to_field(&name, &ty)?));
@@ -259,8 +352,13 @@ pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<
     event_batch_with_recency(events, put_fields, iid_encoding, recency, true)
 }
 
-fn event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
-    if events.iter().any(|event| event.recency.is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
+/// As `copy_event_batch_with_recency`, for events of any kind that encode their own cells.
+pub fn copy_encoded_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, true)
+}
+
+fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
+    if events.iter().any(|event| event.recency().is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
     let batch = event_batch(events, put_fields, iid_encoding, copy, None, PutLeg::First)?;
     if recency && events.is_empty() {
         let mut fields = batch.schema().fields().to_vec();

@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{data::{EventBatch, StoredEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::MetadataBuilder};
+use rtdb_format::{data::{EventBatch, PageEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::MetadataBuilder};
 use rtdb_types::{Iid, LogicalType, Result, RunEndWidth, Timestamp};
 use tokio_util::sync::CancellationToken;
 use super::{MergeConfig, MergeFile, OutputSchema, check_disk, create_file, disk_remaining, event_reservation, limit_writer, open_input, read_page, row_bytes};
@@ -46,7 +46,7 @@ struct FinalWriter<'a> {
 }
 
 impl FinalWriter<'_> {
-    fn leaf(&mut self, events: &[StoredEvent]) -> Result<usize> {
+    fn leaf(&mut self, events: &[PageEvent]) -> Result<usize> {
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
         let _batch = event_reservation(self.memory, events, 8)?;
         let batch = self.schema.batch(events)?;
@@ -66,7 +66,7 @@ impl FinalWriter<'_> {
         Ok(leaf)
     }
 
-    fn rows(&mut self, events: &[StoredEvent], depth: usize, page_size: usize) -> Result<usize> {
+    fn rows(&mut self, events: &[PageEvent], depth: usize, page_size: usize) -> Result<usize> {
         if events.is_empty() { return self.metadata.write_nil(); }
         if events.len() <= page_size || depth == 64 || events.first().map(|event| event.iid) == events.last().map(|event| event.iid) { return self.leaf(events); }
         let mut children = [None; 4];
@@ -108,12 +108,12 @@ impl FinalWriter<'_> {
     }
 }
 
-fn read_events(reader: &mut ArrowFile, leaf: &Leaf, memory: &Arc<MemoryBudget>) -> Result<(Vec<StoredEvent>, Arc<MemoryReservation>)> {
+fn read_events(reader: &mut ArrowFile, leaf: &Leaf, memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Arc<MemoryReservation>)> {
     let batch = read_page(reader, leaf.page, memory)?;
     let charge = memory.reserve(super::decoded_bound(batch.batch())?)?;
-    let events = EventBatch::new(batch.batch().clone())?;
+    let events = EventBatch::new(batch.batch().clone())?.page_events()?;
     if events.len() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
-    Ok(((0..events.len()).map(|row| events.read_event(row)).collect::<Result<_>>()?, charge))
+    Ok((events, charge))
 }
 
 struct Level { depth: usize, current: usize, children: [Option<usize>; 4] }
@@ -121,7 +121,7 @@ enum Open { Rows, Entity(Vec<(Timestamp, usize)>) }
 struct StreamingTrie {
     spine: Vec<Level>,
     open: Open,
-    rows: Vec<StoredEvent>,
+    rows: Vec<PageEvent>,
     charges: Vec<Arc<MemoryReservation>>,
     start_depth: usize,
     page_size: usize,
@@ -201,7 +201,7 @@ impl StreamingTrie {
         Ok(())
     }
 
-    fn add(&mut self, event: StoredEvent, output: &mut FinalWriter<'_>) -> Result<()> {
+    fn add(&mut self, event: PageEvent, output: &mut FinalWriter<'_>) -> Result<()> {
         if let Some(index) = self.spine.iter().position(|level| usize::from(bucket(event.iid, level.depth)) != level.current) {
             let child = self.close_open(output)?;
             let level = self.spine.last_mut().ok_or_else(|| crate::invalid("Missing IID trie level"))?;
