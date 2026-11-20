@@ -167,14 +167,22 @@ async fn located(bucket: &dyn ObjectStore, store: &str, base: &Base, name: &str)
     Ok(holds(bucket, owner, name).await?.then(|| format!("{owner}/{name}")))
 }
 
+/// The block a trie file's name ends in.
+fn trie_block(name: &str) -> Option<i64> {
+    if !name.starts_with("tables/") || !(name.contains("/data/") || name.contains("/meta/")) { return None; }
+    let stem = name.rsplit('/').next()?.strip_suffix(".arrow")?;
+    stem.parse::<rtdb_format::keys::TrieKey>().ok().map(|trie| trie.block_index().0)
+}
+
 /// Forks the deployment at `parent` (a prefix in the cell's bucket) into `child`, referencing every object the parent's stores hold or reference, or, from a past block, those it may need.
-/// A past block's packs are the ones its own pack names, and its releases those before it was written; every other object is referenced too, since sealing makes anything the fork writes again the same bytes.
+/// A past block's packs are the ones its own pack names, its releases those before it was written, and its trie files those of blocks up to it; every other object is referenced too, since sealing makes anything the fork writes again the same bytes.
+/// A trie file of a later block is the parent's history after the fork point, under a name the fork's own compaction writes with its own rows.
 pub async fn fork(bucket: &dyn ObjectStore, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
-    let past = match at_block { Some(block) => Some((block_packs(bucket, parent, block).await?, written_at_ms(bucket, parent, block).await?)), None => None };
+    let past = match at_block { Some(block) => Some((block, block_packs(bucket, parent, block).await?, written_at_ms(bucket, parent, block).await?)), None => None };
     let wanted = |name: &str| match &past {
         None => true,
-        Some((packs, _)) if name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY)) => packs.contains(name),
-        Some((_, written)) => crate::store::garbage_released_at(name).is_none_or(|released| released <= *written),
+        Some((_, packs, _)) if name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY)) => packs.contains(name),
+        Some((block, _, written)) => trie_block(name).is_none_or(|trie| trie <= *block) && crate::store::garbage_released_at(name).is_none_or(|released| released <= *written),
     };
     for store in stores(bucket, parent).await? {
         let version = store.rsplit('/').next().expect("a store has a version").to_owned();
@@ -311,6 +319,21 @@ mod tests {
         let referenced: Vec<String> = Base::load(bucket.as_ref(), "c/v06").await.unwrap().objects.into_keys().collect();
         assert_eq!(referenced, ["tables/t/data/l01-compacted.arrow".to_owned(), format!("{}/{:020}-early", crate::store::GARBAGE_DIRECTORY, 500), pack(0)],
             "a later block's pack and a release after the block are left out; everything else is referenced");
+    }
+
+    #[tokio::test]
+    async fn a_fork_at_a_past_block_leaves_out_the_trie_files_of_later_blocks_and_writes_its_own() {
+        let bucket = bucket();
+        let clock = crate::store::stamps(|| 1_000);
+        let parent = crate::store::open_deployment_store(Arc::clone(&bucket), "p/v06", crate::packing::PackDiscovery::List, Arc::clone(&clock)).await.unwrap();
+        for block in 0..2 { parent.put(&key(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block)).unwrap()).unwrap(), Bytes::from_static(b"catalog")).await.unwrap(); }
+        for (name, bytes) in [("tables/t/data/l01-rc-b00.arrow", b"parent's b00"), ("tables/t/data/l01-rc-b01.arrow", b"parent's b01")] { parent.put(&key(name).unwrap(), Bytes::from_static(bytes)).await.unwrap(); }
+        fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
+        let child = crate::store::open_deployment_store(Arc::clone(&bucket), "c/v06", crate::packing::PackDiscovery::List, clock).await.unwrap();
+        let listed: Vec<String> = child.list(Some(&key("tables").unwrap())).await.unwrap().into_iter().map(|object| object.key.as_str().to_owned()).collect();
+        assert_eq!(listed, ["tables/t/data/l01-rc-b00.arrow"], "a compaction output of a block after the fork point is not the fork's");
+        child.put(&key("tables/t/data/l01-rc-b01.arrow").unwrap(), Bytes::from_static(b"child's b01")).await.unwrap();
+        assert_eq!(child.get(&key("tables/t/data/l01-rc-b01.arrow").unwrap()).await.unwrap().as_ref(), b"child's b01", "and the fork's own compaction writes its own under that name");
     }
 
     #[tokio::test]
