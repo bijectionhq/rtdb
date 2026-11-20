@@ -51,6 +51,7 @@ Update this section as work lands.
 
 - A promotion that inherited a flushed block reopened its source tail behind the flush and stopped with "Source reader did not advance" (`ReplicationDriver::promote`); it affected classic failover too.
 - A planned move whose target died afterwards left a move intent no node could ever satisfy.
+- A recovery that died part-way through copying its history onto a server left that server unsynced, so the next recovery could prefer a staler server and lose committed entries (`StreamState::overwrite`, found by the simulation).
 
 ## 1. Ground rules
 

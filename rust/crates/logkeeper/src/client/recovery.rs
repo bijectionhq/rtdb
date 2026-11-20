@@ -84,6 +84,31 @@ mod tests {
     }
 
     #[test]
+    fn a_server_partly_copied_by_a_dead_recovery_still_wins_over_a_staler_one() {
+        use crate::protocol::{Entry, ResponseBody};
+        use crate::server::state::StreamState;
+        let entry = |lsn: i64| Entry { lsn, epoch: 1, timestamp: lsn, payload: Default::default() };
+        let sealed = |state: &mut StreamState, epoch: u64| match state.seal(epoch).reply { ResponseBody::Sealed(sealed) => sealed, other => panic!("{other:?}") };
+        let synced_at_1 = |lsns: std::ops::RangeInclusive<i64>| {
+            let mut state = StreamState::default();
+            state.seal(1);
+            state.overwrite(1, 0, Vec::new(), true, -1);
+            state.append(1, 0, lsns.map(entry).collect(), -1);
+            state
+        };
+        // Epoch 1 committed lsns 0..=3 on `a` and `c`; `c` also holds 4 and 5, and `b` lags at 0.
+        let (mut a, mut b, mut c) = (synced_at_1(0..=3), synced_at_1(0..=0), synced_at_1(0..=5));
+        let (from_a, from_c) = (sealed(&mut a, 2), sealed(&mut c, 2));
+        assert_eq!(winner(&[from_a.clone(), from_c.clone()]), 1);
+        let plan = plan_repair(&Holding::from(&from_a), &Holding::from(&from_c)).unwrap();
+        // Epoch 2 copies one chunk of `c`'s history onto `a`, then dies.
+        a.overwrite(2, plan.from, vec![entry(4)], false, -1);
+        let replies = [sealed(&mut a, 3), sealed(&mut b, 3)];
+        let history = Holding::from(&replies[winner(&replies)]);
+        assert!(history.last >= 3, "epoch 3 recovers everything committed, not only through {}", history.last);
+    }
+
+    #[test]
     fn an_identical_or_shorter_server_continues_from_its_end() {
         let history = holding(-1, 5, &[(0, 1), (3, 2)]);
         assert_eq!(plan_repair(&history, &history), Ok(RepairPlan { trim_through: None, from: 6 }));

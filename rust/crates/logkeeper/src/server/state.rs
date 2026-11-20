@@ -130,8 +130,8 @@ impl StreamState {
         if from <= self.last() { events.push(Event::Truncate(from)); }
         let last = from + entries.len() as i64 - 1;
         events.extend(entries.into_iter().map(Event::Append));
-        let synced = complete.then_some(epoch);
-        if synced != self.synced { events.push(Event::Synced(synced)); }
+        // A partial copy keeps the epoch the server was synced at: it still holds everything it held of that writer's committed history, so recovery must still count it as that writer's witness.
+        if complete && self.synced != Some(epoch) { events.push(Event::Synced(Some(epoch))); }
         if complete { events.extend(self.commit_event(commit, last)); }
         self.persist(events, Self::accepted)
     }
@@ -226,14 +226,14 @@ mod tests {
     }
 
     #[test]
-    fn an_overwrite_truncates_an_uncommitted_suffix_and_syncs_only_when_complete() {
+    fn an_overwrite_truncates_an_uncommitted_suffix_and_syncs_at_its_epoch_only_when_complete() {
         let mut state = synced(1);
         state.append(1, 0, vec![entry(0, 1), entry(1, 1), entry(2, 1)], 0);
         state.seal(2);
         assert!(matches!(reply(state.overwrite(2, 0, vec![entry(0, 2)], true, -1)), ResponseBody::Failed(_)), "never below commit");
         assert!(matches!(reply(state.overwrite(1, 1, Vec::new(), true, -1)), ResponseBody::Refused(_)), "never from a deposed writer");
         state.overwrite(2, 1, vec![entry(1, 1)], false, 1);
-        assert_eq!((state.last(), state.synced, state.commit), (1, None, 0), "a partial copy is unsynced and commits nothing");
+        assert_eq!((state.last(), state.synced, state.commit), (1, Some(1), 0), "a partial copy commits nothing and keeps the epoch the server was synced at");
         state.overwrite(2, 2, vec![entry(2, 2)], true, 2);
         assert_eq!((state.last(), state.synced, state.commit), (2, Some(2), 2));
         assert_eq!(state.runs(), vec![EpochRun { start_lsn: 0, epoch: 1 }, EpochRun { start_lsn: 2, epoch: 2 }]);

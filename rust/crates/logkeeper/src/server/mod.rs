@@ -1,7 +1,7 @@
 //! The logkeeper server: many named streams on one data directory, served over one multiplexed protocol.
 
 mod journal;
-mod state;
+pub(crate) mod state;
 mod store;
 
 use crate::protocol::{Request, RequestBody, Response, ResponseBody, read_frame, encode_frame};

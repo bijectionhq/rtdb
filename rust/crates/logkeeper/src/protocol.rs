@@ -82,7 +82,7 @@ pub(crate) struct Fetch {
 }
 
 /// Truncates at `from_lsn` and appends `entries`.
-/// `complete` claims the server now holds the writer's whole history up to its last entry, marking it synced at `epoch`; until then it is unsynced.
+/// `complete` claims the server now holds the writer's whole history up to its last entry, marking it synced at `epoch`; until then it stays synced at whatever epoch it was.
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Overwrite {
     #[prost(string, tag = "1")]
