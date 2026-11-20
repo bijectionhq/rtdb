@@ -66,6 +66,8 @@ pub struct PageEvent {
     pub valid_time: Interval,
     pub op: EventOp,
     pub recency: Option<Timestamp>,
+    /// `document_bytes`, once asked for, since compaction charges an event's document at each stage it passes.
+    bytes: std::sync::OnceLock<usize>,
 }
 
 #[derive(Debug)]
@@ -74,12 +76,14 @@ struct EventPage { put: Option<(arrow_array::StructArray, arrow_schema::Fields, 
 impl PageEvent {
     /// The bytes the event's document decodes to at most, which encoding its cells may hold at once.
     pub fn document_bytes(&self) -> Result<usize> {
-        match (&self.page.put, self.op) {
+        if let Some(bytes) = self.bytes.get() { return Ok(*bytes); }
+        let bytes = match (&self.page.put, self.op) {
             (Some((array, fields, _)), EventOp::Put) => fields.iter().enumerate().try_fold(0usize, |bytes, (index, field)| {
                 bytes.checked_add(rtdb_columnar::estimate_read_cell_bytes(field, array.column(index).as_ref(), self.offset)?).ok_or_else(event_size)
-            }),
-            _ => Ok(0),
-        }
+            })?,
+            _ => 0,
+        };
+        Ok(*self.bytes.get_or_init(|| bytes))
     }
 }
 
@@ -167,7 +171,7 @@ impl EventBatch {
         (0..self.len()).map(|row| {
             let header = self.header(row)?;
             Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), iid: header.iid, system_from: header.system_from, valid_time: header.valid_time,
-                op: header.op, recency: self.recency.map(|index| self.timestamp(index, row)).transpose()? })
+                op: header.op, recency: self.recency.map(|index| self.timestamp(index, row)).transpose()?, bytes: std::sync::OnceLock::new() })
         }).collect()
     }
     /// The dense union of each row's operation, whose put leg holds its document.
