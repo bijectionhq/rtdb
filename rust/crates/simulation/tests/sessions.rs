@@ -17,6 +17,8 @@ fn sweep(seeds: std::ops::Range<u64>, steps: usize) -> Summary {
         total.unknown += summary.unknown;
         total.failed += summary.failed;
         total.faults += summary.faults;
+        total.greeting_faults += summary.greeting_faults;
+        total.prepared_reads += summary.prepared_reads;
         total.resent += summary.resent;
     }
     total
@@ -38,6 +40,7 @@ fn a_session_seed_replays_exactly() {
 fn sessions_over_failing_backends_run_every_command_at_most_once() {
     let total = sweep(0..300, 200);
     eprintln!("{total:?}");
+    assert!(total.greeting_faults > 10 && total.prepared_reads > 100, "{total:?}");
     assert!(total.resent > 1_000 && total.unknown > 1_000 && total.failed > 100, "the sweep resends, loses and refuses commands: {total:?}");
 }
 

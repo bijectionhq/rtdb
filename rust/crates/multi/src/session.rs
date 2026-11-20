@@ -103,6 +103,7 @@ pub struct Session {
     status: Status,
     /// The frames of the command sent since the session was last idle, kept until it is answered, so a refusal before it ran can resend it.
     pending: Vec<Frame>,
+    prepared_responses: usize,
     /// Whether any reply to the pending command has reached the client; once one has, the command is never resent.
     answered: bool,
     /// Whether the pending command went to a backend lost before any reply reached the client, so that it may have run there.
@@ -120,19 +121,27 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, std::time::Duration::from_millis(100));
-        Self { startup, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
     }
 
     /// Reconnects to the current holder, retrying through a failover: until the dead holder's lease expires, no other node may claim.
     async fn connect(&mut self) -> Result<Backend> {
-        let deadline = tokio::time::Instant::now() + RECONNECT_WITHIN;
-        loop {
-            match self.connect_once().await {
-                Ok(backend) => return Ok(backend),
-                Err(error) if tokio::time::Instant::now() >= deadline || error.category != AnomalyCategory::Unavailable && error.category != AnomalyCategory::Conflict => return Err(error),
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        let result = tokio::time::timeout(RECONNECT_WITHIN, async {
+            loop {
+                match self.connect_once().await {
+                    Ok(backend) => return Ok(backend),
+                    Err(error) if !matches!(error.category, AnomalyCategory::Unavailable | AnomalyCategory::Conflict) => return Err(error),
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                }
             }
-        }
+        }).await.unwrap_or_else(|_| Err(lost("timed out reconnecting to the holder")));
+        result.map_err(|error| {
+            if self.lost_unanswered {
+                lost(&format!("{}; the command's outcome is unknown", error.message.as_deref().unwrap_or(&error.code)))
+            } else {
+                error
+            }
+        })
     }
 
     async fn connect_once(&mut self) -> Result<Backend> {
@@ -140,13 +149,9 @@ impl Session {
         stream.write_all(&self.reconnection_startup()).await.map_err(io)?;
         let mut backend = Backend::new(stream, epoch);
         let mut replay = BytesMut::new();
-        // A statement the pending command itself parses is defined again when that command is resent, so it is not replayed here.
-        let resent: std::collections::BTreeSet<String> = self.pending.iter().filter(|frame| frame.tag == b'P').map(parse_name).collect();
-        let replayed: Vec<&Frame> = self.prepared.iter().filter(|(name, _)| !resent.contains(*name)).map(|(_, frame)| frame).collect();
-        for frame in &replayed { replay.extend_from_slice(&frame.encode()); }
-        if !replayed.is_empty() { replay.extend_from_slice(&Frame { tag: b'S', body: Bytes::new() }.encode()); }
-        // Swallow the backend's greeting, and the replies to the replayed statements, through to the last ReadyForQuery.
-        let mut ready_expected = 1 + usize::from(!replayed.is_empty());
+        for frame in self.prepared.values() { replay.extend_from_slice(&frame.encode()); }
+        if !replay.is_empty() { replay.extend_from_slice(&Frame { tag: b'S', body: Bytes::new() }.encode()); }
+        let mut ready_expected = 1 + usize::from(!replay.is_empty());
         let mut replayed = false;
         while ready_expected > 0 {
             let frame = backend.frames.recv().await.ok_or_else(|| lost("the new backend closed during its greeting"))?.map_err(io)?;
@@ -183,9 +188,9 @@ impl Session {
         let (client_read, mut client_write) = client.into_split();
         let (mut requests, client_reader) = pump(client_read);
         let mut backend = Some(Backend::new(first, first_epoch));
-        backend.as_mut().expect("just set").writer.write_all(&self.startup).await.map_err(io)?;
         enum Event { Request(Option<std::io::Result<Frame>>), Reply(Option<std::io::Result<Frame>>) }
         let outcome = async {
+            backend.as_mut().expect("just set").writer.write_all(&self.startup).await.map_err(io)?;
             loop {
                 let event = {
                     let Some(current) = backend.as_mut() else { break Ok(()) };
@@ -202,13 +207,19 @@ impl Session {
                             if let Some(current) = backend.as_mut() { let _ = current.writer.write_all(&request.encode()).await; }
                             break Ok(());
                         }
-                        // A request sent while idle starts a new command: the previous command's frames are no longer pending, and must not shape a reconnection's replay.
+                        if !self.greeting.done {
+                            backend.as_mut().expect("greeting backend").writer.write_all(&request.encode()).await.map_err(io)?;
+                            continue;
+                        }
+                        if request.tag == b'H' {
+                            backend.as_mut().expect("connected").writer.write_all(&request.encode()).await.map_err(io)?;
+                            continue;
+                        }
                         let starts = self.status == Status::Idle;
-                        if starts { self.pending.clear(); self.answered = false; self.lost_unanswered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
+                        if starts { self.answered = false; self.lost_unanswered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
                         if starts && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
                         if backend.is_none() { backend = Some(self.connect().await?); }
                         if starts { if let Some(key) = self.key.clone() { self.send_key(backend.as_mut().expect("connected"), &key).await?; } }
-                        self.remember(&request);
                         self.pending.push(request.clone());
                         self.status = Status::Busy;
                         let current = backend.as_mut().expect("connected");
@@ -217,6 +228,13 @@ impl Session {
                         }
                     }
                     Event::Reply(Some(Ok(frame))) => {
+                        if !self.greeting.done {
+                            self.greeting.observe(&frame, &mut self.authenticated);
+                            if self.greeting.done { self.status = Status::Idle; }
+                            client_write.write_all(&frame.encode()).await.map_err(io)?;
+                            if frame.tag == b'E' { break Ok(()); }
+                            continue;
+                        }
                         if self.swallowing > 0 {
                             // A key the backend did not take leaves the command unkeyed, and an unkeyed command is never resent.
                             if frame.tag == b'E' { self.key = None; }
@@ -237,13 +255,25 @@ impl Session {
                             break Err(lost("the holder went away during a command, and its successor refused the command part way: its outcome is unknown"));
                         }
                         self.answered = true;
-                        self.greeting.observe(&frame, &mut self.authenticated);
-                        if frame.tag == b'Z' {
-                            self.status = match frame.body.first() { Some(b'I') => Status::Idle, Some(b'T' | b'E') => Status::InTransaction, _ => Status::Busy };
+                        match frame.tag {
+                            b'1' | b'3' => self.confirm_prepared_change(frame.tag),
+                            b'Z' => {
+                                if let Some(end) = self.pending.iter().position(|request| matches!(request.tag, b'Q' | b'S')) {
+                                    self.pending.drain(..=end);
+                                }
+                                self.prepared_responses = 0;
+                                self.status = match frame.body.first() {
+                                    Some(b'I') if self.pending.is_empty() => Status::Idle,
+                                    Some(b'T' | b'E') => Status::InTransaction,
+                                    _ => Status::Busy,
+                                };
+                            }
+                            _ => {}
                         }
                         client_write.write_all(&frame.encode()).await.map_err(io)?;
                     }
                     Event::Reply(Some(Err(_)) | None) => {
+                        if !self.greeting.done { break Err(lost("the holder closed during session startup")); }
                         backend = None;
                         // A refusal whose ReadyForQuery never came is over with its backend: the resent command's replies are the client's.
                         self.discarding = false;
@@ -284,13 +314,17 @@ impl Session {
         Ok(())
     }
 
-    fn remember(&mut self, request: &Frame) {
-        match request.tag {
-            b'P' => {
+    fn confirm_prepared_change(&mut self, response: u8) {
+        let Some((position, request)) = self.pending.iter().enumerate().skip(self.prepared_responses)
+            .take_while(|(_, request)| !matches!(request.tag, b'Q' | b'S'))
+            .find(|(_, request)| matches!(request.tag, b'P' | b'C')) else { return };
+        self.prepared_responses = position + 1;
+        match (response, request.tag) {
+            (b'1', b'P') => {
                 let name = parse_name(request);
                 if !name.is_empty() { self.prepared.insert(name, request.clone()); }
             }
-            b'C' if request.body.first() == Some(&b'S') => {
+            (b'3', b'C') if request.body.first() == Some(&b'S') => {
                 let name = request.body[1..].split(|byte| *byte == 0).next().map(|name| String::from_utf8_lossy(name).into_owned()).unwrap_or_default();
                 self.prepared.remove(&name);
             }

@@ -1,7 +1,7 @@
 //! A deterministic simulation of gateway sessions over backends that fail: the real `session::Session` splices a client to stub backends over loopback TCP, through a `Router` that hands out a new backend on each reconnection.
 //!
-//! The backends are stubs that speak just enough pgwire (startup, `SET rtdb_idempotency_key`, simple queries, their replies) over one shared deployment state, with the node's deduplication: a command's transactions are keyed `key/0`, `key/1`, ..., and a key already committed commits nothing and is answered as the original.
-//! At seeded moments a backend dies before executing a statement, after executing it and before replying, between replies, or while idle, or refuses with the not-held error before executing.
+//! The backends are stubs that speak just enough pgwire (startup, `SET rtdb_idempotency_key`, simple queries and a named prepared read) over one shared deployment state, with the node's deduplication: a command's transactions are keyed `key/0`, `key/1`, ..., and a key already committed commits nothing and is answered as the original.
+//! At seeded moments a backend dies before executing a statement, after executing it and before replying, between replies, during its greeting or while idle, or refuses with the not-held error before executing.
 //!
 //! Every action is sequenced: the client sends a command only once the previous one is answered, a backend acts only on the frame it was sent, and a backend that dies half-closes and drains, so no read races a reset.
 //! Each backend draws from its own generator, seeded by the run's seed and the order it was connected in, so the schedule is a function of the seed although the client, the gateway and the backends are separate tasks.
@@ -61,6 +61,8 @@ pub struct Summary {
     pub failed: usize,
     /// Backends that died or refused.
     pub faults: usize,
+    pub greeting_faults: usize,
+    pub prepared_reads: usize,
     /// Keys sent to more than one backend: commands the gateway resent.
     pub resent: usize,
 }
@@ -82,6 +84,7 @@ struct Shared {
     idle_death: Option<(bool, u64)>,
     trace: VecDeque<String>,
     faults: usize,
+    greeting_faults: usize,
 }
 
 type World = Arc<Mutex<Shared>>;
@@ -143,6 +146,9 @@ async fn pair(listener: &TcpListener, far_resets: bool) -> std::io::Result<(TcpS
 
 const UPDATE: &str = "UPDATE counters SET n = n + 1 WHERE id = ";
 const SELECT: &str = "SELECT n FROM counters WHERE id = ";
+const PREPARE: &[u8] = b"sim_read\0SELECT n FROM counters WHERE id = $1\0\0\0";
+const BIND_PREFIX: &[u8] = b"\0sim_read\0\0\x01\0\x01\0\x01\0\0\0\x08";
+const SYNC: u8 = b'S';
 
 /// One backend's session: its key and transaction, as a node's pgwire session keeps them.
 struct Backend {
@@ -153,6 +159,7 @@ struct Backend {
     transaction: Option<Vec<u64>>,
     failed: bool,
     holder: bool,
+    initial: bool,
 }
 
 /// How a backend fails the command it was just sent: at which of its events (executing statement i is event 2i, replying to it 2i + 1, ReadyForQuery the last), by refusing statement i, and perhaps dying before the ReadyForQuery that follows, or by crashing after executing statement `executed` with only the replies before statement `delivered` reaching the gateway, the rest lost in flight.
@@ -226,14 +233,55 @@ impl Backend {
         let Ok(length) = stream.read_i32().await else { return };
         let mut startup = vec![0; usize::try_from(length).unwrap_or(4).saturating_sub(4)];
         if stream.read_exact(&mut startup).await.is_err() { return; }
+        if Rng::new(mix(self.world.lock().expect("unpoisoned").seed ^ 0x37, self.index)).chance(2) {
+            self.world.lock().expect("unpoisoned").greeting_faults += 1;
+            if !Self::send(&mut stream, &[frame(b'R', &[0, 0, 0, 0])]).await { return; }
+            return self.die(&mut stream, "during its greeting").await;
+        }
         self.note("greets".to_owned());
         if !Self::send(&mut stream, &[frame(b'R', &[0, 0, 0, 0]), ready(b'I')]).await { return; }
         self.world.lock().expect("unpoisoned").greeted += 1;
         reconnected.notify_one();
         let keying = format!("SET {IDEMPOTENCY_KEY_PARAMETER} = '");
+        let mut prepared = false;
+        let mut prepared_now = false;
+        let mut bound = None;
         loop {
             let Some(request) = read_frame(&mut stream).await else { return };
-            if request.tag == b'X' { return; }
+            match request.tag {
+                b'X' => return,
+                b'P' if request.body.as_ref() == PREPARE && !prepared => {
+                    prepared = true;
+                    prepared_now = true;
+                    if !Self::send(&mut stream, &[frame(b'1', &[])]).await { return; }
+                    continue;
+                }
+                b'B' if prepared => {
+                    let arg = request.body.strip_prefix(BIND_PREFIX).and_then(|body| body.strip_suffix(&[0, 0]));
+                    let Some(arg) = arg.and_then(|bytes| bytes.try_into().ok()) else { return };
+                    bound = Some(u64::from_be_bytes(arg));
+                    if !Self::send(&mut stream, &[frame(b'2', &[])]).await { return; }
+                    continue;
+                }
+                b'E' => {
+                    let Some(id) = bound.take() else { return };
+                    if !Self::send(&mut stream, &[frame(b'D', format!("{id}").as_bytes()), text(&format!("SELECT 1 #{id}"))]).await { return; }
+                    continue;
+                }
+                SYNC => {
+                    let dies_idle = prepared_now && self.initial;
+                    prepared_now = false;
+                    if dies_idle {
+                        let mut shared = self.world.lock().expect("unpoisoned");
+                        shared.idle_death = Some((false, shared.greeted));
+                    }
+                    if !Self::send(&mut stream, &[ready(self.status())]).await { return; }
+                    if dies_idle { return self.die(&mut stream, "after preparing a statement").await; }
+                    continue;
+                }
+                b'Q' => {}
+                _ => return,
+            }
             let query = String::from_utf8_lossy(request.body.strip_suffix(b"\0").unwrap_or(&request.body)).into_owned();
             if let Some(key) = query.strip_prefix(&keying).and_then(|rest| rest.strip_suffix('\'')) {
                 if self.rng.chance(4) { return self.die(&mut stream, "on being keyed").await; }
@@ -290,13 +338,13 @@ impl Backend {
     }
 }
 
-fn spawn_backend(world: &World, stream: TcpStream, reconnected: &Arc<Notify>) -> JoinHandle<()> {
+fn spawn_backend(world: &World, stream: TcpStream, reconnected: &Arc<Notify>, initial: bool) -> JoinHandle<()> {
     let (index, seed) = {
         let mut shared = world.lock().expect("unpoisoned");
         shared.connections += 1;
         (shared.connections - 1, shared.seed)
     };
-    let backend = Backend { index, world: Arc::clone(world), rng: Rng::new(mix(seed, index)), key: None, transaction: None, failed: false, holder: true };
+    let backend = Backend { index, world: Arc::clone(world), rng: Rng::new(mix(seed, index)), key: None, transaction: None, failed: false, holder: true, initial };
     tokio::spawn(backend.run(stream, Arc::clone(reconnected)))
 }
 
@@ -306,7 +354,7 @@ struct Backends { listener: TcpListener, world: World, reconnected: Arc<Notify>,
 impl Router for Backends {
     async fn route(&self) -> rtdb_types::Result<(TcpStream, Option<String>, u64)> {
         let (near, far) = pair(&self.listener, true).await.map_err(|error| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.simulation/connect", error.to_string()))?;
-        let task = spawn_backend(&self.world, far, &self.reconnected);
+        let task = spawn_backend(&self.world, far, &self.reconnected, false);
         self.tasks.lock().expect("unpoisoned").push(task);
         Ok((near, None, 0))
     }
@@ -327,6 +375,7 @@ struct Client {
     outcomes: BTreeMap<u64, Outcome>,
     /// Whether any reply to the current command has reached the client.
     answered: bool,
+    prepared: bool,
     summary: Summary,
 }
 
@@ -345,32 +394,52 @@ impl Client {
 
     async fn start_session(&mut self) -> Step {
         let keyed = self.rng.chance(90);
-        let (mut client, gateway) = pair(&self.clients, false).await.map_err(|error| error.to_string())?;
-        let (first, far) = pair(&self.backends.listener, true).await.map_err(|error| error.to_string())?;
-        self.note(format!("opens a session, {}", if keyed { "keyed" } else { "unkeyed" }));
-        let task = spawn_backend(&self.world, far, &self.backends.reconnected);
-        self.backends.tasks.lock().expect("unpoisoned").push(task);
-        let directory: Arc<dyn Directory> = self.directory.clone();
-        let router: Arc<dyn Router> = self.backends.clone();
-        let session = Session::new(Self::startup(), router, directory, self.deployment.clone(), None, keyed);
-        let running = tokio::spawn(session.run(gateway, first, 0));
-        for expected in [frame(b'R', &[0, 0, 0, 0]), ready(b'I')] {
+        loop {
+            let (mut client, gateway) = pair(&self.clients, false).await.map_err(|error| error.to_string())?;
+            let (first, far) = pair(&self.backends.listener, true).await.map_err(|error| error.to_string())?;
+            self.note(format!("opens a session, {}", if keyed { "keyed" } else { "unkeyed" }));
+            let task = spawn_backend(&self.world, far, &self.backends.reconnected, true);
+            self.backends.tasks.lock().expect("unpoisoned").push(task);
+            let directory: Arc<dyn Directory> = self.directory.clone();
+            let router: Arc<dyn Router> = self.backends.clone();
+            let session = Session::new(Self::startup(), router, directory, self.deployment.clone(), None, keyed);
+            let running = tokio::spawn(session.run(gateway, first, 0));
+            let greeting = read_frame(&mut client).await;
+            if !greeting.as_ref().is_some_and(|greeting| same(greeting, &frame(b'R', &[0, 0, 0, 0]))) {
+                return Err(format!("unexpected authentication reply {:?}", greeting.as_ref().map(show)));
+            }
             match read_frame(&mut client).await {
-                Some(greeting) if same(&greeting, &expected) => {}
-                other => return Err(format!("the client was greeted with {:?}, not {}", other.as_ref().map(show), show(&expected))),
+                Some(greeting) if same(&greeting, &ready(b'I')) => {
+                    self.session = Some((client, running));
+                    self.summary.sessions += 1;
+                    break;
+                }
+                Some(error) if error.tag == b'E' && contains(&error, "closed during session startup") => {
+                    drop(client);
+                    let _ = running.await;
+                }
+                other => return Err(format!("unexpected startup reply {:?}", other.as_ref().map(show))),
             }
         }
-        self.session = Some((client, running));
-        self.summary.sessions += 1;
+        self.prepared = self.rng.chance(25);
+        if self.prepared {
+            let outcome = self.exchange_frames(0, "prepare", &[frame(b'P', PREPARE), frame(SYNC, &[])], &[frame(b'1', &[]), ready(b'I')]).await?;
+            if outcome.is_some() { return Err("preparing a statement failed".into()); }
+        }
         Ok(())
     }
 
-    /// Sends `query` and reads its replies, which must be `expected` exactly, or a prefix of them and then an error.
     async fn exchange(&mut self, id: u64, query: &str, expected: &[Frame]) -> Result<Option<Outcome>, String> {
-        let (stream, _) = self.session.as_mut().expect("a session is open");
         let mut body = query.as_bytes().to_vec();
         body.push(0);
-        if stream.write_all(&frame(b'Q', &body).encode()).await.is_err() { return Err(format!("c{id}: the gateway stopped reading")); }
+        self.exchange_frames(id, query, &[frame(b'Q', &body)], expected).await
+    }
+
+    async fn exchange_frames(&mut self, id: u64, query: &str, requests: &[Frame], expected: &[Frame]) -> Result<Option<Outcome>, String> {
+        let (stream, _) = self.session.as_mut().expect("a session is open");
+        let mut bytes = BytesMut::new();
+        for request in requests { bytes.extend_from_slice(&request.encode()); }
+        if stream.write_all(&bytes).await.is_err() { return Err(format!("c{id}: the gateway stopped reading")); }
         let mut position = 0;
         loop {
             let Some(reply) = read_frame(stream).await else { return Err(format!("c{id}: the session closed without telling the client what became of {query:?}")) };
@@ -427,6 +496,19 @@ impl Client {
 
     async fn command(&mut self, id: u64) -> Step {
         if self.session.is_none() { self.start_session().await?; }
+        if self.prepared && id % 5 == 0 {
+            let mut bind = BytesMut::from(BIND_PREFIX);
+            bind.put_u64(id);
+            bind.put_u16(0);
+            let requests = [frame(b'B', &bind), frame(b'E', &[0; 5]), frame(SYNC, &[])];
+            let expected = [frame(b'2', &[]), frame(b'D', format!("{id}").as_bytes()), text(&format!("SELECT 1 #{id}")), ready(b'I')];
+            if self.exchange_frames(id, "execute prepared read", &requests, &expected).await?.is_some() {
+                return Err(format!("c{id}: executing the prepared read failed"));
+            }
+            self.summary.prepared_reads += 1;
+            self.summary.succeeded += 1;
+            return self.check();
+        }
         let update = format!("{UPDATE}{id}");
         let (kind, exchanges): (&str, Vec<(String, Vec<Frame>)>) = match self.rng.below(10) {
             0..4 => ("a write", vec![(update.clone(), vec![text(&format!("UPDATE 1 #{id}")), ready(b'I')])]),
@@ -490,6 +572,7 @@ impl Client {
         self.summary.steps = self.config.steps;
         self.summary.backends = shared.connections as usize;
         self.summary.faults = shared.faults;
+        self.summary.greeting_faults = shared.greeting_faults;
         self.summary.resent = shared.keys.values().filter(|(_, reached)| *reached > 1).count();
         drop(shared);
         Ok(self.summary)
@@ -498,7 +581,7 @@ impl Client {
 
 async fn simulate(config: Config) -> Result<Summary, Violation> {
     let world: World = Arc::new(Mutex::new(Shared {
-        seed: config.seed, bug: config.bug, executions: BTreeMap::new(), committed: BTreeSet::new(), keys: BTreeMap::new(), connections: 0, greeted: 0, idle_death: None, trace: VecDeque::new(), faults: 0,
+        seed: config.seed, bug: config.bug, executions: BTreeMap::new(), committed: BTreeSet::new(), keys: BTreeMap::new(), connections: 0, greeted: 0, idle_death: None, trace: VecDeque::new(), faults: 0, greeting_faults: 0,
     }));
     let seed = config.seed;
     let violation = |step: usize, message: String| Violation { seed, step, message, trace: world.lock().expect("unpoisoned").trace.iter().cloned().collect() };
@@ -510,7 +593,7 @@ async fn simulate(config: Config) -> Result<Summary, Violation> {
     let record = directory.create_deployment(record).await.map_err(|error| violation(0, error.to_string()))?;
     let client = Client {
         rng: Rng::new(config.seed), world: Arc::clone(&world), backends: Arc::new(Backends { listener: backends, world: Arc::clone(&world), reconnected: Arc::new(Notify::new()), tasks: Mutex::new(Vec::new()) }),
-        clients, directory, deployment: record.id, session: None, outcomes: BTreeMap::new(), answered: false, summary: Summary { seed: config.seed, ..Summary::default() }, config,
+        clients, directory, deployment: record.id, session: None, outcomes: BTreeMap::new(), answered: false, prepared: false, summary: Summary { seed: config.seed, ..Summary::default() }, config,
     };
     match tokio::time::timeout(STALL, client.run()).await {
         Ok(Ok(summary)) => Ok(summary),
