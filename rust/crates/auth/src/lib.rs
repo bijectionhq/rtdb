@@ -60,16 +60,22 @@ pub fn method_for(rules: &[MethodRule], user: Option<&str>, remote_address: Opti
 #[derive(Clone, Debug)]
 pub enum AuthConfig {
     SingleRootUser { password: Option<Secret> },
-    UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule> },
+    /// `grants` limits the users it names to the databases it grants them; a user it does not name may use every database.
+    UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule>, grants: Grants },
     OpenIdConnect(OidcConfig),
 }
+
+/// For each user limited to some databases, the access granted on each.
+pub type Grants = BTreeMap<String, BTreeMap<String, DatabaseAccess>>;
+pub use rtdb_node::DatabaseAccess as GrantedAccess;
+
 impl Default for AuthConfig {
     fn default() -> Self { Self::SingleRootUser { password: std::env::var("XTDB_PASSWORD").ok().map(Secret::new) } }
 }
 
 enum Authentication {
     SingleRootUser { password: Option<Secret> },
-    UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule> },
+    UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule>, grants: Grants },
     OpenIdConnect(Arc<oidc::Provider>),
 }
 
@@ -79,7 +85,7 @@ impl Authenticator {
     pub async fn open(config: AuthConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
         let authentication = match config {
             AuthConfig::SingleRootUser { password } => Authentication::SingleRootUser { password },
-            AuthConfig::UserList { users, rules } => Authentication::UserList { users, rules },
+            AuthConfig::UserList { users, rules, grants } => Authentication::UserList { users, rules, grants },
             AuthConfig::OpenIdConnect(config) => Authentication::OpenIdConnect(oidc::Provider::open(config, Arc::clone(&memory), clock, http).await?),
         };
         Ok(Arc::new(Self { authentication, memory }))
@@ -97,8 +103,14 @@ impl Authenticator {
     pub fn is_superuser(&self, user: &str) -> bool { user == "xtdb" && !matches!(self.authentication, Authentication::OpenIdConnect(_)) }
 
     /// Trusted embedded callers may construct a principal regardless of network authentication rules.
-    pub fn authenticate_trusted(&self, user: &str) -> Result<Arc<Principal>> { Principal::static_user(Some(user), &self.memory) }
-    pub fn unauthenticated(&self) -> Result<Arc<Principal>> { Principal::static_user(None, &self.memory) }
+    pub fn authenticate_trusted(&self, user: &str) -> Result<Arc<Principal>> { self.principal(Some(user)) }
+    pub fn unauthenticated(&self) -> Result<Arc<Principal>> { self.principal(None) }
+
+    /// The principal for `user`, bound by whatever databases the configuration grants it.
+    fn principal(&self, user: Option<&str>) -> Result<Arc<Principal>> {
+        let grants = match (&self.authentication, user) { (Authentication::UserList { grants, .. }, Some(user)) => grants.get(user).cloned(), _ => None };
+        Principal::static_user(user, grants, &self.memory)
+    }
 
     pub async fn verify_password(&self, user: &str, password: &str) -> Result<Arc<Principal>> {
         match &self.authentication {
@@ -108,11 +120,11 @@ impl Authenticator {
                     let right = Sha256::digest(password.as_bytes());
                     bool::from(left.as_slice().ct_eq(right.as_slice())) && user == "xtdb"
                 });
-                if matches { Principal::static_user(Some(user), &self.memory) } else { Err(password_failed(user)) }
+                if matches { self.principal(Some(user)) } else { Err(password_failed(user)) }
             }
             Authentication::UserList { users, .. } => {
                 if let Some(hash) = users.get(user) {
-                    if hash.verify(password, &self.memory)? { return Principal::static_user(Some(user), &self.memory); }
+                    if hash.verify(password, &self.memory)? { return self.principal(Some(user)); }
                 }
                 Err(password_failed(user))
             }
@@ -156,12 +168,19 @@ impl rtdb_plan::CatalogUsers for Authenticator {
 
 enum Credentials { Static, Oidc(oidc::Credentials) }
 
-pub struct Principal { user: Option<String>, credentials: Credentials, _reservation: Arc<MemoryReservation> }
+pub struct Principal {
+    user: Option<String>,
+    credentials: Credentials,
+    /// The databases this principal may use and how, if it is limited to some.
+    grants: Option<BTreeMap<String, DatabaseAccess>>,
+    _reservation: Arc<MemoryReservation>,
+}
 impl Principal {
-    fn static_user(user: Option<&str>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let bytes = user.map_or(0, str::len).checked_add(std::mem::size_of::<Self>()).ok_or_else(|| Anomaly::incorrect("rtdb.auth/principal-allocation", "Principal allocation exceeds addressable memory"))?;
+    fn static_user(user: Option<&str>, grants: Option<BTreeMap<String, DatabaseAccess>>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let granted = grants.iter().flatten().try_fold(0usize, |bytes, (database, _)| bytes.checked_add(database.len() + 64));
+        let bytes = granted.and_then(|granted| user.map_or(0, str::len).checked_add(granted)?.checked_add(std::mem::size_of::<Self>())).ok_or_else(|| Anomaly::incorrect("rtdb.auth/principal-allocation", "Principal allocation exceeds addressable memory"))?;
         let reservation = memory.reserve(bytes)?;
-        Ok(Arc::new(Self { user: user.map(str::to_owned), credentials: Credentials::Static, _reservation: reservation }))
+        Ok(Arc::new(Self { user: user.map(str::to_owned), credentials: Credentials::Static, grants, _reservation: reservation }))
     }
     pub fn user_id(&self) -> Option<&str> { self.user.as_deref() }
 }
@@ -171,7 +190,14 @@ impl SessionIdentity for Principal {
     async fn revalidate(&self, now: Timestamp) -> Result<()> {
         match &self.credentials { Credentials::Static => Ok(()), Credentials::Oidc(credentials) => credentials.revalidate(now).await }
     }
-    fn authorize_database(&self, _database: &str, _access: DatabaseAccess) -> Result<()> { Ok(()) }
+    fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()> {
+        let Some(grants) = &self.grants else { return Ok(()) };
+        match (grants.get(database), access) {
+            (Some(DatabaseAccess::Write), _) | (Some(DatabaseAccess::Read), DatabaseAccess::Read) => Ok(()),
+            (Some(DatabaseAccess::Read), DatabaseAccess::Write) => Err(forbidden("xtdb.authz/read-only-grant", format!("{} may only read database '{database}'", self.user.as_deref().unwrap_or_default()))),
+            (None, _) => Err(forbidden("xtdb.authz/database-not-granted", format!("{} has no access to database '{database}'", self.user.as_deref().unwrap_or_default()))),
+        }
+    }
 }
 
 fn password_failed(user: &str) -> Anomaly { forbidden("xtdb.authn/failed", format!("password authentication failed for user: {user}")) }

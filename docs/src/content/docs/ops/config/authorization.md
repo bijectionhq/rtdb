@@ -76,3 +76,22 @@ The superuser convention is the `xtdb` username:
 - `!SingleRootUser`: the root `xtdb` user is the superuser.
 - `!UserList`: a configured user named `xtdb` is the superuser.
 - `!OpenIdConnect`: no superuser is currently defined, so role membership can't be managed under OIDC yet.
+
+## Limiting users to databases
+
+Under `!UserList`, `grants` limits the users it names to the databases it lists, with `READ` or `READ_WRITE` access to each:
+
+``` yaml
+authn: !UserList
+  users:
+    alice: !Argon2id "$argon2id$v=19$..."
+    reporting: !Argon2id "$argon2id$v=19$..."
+  grants:
+    # reads 'shop', and nothing else
+    reporting:
+      shop: READ
+```
+
+A user `grants` doesn't name — `alice` here — may use every database, so a configuration without `grants` behaves as before.
+
+A session on a database the user has no grant for is refused at connection, and a write to a database granted `READ` is refused when it's submitted.
