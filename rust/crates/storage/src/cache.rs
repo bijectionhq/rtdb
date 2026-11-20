@@ -170,6 +170,29 @@ impl BufferPool {
         self.budget.reserve(bytes)
     }
 
+    /// `range` of an object: a slice of the object where the pool holds all of it, and otherwise those bytes alone,
+    /// fetched and charged to the pool's budget for as long as the lease lives, but not kept.
+    pub async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<CacheLease> {
+        let held = self.entries.lock().get(key).cloned();
+        if let Some(entry) = held && let Ok(slot) = entry.allocation.try_lock() && let Some(allocation) = slot.as_ref() {
+            let (start, end) = (usize::try_from(range.start), usize::try_from(range.end));
+            if let (Ok(start), Ok(end)) = (start, end) && start <= end && end <= allocation.len() {
+                return Ok(CacheLease { allocation: allocation.clone(), range: start..end });
+            }
+        }
+        let length = range.end.checked_sub(range.start).and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| Error::Task("Object range is inverted or exceeds addressable memory".into()))?;
+        let reservation = ReadReservation::new(length, self.reserve(length)?);
+        let allocation = Arc::new(self.store.get_reserved_range(key, range, reservation).await?);
+        Ok(CacheLease { allocation, range: 0..length })
+    }
+
+    /// Whether the pool holds all of an object, so that a whole read of it costs nothing more.
+    pub fn holds(&self, key: &ObjectKey) -> bool {
+        let held = self.entries.lock().get(key).cloned();
+        held.is_some_and(|entry| entry.allocation.try_lock().is_ok_and(|slot| slot.is_some()))
+    }
+
     /// Concurrent fetches of a key share one load; cancellation releases that caller's wait.
     /// An empty entry is removed when its last fetcher fails or is cancelled.
     pub async fn get(&self, key: &ObjectKey) -> Result<CacheLease> {

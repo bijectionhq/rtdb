@@ -15,7 +15,8 @@ use rtdb_types::{Anomaly, EventHeader, Iid, Interval, Result, TemporalBounds, Ti
 
 use crate::{context::Execution, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
-enum DataState { Unopened, Open { reader: ArrowFile, _reservation: Arc<MemoryReservation> } }
+/// A data file read whole from the buffer pool, or, where the pool no longer holds it but its layout is known, a page at a time.
+enum DataState { Unopened, Open { reader: ArrowFile, _reservation: Arc<MemoryReservation> }, Ranged { reader: ArrowFile, file: rtdb_format::ipc::SparseFile, _reservation: Arc<MemoryReservation> } }
 struct DataFile { storage: Arc<BufferPool>, key: ObjectKey, state: DataState }
 
 #[derive(Default)]
@@ -418,6 +419,15 @@ impl PartitionScan {
             }
             (PageSource::File { file, page: page_index }, None) => {
                 let data = &mut self.files.entries[*file];
+                if matches!(&data.state, DataState::Unopened) && let Some(layout) = metadata_cache::layout(&data.storage, &data.key) && !data.storage.holds(&data.key) {
+                    let length = data.storage.object_store().head(&data.key).await?.size;
+                    let footer = length.checked_sub(u64::try_from(layout.footer_encoded_bytes).map_err(|_| invalid("file-size", "Arrow footer exceeds its file"))?)
+                        .ok_or_else(|| invalid("file-size", "Arrow footer exceeds its file"))?;
+                    let file = rtdb_format::ipc::SparseFile::new(length);
+                    file.add(footer, Arc::new(data.storage.get_range(&data.key, footer..length).await?));
+                    let reservation = self.execution.context.memory.reserve(layout.opening_allocation_bound()?)?;
+                    data.state = DataState::Ranged { reader: ArrowFile::from_inspected_reader(file.clone(), None, layout)?, file, _reservation: reservation };
+                }
                 if matches!(&data.state, DataState::Unopened) {
                     let lease = data.storage.get(&data.key).await?;
                     let mut cursor = Cursor::new(lease);
@@ -432,7 +442,17 @@ impl PartitionScan {
                     let reservation = self.execution.context.memory.reserve(layout.opening_allocation_bound()?)?;
                     data.state = DataState::Open { reader: ArrowFile::from_inspected_reader(cursor, None, layout)?, _reservation: reservation };
                 }
-                let DataState::Open { reader, .. } = &mut data.state else { return Err(invalid("file-state", "Data file failed to open")); };
+                let reader = match &mut data.state {
+                    DataState::Open { reader, .. } => reader,
+                    DataState::Ranged { reader, file, .. } => {
+                        let range = reader.page_range(*page_index)?;
+                        let bytes = data.storage.get_range(&data.key, range.clone()).await?;
+                        file.retain_from(0);
+                        file.add(range.start, Arc::new(bytes));
+                        reader
+                    }
+                    DataState::Unopened => return Err(invalid("file-state", "Data file failed to open")),
+                };
                 let mut bound = reader.page_allocation_bound(*page_index)?;
                 for field in reader.schema().fields() {
                     bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?).ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
