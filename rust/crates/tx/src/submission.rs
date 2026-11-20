@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rtdb_columnar::MemoryBudget;
-use rtdb_expr::{EvalContext, evaluate};
+use rtdb_expr::{EvalContext, evaluate, evaluate_static_cell};
 use rtdb_plan::{Catalog, QualifiedTable, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
 use rtdb_types::{Anomaly, Result, Timestamp, Value};
 use rtdb_sql::StaticMutationKind;
@@ -123,8 +123,8 @@ fn infer_document_decimals(value: &mut Value) -> Result<()> {
 
 fn materialize(input: &Relation, context: &EvalContext<'_>) -> Result<Vec<Vec<Value>>> {
     match input.node() {
-        RelationNode::Values { rows } => rows.iter().map(|row| row.iter().map(|expr| evaluate(expr, &Schema::default(), &[], context)).collect()).collect(),
-        RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => materialize(input, context)?.iter().map(|row| expressions.iter().map(|expr| evaluate(&expr.expr, input.schema(), row, context)).collect()).collect(),
+        RelationNode::Values { rows } => rows.iter().map(|row| row.iter().map(|expr| evaluate_static_cell(expr, &Schema::default(), &[], context)).collect()).collect(),
+        RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => materialize(input, context)?.iter().map(|row| expressions.iter().map(|expr| evaluate_static_cell(&expr.expr, input.schema(), row, context)).collect()).collect(),
         _ => Err(Anomaly::fault("rtdb.tx/static-plan", "Static SQL source contains a data-dependent operator")),
     }
 }

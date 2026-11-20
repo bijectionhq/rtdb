@@ -409,6 +409,26 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate(row,context)
 }
 
+/// Copies a static SQL input cell without building an invocation when its emitted type is unused.
+pub fn evaluate_static_cell(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    if context.parameter_types.is_none() {
+        let value = match expr {
+            Expr::Parameter { index, .. } => context.parameters.get(*index),
+            Expr::Column { id, .. } => schema.position(*id).and_then(|position| row.get(position)),
+            Expr::Literal(value) => Some(value),
+            _ => None,
+        };
+        if let Some(value) = value
+            && !matches!(value, Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Struct(_) | Value::Map { .. })
+        {
+            let mut value = retained_clone(value, context)?;
+            value.admit_expression_dates()?;
+            return Ok(value);
+        }
+    }
+    evaluate(expr, schema, row, context)
+}
+
 fn evaluate_inner(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
     macro_rules! eval { ($child:expr) => { evaluate_inner($child, schema, row, context) }; }
     macro_rules! call { ($name:expr, $args:expr) => { scalar_call($name, $args, context) }; }
