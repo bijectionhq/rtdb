@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Event {
+pub enum Event {
     Promise(u64),
     Synced(Option<u64>),
     /// Drops every entry at or above the lsn.
@@ -18,14 +18,14 @@ pub(crate) enum Event {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Held {
+pub struct Held {
     pub epoch: u64,
     pub timestamp: i64,
     pub payload: Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StreamState {
+pub struct StreamState {
     pub promised: u64,
     /// The epoch whose writer last brought this server up to that writer's whole history.
     pub synced: Option<u64>,
@@ -36,7 +36,7 @@ pub(crate) struct StreamState {
     pub entries: VecDeque<Held>,
 }
 
-pub(crate) struct Decision {
+pub struct Decision {
     pub events: Vec<Event>,
     pub reply: ResponseBody,
 }

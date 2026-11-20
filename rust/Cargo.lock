@@ -4540,6 +4540,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtdb-simulation"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "rtdb-directory",
+ "rtdb-logkeeper",
+]
+
+[[package]]
 name = "rtdb-sql"
 version = "0.1.0"
 dependencies = [

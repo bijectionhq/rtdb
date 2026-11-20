@@ -50,6 +50,7 @@ rtdb-tls = { path = "crates/tls" }
 rtdb-affinity = { path = "crates/affinity" }
 rtdb-directory = { path = "crates/directory" }
 rtdb-logkeeper = { path = "crates/logkeeper" }
+rtdb-simulation = { path = "crates/simulation" }
 sqlparser = { path = "vendor/sqlparser", version = "=0.63.0" }
 arrow-array = { version = "=58.4.1", features = ["ffi"] }
 arrow-buffer = "=58.4.1"

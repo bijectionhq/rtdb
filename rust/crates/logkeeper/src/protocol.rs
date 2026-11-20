@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 pub(crate) const MAXIMUM_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Message)]
-pub(crate) struct Entry {
+pub struct Entry {
     #[prost(sint64, tag = "1")]
     pub lsn: i64,
     #[prost(uint64, tag = "2")]
@@ -22,7 +22,7 @@ pub(crate) struct Entry {
 
 /// Entries from `start_lsn` up to the next run's start (or the holder's last lsn) were written at `epoch`.
 #[derive(Clone, Copy, PartialEq, Eq, Message)]
-pub(crate) struct EpochRun {
+pub struct EpochRun {
     #[prost(sint64, tag = "1")]
     pub start_lsn: i64,
     #[prost(uint64, tag = "2")]
@@ -157,7 +157,7 @@ pub(crate) struct Request {
 
 /// An `Accepted` reply to an Append, Overwrite, Commit or Check announces that the stream's promise on this server was still at most the request's epoch when the server decided it, which was after the request was sent.
 #[derive(Clone, Copy, PartialEq, Eq, Message)]
-pub(crate) struct Accepted {
+pub struct Accepted {
     #[prost(sint64, tag = "1")]
     pub last_lsn: i64,
     #[prost(sint64, tag = "2")]
@@ -166,7 +166,7 @@ pub(crate) struct Accepted {
 
 /// `promised > epoch` means the writer is deposed; otherwise the server needs repair before it accepts this writer's appends.
 #[derive(Clone, Copy, PartialEq, Eq, Message)]
-pub(crate) struct Refused {
+pub struct Refused {
     #[prost(uint64, tag = "1")]
     pub promised: u64,
     #[prost(sint64, tag = "2")]
@@ -175,7 +175,7 @@ pub(crate) struct Refused {
 
 /// `synced` is the epoch whose writer last brought this server up to its whole history, 0 when none has.
 #[derive(Clone, PartialEq, Message)]
-pub(crate) struct Sealed {
+pub struct Sealed {
     #[prost(uint64, tag = "1")]
     pub promised: u64,
     #[prost(uint64, tag = "2")]
@@ -192,7 +192,7 @@ pub(crate) struct Sealed {
 
 /// A read at or below `trim_lsn` returns no entries; the client reports the trimmed range.
 #[derive(Clone, PartialEq, Message)]
-pub(crate) struct Entries {
+pub struct Entries {
     #[prost(message, repeated, tag = "1")]
     pub entries: Vec<Entry>,
     #[prost(sint64, tag = "2")]
@@ -204,13 +204,13 @@ pub(crate) struct Entries {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub(crate) struct Failed {
+pub struct Failed {
     #[prost(string, tag = "1")]
     pub message: String,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
-pub(crate) enum ResponseBody {
+pub enum ResponseBody {
     #[prost(message, tag = "2")]
     Accepted(Accepted),
     #[prost(message, tag = "3")]

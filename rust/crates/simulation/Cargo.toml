@@ -1,0 +1,17 @@
+[package]
+name = "rtdb-simulation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Deterministic simulation of an RTDB multi cell's single-writer protocol: claims, seals, recovery, appends and depositions under seeded faults"
+
+[dependencies]
+rtdb-directory.workspace = true
+rtdb-logkeeper = { workspace = true, features = ["simulation"] }
+bytes.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true

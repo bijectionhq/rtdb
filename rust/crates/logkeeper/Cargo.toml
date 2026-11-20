@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 description = "The RTDB multi log server and its quorum client: many named streams, epoch-fenced appends, write-quorum commit"
 
+[features]
+# Exposes the pure pieces of the protocol, the per-stream server state machine and the recovery planning, for `rtdb-simulation`.
+simulation = []
+
 [dependencies]
 rtdb-types.workspace = true
 rtdb-storage.workspace = true

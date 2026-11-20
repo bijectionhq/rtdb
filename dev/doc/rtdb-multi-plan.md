@@ -45,7 +45,7 @@ Update this section as work lands.
 | 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal | autoscaling acts on the signal outside RTDB |
 | 12 | per-deployment AES-256-GCM keys for objects (above the disk cache) and log payloads; forks by reference into the parent's lineage on fresh logs: a fork's `~base` manifest names where each object it shares physically lives, and whatever erases a shared object (the reaper, the parent's deletion) copies it into the forks still referencing it first; a cell move materializes every reference; deletion that seals, trims, destroys the key, erases and proves | forks are of the current state only, after flushing the parent, rather than of a past basis with its tail in a pack; a referenced object is copied out before its owner erases it rather than kept in place, and a fork made during a reaper pass is safe because the reaper's grace outlasts a pass, rather than by a lineage version |
 | 13 | the cell map, gateway forwarding, creation in the least occupied cell, cell moves that carry the unflushed tail across | |
-| 14 | the chaos test and the history audit | no deterministic simulation of a whole cell |
+| 14 | the chaos test and the history audit; `crates/simulation` runs one deployment's single-writer protocol from a seed (members claiming through the directory, three logkeeper state machines, a modelled writer, crashes, partitions, broken connections) and checks the epoch and log invariants after every step | the simulation covers the log and the claim rules only: no nodes, gateways, object storage, flushes or zombie harness; no simulation of a whole cell |
 
 **Fixed on the way.**
 

@@ -2,7 +2,7 @@
 
 mod connection;
 mod ensemble;
-mod recovery;
+pub(crate) mod recovery;
 mod writer;
 
 use async_trait::async_trait;

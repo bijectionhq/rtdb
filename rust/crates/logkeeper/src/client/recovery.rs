@@ -7,14 +7,14 @@
 use crate::protocol::{EpochRun, Sealed};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Holding {
+pub struct Holding {
     pub trim: i64,
     pub last: i64,
     pub runs: Vec<EpochRun>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RepairPlan {
+pub struct RepairPlan {
     /// The server holds entries below the history's trim point that cannot be compared, so it drops them first.
     pub trim_through: Option<i64>,
     /// The first lsn at which the server's entries differ from the history, or one past the shorter of the two.
@@ -42,11 +42,11 @@ impl Holding {
     }
 }
 
-pub(crate) fn winner(replies: &[Sealed]) -> usize {
+pub fn winner(replies: &[Sealed]) -> usize {
     (0..replies.len()).max_by_key(|&index| (replies[index].synced, replies[index].last_lsn)).expect("a quorum of replies")
 }
 
-pub(crate) fn plan_repair(server: &Holding, history: &Holding) -> Result<RepairPlan, String> {
+pub fn plan_repair(server: &Holding, history: &Holding) -> Result<RepairPlan, String> {
     let (server, trim_through) = if server.trim < history.trim {
         (server.trimmed_through(history.trim), Some(history.trim))
     } else {
