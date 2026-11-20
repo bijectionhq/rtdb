@@ -11,6 +11,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{config::NodeConfiguration, health::{HealthConfig, HealthDriver, HealthHandle}};
 
+/// What a node placed by an outside authority needs beyond its configuration.
+pub struct PlacedOptions {
+    /// Log factories for the placed databases' logs, by protobuf type name.
+    pub log_factories: Vec<(String, Arc<dyn rtdb_node::LogFactory>)>,
+    /// How long a placed holder waits on an empty replica read before claiming.
+    pub claim_wait: Duration,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ListenerAddresses { pub pgwire: Option<SocketAddr>, pub read_only_pgwire: Option<SocketAddr>, pub flight_sql: Option<SocketAddr>, pub health: Option<SocketAddr> }
 
@@ -45,18 +53,24 @@ impl ServerDriver {
     /// Run exactly once; request shutdown through the handle and join this run before releasing dependencies.
     pub async fn open(config: NodeConfiguration, allocation_limit_bytes: usize) -> Result<(ServerHandle, Self)> {
         let memory = MemoryBudget::new(config.node_options(allocation_limit_bytes)?.execution_memory_bytes);
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None).await
     }
 
     /// The supplied execution budget must match the cache/execution split of the process allocation ceiling.
     /// Startup allocations retained by the caller may already hold reservations from this budget.
     pub async fn open_with_memory(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None).await
+    }
+
+    /// Opens a node whose databases an outside placement authority attaches and detaches, with no primary database.
+    /// Its holders claim as soon as they reach the tip and append nothing while idle.
+    pub async fn open_placed(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, placed: PlacedOptions) -> Result<(ServerHandle, Self)> {
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed)).await
     }
 
     /// Uses a host clock for transactions appended to in-memory and local source logs.
     pub async fn open_with_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None).await
     }
 
     /// Runs compaction while following the replica log, with no transaction listeners or leader election.
@@ -72,11 +86,16 @@ impl ServerDriver {
         config.flight_sql = None;
         config.indexer.enabled = true;
         config.garbage.enabled = false;
-        Self::open_mode(config, allocation_limit_bytes, memory, true, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None).await
     }
 
-    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>) -> Result<(ServerHandle, Self)> {
+    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>) -> Result<(ServerHandle, Self)> {
         let mut options = config.node_options(allocation_limit_bytes)?;
+        if let Some(placed) = &placed {
+            options.membership = rtdb_node::Membership::Placed;
+            options.replication.claim_wait = Some(placed.claim_wait);
+            options.replication.idle_heartbeat = false;
+        }
         if memory.limit_bytes() != options.execution_memory_bytes { return Err(Anomaly::incorrect("rtdb.server/invalid-memory-budget", "Supplied execution budget differs from the configured allocation split")); }
         if compactor_only { options.replication.may_lead = false; }
         let metrics = Registry::new(&config.node_id, Arc::clone(&memory))?;
@@ -88,10 +107,11 @@ impl ServerDriver {
         let http = Arc::new(NativeHttp::new(Arc::clone(&memory), Duration::from_secs(30), 4 * 1024 * 1024)?);
         let auth = Authenticator::open(config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), http).await?;
         let (resources, external_sources, mut registrations) = crate::resources::open(&config, &memory, &metrics)?;
-        let resources = match transaction_clock {
+        let mut resources = match transaction_clock {
             Some(clock) => resources.with_log_clock(clock),
             None => resources,
         };
+        for (protobuf_type, factory) in placed.map(|placed| placed.log_factories).unwrap_or_default() { resources = resources.register_log(protobuf_type, factory)?; }
         let services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer,
             ..NodeServices::local(auth.clone(), metrics.clone(), auth.clone(), metrics.clone()) };
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;
