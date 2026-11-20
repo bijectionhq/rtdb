@@ -35,7 +35,7 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
             let mut id = 0i64;
             while !stop.load(Ordering::Relaxed) {
                 if client.is_none() {
-                    match tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=xtdb dbname=shop"), NoTls).await {
+                    match tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=xtdb password=cell-test dbname=shop"), NoTls).await {
                         Ok((connected, connection)) => { tokio::spawn(connection); client = Some(connected); }
                         Err(_) => { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
                     }

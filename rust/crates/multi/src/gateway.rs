@@ -28,10 +28,12 @@ pub struct GatewayOptions {
     pub control_timeout: Duration,
     /// How often an open connection tells its holder it is in use.
     pub touch_interval: Duration,
+    /// The cell's secret, with which the gateway mints a capability for each reconnection of an authenticated session.
+    pub capabilities: Option<Arc<crate::capability::CellSecret>>,
 }
 
 impl Default for GatewayOptions {
-    fn default() -> Self { Self { cells: None, control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10) } }
+    fn default() -> Self { Self { cells: None, control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10), capabilities: None } }
 }
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
@@ -89,7 +91,8 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
             }
         })
     });
-    let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment);
+    let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
+    let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants);
     let outcome = tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
         outcome = session.run(client, server, epoch) => outcome,
@@ -203,13 +206,23 @@ async fn read_startup(client: &mut TcpStream) -> Result<Option<Startup>> {
                     if key.is_empty() { break; }
                     parameters.insert(key, value);
                 }
-                let mut bytes = (length as i32).to_be_bytes().to_vec();
-                bytes.extend_from_slice(&body);
-                return Ok(Some(Startup { bytes, parameters }));
+                // Only a gateway grants capabilities: one a client sends is dropped.
+                parameters.remove(rtdb_pgwire::CAPABILITY_PARAMETER);
+                return Ok(Some(Startup { bytes: encode_startup(&parameters), parameters }));
             }
             _ => return Err(Anomaly::incorrect("rtdb.multi/startup", format!("Unsupported startup code {code}"))),
         }
     }
+}
+
+/// A protocol-3 startup message carrying `parameters`.
+pub(crate) fn encode_startup(parameters: &BTreeMap<String, String>) -> Vec<u8> {
+    let mut body = PROTOCOL_3.to_be_bytes().to_vec();
+    for (key, value) in parameters { for field in [key, value] { body.extend_from_slice(field.as_bytes()); body.push(0); } }
+    body.push(0);
+    let mut bytes = ((body.len() + 4) as i32).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&body);
+    bytes
 }
 
 async fn refuse(client: &mut TcpStream, sqlstate: &str, message: &str) -> Result<()> {

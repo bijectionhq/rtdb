@@ -4,7 +4,7 @@
 //! It learns the session's transaction status from every ReadyForQuery, and remembers the startup message and every named prepared statement.
 //! Whenever the session is idle and its backend is gone or no longer the deployment's holder, it reconnects to the current holder, replays the startup and the prepared statements, swallows their replies, and carries on.
 //! A backend lost in the middle of a command is never replayed: the command may have committed, so the client is told and the session ends.
-//! Transparent reconnection replays the startup without a password exchange, so it applies to backends that trust the gateway.
+//! A reconnection carries no password: once the first holder has authenticated the client, each reconnection's startup carries a capability the gateway mints instead, which needs the gateway to hold the cell's secret, or backends that trust the gateway.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,6 +19,8 @@ use tokio::sync::{mpsc, watch};
 
 const MAXIMUM_FRAME_BYTES: usize = 1 << 30;
 const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+/// A capability serves one reconnection, so it only has to outlive the startup it is sent in.
+const CAPABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One pgwire message after startup: its type byte and its body.
 #[derive(Clone, Debug)]
@@ -85,8 +87,14 @@ impl Backend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status { Idle, InTransaction, Busy }
 
+/// What a gateway needs to mint a session's capabilities: the cell's secret and the session's startup.
+pub struct Grants { pub secret: Arc<crate::capability::CellSecret>, pub parameters: std::collections::BTreeMap<String, String>, pub read_only: bool }
+
 pub struct Session {
     startup: Bytes,
+    grants: Option<Grants>,
+    /// Whether a backend has authenticated the client, after which the gateway vouches for it with capabilities.
+    authenticated: bool,
     router: Arc<dyn Router>,
     record: watch::Receiver<Option<DeploymentRecord>>,
     prepared: BTreeMap<String, Frame>,
@@ -100,9 +108,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String) -> Self {
+    pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, std::time::Duration::from_millis(100));
-        Self { startup, router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, discarding: false }
+        Self { startup, grants, authenticated: false, router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, discarding: false }
     }
 
     /// Reconnects to the current holder, retrying through a failover: until the dead holder's lease expires, no other node may claim.
@@ -119,7 +127,7 @@ impl Session {
 
     async fn connect_once(&mut self) -> Result<Backend> {
         let (mut stream, _, epoch) = self.router.route().await?;
-        stream.write_all(&self.startup).await.map_err(io)?;
+        stream.write_all(&self.reconnection_startup()).await.map_err(io)?;
         let mut backend = Backend::new(stream, epoch);
         let mut replay = BytesMut::new();
         // A statement the pending command itself parses is defined again when that command is resent, so it is not replayed here.
@@ -143,6 +151,15 @@ impl Session {
             }
         }
         Ok(backend)
+    }
+
+    /// The startup a reconnection sends: the client's, with a fresh capability once the client has authenticated.
+    fn reconnection_startup(&self) -> Bytes {
+        let (Some(grants), true) = (&self.grants, self.authenticated) else { return self.startup.clone() };
+        let (Some(deployment), Some(user)) = (grants.parameters.get("database").or_else(|| grants.parameters.get("user")), grants.parameters.get("user")) else { return self.startup.clone() };
+        let mut parameters = grants.parameters.clone();
+        parameters.insert(rtdb_pgwire::CAPABILITY_PARAMETER.into(), grants.secret.mint(deployment, user, grants.read_only, CAPABILITY_TTL));
+        Bytes::from(crate::gateway::encode_startup(&parameters))
     }
 
     fn stale(&self, backend: &Backend) -> bool {
@@ -197,6 +214,7 @@ impl Session {
                             continue;
                         }
                         self.answered = true;
+                        if frame.tag == b'R' && frame.body.get(..4) == Some(&[0, 0, 0, 0]) { self.authenticated = true; }
                         if frame.tag == b'Z' {
                             self.status = match frame.body.first() { Some(b'I') => Status::Idle, Some(b'T' | b'E') => Status::InTransaction, _ => Status::Busy };
                         }

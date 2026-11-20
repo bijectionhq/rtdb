@@ -34,6 +34,8 @@ pub struct NodeSettings {
     pub cache_dir: PathBuf,
     /// Whether this node's holders compact their own deployments; off when the cell has compaction workers.
     pub local_compaction: bool,
+    /// The cell's secret, so the node accepts the capabilities its gateways mint in place of a password.
+    pub capabilities: Option<Arc<crate::capability::CellSecret>>,
 }
 
 /// A running node. Dropping it does not stop it; call `shutdown` or `kill`.
@@ -64,6 +66,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
         claim_wait: settings.claim_wait,
+        capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
         compaction_relay: (settings.pool == rtdb_directory::MemberPool::Compaction).then(|| Arc::new(crate::relay::HolderRelay { directory: Arc::clone(&directory) }) as Arc<dyn rtdb_node::CompactionRelay>),
     };

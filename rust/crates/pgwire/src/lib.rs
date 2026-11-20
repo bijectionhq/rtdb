@@ -6,5 +6,5 @@ mod server;
 mod wire;
 mod copy;
 
-pub use config::ServerConfig;
+pub use config::{CAPABILITY_PARAMETER, CapabilityVerifier, ServerConfig, VerifiedCapability};
 pub use server::{ServerDriver, ServerHandle, ServerStatus};

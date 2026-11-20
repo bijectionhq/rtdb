@@ -22,11 +22,13 @@ rtdb-directory = { workspace = true, features = ["network"] }
 rtdb-format.workspace = true
 rtdb-logkeeper.workspace = true
 rtdb-node.workspace = true
+rtdb-pgwire.workspace = true
 rtdb-replication.workspace = true
 rtdb-server.workspace = true
 rtdb-storage.workspace = true
 rtdb-types.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 parking_lot.workspace = true

@@ -3,13 +3,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use rtdb_auth::{Authenticator, Method};
 use rtdb_columnar::MemoryReservation;
-use rtdb_node::{NativeSession, Node, SessionIdentity};
+use rtdb_node::{DatabaseAccess, NativeSession, Node, SessionIdentity};
 use rtdb_types::{Anomaly, AnomalyCategory, PgType, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use crate::{ServerConfig, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
+use crate::{CAPABILITY_PARAMETER, ServerConfig, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
 
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
@@ -89,13 +89,19 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
             80877104 => return Err(protocol("GSSAPI is not supported")),
             80877102 => { let process = input.integer()?; let _secret = input.integer()?; input.end()?; registry.cancel(process); return Ok(None); }
             196608 => {
-                let requested = input.startup()?; input.end()?;
+                let mut requested = input.startup()?; input.end()?;
+                let capability = requested.remove(CAPABILITY_PARAMETER);
                 let database = requested.get("database").map_or("xtdb", String::as_str);
                 if config.playground { node.database_or_attach(database.to_owned(), Default::default()).await?; }
                 node.catalog().database(database).map_err(|_| Anomaly::incorrect("xtdb.pgwire/invalid-catalog", format!("database '{database}' does not exist")).with_context("sql-state", "3D000".into()))?;
                 let user = requested.get("user").map(String::as_str); let remote = address.ip().to_string();
-                let method = auth.method_for(user, Some(&remote)).ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/no-matching-rule", format!("no authentication record found for user: {}", user.unwrap_or_default())))?;
-                let identity: Arc<dyn SessionIdentity> = match method {
+                let method = if capability.is_some() { Method::Trust } else { auth.method_for(user, Some(&remote)).ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/no-matching-rule", format!("no authentication record found for user: {}", user.unwrap_or_default())))? };
+                let identity: Arc<dyn SessionIdentity> = if let Some(token) = &capability {
+                    let verifier = config.capabilities.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/capability-not-accepted", "This server does not accept capabilities").with_context("sql-state", "28000".into()))?;
+                    let granted = verifier.verify(token, database).map_err(|error| error.with_context("sql-state", "28000".into()))?;
+                    if user.is_some_and(|user| user != granted.principal) { return Err(Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/capability-principal", "The capability was granted to another user").with_context("sql-state", "28000".into())); }
+                    Arc::new(CapabilityIdentity { principal: auth.authenticate_trusted(&granted.principal)?, read_only: granted.read_only })
+                } else { match method {
                     Method::Trust => match user { Some(user) => auth.authenticate_trusted(user)?, None => auth.unauthenticated()? },
                     Method::Password | Method::ClientCredentials => {
                         Writer::new(&mut **stream, Arc::clone(node.memory())).auth(3).await?;
@@ -111,7 +117,7 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                         writer.notice(&format!("\nHello! Please head over here to authenticate:\n\n{}\n", device.url())).await?;
                         device.await_principal(cancellation).await?
                     }
-                };
+                } };
                 let mut session = node.session(database, identity)?;
                 let size = config.parameters.iter().chain(requested.iter()).try_fold(8192usize, |size, (key, value)| size.checked_add(key.len().checked_mul(4)?).and_then(|size| size.checked_add(value.len())).and_then(|size| size.checked_add(256))).ok_or_else(|| protocol("Startup parameters exceed memory range"))?;
                 let reservation = node.memory().reserve(size)?;
@@ -125,6 +131,19 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
             }
             _ => return Err(protocol("Unknown protocol version")),
         }
+    }
+}
+
+/// A principal admitted by a capability: the access the capability grants bounds what the principal may do.
+struct CapabilityIdentity { principal: Arc<dyn SessionIdentity>, read_only: bool }
+
+#[async_trait::async_trait]
+impl SessionIdentity for CapabilityIdentity {
+    fn user(&self) -> Option<&str> { self.principal.user() }
+    async fn revalidate(&self, now: rtdb_types::Timestamp) -> Result<()> { self.principal.revalidate(now).await }
+    fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()> {
+        if self.read_only && access == DatabaseAccess::Write { return Err(Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authz/read-only-capability", "This session's capability grants read access only")); }
+        self.principal.authorize_database(database, access)
     }
 }
 

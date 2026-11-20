@@ -93,7 +93,7 @@ async fn deployments_are_isolated_from_each_other() {
     blog.simple_query("INSERT INTO items (_id, label) VALUES (1, 'blog')").await.unwrap();
     assert_eq!(values(&shop, "SELECT label FROM items").await, ["shop"]);
     assert_eq!(values(&blog, "SELECT label FROM items").await, ["blog"]);
-    let unknown = tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb dbname=nowhere", cell.gateway.port()), NoTls).await;
+    let unknown = tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=nowhere", cell.gateway.port()), NoTls).await;
     assert!(unknown.is_err(), "an unknown deployment is refused at the gateway");
     drop((shop, blog));
     cell.stop().await;
@@ -134,7 +134,7 @@ async fn a_read_only_session_is_served_by_a_log_fed_replica() {
     admin::set_read_width(cell.directory.as_ref(), "shop", 2).await.unwrap();
     let holder = cell.holder("shop").await.unwrap();
 
-    let (reader, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port()).user("xtdb").dbname("shop")
+    let (reader, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port()).user("xtdb").password("cell-test").dbname("shop")
         .options("-c default_transaction_read_only=on").connect(NoTls).await.unwrap();
     tokio::spawn(connection);
     let replica = 1 - holder;
@@ -186,7 +186,7 @@ async fn a_deployment_whose_activations_crash_is_quarantined_to_the_isolation_po
     broken.ensemble = vec![rtdb_directory::MemberId("no-such-logkeeper".into())];
     cell.directory.replace_deployment(broken, current.version).await.unwrap();
 
-    for _ in 0..3 { let _ = tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb dbname=shop", cell.gateway.port()), NoTls).await; }
+    for _ in 0..3 { let _ = tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await; }
     let quarantined = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert_eq!(quarantined.lifecycle, rtdb_directory::Lifecycle::Quarantined);
     assert!(cell.node(0).agent.held().is_empty(), "a general node no longer takes it");
@@ -219,7 +219,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     assert!(!root.join(parent.storage_prefix()).exists(), "the parent's objects are erased");
     assert!(!cell.data.path().join("keys").join(format!("{}.key", parent.id)).exists(), "its key is destroyed");
     assert_eq!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
-    assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb dbname=shop", cell.gateway.port()), NoTls).await.is_err(), "a deleted deployment is refused");
+    assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await.is_err(), "a deleted deployment is refused");
     let preview = connect_eventually(&cell, "shop-preview").await;
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20", "30"], "a fork outlives its parent's deletion");
     drop(preview);
@@ -513,5 +513,38 @@ async fn a_transaction_retried_with_its_idempotency_key_commits_once() {
     assert_eq!(values(&client, "SELECT _id FROM orders").await, ["1", "4"]);
     drop(client);
     cell.add_node().await;
+    cell.stop().await;
+}
+
+/// The type of the first message a server answers `parameters`' startup with, and its first four body bytes.
+async fn greeting(address: &str, parameters: &[(&str, &str)]) -> (u8, [u8; 4]) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut body = 196608i32.to_be_bytes().to_vec();
+    for (key, value) in parameters { for field in [key, value] { body.extend_from_slice(field.as_bytes()); body.push(0); } }
+    body.push(0);
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream.write_all(&((body.len() + 4) as i32).to_be_bytes()).await.unwrap();
+    stream.write_all(&body).await.unwrap();
+    let tag = stream.read_u8().await.unwrap();
+    let _length = stream.read_i32().await.unwrap();
+    let mut first = [0; 4];
+    stream.read_exact(&mut first).await.unwrap();
+    (tag, first)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_admits_a_capability_only_for_its_deployment_and_the_gateway_never_forwards_a_clients() {
+    let cell = Cell::start(1, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    admin::create_deployment(cell.directory.as_ref(), "blog", "acme", 3).await.unwrap();
+    drop(cell.connect("shop").await);
+    let node = cell.node(0).pgwire_address.to_string();
+    let genuine = common::secret().mint("shop", "xtdb", false, Duration::from_secs(30));
+    let ok = (b'R', [0, 0, 0, 0]);
+    assert_eq!(greeting(&node, &[("user", "xtdb"), ("database", "shop"), ("rtdb.capability", &genuine)]).await, ok, "a genuine capability stands in for the password");
+    assert_eq!(greeting(&node, &[("user", "xtdb"), ("database", "blog"), ("rtdb.capability", &genuine)]).await.0, b'E', "another deployment's capability is refused");
+    let foreign = rtdb_multi::capability::CellSecret::new(&[9; 32]).unwrap().mint("shop", "xtdb", false, Duration::from_secs(30));
+    assert_eq!(greeting(&node, &[("user", "xtdb"), ("database", "shop"), ("rtdb.capability", &foreign)]).await.0, b'E', "another cell's capability is refused");
+    assert_eq!(greeting(&cell.gateway.to_string(), &[("user", "xtdb"), ("database", "shop"), ("rtdb.capability", &genuine)]).await, (b'R', [0, 0, 0, 3]), "through the gateway, a client's capability is dropped and the password asked for");
     cell.stop().await;
 }

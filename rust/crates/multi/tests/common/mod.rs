@@ -16,11 +16,14 @@ async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, inde
     agent.park_after = park_after;
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     process::start_node(Arc::clone(directory), process::NodeSettings {
-        configuration: NodeConfiguration::from_yaml("server:\n  port: 0\n").unwrap(), allocation_limit_bytes: 1 << 30,
+        configuration: NodeConfiguration::from_yaml("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n").unwrap(), allocation_limit_bytes: 1 << 30,
         control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), agent, lease: lease(), claim_wait: Duration::from_millis(20), pool,
-        keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers,
+        keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers, capabilities: Some(secret()),
     }).await.unwrap()
 }
+
+/// The secret a cell's gateway and nodes share; a test cell's is fixed.
+pub fn secret() -> Arc<rtdb_multi::capability::CellSecret> { Arc::new(rtdb_multi::capability::CellSecret::new(&[7; 32]).unwrap()) }
 
 pub fn lease() -> LeaseOptions { LeaseOptions { lease: Duration::from_millis(1500), heartbeat: Duration::from_millis(200) } }
 
@@ -63,7 +66,7 @@ impl Cell {
         let gateway = listener.local_addr().unwrap();
         let gateway_cancellation = CancellationToken::new();
         if let Some((map, cell)) = &cells { map.register_cell(cell, &gateway.to_string()).await.unwrap(); }
-        tokio::spawn(gateway::serve(listener, Arc::clone(&directory), gateway::GatewayOptions { cells, touch_interval: Duration::from_millis(200), ..Default::default() }, gateway_cancellation.clone()));
+        tokio::spawn(gateway::serve(listener, Arc::clone(&directory), gateway::GatewayOptions { cells, touch_interval: Duration::from_millis(200), capabilities: Some(secret()), ..Default::default() }, gateway_cancellation.clone()));
         Self { directory, nodes: running, logkeepers, gateway, gateway_cancellation, data }
     }
 
@@ -105,7 +108,7 @@ impl Cell {
 
 pub async fn connect(address: &str, database: &str) -> Client {
     let (host, port) = address.rsplit_once(':').unwrap();
-    let (client, connection) = tokio_postgres::connect(&format!("host={host} port={port} user=xtdb dbname={database}"), NoTls).await.unwrap();
+    let (client, connection) = tokio_postgres::connect(&format!("host={host} port={port} user=xtdb password=cell-test dbname={database}"), NoTls).await.unwrap();
     tokio::spawn(connection);
     client
 }
@@ -114,7 +117,7 @@ pub async fn connect(address: &str, database: &str) -> Client {
 pub async fn connect_eventually(cell: &Cell, database: &str) -> Client {
     let (host, port) = cell.gateway.to_string().rsplit_once(':').map(|(host, port)| (host.to_owned(), port.to_owned())).unwrap();
     for _ in 0..100 {
-        if let Ok((client, connection)) = tokio_postgres::connect(&format!("host={host} port={port} user=xtdb dbname={database}"), NoTls).await {
+        if let Ok((client, connection)) = tokio_postgres::connect(&format!("host={host} port={port} user=xtdb password=cell-test dbname={database}"), NoTls).await {
             tokio::spawn(connection);
             if client.simple_query("SELECT 1").await.is_ok() { return client; }
         }

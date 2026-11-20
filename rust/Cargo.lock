@@ -4239,6 +4239,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "parking_lot",
@@ -4251,6 +4252,7 @@ dependencies = [
  "rtdb-format",
  "rtdb-logkeeper",
  "rtdb-node",
+ "rtdb-pgwire",
  "rtdb-replication",
  "rtdb-server",
  "rtdb-storage",
