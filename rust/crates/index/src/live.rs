@@ -170,6 +170,13 @@ impl LiveTable {
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
+    /// The header of `row`, without taking a handle on its batch.
+    pub fn header(&self, row: u32) -> Result<EventHeader> {
+        if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
+        let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
+        let (start, batch) = &self.chunks[index];
+        batch.header((row - start) as usize)
+    }
     pub fn row(&self, row: u32) -> Result<RowSource> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
         let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;

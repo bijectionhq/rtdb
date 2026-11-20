@@ -104,6 +104,9 @@ impl ActiveRows {
     fn row(&self, index: usize) -> Result<RowSource> {
         match self { Self::Live { table, rows } => table.row(rows[index]), Self::File(batch) => Ok(RowSource { batch: Arc::clone(batch), row: index }) }
     }
+    fn header(&self, index: usize) -> Result<EventHeader> {
+        match self { Self::Live { table, rows } => table.header(rows[index]), Self::File(batch) => batch.header(index) }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Head { header: EventHeader, active: usize, priority: usize, ordinal: usize }
@@ -491,24 +494,24 @@ impl PartitionScan {
             let (mut low, mut high) = (0, rows.len());
             while low < high {
                 let middle = (low + high) / 2;
-                if rows.row(middle)?.header()?.iid < task.range.lower { low = middle + 1; } else { high = middle; }
+                if rows.header(middle)?.iid < task.range.lower { low = middle + 1; } else { high = middle; }
             }
             if low < rows.len() {
-                let header = rows.row(low)?.header()?;
+                let header = rows.header(low)?;
                 if header.iid <= task.range.upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
             }
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let mut visited = 0usize;
+        let active: Vec<&ActiveRows> = selected.iter().map(|index| &self.loaded[index].rows).collect();
         let mut next = heads.pop();
         while let Some(head) = next.take() {
             self.execution.context.check_cancelled_at(visited)?;
             visited += 1;
-            let rows = &self.loaded[&selected[head.active]].rows;
-            let source = rows.row(head.ordinal)?;
+            let rows = active[head.active];
             let ordinal = head.ordinal + 1;
             let following = if ordinal < rows.len() {
-                let header = rows.row(ordinal)?.header()?;
+                let header = rows.header(ordinal)?;
                 (header.iid <= task.range.upper).then_some(Head { header,ordinal,..head })
             } else { None };
             // A page's next row that still precedes every other page's head is taken without passing through the heap.
@@ -519,6 +522,7 @@ impl PartitionScan {
             };
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
+            let source = rows.row(head.ordinal)?;
             let group: &mut Vec<_> = &mut groups[head.active];
             let memory = &self.execution.context.memory;
             resolver.resolve_fragments(&head.header, |valid_time, system_time| {
