@@ -197,9 +197,30 @@ impl LiveTable {
             next.row_count = start.checked_add(count).ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
             next.chunks.push((start, Arc::clone(batch)));
             next.trie = self.trie.add_range(&next, start, count)?;
+            next.merge_small_chunks()?;
         }
         next.last_system_time = Some(system_time);
         Ok(next)
+    }
+    /// Merges the newest chunk into the one before it while it is at least as large, they share a layout and together
+    /// stay small, so a table written a row per transaction is read from chunks of up to `MERGED_CHUNK_ROWS` rows.
+    /// Chunks keep their row addresses, since a merged chunk starts where the earlier one did.
+    fn merge_small_chunks(&mut self) -> Result<()> {
+        const MERGED_CHUNK_ROWS: usize = 1024;
+        while let [.., (start, previous), (_, last)] = self.chunks.as_slice() {
+            if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
+            let schema = previous.arrow().schema();
+            let budget = Arc::clone(previous.owned.reservation().budget());
+            let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_add(4096))
+                .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
+            let reservation = budget.reserve(bound)?;
+            let merged = arrow_select::concat::concat_batches(&schema, [previous.arrow(), last.arrow()]).map_err(invalid)?;
+            let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
+            let start = *start;
+            self.chunks.truncate(self.chunks.len() - 2);
+            self.chunks.push((start, merged));
+        }
+        Ok(())
     }
     pub fn ordered_events(&self) -> Result<Vec<EventRow<RowSource>>> {
         self.trie.sorted_rows(self)?.into_iter().map(|row| {
@@ -600,5 +621,27 @@ mod row_column_type_tests {
         assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), [scalar(ScalarType::I64), scalar(ScalarType::Utf8)]);
         assert_eq!(row_column_types(&documents[..1]), Some(documents[0].clone()));
         assert_eq!(row_column_types(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+    use rtdb_types::EntityId;
+
+    #[test]
+    fn a_table_written_a_row_per_transaction_is_held_in_merged_chunks_with_its_rows_in_place() {
+        let memory = MemoryBudget::new(1 << 26);
+        let table = TableRef::new("public", "docs");
+        let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+        for id in 0..2000i64 {
+            let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::F64(id as f64))])), recency: None };
+            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id)).unwrap();
+        }
+        assert!(live.chunks.len() <= 16, "{} chunks", live.chunks.len());
+        for id in [0u32, 1, 1023, 1024, 1999] {
+            assert_eq!(live.row(id).unwrap().header().unwrap().system_from, Timestamp(i64::from(id)));
+        }
     }
 }

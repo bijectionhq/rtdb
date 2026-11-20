@@ -3990,6 +3990,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "arrow-select",
  "chrono",
  "parking_lot",
  "rtdb-columnar",
