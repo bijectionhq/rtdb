@@ -198,6 +198,13 @@ fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<Logi
     Ok(Some(fields))
 }
 
+fn needs_same_time_resolution(events: &[PageEvent]) -> bool {
+    events.windows(2).any(|pair| pair[0].iid >= pair[1].iid)
+        || events.iter().any(|event| {
+            event.op == EventOp::Erase || event.valid_time.is_empty() || event.system_from == Timestamp::MAX
+        })
+}
+
 fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Vec<Arc<MemoryReservation>>)> {
     let mut result = Vec::new();
     let mut charges = Vec::new();
@@ -283,7 +290,7 @@ impl CompactionExecutor for SegmentCompactor {
                 let batch = read_page(&mut input.reader, page.page, &self.memory)?;
                 let _decoded = self.memory.reserve(decoded_bound(batch.batch())?)?;
                 let mut events = EventBatch::new(batch.batch().clone())?.page_events()?;
-                if input.key.level() == 0 {
+                if input.key.level() == 0 && needs_same_time_resolution(&events) {
                     let (resolved, reservations) = resolve_same_time(&events, &self.memory)?;
                     events = resolved;
                     charges.extend(reservations);
@@ -379,6 +386,35 @@ mod tests {
     use rtdb_types::Iid;
 
     fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
+
+    #[test]
+    fn unique_ordered_l0_events_keep_their_original_intervals() {
+        let event = |iid, lower, upper| StoredEvent {
+            iid: Iid([iid; 16]),
+            system_from: Timestamp(100),
+            valid_time: Interval::from_micros(lower, upper).unwrap(),
+            operation: StoredOperation::Delete,
+            recency: None,
+        };
+        let mut input = page(&[event(1, 10, 20), event(2, 20, 30)]);
+        assert!(!needs_same_time_resolution(&input));
+        let (resolved, _charges) = resolve_same_time(&input, &MemoryBudget::new(1 << 20)).unwrap();
+        assert_eq!(
+            input.iter().map(EncodedEvent::header).collect::<Vec<_>>(),
+            resolved.iter().map(EncodedEvent::header).collect::<Vec<_>>(),
+        );
+        input[1].iid = input[0].iid;
+        assert!(needs_same_time_resolution(&input));
+        input[1].iid = Iid([2; 16]);
+        input[1].op = EventOp::Erase;
+        assert!(needs_same_time_resolution(&input));
+        input[1].op = EventOp::Delete;
+        input[1].valid_time = Interval::from_micros(10, 10).unwrap();
+        assert!(needs_same_time_resolution(&input));
+        input[1].valid_time = Interval::ALL;
+        input[1].system_from = Timestamp::MAX;
+        assert!(needs_same_time_resolution(&input));
+    }
 
     #[test]
     fn same_time_compaction_resolves_a_lone_event_with_only_its_output_row() {
