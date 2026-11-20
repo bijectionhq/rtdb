@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, QueryBasis, ResourceFactory, Session, SessionIdentity, SessionService, SystemClock,
     catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory}, statement::prepare_query};
 
+
 #[derive(Clone)]
 pub struct NodeServices {
     pub resources: Arc<dyn ResourceFactory>,
@@ -133,6 +134,8 @@ impl Node {
     }
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> { &self.catalog }
     pub fn memory(&self) -> &Arc<MemoryBudget> { &self.factory.memory }
+    /// The budget a query or a result stream reserves from, as the node's query options shape it.
+    pub fn query_memory(&self) -> Arc<MemoryBudget> { self.factory.options.query.query_memory(&self.factory.memory) }
     pub fn cache_budget(&self) -> &Arc<CacheBudget> { &self.factory.cache }
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.
@@ -238,7 +241,7 @@ impl Node {
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot.with_system_time_cap(cap)?], storage: Arc::clone(&database.storage) });
         }
         let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())));
-        QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+        QueryContext::with_owner(catalog, self.factory.options.query.query_memory(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
     }
 
