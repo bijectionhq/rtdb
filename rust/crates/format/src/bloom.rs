@@ -34,6 +34,11 @@ impl BloomFilter {
         if let Ok(other) = RoaringBitmap::from_sorted_iter(positions.drain(..)) { self.bitmap |= other; }
     }
 
+    /// Adds bit positions given in strictly increasing order.
+    pub fn insert_sorted_positions(&mut self, positions: impl IntoIterator<Item = u32>) {
+        if let Ok(other) = RoaringBitmap::from_sorted_iter(positions) { self.bitmap |= other; }
+    }
+
     pub fn insert_hashes(&mut self, hash1: i32, hash2: i32) {
         for hash in hashes(hash1, hash2) { self.bitmap.insert(hash); }
     }

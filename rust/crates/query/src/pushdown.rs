@@ -194,8 +194,10 @@ impl Key {
         match &mut self.pending {
             Pending::Sorted(pending) => bloom.insert_positions(pending),
             Pending::Dense(words) => {
-                let mut positions: Vec<u32> = words.iter().enumerate().flat_map(|(index, word)| (0..64u32).filter(move |bit| word >> bit & 1 == 1).map(move |bit| index as u32 * 64 + bit)).collect();
-                bloom.insert_positions(&mut positions);
+                bloom.insert_sorted_positions(words.iter().enumerate().flat_map(|(index, word)| {
+                    let mut bits = *word;
+                    std::iter::from_fn(move || (bits != 0).then(|| { let bit = bits.trailing_zeros(); bits &= bits - 1; index as u32 * 64 + bit }))
+                }));
                 words.iter_mut().for_each(|word| *word = 0);
             }
         }
