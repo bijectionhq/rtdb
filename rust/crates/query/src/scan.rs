@@ -500,16 +500,23 @@ impl PartitionScan {
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let mut visited = 0usize;
-        while let Some(head) = heads.pop() {
+        let mut next = heads.pop();
+        while let Some(head) = next.take() {
             self.execution.context.check_cancelled_at(visited)?;
             visited += 1;
             let rows = &self.loaded[&selected[head.active]].rows;
             let source = rows.row(head.ordinal)?;
             let ordinal = head.ordinal + 1;
-            if ordinal < rows.len() {
+            let following = if ordinal < rows.len() {
                 let header = rows.row(ordinal)?.header()?;
-                if header.iid <= task.range.upper { heads.push(Head { header,ordinal,..head }); }
-            }
+                (header.iid <= task.range.upper).then_some(Head { header,ordinal,..head })
+            } else { None };
+            // A page's next row that still precedes every other page's head is taken without passing through the heap.
+            next = match following {
+                Some(following) if heads.peek().is_none_or(|top| following > *top) => Some(following),
+                Some(following) => { heads.push(following); heads.pop() }
+                None => heads.pop(),
+            };
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
             let group: &mut Vec<_> = &mut groups[head.active];
