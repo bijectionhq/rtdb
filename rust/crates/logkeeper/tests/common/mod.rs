@@ -19,14 +19,16 @@ pub struct Server {
 impl Server {
     pub async fn start(data_dir: &Path) -> Self { Self::start_at(data_dir, "127.0.0.1:0".parse().unwrap()).await }
 
-    pub async fn start_at(data_dir: &Path, address: SocketAddr) -> Self {
+    pub async fn start_at(data_dir: &Path, address: SocketAddr) -> Self { Self::start_with(data_dir, address, ServerOptions::DEFAULT_CACHE_BYTES).await }
+
+    pub async fn start_with(data_dir: &Path, address: SocketAddr, cache_bytes: usize) -> Self {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_reuseaddr(true).unwrap();
         socket.bind(address).unwrap();
         let listener = socket.listen(1024).unwrap();
         let address = listener.local_addr().unwrap();
         let cancellation = CancellationToken::new();
-        let options = ServerOptions { data_dir: data_dir.to_path_buf(), fsync: true };
+        let options = ServerOptions { data_dir: data_dir.to_path_buf(), fsync: true, cache_bytes };
         let task = tokio::spawn(serve(listener, options, cancellation.clone()));
         Self { address, data_dir: data_dir.to_path_buf(), cancellation, task }
     }

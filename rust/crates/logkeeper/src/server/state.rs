@@ -1,8 +1,11 @@
 //! One stream's state on one server, as a pure state machine.
 //! A mutation is decided against the accepted state, which already includes every earlier decision of the stream, and yields the events to persist and the reply to send once they are durable.
 //! Replay applies the same events on restart.
+//! An entry's payload is held as a `Payload`: the bytes themselves, or a handle the server resolves to them; the machine decides on lengths alone.
 
-use crate::protocol::{Accepted, Entries, Entry, EpochRun, Refused, ResponseBody, Sealed, runs_of};
+#[cfg(any(test, feature = "simulation"))]
+use crate::protocol::Entries;
+use crate::protocol::{Accepted, Entry, EpochRun, Refused, ResponseBody, Sealed, runs_of};
 use bytes::Bytes;
 use std::collections::VecDeque;
 
@@ -17,15 +20,35 @@ pub enum Event {
     Trim(i64),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Held {
-    pub epoch: u64,
-    pub timestamp: i64,
-    pub payload: Bytes,
+/// How a held entry's payload is kept.
+pub trait Payload: Clone {
+    /// Holds a payload just decided, before anything is written.
+    fn decided(payload: &Bytes) -> Self;
+    fn bytes(&self) -> usize;
+}
+
+impl Payload for Bytes {
+    fn decided(payload: &Bytes) -> Self { payload.clone() }
+    fn bytes(&self) -> usize { self.len() }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StreamState {
+pub struct Held<P = Bytes> {
+    pub epoch: u64,
+    pub timestamp: i64,
+    pub payload: P,
+}
+
+/// Entries selected by `StreamState::window`, with the stream's positions as of the selection.
+pub struct Window<T> {
+    pub items: Vec<T>,
+    pub commit_lsn: i64,
+    pub trim_lsn: i64,
+    pub last_lsn: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamState<P = Bytes> {
     pub promised: u64,
     /// The epoch whose writer last brought this server up to that writer's whole history.
     pub synced: Option<u64>,
@@ -33,7 +56,7 @@ pub struct StreamState {
     pub trim: i64,
     pub commit: i64,
     /// Entry `i` has lsn `trim + 1 + i`.
-    pub entries: VecDeque<Held>,
+    pub entries: VecDeque<Held<P>>,
 }
 
 pub struct Decision {
@@ -49,14 +72,19 @@ fn dense(first: i64, entries: &[Entry]) -> bool {
     entries.iter().zip(first..).all(|(entry, lsn)| entry.lsn == lsn)
 }
 
-impl Default for StreamState {
+impl<P> Default for StreamState<P> {
     fn default() -> Self { Self { promised: 0, synced: None, trim: -1, commit: -1, entries: VecDeque::new() } }
 }
 
-impl StreamState {
+impl<P: Payload> StreamState<P> {
     pub fn last(&self) -> i64 { self.trim + self.entries.len() as i64 }
 
-    pub fn retained_bytes(&self) -> usize { self.entries.iter().map(|held| held.payload.len() + 32).sum() }
+    pub fn retained_bytes(&self) -> usize { self.entries.iter().map(|held| held.payload.bytes() + 32).sum() }
+
+    pub fn held_mut(&mut self, lsn: i64) -> Option<&mut Held<P>> {
+        if lsn <= self.trim { return None; }
+        self.entries.get_mut((lsn - self.trim - 1) as usize)
+    }
 
     pub fn apply(&mut self, event: &Event) {
         match event {
@@ -69,7 +97,7 @@ impl StreamState {
             }
             Event::Append(entry) => {
                 debug_assert_eq!(entry.lsn, self.last() + 1);
-                self.entries.push_back(Held { epoch: entry.epoch, timestamp: entry.timestamp, payload: entry.payload.clone() });
+                self.entries.push_back(Held { epoch: entry.epoch, timestamp: entry.timestamp, payload: P::decided(&entry.payload) });
             }
             Event::Commit(lsn) => self.commit = self.commit.max((*lsn).min(self.last())),
             Event::Trim(through) => {
@@ -126,7 +154,7 @@ impl StreamState {
             return invalid("an overwrite's entries must be dense from its first lsn and no later than its epoch");
         }
         // A writer's own overwrites never cut what it placed, so one that would is a request delivered after newer ones: deciding it would drop entries those may have committed.
-        let own = |held: &Held| held.epoch == epoch;
+        let own = |held: &Held<P>| held.epoch == epoch;
         if from <= self.last() && (self.synced == Some(epoch) || self.entries.iter().skip((from - self.trim - 1) as usize).any(own)) {
             return invalid(format!("an overwrite at epoch {epoch} from {from} would drop entries its own writer placed, up to {}", self.last()));
         }
@@ -176,18 +204,26 @@ impl StreamState {
     pub fn runs(&self) -> Vec<EpochRun> { runs_of(self.entries.iter().zip(self.trim + 1..).map(|(held, lsn)| (lsn, held.epoch))) }
 
     /// Entries in `[from, to]`, the first always included when present, then while within the limits.
-    pub fn entries(&self, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Entries {
-        let mut entries = Vec::new();
+    pub fn window<T>(&self, from: i64, to: i64, max_entries: usize, max_bytes: usize, mut item: impl FnMut(i64, &Held<P>) -> T) -> Window<T> {
+        let mut items = Vec::new();
         if from > self.trim {
             let mut bytes = 0usize;
             let skip = (from - self.trim - 1) as usize;
             for (held, lsn) in self.entries.iter().skip(skip).zip(from..=to).take(max_entries) {
-                bytes = bytes.saturating_add(held.payload.len());
-                if bytes > max_bytes && !entries.is_empty() { break; }
-                entries.push(Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload: held.payload.clone() });
+                bytes = bytes.saturating_add(held.payload.bytes());
+                if bytes > max_bytes && !items.is_empty() { break; }
+                items.push(item(lsn, held));
             }
         }
-        Entries { entries, commit_lsn: self.commit, trim_lsn: self.trim, last_lsn: self.last() }
+        Window { items, commit_lsn: self.commit, trim_lsn: self.trim, last_lsn: self.last() }
+    }
+}
+
+#[cfg(any(test, feature = "simulation"))]
+impl StreamState<Bytes> {
+    pub fn entries(&self, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Entries {
+        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload: held.payload.clone() });
+        Entries { entries: window.items, commit_lsn: window.commit_lsn, trim_lsn: window.trim_lsn, last_lsn: window.last_lsn }
     }
 }
 
@@ -198,7 +234,7 @@ mod tests {
     fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
 
     fn synced(epoch: u64) -> StreamState {
-        let mut state = StreamState::default();
+        let mut state = <StreamState>::default();
         state.seal(epoch);
         state.overwrite(epoch, 0, Vec::new(), true, -1);
         state
@@ -208,7 +244,7 @@ mod tests {
 
     #[test]
     fn appends_need_a_synced_writer_at_the_promised_epoch() {
-        let mut state = StreamState::default();
+        let mut state = <StreamState>::default();
         assert_eq!(reply(state.append(1, 0, vec![entry(0, 1)], -1)), ResponseBody::Refused(Refused { promised: 0, last_lsn: -1 }));
         state.seal(1);
         assert!(matches!(reply(state.append(1, 0, vec![entry(0, 1)], -1)), ResponseBody::Refused(_)), "sealed is not synced");
@@ -250,7 +286,7 @@ mod tests {
         state.append(1, 0, vec![entry(0, 1), entry(1, 1), entry(2, 1)], 0);
         assert!(matches!(reply(state.overwrite(1, 1, Vec::new(), true, 0)), ResponseBody::Failed(_)), "a rejoin delivered after the appends that followed it");
         assert!(matches!(reply(state.overwrite(1, 3, vec![entry(3, 1)], true, 0)), ResponseBody::Accepted(_)));
-        let mut copying = StreamState::default();
+        let mut copying = <StreamState>::default();
         copying.seal(2);
         copying.overwrite(2, 0, vec![entry(0, 1), entry(1, 2)], false, -1);
         assert!(matches!(reply(copying.overwrite(2, 1, vec![entry(1, 2)], false, -1)), ResponseBody::Failed(_)), "a chunk delivered after the one that followed it");
@@ -294,13 +330,13 @@ mod tests {
 
     #[test]
     fn replaying_the_events_rebuilds_the_state() {
-        let mut state = StreamState::default();
+        let mut state = <StreamState>::default();
         let mut events = Vec::new();
         events.extend(state.seal(3).events);
         events.extend(state.overwrite(3, 0, vec![entry(0, 2), entry(1, 3)], true, 0).events);
         events.extend(state.append(3, 2, vec![entry(2, 3)], 2).events);
         events.extend(state.trim(0).events);
-        let mut replayed = StreamState::default();
+        let mut replayed = <StreamState>::default();
         for event in &events { replayed.apply(event); }
         assert_eq!(replayed, state);
     }

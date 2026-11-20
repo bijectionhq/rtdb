@@ -1,8 +1,9 @@
 //! Every stream a server holds, and the order in which their mutations reach the journal.
 
 use super::journal::{Captured, Journal, Recovered, Work, Write};
-use super::state::{Decision, StreamState};
-use crate::protocol::{Entries, Failed, RequestBody, ResponseBody};
+use super::payload::{Item, Source, Stored};
+use super::state::{Decision, StreamState, Window};
+use crate::protocol::{Entries, Entry, Failed, RequestBody, ResponseBody};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ pub(crate) struct Slot {
     /// Names the stream in the journal's records.
     pub id: u64,
     pub name: String,
-    pub state: Mutex<StreamState>,
+    pub state: Mutex<StreamState<Stored>>,
     /// Woken when the commit lsn or trim point moves.
     pub progressed: Notify,
 }
@@ -55,7 +56,7 @@ impl Store {
 
     /// Decides a mutation and queues its events, both under the stream's lock, so the journal sees the stream's decisions in order.
     pub fn mutate(&self, body: RequestBody) -> Outcome {
-        let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState) -> Decision>) = match body {
+        let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision>) = match body {
             RequestBody::Append(append) => (append.stream, Box::new(move |state| state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn))),
             RequestBody::Overwrite(overwrite) => (overwrite.stream, Box::new(move |state| state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn))),
             RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
@@ -90,26 +91,44 @@ impl Store {
         if disk <= 2 * live + COMPACTION_SLACK_BYTES || !self.journal.claim_compaction() { return; }
         let streams = self.streams.lock();
         let locked: Vec<_> = streams.values().map(|slot| (slot, slot.state.lock())).collect();
-        let captured = locked.iter().map(|(slot, state)| Captured { id: slot.id, name: slot.name.clone(), state: (**state).clone() }).collect();
+        let captured = locked.iter().map(|(slot, state)| Captured { slot: Arc::clone(slot), state: (**state).clone() }).collect();
         if self.queue.send(Work { write: Write::Compact(captured), done: oneshot::channel().0 }).is_err() { self.journal.release_compaction(); }
     }
 
     pub fn check(&self, stream: &str, epoch: u64) -> ResponseBody {
-        match self.existing(stream) { Some(slot) => slot.state.lock().check(epoch), None => StreamState::default().check(epoch) }
+        match self.existing(stream) { Some(slot) => slot.state.lock().check(epoch), None => StreamState::<Stored>::default().check(epoch) }
     }
 
-    pub fn fetch(&self, stream: &str, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> ResponseBody {
-        let Some(slot) = self.existing(stream) else { return ResponseBody::Entries(StreamState::default().entries(from, -1, 0, 0)); };
+    /// Selects entries in `[from, to]` and where to find each payload, under the stream's lock.
+    fn select(&self, state: &StreamState<Stored>, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Window<Item> {
+        state.window(from, to, max_entries, max_bytes, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, source: self.journal.source(&held.payload) })
+    }
+
+    /// Held entries in `[from, to)`, committed or not; a selection with payloads still on disk is resolved by `entries`.
+    pub fn fetch(&self, stream: &str, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Selected {
+        let Some(slot) = self.existing(stream) else { return Selected(self.select(&StreamState::default(), from, -1, 0, 0)); };
         let state = slot.state.lock();
         let to = to.saturating_sub(1).min(state.last());
-        ResponseBody::Entries(state.entries(from, to, max_entries, max_bytes))
+        Selected(self.select(&state, from, to, max_entries, max_bytes))
+    }
+
+    /// Reads whatever payloads a selection still needs from the segments, off the async threads.
+    pub async fn entries(&self, selected: Selected) -> ResponseBody {
+        let window = match selected.ready() { Ok(body) => return body, Err(Selected(window)) => window };
+        let journal = Arc::clone(&self.journal);
+        match tokio::task::spawn_blocking(move || journal.resolve(window)).await {
+            Ok(Ok(entries)) => ResponseBody::Entries(entries),
+            Ok(Err(error)) => failed(format!("reading the segments failed: {error}")),
+            Err(error) => failed(format!("reading the segments failed: {error}")),
+        }
     }
 
     /// Long-polls up to `wait` for a committed entry at `from`.
     pub async fn read(&self, stream: &str, from: i64, max_entries: usize, max_bytes: usize, wait: Duration, cancellation: &CancellationToken) -> ResponseBody {
-        let read = |state: &StreamState| state.entries(from, state.commit, max_entries, max_bytes);
+        let read = |state: &StreamState<Stored>| Selected(self.select(state, from, state.commit, max_entries, max_bytes));
         if wait.is_zero() {
-            return ResponseBody::Entries(match self.existing(stream) { Some(slot) => read(&slot.state.lock()), None => StreamState::default().entries(from, -1, 0, 0) });
+            let selected = match self.existing(stream) { Some(slot) => read(&slot.state.lock()), None => read(&StreamState::default()) };
+            return self.entries(selected).await;
         }
         let slot = self.slot(stream);
         let deadline = tokio::time::Instant::now() + wait;
@@ -117,14 +136,30 @@ impl Store {
             let progressed = slot.progressed.notified();
             tokio::pin!(progressed);
             progressed.as_mut().enable();
-            let entries: Entries = read(&slot.state.lock());
-            if !entries.entries.is_empty() || from <= entries.trim_lsn { return ResponseBody::Entries(entries); }
+            let selected = read(&slot.state.lock());
+            if !selected.0.items.is_empty() || from <= selected.0.trim_lsn { return self.entries(selected).await; }
             tokio::select! {
                 _ = progressed => (),
-                _ = tokio::time::sleep_until(deadline) => return ResponseBody::Entries(entries),
-                _ = cancellation.cancelled() => return ResponseBody::Entries(entries),
+                _ = tokio::time::sleep_until(deadline) => return self.entries(selected).await,
+                _ = cancellation.cancelled() => return self.entries(selected).await,
             }
         }
+    }
+}
+
+/// Entries selected under their stream's lock, some of whose payloads may still have to be read from the segments.
+pub(crate) struct Selected(Window<Item>);
+
+impl Selected {
+    /// The reply, if every payload is already in hand.
+    pub fn ready(self) -> std::result::Result<ResponseBody, Selected> {
+        if self.0.items.iter().any(|item| matches!(item.source, Source::Disk(..))) { return Err(self); }
+        let Window { items, commit_lsn, trim_lsn, last_lsn } = self.0;
+        let entries = items.into_iter().map(|item| {
+            let Source::Ready(payload) = item.source else { unreachable!("checked above") };
+            Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, payload }
+        }).collect();
+        Ok(ResponseBody::Entries(Entries { entries, commit_lsn, trim_lsn, last_lsn }))
     }
 }
 

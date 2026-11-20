@@ -22,7 +22,7 @@ async fn the_resident_cost_of_an_idle_deployment() {
     let mut logkeepers = Vec::new();
     for index in 0..3 {
         logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {
-            listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("lk{index}")), fsync: false, availability_zone: format!("z{index}"), lease: lease.clone(),
+            listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("lk{index}")), fsync: false, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES, availability_zone: format!("z{index}"), lease: lease.clone(),
         }).await.unwrap());
     }
     let node = process::start_node(Arc::clone(&directory), process::NodeSettings {

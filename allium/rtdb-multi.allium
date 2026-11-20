@@ -399,6 +399,7 @@ contract LogService {
     @invariant ReadsAreDemultiplexed
         -- A read or subscription for one deployment is served from that deployment's own index and returns only its records.
         --   Records of many deployments share physical segments; no reader of one deployment reads another's.
+        --   A server holds a deployment's index in memory and its records in the segments, so its memory grows with how many records it retains, not with their bytes.
 
     @invariant GroupCommitSpansDeployments
         -- One durable round on a log server carries the pending appends of every deployment its writers have sent, within group_commit_window.

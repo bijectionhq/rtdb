@@ -1,7 +1,7 @@
 mod common;
 
 use common::{Server, append};
-use rtdb_logkeeper::{StreamConfig, open_reader, open_writer, seal, trim};
+use rtdb_logkeeper::{ServerOptions, StreamConfig, open_reader, open_writer, seal, trim};
 use rtdb_storage::Error;
 use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::AnomalyCategory;
@@ -22,10 +22,21 @@ async fn payloads(log: &dyn Log, from: i64) -> Vec<String> {
     log.read_range(LogOffset(from), LogOffset(i64::MAX)).await.unwrap().iter().map(|record| String::from_utf8(record.payload.to_vec()).unwrap()).collect()
 }
 
+async fn start(data_dir: &Path, cache_bytes: usize) -> Server { Server::start_with(data_dir, "127.0.0.1:0".parse().unwrap(), cache_bytes).await }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streams_share_segments_that_a_trim_compacts_and_a_restart_replays() {
+    share_compact_and_replay(ServerOptions::DEFAULT_CACHE_BYTES).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_caching_almost_nothing_serves_every_entry_from_its_segments_across_a_compaction_and_a_restart() {
+    share_compact_and_replay(4 * 1024).await;
+}
+
+async fn share_compact_and_replay(cache_bytes: usize) {
     let directory = tempfile::tempdir().unwrap();
-    let server = Server::start(directory.path()).await;
+    let server = start(directory.path(), cache_bytes).await;
     let streams = 50;
     let mut writers = Vec::new();
     for stream in 0..streams {
@@ -37,6 +48,10 @@ async fn streams_share_segments_that_a_trim_compacts_and_a_restart_replays() {
 
     let large = "x".repeat(40 * 1024);
     for position in 3..43 { append(writers[0].as_ref(), &format!("{position}{large}"), position).await; }
+    let reader = open_reader(config(&server, 0), CancellationToken::new()).await.unwrap();
+    let all = payloads(reader.as_ref(), 0).await;
+    assert_eq!((all.len(), all[2].as_str(), all[42].len()), (43, "0:2", 2 + large.len()), "a reader is served entries the cache no longer holds");
+    drop(reader);
     let before = segments(directory.path()).1;
     trim(&config(&server, 0), LogOffset(40)).await.unwrap();
     append(writers[0].as_ref(), "after the trim", 43).await;
@@ -50,7 +65,7 @@ async fn streams_share_segments_that_a_trim_compacts_and_a_restart_replays() {
     drop(writers);
     server.stop().await;
 
-    let server = Server::start(directory.path()).await;
+    let server = start(directory.path(), cache_bytes).await;
     for stream in 1..streams {
         let reader = open_reader(config(&server, stream), CancellationToken::new()).await.unwrap();
         assert_eq!(payloads(reader.as_ref(), 0).await, (0..3).map(|position| format!("{stream}:{position}")).collect::<Vec<_>>());

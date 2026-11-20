@@ -127,7 +127,7 @@ impl rtdb_node::ReadFence for FenceSlot {
     }
 }
 
-pub struct LogkeeperSettings { pub listen: SocketAddr, pub data_dir: PathBuf, pub fsync: bool, pub availability_zone: String, pub lease: LeaseOptions }
+pub struct LogkeeperSettings { pub listen: SocketAddr, pub data_dir: PathBuf, pub fsync: bool, pub cache_bytes: usize, pub availability_zone: String, pub lease: LeaseOptions }
 
 pub struct RunningLogkeeper {
     pub address: SocketAddr,
@@ -142,7 +142,7 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: address.to_string(), control_address: None, availability_zone: settings.availability_zone, pool: Default::default() }, settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    tasks.spawn(rtdb_logkeeper::serve(listener, rtdb_logkeeper::ServerOptions { data_dir: settings.data_dir, fsync: settings.fsync }, cancellation.clone()));
+    tasks.spawn(rtdb_logkeeper::serve(listener, rtdb_logkeeper::ServerOptions { data_dir: settings.data_dir, fsync: settings.fsync, cache_bytes: settings.cache_bytes }, cancellation.clone()));
     { let lease = Arc::clone(&lease); let cancellation = cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     Ok(RunningLogkeeper { address, lease, cancellation, tasks })
 }

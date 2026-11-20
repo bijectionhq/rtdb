@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi directory --listen ADDR\n\
-       rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--no-fsync]\n\
+       rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
        rtdb-multi cell-map --listen ADDR\n\
@@ -83,6 +83,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             let logkeeper = process::start_logkeeper(directory, process::LogkeeperSettings {
                 listen: arguments.address("listen", "127.0.0.1:0")?, data_dir: PathBuf::from(arguments.required("data")?), fsync: !arguments.present("no-fsync"),
+                cache_bytes: arguments.number("cache-bytes", rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES)?,
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(), lease: LeaseOptions::default(),
             }).await?;
             eprintln!("logkeeper {} listening on {}", logkeeper.lease.id(), logkeeper.address);

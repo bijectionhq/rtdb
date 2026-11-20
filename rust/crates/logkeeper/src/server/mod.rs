@@ -1,6 +1,7 @@
 //! The logkeeper server: many named streams on one data directory, served over one multiplexed protocol.
 
 mod journal;
+mod payload;
 pub(crate) mod state;
 mod store;
 
@@ -22,12 +23,18 @@ pub struct ServerOptions {
     pub data_dir: PathBuf,
     /// Syncs every round before acknowledging it; only tests turn this off.
     pub fsync: bool,
+    /// The most bytes of recently written or read payloads the server keeps in memory, across every stream; the rest are read from the segments.
+    pub cache_bytes: usize,
+}
+
+impl ServerOptions {
+    pub const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 }
 
 /// Serves until `cancellation`, then closes every connection and drains the journal.
 /// A failed journal write stops the server, since its later acknowledgements could no longer be trusted.
 pub async fn serve(listener: TcpListener, options: ServerOptions, cancellation: CancellationToken) -> Result<()> {
-    let opened = tokio::task::spawn_blocking(move || Journal::open(&options.data_dir, options.fsync))
+    let opened = tokio::task::spawn_blocking(move || Journal::open(&options.data_dir, options.fsync, options.cache_bytes))
         .await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))?;
     let (journal, recovered) = opened?;
     let journal = Arc::new(journal);
@@ -71,8 +78,16 @@ async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, ca
         match request.body {
             None => { let _ = replies.send(reply(failed("a request without a body"))); }
             Some(RequestBody::Fetch(fetch)) => {
-                let body = store.fetch(&fetch.stream, fetch.from_lsn, fetch.to_lsn, fetch.max_entries as usize, fetch.max_bytes as usize);
-                let _ = replies.send(reply(body));
+                match store.fetch(&fetch.stream, fetch.from_lsn, fetch.to_lsn, fetch.max_entries as usize, fetch.max_bytes as usize).ready() {
+                    Ok(body) => { let _ = replies.send(reply(body)); }
+                    Err(selected) => {
+                        let (store, replies) = (Arc::clone(&store), replies.clone());
+                        tasks.spawn(async move {
+                            let body = store.entries(selected).await;
+                            let _ = replies.send(Response { id, body: Some(body) });
+                        });
+                    }
+                }
             }
             Some(RequestBody::Check(check)) => { let _ = replies.send(reply(store.check(&check.stream, check.epoch))); }
             Some(RequestBody::Read(read)) => {

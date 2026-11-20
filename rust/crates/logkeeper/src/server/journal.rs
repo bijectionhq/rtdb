@@ -3,10 +3,12 @@
 //! A round of writes, across every stream, is one write and at most one sync.
 //! A compaction writes a base segment holding a snapshot of every stream and then deletes every earlier segment; replay starts at the last base segment.
 //! A torn final record of the last segment is cut off on recovery, as it was never acknowledged.
+//! A retained entry's payload stays in the segment its record was written to, and a reader reads it from there; memory holds only each entry's location and a bounded cache of payloads.
 
-use super::state::{Event, StreamState};
+use super::payload::{Cache, Item, Location, Source, Stored};
+use super::state::{Event, StreamState, Window};
 use super::store::Slot;
-use crate::protocol::Entry;
+use crate::protocol::{Entries, Entry};
 use bytes::{BufMut, Bytes, BytesMut};
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -14,13 +16,17 @@ use prost::Message;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{BufReader, Write as _};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A compaction writes its base segment in pieces of about this size.
+const COMPACTION_WRITE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Message)]
 struct Snapshot {
@@ -84,15 +90,6 @@ fn frame(stream: u64, kind: Kind, buffer: &mut BytesMut) {
     buffer.put_slice(&body);
 }
 
-fn frame_state(stream: &Captured, buffer: &mut BytesMut) {
-    let (id, state) = (stream.id, &stream.state);
-    frame(id, Kind::Declare(stream.name.clone()), buffer);
-    frame(id, Kind::Snapshot(Snapshot { promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit }), buffer);
-    for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
-        frame(id, Kind::Append(Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload: held.payload.clone() }), buffer);
-    }
-}
-
 fn io_error(path: &Path, error: std::io::Error) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/io", format!("I/O at {}: {error}", path.display()))
 }
@@ -103,9 +100,8 @@ fn corrupt(path: &Path, reason: impl std::fmt::Display) -> Anomaly {
 
 /// A stream's state as of a point in the journal's order, for a base segment.
 pub(crate) struct Captured {
-    pub id: u64,
-    pub name: String,
-    pub state: StreamState,
+    pub slot: Arc<Slot>,
+    pub state: StreamState<Stored>,
 }
 
 pub(crate) enum Write {
@@ -121,7 +117,7 @@ pub(crate) struct Work {
 
 /// The segment being appended to; touched only by the journal's rounds.
 struct Current {
-    file: File,
+    file: Arc<File>,
     path: PathBuf,
     sequence: u64,
     bytes: u64,
@@ -138,12 +134,23 @@ pub(crate) struct Journal {
     bytes: AtomicU64,
     next_id: AtomicU64,
     compaction_queued: AtomicBool,
+    /// A handle on every segment from the last base on, for reads.
+    files: Mutex<BTreeMap<u64, Arc<File>>>,
+    cache: Mutex<Cache>,
 }
 
 pub(crate) struct Recovered {
     pub id: u64,
     pub name: String,
-    pub state: StreamState,
+    pub state: StreamState<Stored>,
+}
+
+/// An `Append` record in a round's buffer, whose entry learns its location once the round is written.
+struct Placed<'a> {
+    slot: &'a Arc<Slot>,
+    entry: &'a Entry,
+    start: usize,
+    length: usize,
 }
 
 fn segment_path(segments: &Path, sequence: u64) -> PathBuf { segments.join(format!("{sequence:020}.seg")) }
@@ -170,6 +177,32 @@ fn list_segments(segments: &Path) -> Result<BTreeMap<u64, PathBuf>> {
     Ok(sequences)
 }
 
+fn open_segment(path: &Path) -> Result<Arc<File>> {
+    OpenOptions::new().create(true).read(true).append(true).open(path).map(Arc::new).map_err(|error| io_error(path, error))
+}
+
+/// Whether a segment starts with a `Base` record.
+fn is_base(path: &Path) -> Result<bool> {
+    let file = File::open(path).map_err(|error| io_error(path, error))?;
+    let length = file.metadata().map_err(|error| io_error(path, error))?.len();
+    let mut reader = BufReader::new(file);
+    Ok(matches!(read_record(&mut reader, length).map_err(|error| io_error(path, error))?, Some((Record { kind: Some(Kind::Base(_)), .. }, _))))
+}
+
+/// Reads the next whole record of a segment of `remaining` bytes from here, with its framed length; none at the first incomplete or damaged one.
+fn read_record(reader: &mut impl std::io::Read, remaining: u64) -> std::io::Result<Option<(Record, u64)>> {
+    if remaining < 8 { return Ok(None); }
+    let mut header = [0u8; 8];
+    reader.read_exact(&mut header)?;
+    let length = u32::from_be_bytes(header[0..4].try_into().expect("four bytes")) as u64;
+    let checksum = u32::from_be_bytes(header[4..8].try_into().expect("four bytes"));
+    if remaining - 8 < length { return Ok(None); }
+    let mut body = vec![0; length as usize];
+    reader.read_exact(&mut body)?;
+    if crc32fast::hash(&body) != checksum { return Ok(None); }
+    Ok(Record::decode(Bytes::from(body)).ok().map(|record| (record, 8 + length)))
+}
+
 fn remove_before(segments: &Path, sequence: u64) -> Result<()> {
     for (_, path) in list_segments(segments)?.range(..sequence) { fs::remove_file(path).map_err(|error| io_error(path, error))?; }
     Ok(())
@@ -177,36 +210,38 @@ fn remove_before(segments: &Path, sequence: u64) -> Result<()> {
 
 impl Journal {
     /// Replays the segments from the last base on, deleting any earlier ones a crash left behind, and opens the last for appending.
-    pub fn open(data_dir: &Path, fsync: bool) -> Result<(Self, Vec<Recovered>)> {
+    pub fn open(data_dir: &Path, fsync: bool, cache_bytes: usize) -> Result<(Self, Vec<Recovered>)> {
         let segments = data_dir.join("segments");
         fs::create_dir_all(&segments).map_err(|error| io_error(&segments, error))?;
         let lock_path = data_dir.join("LOCK");
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).map_err(|error| io_error(&lock_path, error))?;
         lock.try_lock_exclusive().map_err(|error| io_error(&lock_path, error))?;
-        let mut contents = Vec::new();
+        let mut chain = Vec::new();
         for (sequence, path) in list_segments(&segments)?.into_iter().rev() {
-            let bytes = Bytes::from(fs::read(&path).map_err(|error| io_error(&path, error))?);
-            let base = matches!(next_record(&bytes, &mut 0), Some(Record { kind: Some(Kind::Base(_)), .. }));
-            contents.push((sequence, path, bytes));
+            let base = is_base(&path)?;
+            chain.push((sequence, path));
             if base { break; }
         }
-        contents.reverse();
-        if let Some((first, _, _)) = contents.first() { remove_before(&segments, *first)?; }
+        chain.reverse();
+        if let Some((first, _)) = chain.first() { remove_before(&segments, *first)?; }
         let mut replay = Replay::default();
         let mut total = 0u64;
-        let last_index = contents.len().checked_sub(1);
-        for (index, (_, path, bytes)) in contents.iter().enumerate() {
-            let end = replay.segment(path, bytes)?;
-            if end < bytes.len() {
+        let mut files = BTreeMap::new();
+        let last_index = chain.len().checked_sub(1);
+        for (index, (sequence, path)) in chain.iter().enumerate() {
+            let (end, length) = replay.segment(*sequence, path)?;
+            if end < length {
                 if Some(index) != last_index { return Err(corrupt(path, format!("a damaged record at {end} before the last segment"))); }
                 let file = OpenOptions::new().write(true).open(path).map_err(|error| io_error(path, error))?;
-                file.set_len(end as u64).and_then(|_| rtdb_storage::sync_file(&file)).map_err(|error| io_error(path, error))?;
+                file.set_len(end).and_then(|_| rtdb_storage::sync_file(&file)).map_err(|error| io_error(path, error))?;
             }
-            total += end as u64;
+            if Some(index) != last_index { files.insert(*sequence, Arc::new(File::open(path).map_err(|error| io_error(path, error))?)); }
+            total += end;
         }
-        let (sequence, path) = contents.last().map_or_else(|| (0, segment_path(&segments, 0)), |(sequence, path, _)| (*sequence, path.clone()));
-        let file = OpenOptions::new().create(true).append(true).open(&path).map_err(|error| io_error(&path, error))?;
-        if contents.is_empty() { sync_directory(&segments, fsync)?; }
+        let (sequence, path) = chain.last().map_or_else(|| (0, segment_path(&segments, 0)), |(sequence, path)| (*sequence, path.clone()));
+        let file = open_segment(&path)?;
+        files.insert(sequence, Arc::clone(&file));
+        if chain.is_empty() { sync_directory(&segments, fsync)?; }
         let bytes = file.metadata().map_err(|error| io_error(&path, error))?.len();
         let declared = replay.names.keys().copied().collect();
         let next_id = replay.names.keys().max().map_or(0, |id| id + 1);
@@ -219,6 +254,8 @@ impl Journal {
             bytes: AtomicU64::new(total),
             next_id: AtomicU64::new(next_id),
             compaction_queued: AtomicBool::new(false),
+            files: Mutex::new(files),
+            cache: Mutex::new(Cache::new(cache_bytes)),
         };
         Ok((journal, recovered))
     }
@@ -237,27 +274,50 @@ impl Journal {
     fn write_round(&self, works: &[Work]) -> Result<()> {
         let mut current = self.current.lock();
         let mut buffer = BytesMut::new();
+        let mut placed = Vec::new();
         let mut sync = false;
         for work in works {
             match &work.write {
                 Write::Events(_, events) if events.is_empty() => (),
                 Write::Events(slot, events) => {
-                    if current.declared.insert(slot.id) {
-                        frame(slot.id, Kind::Declare(slot.name.clone()), &mut buffer);
-                        sync = true;
+                    if current.declared.insert(slot.id) { frame(slot.id, Kind::Declare(slot.name.clone()), &mut buffer); }
+                    for event in events {
+                        let start = buffer.len();
+                        frame(slot.id, record(event), &mut buffer);
+                        if let Event::Append(entry) = event { placed.push(Placed { slot, entry, start, length: buffer.len() - start }); }
                     }
-                    for event in events { frame(slot.id, record(event), &mut buffer); }
                     sync = true;
                 }
                 Write::Compact(captured) => {
-                    self.append(&mut current, &buffer, sync)?;
+                    self.flush(&mut current, &buffer, sync, &placed)?;
                     buffer.clear();
+                    placed.clear();
                     sync = false;
                     self.compact(&mut current, captured)?;
                 }
             }
         }
-        self.append(&mut current, &buffer, sync)
+        self.flush(&mut current, &buffer, sync, &placed)
+    }
+
+    /// Appends a buffer, then points each entry it placed at its record.
+    /// An entry already replaced by a later decision keeps that decision's payload, which a later record carries.
+    fn flush(&self, current: &mut Current, buffer: &[u8], sync: bool, placed: &[Placed]) -> Result<()> {
+        let (segment, base) = (current.sequence, current.bytes);
+        self.append(current, buffer, sync)?;
+        for placed in placed {
+            let entry = placed.entry;
+            let location = Location { segment, offset: base + placed.start as u64, length: placed.length as u32, payload: entry.payload.len() as u32 };
+            let mut state = placed.slot.state.lock();
+            let Some(held) = state.held_mut(entry.lsn) else { continue };
+            let same = held.epoch == entry.epoch && held.timestamp == entry.timestamp
+                && matches!(&held.payload, Stored::Pending(payload) if payload.as_ptr() == entry.payload.as_ptr() && payload.len() == entry.payload.len());
+            if same {
+                held.payload = Stored::Written(location);
+                self.cache.lock().insert(location, &entry.payload);
+            }
+        }
+        Ok(())
     }
 
     fn append(&self, current: &mut Current, buffer: &[u8], sync: bool) -> Result<()> {
@@ -270,32 +330,123 @@ impl Journal {
             if !sync { self.sync(&current.file, &current.path)?; }
             let sequence = current.sequence + 1;
             let path = segment_path(&self.segments, sequence);
-            let file = OpenOptions::new().create(true).append(true).open(&path).map_err(|error| io_error(&path, error))?;
+            let file = open_segment(&path)?;
             sync_directory(&self.segments, self.fsync)?;
+            self.files.lock().insert(sequence, Arc::clone(&file));
             *current = Current { file, path, sequence, bytes: 0, declared: std::mem::take(&mut current.declared) };
         }
         Ok(())
     }
 
-    /// Writes a base segment holding every captured stream, then deletes every earlier segment.
+    /// Writes a base segment holding every captured stream, copying each retained payload from where it is, then points each stream's entries at their copies and deletes every earlier segment.
     fn compact(&self, current: &mut Current, captured: &[Captured]) -> Result<()> {
-        let mut buffer = BytesMut::new();
-        frame(0, Kind::Base(true), &mut buffer);
-        for stream in captured { frame_state(stream, &mut buffer); }
         let sequence = current.sequence + 1;
         let path = segment_path(&self.segments, sequence);
         let temporary = path.with_extension("tmp");
         let mut file = File::create(&temporary).map_err(|error| io_error(&temporary, error))?;
+        let mut buffer = BytesMut::new();
+        let mut written = 0u64;
+        let mut copies = Vec::with_capacity(captured.len());
+        frame(0, Kind::Base(true), &mut buffer);
+        for stream in captured {
+            let (id, state) = (stream.slot.id, &stream.state);
+            frame(id, Kind::Declare(stream.slot.name.clone()), &mut buffer);
+            frame(id, Kind::Snapshot(Snapshot { promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit }), &mut buffer);
+            let mut locations = Vec::with_capacity(state.entries.len());
+            for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
+                let payload = match &held.payload {
+                    Stored::Pending(payload) => payload.clone(),
+                    Stored::Written(location) => self.payload(lsn, *location)?,
+                };
+                let start = buffer.len();
+                let length = payload.len() as u32;
+                frame(id, Kind::Append(Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload }), &mut buffer);
+                locations.push(Location { segment: sequence, offset: written + start as u64, length: (buffer.len() - start) as u32, payload: length });
+                if buffer.len() >= COMPACTION_WRITE_BYTES {
+                    file.write_all(&buffer).map_err(|error| io_error(&temporary, error))?;
+                    written += buffer.len() as u64;
+                    buffer.clear();
+                }
+            }
+            copies.push(locations);
+        }
         file.write_all(&buffer).map_err(|error| io_error(&temporary, error))?;
+        written += buffer.len() as u64;
         self.sync(&file, &temporary)?;
+        drop(file);
         fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
         sync_directory(&self.segments, self.fsync)?;
-        let file = OpenOptions::new().append(true).open(&path).map_err(|error| io_error(&path, error))?;
-        *current = Current { file, path, sequence, bytes: buffer.len() as u64, declared: captured.iter().map(|stream| stream.id).collect() };
-        self.bytes.store(buffer.len() as u64, Ordering::Relaxed);
+        let file = open_segment(&path)?;
+        self.files.lock().insert(sequence, Arc::clone(&file));
+        *current = Current { file, path, sequence, bytes: written, declared: captured.iter().map(|stream| stream.slot.id).collect() };
+        self.bytes.store(written, Ordering::Relaxed);
+        for (stream, locations) in captured.iter().zip(copies) { self.moved(stream, &locations); }
         remove_before(&self.segments, sequence)?;
+        self.files.lock().retain(|segment, _| *segment >= sequence);
         sync_directory(&self.segments, self.fsync)
     }
+
+    /// Points a captured stream's entries at their copies in the base segment.
+    /// Every entry decided before the capture has been written by now and every one decided after is still pending, so a written entry is the one captured.
+    fn moved(&self, stream: &Captured, locations: &[Location]) {
+        let mut state = stream.slot.state.lock();
+        for ((captured, lsn), copy) in stream.state.entries.iter().zip(stream.state.trim + 1..).zip(locations) {
+            let Some(held) = state.held_mut(lsn) else { continue };
+            let Stored::Written(old) = held.payload else { continue };
+            if (held.epoch, held.timestamp) != (captured.epoch, captured.timestamp) { continue; }
+            held.payload = Stored::Written(*copy);
+            self.cache.lock().moved(old, *copy);
+        }
+    }
+
+    /// Where each entry's payload is to be read from, under its stream's lock.
+    pub fn source(&self, stored: &Stored) -> Source {
+        match stored {
+            Stored::Pending(payload) => Source::Ready(payload.clone()),
+            Stored::Written(location) => match self.cache.lock().get(*location) {
+                Some(payload) => Source::Ready(payload),
+                None => Source::Disk(self.files.lock().get(&location.segment).cloned(), *location),
+            },
+        }
+    }
+
+    /// Reads a written payload, from the cache or from its segment.
+    fn payload(&self, lsn: i64, location: Location) -> Result<Bytes> {
+        if let Some(payload) = self.cache.lock().get(location) { return Ok(payload); }
+        let file = self.files.lock().get(&location.segment).cloned();
+        self.read(file.as_deref(), lsn, location)
+    }
+
+    fn read(&self, file: Option<&File>, lsn: i64, location: Location) -> Result<Bytes> {
+        let path = segment_path(&self.segments, location.segment);
+        let file = file.ok_or_else(|| Anomaly::fault("rtdb.logkeeper/segment-retired", format!("lsn {lsn} points at retired segment {}", path.display())))?;
+        let mut frame = vec![0; location.length as usize];
+        file.read_exact_at(&mut frame, location.offset).map_err(|error| io_error(&path, error))?;
+        match next_record(&Bytes::from(frame), &mut 0) {
+            Some(Record { kind: Some(Kind::Append(entry)), .. }) if entry.lsn == lsn => Ok(entry.payload),
+            _ => Err(corrupt(&path, format!("no entry {lsn} at {}", location.offset))),
+        }
+    }
+
+    /// Reads every payload a window still needs from its segment, caching what it reads; blocks.
+    pub fn resolve(&self, window: Window<Item>) -> Result<Entries> {
+        let mut entries = Vec::with_capacity(window.items.len());
+        for item in window.items {
+            let payload = match item.source {
+                Source::Ready(payload) => payload,
+                Source::Disk(file, location) => {
+                    let payload = self.read(file.as_deref(), item.lsn, location)?;
+                    self.cache.lock().insert(location, &payload);
+                    payload
+                }
+            };
+            entries.push(Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, payload });
+        }
+        Ok(Entries { entries, commit_lsn: window.commit_lsn, trim_lsn: window.trim_lsn, last_lsn: window.last_lsn })
+    }
+
+    #[cfg(test)]
+    pub fn cache_bytes(&self) -> usize { self.cache.lock().bytes() }
 
     fn sync(&self, file: &File, path: &Path) -> Result<()> {
         if self.fsync { rtdb_storage::sync_file(file).map_err(|error| io_error(path, error))?; }
@@ -306,14 +457,19 @@ impl Journal {
 #[derive(Default)]
 struct Replay {
     names: HashMap<u64, String>,
-    states: HashMap<u64, StreamState>,
+    states: HashMap<u64, StreamState<Stored>>,
 }
 
 impl Replay {
-    /// Applies a segment's records, returning where the last whole record ends.
-    fn segment(&mut self, path: &Path, bytes: &Bytes) -> Result<usize> {
-        let mut position = 0usize;
-        while let Some(Record { stream, kind }) = next_record(bytes, &mut position) {
+    /// Applies a segment's records, reading it once in order, returning where the last whole record ends and the segment's length.
+    fn segment(&mut self, sequence: u64, path: &Path) -> Result<(u64, u64)> {
+        let file = File::open(path).map_err(|error| io_error(path, error))?;
+        let length = file.metadata().map_err(|error| io_error(path, error))?.len();
+        let mut reader = BufReader::with_capacity(1 << 20, file);
+        let mut position = 0u64;
+        while let Some((Record { stream, kind }, framed)) = read_record(&mut reader, length - position).map_err(|error| io_error(path, error))? {
+            let at = position;
+            position += framed;
             let kind = kind.ok_or_else(|| corrupt(path, "a record without a kind"))?;
             if let Kind::Declare(name) = &kind {
                 self.names.insert(stream, name.clone());
@@ -332,13 +488,16 @@ impl Replay {
                 Kind::Truncate(from) => state.apply(&Event::Truncate(from)),
                 Kind::Append(entry) => {
                     if entry.lsn != state.last() + 1 { return Err(corrupt(path, format!("stream {stream}'s entry {} follows {}", entry.lsn, state.last()))); }
-                    state.apply(&Event::Append(entry));
+                    let (lsn, payload) = (entry.lsn, entry.payload.len() as u32);
+                    state.apply(&Event::Append(Entry { payload: Bytes::new(), ..entry }));
+                    let held = state.held_mut(lsn).expect("just appended");
+                    held.payload = Stored::Written(Location { segment: sequence, offset: at, length: framed as u32, payload });
                 }
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),
                 Kind::Trim(through) => state.apply(&Event::Trim(through)),
             }
         }
-        Ok(position)
+        Ok((position, length))
     }
 }
 
@@ -386,7 +545,11 @@ pub(crate) async fn run(journal: Arc<Journal>, mut queue: mpsc::UnboundedReceive
 mod tests {
     use super::*;
 
+    const UNBOUNDED: usize = usize::MAX;
+
     fn entry(lsn: i64) -> Entry { Entry { lsn, epoch: 1, timestamp: lsn, payload: Bytes::from(format!("entry {lsn}")) } }
+
+    fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
 
     fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0 } }
 
@@ -394,48 +557,152 @@ mod tests {
         Arc::new(Slot { id: journal.allocate_id(), name: name.into(), state: Default::default(), progressed: Default::default() })
     }
 
-    fn captured(slot: &Slot, state: &StreamState) -> Captured { Captured { id: slot.id, name: slot.name.clone(), state: state.clone() } }
-
-    fn by_name(recovered: Vec<Recovered>) -> BTreeMap<String, StreamState> {
-        recovered.into_iter().map(|stream| (stream.name, stream.state)).collect()
+    fn recovered_slots(recovered: Vec<Recovered>) -> BTreeMap<String, Arc<Slot>> {
+        recovered.into_iter().map(|stream| (stream.name.clone(), Arc::new(Slot { id: stream.id, name: stream.name, state: Mutex::new(stream.state), progressed: Default::default() }))).collect()
     }
+
+    /// Decides on the slot's own state and writes the decision as one round, as the store and the journal task do.
+    fn decide(journal: &Journal, slot: &Arc<Slot>, decide: impl FnOnce(&mut StreamState<Stored>) -> super::super::state::Decision) {
+        let events = decide(&mut slot.state.lock()).events;
+        journal.write_round(&[work(Write::Events(Arc::clone(slot), events))]).unwrap();
+    }
+
+    fn compact(journal: &Journal, slots: &[&Arc<Slot>]) {
+        let captured = slots.iter().map(|slot| Captured { slot: Arc::clone(slot), state: slot.state.lock().clone() }).collect();
+        journal.write_round(&[work(Write::Compact(captured))]).unwrap();
+    }
+
+    fn synced(journal: &Journal, slot: &Arc<Slot>, epoch: u64) {
+        decide(journal, slot, |state| state.seal(epoch));
+        decide(journal, slot, |state| state.overwrite(epoch, state.last() + 1, Vec::new(), true, -1));
+    }
+
+    /// Every retained entry, with its payload resolved as a reader's would be.
+    fn retained(journal: &Journal, slot: &Slot) -> Vec<Entry> {
+        let window = {
+            let state = slot.state.lock();
+            state.window(state.trim + 1, state.last(), UNBOUNDED, UNBOUNDED, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, source: journal.source(&held.payload) })
+        };
+        journal.resolve(window).unwrap().entries
+    }
+
+    fn written(slot: &Slot) -> bool { slot.state.lock().entries.iter().all(|held| matches!(held.payload, Stored::Written(_))) }
 
     fn segment_files(directory: &Path) -> usize { fs::read_dir(directory.join("segments")).unwrap().count() }
 
     #[test]
     fn streams_sharing_segments_replay_to_their_decided_states_across_a_compaction() {
         let directory = tempfile::tempdir().unwrap();
-        let (journal, _) = Journal::open(directory.path(), true).unwrap();
+        let (journal, _) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
         let (first, second) = (slot(&journal, "deployment/1/replica"), slot(&journal, "deployment/2/replica"));
-        let (mut one, mut two) = (StreamState::default(), StreamState::default());
-        let mut events = one.seal(1).events;
-        events.extend(one.overwrite(1, 0, Vec::new(), true, -1).events);
-        events.extend(one.append(1, 0, (0..4).map(entry).collect(), 2).events);
-        journal.write_round(&[work(Write::Events(Arc::clone(&first), events)), work(Write::Events(Arc::clone(&second), two.seal(3).events))]).unwrap();
-        one.trim(1);
-        let compaction = Write::Compact(vec![captured(&first, &one), captured(&second, &two)]);
-        journal.write_round(&[work(compaction), work(Write::Events(Arc::clone(&first), one.append(1, 4, vec![entry(4)], 4).events))]).unwrap();
+        let events = {
+            let mut one = first.state.lock();
+            let mut events = one.seal(1).events;
+            events.extend(one.overwrite(1, 0, Vec::new(), true, -1).events);
+            events.extend(one.append(1, 0, (0..4).map(entry).collect(), 2).events);
+            events
+        };
+        let two_events = second.state.lock().seal(3).events;
+        journal.write_round(&[work(Write::Events(Arc::clone(&first), events)), work(Write::Events(Arc::clone(&second), two_events))]).unwrap();
+        first.state.lock().trim(1);
+        let captured = [&first, &second].iter().map(|slot| Captured { slot: Arc::clone(slot), state: slot.state.lock().clone() }).collect();
+        let after = first.state.lock().append(1, 4, vec![entry(4)], 4).events;
+        journal.write_round(&[work(Write::Compact(captured)), work(Write::Events(Arc::clone(&first), after))]).unwrap();
+        assert!(written(&first), "the entry appended after the capture is written after the base");
+        let expected = retained(&journal, &first);
+        assert_eq!(expected, (2..5).map(entry).collect::<Vec<_>>());
         drop(journal);
-        let (journal, recovered) = Journal::open(directory.path(), true).unwrap();
-        assert_eq!(by_name(recovered), BTreeMap::from([(first.name.clone(), one), (second.name.clone(), two)]));
+        let (journal, recovered) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
+        let slots = recovered_slots(recovered);
+        let (one, two) = (&slots[&first.name], &slots[&second.name]);
+        assert_eq!(*one.state.lock(), *first.state.lock(), "entries are recovered at the locations they were left at");
+        assert_eq!(*two.state.lock(), *second.state.lock());
+        assert_eq!(retained(&journal, one), expected);
         assert_eq!(segment_files(directory.path()), 1, "a compaction deletes the segments it supersedes");
         assert_eq!(journal.allocate_id(), 2, "ids are not reused");
     }
 
     #[test]
+    fn entries_evicted_from_the_cache_are_read_from_their_segments_and_the_cache_keeps_its_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = 8 * 1024;
+        let (journal, _) = Journal::open(directory.path(), true, budget).unwrap();
+        let stream = slot(&journal, "a/b");
+        synced(&journal, &stream, 1);
+        let entries: Vec<Entry> = (0..400).map(|lsn| sized(lsn, 1, 1000)).collect();
+        for chunk in entries.chunks(10) {
+            decide(&journal, &stream, |state| state.append(1, chunk[0].lsn, chunk.to_vec(), chunk[0].lsn));
+            assert!(journal.cache_bytes() <= budget, "the cache holds {} bytes of a {budget} budget", journal.cache_bytes());
+        }
+        assert!(written(&stream));
+        assert_eq!(retained(&journal, &stream), entries, "every entry is served, most from disk");
+        assert!(journal.cache_bytes() <= budget);
+        drop(journal);
+        let (journal, recovered) = Journal::open(directory.path(), true, budget).unwrap();
+        assert_eq!(journal.cache_bytes(), 0, "recovery reads no payload into memory");
+        let slots = recovered_slots(recovered);
+        assert!(written(&slots["a/b"]));
+        assert_eq!(retained(&journal, &slots["a/b"]), entries);
+        assert!(journal.cache_bytes() <= budget);
+    }
+
+    #[test]
+    fn a_truncation_and_a_trim_of_evicted_entries_read_correctly_and_a_compaction_retires_their_segments() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, _) = Journal::open(directory.path(), true, 0).unwrap();
+        let stream = slot(&journal, "a/b");
+        synced(&journal, &stream, 1);
+        let mut expected: Vec<Entry> = (0..100).map(|lsn| sized(lsn, 1, 100)).collect();
+        decide(&journal, &stream, |state| state.append(1, 0, expected.clone(), 49));
+        decide(&journal, &stream, |state| state.seal(2));
+        let replacement: Vec<Entry> = (50..120).map(|lsn| sized(lsn, 2, 200)).collect();
+        decide(&journal, &stream, |state| state.overwrite(2, 50, replacement.clone(), true, 119));
+        expected.truncate(50);
+        expected.extend(replacement);
+        assert_eq!(retained(&journal, &stream), expected, "a later writer's entries replace the truncated suffix");
+        decide(&journal, &stream, |state| state.trim(79));
+        expected.drain(..80);
+        assert_eq!(retained(&journal, &stream), expected);
+        let before = journal.current.lock().sequence;
+        compact(&journal, &[&stream]);
+        assert_eq!(segment_files(directory.path()), 1, "the segments holding only trimmed or truncated entries are deleted");
+        assert!(journal.files.lock().keys().all(|segment| *segment > before), "no handle on a retired segment is kept");
+        assert_eq!(retained(&journal, &stream), expected, "entries are read from their copies in the base segment");
+        decide(&journal, &stream, |state| state.append(2, 120, vec![sized(120, 2, 10)], 120));
+        expected.push(sized(120, 2, 10));
+        drop(journal);
+        let (journal, recovered) = Journal::open(directory.path(), true, 0).unwrap();
+        assert_eq!(retained(&journal, &recovered_slots(recovered)["a/b"]), expected);
+    }
+
+    #[test]
+    fn a_replacement_decided_before_the_replaced_entry_is_written_keeps_its_own_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, _) = Journal::open(directory.path(), true, 0).unwrap();
+        let stream = slot(&journal, "a/b");
+        synced(&journal, &stream, 1);
+        let first = stream.state.lock().append(1, 0, vec![sized(0, 1, 10)], -1).events;
+        let sealed = stream.state.lock().seal(2).events;
+        let replaced = stream.state.lock().overwrite(2, 0, vec![sized(0, 2, 10)], true, 0).events;
+        journal.write_round(&[work(Write::Events(Arc::clone(&stream), first))]).unwrap();
+        assert!(matches!(stream.state.lock().entries[0].payload, Stored::Pending(_)), "the replaced entry's record does not claim its replacement");
+        journal.write_round(&[work(Write::Events(Arc::clone(&stream), sealed)), work(Write::Events(Arc::clone(&stream), replaced))]).unwrap();
+        assert_eq!(retained(&journal, &stream), vec![sized(0, 2, 10)]);
+    }
+
+    #[test]
     fn a_base_segment_supersedes_segments_a_crash_left_behind() {
         let directory = tempfile::tempdir().unwrap();
-        let (journal, _) = Journal::open(directory.path(), true).unwrap();
+        let (journal, _) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
         let stream = slot(&journal, "a/b");
-        let mut state = StreamState::default();
-        journal.write_round(&[work(Write::Events(Arc::clone(&stream), state.seal(2).events))]).unwrap();
+        decide(&journal, &stream, |state| state.seal(2));
         let stale = fs::read(segment_path(&journal.segments, 0)).unwrap();
-        journal.write_round(&[work(Write::Compact(vec![captured(&stream, &state)]))]).unwrap();
-        journal.write_round(&[work(Write::Events(Arc::clone(&stream), state.seal(5).events))]).unwrap();
+        compact(&journal, &[&stream]);
+        decide(&journal, &stream, |state| state.seal(5));
         fs::write(segment_path(&journal.segments, 0), stale).unwrap();
         drop(journal);
-        let (_, recovered) = Journal::open(directory.path(), true).unwrap();
-        assert_eq!(by_name(recovered)["a/b"].promised, 5);
+        let (_, recovered) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
+        assert_eq!(recovered_slots(recovered)["a/b"].state.lock().promised, 5);
         assert_eq!(segment_files(directory.path()), 1);
     }
 
@@ -451,7 +718,7 @@ mod tests {
         let good = buffer.len();
         frame(7, Kind::Append(Entry { lsn: 0, epoch: 4, timestamp: 1, payload: Bytes::from_static(b"torn") }), &mut buffer);
         fs::write(&path, &buffer[..buffer.len() - 3]).unwrap();
-        let (journal, recovered) = Journal::open(directory.path(), true).unwrap();
+        let (journal, recovered) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
         assert_eq!((recovered.len(), recovered[0].name.as_str(), recovered[0].state.promised, recovered[0].state.last()), (1, "a/b", 4, -1));
         assert_eq!(fs::metadata(&path).unwrap().len(), good as u64);
         assert_eq!(journal.allocate_id(), 8);
