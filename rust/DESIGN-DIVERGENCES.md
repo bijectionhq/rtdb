@@ -118,7 +118,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
   - The cache sizes a file by the node arrays it retains (`MetadataFile::stored_bytes`), not by its decode bound.
   - `PageTest::matches` (`R/query/src/page_metadata.rs`) finds a column by linear search over those `Value` structs, using string field lookups (`column.field("col-name")`, `"root-col?"`).
   - Blooms are checked by `BloomFilter::from_bytes`, which **deserialises a `RoaringBitmap` per page per test**. The join pushdown does the same in `Pushdowns::page_matches` (`R/query/src/pushdown.rs:144-151`).
-  - Decoded files sit in a process-global cache (`R/query/src/scan.rs` `mod metadata_cache`, 1024 files / 256 MB).
+  - Decoded files are held as views in the database's `BufferPool`, under the node's memory cache (§6).
 - Divergence and impact:
   - A point lookup that visits one leaf in each of N files pays N full statistic decodes on a cold cache, and a bloom deserialisation per leaf even when warm.
   - The lazy change removes the decoding of unvisited leaves, but not the `Value` materialisation or the bloom deserialisation of visited ones.
@@ -161,8 +161,8 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
    - Every step takes a `MemoryBudget` reservation (candidate, summary, selector, stack and descriptor reservations).
 2. `ScanTaskPlan` partitions pages by IID range.
 3. `buffer_task` loads each page:
-   - `metadata_cache::page` (global decoded-page cache), else
-   - `BufferPool::get` of the **whole data file** (§6), `read_page` (memcpy into a new `Vec`), `IndexBatch::from_owned` (decodes all row headers), then an order check of every row on first load.
+   - a decoded page held as a view by the `BufferPool` (§6), else
+   - `BufferPool::get` of the **whole data file** on its first open, and a ranged read of the page once its layout is cached (§6), `read_page` (memcpy into a new `Vec`), `IndexBatch::from_owned` (decodes all row headers), then an order check of every row on first load.
 4. It runs a `BinaryHeap` k-way merge over **every row in the task's IID range**. Rows not in `scan.iids` are dropped one by one (`iids.contains`), after the heap has visited them.
    - There is no binary search for the target IID inside a page: the only binary search finds the task's lower bound.
    - A point lookup therefore walks up to a full 1024-row leaf through the heap, per file that holds that leaf.
@@ -183,7 +183,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
   - It is the most plausible size-dependent cause of the 15× point-lookup and update gap at 1M rows **(inference)**.
   - Compaction lag (§9) makes it worse, because uncompacted L0 files each cover the whole IID space.
 - **System columns are never columnar.** Any query projecting or filtering on `_valid_from`, `_system_from` and the like (valid-time history, `FOR VALID_TIME AS OF` outputs, all UPDATE/DELETE inputs, which read `_iid` and the valid-time columns) goes through `Value` per cell, a `String` allocation per timestamp, and the row fallback in every operator above.
-- **Decoded pages are cached twice.** Pages are held in the decoded-page cache *and* the raw file in the `BufferPool`. The memory spent is roughly 2–3× XTDB's for the same working set (inference).
+- **Decoded pages cost a page decode per cold read.** A page is decoded once into the pool, which then drops the raw file, so warm reads are cheap but every eviction costs a decode, where XTDB maps the raw page in place (inference).
 
 ### Recommendation
 
@@ -273,14 +273,15 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 
 - `R/storage/src/cache.rs` `BufferPool::get` does a `head` and then `get_reserved_range(key, 0..size)`: **the whole object goes into a heap `Vec`**.
   - The defaults make this costly: `file_size_target` is 100 MB and `cache_bytes` is 256 MB (`R/node/src/config.rs:43-44`).
-  - Entries live in a `parking_lot::Mutex<BTreeMap>` with a per-entry `tokio::Mutex` for single-flight loads. The miss path sorts the idle entries under the mutex.
+  - Objects have a per-entry `tokio::Mutex` for single-flight loads.
+- The pool also holds decoded views of an object (`cache::View`: a whole decoded file, a file's layout, one page), under the same `CacheBudget` as the raw bytes.
+  - Every pool sharing a budget keeps its entries in one recency list behind one `parking_lot::Mutex`, with O(1) lookup, touch, insert and removal.
+  - Admitting bytes, raw or decoded, evicts the least recently used idle entries of any pool; an entry still leased or in use is skipped, since evicting it would free nothing.
+  - A view that would take more than an eighth of the budget, or that does not fit, is not cached.
+- Scans (`R/query/src/scan.rs`) cache decoded trie metadata, data-file layouts and decoded `IndexBatch` pages as views, and evict the raw object once its decoded form is admitted.
+  - A data file whose layout is cached is read a page at a time with `get_range`.
+  - A read the cache cannot admit is charged to the query's own budget instead (`get_or`, `get_range_or`).
 - `ArrowFile::read_page` → `read_block` (`R/format/src/ipc.rs:106-141`) copies each page into a new `Vec`, then decodes it.
-- Three process-global `std::sync::Mutex` caches live in `R/query/src/scan.rs` `mod metadata_cache`:
-  - decoded metadata (1024 files / 256 MB);
-  - layouts (4096 entries, cleared wholesale when full);
-  - decoded `IndexBatch` pages (512 MB under their own `MemoryBudget`).
-  - Every lookup allocates a `String` key (`key.as_str().to_owned()`).
-  - `insert_page` and `insert` run `retain` over **all** entries on every insert, and eviction is a linear `min_by_key` scan. Both are O(n) under the global lock.
 - `R/storage/src/disk_cache.rs`:
   - a miss downloads the object as **sequential 1 MB range GETs**;
   - `put_file` copies in 64 KB chunks;
@@ -291,15 +292,15 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 
 - **Read amplification.** Up to file size ÷ page size: one 1024-row page from a 100 MB L2 file costs 100 MB of I/O and memcpy on a cold read.
 - **Cache thrash.** Two or three large files exhaust the 256 MB pool.
-- **Copies.** Each page is copied twice before decoding, and kept in two caches as well as the OS cache.
-- **Contention and full scans.** Global mutexes with O(n) maintenance contend under the 8-reader workloads, and make large scans O(pages²) in cache maintenance (inference).
+- **Copies.** Each page is copied twice before decoding.
+- **Contention.** Every pool sharing a budget shares one mutex; its operations are O(1), but the 8-reader workloads still serialise on it (inference).
 - Overall: very high for cold point lookups over compacted data; medium under concurrency.
 
 ### Recommendation
 
 - Cache the footer and layout per file, then fetch and cache by `(key, page)` byte range: a `get_range` against the object store, or `pread`/mmap against the disk cache and the local store.
-- Drop the whole-file `BufferPool::get` from scans and compaction.
-- Make the decoded-page cache the single in-memory tier, sharded or lock-free (e.g. `moka`), keyed by an interned `(file id, page)`.
+- Drop the whole-file `BufferPool::get` from compaction, and from a scan's first open of a file, by inspecting the layout from ranged reads.
+- Shard the pool's recency list, and key its views by an interned `(file id, page)` rather than an `ObjectKey`.
 - Download disk-cache misses as one streamed GET.
 
 ---
