@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{DeploymentRecord, Lifecycle, MemberId, MemberRecord};
+use crate::{DeploymentRecord, Lifecycle, MemberId, MemberPool, MemberRecord};
 
 /// The holder that counts: the recorded holder, only while its member may hold.
 pub fn effective_holder<'a>(record: &'a DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>, now_ms: i64) -> Option<&'a MemberId> {
@@ -14,12 +14,15 @@ pub fn effective_holder<'a>(record: &'a DeploymentRecord, members: &BTreeMap<Mem
 /// The record that makes `claimant` the holder under the next epoch, or `None` if the deployment may not be claimed by it now.
 /// A live holder other than the claimant blocks the claim; the claimant's own stale holding does not, so a restarted member's successor process can reclaim.
 pub fn claim(record: &DeploymentRecord, claimant: &MemberId, members: &BTreeMap<MemberId, MemberRecord>, now_ms: i64) -> Option<DeploymentRecord> {
-    if record.lifecycle != Lifecycle::Live { return None; }
-    if !members.get(claimant).is_some_and(|member| member.may_receive_placements(now_ms)) { return None; }
+    let member = members.get(claimant).filter(|member| member.may_receive_placements(now_ms))?;
+    let pool = match record.lifecycle { Lifecycle::Live => MemberPool::General, Lifecycle::Quarantined => MemberPool::Isolation, _ => return None };
+    if member.pool != pool { return None; }
+    if record.move_intent.as_ref().is_some_and(|target| target != claimant) { return None; }
     if effective_holder(record, members, now_ms).is_some_and(|holder| holder != claimant) { return None; }
     let mut next = record.clone();
     next.epoch += 1;
     next.holder = Some(claimant.clone());
+    next.move_intent = None;
     Some(next)
 }
 
@@ -39,7 +42,7 @@ mod tests {
 
     fn node(id: &str, state: MemberState, lease: i64) -> MemberRecord {
         MemberRecord { id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None, availability_zone: "a".into(),
-            engine_version: "0".into(), lease_expires_at_ms: lease, state, version: 1 }
+            engine_version: "0".into(), lease_expires_at_ms: lease, state, pool: MemberPool::General, version: 1 }
     }
 
     fn members(list: &[MemberRecord]) -> BTreeMap<MemberId, MemberRecord> { list.iter().map(|member| (member.id.clone(), member.clone())).collect() }
@@ -56,6 +59,22 @@ mod tests {
         record.epoch = 7;
         let taken = claim(&record, &MemberId("b".into()), &members, 10).unwrap();
         assert_eq!(taken.epoch, 8, "taking over from a dead holder bumps the epoch");
+    }
+
+    #[test]
+    fn a_quarantined_deployment_goes_only_to_the_isolation_pool_and_a_move_only_to_its_target() {
+        let mut isolated = node("i", MemberState::Eligible, 100);
+        isolated.pool = MemberPool::Isolation;
+        let members = members(&[node("a", MemberState::Eligible, 100), node("b", MemberState::Eligible, 100), isolated]);
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        assert!(claim(&record, &MemberId("i".into()), &members, 10).is_none(), "the isolation pool holds only quarantined deployments");
+        record.lifecycle = Lifecycle::Quarantined;
+        assert!(claim(&record, &MemberId("a".into()), &members, 10).is_none());
+        assert!(claim(&record, &MemberId("i".into()), &members, 10).is_some());
+        record.lifecycle = Lifecycle::Live;
+        record.move_intent = Some(MemberId("b".into()));
+        assert!(claim(&record, &MemberId("a".into()), &members, 10).is_none(), "a move reserves the next claim for its target");
+        assert_eq!(claim(&record, &MemberId("b".into()), &members, 10).unwrap().move_intent, None, "claiming completes the move");
     }
 
     #[test]

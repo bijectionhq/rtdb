@@ -75,7 +75,18 @@ pub struct MemberRecord {
     pub engine_version: String,
     pub lease_expires_at_ms: i64,
     pub state: MemberState,
+    /// Which nodes may hold what: a quarantined deployment is placed only on the isolation pool.
+    #[serde(default)]
+    pub pool: MemberPool,
     pub version: Version,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberPool {
+    #[default]
+    General,
+    Isolation,
 }
 
 impl MemberRecord {
@@ -97,6 +108,8 @@ pub enum Lifecycle {
     Live,
     /// Activation crashed members repeatedly; placed only on the isolation pool.
     Quarantined,
+    /// Being moved to another cell; fenced while the cutover completes.
+    Moving,
     /// Fenced; its objects, log and keys are being destroyed.
     Deleting,
     /// A tombstone.
@@ -125,6 +138,15 @@ pub struct DeploymentRecord {
     pub read_width: u32,
     pub activation_crashes: u32,
     pub created_at_ms: i64,
+    /// A planned move in progress: only this member may claim the deployment until it does.
+    #[serde(default)]
+    pub move_intent: Option<MemberId>,
+    /// The namespace of the deployment's log positions; bumped when it starts again on fresh logs over existing objects, as a fork does.
+    #[serde(default)]
+    pub log_epoch: i32,
+    /// The deployment a fork was taken from.
+    #[serde(default)]
+    pub parent: Option<String>,
     pub version: Version,
 }
 
@@ -132,7 +154,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, version: 0 }
     }
 
     /// The affinity key: stable across epochs and residency, distinct across incarnations.
