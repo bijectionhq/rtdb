@@ -21,6 +21,18 @@ pub async fn create_deployment(directory: &dyn Directory, name: &str, org: &str,
     directory.create_deployment(record).await
 }
 
+/// Starts scaling a node in: it keeps serving what it holds, receives no new placements, and parks everything it holds so that each deployment's next request activates it elsewhere.
+pub async fn drain(directory: &dyn Directory, member: &rtdb_directory::MemberId) -> Result<()> {
+    for _ in 0..8 {
+        let current = directory.member(member).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-member", format!("No member {member}")))?;
+        if current.state != MemberState::Eligible { return Ok(()); }
+        let mut draining = current.clone();
+        draining.state = MemberState::Draining;
+        if let Cas::Applied(_) = directory.replace_member(draining, current.version).await? { return Ok(()); }
+    }
+    Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/drain-contended", "The member kept changing while being drained"))
+}
+
 /// Marks every member whose lease expired more than `grace` ago as dead.
 /// Placements need no write: a dead member's holdings stop counting through `effective_holder`; this keeps the member list honest.
 pub async fn reap_members(directory: &dyn Directory, grace: Duration) -> Result<usize> {

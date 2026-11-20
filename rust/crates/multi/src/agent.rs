@@ -169,6 +169,7 @@ impl NodeAgent {
 
     /// Gives up every deployment the directory no longer places here under the epoch this node opened it at, every one whose database stopped, and every idle one.
     pub async fn reconcile(&self) {
+        let draining = self.lease.record().state == rtdb_directory::MemberState::Draining;
         let held: Vec<(String, String, u64, Instant)> = self.holdings.lock().iter().map(|(name, holding)| (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch)).collect();
         let me = self.member();
         for (name, id, epoch, last_touch) in held {
@@ -180,7 +181,7 @@ impl NodeAgent {
                 self.stop_running(&name).await;
                 continue;
             }
-            if self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
+            if draining || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
         }
     }
 

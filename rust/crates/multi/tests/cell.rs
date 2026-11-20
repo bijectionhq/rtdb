@@ -181,3 +181,27 @@ async fn deployments_are_isolated_from_each_other() {
     drop((shop, blog));
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drained_node_hands_its_deployments_to_the_rest_of_the_cell() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+
+    let drained = cell.holder("shop").await.unwrap();
+    admin::drain(cell.directory.as_ref(), &cell.nodes[drained].as_ref().unwrap().lease.id()).await.unwrap();
+    for _ in 0..100 {
+        if cell.nodes[drained].as_ref().unwrap().agent.held().is_empty() { break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(cell.nodes[drained].as_ref().unwrap().agent.held().is_empty(), "a draining node parks what it holds");
+
+    let client = cell.connect("shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    let holder = cell.holder("shop").await.unwrap();
+    assert_ne!(holder, drained, "the next request activates it on a node that may take placements");
+    drop(client);
+    cell.stop().await;
+}

@@ -19,7 +19,8 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi gateway --directory DIR --listen ADDR\n\
        rtdb-multi controller --directory DIR\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
-       rtdb-multi list --directory DIR\n\n\
+       rtdb-multi list --directory DIR\n\
+       rtdb-multi drain --directory DIR --member ID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n";
 
@@ -111,6 +112,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
             Ok(())
         }
+        "drain" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            admin::drain(directory.as_ref(), &rtdb_directory::MemberId(arguments.required("member")?.into())).await?;
+            Ok(())
+        }
         "list" => {
             let directory = directory(arguments.required("directory")?).await?;
             let listing = serde_json::json!({ "deployments": directory.deployments().await?, "members": directory.members().await? });
@@ -123,7 +129,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
 
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
     if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix).await; }
-    Ok(RemoteDirectory::connect(spec).await?)
+    let mut attempts = 0;
+    loop {
+        match RemoteDirectory::connect(spec).await {
+            Ok(directory) => return Ok(directory),
+            Err(error) if attempts < 50 => { attempts += 1; let _ = error; tokio::time::sleep(Duration::from_millis(200)).await; }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(feature = "dynamodb")]
