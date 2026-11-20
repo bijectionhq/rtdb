@@ -185,19 +185,19 @@ fn configuration(value: &[u8]) -> DatabaseConfig {
 }
 
 #[tokio::test]
-async fn remote_resources_require_cache_and_scope_equal_keys_by_database() {
+async fn remote_resources_require_a_cache_and_cache_each_store_apart_whatever_the_database_name() {
     let native = NativeResources::default().register_storage("test.Remote", Arc::new(Remote)).unwrap();
     assert!(native.validate("first", &configuration(b"one")).unwrap_err().message.as_deref().is_some_and(|message| message.contains("disk cache")));
     let directory = tempfile::tempdir().unwrap();
     let cache = DiskCache::open(directory.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
     let native = native.with_disk_cache(cache);
+    let key = ObjectKey::new("same").unwrap();
     let first = native.open("first", &configuration(b"one"), rtdb_node::LogAccess::ReadWrite, CancellationToken::new()).await.unwrap();
     let second = native.open("second", &configuration(b"two"), rtdb_node::LogAccess::ReadWrite, CancellationToken::new()).await.unwrap();
-    let key = ObjectKey::new("same").unwrap();
     assert_eq!(first.store.get(&key).await.unwrap().as_ref(), b"one");
     assert_eq!(second.store.get(&key).await.unwrap().as_ref(), b"two");
-    assert!(directory.path().join("first/0/same").exists());
-    assert!(directory.path().join("second/0/same").exists());
+    let reattached = native.open("first", &configuration(b"three"), rtdb_node::LogAccess::ReadWrite, CancellationToken::new()).await.unwrap();
+    assert_eq!(reattached.store.get(&key).await.unwrap().as_ref(), b"three", "a name re-attached to another store is not served the previous store's cached object");
 }
 
 #[tokio::test]

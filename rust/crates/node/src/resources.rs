@@ -235,7 +235,7 @@ impl ResourceFactory for NativeResources {
                     let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
                     let remote = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?.open(configuration, &root, Arc::clone(&io)).await?;
                     let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
-                    cache.scope_in(cache_namespace(name)?, remote, Arc::clone(&io))?
+                    cache.scope_in(cache_namespace(configuration, storage_epoch)?, remote, Arc::clone(&io))?
                 }
             };
             Ok(DatabaseStorage { store, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
@@ -268,14 +268,31 @@ impl ResourceFactory for NativeResources {
     }
 }
 
-fn cache_namespace(database: &str) -> Result<ObjectKey> {
-    if !database.contains('/') && !database.starts_with("~rtdb-") && ObjectKey::new(database).is_ok() {
-        return ObjectKey::new(format!("{database}/0")).map_err(Into::into);
+/// Cached objects belong to the store they came from, so the namespace is the store's identity, never the database's name.
+/// A name re-attached to a different bucket, prefix or storage epoch must not be served the previous store's objects.
+fn cache_namespace(store: &Any, epoch: StorageEpoch) -> Result<ObjectKey> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [store.type_url.as_bytes(), &store.value, &epoch.0.to_be_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
     }
-    use std::fmt::Write;
-    let mut name = String::from("~rtdb-");
-    for byte in database.as_bytes() { write!(name, "{byte:02x}").map_err(|error| invalid(error.to_string()))?; }
-    ObjectKey::new(format!("{name}/0")).map_err(Into::into)
+    let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    ObjectKey::new(format!("~rtdb-store-{digest}/0")).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod cache_namespace_tests {
+    use super::*;
+
+    fn store(value: &[u8]) -> Any { Any { type_url: "type.googleapis.com/xtdb.aws.proto.S3ObjectStoreConfig".into(), value: value.to_vec() } }
+
+    #[test]
+    fn the_cache_namespace_follows_the_store_not_the_database_name() {
+        assert_eq!(cache_namespace(&store(b"bucket-a"), StorageEpoch(0)).unwrap(), cache_namespace(&store(b"bucket-a"), StorageEpoch(0)).unwrap());
+        assert_ne!(cache_namespace(&store(b"bucket-a"), StorageEpoch(0)).unwrap(), cache_namespace(&store(b"bucket-b"), StorageEpoch(0)).unwrap(), "another bucket or prefix");
+        assert_ne!(cache_namespace(&store(b"bucket-a"), StorageEpoch(0)).unwrap(), cache_namespace(&store(b"bucket-a"), StorageEpoch(1)).unwrap(), "another storage epoch");
+    }
 }
 
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.db-catalog/invalid-db-config", message) }
