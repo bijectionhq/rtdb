@@ -107,7 +107,22 @@ pub fn compaction_output(key: &str) -> bool {
 /// Milliseconds since the epoch, as a store stamps the releases and packs it writes.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-pub fn wall_clock() -> Clock { Arc::new(now_ms) }
+/// `time`, made strictly increasing: a fork at a past block keeps the releases stamped before the block's pack, so a release and a pack must never share a stamp.
+pub fn stamps(time: impl Fn() -> i64 + Send + Sync + 'static) -> Clock {
+    let last = std::sync::atomic::AtomicI64::new(i64::MIN);
+    Arc::new(move || {
+        let now = time();
+        let previous = last.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |previous| Some(previous.saturating_add(1).max(now))).expect("the update always applies");
+        previous.saturating_add(1).max(now)
+    })
+}
+
+/// The wall clock's stamps, one sequence for the whole process.
+/// Stamps run ahead of the wall clock through a burst of releases, which only defers their reaping; the reaper reads its time from them too, so that in one process nothing is stamped after the time it reaps as of.
+pub fn wall_clock() -> Clock {
+    static WALL: std::sync::OnceLock<Clock> = std::sync::OnceLock::new();
+    Arc::clone(WALL.get_or_init(|| stamps(now_ms)))
+}
 
 /// One store of a deployment in the cell's `bucket` (a prefix and a storage version), as a node opens it below its disk cache: its own objects and those its manifest references, packed, with deletes as releases.
 pub async fn open_deployment_store(bucket: crate::reference::Bucket, store: &str, discovery: crate::packing::PackDiscovery, clock: Clock) -> Result<Arc<GarbageStore>> {
@@ -257,7 +272,7 @@ pub struct Reaped { pub erased: usize, pub waiting: usize }
 /// Erases every object a deployment released more than `grace` ago from the cell's bucket.
 /// An object other deployments still reference is copied into them first; an object this deployment only references is dropped from its manifest.
 pub async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
-    reap_as_of(bucket, record, now_ms(), grace, references).await
+    reap_as_of(bucket, record, wall_clock()(), grace, references).await
 }
 
 /// `reap` as of `now_ms`, in milliseconds since the epoch.
@@ -329,7 +344,7 @@ pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deploymen
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(interval) => {
-                if let Ok(deployments) = directory.deployments().await { let _ = reaper_pass(bucket.as_ref(), &deployments, now_ms(), grace).await; }
+                if let Ok(deployments) = directory.deployments().await { let _ = reaper_pass(bucket.as_ref(), &deployments, wall_clock()(), grace).await; }
             }
         }
     }
@@ -461,6 +476,32 @@ mod tests {
         store.delete(&key("blocks/b00.binpb")).await.unwrap();
         assert_eq!(reap(&bucket, &record, Duration::ZERO, &Default::default()).await.unwrap().erased, 3);
         assert_eq!(packs(), 1, "a fully released pack is erased, and the latest block's, which names every pack, stays");
+    }
+
+    #[tokio::test]
+    async fn a_fork_at_a_past_block_keeps_an_object_released_in_the_same_millisecond_after_the_block() {
+        let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
+        let clock = stamps(|| 1_000);
+        let store = open_deployment_store(Arc::clone(&bucket), "p/v06", crate::packing::PackDiscovery::List, Arc::clone(&clock)).await.unwrap();
+        store.put(&key("tables/t/data/l01-rc-b00.arrow"), Bytes::from_static(b"compacted")).await.unwrap();
+        store.put(&key("blocks/b00.binpb"), Bytes::from_static(b"catalog")).await.unwrap();
+        store.delete(&key("tables/t/data/l01-rc-b00.arrow")).await.unwrap();
+        crate::reference::fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
+        let fork = open_deployment_store(Arc::clone(&bucket), "c/v06", crate::packing::PackDiscovery::List, clock).await.unwrap();
+        let listed: Vec<String> = fork.list(Some(&key("tables"))).await.unwrap().into_iter().map(|object| object.key.as_str().to_owned()).collect();
+        assert_eq!(listed, ["tables/t/data/l01-rc-b00.arrow"], "the release came after the block, though within its millisecond");
+    }
+
+    #[test]
+    fn stamps_rise_strictly_though_the_clock_stands_still_or_goes_back() {
+        let time = Arc::new(std::sync::atomic::AtomicI64::new(5));
+        let source = Arc::clone(&time);
+        let clock = stamps(move || source.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!([clock(), clock()], [5, 6]);
+        time.store(3, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(clock(), 7);
+        time.store(20, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(clock(), 20);
     }
 
     #[tokio::test]
