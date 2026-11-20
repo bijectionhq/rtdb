@@ -1693,3 +1693,76 @@ async fn each_argument_row_of_a_batched_update_reads_what_the_rows_before_it_wro
         stop(&node, driver).await;
     }).await.unwrap();
 }
+
+fn put_rows(node: &Node, table: &str, documents: Vec<StructFields<Value>>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp>) -> TxOp {
+    TxOp::PutDocs { table: TableRef::new("public", table), documents: Documents::new(documents, node.memory()).unwrap(), valid_from, valid_to }
+}
+fn sql(node: &Node, sql: &str, arguments: Vec<Value>) -> TxOp {
+    TxOp::Sql { sql: sql.into(), args: (!arguments.is_empty()).then(|| SqlArguments::from_rows(vec![arguments], node.memory()).unwrap()) }
+}
+
+#[tokio::test]
+async fn a_set_based_update_rewrites_exactly_the_rows_whose_assigned_values_differ() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let instant = |micros: i64| Value::Timestamp { value: micros, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let row = |id: i64, f: Value, t: Value, n: Value, ts: Value, d: Value| StructFields::from([("_id".into(), Value::I64(id)), ("f".into(), f), ("t".into(), t), ("n".into(), n), ("ts".into(), ts), ("d".into(), d)]);
+        let documents = vec![
+            row(1, Value::F64(1.5), Value::Utf8("a".into()), Value::I64(1), instant(1_000), Value::DateDay(18_000)),
+            row(2, Value::F64(f64::NAN), Value::Null, Value::Null, Value::Null, Value::Null),
+            row(3, Value::F64(0.0), Value::Utf8(String::new()), Value::I64(2), instant(-1), Value::DateDay(-1)),
+            row(4, Value::Null, Value::Utf8("b".into()), Value::I64(3), instant(i64::MAX - 1), Value::DateDay(0)),
+        ];
+        assert!(session.state_mut().execute_tx(vec![put_rows(&node, "items", documents, None, None)], AutonomousTxOptions::default()).await.unwrap().committed());
+        for (statement, arguments) in [
+            // Only NaN differs from itself; a null equals a null.
+            ("UPDATE items SET f = f", vec![]),
+            // -0.0 equals 0.0, so the stored 0.0 keeps its sign.
+            ("UPDATE items SET f = ? WHERE _id = 3", vec![Value::F64(-0.0)]),
+            ("UPDATE items SET t = t, ts = ts, d = d", vec![]),
+            ("UPDATE items SET n = n + 1", vec![]),
+            ("UPDATE items SET f = f * 1.01 WHERE n < 100", vec![]),
+        ] {
+            let result = session.state_mut().execute_tx(vec![sql(&node, statement, arguments)], AutonomousTxOptions::default()).await.unwrap();
+            assert!(result.committed(), "{statement}: {:?}", result.error());
+        }
+        let versions = rows(session.query_sql("SELECT _id, COUNT(*) AS versions FROM items FOR ALL SYSTEM_TIME GROUP BY _id ORDER BY _id", vec![]).await.unwrap()).await;
+        assert_eq!(versions, [1, 2, 3, 4].into_iter().zip([3, 2, 2, 2]).map(|(id, count)| vec![Value::I64(id), Value::I64(count)]).collect::<Vec<_>>());
+        let current = rows(session.query_sql("SELECT _id, f, t, n, ts, d FROM items ORDER BY _id", vec![]).await.unwrap()).await;
+        let f = |row: usize| match current[row][1] { Value::F64(value) => Some(value.to_bits()), Value::Null => None, ref other => panic!("{other:?}") };
+        assert_eq!([f(0), f(2), f(3)], [Some((1.5f64 * 1.01).to_bits()), Some(0.0f64.to_bits()), None]);
+        assert!(f64::from_bits(f(1).unwrap()).is_nan());
+        assert_eq!(current.iter().map(|row| row[3].clone()).collect::<Vec<_>>(), [Value::I64(2), Value::Null, Value::I64(3), Value::I64(4)]);
+        assert_eq!(current.iter().map(|row| (row[2].clone(), row[4].clone(), row[5].clone())).collect::<Vec<_>>(), [
+            (Value::Utf8("a".into()), instant(1_000), Value::DateDay(18_000)), (Value::Null, Value::Null, Value::Null),
+            (Value::Utf8(String::new()), instant(-1), Value::DateDay(-1)), (Value::Utf8("b".into()), instant(i64::MAX - 1), Value::DateDay(0)),
+        ]);
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_updated_row_is_valid_from_the_transaction_time_to_the_end_of_the_version_it_replaces() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let instant = |time: Timestamp| Value::Timestamp { value: time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let row = |id: i64, value: i64| StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(value))]);
+        let (start, end) = (Timestamp(500), Timestamp(10_000_000_000));
+        let bounded = session.state_mut().execute_tx(vec![put_rows(&node, "spans", vec![row(1, 10)], Some(start), Some(end))], AutonomousTxOptions::default()).await.unwrap();
+        let open = session.state_mut().execute_tx(vec![put_rows(&node, "spans", vec![row(2, 20)], None, None)], AutonomousTxOptions::default()).await.unwrap();
+        assert!(bounded.committed() && open.committed());
+        let updated = session.state_mut().execute_tx(vec![sql(&node, "UPDATE spans SET v = v + 1", vec![])], AutonomousTxOptions::default()).await.unwrap();
+        assert!(updated.committed(), "{:?}", updated.error());
+        let now = updated.tx_key().system_time;
+        let history = rows(session.query_sql("SELECT _id, v, _valid_from, _valid_to FROM spans FOR ALL VALID_TIME ORDER BY _id, _valid_from", vec![]).await.unwrap()).await;
+        assert_eq!(history, vec![
+            vec![Value::I64(1), Value::I64(10), instant(start), instant(now)],
+            vec![Value::I64(1), Value::I64(11), instant(now), instant(end)],
+            vec![Value::I64(2), Value::I64(20), instant(open.tx_key().system_time), instant(now)],
+            vec![Value::I64(2), Value::I64(21), instant(now), Value::Null],
+        ]);
+        stop(&node, driver).await;
+    }).await.unwrap();
+}

@@ -26,7 +26,7 @@ fn denied() -> Anomaly {
 
 fn state() -> Arc<PartitionState> {
     let table = TableRef::new("public", "foo");
-    let catalog = TrieCatalog::default().with_tries(table, [CatalogTrie { key: "l00-rc-b00".parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live }], Timestamp(0)).unwrap();
+    let catalog = TrieCatalog::default().with_tries(table, [CatalogTrie { key: "l00-rc-b00".parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(0)).unwrap();
     Arc::new(PartitionState::new(PartitionValue::loaded(catalog, TableCatalog::default(), TrieConfig::default()).unwrap()))
 }
 
@@ -248,7 +248,7 @@ async fn actual_metadata_upload_failure_preserves_storage_anomaly_and_emits_the_
         store.put(&ObjectKey::new(slug.data_key(&input)).unwrap(), Bytes::from(write_file(&data.schema(), &[data]).unwrap())).await.unwrap();
         store.put(&ObjectKey::new(slug.metadata_key(&input)).unwrap(), Bytes::from(metadata.write().unwrap())).await.unwrap();
         let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
-        let tries = TrieCatalog::default().with_tries(table, [CatalogTrie { key: input, data_file_size: 1, metadata: None, state: TrieState::Live }], Timestamp(0)).unwrap();
+        let tries = TrieCatalog::default().with_tries(table, [CatalogTrie { key: input, data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(0)).unwrap();
         let state = Arc::new(PartitionState::new(PartitionValue::loaded(tries, tables, TrieConfig::default()).unwrap()));
         let memory = MemoryBudget::new(64 << 20);
         let executor = Arc::new(SegmentCompactor::new(store.clone(), state.clone(), memory.clone(), StorageVersion(6), StorageEpoch(0),

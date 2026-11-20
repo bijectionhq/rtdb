@@ -117,6 +117,12 @@ impl Lru {
         None
     }
 
+    fn remove_key(&mut self, pool: u64, key: &ObjectKey) -> Vec<Value> {
+        let nodes: Vec<_> = self.index.get(&pool).and_then(|files| files.get(key))
+            .into_iter().flat_map(|slots| slots.values().copied()).collect();
+        nodes.into_iter().filter_map(|node| self.remove(node)).collect()
+    }
+
     fn remove_pool(&mut self, pool: u64) -> Vec<Value> {
         let nodes: Vec<usize> = self.index.get(&pool).into_iter().flat_map(|files| files.values().flat_map(|slots| slots.values().copied())).collect();
         nodes.into_iter().filter_map(|node| self.remove(node)).collect()
@@ -238,6 +244,13 @@ impl BufferPool {
 
     pub fn retained_bytes(&self) -> usize { self.budget.retained_bytes() }
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { &self.store }
+
+    /// Drops the object's bytes, decoded views and disk copy from this pool's caches. Outstanding leases keep their bytes.
+    pub async fn invalidate(&self, key: &ObjectKey) -> Result<()> {
+        let removed = self.budget.lru.lock().remove_key(self.id, key);
+        drop(removed);
+        self.store.forget(key).await
+    }
 
     /// An evicted object remains charged while a caller retains any slice of its lease.
     pub fn evict(&self, key: &ObjectKey) -> bool {

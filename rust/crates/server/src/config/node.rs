@@ -43,6 +43,8 @@ impl NodeConfiguration {
         options.garbage.blocks_to_keep = self.garbage.blocks_to_keep;
         options.garbage.garbage_lifetime = self.garbage.garbage_lifetime;
         options.automatic_gc = self.garbage.enabled;
+        options.artefact_threads = if self.fixed_databases.is_some() || !self.search.enabled { 0 } else { self.search.threads };
+        options.scan_acceleration = self.search.enabled;
         Ok(options)
     }
 }

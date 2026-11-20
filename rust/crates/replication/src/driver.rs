@@ -100,6 +100,18 @@ impl ReplicationHandle {
         self.await_source(position, cancellation).await?;
         Ok(position)
     }
+    /// Returns once this node has applied the message; an entry the leader did not accept is recorded on no trie.
+    pub async fn publish_artefacts(&self, message: proto::ArtefactsAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
+        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::ArtefactsAdded(message)), (self.clock)()).await?;
+        self.await_source(position, cancellation).await?;
+        Ok(position)
+    }
+    /// Returns once this node has applied the removal.
+    pub async fn remove_artefacts(&self, message: proto::ArtefactsRemoved, cancellation: &CancellationToken) -> Result<SourcePosition> {
+        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(message)), (self.clock)()).await?;
+        self.await_source(position, cancellation).await?;
+        Ok(position)
+    }
 }
 #[derive(Clone)]
 pub struct TermHandle { handle: ReplicationHandle, term: Term }
@@ -792,6 +804,27 @@ impl ReplicationDriver {
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
                 }
+                ReplicaBody::ArtefactsAdded(message) => {
+                    if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
+                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) { self.partition.add_artefacts(&table, artefact_entries(&message.entries)); }
+                    }
+                    self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
+                    self.complete_control(&record);
+                }
+                ReplicaBody::ArtefactsRemoved(message) => {
+                    if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
+                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) {
+                            let entries = artefact_entries(&message.entries);
+                            let slug = self.partition.value().table_catalog().entry(&table).map(|entry| entry.slug.clone());
+                            self.partition.remove_artefacts(&table, entries.clone());
+                            // The lane deletes the objects from the store next; this node's cached copies are its own to drop.
+                            let keys = slug.iter().flat_map(|slug| entries.iter().filter_map(move |(trie, record)| slug.recorded_artefact_key(trie, record).ok()));
+                            for key in keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<BTreeSet<_>>() { let _ = self.resolve.storage.invalidate(&key).await; }
+                        }
+                    }
+                    self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
+                    self.complete_control(&record);
+                }
                 ReplicaBody::BlockBoundary(_) => {
                     let prepared = self.partition.prepare_block()?;
                     self.pending_block = Some(PendingBlock::new(record.clone(), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
@@ -804,7 +837,10 @@ impl ReplicationDriver {
                 ReplicaBody::TriesDeleted(message) => {
                     let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
                     let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
+                    let cached = cached_objects(&self.partition.value(), &table, &keys);
                     self.partition.delete_tries(&BTreeMap::from([(table, keys)]));
+                    // Every node holds its own cached copies, and the leader's delete reached only the remote store.
+                    for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
                     self.complete_control(&record);
                 }
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("Unresolved oversized body reached apply")),
@@ -836,6 +872,8 @@ impl ReplicationDriver {
         match &record.envelope.message {
             ReplicaBody::ResolvedTx(message) => message.tx_id.unwrap_or_default() <= progress.tx_id().0,
             ReplicaBody::TriesAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
+            ReplicaBody::ArtefactsAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
+            ReplicaBody::ArtefactsRemoved(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
             ReplicaBody::BlockBoundary(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::BlockUploaded(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::NoOp(message) => message.src_msg_id.is_some_and(|source| source <= progress.source_position.0),
@@ -970,6 +1008,25 @@ impl ReplicationDriver {
                 leader.resolver_mut()?.advance_source(position)?;
                 None
             }
+            Some(SourceMessage::Protobuf(SourceBody::ArtefactsAdded(mut message))) => {
+                let rejected = accept_artefacts(&mut message, &durable, self.logs.storage_version.0, self.logs.storage_epoch.0);
+                message.source_msg_id = Some(position.0);
+                leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsAdded(message)), block, None, &self.resolve.memory)?;
+                leader.resolver_mut()?.advance_source(position)?;
+                // Readers treat a missing artefact as absent, so these deletes are best effort, and must not hold up resolution.
+                if !rejected.is_empty() {
+                    let store = Arc::clone(self.resolve.storage.object_store());
+                    tokio::spawn(async move { for key in rejected { let _ = store.delete(&key).await; } });
+                }
+                None
+            }
+            Some(SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(mut message))) => {
+                if message.storage_version != Some(self.logs.storage_version.0) || message.storage_epoch.unwrap_or_default() != self.logs.storage_epoch.0 { message.entries.clear(); }
+                message.source_msg_id = Some(position.0);
+                leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsRemoved(message)), block, None, &self.resolve.memory)?;
+                leader.resolver_mut()?.advance_source(position)?;
+                None
+            }
             Some(SourceMessage::Protobuf(SourceBody::FlushBlock(message))) => {
                 let expected = self.partition.value().table_catalog().block_index().map_or(-1, |index| index.0);
                 leader.resolver_mut()?.advance_source(position)?;
@@ -1056,6 +1113,48 @@ fn additions(details: &[proto::TrieDetails]) -> Result<BTreeMap<TableRef, Vec<Ca
     }
     Ok(result)
 }
+/// Keeps the entries whose trie is live in the durable catalog under this node's storage version and epoch, and returns the object keys of refused entries to delete.
+/// Artefacts are advisory, so an entry that does not parse is dropped rather than faulting the log.
+/// An entry under another storage version or epoch is dropped without deleting: its key is computed here, under this node's storage root, and may name another builder's file.
+/// A group's object is deleted only when the catalog holds none of its members, since a member it still holds may take the same object later or be collected with it.
+fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::Snapshot, version: i32, epoch: i32) -> Vec<rtdb_storage::ObjectKey> {
+    let entries = std::mem::take(&mut message.entries);
+    let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) else { return Vec::new() };
+    if message.storage_version != Some(version) || message.storage_epoch.unwrap_or_default() != epoch { return Vec::new(); }
+    let slug = durable.table_entry(&table).map(|entry| entry.slug.clone());
+    let catalog = durable.trie_catalog();
+    let mut rejected = BTreeSet::new();
+    for entry in entries {
+        let (Ok(key), Some(record)) = (entry.trie_key.as_deref().unwrap_or_default().parse::<TrieKey>(), &entry.record) else { continue };
+        if catalog.trie(&table, &key).is_some_and(|trie| trie.state == rtdb_index::TrieState::Live) { message.entries.push(entry); continue; }
+        let Ok(owner) = rtdb_format::keys::ArtefactOwner::of(&key, record) else { continue };
+        if owner.tries().iter().any(|member| member != &key && catalog.trie(&table, member).is_some()) { continue; }
+        if let Some(object) = slug.as_ref().and_then(|slug| slug.owner_artefact_key(&owner, record.kind(), record.definition_id(), record.definition_version()).ok()).and_then(|key| rtdb_storage::ObjectKey::new(key).ok()) {
+            rejected.insert(object);
+        }
+    }
+    rejected.into_iter().collect()
+}
+
+/// The objects of collected tries this node may hold copies of: data, meta, and the artefacts their entries record.
+/// A group's artefact goes only with the last member the catalog holds.
+fn cached_objects(value: &rtdb_index::PartitionValue, table: &TableRef, keys: &BTreeSet<TrieKey>) -> Vec<rtdb_storage::ObjectKey> {
+    let Some(entry) = value.table_catalog().entry(table) else { return Vec::new() };
+    let tries = value.trie_catalog();
+    let objects: BTreeSet<String> = keys.iter().flat_map(|key| {
+        let artefacts = tries.trie(table, key).into_iter().flat_map(|trie| trie.artefacts.iter())
+            .filter_map(|record| rtdb_format::keys::ArtefactOwner::of(key, record).ok().map(|owner| (owner, record)))
+            .filter(|(owner, _)| owner.tries().iter().all(|member| keys.contains(member) || tries.trie(table, member).is_none()))
+            .filter_map(|(owner, record)| entry.slug.owner_artefact_key(&owner, record.kind(), record.definition_id(), record.definition_version()).ok());
+        [entry.slug.data_key(key), entry.slug.metadata_key(key)].into_iter().chain(artefacts).collect::<Vec<_>>()
+    }).collect();
+    objects.into_iter().filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect()
+}
+
+fn artefact_entries(entries: &[proto::ArtefactEntry]) -> Vec<(TrieKey, proto::ArtefactRecord)> {
+    entries.iter().filter_map(|entry| Some((entry.trie_key.as_deref()?.parse().ok()?, entry.record.clone()?))).collect()
+}
+
 fn check_db_op(effects: &dyn DatabaseEffects, resolver: &TxResolver, operation: &DbOp) -> Result<()> {
     let name = match operation { DbOp::AttachDatabase(message) => message.db_name.as_deref(), DbOp::DetachDatabase(message) => message.db_name.as_deref() }.unwrap_or_default();
     match (operation, resolver.staged_db_op(name)) {

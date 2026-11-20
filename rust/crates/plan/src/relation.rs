@@ -29,7 +29,20 @@ pub struct Scan {
     pub iids: Option<BTreeSet<Iid>>,
     #[serde(default)]
     pub predicates: Vec<Expr>,
+    /// Set when the scan's rows feed a sort taking only the `limit` best by `search_score(column, query)`; see fts.allium.
+    #[serde(default)]
+    pub top_k: Option<ScanTopK>,
+    /// The MATCHes the scan evaluates itself, each projected as a boolean column of its own; see fts.allium.
+    #[serde(default)]
+    pub matches: Vec<ScanMatch>,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScanTopK { pub column: ColumnId, pub query: Expr, pub limit: Expr }
+
+/// `match(column, query)` with a constant query, as the scan's column `id`: the scan may answer it from an index, reading no text.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScanMatch { pub id: ColumnId, pub column: String, pub query: Expr }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NamedExpr { pub field: Field, pub expr: Expr }

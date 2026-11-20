@@ -1,0 +1,119 @@
+= Bitemporal full-text search: implementation plan
+
+Full-text search over a table's documents, answered at any valid time and system time.
+The behavioural specification is link:fts.allium[fts.allium]; this file is the implementation plan and the map of where the code lives.
+
+== Shape
+
+Search is a plugin behind generic extension points in the core.
+The core knows only that a trie may carry *derived artefacts*: extra files built from a trie's data file or its group's data files and recorded on the relevant catalog entries.
+It does not know what a search index is.
+
+[cols="1,3"]
+|===
+| Core extension point | What search plugs into it
+
+| Artefact records on `TrieDetails` (`format`, `index`)
+| A record per search file carries kind `search`, the index definition's id and version, opaque statistics, and the scope.
+  A shared file is recorded on every member.
+
+| `ArtefactsAdded` and `ArtefactsRemoved` source and replica messages (`replication`)
+| The index lane publishes a built search file; the leader accepts it while its trie is live and every node records it.
+  The lane publishes removal of the retired file's records, and every node removes them.
+
+| Artefact deletion in trie GC (`maintenance`)
+| GC deletes a trie's artefacts before its data and meta files.
+  It deletes shared files when it collects the last member.
+
+| The artefact lane (`maintenance`)
+| A deterministic job per eligible live trie or partition group lacking a file, run like compaction jobs.
+  Once a definition leaves force, the lane retires its artefacts: it publishes `ArtefactsRemoved` for their records, then deletes their objects, unrecorded ones included.
+
+| The scan accelerator (`query`)
+| Before a scan opens, an accelerator may narrow `Scan.iids` to a candidate superset; the scan's resolution and `PageFilter` decide the result.
+  It may also answer a `MATCH` the scan evaluates (`Scan.matches`) for the rows of whole data files, by page and row.
+
+| Scalar functions (`plan`, `expr`, `sql`)
+| `MATCH(column, query)` and `SEARCH_SCORE(column, query)`, evaluated on resolved rows with the analyzer in `rtdb-text`.
+
+| Mutations (`sql`, `tx`)
+| `CREATE SEARCH INDEX` and `DROP SEARCH INDEX` write documents to `xt.search_indexes` at their log position.
+|===
+
+Switching search off is a node option (`search.enabled`) and a Cargo feature (`search` on `rtdb-node`).
+With either off, nothing builds search files and `MATCH` is evaluated by scanning, with identical results.
+Trie GC deletes artefacts whatever the setting, so turning search off leaves nothing behind.
+
+== Decisions
+
+* *Index text runs, with where they are visible.*
+  A search document is a run of one entity's versions with the same tokens in one column, with its visibility rectangles from the scan's own resolver.
+* *A partition group shares one file.*
+  Each tiered compaction job writes one bucket, so the lane waits until all sibling tries are live.
+  It indexes eligible siblings in bucket order when their combined data fits `GROUP_BYTES` and a quarter of the node's memory budget.
+  Compaction still builds search files inline for eligible outputs that cannot form a shared file based on their own key or size.
+  A scan reads a shared file once and takes candidates and row-level MATCH answers from its selected members.
+  If the shared file needs repair after a member's data file has been collected, the lane publishes an individual file for each surviving trie.
+* *A search file only nominates candidates, and answers MATCH exactly.*
+  The scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
+  A `MATCH` with a constant query in a scan predicate becomes a column the scan evaluates: from the search file of the row's data file, null included, and from the row's value where there is none.
+* *A missing search file is never an error.*
+  The accelerator treats it as absent and builds the trie's search file itself from the immutable data file, which is what makes deleting one always safe.
+* *Tokens are ours, postings are tantivy's.*
+  `rtdb-text` analyses text (Unicode word split, lowercasing); the search file feeds tantivy pre-tokenized strings, so the residual check and the index agree token for token.
+* *Byte-deterministic search files.*
+  Segment ids derive from the artefact owner and definition, the writer is single-threaded with no merges, and the bundle orders its files by name.
+  Two builders of one job write identical bytes to one key.
+* *Definitions are documents.*
+  `xt.search_indexes` is written by the indexer, so the definitions in force are a function of log position and readable as of any basis.
+
+== Where it lives
+
+Each piece landed as its own commit on `docs/fts-spec`, with its tests.
+
+[cols="1,2,2"]
+|===
+| Piece | Code | Tests
+
+| Artefact records and messages
+| `format/src/keys.rs`, `index/src/trie_catalog.rs`, `replication/src/driver.rs` (`accept_artefacts`)
+| `index/tests/catalogs.rs`, `replication/src/tests.rs`
+
+| Partition-group artefacts
+| `format/src/keys.rs` (`PartGroup`, `ArtefactOwner`), `maintenance/src/artefact.rs`, `maintenance/src/gc.rs`
+| `format/tests/persistence.rs`, `maintenance/tests/artefacts.rs`, `maintenance/tests/gc.rs`, `replication/src/tests.rs`
+
+| Artefact GC
+| `maintenance/src/gc.rs`
+| `maintenance/tests/gc.rs`
+
+| Artefact lane
+| `maintenance/src/artefact.rs`, `node/src/database.rs`
+| `maintenance/tests/artefacts.rs`
+
+| Analyzer, `MATCH`, `SEARCH_SCORE`
+| `text`, `plan/src/search.rs`, `expr/src/search.rs`
+| `text`, `node/tests/search.rs`
+
+| Definitions
+| `sql/src/parse.rs`, `tx/src/resolver.rs`
+| `node/tests/search.rs`
+
+| Search files for a trie or a partition group
+| `search/src/file.rs`, `search/src/lane.rs`, `search/src/accelerate.rs`
+| `search/src/file.rs`, `search/src/accelerate.rs`, `node/tests/search.rs`
+
+| Lane builder, switches
+| `search/src/lane.rs`, `node/src/node.rs`, `server/src/config`
+| `node/tests/search.rs`, `server/tests/config.rs`
+
+| Acceleration, ranking
+| `query/src/accelerate.rs`, `search/src/accelerate.rs`
+| `search/src/accelerate.rs`, `node/tests/search.rs`
+|===
+
+`node/tests/search.rs` holds the oracle: every accelerated query is compared with the same predicate widened so that it is never pushed to the scan, across valid and system times, over tries with and without search files, an uncovered L0 tail and live rows.
+
+== Deferred
+
+* Indexing the historical side, and search files spanning several partition groups.

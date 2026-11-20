@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use prost::Message;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, read_value};
+use arrow_array::Array;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::ReplicaBody, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
 use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
@@ -329,15 +330,29 @@ impl<'a> OpenTransaction<'a> {
     async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
         use rtdb_sql::Mutation;
         let (table, input, kind) = match mutation {
-            Mutation::Put { table, input } => (Some(table), input, 0),
-            Mutation::Delete { table, input } => (Some(table), input, 1),
-            Mutation::Erase { table, input } => (Some(table), input, 2),
+            Mutation::Put { table, input } => (Some(table), input, MutationKind::Put),
+            Mutation::Delete { table, input } => (Some(table), input, MutationKind::Delete),
+            Mutation::Erase { table, input } => (Some(table), input, MutationKind::Erase),
             Mutation::Assert { input, message } => {
                 let mut cursor = execute(input, context, arguments, syntax).await?;
                 if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, "xtdb/assert-failed", message.unwrap_or_else(|| "Assert failed".into()))); }
                 return Ok(());
             }
             Mutation::CreateTable { table, columns } => return self.declare_table(table.table, columns),
+            Mutation::CreateSearchIndex { name, table, columns, history } => {
+                if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A search index cannot cover another database's table")); }
+                check_search_index_name(&name)?;
+                let document = rtdb_types::StructFields::from([
+                    ("_id".into(), Value::Utf8(name)), ("schema_name".into(), Value::Utf8(table.table.schema.clone())), ("table_name".into(), Value::Utf8(table.table.table.clone())),
+                    ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())), ("analyzer".into(), Value::Utf8(rtdb_text::SIMPLE_ANALYZER.into())),
+                    ("version".into(), Value::I64(self.tx_key().tx_id.0)), ("history".into(), Value::Bool(history)),
+                ]);
+                return self.buffer.put(TableRef::new("xt", "search_indexes"), document, interval(self.tx_key().system_time, Timestamp::MAX)?);
+            }
+            Mutation::DropSearchIndex { name } => {
+                check_search_index_name(&name)?;
+                return self.buffer.delete(TableRef::new("xt", "search_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
+            }
             Mutation::GrantRole { user, role, revoke } => {
                 if self.context.database != "xtdb" { return Err(Anomaly::incorrect("xtdb/role-membership-non-primary", "Role membership can only be managed on the primary 'xtdb' database.").with_context("db", self.context.database.clone().into())); }
                 self.context.authorization.check_role_membership(&self.context.database, self.options.user.as_deref())?;
@@ -357,20 +372,9 @@ impl<'a> OpenTransaction<'a> {
         if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "Mutation cannot write to another database")); }
         check_table(&table.table)?;
         let mut cursor = execute(input, context, arguments, syntax).await?;
+        let system_time = self.tx_key().system_time;
         while let Some(batch) = cursor.next_batch().await? {
-            let schema = batch.batch().schema();
-            let index = |name| schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()));
-            let iid_index = index("_iid")?;
-            for row in 0..batch.batch().num_rows() {
-                let cell = |column| read_value(schema.field(column), batch.batch().column(column).as_ref(), row);
-                let iid = match cell(iid_index)? { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes)?, _ => return Err(Anomaly::incorrect("xtdb/invalid-id", "Mutation IID is null or invalid")) };
-                let valid_time = if kind == 2 { Interval::ALL } else { valid_range(cell(index("_valid_from")?)?, cell(index("_valid_to")?)?, self.tx_key().system_time)? };
-                let operation = match kind {
-                    0 => match cell(index("doc")?)? { Value::Struct(document) => StoredOperation::Put(document), _ => return Err(Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document")) },
-                    1 => StoredOperation::Delete, _ => StoredOperation::Erase,
-                };
-                self.buffer.append_to(&table.table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation, recency: None })?;
-            }
+            mutation_events(batch.batch(), kind, system_time, |event| self.buffer.append_to(&table.table, event))?;
         }
         Ok(())
     }
@@ -509,7 +513,7 @@ async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, ar
     if arguments.len() != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {} provided, {count} expected", arguments.len())).with_context("param-count", count.into()).with_context("arg-count", arguments.len().into())); }
     let query = PreparedQuery::new_in(input, &context.memory)?;
     drop(syntax);
-    query.execute(context, arguments.to_vec()).await
+    query.execute_columns(context, arguments.to_vec()).await
 }
 fn validate_document_operation(operation: &Operation) -> Result<()> {
     let (table, documents, verb, permitted) = match operation {
@@ -553,10 +557,94 @@ fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
     }
     Interval::new(from, to)
 }
+#[derive(Clone, Copy)]
+enum MutationKind { Put, Delete, Erase }
+
+/// The events one batch of a mutation's output writes, in its row order.
+fn mutation_events(batch: &arrow_array::RecordBatch, kind: MutationKind, system_time: Timestamp, mut append: impl FnMut(StoredEvent) -> Result<()>) -> Result<()> {
+    let schema = batch.schema();
+    let column = |name| schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))
+        .and_then(|index| OutputColumn::new(schema.field(index), batch.column(index).as_ref()));
+    let iids = column("_iid")?;
+    let times = match kind { MutationKind::Erase => None, _ => Some((column("_valid_from")?, column("_valid_to")?)) };
+    let documents = match kind { MutationKind::Put => Some(column("doc")?), _ => None };
+    for row in 0..batch.num_rows() {
+        let iid = iids.iid(row)?;
+        let valid_time = match &times { None => Interval::ALL, Some((from, to)) => interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)? };
+        let operation = match (&documents, kind) {
+            (Some(documents), _) => match documents.read(row)? { Value::Struct(document) => StoredOperation::Put(document), _ => return Err(Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document")) },
+            (None, MutationKind::Delete) => StoredOperation::Delete,
+            (None, _) => StoredOperation::Erase,
+        };
+        append(StoredEvent { iid, system_from: system_time, valid_time, operation, recency: None })?;
+    }
+    Ok(())
+}
+
+/// One column of a mutation's output, read through its typed array where its layout is the one the event field takes,
+/// and cell by cell as `read_value` reads it otherwise.
+enum OutputColumn<'a> {
+    Iids(&'a arrow_array::FixedSizeBinaryArray),
+    Times(&'a arrow_array::TimestampMicrosecondArray),
+    Struct { array: &'a arrow_array::StructArray, children: Vec<(&'a String, Option<(LogicalType, &'a arrow_schema::Field)>)> },
+    Cells(rtdb_columnar::ColumnReader<'a>, &'a dyn arrow_array::Array),
+}
+
+impl<'a> OutputColumn<'a> {
+    fn new(field: &'a arrow_schema::Field, array: &'a dyn arrow_array::Array) -> Result<Self> {
+        use arrow_schema::DataType;
+        let reader = rtdb_columnar::ColumnReader::new(field)?;
+        let logical = match reader.logical() { LogicalType::Maybe(inner) => inner.as_ref(), logical => logical };
+        let any = array.as_any();
+        Ok(match (logical, field.data_type()) {
+            (LogicalType::Scalar(ScalarType::FixedSizeBinary(16)), DataType::FixedSizeBinary(16)) => match any.downcast_ref() { Some(array) => Self::Iids(array), None => Self::Cells(reader, array) },
+            (LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(_) }), DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _)) => match any.downcast_ref() { Some(array) => Self::Times(array), None => Self::Cells(reader, array) },
+            (LogicalType::Struct(types), DataType::Struct(fields)) => {
+                let children = fields.iter().map(|child| match types.get(child.name()) {
+                    Some(LogicalType::Nothing) => Some((child.name(), None)),
+                    Some(logical) => Some((child.name(), Some((logical.clone(), child.as_ref())))),
+                    None => None,
+                }).collect::<Option<Vec<_>>>();
+                match (children, any.downcast_ref::<arrow_array::StructArray>()) { (Some(children), Some(structs)) => Self::Struct { array: structs, children }, _ => Self::Cells(reader, array) }
+            }
+            _ => Self::Cells(reader, array),
+        })
+    }
+    fn read(&self, row: usize) -> Result<Value> {
+        match self {
+            Self::Struct { array, children } => {
+                if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
+                if array.is_null(row) { return Ok(Value::Null); }
+                let mut values = StructFields::new();
+                for (index, (name, child)) in children.iter().enumerate() {
+                    let value = match child { None => Value::Undefined, Some((logical, field)) => rtdb_columnar::read_value_as(logical, field, array.column(index).as_ref(), row)? };
+                    values.insert((*name).clone(), value);
+                }
+                Ok(Value::Struct(values))
+            }
+            Self::Cells(reader, array) => reader.read(*array, row),
+            Self::Iids(array) => Ok(if array.is_null(row) { Value::Null } else { Value::FixedSizeBinary(array.value(row).to_vec()) }),
+            Self::Times(array) => Ok(if array.is_null(row) { Value::Null } else { time_value(Timestamp(array.value(row))) }),
+        }
+    }
+    fn iid(&self, row: usize) -> Result<Iid> {
+        let invalid = || Anomaly::incorrect("xtdb/invalid-id", "Mutation IID is null or invalid");
+        match self {
+            Self::Iids(array) => if array.is_null(row) { Err(invalid()) } else { Iid::from_slice(array.value(row)) },
+            column => match column.read(row)? { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes), _ => Err(invalid()) },
+        }
+    }
+    fn time(&self, row: usize, fallback: Timestamp) -> Result<Timestamp> {
+        match self {
+            Self::Times(array) => Ok(if array.is_null(row) { fallback } else { Timestamp(array.value(row)) }),
+            column => timestamp(&column.read(row)?, fallback),
+        }
+    }
+}
+
 fn timestamp(value: &Value, fallback: Timestamp) -> Result<Timestamp> {
     match value { Value::Null | Value::Undefined => Ok(fallback), Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some(_) } => Ok(Timestamp(*value)), _ => Err(Anomaly::fault("xtdb/invalid-timestamp-col-type", "Invalid timestamp col type")) }
 }
-fn valid_range(from: Value, to: Value, current_time: Timestamp) -> Result<Interval> { interval(timestamp(&from, current_time)?, timestamp(&to, Timestamp::MAX)?) }
 fn time_value(time: Timestamp) -> Value { Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 fn tx_key_context(key: TransactionKey) -> Result<serde_json::Value> {
     transit::to_json_value(&T::Tagged { tag: "xtdb/tx-key".into(), representation: Box::new(T::Map(vec![
@@ -665,4 +753,79 @@ mod tests {
             assert_eq!(transit::from_json_value(&durable.context[field]).unwrap(), T::Tagged { tag: "time/instant".into(), representation: Box::new(T::String(text.into())) });
         }
     }
+
+    /// The events a mutation's output writes when every cell is read through `read_value`, as each row once was.
+    async fn events_read_row_by_row(mut cursor: QueryCursor, kind: MutationKind, system_time: Timestamp) -> Vec<StoredEvent> {
+        let mut events = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            let (batch, schema) = (batch.batch(), batch.batch().schema());
+            let cell = |name: &str, row| { let index = schema.index_of(name).unwrap(); rtdb_columnar::read_value(schema.field(index), batch.column(index).as_ref(), row).unwrap() };
+            for row in 0..batch.num_rows() {
+                let Value::FixedSizeBinary(iid) = cell("_iid", row) else { panic!("an IID") };
+                let valid_time = match kind { MutationKind::Erase => Interval::ALL, _ => interval(timestamp(&cell("_valid_from", row), system_time).unwrap(), timestamp(&cell("_valid_to", row), Timestamp::MAX).unwrap()).unwrap() };
+                let operation = match kind { MutationKind::Put => { let Value::Struct(document) = cell("doc", row) else { panic!("a document") }; StoredOperation::Put(document) }, MutationKind::Delete => StoredOperation::Delete, MutationKind::Erase => StoredOperation::Erase };
+                events.push(StoredEvent { iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
+            }
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn a_mutation_read_a_column_at_a_time_writes_the_events_a_row_by_row_read_does() {
+        let memory = MemoryBudget::new(1 << 26);
+        let resolve = ResolveContext {
+            database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions::default(),
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let state = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+        let options = SubmitOptions::default();
+        let system_time = Timestamp(1_000_000);
+        let mut tx = OpenTransaction::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time }, &options, &resolve).unwrap();
+        let table = TableRef::new("public", "items");
+        let instant = |micros: i64| Value::Timestamp { value: micros, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let cells: [(Value, Value, Value, Value, Value); 5] = [
+            (Value::F64(f64::NAN), Value::Utf8("a".into()), Value::I64(1), instant(1_000), Value::DateDay(18_000)),
+            (Value::F64(1.5), Value::Null, Value::Null, Value::Null, Value::Null),
+            (Value::F64(-0.0), Value::Utf8(String::new()), Value::I64(3), instant(-1), Value::DateDay(-1)),
+            (Value::Null, Value::Utf8("b".into()), Value::I64(200), instant(i64::MAX - 1), Value::DateDay(0)),
+            (Value::F64(0.0), Value::Utf8("c".into()), Value::I64(-5), instant(0), Value::Null),
+        ];
+        for (id, (f, t, n, ts, d)) in cells.into_iter().enumerate() {
+            let document = StructFields::from([("_id".into(), Value::I64(id as i64)), ("f".into(), f), ("t".into(), t), ("n".into(), n), ("ts".into(), ts), ("d".into(), d)]);
+            let to = if id == 2 { Timestamp(5_000_000) } else { Timestamp::MAX };
+            tx.buffer.put(table.clone(), document, Interval::new(Timestamp(id as i64 * 1000), to).unwrap()).unwrap();
+        }
+        let statements = [
+            "UPDATE items SET f = f", "UPDATE items SET f = f * 1.01 WHERE n < 100", "UPDATE items SET t = t, ts = ts, d = d",
+            "UPDATE items SET n = n + 1", "UPDATE items SET t = 'z' WHERE _id = 1", "UPDATE items SET d = d, f = 0.0 WHERE ts IS NOT NULL",
+            "UPDATE items SET ts = NULL", "DELETE FROM items WHERE n = 1", "INSERT INTO copies SELECT * FROM items",
+        ];
+        let mut written = 0;
+        for statement in statements {
+            let context = || resolve.query_context(tx.snapshot().unwrap(), system_time, "UTC", None).unwrap();
+            let (input, kind) = match rtdb_sql::prepare_tx(statement, &context().catalog, &Default::default()).unwrap() {
+                rtdb_sql::Mutation::Put { input, .. } => (input, MutationKind::Put),
+                rtdb_sql::Mutation::Delete { input, .. } => (input, MutationKind::Delete),
+                _ => panic!("{statement} is a put or a delete"),
+            };
+            let query = PreparedQuery::new_in(input, &memory).unwrap();
+            let expected = events_read_row_by_row(query.execute(context(), vec![]).await.unwrap(), kind, system_time).await;
+            let mut cursor = query.execute_columns(context(), vec![]).await.unwrap();
+            let mut actual = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() { mutation_events(batch.batch(), kind, system_time, |event| { actual.push(event); Ok(()) }).unwrap(); }
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{statement}");
+            written += actual.len();
+        }
+        assert!(written > 15, "the statements should write events, wrote {written}");
+    }
+}
+
+/// A search index's name keys the object paths of its search files.
+fn check_search_index_name(name: &str) -> Result<()> {
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\', '\0', '~']) {
+        return Err(Anomaly::incorrect("xtdb/invalid-search-index-name", format!("Invalid search index name: {name}")));
+    }
+    Ok(())
 }

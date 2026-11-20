@@ -58,6 +58,8 @@ rtdb-metrics = { path = "crates/metrics" }
 rtdb-flight-sql = { path = "crates/flight-sql" }
 rtdb-ffi = { path = "crates/ffi" }
 rtdb-tls = { path = "crates/tls" }
+rtdb-text = { path = "crates/text" }
+rtdb-search = { path = "crates/search" }
 sqlparser = { path = "vendor/sqlparser", version = "=0.63.0" }
 arrow-array = { version = "=58.4.1", features = ["ffi"] }
 arrow-buffer = "=58.4.1"
@@ -70,6 +72,9 @@ datafusion-physical-expr = { version = "=54.2.0", default-features = false }
 datafusion-functions = { version = "=54.2.0", default-features = false, features = ["math_expressions", "string_expressions", "unicode_expressions"] }
 arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
 async-trait = "0.1"
+memmap2 = "=0.9.12"
+tantivy = { version = "=0.27.0", default-features = false, features = ["mmap"] }
+stable_deref_trait = "1.2"
 async-stream = "=0.3.6"
 http = "1"
 base64 = "0.22"
