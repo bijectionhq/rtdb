@@ -50,6 +50,12 @@ pub fn block_pack(catalog: &str) -> String {
     format!("{PACK_DIRECTORY}/{stem}.pack")
 }
 
+/// The block whose pack `pack` is, if it is a block's: `~packs/b0a.pack` is block 10's.
+pub fn pack_block(pack: &str) -> Option<i64> {
+    let stem = pack.strip_prefix(&format!("{PACK_DIRECTORY}/"))?.strip_suffix(".pack")?;
+    rtdb_format::keys::block_index_from_key(&format!("{stem}.binpb")).ok().map(|block| block.0)
+}
+
 /// Whether a flush writes `key` before its block catalog: a level-0 trie file or a per-table block file.
 pub fn held_back(key: &str) -> bool {
     key.starts_with("tables/") && (key.contains("/data/l00-") || key.contains("/meta/l00-") || key.contains("/blocks/b"))

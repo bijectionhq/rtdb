@@ -310,11 +310,13 @@ pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now
         let packs: BTreeSet<String> = own.iter().chain(before.objects.keys()).filter(|name| name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY))).cloned().collect();
         // The latest block's pack names every other pack, so a cold start finds them all through it: it stays.
         let latest = packs.iter().filter(|pack| pack.starts_with(&format!("{}/b", crate::packing::PACK_DIRECTORY))).max().cloned();
+        // A cold start walks block by block from the published checkpoint's pack to the latest, stopping at the first one missing: from the checkpoint on, every block's pack stays.
+        let walked = |pack: &str| record.checkpoint.is_some_and(|checkpoint| crate::packing::pack_block(pack).is_some_and(|block| block >= checkpoint.block));
         let mut packed: BTreeSet<String> = BTreeSet::new();
         for pack in packs {
             let Some(location) = physical(&pack) else { continue };
             let Ok(index) = crate::packing::read_index(bucket, &crate::reference::key(&location)?).await else { continue };
-            if Some(&pack) != latest.as_ref() && index.entries.keys().all(|name| due.contains_key(name)) {
+            if Some(&pack) != latest.as_ref() && !walked(&pack) && index.entries.keys().all(|name| due.contains_key(name)) {
                 if own.contains(&pack) { references.erase(bucket, &store, &pack).await?; } else { forgotten.insert(pack.clone()); }
                 erased.extend(index.entries.into_keys());
             } else {
@@ -502,6 +504,24 @@ mod tests {
         assert_eq!(clock(), 7);
         time.store(20, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(clock(), 20);
+    }
+
+    #[tokio::test]
+    async fn a_store_opened_from_a_checkpoint_behind_its_latest_block_still_finds_it_after_the_reaper_passes() {
+        let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let store = format!("{}/v06", record.storage_prefix());
+        let open = |discovery| open_deployment_store(Arc::clone(&bucket), &store, discovery, wall_clock());
+        let writer = open(crate::packing::PackDiscovery::List).await.unwrap();
+        for block in 0..3i64 {
+            writer.put(&key(&format!("tables/t/data/l00-rc-b0{block}.arrow")), Bytes::from(format!("rows {block}"))).await.unwrap();
+            writer.put(&key(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block)).unwrap()), Bytes::from_static(b"catalog")).await.unwrap();
+        }
+        record.checkpoint = Some(rtdb_directory::Checkpoint { block: 0, boundary: 0, source: 0, system_time: 0 });
+        for name in ["tables/t/data/l00-rc-b01.arrow", "blocks/b01.binpb"] { writer.delete(&key(name)).await.unwrap(); }
+        reap(bucket.as_ref(), &record, Duration::ZERO, &Default::default()).await.unwrap();
+        let cold = open(crate::packing::PackDiscovery::From(0)).await.unwrap();
+        assert_eq!(cold.get(&key("tables/t/data/l00-rc-b02.arrow")).await.unwrap().as_ref(), b"rows 2", "a block after a fully released one is found from the checkpoint");
     }
 
     #[tokio::test]
