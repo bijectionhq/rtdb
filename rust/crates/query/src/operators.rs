@@ -94,6 +94,24 @@ pub(crate) fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution,
     }
 }) }
 
+/// Opens a whole plan as a batch source where `build_batches` takes its shape, charging the root operator's state as
+/// `build_pages` does; `None` where the plan runs as pages.
+pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
+    execution.context.check_cancelled()?;
+    if execution.analysis.is_some() || execution.context.tracer.is_some() || batch_shape(&runtime)?.is_none() { return Ok(None); }
+    let reservation = state_reservation(&runtime, &execution)?;
+    let Some((batches, _)) = build_batches(runtime, execution, None).await? else { return Ok(None) };
+    Ok(Some(crate::columnar::retain_batch_state(batches, reservation)))
+}
+
+fn state_reservation(runtime: &Arc<EmittedRelation>, execution: &Execution) -> Result<Arc<rtdb_columnar::MemoryReservation>> {
+    let relation = runtime.relation();
+    let mut state_bound = crate::runtime_schema::local_allocation_bound(relation)?;
+    state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.schema())?).ok_or_else(||invalid("operator-size","Operator schema copies exceed addressable memory"))?;
+    for (index,_) in relation.children().iter().enumerate() { state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.child(index)?.schema())?).ok_or_else(|| invalid("operator-size", "Operator schema copies exceed addressable memory"))?; }
+    execution.context.memory.reserve(state_bound)
+}
+
 /// Whether `build_batches` opens this subtree as batches, and if so whether they pass through a projection.
 fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
     let relation = Arc::clone(runtime.relation());
@@ -116,10 +134,7 @@ fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
 fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<crate::pages::BoxPageCursor>> { Box::pin(async move {
     execution.context.check_cancelled()?;
     let relation = Arc::clone(runtime.relation());
-    let mut state_bound = crate::runtime_schema::local_allocation_bound(&relation)?;
-    state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.schema())?).ok_or_else(||invalid("operator-size","Operator schema copies exceed addressable memory"))?;
-    for (index,_) in relation.children().iter().enumerate() { state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.child(index)?.schema())?).ok_or_else(|| invalid("operator-size", "Operator schema copies exceed addressable memory"))?; }
-    let state_reservation = execution.context.memory.reserve(state_bound)?;
+    let state_reservation = state_reservation(&runtime, &execution)?;
     let traced_relation = Arc::clone(&relation);
     let traced_context = Arc::clone(&execution.context);
     let analysis = execution.analysis.clone();
