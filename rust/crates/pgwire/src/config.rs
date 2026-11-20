@@ -25,6 +25,9 @@ pub struct ServerConfig {
 /// The startup parameter a capability travels in.
 pub const CAPABILITY_PARAMETER: &str = "rtdb.capability";
 
+/// The parameter status a server reports at startup when the session's principal may be re-established from its name, by a capability.
+pub const DELEGABLE_PARAMETER: &str = "rtdb.delegable";
+
 /// What a verified capability grants: one principal's session on the database it names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedCapability { pub principal: String, pub read_only: bool }

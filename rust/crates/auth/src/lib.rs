@@ -190,6 +190,7 @@ impl SessionIdentity for Principal {
     async fn revalidate(&self, now: Timestamp) -> Result<()> {
         match &self.credentials { Credentials::Static => Ok(()), Credentials::Oidc(credentials) => credentials.revalidate(now).await }
     }
+    fn delegable(&self) -> bool { matches!(self.credentials, Credentials::Static) }
     fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()> {
         let Some(grants) = &self.grants else { return Ok(()) };
         match (grants.get(database), access) {

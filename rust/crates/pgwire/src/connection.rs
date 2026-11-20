@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use crate::{CAPABILITY_PARAMETER, ServerConfig, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
+use crate::{CAPABILITY_PARAMETER, DELEGABLE_PARAMETER, ServerConfig, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
 
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
@@ -118,6 +118,7 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                         device.await_principal(cancellation).await?
                     }
                 } };
+                let delegable = identity.delegable();
                 let mut session = node.session(database, identity)?;
                 let size = config.parameters.iter().chain(requested.iter()).try_fold(8192usize, |size, (key, value)| size.checked_add(key.len().checked_mul(4)?).and_then(|size| size.checked_add(value.len())).and_then(|size| size.checked_add(256))).ok_or_else(|| protocol("Startup parameters exceed memory range"))?;
                 let reservation = node.memory().reserve(size)?;
@@ -126,6 +127,8 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 let mut writer = Writer::new(&mut **stream, Arc::clone(node.memory()));
                 if method != Method::DeviceAuth { writer.auth(0).await?; }
                 apply_startup(&mut session, &parameters, &mut writer).await?;
+                // Tells a gateway it may vouch for this session's user when it reconnects it elsewhere.
+                if delegable { writer.parameter(DELEGABLE_PARAMETER, "on").await?; }
                 writer.backend_key(process).await?; writer.ready(b'I').await?;
                 return Ok(Some((session, Startup { parameters, _reservation: reservation })));
             }
@@ -140,6 +143,7 @@ struct CapabilityIdentity { principal: Arc<dyn SessionIdentity>, read_only: bool
 #[async_trait::async_trait]
 impl SessionIdentity for CapabilityIdentity {
     fn user(&self) -> Option<&str> { self.principal.user() }
+    fn delegable(&self) -> bool { self.principal.delegable() }
     async fn revalidate(&self, now: rtdb_types::Timestamp) -> Result<()> { self.principal.revalidate(now).await }
     fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()> {
         if self.read_only && access == DatabaseAccess::Write { return Err(Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authz/read-only-capability", "This session's capability grants read access only")); }

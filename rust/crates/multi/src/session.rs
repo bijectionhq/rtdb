@@ -93,8 +93,10 @@ pub struct Grants { pub secret: Arc<crate::capability::CellSecret>, pub paramete
 pub struct Session {
     startup: Bytes,
     grants: Option<Grants>,
-    /// Whether a backend has authenticated the client, after which the gateway vouches for it with capabilities.
-    authenticated: bool,
+    /// The principal the first backend authenticated and reported it may be vouched for, for whom the gateway mints its reconnections' capabilities.
+    authenticated: Option<String>,
+    /// What the first backend's greeting has reported so far: its authentication, the session's user, and whether that user may be vouched for.
+    greeting: Greeting,
     router: Arc<dyn Router>,
     record: watch::Receiver<Option<DeploymentRecord>>,
     prepared: BTreeMap<String, Frame>,
@@ -116,7 +118,7 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, std::time::Duration::from_millis(100));
-        Self { startup, grants, authenticated: false, router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, discarding: false, keyed, key: None, swallowing: 0 }
     }
 
     /// Reconnects to the current holder, retrying through a failover: until the dead holder's lease expires, no other node may claim.
@@ -161,9 +163,11 @@ impl Session {
 
     /// The startup a reconnection sends: the client's, with a fresh capability once the client has authenticated.
     fn reconnection_startup(&self) -> Bytes {
-        let (Some(grants), true) = (&self.grants, self.authenticated) else { return self.startup.clone() };
-        let (Some(deployment), Some(user)) = (grants.parameters.get("database").or_else(|| grants.parameters.get("user")), grants.parameters.get("user")) else { return self.startup.clone() };
+        let (Some(grants), Some(user)) = (&self.grants, &self.authenticated) else { return self.startup.clone() };
+        let Some(deployment) = grants.parameters.get("database").or_else(|| grants.parameters.get("user")) else { return self.startup.clone() };
         let mut parameters = grants.parameters.clone();
+        // The capability names the principal the backend authenticated, whatever user the client claimed.
+        parameters.insert("user".into(), user.clone());
         parameters.insert(rtdb_pgwire::CAPABILITY_PARAMETER.into(), grants.secret.mint(deployment, user, grants.read_only, CAPABILITY_TTL));
         Bytes::from(crate::gateway::encode_startup(&parameters))
     }
@@ -225,7 +229,7 @@ impl Session {
                             continue;
                         }
                         self.answered = true;
-                        if frame.tag == b'R' && frame.body.get(..4) == Some(&[0, 0, 0, 0]) { self.authenticated = true; }
+                        self.greeting.observe(&frame, &mut self.authenticated);
                         if frame.tag == b'Z' {
                             self.status = match frame.body.first() { Some(b'I') => Status::Idle, Some(b'T' | b'E') => Status::InTransaction, _ => Status::Busy };
                         }
@@ -289,6 +293,31 @@ fn not_held(frame: &Frame) -> bool { frame.body.windows(rtdb_node::NOT_HELD.len(
 
 fn parse_name(frame: &Frame) -> String {
     frame.body.split(|byte| *byte == 0).next().map(|name| String::from_utf8_lossy(name).into_owned()).unwrap_or_default()
+}
+
+/// What the first backend's greeting, everything before its first ReadyForQuery, has reported.
+/// Only the greeting counts: a parameter status later in the session reports a `SET`, which the client chose.
+#[derive(Default)]
+struct Greeting { done: bool, authenticated: bool, user: Option<String>, delegable: bool }
+
+impl Greeting {
+    fn observe(&mut self, frame: &Frame, vouched: &mut Option<String>) {
+        if self.done { return; }
+        match frame.tag {
+            b'R' if frame.body.get(..4) == Some(&[0, 0, 0, 0]) => self.authenticated = true,
+            b'S' => {
+                let mut fields = frame.body.split(|byte| *byte == 0).map(|field| String::from_utf8_lossy(field).into_owned());
+                if let (Some(key), Some(value)) = (fields.next(), fields.next()) {
+                    if key == "user" { self.user = Some(value); } else if key == rtdb_pgwire::DELEGABLE_PARAMETER { self.delegable = value == "on"; }
+                }
+            }
+            b'Z' => {
+                self.done = true;
+                if self.authenticated && self.delegable { *vouched = self.user.clone(); }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn error_frame(sqlstate: &str, message: &str) -> Frame {
@@ -385,5 +414,19 @@ mod tests {
         assert_eq!(receive(&mut client).await.0, b'Z');
         drop(client);
         let _ = running.await;
+    }
+
+    fn status(key: &str, value: &str) -> Frame { Frame { tag: b'S', body: Bytes::from(format!("{key}\0{value}\0")) } }
+    fn frame(tag: u8, body: &[u8]) -> Frame { Frame { tag, body: Bytes::copy_from_slice(body) } }
+
+    #[test]
+    fn a_gateway_vouches_only_for_the_principal_its_backend_authenticated_and_reported_delegable() {
+        let greet = |frames: Vec<Frame>| { let (mut greeting, mut vouched) = (Greeting::default(), None); for frame in &frames { greeting.observe(frame, &mut vouched); } vouched };
+        let ok = frame(b'R', &[0, 0, 0, 0]);
+        assert_eq!(greet(vec![ok.clone(), status("user", "alice"), status(rtdb_pgwire::DELEGABLE_PARAMETER, "on"), frame(b'Z', b"I")]).as_deref(), Some("alice"));
+        assert_eq!(greet(vec![ok.clone(), status("user", "alice"), frame(b'Z', b"I")]), None, "a principal whose tokens must be revalidated is never vouched for");
+        assert_eq!(greet(vec![status("user", "alice"), status(rtdb_pgwire::DELEGABLE_PARAMETER, "on"), frame(b'Z', b"I")]), None, "nor one never authenticated");
+        assert_eq!(greet(vec![ok, status("user", "alice"), status(rtdb_pgwire::DELEGABLE_PARAMETER, "on"), frame(b'Z', b"I"), status("user", "mallory")]).as_deref(), Some("alice"),
+            "a user the client sets after the greeting is not the one vouched for");
     }
 }

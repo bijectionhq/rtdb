@@ -69,6 +69,8 @@ pub trait SessionIdentity: Send + Sync {
     fn user(&self) -> Option<&str>;
     async fn revalidate(&self, now: Timestamp) -> Result<()>;
     fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()>;
+    /// Whether another party may re-establish this identity from its name alone: true of a password or trusted principal, false of one whose tokens must keep being revalidated.
+    fn delegable(&self) -> bool { false }
 }
 
 #[async_trait]
