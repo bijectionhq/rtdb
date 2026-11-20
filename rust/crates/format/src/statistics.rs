@@ -144,7 +144,9 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         statistics.bytes_seen = true;
         if with_bloom {
             let bloom = statistics.bloom.get_or_insert_with(BloomFilter::default);
-            for row in 0..array.len() { if mask.includes(row) { bloom.insert_cell(field, array, row)?; } }
+            if !bloom.insert_byte_cells(array, (0..array.len()).filter(|row| mask.includes(*row))) {
+                for row in 0..array.len() { if mask.includes(row) { bloom.insert_cell(field, array, row)?; } }
+            }
         }
         return Ok(());
     }
