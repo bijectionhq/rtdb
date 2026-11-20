@@ -1,7 +1,7 @@
-//! Packs (`WritePackAndManifest`): a block flush costs one object for all its level-0 files, plus the block catalog.
+//! Packs (`WritePackAndManifest`): a block flush costs one object, its block's pack, which is also the deployment's boot object.
 //!
-//! The objects a flush writes before its block catalog (level-0 trie data and metadata, per-table block files) are held back and written, when the catalog is published, as one pack whose trailer indexes them.
-//! The catalog itself stays its own object, so recovery still finds blocks where it looks for them.
+//! The objects a flush writes before its block catalog (level-0 trie data and metadata, per-table block files) are held back and written, with the catalog, as one pack whose trailer indexes them.
+//! A cold start reads the latest block's pack and nothing else: its index, its catalog and its table blocks are ranges of one object.
 //! Every other write (compaction outputs, oversized payloads) goes straight through.
 //! The pack written with a block catalog is named after that block, and its index lists every pack written before it, so a store finds every pack by reading the latest block's, never listing.
 //! A store probes for newer block catalogs when asked for an object it does not know, so a reader finds packs its writer published after it opened.
@@ -53,6 +53,9 @@ pub fn held_back(key: &str) -> bool {
 }
 
 fn is_catalog(key: &str) -> bool { key.starts_with("blocks/b") && key.ends_with(".binpb") }
+
+/// Whether `key` is found only in a pack: what a flush holds back, and the catalog it is packed with.
+fn packed(key: &str) -> bool { held_back(key) || is_catalog(key) }
 
 /// Encodes a pack: the objects back to back, the index as JSON, and the index's length as eight big-endian bytes.
 pub fn encode_pack(objects: &BTreeMap<String, Bytes>, previous: Vec<String>) -> (Bytes, PackIndex) {
@@ -114,17 +117,14 @@ impl PackingStore {
         let (discovery, latest) = { let state = self.state.lock(); (state.discovery, state.latest_block) };
         let start = match (discovery, latest) {
             (_, Some(latest)) => latest + 1,
-            (PackDiscovery::From(hint), None) if self.exists(&catalog_key(hint)?).await? => hint,
+            (PackDiscovery::From(hint), None) if self.exists(&pack_key(hint)?).await? => hint,
             _ => return self.refresh_by_listing().await,
         };
         let mut next = start;
-        while self.exists(&catalog_key(next)?).await? { next += 1; }
+        while self.exists(&pack_key(next)?).await? { next += 1; }
         let Some(found) = (next > start).then(|| next - 1).or(latest) else { return Ok(()) };
         if latest == Some(found) { return Ok(()); }
-        let pack = key(&block_pack(&catalog_key(found)?.as_str().to_owned()))?;
-        // A block catalog published before its packs were named after it: only a listing finds them.
-        if !self.exists(&pack).await? { return self.refresh_by_listing().await; }
-        if let Some(index) = self.adopt(pack).await? {
+        if let Some(index) = self.adopt(pack_key(found)?).await? {
             for previous in index.previous { self.adopt(key(&previous)?).await?; }
         }
         self.state.lock().latest_block = Some(found);
@@ -165,7 +165,7 @@ impl PackingStore {
 
     async fn locate(&self, object: &ObjectKey) -> rtdb_storage::Result<Option<(ObjectKey, PackEntry)>> {
         if let Some(found) = self.located(object) { return Ok(Some(found)); }
-        if held_back(object.as_str()) { self.refresh().await?; }
+        if packed(object.as_str()) { self.refresh().await?; }
         Ok(self.located(object))
     }
 }
@@ -173,6 +173,8 @@ impl PackingStore {
 fn catalog_key(block: i64) -> rtdb_storage::Result<ObjectKey> {
     key(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block)).map_err(|error| Error::Task(error.to_string()))?)
 }
+
+fn pack_key(block: i64) -> rtdb_storage::Result<ObjectKey> { key(&block_pack(catalog_key(block)?.as_str())) }
 
 fn key(name: &str) -> rtdb_storage::Result<ObjectKey> { ObjectKey::new(name).map_err(|error| Error::Task(error.to_string())) }
 
@@ -214,7 +216,14 @@ impl ObjectStore for PackingStore {
             };
             return if full { self.write_pack(None).await } else { Ok(()) };
         }
-        if is_catalog(object.as_str()) { self.write_pack(Some(object)).await?; }
+        if is_catalog(object.as_str()) {
+            // Put-if-absent holds for a packed catalog as for any object: the same bytes again succeed, others conflict.
+            if self.located(object).is_some() || self.locate(object).await?.is_some() {
+                return if self.get(object).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(object.to_string())) };
+            }
+            self.state.lock().held.insert(object.as_str().to_owned(), bytes);
+            return self.write_pack(Some(object)).await;
+        }
         self.inner.put(object, bytes).await
     }
     async fn put_file(&self, object: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
@@ -246,7 +255,7 @@ mod tests {
     fn object(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
 
     #[tokio::test]
-    async fn a_flush_costs_one_pack_and_its_catalog_and_every_object_still_reads() {
+    async fn a_flush_costs_one_object_and_every_object_still_reads() {
         let raw = Arc::new(MemoryStore::default());
         let store = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
         for name in ["tables/public$orders/data/l00-rc-b00.arrow", "tables/public$orders/meta/l00-rc-b00.arrow", "tables/public$orders/blocks/b00.binpb", "tables/public$items/data/l00-rc-b00.arrow"] {
@@ -256,8 +265,10 @@ mod tests {
         assert_eq!(store.get(&object("tables/public$orders/blocks/b00.binpb")).await.unwrap().as_ref(), b"tables/public$orders/blocks/b00.binpb", "held objects read back");
         store.put(&object("blocks/b00.binpb"), Bytes::from_static(b"catalog")).await.unwrap();
         let written: Vec<String> = raw.list(None).await.unwrap().into_iter().map(|object| object.key.as_str().to_owned()).collect();
-        assert_eq!(written.len(), 2, "one pack and the catalog: {written:?}");
-        assert!(written.iter().any(|name| name == "blocks/b00.binpb"));
+        assert_eq!(written, ["~packs/b00.pack"], "one pack, holding the catalog too");
+        assert_eq!(store.get(&object("blocks/b00.binpb")).await.unwrap().as_ref(), b"catalog");
+        store.put(&object("blocks/b00.binpb"), Bytes::from_static(b"catalog")).await.unwrap();
+        assert!(store.put(&object("blocks/b00.binpb"), Bytes::from_static(b"other")).await.is_err(), "a packed catalog is put-if-absent like any object");
 
         let reader = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
         assert_eq!(reader.get_range(&object("tables/public$orders/meta/l00-rc-b00.arrow"), 7..13).await.unwrap().as_ref(), b"public");

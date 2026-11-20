@@ -427,7 +427,8 @@ mod tests {
         assert_eq!(reap_local(directory.path(), &record, Duration::ZERO, &Default::default()).unwrap(), Reaped { erased: 0, waiting: 1 }, "half a pack released keeps the pack");
         assert_eq!(packs(), 2);
         store.delete(&key("tables/t/meta/l00-rc-b00.arrow")).await.unwrap();
-        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO, &Default::default()).unwrap().erased, 2);
+        store.delete(&key("blocks/b00.binpb")).await.unwrap();
+        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO, &Default::default()).unwrap().erased, 3);
         assert_eq!(packs(), 1, "a fully released pack is erased, and the latest block's, which names every pack, stays");
     }
 
