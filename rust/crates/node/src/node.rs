@@ -174,7 +174,7 @@ impl Node {
         let database = database.into();
         identity.authorize_database(&database, DatabaseAccess::Read)?;
         self.catalog.database(&database)?;
-        let service = Arc::new(NativeSessionService { node: self.clone(), identity });
+        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone() });
         let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.cancellation)?;
         Ok(NativeSession { state, service })
     }
@@ -496,7 +496,7 @@ impl NativeSession {
     }
 }
 
-pub(crate) struct NativeSessionService { pub(crate) node: Node, pub(crate) identity: Arc<dyn SessionIdentity> }
+pub(crate) struct NativeSessionService { pub(crate) node: Node, pub(crate) identity: Arc<dyn SessionIdentity>, pub(crate) database: String }
 #[async_trait]
 impl SessionService for NativeSessionService {
     fn memory(&self) -> &Arc<MemoryBudget> { self.node.memory() }
@@ -506,7 +506,12 @@ impl SessionService for NativeSessionService {
     async fn revalidate(&self) -> Result<()> { self.node.ensure_open()?; self.identity.revalidate(self.node.now()).await }
     fn now(&self) -> Timestamp { self.node.now() }
     fn query_instant(&self) -> rtdb_types::Instant { self.node.query_instant() }
-    fn snapshot_basis(&self) -> Result<TimeBasis> { self.node.snapshot_basis() }
+    fn snapshot_basis(&self) -> Result<TimeBasis> {
+        let mut basis = self.node.snapshot_basis()?;
+        // On a placed node the other databases are other tenants': a session's basis names only its own.
+        if self.node.catalog.is_placed() { basis.databases.retain(|name, _| *name == self.database); }
+        Ok(basis)
+    }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> { self.node.await_basis(basis, timeout, cancellation).await }
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), cancellation).await }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction(database, tx_id, self.identity.as_ref(), cancellation).await }

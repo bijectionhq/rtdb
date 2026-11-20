@@ -1715,6 +1715,10 @@ async fn a_session_on_a_placed_node_sees_its_own_database_and_no_other() {
     let reached = match shop.query_sql("SELECT value FROM blog.public.docs", vec![]).await { Ok(cursor) => Some(rows(cursor).await), Err(_) => None };
     assert!(reached.as_ref().is_none_or(|rows| rows.is_empty()), "another tenant's table is not reachable by name: {reached:?}");
     assert_eq!(rows(blog.query_sql("SELECT value FROM blog.public.docs", vec![]).await.unwrap()).await, [vec![Value::I64(10)]], "a session still names its own database");
+    shop.state_mut().set_auto_commit(false).await.unwrap();
+    let basis = shop.state_mut().read_basis().await.unwrap();
+    assert_eq!(basis.snapshot.databases.keys().cloned().collect::<Vec<_>>(), ["shop"], "a session's basis names no other tenant");
+    shop.state_mut().rollback_tx().unwrap();
     drop((shop, blog));
     stop(&node, driver).await;
 }

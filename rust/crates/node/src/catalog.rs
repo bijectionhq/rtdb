@@ -37,6 +37,8 @@ impl DatabaseCatalog {
         Arc::new(Self { value: RwLock::new(Arc::new(DatabaseSet::default())), membership })
     }
     pub fn database_names(&self) -> BTreeSet<String> { self.open_databases().into_keys().collect() }
+    /// Whether this node's databases are tenants placed by an outside authority, each visible only to its own sessions.
+    pub fn is_placed(&self) -> bool { matches!(self.membership, Membership::Placed) }
     pub fn database(&self, name: &str) -> Result<Arc<Database>> {
         match self.value.read().entries.get(name) {
             Some(Entry::Open { database, .. }) => Ok(Arc::clone(database)),
