@@ -1724,6 +1724,8 @@ rule UpgradeFormatLazily {
 ------------------------------------------------------------
 
 rule BeginCellMove {
+    -- The source and target have distinct object and key namespaces.
+    -- Each cell's object namespace lies outside the other's cleanup prefix for the deployment.
     when: CellMoveRequested(record, target_cell)
 
     requires: record.lifecycle = live

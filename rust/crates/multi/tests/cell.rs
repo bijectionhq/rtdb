@@ -862,3 +862,56 @@ async fn a_fork_publishes_and_trims_only_after_adopting_a_block_from_its_own_log
     drop((parent, preview));
     cell.stop().await;
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsafe_cell_move_leaves_the_source_live() {
+    use rtdb_multi::{deployment::CellStorage, keys::{KeyService, LocalKeyService}};
+
+    let map = rtdb_multi::cells::MemoryCellMap::new();
+    let east = Cell::start_in("east", map.clone(), 1).await;
+    let west = Cell::start_in("west", map.clone(), 0).await;
+    let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
+    let from = admin::CellHandle { name: "east", directory: east.directory.as_ref(), storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
+    let deployment = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap().1;
+    let client = east.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let before = east.directory.deployment(&deployment.id).await.unwrap().unwrap();
+
+    let object_alias = west.data.path().join("east-objects");
+    std::os::unix::fs::symlink(east.data.path().join("objects"), &object_alias).unwrap();
+    let aliased_storage = CellStorage::Local { root: object_alias };
+    let pack_prefix = format!("{}/v06/~packs", deployment.storage_prefix());
+    let nested_storage = CellStorage::Local { root: east.data.path().join("objects").join(&pack_prefix) };
+    let object_store = east_storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+    let packs = rtdb_storage::ObjectKey::new(pack_prefix).unwrap();
+    let old_packs = object_store.list(Some(&packs)).await.unwrap();
+    let key_alias = west.data.path().join("east-keys");
+    std::os::unix::fs::symlink(east.data.path().join("keys"), &key_alias).unwrap();
+    let aliased_keys = LocalKeyService::new(key_alias).unwrap();
+
+    let mut conflicting_key = east_keys.key(&deployment.id).unwrap();
+    conflicting_key[0] ^= 1;
+    west_keys.install(&deployment.id, conflicting_key).unwrap();
+    for (storage, keys, expected) in [
+        (&aliased_storage, &west_keys, "rtdb.multi/shared-cell-storage"),
+        (&nested_storage, &west_keys, "rtdb.multi/shared-cell-storage"),
+        (&west_storage, &aliased_keys, "rtdb.multi/shared-cell-keys"),
+        (&west_storage, &west_keys, "rtdb.multi/key-conflict"),
+    ] {
+        let to = admin::CellHandle { name: "west", directory: west.directory.as_ref(), storage, keys, maximum_deployments: 10 };
+        let error = admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20).await.unwrap_err();
+        assert_eq!(error.code, expected);
+        let after = east.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(after.lifecycle, rtdb_directory::Lifecycle::Live);
+        assert_eq!(after.holder, before.holder);
+        assert!(west.directory.deployment_by_name("shop").await.unwrap().is_none());
+    }
+    assert_eq!(object_store.list(Some(&packs)).await.unwrap(), old_packs);
+    assert_eq!(rtdb_multi::cells::CellMap::cell_of(map.as_ref(), "shop").await.unwrap().as_deref(), Some("east"));
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    drop(client);
+    east.stop().await;
+    west.stop().await;
+}

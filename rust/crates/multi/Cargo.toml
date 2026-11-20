@@ -41,9 +41,9 @@ ring = "0.17"
 uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio-postgres = "0.7"

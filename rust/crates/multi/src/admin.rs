@@ -220,8 +220,41 @@ fn crate_exists(name: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Conflict,
 /// Moves a deployment to another cell (`BeginCellMove`, `MoveCutover`): the source fences it and seals its stream, its objects and key are copied, the target records it with the source's logkeepers to move from, the cell map flips, and the source keeps a tombstone that its gateway forwards.
 /// The target's first holder recovers the unflushed tail from the source's logkeepers and moves it onto its own.
 pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, to: &CellHandle<'_>, name: &str, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    if from.name == to.name || map.cell_of(name).await?.as_deref() != Some(from.name) {
+        return Err(Anomaly::incorrect("rtdb.multi/move-source", format!("{name} must be placed in {} before it can be moved to a different cell", from.name)));
+    }
+    let current = record(from.directory, name).await?;
+    if current.lifecycle != Lifecycle::Live {
+        return Err(Anomaly::incorrect("rtdb.multi/not-live", format!("{name} is not live")));
+    }
+    if to.directory.deployment_by_name(name).await?.is_some() || to.directory.deployment(&current.id).await?.is_some() {
+        return Err(crate_exists(name));
+    }
+    choose_ensemble(to.directory, &current, current.ensemble.len()).await?;
+    let (source, target) = tokio::try_join!(
+        from.storage.bucket(rtdb_storage::IoRegion::new()),
+        to.storage.bucket(rtdb_storage::IoRegion::new()),
+    )?;
+    let prefix = rtdb_storage::ObjectKey::new(current.storage_prefix())?;
+    if from.storage.cleanup_contains(to.storage, &prefix)? || to.storage.cleanup_contains(from.storage, &prefix)? {
+        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-storage", "Cell moves require object stores outside each other's deployment cleanup prefixes"));
+    }
+    let (source_namespace, target_namespace) = tokio::try_join!(
+        crate::deployment::storage_namespace(source.as_ref()),
+        crate::deployment::storage_namespace(target.as_ref()),
+    )?;
+    if source_namespace == target_namespace {
+        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-storage", "Cell moves require distinct source and destination object stores"));
+    }
+    if from.keys.namespace_id()? == to.keys.namespace_id()? {
+        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-keys", "Cell moves require distinct source and destination key namespaces"));
+    }
+    let key = from.keys.key(&current.id)?;
+    to.keys.validate_install(&current.id, &key)?;
     let fenced = update(from.directory, name, |record| {
-        if record.lifecycle != Lifecycle::Live { return Err(Anomaly::incorrect("rtdb.multi/not-live", format!("{name} is not live"))); }
+        if record.id != current.id || record.lifecycle != Lifecycle::Live {
+            return Err(Anomaly::incorrect("rtdb.multi/not-live", format!("{name} is no longer the live deployment selected for the move")));
+        }
         record.lifecycle = Lifecycle::Moving;
         record.epoch += 1;
         record.holder = None;
@@ -231,9 +264,8 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     let servers: Vec<String> = fenced.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers: servers.clone(), stream: fenced.stream("replica"), maximum_message_bytes };
     rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
-    let (source, target) = (from.storage.bucket(rtdb_storage::IoRegion::new()).await?, to.storage.bucket(rtdb_storage::IoRegion::new()).await?);
     crate::reference::materialize(source.as_ref(), &fenced.storage_prefix(), target.as_ref(), &fenced.storage_prefix()).await?;
-    to.keys.install(&fenced.id, from.keys.key(&fenced.id)?)?;
+    to.keys.install(&fenced.id, key)?;
     let mut arrived = fenced.clone();
     arrived.lifecycle = Lifecycle::Live;
     arrived.move_intent = None;

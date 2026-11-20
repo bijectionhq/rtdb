@@ -487,6 +487,10 @@ Unbounded means adding cells (spec contract `CellMap`).
 
 1. The cell map, encoded in deployment hostnames where possible.
 2. Cell move: fork into the target cell, fence, copy the remaining tail, flip the map, leave a forwarding tombstone (`BeginCellMove`, `MoveCutover`).
+   The source and target must have distinct physical object namespaces and key namespaces.
+   A move verifies both before fencing the source.
+   It refuses a shared namespace, a storage root inside the other deployment's cleanup prefix, or a conflicting destination key.
+   Overlapping S3 prefixes in the same named bucket are rejected before writing namespace markers.
 3. Format upgrades: readers for N-2 to N, rewrite on flush and compaction, a maintenance trickle for the rest.
 
 **Done when** a deployment moves between two simulated cells with one fenced write stall.

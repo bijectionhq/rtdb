@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use rtdb_directory::DeploymentRecord;
 use rtdb_format::database::proto::{DatabaseConfig, RemoteStorage, database_config};
+use rtdb_storage::{Error as StoreError, ObjectKey, ObjectStore};
+use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
 /// The protobuf type name the logkeeper log factory is registered under.
@@ -21,6 +23,7 @@ pub enum CellStorage {
 
 /// The key under an S3 configuration's prefix that a cell's objects are kept below.
 const S3_CELL_ROOT: &str = "cell";
+const STORAGE_NAMESPACE_MARKER: &str = "~cell-namespace";
 
 impl CellStorage {
     /// The cell's objects as one store, keyed relative to the cell's storage root.
@@ -31,6 +34,27 @@ impl CellStorage {
                 let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT).map_err(rtdb_types::Anomaly::from)?;
                 config.open(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
             }
+        }
+    }
+
+    pub(crate) fn cleanup_contains(&self, other: &Self, deployment: &ObjectKey) -> Result<bool> {
+        match (self, other) {
+            (Self::Local { root }, Self::Local { root: other_root }) => {
+                let canonical = |path: &std::path::Path| {
+                    std::fs::canonicalize(path).map_err(|error| {
+                        Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/storage-namespace", format!("{}: {error}", path.display()))
+                    })
+                };
+                Ok(canonical(other_root)?.starts_with(canonical(root)?.join(deployment.as_str())))
+            }
+            (Self::S3 { config }, Self::S3 { config: other_config }) if config.bucket == other_config.bucket => {
+                let cell = ObjectKey::new(S3_CELL_ROOT)?;
+                let root = config.object_prefix(&cell)?;
+                let other_root = other_config.object_prefix(&cell)?;
+                let Some(relative) = other_root.as_str().strip_prefix(&format!("{root}/")) else { return Ok(false) };
+                Ok(ObjectKey::new(relative)?.is_under(deployment))
+            }
+            _ => Ok(false),
         }
     }
 
@@ -51,6 +75,23 @@ impl CellStorage {
         }
         Ok(CellStorage::S3 { config })
     }
+}
+
+pub(crate) async fn storage_namespace(bucket: &dyn ObjectStore) -> Result<uuid::Uuid> {
+    let marker = ObjectKey::new(STORAGE_NAMESPACE_MARKER)?;
+    let bytes = match bucket.get(&marker).await {
+        Ok(bytes) => bytes,
+        Err(StoreError::MissingObject(_)) => {
+            let id = uuid::Uuid::new_v4();
+            match bucket.put(&marker, bytes::Bytes::copy_from_slice(id.as_bytes())).await {
+                Ok(()) => return Ok(id),
+                Err(StoreError::ConflictingObject(_)) => bucket.get(&marker).await?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    uuid::Uuid::from_slice(&bytes).map_err(|_| Anomaly::fault("rtdb.multi/storage-namespace", "The cell storage has an invalid namespace marker"))
 }
 
 /// How a node holds a deployment.
