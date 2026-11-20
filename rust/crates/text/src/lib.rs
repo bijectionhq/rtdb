@@ -6,15 +6,29 @@ use std::collections::BTreeMap;
 pub const SIMPLE_ANALYZER: &str = "simple";
 
 /// Bumped whenever tokenisation changes, so that search files built by an earlier analyzer are never read by a later one.
-pub const ANALYZER_VERSION: i32 = 1;
+pub const ANALYZER_VERSION: i32 = 2;
+
+/// The longest token a search index holds, in bytes: tantivy drops longer ones, so a longer run of alphanumerics is split into tokens of at most this many.
+pub const MAX_TOKEN_BYTES: usize = 65_530;
 
 pub fn tokens(text: &str) -> Vec<String> {
-    text.split(|character: char| !character.is_alphanumeric()).filter(|token| !token.is_empty()).map(str::to_lowercase).collect()
+    let mut tokens = Vec::new();
+    for word in text.split(|character: char| !character.is_alphanumeric()).filter(|token| !token.is_empty()) {
+        let word = word.to_lowercase();
+        if word.len() <= MAX_TOKEN_BYTES { tokens.push(word); continue; }
+        let mut piece = String::new();
+        for character in word.chars() {
+            if piece.len() + character.len_utf8() > MAX_TOKEN_BYTES { tokens.push(std::mem::take(&mut piece)); }
+            piece.push(character);
+        }
+        tokens.push(piece);
+    }
+    tokens
 }
 
 /// A query's distinct terms, in first-occurrence order, and its phrases: runs of terms written between double quotes.
 /// A document matches when it holds every term, and every phrase as consecutive tokens; an unclosed quote runs to the end.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Query { terms: Vec<String>, phrases: Vec<Vec<String>> }
 
 impl Query {
@@ -109,6 +123,16 @@ mod tests {
     fn tokens_split_on_non_alphanumerics_and_lowercase() {
         assert_eq!(tokens("Invoice #42 is OVERDUE—since Ünter-Tag!"), ["invoice", "42", "is", "overdue", "since", "ünter", "tag"]);
         assert!(tokens(" ,;! ").is_empty());
+    }
+
+    #[test]
+    fn a_word_longer_than_an_index_token_is_split_into_tokens_the_index_holds() {
+        let word = "é".repeat(MAX_TOKEN_BYTES);
+        let found = tokens(&format!("short {word} tail"));
+        assert_eq!(found.len(), 4);
+        assert!(found.iter().all(|token| token.len() <= MAX_TOKEN_BYTES && !token.is_empty()));
+        assert_eq!(found[1..3].concat(), word);
+        assert!(Query::parse(&word).matches(&found), "the word still matches itself");
     }
 
     #[test]

@@ -105,11 +105,11 @@ pub struct ArtefactDriver {
     strays: StraySweep,
 }
 
-/// Where the lane looks for its kind's stray objects, the definitions in force per table when it last looked (`None` until its first look, which covers every table), and the tables whose last sweep failed.
+/// Where the lane looks for its kind's stray objects, the definitions in force per table when it last looked (`None` until its first look, which covers every table), and the tables to look at again: their last sweep, or a job of theirs, failed.
 struct StraySweep { kind: String, store: Arc<dyn ObjectStore>, swept: Option<BTreeMap<TableRef, BTreeSet<(String, i64)>>>, failed: BTreeSet<TableRef> }
 
 impl StraySweep {
-    /// Deletes the stray objects of every table whose definitions changed since the last sweep or whose last sweep failed, or of every table on the first.
+    /// Deletes the stray objects of every table whose definitions changed since the last sweep or that is to be looked at again, or of every table on the first.
     async fn sweep(&mut self, snapshot: &PartitionValue, definitions: &[ArtefactDefinition]) {
         let mut current: BTreeMap<TableRef, BTreeSet<(String, i64)>> = BTreeMap::new();
         for definition in definitions { current.entry(definition.table.clone()).or_default().insert((definition.id.clone(), definition.version)); }
@@ -157,11 +157,12 @@ impl ArtefactDriver {
         self.observer.failed(&CompactionFailure::new(&job.definition.table, &job.trie, error));
     }
 
-    async fn available(&mut self, cancellation: &CancellationToken) -> Result<Vec<ArtefactJob>> {
+    /// Strays are swept only while no job runs, since a running job may be uploading an object its definition no longer wants.
+    async fn available(&mut self, cancellation: &CancellationToken, idle: bool) -> Result<Vec<ArtefactJob>> {
         let snapshot = self.snapshots.snapshot();
         let mut jobs = self.builder.repairs(&snapshot, cancellation).await?;
         let definitions = self.builder.definitions(&snapshot, cancellation).await?;
-        self.strays.sweep(&snapshot, &definitions).await;
+        if idle { self.strays.sweep(&snapshot, &definitions).await; }
         jobs.extend(available_artefact_jobs(snapshot.trie_catalog(), &definitions));
         Ok(jobs)
     }
@@ -177,7 +178,7 @@ impl ArtefactDriver {
         let outcome = loop {
             if cancellation.is_cancelled() { break Ok(()); }
             let jobs = if self.automatic || !pending.is_empty() {
-                match self.available(&cancellation).await {
+                match self.available(&cancellation, running.is_empty()).await {
                     Ok(jobs) => jobs,
                     Err(error) => {
                         for request in pending.drain(..) { let _ = request.send(Err(error.clone())); }
@@ -216,7 +217,8 @@ impl ArtefactDriver {
                 _ = cancellation.cancelled() => break Ok(()),
                 Some((job, result)) = running.next(), if !running.is_empty() => {
                     active.remove(&job);
-                    if let Err(error) = result { self.report_failure(&job, &error); failed.insert(job, error); }
+                    // A job that failed after uploading leaves an object only a sweep of its table can find.
+                    if let Err(error) = result { self.report_failure(&job, &error); self.strays.failed.insert(job.definition.table.clone()); failed.insert(job, error); }
                 }
                 Some(request) = self.requests.recv() => pending.push(request),
                 // A new block may have healed whatever failed, so failed jobs become eligible again.
