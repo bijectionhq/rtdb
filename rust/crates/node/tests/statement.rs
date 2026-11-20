@@ -1003,3 +1003,21 @@ async fn a_join_and_aggregate_over_integer_keys_of_several_widths_and_null_keys_
         assert!((actual - sum).abs() < 1e-9, "{region}: {actual} against {sum}");
     }
 }
+
+#[tokio::test]
+async fn an_inner_join_whose_left_input_exceeds_the_build_limit_builds_its_right_input_and_keeps_its_columns() {
+    let memory = MemoryBudget::new(1 << 28);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(1), system_time: Timestamp(1) }, Arc::clone(&memory)).unwrap();
+    for id in 0..30i64 { buffer.put(TableRef::new("public", "customers"), StructFields::from([("_id".into(), Value::I64(id)), ("name".into(), Value::Utf8(format!("c{id}")))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap(); }
+    for id in 0..300i64 { buffer.put(TableRef::new("public", "orders"), StructFields::from([("_id".into(), Value::I64(1000 + id)), ("customer_id".into(), Value::I64(id % 40))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap(); }
+    state.apply(&buffer.stage().unwrap()).unwrap();
+    let base = context(Some(&state), &memory);
+    let context = QueryContext::new(base.catalog.clone(), Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions { join_build_rows: 50, ..Default::default() }, &CancellationToken::new()).unwrap();
+    let statement = PreparedSql::prepare("SELECT c.name, COUNT(*), SUM(o._id) FROM orders o JOIN customers c ON o.customer_id = c._id GROUP BY c.name ORDER BY c.name", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let rows = rows_of(statement.open_query(Arc::clone(&context), vec![]).await.unwrap()).await;
+    let mut expected: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for id in (0..300i64).filter(|id| id % 40 < 30) { let entry = expected.entry(format!("c{}", id % 40)).or_default(); entry.0 += 1; entry.1 += 1000 + id; }
+    let expected = expected.into_iter().map(|(name, (count, sum))| vec![Value::Utf8(name), Value::I64(count), Value::I64(sum)]).collect::<Vec<_>>();
+    assert_eq!(rows, expected);
+}

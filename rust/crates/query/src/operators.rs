@@ -72,13 +72,23 @@ pub(crate) fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution,
         RelationNode::Join { left,right,kind: rtdb_plan::JoinKind::Inner,condition: Some(condition) } if execution.analysis.is_none() && execution.context.tracer.is_none() => {
             let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?)?,batch_shape(&runtime.child(1)?)?) else { return Ok(None) };
             if build_projected != probe_projected || !crate::join::build_left(left,right,rtdb_plan::JoinKind::Inner,&execution)? { return Ok(None); }
-            let mut layout = crate::join_key::JoinLayout::new(left,right,Some(condition),&execution.context.memory)?;
-            layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
+            // The left input is built unless it would spill and the right one fits, in which case the right one is built
+            // and the output keeps its left-then-right columns: a spilled build orders its output differently anyway.
+            let threshold = execution.context.options.join_build_rows;
+            let swapped = crate::join::rows_at_most(left,&execution)? > threshold && crate::join::rows_at_most(right,&execution)? <= threshold;
+            let (build_side,probe_side,build_relation,probe_relation) = if swapped { (1,0,right,left) } else { (0,1,left,right) };
+            let mut layout = crate::join_key::JoinLayout::new(build_relation,probe_relation,Some(condition),&execution.context.memory)?;
+            layout.resolve_types(runtime.child(build_side)?.schema(),runtime.child(probe_side)?.schema(),&execution)?;
             let Some(order) = crate::batch_join::key_order(&layout) else { return Ok(None) };
-            let Some((build,projected)) = build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await? else { return Ok(None) };
+            let Some((build,projected)) = build_batches(runtime.child(build_side)?,execution.child(build_side),pushdowns.clone()).await? else { return Ok(None) };
             if projected != build_projected { return Ok(None); }
-            let probe = crate::batch_join::ProbeInput { runtime: runtime.child(1)?,execution: execution.child(1),pushdowns };
-            Ok(Some((Box::new(crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution)) as crate::columnar::BoxBatchCursor,projected)))
+            let probe = crate::batch_join::ProbeInput { runtime: runtime.child(probe_side)?,execution: execution.child(probe_side),pushdowns };
+            let unswapped = if swapped {
+                let mut layout = crate::join_key::JoinLayout::new(left,right,Some(condition),&execution.context.memory)?;
+                layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
+                Some(layout)
+            } else { None };
+            Ok(Some((Box::new(crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution).swapped(unswapped)) as crate::columnar::BoxBatchCursor,projected)))
         }
         _ => Ok(None),
     }

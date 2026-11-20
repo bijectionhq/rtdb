@@ -47,14 +47,21 @@ struct Table { batches: Vec<ColumnBatch>, starts: Vec<usize>, keys: Vec<Value>, 
 pub(crate) struct BatchJoin { state: State, spec: Spec }
 
 /// What the join compares and how it reads cells, fixed for its lifetime.
-struct Spec { order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, projected: bool, execution: Execution }
+/// `unswapped` is the join's own layout where the join builds its right input, which a spill hands to the row join.
+struct Spec { order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, projected: bool, swapped: bool, unswapped: Option<JoinLayout>, execution: Execution }
 
 impl BatchJoin {
     pub fn new(build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout, order: Vec<bool>, projected: bool, execution: Execution) -> Self {
         let build_keys = layout.left.key_positions().to_vec();
         let probe_keys = layout.right.key_positions().to_vec();
-        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, projected, execution } }
+        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, projected, swapped: false, unswapped: None, execution } }
     }
+}
+
+impl BatchJoin {
+    /// With the join's own layout, builds its right input and emits each match's left columns first, as the join's
+    /// schema orders them.
+    pub fn swapped(mut self, unswapped: Option<JoinLayout>) -> Self { self.spec.swapped = unswapped.is_some(); self.spec.unswapped = unswapped; self }
 }
 
 impl Spec {
@@ -113,14 +120,15 @@ impl Spec {
     }
 
     /// Hands the input read so far, and the rest, to the row join, which spills a build side this large.
-    fn spill(&self, held: Vec<ColumnBatch>, rest: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
+    fn spill(&mut self, held: Vec<ColumnBatch>, rest: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
         let memory = &self.execution.context.memory;
         let pages = held.iter().map(|batch| batch.rows_admitting(memory, self.projected)).collect::<Result<VecDeque<_>>>()?;
         drop(held);
         let rest: BoxPageCursor = Box::new(crate::columnar::BatchRows::new(rest, Arc::clone(memory)).admitting_dates(self.projected));
         let build: BoxPageCursor = Box::new(HeldThen { pages, rest });
         let probe = DeferredInput::new(probe.runtime, probe.execution, crate::inspection::Constraints::default(), probe.pushdowns);
-        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, probe, layout, true, rtdb_plan::JoinKind::Inner, self.execution.clone())?)))
+        let (layout, build_left) = match self.unswapped.take() { Some(unswapped) => (unswapped, false), None => (layout, true) };
+        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, probe, layout, build_left, rtdb_plan::JoinKind::Inner, self.execution.clone())?)))
     }
 
     fn probe_batch(&self, table: &Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {
@@ -161,9 +169,10 @@ impl Spec {
         let mut reservation = self.execution.context.memory.reserve(256)?;
         let mut columns = Vec::with_capacity(table.batches.first().map_or(0, |batch| batch.columns.len()) + probe.columns.len());
         let build_width = table.batches.first().map_or(0, |batch| batch.columns.len());
-        for position in 0..build_width { columns.push(gathered(&table.batches, position, &pairs)?); }
         let indices = UInt32Array::from(probes);
-        for column in &probe.columns { columns.push(taken(column, &indices)?); }
+        if self.swapped { for column in &probe.columns { columns.push(taken(column, &indices)?); } }
+        for position in 0..build_width { columns.push(gathered(&table.batches, position, &pairs)?); }
+        if !self.swapped { for column in &probe.columns { columns.push(taken(column, &indices)?); } }
         for column in &columns {
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("join-size", "A join output charge is shared"))?;
             lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
