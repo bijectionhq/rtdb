@@ -150,6 +150,10 @@ impl Node {
         self.cancellation.run_until_cancelled(cancellation.run_until_cancelled(identity.revalidate(self.now()))).await.flatten().ok_or_else(cancelled)??;
         if cancellation.is_cancelled() { return Err(cancelled()); }
         self.ensure_open()?;
+        // A placed node may stop holding a session's database at any moment; the command is refused before anything runs, so the gateway may resend it to the new holder.
+        if matches!(self.factory.options.membership, Membership::Placed) && self.catalog.database(database).is_err() {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, NOT_HELD, format!("This node no longer holds {database}")).with_context("db-name", database.into()));
+        }
         identity.authorize_database(database, access)
     }
 
@@ -494,6 +498,9 @@ impl SessionService for NativeSessionService {
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), cancellation).await }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction(database, tx_id, self.identity.as_ref(), cancellation).await }
 }
+
+/// The code a placed node refuses a command with when it no longer holds the command's database.
+pub const NOT_HELD: &str = "rtdb.node/database-not-held";
 
 fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/node-closed", "Node is closed") }
 fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled") }
