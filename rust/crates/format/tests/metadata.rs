@@ -162,6 +162,21 @@ fn metadata_builder_rebases_nested_column_indices_across_data_pages() {
 }
 
 #[test]
+fn a_sliced_pages_temporal_bounds_are_those_of_its_own_rows() {
+    use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_format::metadata::MetadataBuilder;
+    use rtdb_types::{Iid, Interval};
+
+    let event = |n: i64| StoredEvent { iid: Iid([n as u8; 16]), system_from: Timestamp(10 * n), valid_time: Interval::from_micros(n, 100 * n).unwrap(), operation: StoredOperation::Delete, recency: None };
+    let batch = build_event_batch(&[event(1), event(2), event(3), event(4)], None, None).unwrap().slice(1, 2);
+    let mut writer = MetadataBuilder::new(false, false);
+    writer.write_leaf(&batch).unwrap();
+    let temporal = writer.finish().unwrap().1.temporal_metadata.unwrap();
+    assert_eq!((temporal.min_valid_from, temporal.max_valid_from, temporal.min_valid_to, temporal.max_valid_to), (Some(2), Some(3), Some(200), Some(300)));
+    assert_eq!((temporal.min_system_from, temporal.max_system_from), (Some(20), Some(30)));
+}
+
+#[test]
 fn a_read_metadata_file_retains_its_stored_nodes_rather_than_their_decoded_statistics() {
     use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
     use rtdb_format::ipc::inspect_file_reserved;

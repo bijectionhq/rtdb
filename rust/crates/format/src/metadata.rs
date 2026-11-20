@@ -5,7 +5,7 @@ use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArr
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_types::{Anomaly, LogicalType, Result, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, Interval, LogicalType, Result, TimeUnit, Timestamp, Value};
 
 use crate::ipc::ArrowFile;
 
@@ -115,16 +115,21 @@ impl MetadataBuilder {
 
     pub fn write_leaf(&mut self, batch: &RecordBatch) -> Result<usize> {
         if batch.schema().index_of("_recency").is_ok() != self.recency_branches { return Err(invalid("Data recency column does not match metadata schema")); }
-        let events = crate::data::EventBatch::new(batch.clone())?;
+        crate::data::EventBatch::new(batch.clone())?;
+        let times = |name: &str| -> Result<&[i64]> {
+            let index = batch.schema().index_of(name).map_err(invalid)?;
+            batch.column(index).as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>().map(|array| array.values().as_ref()).ok_or_else(|| invalid("Event timestamp array type changed"))
+        };
+        let (valid_from, valid_to, system_from) = (times("_valid_from")?, times("_valid_to")?, times("_system_from")?);
         let mut temporal = self.temporal.clone();
-        for row in 0..events.len() {
-            let event = events.header(row)?;
-            temporal.min_valid_from = Some(temporal.min_valid_from.unwrap_or(i64::MAX).min(event.valid_time.lower().0));
-            temporal.max_valid_from = Some(temporal.max_valid_from.unwrap_or(i64::MIN).max(event.valid_time.lower().0));
-            temporal.min_valid_to = Some(temporal.min_valid_to.unwrap_or(i64::MAX).min(event.valid_time.upper().0));
-            temporal.max_valid_to = Some(temporal.max_valid_to.unwrap_or(i64::MIN).max(event.valid_time.upper().0));
-            temporal.min_system_from = Some(temporal.min_system_from.unwrap_or(i64::MAX).min(event.system_from.0));
-            temporal.max_system_from = Some(temporal.max_system_from.unwrap_or(i64::MIN).max(event.system_from.0));
+        for ((lower, upper), system) in valid_from.iter().zip(valid_to).zip(system_from) {
+            Interval::new(Timestamp(*lower), Timestamp(*upper))?;
+            temporal.min_valid_from = Some(temporal.min_valid_from.unwrap_or(i64::MAX).min(*lower));
+            temporal.max_valid_from = Some(temporal.max_valid_from.unwrap_or(i64::MIN).max(*lower));
+            temporal.min_valid_to = Some(temporal.min_valid_to.unwrap_or(i64::MAX).min(*upper));
+            temporal.max_valid_to = Some(temporal.max_valid_to.unwrap_or(i64::MIN).max(*upper));
+            temporal.min_system_from = Some(temporal.min_system_from.unwrap_or(i64::MAX).min(*system));
+            temporal.max_system_from = Some(temporal.max_system_from.unwrap_or(i64::MIN).max(*system));
         }
         let mut columns = columns_for_event_page(batch, self.calculate_blooms)?;
         let base = i32::try_from(self.column_count).map_err(invalid)?;

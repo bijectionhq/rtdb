@@ -52,11 +52,17 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     let mut statistics = Statistics::default();
     let with_bloom = calculate_blooms || (root && field.name() == "_iid");
     fold(field, array, mask, with_bloom, calculate_blooms, output, &mut statistics, depth)?;
-    let mut count = 0i64;
     let reader = rtdb_columnar::ColumnReader::new(field)?;
-    for row in 0..array.len() {
-        if mask.includes(row) && !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) { count += 1; }
-    }
+    let count = match present_cells(field, array, mask) {
+        Some(count) => i64::try_from(count).map_err(invalid)?,
+        None => {
+            let mut count = 0i64;
+            for row in 0..array.len() {
+                if mask.includes(row) && !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) { count += 1; }
+            }
+            count
+        }
+    };
     statistics.fields.insert("col-name".into(), Value::Utf8(field.name().clone()));
     statistics.fields.insert("root-col?".into(), Value::Bool(root));
     statistics.fields.insert("count".into(), Value::I64(count));
@@ -177,6 +183,17 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         if value.is_nan() || bounds.1.is_nan() { bounds.1 = f64::NAN; } else { bounds.1 = bounds.1.max(value); }
     }
     Ok(())
+}
+
+/// How many of a flat array's selected cells read as neither null nor undefined, counted from its validity.
+fn present_cells(field: &Field, array: &dyn Array, mask: &Mask) -> Option<usize> {
+    let data_type = array.data_type();
+    let flat = data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_));
+    if !flat || field.data_type() != data_type || !field.metadata().is_empty() { return None; }
+    Some(match mask {
+        Mask::All => array.len() - array.null_count(),
+        Mask::Selected(rows) => (0..array.len()).filter(|row| rows[*row] && array.is_valid(*row)).count(),
+    })
 }
 
 /// A plain signed integer, float or temporal array's cells as `numeric_value` takes them of each cell's value, read in place.
