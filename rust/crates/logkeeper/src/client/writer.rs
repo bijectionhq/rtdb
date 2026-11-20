@@ -462,14 +462,9 @@ impl Writer {
 
     /// A live server with an append in flight is answered by the commit that follows once the pipeline reaches its tip, or by later appends; every other server is sent a check.
     fn start_round(self: &Arc<Self>, pipeline: &mut Pipeline, round: Arc<Round>) {
-        let tip = pipeline.next_lsn - 1;
-        let busy = pipeline.commit < tip;
+        // Every server is asked directly: a reply to an append in flight could otherwise be the round's only answer from a server that then fails, leaving the round unsettled.
         pipeline.confirming = Some(Confirming { round: Arc::clone(&round), marks: vec![Mark::Pending; pipeline.replicas.len()], next: None });
-        for server in 0..pipeline.replicas.len() {
-            let replica = &pipeline.replicas[server];
-            let answered_by_pipeline = busy && matches!(replica.link, Link::Live) && replica.acked < tip;
-            if !answered_by_pipeline { self.send_check(server, &round); }
-        }
+        for server in 0..pipeline.replicas.len() { self.send_check(server, &round); }
     }
 
     /// Records one server's answer to `round` if it is still the round in flight, and ends the round once its outcome is settled.

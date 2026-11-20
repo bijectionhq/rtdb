@@ -69,7 +69,7 @@ pub(crate) fn connection(address: &str) -> Arc<Connection> {
 impl Connection {
     pub fn address(&self) -> &str { &self.address }
 
-    /// The callback runs on the connection's own task, or on the caller's when the session has already failed.
+    /// The callback runs on the connection's own task, or on a task of its own when the session has already failed, never on the caller's: callers send while holding locks their callbacks take.
     pub fn send(&self, body: RequestBody, callback: Callback) {
         let (outbox, waiters) = {
             let mut session = self.session.lock();
@@ -84,10 +84,15 @@ impl Connection {
             Waiting::Open(waiting) => { waiting.insert(id, callback); None }
             Waiting::Failed(reason) => Some((callback, reason.clone())),
         };
-        if let Some((callback, reason)) = refused { return callback(Err(remote(&self.address, reason))); }
+        if let Some((callback, reason)) = refused {
+            let error = remote(&self.address, reason);
+            tokio::spawn(async move { callback(Err(error)) });
+            return;
+        }
         if outbox.send(Request { id, body: Some(body) }).is_err()
             && let Some(callback) = waiters.take(id) {
-            callback(Err(remote(&self.address, "the connection closed")));
+            let error = remote(&self.address, "the connection closed");
+            tokio::spawn(async move { callback(Err(error)) });
         }
     }
 

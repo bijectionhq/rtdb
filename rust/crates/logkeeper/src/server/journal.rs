@@ -233,7 +233,7 @@ impl Journal {
     pub fn release_compaction(&self) { self.compaction_queued.store(false, Ordering::Release); }
 
     /// Writes one round: every work in order, then one sync of the segment.
-    /// A round of commit records alone is not synced: a commit lsn is a hint to readers that the next writer re-establishes, and the entries it covers were synced by earlier rounds.
+    /// Commit records are synced like any other: a sealed loglet's commit lsn is written once, by the move that ends it, and no later writer re-establishes it.
     fn write_round(&self, works: &[Work]) -> Result<()> {
         let mut current = self.current.lock();
         let mut buffer = BytesMut::new();
@@ -247,7 +247,7 @@ impl Journal {
                         sync = true;
                     }
                     for event in events { frame(slot.id, record(event), &mut buffer); }
-                    sync |= events.iter().any(|event| !matches!(event, Event::Commit(_)));
+                    sync = true;
                 }
                 Write::Compact(captured) => {
                     self.append(&mut current, &buffer, sync)?;
