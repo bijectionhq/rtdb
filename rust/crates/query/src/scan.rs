@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_format::{ipc::{ArrowFile, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
-use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, RowSource, Snapshot, TrieState};
+use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
@@ -36,25 +36,7 @@ impl FileDescriptors {
     }
 }
 
-enum PageSource { Live { table: Arc<LiveTable>, rows: Arc<LiveRows> }, File { file: usize, page: usize } }
-
-/// A live leaf's rows in iid order, each located in its table's chunks with its header copied out, so that the merge reads them in order.
-struct LiveRows { located: Vec<(u32, u32)>, headers: Vec<EventHeader>, _reservation: Arc<MemoryReservation> }
-impl LiveRows {
-    fn locate(table: &LiveTable, rows: &[u32], memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let bytes = rows.len().checked_mul(std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<EventHeader>()).and_then(|bytes| bytes.checked_add(256))
-            .ok_or_else(|| invalid("page-size", "Live page rows exceed addressable memory"))?;
-        let _reservation = memory.reserve(bytes)?;
-        let mut located = Vec::with_capacity(rows.len());
-        let mut headers = Vec::with_capacity(rows.len());
-        for row in rows {
-            let at = table.locate(*row)?;
-            headers.push(table.header_at(at)?);
-            located.push(at);
-        }
-        Ok(Self { located, headers, _reservation })
-    }
-}
+enum PageSource { Live { table: Arc<LiveTable>, rows: Arc<LocatedRows> }, File { file: usize, page: usize } }
 struct Page { lower: Iid, upper: Iid, priority: usize, source: PageSource, summary: PageSummary, content_matches: bool }
 
 #[derive(Default)]
@@ -116,7 +98,7 @@ fn summary_bytes(count: usize) -> Result<usize> {
 }
 
 /// A loaded page's rows.
-enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<LiveRows> }, File(Arc<IndexBatch>) }
+enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<LocatedRows> }, File(Arc<IndexBatch>) }
 struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation>, _charge: Option<Arc<MemoryReservation>> }
 impl ActiveRows {
     fn len(&self) -> usize { match self { Self::Live { rows, .. } => rows.located.len(), Self::File(batch) => batch.len() } }
@@ -298,7 +280,7 @@ impl PartitionScan {
             segment.trie().try_visit_leaves(|leaf| {
                 let (lower, upper) = path_range(leaf.path().as_slice())?;
                 if !self.path_matches(lower, upper) { return Ok(()); }
-                let rows = Arc::new(LiveRows::locate(segment, &leaf.sorted_rows(segment.as_ref())?, &self.execution.context.memory)?);
+                let rows = segment.located_rows(leaf)?;
                 let temporal = summarize_headers(rows.headers.iter().copied());
                 pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true,
                     summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)
@@ -850,17 +832,9 @@ mod tests {
         (scan, execution, memory)
     }
 
-    /// What a scan of `table` charges for its live leaves' located rows.
-    fn live_rows_extent(snapshot: &Snapshot, table: &TableRef) -> usize {
-        snapshot.segments(table).iter().flat_map(|segment| segment.trie().leaves().into_iter()
-            .map(|leaf| leaf.sorted_rows(segment.as_ref()).unwrap().len() * (std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<EventHeader>()) + 256)
-            .collect::<Vec<_>>()).sum()
-    }
-
     async fn assert_descriptor_lifetime(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>, persisted: Option<(usize, usize)>) {
         let (metadata_size, metadata_charge) = persisted.unwrap_or_default();
         let files_used = usize::from(persisted.is_some());
-        let live_rows = live_rows_extent(&snapshot, &table);
         let storage = Arc::new(BufferPool::new(store, 1 << 20));
         let (scan, execution, memory) = descriptor_scan(snapshot, table, Arc::clone(&storage));
         let before_cursor = memory.used_bytes();
@@ -953,9 +927,9 @@ mod tests {
         }
         let old_extent = 2 * std::mem::size_of::<Page>() + 256;
         let replacement_extent = 4 * std::mem::size_of::<Page>() + 256;
-        let headroom = candidate_extent + selected_extent + metadata_charge + file_extent + stack_extent + live_rows + old_extent + replacement_extent - 1;
+        let headroom = candidate_extent + selected_extent + metadata_charge + file_extent + stack_extent + old_extent + replacement_extent - 1;
         let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
-        let retained_at_growth = cursor_open + pressure.bytes() + candidate_extent + selected_extent + metadata_charge + file_extent + stack_extent + live_rows + old_extent;
+        let retained_at_growth = cursor_open + pressure.bytes() + candidate_extent + selected_extent + metadata_charge + file_extent + stack_extent + old_extent;
         let error = cursor.next_page().await.err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let expected = format!("Cannot reserve {replacement_extent} bytes from budget {} with {retained_at_growth} retained", memory.limit_bytes());
@@ -1165,7 +1139,6 @@ mod tests {
         assert_eq!(mixed.segments(&table).len(), 1);
         assert_eq!(mixed.segments(&table)[0].trie().leaves().len(), 1);
         let storage = Arc::new(BufferPool::new(store, 1 << 20));
-        let live_rows = live_rows_extent(&mixed, &table);
         let (scan, execution, memory) = descriptor_scan(mixed, table, Arc::clone(&storage));
         let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
         let baseline = memory.used_bytes();
@@ -1173,9 +1146,9 @@ mod tests {
         let old_summary = std::mem::size_of::<PageSummary>() + 256;
         let new_summary = 2 * std::mem::size_of::<PageSummary>() + 256;
         let live_page = std::mem::size_of::<Page>() + 256;
-        let headroom = candidate + old_summary + live_rows + live_page + new_summary - 1;
+        let headroom = candidate + old_summary + live_page + new_summary - 1;
         let pressure = memory.reserve(memory.limit_bytes() - baseline - headroom).unwrap();
-        let retained = baseline + pressure.bytes() + candidate + old_summary + live_rows + live_page;
+        let retained = baseline + pressure.bytes() + candidate + old_summary + live_page;
         let error = cursor.next_page().await.err().unwrap();
         let expected = format!("Cannot reserve {new_summary} bytes from budget {} with {retained} retained", memory.limit_bytes());
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");

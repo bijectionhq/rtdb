@@ -157,11 +157,22 @@ pub struct LiveTable {
     trie: MemoryHashTrie,
     last_system_time: Option<Timestamp>,
     canonical_entity_iids: bool,
+    located: LocatedLeaves,
 }
+
+/// A trie leaf's rows in iid order, each located in its table's chunks with its header copied out.
+#[derive(Debug)]
+pub struct LocatedRows { pub located: Vec<(u32, u32)>, pub headers: Vec<EventHeader>, _reservation: Option<Arc<MemoryReservation>> }
+
+/// The leaves a snapshot's scans have located, keyed by the leaf's address in the snapshot's own trie.
+/// A row's location depends on the chunk layout, which every append can change, so a cloned table starts empty.
+#[derive(Debug, Default)]
+struct LocatedLeaves(std::sync::Mutex<std::collections::HashMap<usize, Arc<LocatedRows>>>);
+impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
@@ -175,6 +186,24 @@ impl LiveTable {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
         let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
         Ok((index as u32, row - self.chunks[index].0))
+    }
+    /// `leaf`'s rows located and their headers copied, once per snapshot; `leaf` is one of this table's trie leaves.
+    pub fn located_rows(&self, leaf: &rtdb_trie::Leaf) -> Result<Arc<LocatedRows>> {
+        let key = leaf as *const rtdb_trie::Leaf as usize;
+        if let Some(rows) = self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.get(&key) { return Ok(Arc::clone(rows)); }
+        let rows = leaf.sorted_rows(self)?;
+        let bytes = rows.len().checked_mul(std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<EventHeader>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| invalid("Located leaf rows exceed addressable memory"))?;
+        let _reservation = self.chunks.first().map(|(_, batch)| batch.owned.reservation().budget().reserve(bytes)).transpose()?;
+        let mut located = Vec::with_capacity(rows.len());
+        let mut headers = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let at = self.locate(*row)?;
+            headers.push(self.header_at(at)?);
+            located.push(at);
+        }
+        let rows = Arc::new(LocatedRows { located, headers, _reservation });
+        Ok(Arc::clone(self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.entry(key).or_insert(rows)))
     }
     /// The header of a row `locate` found.
     pub fn header_at(&self, (chunk, offset): (u32, u32)) -> Result<EventHeader> {
@@ -659,5 +688,29 @@ mod chunk_tests {
         for id in [0u32, 1, 1023, 1024, 1999] {
             assert_eq!(live.row(id).unwrap().header().unwrap().system_from, Timestamp(i64::from(id)));
         }
+    }
+
+    fn put(id: i64, memory: &Arc<MemoryBudget>) -> TableWrite {
+        let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])), recency: None };
+        TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), memory).unwrap()))
+    }
+
+    #[test]
+    fn a_snapshot_locates_a_leaf_once_and_a_later_append_relocates_it() {
+        let memory = MemoryBudget::new(1 << 26);
+        let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+        for id in 0..3 { live = live.append(&put(id, &memory), Timestamp(id)).unwrap(); }
+        let leaf = live.trie().leaves()[0];
+        let located = live.located_rows(leaf).unwrap();
+        assert!(Arc::ptr_eq(&located, &live.located_rows(leaf).unwrap()));
+        assert_eq!(located.headers.iter().map(|header| header.system_from).collect::<OrderedSet<_>>(), (0..3).map(Timestamp).collect());
+        let appended = live.append(&put(3, &memory), Timestamp(3)).unwrap();
+        let relocated = appended.located_rows(appended.trie().leaves()[0]).unwrap();
+        assert!(!Arc::ptr_eq(&located, &relocated));
+        assert_eq!(relocated.headers.len(), 4);
+        for (at, header) in relocated.located.iter().zip(&relocated.headers) { assert_eq!(appended.header_at(*at).unwrap(), *header); }
+        drop((located, relocated, live, appended));
+        assert_eq!(memory.used_bytes(), 0, "located rows are released with the table that holds them");
     }
 }
