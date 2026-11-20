@@ -105,6 +105,8 @@ pub struct Session {
     pending: Vec<Frame>,
     /// Whether any reply to the pending command has reached the client; once one has, the command is never resent.
     answered: bool,
+    /// Whether the pending command went to a backend lost before any reply reached the client, so that it may have run there.
+    lost_unanswered: bool,
     /// Discarding a refused command's replies through its ReadyForQuery, before resending it.
     discarding: bool,
     /// Whether the gateway keys the session's commands, so that one whose holder went away can be resent without running twice.
@@ -118,7 +120,7 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, std::time::Duration::from_millis(100));
-        Self { startup, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
     }
 
     /// Reconnects to the current holder, retrying through a failover: until the dead holder's lease expires, no other node may claim.
@@ -202,7 +204,7 @@ impl Session {
                         }
                         // A request sent while idle starts a new command: the previous command's frames are no longer pending, and must not shape a reconnection's replay.
                         let starts = self.status == Status::Idle;
-                        if starts { self.pending.clear(); self.answered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
+                        if starts { self.pending.clear(); self.answered = false; self.lost_unanswered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
                         if starts && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
                         if backend.is_none() { backend = Some(self.connect().await?); }
                         if starts { if let Some(key) = self.key.clone() { self.send_key(backend.as_mut().expect("connected"), &key).await?; } }
@@ -230,6 +232,10 @@ impl Session {
                             }
                             continue;
                         }
+                        // A refusal part way through a resent command says nothing of the attempt that was lost, which may have committed.
+                        if self.answered && self.lost_unanswered && frame.tag == b'E' && not_held(&frame) {
+                            break Err(lost("the holder went away during a command, and its successor refused the command part way: its outcome is unknown"));
+                        }
                         self.answered = true;
                         self.greeting.observe(&frame, &mut self.authenticated);
                         if frame.tag == b'Z' {
@@ -244,6 +250,7 @@ impl Session {
                         if self.status != Status::Idle {
                             // A keyed command none of whose replies reached the client is resent under its key: whatever of it committed is not run again.
                             if self.key.is_none() || self.answered { break Err(lost("the holder went away during a command, whose outcome is unknown")); }
+                            self.lost_unanswered = true;
                             self.swallowing = 0;
                             backend = Some(self.connect().await?);
                             self.resend(backend.as_mut().expect("connected")).await?;
@@ -455,6 +462,49 @@ mod tests {
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), receive(&mut client)).await.expect("the successor's answer reaches the client");
         assert_eq!(answer, (b'C', b"UPDATE 1\0".to_vec()), "rather than being discarded as the refused command's");
         drop(client);
+        let _ = running.await;
+    }
+
+    #[tokio::test]
+    async fn a_resent_command_refused_part_way_has_an_unknown_outcome_for_the_lost_attempt_may_have_committed() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway_side) = pair(&listener).await;
+        let (first, mut crashing) = pair(&listener).await;
+        let (second, mut successor) = pair(&listener).await;
+        let mut startup = 196608i32.to_be_bytes().to_vec();
+        startup.extend_from_slice(b"user\0xtdb\0database\0shop\0\0");
+        let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&startup);
+        let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
+        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        greet(&mut crashing).await;
+        receive(&mut client).await;
+        receive(&mut client).await;
+        let command = "BEGIN; UPDATE counters SET n = n + 1; COMMIT";
+        send(&mut client, b'Q', format!("{command}\0").as_bytes()).await;
+        query(&mut crashing).await;
+        send(&mut crashing, b'C', b"SET\0").await;
+        send(&mut crashing, b'Z', b"I").await;
+        assert_eq!(query(&mut crashing).await, command);
+        // It commits, and its replies are lost with it.
+        drop(crashing);
+
+        greet(&mut successor).await;
+        query(&mut successor).await;
+        send(&mut successor, b'C', b"SET\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(query(&mut successor).await, command);
+        send(&mut successor, b'C', b"BEGIN\0").await;
+        send(&mut successor, b'C', b"UPDATE 1\0").await;
+        send(&mut successor, b'E', format!("SERROR\0C57P03\0M{}\0\0", rtdb_node::NOT_HELD).as_bytes()).await;
+        send(&mut successor, b'Z', b"E").await;
+        assert_eq!(receive(&mut client).await.1, b"BEGIN\0");
+        assert_eq!(receive(&mut client).await.1, b"UPDATE 1\0");
+        let (tag, body) = receive(&mut client).await;
+        assert_eq!(tag, b'E');
+        assert!(String::from_utf8_lossy(&body).contains("outcome is unknown"), "the client is not told the command failed: {}", String::from_utf8_lossy(&body));
         let _ = running.await;
     }
 
