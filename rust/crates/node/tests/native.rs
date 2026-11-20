@@ -1722,3 +1722,25 @@ async fn a_session_on_a_placed_node_sees_its_own_database_and_no_other() {
     drop((shop, blog));
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn concurrent_transactions_with_one_idempotency_key_commit_once_and_both_report_it() {
+    let (node, driver) = running(options(), services()).await;
+    let metadata = || {
+        let mut options = AutonomousTxOptions::default();
+        options.user_metadata = Some(rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([("idempotency_key".into(), Value::Utf8("charge-7".into()))])), node.memory()).unwrap());
+        options
+    };
+    let mut first = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut second = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let (a, b) = tokio::join!(
+        first.state_mut().execute_tx(vec![put(&node, 1, 10)], metadata()),
+        second.state_mut().execute_tx(vec![put(&node, 2, 20)], metadata()),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(a.committed() && b.committed(), "both callers are told the keyed transaction committed");
+    assert_eq!(a.tx_key(), b.tx_key(), "and both are told it is the same transaction");
+    assert_eq!(rows(first.query_sql("SELECT COUNT(*) FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(1)]], "only one of them ran");
+    drop((first, second));
+    stop(&node, driver).await;
+}

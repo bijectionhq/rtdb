@@ -56,6 +56,8 @@ pub struct Node {
     cancellation: CancellationToken,
     pub(crate) runtime: Arc<crate::runtime::RuntimeProviders>,
     read_fence: Option<Arc<dyn ReadFence>>,
+    /// The idempotency keys of transactions this node submitted and has not yet seen resolved, so an abort by a duplicate key can be answered with the original's outcome.
+    keyed: Arc<parking_lot::Mutex<BTreeMap<TxId, String>>>,
 }
 
 pub struct NodeDriver {
@@ -115,7 +117,7 @@ impl Node {
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
             external_sources: services.external_sources, compaction_relay: services.compaction_relay, clock: services.clock, options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
-        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence };
+        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, keyed: Arc::default() };
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
@@ -264,8 +266,21 @@ impl Node {
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
     }
 
-    async fn submit(&self, database: &str, operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+    async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
+        let key = idempotency_key(&options);
+        if let Some(key) = &key {
+            // A transaction carrying a key that already committed is not run again: its submission is the original's.
+            if let Some(original) = self.keyed_transaction(database, key, identity, cancellation).await? { return Ok(SubmittedTx { tx_id: original }); }
+            let literal = quoted(key);
+            let put = |id: &str| -> Result<TxOp> {
+                let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([("_id".to_owned(), Value::Utf8(id.to_owned()))])], &self.factory.memory)?;
+                Ok(TxOp::PutDocs { table: rtdb_types::TableRef::new("public", IDEMPOTENCY_TABLE), documents, valid_from: None, valid_to: None })
+            };
+            // The sentinel makes the keys table exist within the transaction, so the assertion can read it on the very first keyed transaction.
+            operations.splice(0..0, [put(IDEMPOTENCY_SENTINEL)?, TxOp::Sql { sql: format!("ASSERT NOT EXISTS (SELECT 1 FROM {IDEMPOTENCY_TABLE} WHERE _id = {literal})"), args: None }]);
+            operations.push(put(key)?);
+        }
         let database = self.catalog.database(database)?;
         database.require_writable()?;
         if database.external_source() { return Err(Anomaly::incorrect("xtdb/submit-tx-to-external-source-db", "Cannot submit transactions to an external-source database").with_context("db-name", database.name().into())); }
@@ -275,13 +290,62 @@ impl Node {
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
         let payload = source.encode()?.into_bytes();
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
+        if let Some(key) = key {
+            let mut keyed = self.keyed.lock();
+            keyed.insert(TxId(position.0), key);
+            while keyed.len() > KEYED_RETAINED { keyed.pop_first(); }
+        }
         Ok(SubmittedTx { tx_id: TxId(position.0) })
+    }
+
+    /// The transaction that committed with `key`, if one has.
+    async fn keyed_transaction(&self, database: &str, key: &str, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Option<TxId>> {
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = &basis;
+        let rows = |sql: String| async move {
+            let context = self.query_context(database, basis, identity, cancellation).await?;
+            let options = rtdb_sql::PrepareOptions { default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
+            let mut cursor = match prepare_query(&sql, &context, &options) {
+                Ok(prepared) => prepared.execute(context, Vec::new()).await?,
+                // No keyed transaction has committed yet, so the table does not exist.
+                Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
+            let mut rows = Vec::new();
+            while let Some(batch) = cursor.next_batch().await? {
+                let batch = batch.batch();
+                for row in 0..batch.num_rows() {
+                    rows.push((0..batch.num_columns()).map(|column| read_value(batch.schema().field(column), batch.column(column).as_ref(), row)).collect::<Result<Vec<_>>>()?);
+                }
+            }
+            Ok::<_, Anomaly>(rows)
+        };
+        let recorded = match rows(format!("SELECT _system_from FROM {IDEMPOTENCY_TABLE} FOR ALL VALID_TIME WHERE _id = {}", quoted(key))).await {
+            Ok(recorded) => recorded,
+            Err(error) if error.code == "xtdb/table-not-found" => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(Value::Timestamp { value: committed_at, .. }) = recorded.first().and_then(|row| row.first()).cloned() else { return Ok(None) };
+        // Rare: only a retry pays for finding the original's id.
+        for row in rows("SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true".into()).await? {
+            if let [Value::I64(id), Value::Timestamp { value, .. }] = row.as_slice() { if *value == committed_at { return Ok(Some(TxId(*id))); } }
+        }
+        Ok(None)
     }
     pub async fn await_transaction(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         self.ensure_indexing()?;
         let db = self.catalog.database(database)?;
-        if let Some(result) = db.replication.await_tx(tx_id, cancellation).await? { return Ok(result.as_ref().clone()); }
+        if let Some(result) = db.replication.await_tx(tx_id, cancellation).await? {
+            let key = self.keyed.lock().remove(&tx_id);
+            // Aborted because another transaction with its key committed first: its outcome is the original's.
+            if let (TransactionResult::Aborted { .. }, Some(key)) = (result.as_ref(), key) {
+                if let Some(original) = self.keyed_transaction(database, &key, identity, cancellation).await?.filter(|original| *original != tx_id) {
+                    return Box::pin(self.await_transaction(database, original, identity, cancellation)).await;
+                }
+            }
+            return Ok(result.as_ref().clone());
+        }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context(database, &basis, identity, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
@@ -516,6 +580,19 @@ impl SessionService for NativeSessionService {
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), cancellation).await }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction(database, tx_id, self.identity.as_ref(), cancellation).await }
 }
+
+/// Where a transaction's idempotency key is recorded, keyed by the key, so a retry finds it with one point lookup.
+pub const IDEMPOTENCY_TABLE: &str = "rtdb_idempotency_keys";
+const KEYED_RETAINED: usize = 16_384;
+const IDEMPOTENCY_SENTINEL: &str = "~table";
+
+/// The `idempotency_key` a transaction's metadata carries, set with `BEGIN READ WRITE WITH (METADATA = {idempotency_key: '...'})`.
+fn idempotency_key(options: &SubmitOptions) -> Option<String> {
+    let Value::Struct(fields) = options.user_metadata.as_ref()?.value() else { return None };
+    fields.iter().find(|(name, _)| name.as_str() == "idempotency_key").and_then(|(_, value)| match value { Value::Utf8(key) => Some(key.clone()), _ => None })
+}
+
+fn quoted(text: &str) -> String { format!("'{}'", text.replace('\'', "''")) }
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.
 pub const NOT_HELD: &str = "rtdb.node/database-not-held";

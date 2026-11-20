@@ -493,3 +493,25 @@ async fn a_command_that_parses_a_statement_is_resent_whole_after_a_move() {
     drop(client);
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transaction_retried_with_its_idempotency_key_commits_once() {
+    let mut cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let keyed = |key: &str, id: i64| format!("BEGIN READ WRITE WITH (METADATA = {{idempotency_key: '{key}'}}); INSERT INTO orders (_id, total) VALUES ({id}, 1); COMMIT");
+    let client = cell.connect("shop").await;
+    client.batch_execute(&keyed("order-1", 1)).await.unwrap();
+    client.batch_execute(&keyed("order-1", 2)).await.expect("a retry with a committed key succeeds");
+    assert_eq!(values(&client, "SELECT _id FROM orders").await, ["1"], "and does not run again");
+    drop(client);
+
+    let holder = cell.holder("shop").await.unwrap();
+    cell.nodes[holder].take().unwrap().kill().await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.batch_execute(&keyed("order-1", 3)).await.expect("the key survives a change of holder");
+    client.batch_execute(&keyed("order-2", 4)).await.unwrap();
+    assert_eq!(values(&client, "SELECT _id FROM orders").await, ["1", "4"]);
+    drop(client);
+    cell.add_node().await;
+    cell.stop().await;
+}
