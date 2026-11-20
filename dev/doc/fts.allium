@@ -190,6 +190,7 @@ rule RepairUnreadableSearchFile {
 --      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
 --      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
+--      A document is cut by the events of its entity in the partition's other selected tries and live segments, as CutByLaterEvents says, and contributes only if a rectangle it keeps meets the bounds.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
 --   6. MATCH is evaluated on each resolved row, as MatchEvaluatedByTheScan says.
 --
@@ -208,14 +209,28 @@ rule RepairUnreadableSearchFile {
 --   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
 --      Events in live segments are scored from their rows.
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
---   2. IIDs are verified best bound first, in batches, by running the scan itself over the partition restricted to them, with its own predicates.
---   3. Verification stops once n verified rows score strictly above every bound not yet verified, every unscored window's included.
+--   2. IIDs are taken best bound first, in batches.
+--      A document left exactly visible by CutByLaterEvents is a row of the scan's output with its score, so where MATCH is all the scan filters by it counts as verified.
+--      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
+--   3. Verification stops once n verified rows score strictly above every bound not yet taken, every unscored window's included.
 --   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
 -- The scan is left to the unranked narrowing when the matching IIDs exceed max_candidates, or when verification runs past sixteen batches.
 -- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every source the query registered; with none, each term's inverse document frequency is 1.
+
+rule CutByLaterEvents {
+    -- A document's rectangles come from its own file's events; an event of the same entity elsewhere in the partition, in a selected trie or live segment, cuts them.
+    -- A put or delete whose system-from is later than a rectangle's takes the event's valid interval from that system time on; an erase later than it takes the whole rectangle; an earlier event takes nothing.
+    -- An event at the same instant takes nothing: the scan orders such events itself, so the document stays a candidate and is no longer exact.
+    -- The tries cut by are those step 1 keeps, each found for the entity by its IID path and its file's key table, and the live segments by their kept keys; a trie step 1 leaves out holds no cut the query can see.
+    -- A document is exactly visible where a rectangle it keeps meets the bounds and no tie touched it.
+    when: ScanWithMatch(scan, predicate)
+
+    ensures:
+        EachCandidateCutByItsEntitysLaterEvents(scan)
+}
 
 rule MatchIsAResidualPredicate {
     when: ScanWithMatch(scan, predicate)
@@ -328,6 +343,7 @@ surface FullTextSearch {
 --   search_record(job)                  — the artefact record of a built search file: kind `search`, the definition's artefact id and version
 --   search_candidates(scan, predicate)  — steps 1–4 of the query plan
 --   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the trie's artefact key
+--   EachCandidateCutByItsEntitysLaterEvents(scan) — CutByLaterEvents' subtraction, before narrowing and ranking
 --   EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate) — MatchEvaluatedByTheScan's evaluation, in the scan, before its filter
 --   retired_records(table)               — the records RetireSearchFiles retires (maintenance/src/artefact.rs: retired_artefacts)
 --   RetiredSearchFilesDeleted(table)     — delete the retired records' objects, and list the table's artefact objects to delete the unrecorded ones RetireSearchFiles names (stray_artefacts)

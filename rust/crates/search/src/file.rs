@@ -463,7 +463,7 @@ impl Sidecar {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowDoc { Invisible, Null, Run(u32) }
 
-fn meets(rectangle: [i64; 4], bounds: TemporalBounds) -> bool {
+pub fn meets(rectangle: [i64; 4], bounds: TemporalBounds) -> bool {
     rectangle[0] < bounds.valid_time.upper().0 && bounds.valid_time.lower().0 < rectangle[1] && rectangle[2] < bounds.system_time.upper().0 && bounds.system_time.lower().0 < rectangle[3]
 }
 

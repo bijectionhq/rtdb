@@ -67,6 +67,25 @@ impl LivePostings {
 
 type LiveKey = (String, rtdb_types::TableRef, String, usize);
 
+/// Every event of a live segment by IID, with its row, valid for every segment that starts with the same batches.
+struct LiveKeys { batches: Vec<std::sync::Weak<rtdb_index::IndexBatch>>, rows: u32, events: std::collections::HashMap<[u8; 16], Vec<(u32, crate::file::KeyedEvent)>> }
+
+impl LiveKeys {
+    fn shared_prefix(&self, segment: &rtdb_index::LiveTable) -> usize {
+        self.batches.iter().zip(segment.batches()).take_while(|(cached, batch)| cached.upgrade().is_some_and(|cached| Arc::ptr_eq(&cached, batch))).count()
+    }
+    fn extend(&mut self, segment: &rtdb_index::LiveTable) -> Result<()> {
+        for row in self.rows..segment.row_count() {
+            let header = segment.row(row)?.header()?;
+            let event = crate::file::KeyedEvent { system_from: header.system_from.0, valid_from: header.valid_time.lower().0, valid_to: header.valid_time.upper().0, op: header.op };
+            self.events.entry(header.iid.0).or_default().push((row, event));
+        }
+        self.batches = segment.batches().map(Arc::downgrade).collect();
+        self.rows = segment.row_count();
+        Ok(())
+    }
+}
+
 /// Why a recorded search file could not be used; only a file that is gone or whose bytes are wrong is worth rebuilding.
 #[derive(Debug)]
 pub enum FileError { Missing, Corrupt(rtdb_types::Anomaly), Unavailable(rtdb_types::Anomaly) }
@@ -79,11 +98,12 @@ impl FileError {
 type OpenedFile = (std::sync::Weak<BufferPool>, Arc<SearchFile>);
 
 /// A trie's search file as a scan reads it: the data file it indexes, the identity its kept answers go by, and the file.
-pub struct TrieFile { pub data: rtdb_storage::ObjectKey, pub identity: String, pub file: Arc<SearchFile> }
+pub struct TrieFile { pub trie: rtdb_format::keys::TrieKey, pub data: rtdb_storage::ObjectKey, pub identity: String, pub file: Arc<SearchFile> }
 
 pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
+    live_keys: Mutex<Bounded<(String, rtdb_types::TableRef, usize), Arc<Mutex<LiveKeys>>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
     built: Mutex<Bounded<(String, String), OpenedFile>>,
     /// Builds in progress, which a second query for the same file awaits rather than repeats.
@@ -97,7 +117,7 @@ pub struct SearchRuntime {
 impl SearchRuntime {
     /// `file_bytes` bounds the recorded search files kept across queries, each keeping its buffer-pool lease so its bytes stay charged to the pool; half as much bounds the files a node builds itself, and 32 times as much the files mapped from this node's disk, of which only the pages a query reads are resident.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), live_keys: Mutex::new(Bounded::new(256)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -159,11 +179,11 @@ impl SearchRuntime {
 
     /// A search file built on this node from the data file of a trie the lane has not indexed; a data file is immutable, so a kept one is never stale.
     /// The build is charged to `memory` while it runs; the files kept are bounded apart from the recorded ones, so building never evicts those.
-    pub async fn built(&self, database: &str, storage: &Arc<BufferPool>, data: &rtdb_storage::ObjectKey, columns: &[String], memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<TrieFile> {
+    pub async fn built(&self, database: &str, storage: &Arc<BufferPool>, trie: &rtdb_format::keys::TrieKey, data: &rtdb_storage::ObjectKey, columns: &[String], memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<TrieFile> {
         let identity = format!("{data}#{columns:?}");
         let cache_key = (database.to_string(), identity.clone());
         if let Some((pool, file)) = self.built.lock().get(&cache_key) {
-            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { data: data.clone(), identity, file }); }
+            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file }); }
         }
         // A build that fails or whose query is cancelled leaves the cell empty, and the next caller builds.
         let cell = Arc::clone(self.building.lock().entry(cache_key.clone()).or_default());
@@ -185,7 +205,7 @@ impl SearchRuntime {
         let mut building = self.building.lock();
         if building.get(&cache_key).is_some_and(|current| Arc::ptr_eq(current, &cell)) { building.remove(&cache_key); }
         drop(building);
-        Ok(TrieFile { data: data.clone(), identity, file: outcome? })
+        Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file: outcome? })
     }
 
     pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) {
@@ -227,6 +247,29 @@ impl SearchRuntime {
         lists.sort_by_key(|rows| rows.len());
         let Some((shortest, rest)) = lists.split_first() else { return Ok(Vec::new()) };
         Ok(shortest.iter().copied().filter(|row| *row < visible && rest.iter().all(|rows| rows.binary_search(row).is_ok())).collect())
+    }
+
+    /// Every event of an entity a live segment holds, system time descending; a segment's keys are kept and extended by the rows appended since, as its postings are.
+    pub fn live_events(&self, database: &str, segment: &rtdb_index::LiveTable, iid: &[u8; 16]) -> Result<Vec<crate::file::KeyedEvent>> {
+        let Some(first) = segment.batches().next() else { return Ok(Vec::new()) };
+        let key = (database.to_string(), segment.table().clone(), Arc::as_ptr(first) as usize);
+        let existing = self.live_keys.lock().get(&key);
+        let entry = match existing {
+            Some(entry) => entry,
+            None => {
+                let entry = Arc::new(Mutex::new(LiveKeys { batches: Vec::new(), rows: 0, events: Default::default() }));
+                self.live_keys.lock().insert(key.clone(), Arc::clone(&entry), 1);
+                entry
+            }
+        };
+        let mut keys = entry.lock();
+        let shared = keys.shared_prefix(segment);
+        if shared < segment.batches().count().min(keys.batches.len()) { *keys = LiveKeys { batches: Vec::new(), rows: 0, events: Default::default() }; }
+        if keys.shared_prefix(segment) == keys.batches.len() && keys.rows < segment.row_count() { keys.extend(segment)?; }
+        let visible = segment.row_count();
+        let mut events: Vec<crate::file::KeyedEvent> = keys.events.get(iid).map_or_else(Vec::new, |events| events.iter().filter(|(row, _)| *row < visible).map(|(_, event)| *event).collect());
+        events.sort_by_key(|event| std::cmp::Reverse(event.system_from));
+        Ok(events)
     }
 
     /// Hands a recorded file a scan could not read to the database's lane.
@@ -296,15 +339,16 @@ mod tests {
         store.put(&data, data_file()).await.unwrap();
         let columns = vec!["body".to_string()];
         let runtime = SearchRuntime::new(1 << 20);
-        let (first, second) = tokio::join!(runtime.built("xtdb", &pool, &data, &columns, &memory, &cancellation), runtime.built("xtdb", &pool, &data, &columns, &memory, &cancellation));
+        let trie: rtdb_format::keys::TrieKey = "l00-rc-b00".parse().unwrap();
+        let (first, second) = tokio::join!(runtime.built("xtdb", &pool, &trie, &data, &columns, &memory, &cancellation), runtime.built("xtdb", &pool, &trie, &data, &columns, &memory, &cancellation));
         assert!(Arc::ptr_eq(&first.unwrap().file, &second.unwrap().file));
         assert!(runtime.building.lock().is_empty(), "a finished build leaves nothing in flight");
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         let other = ObjectKey::new("tables/docs/data/l00-rc-b01.arrow").unwrap();
         store.put(&other, data_file()).await.unwrap();
-        let _ = runtime.built("xtdb", &pool, &other, &columns, &memory, &cancelled).await;
-        assert!(runtime.built("xtdb", &pool, &other, &columns, &memory, &cancellation).await.is_ok(), "a cancelled build leaves the next caller free to build");
+        let _ = runtime.built("xtdb", &pool, &"l00-rc-b01".parse().unwrap(), &other, &columns, &memory, &cancelled).await;
+        assert!(runtime.built("xtdb", &pool, &"l00-rc-b01".parse().unwrap(), &other, &columns, &memory, &cancellation).await.is_ok(), "a cancelled build leaves the next caller free to build");
     }
 
     #[tokio::test]
