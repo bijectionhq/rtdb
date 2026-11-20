@@ -39,7 +39,14 @@ impl Cell {
     pub async fn start_with(pools: Vec<MemberPool>, park_after: Option<Duration>) -> Self { Self::start_watching(pools, park_after, None).await }
 
     /// A cell whose agents check their holdings against the directory only every `watch`, so other fences are what a test observes.
-    pub async fn start_watching(pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>) -> Self {
+    pub async fn start_watching(pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>) -> Self { Self::start_full(pools, park_after, watch, None).await }
+
+    /// A cell named in a cell map, whose gateway forwards connections for deployments living in other cells.
+    pub async fn start_in(cell: &str, map: Arc<dyn rtdb_multi::cells::CellMap>, nodes: usize) -> Self {
+        Self::start_full(vec![MemberPool::General; nodes], None, None, Some((map, cell.to_owned()))).await
+    }
+
+    pub async fn start_full(pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
         let directory: Arc<dyn Directory> = MemoryDirectory::new();
@@ -55,7 +62,8 @@ impl Cell {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = listener.local_addr().unwrap();
         let gateway_cancellation = CancellationToken::new();
-        tokio::spawn(gateway::serve(listener, Arc::clone(&directory), gateway::GatewayOptions { touch_interval: Duration::from_millis(200), ..Default::default() }, gateway_cancellation.clone()));
+        if let Some((map, cell)) = &cells { map.register_cell(cell, &gateway.to_string()).await.unwrap(); }
+        tokio::spawn(gateway::serve(listener, Arc::clone(&directory), gateway::GatewayOptions { cells, touch_interval: Duration::from_millis(200), ..Default::default() }, gateway_cancellation.clone()));
         Self { directory, nodes: running, logkeepers, gateway, gateway_cancellation, data }
     }
 

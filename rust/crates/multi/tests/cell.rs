@@ -397,3 +397,34 @@ async fn a_deposed_holder_refuses_a_linearizable_read_instead_of_serving_it_stal
     drop((client, direct));
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_forwards() {
+    let map: std::sync::Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::MemoryCellMap::new();
+    let east = Cell::start_in("east", map.clone(), 1).await;
+    let west = Cell::start_in("west", map.clone(), 1).await;
+    let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
+    fn handle<'a>(name: &'a str, cell: &'a Cell, storage: &'a rtdb_multi::deployment::CellStorage, keys: &'a rtdb_multi::keys::LocalKeyService, maximum_deployments: usize) -> admin::CellHandle<'a> {
+        admin::CellHandle { name, directory: cell.directory.as_ref(), storage, keys, maximum_deployments }
+    }
+    let (placed, _) = admin::create_in_cells(map.as_ref(), &[handle("east", &east, &east_storage, &east_keys, 10), handle("west", &west, &west_storage, &west_keys, 0)], "shop", "acme", 3).await.unwrap();
+    assert_eq!(placed, "east", "a deployment goes to a cell with room");
+    let client = east.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    drop(client);
+
+    let arrived = admin::move_cell(map.as_ref(), &handle("east", &east, &east_storage, &east_keys, 10), &handle("west", &west, &west_storage, &west_keys, 10), "shop", 4 << 20).await.unwrap();
+    assert_eq!(map.cell_of("shop").await.unwrap().as_deref(), Some("west"));
+    let through_east = connect_eventually(&east, "shop").await;
+    assert_eq!(values(&through_east, "SELECT total FROM orders").await, ["10", "20"], "the unflushed tail moved with it, and the old cell's gateway forwards");
+    through_east.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
+    let through_west = west.connect("shop").await;
+    assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"]);
+    let settled = west.directory.deployment(&arrived.id).await.unwrap().unwrap();
+    assert!(settled.move_from.is_none(), "the first holder in the new cell moved the stream onto the new cell's logkeepers");
+    assert_eq!(east.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
+    drop((through_east, through_west));
+    east.stop().await;
+    west.stop().await;
+}

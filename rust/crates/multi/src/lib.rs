@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod agent;
+pub mod cells;
 pub mod cipher;
 pub mod control;
 pub mod deployment;

@@ -14,6 +14,8 @@ pub trait KeyService: Send + Sync {
     fn copy(&self, from: &str, to: &str) -> Result<()>;
     /// Destroys the deployment's key irreversibly; its objects are unreadable from then on.
     fn destroy(&self, deployment: &str) -> Result<()>;
+    /// Installs a key brought from another cell's key service, for a deployment that moved here.
+    fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
 }
 
 /// Keys kept as files in a directory apart from the objects they protect, standing in for a key-management service.
@@ -51,6 +53,7 @@ impl KeyService for LocalKeyService {
         let key = self.key(from)?;
         std::fs::write(self.path(to), key).map_err(io)
     }
+    fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()> { std::fs::write(self.path(deployment), key).map_err(io) }
     fn destroy(&self, deployment: &str) -> Result<()> {
         let path = self.path(deployment);
         if path.exists() {

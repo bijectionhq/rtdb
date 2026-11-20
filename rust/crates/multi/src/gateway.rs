@@ -21,15 +21,17 @@ const CANCEL_REQUEST: i32 = 80877102;
 const PROTOCOL_3: i32 = 196608;
 const MAXIMUM_STARTUP_BYTES: usize = 10_000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GatewayOptions {
+    /// The cell map and this gateway's cell, so a connection for a deployment living elsewhere is forwarded there.
+    pub cells: Option<(Arc<dyn crate::cells::CellMap>, String)>,
     pub control_timeout: Duration,
     /// How often an open connection tells its holder it is in use.
     pub touch_interval: Duration,
 }
 
 impl Default for GatewayOptions {
-    fn default() -> Self { Self { control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10) } }
+    fn default() -> Self { Self { cells: None, control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10) } }
 }
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
@@ -63,6 +65,14 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
     let Some(name) = startup.parameters.get("database").or_else(|| startup.parameters.get("user")).cloned() else {
         return refuse(&mut client, "3D000", "The startup message names no database").await;
     };
+    if let Some(gateway) = elsewhere(&directory, &name, &options).await {
+        let mut forward = match connect(&gateway).await { Ok(forward) => forward, Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await };
+        forward.write_all(&startup.bytes).await.map_err(io)?;
+        return tokio::select! {
+            _ = cancellation.cancelled() => Ok(()),
+            copied = tokio::io::copy_bidirectional(&mut client, &mut forward) => copied.map(|_| ()).map_err(io),
+        };
+    }
     let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), read_only: startup.read_only(), options: options.clone() });
     let (server, control, epoch, deployment) = match router.route_with_record().await {
         Ok(route) => route,
@@ -86,6 +96,16 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
     };
     if let Some(touching) = touching { touching.abort(); }
     outcome
+}
+
+/// The gateway of the cell a deployment lives in, when that is not this gateway's cell.
+async fn elsewhere(directory: &Arc<dyn Directory>, name: &str, options: &GatewayOptions) -> Option<String> {
+    let (map, cell) = options.cells.as_ref()?;
+    let here = directory.deployment_by_name(name).await.ok().flatten();
+    if here.as_ref().is_some_and(|record| matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)) { return None; }
+    let living = map.cell_of(name).await.ok().flatten()?;
+    if &living == cell { return None; }
+    map.gateway(&living).await.ok().flatten()
 }
 
 struct GatewayRouter { directory: Arc<dyn Directory>, name: String, read_only: bool, options: GatewayOptions }

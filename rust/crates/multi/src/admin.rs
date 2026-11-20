@@ -163,6 +163,54 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One cell, as cell administration reaches it.
+pub struct CellHandle<'a> { pub name: &'a str, pub directory: &'a dyn Directory, pub storage: &'a CellStorage, pub keys: &'a dyn KeyService, pub maximum_deployments: usize }
+
+/// Creates a deployment in the least occupied cell with room, and records the cell in the cell map.
+pub async fn create_in_cells(map: &dyn crate::cells::CellMap, cells: &[CellHandle<'_>], name: &str, org: &str, replicas: usize) -> Result<(String, DeploymentRecord)> {
+    if map.cell_of(name).await?.is_some() { return Err(crate_exists(name)); }
+    let mut best = None;
+    for cell in cells {
+        let occupied = cell.directory.deployments().await?.iter().filter(|record| record.lifecycle != Lifecycle::Deleted).count();
+        if occupied < cell.maximum_deployments && best.as_ref().is_none_or(|(count, _)| occupied < *count) { best = Some((occupied, cell)); }
+    }
+    let (_, cell) = best.ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/cells-full", "Every cell is at its envelope"))?;
+    if !map.assign(name, cell.name, None).await? { return Err(crate_exists(name)); }
+    Ok((cell.name.to_owned(), create_deployment(cell.directory, name, org, replicas).await?))
+}
+
+fn crate_exists(name: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/exists", format!("A deployment named {name} exists in some cell")) }
+
+/// Moves a deployment to another cell (`BeginCellMove`, `MoveCutover`): the source fences it and seals its stream, its objects and key are copied, the target records it with the source's logkeepers to move from, the cell map flips, and the source keeps a tombstone that its gateway forwards.
+/// The target's first holder recovers the unflushed tail from the source's logkeepers and moves it onto its own.
+pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, to: &CellHandle<'_>, name: &str, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    let fenced = update(from.directory, name, |record| {
+        if record.lifecycle != Lifecycle::Live { return Err(Anomaly::incorrect("rtdb.multi/not-live", format!("{name} is not live"))); }
+        record.lifecycle = Lifecycle::Moving;
+        record.epoch += 1;
+        record.holder = None;
+        Ok(())
+    }).await?;
+    let members = members(from.directory).await?;
+    let servers: Vec<String> = fenced.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers: servers.clone(), stream: fenced.stream("replica"), maximum_message_bytes };
+    rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
+    match (from.storage, to.storage) {
+        (CellStorage::Local { root: source }, CellStorage::Local { root: target }) => copy_tree(&source.join(fenced.storage_prefix()), &target.join(fenced.storage_prefix()))?,
+    }
+    to.keys.install(&fenced.id, from.keys.key(&fenced.id)?)?;
+    let mut arrived = fenced.clone();
+    arrived.lifecycle = Lifecycle::Live;
+    arrived.move_intent = None;
+    arrived.activation_crashes = 0;
+    arrived.move_from = Some(servers);
+    arrived.ensemble = choose_ensemble(to.directory, &arrived, fenced.ensemble.len()).await?;
+    let arrived = to.directory.create_deployment(arrived).await?;
+    if !map.assign(name, to.name, Some(from.name)).await? { return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-raced", format!("{name} was not in {} when the move completed", from.name))); }
+    update(from.directory, name, |record| { record.lifecycle = Lifecycle::Deleted; Ok(()) }).await?;
+    Ok(arrived)
+}
+
 /// What a deletion did, kept as its record.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeletionRecord { pub deployment: String, pub name: String, pub key_destroyed_at_ms: i64, pub objects_erased_at_ms: i64, pub verified_empty: bool }

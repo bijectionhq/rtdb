@@ -16,7 +16,9 @@ const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES]\n\
-       rtdb-multi gateway --directory DIR --listen ADDR\n\
+       rtdb-multi gateway --directory DIR --listen ADDR [--cell NAME --cell-map ADDR]\n\
+       rtdb-multi cell-map --listen ADDR\n\
+       rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--grace SECONDS]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
@@ -110,12 +112,37 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:5432")?).await.map_err(io)?;
             eprintln!("gateway listening on {}", listener.local_addr().map_err(io)?);
-            gateway::serve(listener, directory, gateway::GatewayOptions::default(), cancellation).await
+            let mut options = gateway::GatewayOptions::default();
+            if let (Some(cell), Some(map)) = (arguments.optional("cell"), arguments.optional("cell-map")) {
+                let map: Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::RemoteCellMap::new(map);
+                let advertised = arguments.optional("advertise").map(str::to_owned).unwrap_or(listener.local_addr().map_err(io)?.to_string());
+                map.register_cell(cell, &advertised).await?;
+                options.cells = Some((map, cell.to_owned()));
+            }
+            gateway::serve(listener, directory, options, cancellation).await
         }
         "controller" => {
             let directory = directory(arguments.required("directory")?).await?;
             let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", 0usize)?, ..Default::default() };
             admin::run_controller(directory, options, cancellation).await;
+            Ok(())
+        }
+        "cell-map" => {
+            let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:7000")?).await.map_err(io)?;
+            eprintln!("cell map listening on {}", listener.local_addr().map_err(io)?);
+            rtdb_multi::cells::serve(listener, rtdb_multi::cells::MemoryCellMap::new(), cancellation).await
+        }
+        "move-cell" => {
+            let map = rtdb_multi::cells::RemoteCellMap::new(arguments.required("cell-map")?);
+            let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
+            let from_storage = CellStorage::Local { root: PathBuf::from(arguments.required("from-storage-root")?) };
+            let to_storage = CellStorage::Local { root: PathBuf::from(arguments.required("to-storage-root")?) };
+            let from_keys = rtdb_multi::keys::LocalKeyService::new(arguments.required("from-keys")?)?;
+            let to_keys = rtdb_multi::keys::LocalKeyService::new(arguments.required("to-keys")?)?;
+            let from = admin::CellHandle { name: arguments.required("from")?, directory: from_directory.as_ref(), storage: &from_storage, keys: &from_keys, maximum_deployments: usize::MAX };
+            let to = admin::CellHandle { name: arguments.required("to")?, directory: to_directory.as_ref(), storage: &to_storage, keys: &to_keys, maximum_deployments: usize::MAX };
+            let record = admin::move_cell(map.as_ref(), &from, &to, arguments.required("name")?, 4 << 20).await?;
+            println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
             Ok(())
         }
         "reaper" => {
