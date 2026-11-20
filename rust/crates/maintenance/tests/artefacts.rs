@@ -141,12 +141,30 @@ fn a_group_stray_is_an_unrecorded_group_object_of_a_retired_definition_with_a_li
     assert_eq!(strays, [listed[1].clone()], "recorded by its members, or of a group the catalog holds no member of: kept");
 }
 
-struct Uploading { store: Arc<rtdb_storage::MemoryStore>, definitions: Mutex<Vec<ArtefactDefinition>>, built: Mutex<Vec<ArtefactJob>> }
+struct Uploading {
+    store: Arc<rtdb_storage::MemoryStore>,
+    definitions: Mutex<Vec<ArtefactDefinition>>,
+    built: Mutex<Vec<ArtefactJob>>,
+    repair: Option<(ArtefactJob, ObjectKey)>,
+}
 #[async_trait]
 impl ArtefactBuilder for Uploading {
     async fn definitions(&self, _: &Arc<PartitionValue>, _: &CancellationToken) -> Result<Vec<ArtefactDefinition>> { Ok(self.definitions.lock().unwrap().clone()) }
-    async fn build(&self, job: &ArtefactJob, _: &Arc<PartitionValue>, _: &CancellationToken) -> Result<ArtefactRecord> {
+    async fn repairs(&self, snapshot: &Arc<PartitionValue>, _: &CancellationToken) -> Result<Vec<ArtefactJob>> {
+        Ok(self.repair.iter().filter(|(job, _)| {
+            job.tries().iter().filter_map(|key| snapshot.trie_catalog().trie(&job.definition.table, key))
+                .filter(|trie| trie.state == TrieState::Live)
+                .any(|trie| trie.artefact("search", &job.definition.id, 1).is_some_and(|record| record.scope() == ArtefactScope::PartGroup))
+        }).map(|(job, _)| job.clone()).collect())
+    }
+
+    async fn build(&self, job: &ArtefactJob, _: rtdb_maintenance::ArtefactSource<'_>, _: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         self.built.lock().unwrap().push(job.clone());
+        if let Some((_, input)) = self.repair.as_ref().filter(|(repair, _)| repair == job) {
+            let directory = tempfile::tempdir().unwrap();
+            let memory = rtdb_columnar::MemoryBudget::new(1024);
+            rtdb_maintenance::input::download(self.store.as_ref(), &memory, input, &directory.path().join("input"), cancellation).await?;
+        }
         let slug = TableSlug::recorded("public$docs").unwrap();
         self.store.put(&ObjectKey::new(slug.owner_artefact_key(&job.owner, "search", &job.definition.id, 1).unwrap()).unwrap(), bytes::Bytes::from_static(b"artefact")).await.unwrap();
         Ok(record(&job.definition.id))
@@ -162,7 +180,7 @@ async fn a_group_artefact_is_recorded_on_every_member_and_retired_with_one_delet
     assert_eq!(tables.entry(&table()).unwrap().slug.as_str(), "public$docs");
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog(), tables, TrieConfig::default()).unwrap()));
     let store = Arc::new(rtdb_storage::MemoryStore::default());
-    let builder = Arc::new(Uploading { store: store.clone(), definitions: Mutex::new(vec![ArtefactDefinition { historical: false, ..grouped("body", 400) }]), built: Mutex::new(Vec::new()) });
+    let builder = Arc::new(Uploading { store: store.clone(), definitions: Mutex::new(vec![ArtefactDefinition { historical: false, ..grouped("body", 400) }]), built: Mutex::new(Vec::new()), repair: None });
     let (driver, handle) = ArtefactDriver::new(state.clone() as Arc<dyn SnapshotSource>, builder.clone(), Arc::new(Applying(state.clone())), (StorageVersion(7), StorageEpoch(0)), "search", store.clone(), 2, 4, false).unwrap();
     let cancellation = CancellationToken::new();
     let running = tokio::spawn(driver.run(cancellation.clone()));
@@ -179,6 +197,54 @@ async fn a_group_artefact_is_recorded_on_every_member_and_retired_with_one_delet
     handle.build_all().await.unwrap();
     assert!(store.list(None).await.unwrap().is_empty(), "the group's one object is deleted");
     assert!(members.iter().all(|member| state.value().trie_catalog().trie(&table(), member).unwrap().artefacts.is_empty()), "every member's record is removed");
+    cancellation.cancel();
+    running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_shared_artefact_with_a_collected_input_is_replaced_by_the_survivors_own_files() {
+    let definition = ArtefactDefinition { historical: false, ..grouped("body", 400) };
+    let first = "l02-rc-p0-b00".parse::<TrieKey>().unwrap();
+    let group = first.part_group().unwrap();
+    let members = group.members();
+    let mut catalog = catalog().with_artefacts(&table(), members.iter().cloned().map(|key| (key, group_record("body"))));
+    let intact = catalog.with_artefacts(&table(), [(members[1].clone(), record("body"))]);
+    assert_eq!(intact.trie(&table(), &members[1]).unwrap().artefact("search", "body", 1), Some(&group_record("body")));
+
+    for bucket in 0..4 {
+        let mut child = trie(&format!("l03-rc-p0{bucket}-b01"), 25);
+        child.artefacts.push(group_record("body"));
+        catalog = catalog.with_tries(table(), [child], Timestamp(101)).unwrap();
+    }
+    catalog = catalog.without_tries(&table(), &[first.clone()].into());
+    assert!(catalog.trie(&table(), &first).is_none());
+    let tables = TableCatalog::default().with_seeded_table(table(), Vec::new()).unwrap();
+    let slug = tables.entry(&table()).unwrap().slug.clone();
+    let input = ObjectKey::new(slug.data_key(&first)).unwrap();
+    let store = Arc::new(rtdb_storage::MemoryStore::default());
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let repair = ArtefactJob { definition: definition.clone(), owner: ArtefactOwner::Group(group) };
+    let builder = Arc::new(Uploading {
+        store: store.clone(), definitions: Mutex::new(vec![definition]), built: Mutex::new(Vec::new()), repair: Some((repair, input)),
+    });
+    let (driver, handle) = ArtefactDriver::new(state.clone(), builder.clone(), Arc::new(Applying(state.clone())),
+        (StorageVersion(7), StorageEpoch(0)), "search", store.clone(), 2, 4, false).unwrap();
+    let cancellation = CancellationToken::new();
+    let running = tokio::spawn(driver.run(cancellation.clone()));
+
+    handle.build_all().await.unwrap();
+    state.add_artefacts(&table(), members.iter().cloned().map(|key| (key, group_record("body"))).collect());
+    handle.build_all().await.unwrap();
+
+    assert_eq!(keys(&builder.built.lock().unwrap()), ["body:g02-rc-b00", "body:l02-rc-p1-b00", "body:l02-rc-p2-b00", "body:l02-rc-p3-b00"]);
+    assert_eq!(store.list(None).await.unwrap().len(), 3);
+    for member in &members[1..] {
+        let snapshot = state.value();
+        let record = snapshot.trie_catalog().trie(&table(), member).unwrap().artefact("search", "body", 1).unwrap();
+        assert_eq!(record.scope(), ArtefactScope::Trie);
+        let object = ObjectKey::new(slug.recorded_artefact_key(member, record).unwrap()).unwrap();
+        assert!(store.head(&object).await.is_ok());
+    }
     cancellation.cancel();
     running.await.unwrap().unwrap();
 }

@@ -137,14 +137,14 @@ fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> R
 }
 
 pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
-    let object = store.head(key).await.map_err(crate::invalid)?;
+    let object = store.head(key).await?;
     let mut file = create_file(path)?;
     let mut position = 0;
     while position < object.size {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let count = usize::try_from((object.size - position).min(1024 * 1024)).map_err(crate::invalid)?;
         let reservation = ReadReservation::new(count, memory.reserve(count)?);
-        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await.map_err(crate::invalid)?;
+        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await?;
         file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
         position += count as u64;
     }

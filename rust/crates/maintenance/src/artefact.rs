@@ -30,6 +30,14 @@ impl ArtefactJob {
     /// The scope the artefact's records carry.
     pub fn scope(&self) -> ArtefactScope { match self.owner { ArtefactOwner::Trie(_) => ArtefactScope::Trie, ArtefactOwner::Group(_) => ArtefactScope::PartGroup } }
     fn first_trie(&self) -> TrieKey { self.tries().swap_remove(0) }
+
+    fn entries(&self, mut record: ArtefactRecord) -> Vec<ArtefactEntry> {
+        record.scope = Some(self.scope() as i32);
+        self.tries().into_iter().map(|trie| ArtefactEntry {
+            trie_key: Some(trie.to_string()),
+            record: Some(record.clone()),
+        }).collect()
+    }
 }
 
 /// Where an artefact is built from: its trie's data file already on this node's disk, as compaction has just written it, or the stored object, which the builder fetches.
@@ -123,6 +131,45 @@ pub fn stray_artefacts<'a>(catalog: &TrieCatalog, table: &TableRef, slug: &Table
         let live: Vec<_> = owner.tries().iter().filter_map(|key| catalog.trie(table, key)).filter(|trie| trie.state == TrieState::Live).collect();
         found == kind && retired(definitions, table, kind, &id, version, basis) && !live.is_empty() && live.iter().all(|trie| trie.artefact(kind, &id, version).is_none())
     }).cloned().collect()
+}
+
+fn input_collected(error: &Anomaly, catalog: &TrieCatalog, table: &TableRef, slug: &TableSlug, key: &TrieKey) -> bool {
+    error.code == "rtdb.storage/missing-object"
+        && error.context.get("key").and_then(|key| key.as_str()).is_some_and(|missing| missing == slug.data_key(key).as_str())
+        && catalog.trie(table, key).is_none_or(|trie| matches!(trie.state, TrieState::Garbage { .. }))
+}
+
+async fn build_entries(job: &ArtefactJob, builder: &dyn ArtefactBuilder, snapshots: &dyn SnapshotSource, cancellation: &CancellationToken) -> Result<Vec<ArtefactEntry>> {
+    let snapshot = snapshots.snapshot();
+    let error = match builder.build(job, ArtefactSource::Stored, &snapshot, cancellation).await {
+        Ok(record) => return Ok(job.entries(record)),
+        Err(error) => error,
+    };
+    let ArtefactOwner::Group(group) = &job.owner else { return Err(error) };
+    let table = &job.definition.table;
+    let snapshot = snapshots.snapshot();
+    let catalog = snapshot.trie_catalog();
+    let Some(table_entry) = snapshot.table_catalog().entry(table) else { return Err(error) };
+    let slug = &table_entry.slug;
+    if !group.members().iter().any(|key| input_collected(&error, catalog, table, slug, key)) {
+        return Err(error);
+    }
+
+    let mut entries = Vec::new();
+    for trie in catalog.group_members(table, group).into_iter().filter(|trie| trie.state == TrieState::Live) {
+        if trie.artefact(&job.definition.kind, &job.definition.id, job.definition.version).is_some_and(|record| record.scope() == ArtefactScope::Trie) {
+            continue;
+        }
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        let replacement = ArtefactJob { definition: job.definition.clone(), owner: ArtefactOwner::Trie(trie.key.clone()) };
+        match builder.build(&replacement, ArtefactSource::Stored, &snapshot, cancellation).await {
+            Ok(record) => entries.extend(replacement.entries(record)),
+            // GC can collect another sibling while we build the replacements.
+            Err(error) if input_collected(&error, snapshots.snapshot().trie_catalog(), table, slug, &trie.key) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(entries)
 }
 
 #[derive(Clone)]
@@ -251,11 +298,11 @@ impl ArtefactDriver {
                 let (builder, publisher, snapshots, token, storage) = (Arc::clone(&self.builder), Arc::clone(&self.publisher), Arc::clone(&self.snapshots), workers.clone(), self.storage);
                 running.push(async move {
                     let result = async {
-                        let snapshot = snapshots.snapshot();
-                        let record = ArtefactRecord { scope: Some(job.scope() as i32), ..builder.build(&job, ArtefactSource::Stored, &snapshot, &token).await? };
+                        let entries = build_entries(&job, builder.as_ref(), snapshots.as_ref(), &token).await?;
+                        if entries.is_empty() { return Ok(()); }
                         let message = ArtefactsAdded {
                             storage_version: Some(storage.0.0), storage_epoch: Some(storage.1.0), table_name: Some(job.definition.table.schema_and_table()),
-                            entries: job.tries().into_iter().map(|trie| ArtefactEntry { trie_key: Some(trie.to_string()), record: Some(record.clone()) }).collect(), source_msg_id: None,
+                            entries, source_msg_id: None,
                         };
                         tokio::select! {
                             biased;

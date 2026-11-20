@@ -171,9 +171,10 @@ rule RepairUnreadableSearchFile {
     -- A scan that finds a recorded search file missing, or its bytes unreadable as a search file, evaluates that trie from its data file and reports the file to its database's lane, which wakes for it.
     -- A file that could not be fetched at all is not reported: the store may be briefly unavailable, and the file sound.
     -- The lane drops its cached copies and reads the object afresh. If the object is missing it builds it; if its bytes are still unreadable it deletes it and builds it again; if it cannot be fetched the job fails and is retried.
-    -- Search files are deterministic, so the rebuilt object has the bytes the record was made for, and the record stands.
-    -- A report is dropped when no live member records the file or the definition has left force.
-    -- Rebuilding a shared file requires the original group members' data files.
+    -- Rebuilding the original file reproduces its bytes and leaves its records in place.
+    -- If the group build finds an original member's data file missing and the catalog has superseded or collected that member, the lane builds a file for each remaining live member that still needs one.
+    -- A single ArtefactsAdded message replaces the shared records after the new files have been uploaded.
+    -- A report is dropped when no live member still records that search file or the definition has left force.
     when: SearchFileUnreadable(table, owner, definition)
 
     ensures:

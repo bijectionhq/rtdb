@@ -53,6 +53,7 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
   It indexes eligible siblings in bucket order when their combined data fits `GROUP_BYTES` and a quarter of the node's memory budget.
   Compaction still builds search files inline for eligible outputs that cannot form a shared file based on their own key or size.
   A scan reads a shared file once and takes candidates and row-level MATCH answers from its selected members.
+  If the shared file needs repair after a member's data file has been collected, the lane publishes an individual file for each surviving trie.
 * *A search file only nominates candidates, and answers MATCH exactly.*
   The scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
   A `MATCH` with a constant query in a scan predicate becomes a column the scan evaluates: from the search file of the row's data file, null included, and from the row's value where there is none.

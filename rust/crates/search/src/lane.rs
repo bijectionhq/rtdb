@@ -75,14 +75,18 @@ impl ArtefactBuilder for SearchBuilder {
         let definitions = self.definitions(snapshot, cancellation).await?;
         let mut jobs = Vec::new();
         for suspect in suspects {
-            let definition = definitions.iter().find(|definition| definition.table == suspect.table && definition.id == suspect.artefact_id && definition.version == suspect.version);
+            let Some(definition) = definitions.iter().find(|definition| definition.table == suspect.table && definition.id == suspect.artefact_id && definition.version == suspect.version) else {
+                self.runtime.clear(&suspect);
+                continue;
+            };
+            let job = ArtefactJob { definition: definition.clone(), owner: suspect.owner.clone() };
+            let scope = job.scope();
             let catalog = snapshot.trie_catalog();
-            let recorded = suspect.owner.tries().iter().filter_map(|key| catalog.trie(&suspect.table, key))
-                .any(|trie| trie.state == rtdb_index::TrieState::Live && trie.artefact(KIND, &suspect.artefact_id, suspect.version).is_some());
-            match definition {
-                Some(definition) if recorded => jobs.push(ArtefactJob { definition: definition.clone(), owner: suspect.owner.clone() }),
-                _ => self.runtime.clear(&suspect),
-            }
+            let recorded = job.tries().iter().filter_map(|key| catalog.trie(&suspect.table, key))
+                .filter(|trie| trie.state == rtdb_index::TrieState::Live)
+                .any(|trie| trie.artefact(KIND, &suspect.artefact_id, suspect.version).is_some_and(|record| record.scope() == scope));
+            if recorded { jobs.push(job); }
+            else { self.runtime.clear(&suspect); }
         }
         Ok(jobs)
     }

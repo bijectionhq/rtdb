@@ -223,14 +223,24 @@ impl TrieCatalog {
         }
         next
     }
-    /// A trie the catalog no longer holds takes no record, and a trie keeps the first record for each (kind, definition id, definition version).
+    /// Keeps the first record for each definition version, except when a live trie replaces its obsolete group's record with its own.
     pub fn with_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
         let mut next = self.clone();
         if let Some(state) = next.tables.get_mut(table) {
             for (key, record) in entries {
                 let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
                 let (kind, id, version) = (record.kind(), record.definition_id(), record.definition_version());
-                if trie.artefact(kind, id, version).is_none() { trie.artefacts.push(record); }
+                let held = trie.artefacts.iter_mut().find(|held| same_artefact(held, kind, id, version));
+                match held {
+                    None => trie.artefacts.push(record),
+                    Some(held) if held.scope() == log_pb::ArtefactScope::PartGroup
+                        && record.scope() == log_pb::ArtefactScope::Trie
+                        && trie.state == TrieState::Live
+                        && key.part_group().is_some_and(|group| group.members().iter().any(|member| {
+                            self.trie(table, member).is_none_or(|trie| matches!(trie.state, TrieState::Garbage { .. }))
+                        })) => *held = record,
+                    Some(_) => {}
+                }
             }
         }
         next
