@@ -10,6 +10,7 @@ Paths are relative to `rust/crates/` unless they start with another top-level di
 
 ## Contents
 
+1. [Implementation status](#implementation-status)
 1. [Ground rules](#1-ground-rules)
 2. [Where we start from](#2-where-we-start-from)
 3. [Concept map: spec to code](#3-concept-map-spec-to-code)
@@ -19,6 +20,43 @@ Paths are relative to `rust/crates/` unless they start with another top-level di
 7. [Testing strategy](#7-testing-strategy)
 8. [Decision points](#8-decision-points)
 9. [Commit sketch](#9-commit-sketch)
+
+## Implementation status
+
+What runs today on the `rtdb-multi` branch, and where it still departs from the spec.
+Update this section as stages land.
+
+**Runs end to end.**
+`rtdb-multi directory|logkeeper|node|gateway|controller|create|list|drain` runs a cell as separate processes, and `crates/multi/tests/cell.rs` runs one in process under tokio-postgres:
+
+- the directory (`crates/directory`): records, version-conditional replace, the claim and park rules, the contract suite, and in-memory, TCP and DynamoDB backends (DynamoDB tested against DynamoDB Local);
+- the logkeeper (`crates/logkeeper`): a quorum log with epoch promises checked at append time, seal, recovery by synced epoch, background repair of lagging servers, and the `Log` contract;
+- placed nodes (stage 2): `Membership::Placed`, local attach and detach, claims that wait no election and an idle term that appends nothing;
+- the node agent: claim, open as the epoch's writer, depose on directory change or a stopped database, park on idleness after the flushed block is adopted, self-fence on a lost lease;
+- the gateway: routes a pgwire connection to the holder, activating it on the first node of the affinity order;
+- isolation (stage 1, in part): the disk cache keyed by the store, and a session on a placed node confined to its own database;
+- scale-in by draining a node.
+
+**Departures from the spec, to close.**
+
+- **Two streams per deployment.**
+  Each deployment keeps a source and a replica stream on its ensemble, both written only by the holder; routed resolution with idempotency keys (stage 3, items 3 and 6) is not built, so a transaction costs two quorum appends.
+- **One ensemble for every epoch.**
+  A deployment's streams stay on the ensemble chosen at creation; the loglet chain that lets an epoch move to other logkeepers is not built.
+- **Logkeeper storage.**
+  One journal file per stream rather than per writer, retained entries held in memory, no seal announcements (`SealsAreAnnounced`), so linearizable reads (`ServeLinearizableReadOnWriter`) are not available.
+- **The gateway splices bytes.**
+  It does not own session state, so a planned move or a failover drops open connections; clients reconnect.
+- **The controller only reaps expired members.**
+  Rebalancing, planned handoff with a warm subscriber, quarantine and autoscaling signals (stage 11) are not built.
+
+**Not started.**
+Stage 5 (epoch-named objects, per-epoch credentials, the reaper as sole deleter), stage 6 (packs, boot objects, the multi flush policy), stage 7 (the compaction job pool), resident-idle residency (stage 8), the subscriber and snapshot read tiers (stage 10), stage 12 (encryption, lineages, forks, deletion), stage 13 (cells) and the simulation crate (stage 14).
+
+**Open issue found on the way.**
+A park that released its placement right after `flush()` sometimes left the next holder failing with "Source reader did not advance": its promotion inherited a dangling flushed block, and the block's adoption moved applied progress past where the new leader's source tail had started.
+Parking now waits for the flushed block's adoption, which removes it in practice, but a holder that dies between cutting a flush and uploading it reaches the same promotion path.
+Reverting the wait in `agent.rs` reproduces it in `cell.rs` about one run in five; it needs a replication-level test and a fix in `ReplicationDriver::promote`.
 
 ## 1. Ground rules
 
