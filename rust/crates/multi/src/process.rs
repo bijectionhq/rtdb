@@ -63,7 +63,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let fence = Arc::new(FenceSlot::default());
     let recorder = Arc::new(crate::logs::DirectoryRecorder { directory: Arc::clone(&directory) });
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
-    let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes);
+    let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
     let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys), fence_interval: Duration::from_millis(100) });
     let placed = PlacedOptions {
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
@@ -72,7 +72,11 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
         scan_fragmenter: Some(fragmenter.clone() as Arc<dyn rtdb_query::ScanFragmenter>),
-        compaction_relay: (settings.pool == rtdb_directory::MemberPool::Compaction).then(|| Arc::new(crate::relay::HolderRelay { directory: Arc::clone(&directory) }) as Arc<dyn rtdb_node::CompactionRelay>),
+        compaction_relay: match (settings.pool == rtdb_directory::MemberPool::Compaction, &settings.capabilities) {
+            (true, Some(secret)) => Some(Arc::new(crate::relay::HolderRelay { directory: Arc::clone(&directory), secret: Arc::clone(secret) }) as Arc<dyn rtdb_node::CompactionRelay>),
+            (true, None) => return Err(Anomaly::incorrect("rtdb.multi/no-cell-secret", "A compaction worker publishes through holders, which needs the cell's secret")),
+            (false, _) => None,
+        },
     };
     let (server, driver) = ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed).await?;
     let pgwire_address = server.addresses().pgwire.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;
@@ -82,7 +86,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone, pool: settings.pool,
     }, settings.lease).await?;
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent, writers);
+    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::clone(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();

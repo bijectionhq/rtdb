@@ -33,6 +33,14 @@ impl CellSecret {
         Self::new(&bytes)
     }
 
+    /// A grant by which one of the cell's nodes asks another for a deployment's data or to publish on its behalf, which no client can make.
+    pub fn node_grant(&self, deployment: &str) -> String { self.mint(deployment, NODE_PRINCIPAL, false, Duration::from_secs(30)) }
+
+    /// Refuses unless `grant` is a node grant for `deployment` under this cell's secret.
+    pub fn verify_node_grant(&self, grant: &str, deployment: &str) -> Result<()> {
+        if self.verify(grant, deployment)?.principal == NODE_PRINCIPAL { Ok(()) } else { Err(refused("The grant is not a node's")) }
+    }
+
     /// A capability for `principal` on `deployment`, valid for `ttl`.
     pub fn mint(&self, deployment: &str, principal: &str, read_only: bool, ttl: Duration) -> String {
         let claims = Claims { deployment: deployment.into(), principal: principal.into(), read_only, expires_at_ms: rtdb_directory::now_ms() + ttl.as_millis() as i64 };
@@ -54,6 +62,8 @@ impl CapabilityVerifier for CellSecret {
         Ok(VerifiedCapability { principal: claims.principal, read_only: claims.read_only })
     }
 }
+
+const NODE_PRINCIPAL: &str = "~cell-node";
 
 fn refused(message: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/capability-refused", message) }
 

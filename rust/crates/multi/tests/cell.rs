@@ -553,6 +553,11 @@ async fn a_node_admits_a_capability_only_for_its_deployment_and_the_gateway_neve
     let foreign = rtdb_multi::capability::CellSecret::new(&[9; 32]).unwrap().mint("shop", "xtdb", false, Duration::from_secs(30));
     assert_eq!(greeting(&node, &[("user", "xtdb"), ("database", "shop"), ("rtdb.capability", &foreign)]).await.0, b'E', "another cell's capability is refused");
     assert_eq!(greeting(&cell.gateway.to_string(), &[("user", "xtdb"), ("database", "shop"), ("rtdb.capability", &genuine)]).await, (b'R', [0, 0, 0, 3]), "through the gateway, a client's capability is dropped and the password asked for");
+    let control = cell.node(0).control_address.to_string();
+    for grant in [genuine.clone(), "forged".to_owned(), rtdb_multi::capability::CellSecret::new(&[9; 32]).unwrap().node_grant("shop")] {
+        let answer = rtdb_multi::control::call(&control, &rtdb_multi::control::Request::PublishCompaction { name: "shop".into(), notification: Vec::new(), grant }, Duration::from_secs(5)).await.unwrap();
+        assert!(matches!(answer, rtdb_multi::control::Response::Refused { .. }), "only another of the cell's nodes may ask for a deployment's data or publish for it: {answer:?}");
+    }
     cell.stop().await;
 }
 

@@ -45,6 +45,7 @@ pub fn readers(members: &[MemberRecord]) -> Vec<&MemberRecord> {
 /// A node's fragmenter: places each fragment of its sessions' scans on the reader it ranks first on.
 pub struct CellFragmenter {
     directory: Arc<dyn Directory>,
+    secret: Option<Arc<crate::capability::CellSecret>>,
     member: OnceLock<MemberId>,
     above_bytes: AtomicU64,
     depth: FragmentDepth,
@@ -53,8 +54,8 @@ pub struct CellFragmenter {
 }
 
 impl CellFragmenter {
-    pub fn new(directory: Arc<dyn Directory>, options: &FragmentOptions, cache_bytes: u64) -> Arc<Self> {
-        Arc::new(Self { directory, member: OnceLock::new(), above_bytes: AtomicU64::new(options.above_bytes.unwrap_or(cache_bytes)), depth: options.depth, timeout: options.timeout, failures: AtomicU64::new(0) })
+    pub fn new(directory: Arc<dyn Directory>, options: &FragmentOptions, cache_bytes: u64, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, secret, member: OnceLock::new(), above_bytes: AtomicU64::new(options.above_bytes.unwrap_or(cache_bytes)), depth: options.depth, timeout: options.timeout, failures: AtomicU64::new(0) })
     }
 
     /// Names this node once its lease is registered; until then, every fragment is read here.
@@ -78,7 +79,8 @@ impl CellFragmenter {
     }
 
     async fn read_on(&self, control_address: &str, fragment: &ScanFragment) -> Result<Vec<u8>> {
-        let request = Request::ScanFragment { name: fragment.database().to_owned(), fragment: fragment.clone() };
+        let secret = self.secret.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-cell-secret", "Fragments are read elsewhere only in a cell with a secret"))?;
+        let request = Request::ScanFragment { name: fragment.database().to_owned(), fragment: fragment.clone(), grant: secret.node_grant(fragment.database()) };
         match control::call(control_address, &request, self.timeout).await? {
             Response::Fragment { batches } => base64::engine::general_purpose::STANDARD.decode(batches).map_err(|error| Anomaly::fault("rtdb.multi/fragment-response", error.to_string())),
             Response::Refused { code, message } => Err(Anomaly::new(AnomalyCategory::Unavailable, code, message)),

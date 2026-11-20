@@ -65,6 +65,8 @@ pub struct NodeAgent {
     address: String,
     options: AgentOptions,
     holdings: Mutex<BTreeMap<String, LocalHolding>>,
+    /// The cell's secret, which the requests that read a deployment's data or publish for it must carry a grant under.
+    secret: Option<Arc<crate::capability::CellSecret>>,
     writers: crate::logs::Writers,
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
     /// The lsn each deployment's stream was last trimmed through by this node.
@@ -76,8 +78,8 @@ pub struct NodeAgent {
 }
 
 impl NodeAgent {
-    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
+    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, node, lease, address, options, secret, holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -287,6 +289,11 @@ impl NodeAgent {
     }
 
     /// Reads a fragment of another node's scan of `name`, from the holding or replica this node has of it, opening a replica if it has neither.
+    fn check_node_grant(&self, grant: &str, name: &str) -> Result<()> {
+        let secret = self.secret.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/no-cell-secret", "This node has no cell secret, so it serves no other node's request for data"))?;
+        secret.verify_node_grant(grant, name)
+    }
+
     pub async fn scan_fragment(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<Response> {
         use base64::Engine;
         if fragment.database() != name { return Err(Anomaly::incorrect("rtdb.multi/fragment-database", format!("A fragment of {} was sent as one of {name}", fragment.database()))); }
@@ -474,8 +481,8 @@ impl Handler for NodeAgent {
             Request::Subscribe { name } => self.subscribe(&name).await,
             Request::Snapshot { name } => self.snapshot(&name).await,
             Request::Flush { name } => self.flush(&name).await,
-            Request::PublishCompaction { name, notification } => self.publish_compaction(&name, &notification).await,
-            Request::ScanFragment { name, fragment } => self.scan_fragment(&name, &fragment).await,
+            Request::PublishCompaction { name, notification, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.publish_compaction(&name, &notification).await, Err(error) => Err(error) }
+            Request::ScanFragment { name, fragment, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.scan_fragment(&name, &fragment).await, Err(error) => Err(error) }
         };
         result.unwrap_or_else(|error| Response::refused(&error))
     }

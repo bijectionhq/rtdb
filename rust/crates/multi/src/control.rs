@@ -28,9 +28,9 @@ pub enum Request {
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
     Flush { name: String },
     /// Publish a compaction a worker produced, as the deployment's holder; the notification is an encoded TriesAdded.
-    PublishCompaction { name: String, notification: Vec<u8> },
+    PublishCompaction { name: String, notification: Vec<u8>, grant: String },
     /// Read a fragment of another node's scan of the deployment, at the fragment's basis (`RefineKeyForLargeDeployments`).
-    ScanFragment { name: String, fragment: rtdb_query::ScanFragment },
+    ScanFragment { name: String, fragment: rtdb_query::ScanFragment, grant: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
