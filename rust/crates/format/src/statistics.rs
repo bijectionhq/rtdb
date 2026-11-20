@@ -1,7 +1,7 @@
 use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 
-use arrow_array::{Array, FixedSizeListArray, ListArray, RecordBatch, RunArray, StructArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
+use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, ListArray, PrimitiveArray, RecordBatch, RunArray, StructArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_types::{Anomaly, LogicalType, Result, Value};
 
@@ -164,13 +164,7 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         _ => return Err(Anomaly::unsupported("rtdb.format/metadata-flavour", format!("Unsupported column metadata type: {:?}", field.data_type()))),
     };
     let bounds = statistics.numeric.entry(group).or_insert((f64::INFINITY, f64::NEG_INFINITY));
-    if field.metadata().is_empty() && let Some(cells) = numeric_cells(array) {
-        for row in 0..array.len() {
-            if !mask.includes(row) || array.is_null(row) { continue; }
-            let value = cells(row);
-            if value.is_nan() || bounds.0.is_nan() { bounds.0 = f64::NAN; } else { bounds.0 = bounds.0.min(value); }
-            if value.is_nan() || bounds.1.is_nan() { bounds.1 = f64::NAN; } else { bounds.1 = bounds.1.max(value); }
-        }
+    if field.metadata().is_empty() && fold_numeric_array(array, mask, bounds) {
         return Ok(());
     }
     let reader = rtdb_columnar::ColumnReader::new(field)?;
@@ -178,9 +172,7 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         if !mask.includes(row) { continue; }
         let value = reader.read(array, row)?;
         if matches!(value, Value::Null | Value::Undefined) { continue; }
-        let value = numeric_value(&value)?;
-        if value.is_nan() || bounds.0.is_nan() { bounds.0 = f64::NAN; } else { bounds.0 = bounds.0.min(value); }
-        if value.is_nan() || bounds.1.is_nan() { bounds.1 = f64::NAN; } else { bounds.1 = bounds.1.max(value); }
+        extend_numeric_bounds(bounds, numeric_value(&value)?);
     }
     Ok(())
 }
@@ -196,43 +188,52 @@ fn present_cells(field: &Field, array: &dyn Array, mask: &Mask) -> Option<usize>
     })
 }
 
-/// A plain signed integer, float or temporal array's cells as `numeric_value` takes them of each cell's value, read in place.
-fn numeric_cells(array: &dyn Array) -> Option<Box<dyn Fn(usize) -> f64 + '_>> {
+fn extend_numeric_bounds(bounds: &mut (f64, f64), value: f64) {
+    bounds.0 = if value.is_nan() || bounds.0.is_nan() { f64::NAN } else { bounds.0.min(value) };
+    bounds.1 = if value.is_nan() || bounds.1.is_nan() { f64::NAN } else { bounds.1.max(value) };
+}
+
+fn fold_primitive<T: ArrowPrimitiveType>(
+    array: &PrimitiveArray<T>, mask: &Mask, bounds: &mut (f64, f64), convert: impl Fn(T::Native) -> f64,
+) {
+    for (row, &value) in array.values().iter().enumerate() {
+        if mask.includes(row) && array.is_valid(row) {
+            extend_numeric_bounds(bounds, convert(value));
+        }
+    }
+}
+
+fn fold_numeric_array(array: &dyn Array, mask: &Mask, bounds: &mut (f64, f64)) -> bool {
     use arrow_array::cast::AsArray;
     use arrow_array::types::*;
-    use arrow_schema::TimeUnit as Unit;
-    let per_second = |unit: &Unit| match unit { Unit::Second => 1.0, Unit::Millisecond => 1e3, Unit::Microsecond => 1e6, Unit::Nanosecond => 1e9 };
-    Some(match array.data_type() {
-        DataType::Int8 => { let array = array.as_primitive::<Int8Type>(); Box::new(move |row| f64::from(array.value(row))) }
-        DataType::Int16 => { let array = array.as_primitive::<Int16Type>(); Box::new(move |row| f64::from(array.value(row))) }
-        DataType::Int32 => { let array = array.as_primitive::<Int32Type>(); Box::new(move |row| f64::from(array.value(row))) }
-        DataType::Int64 => { let array = array.as_primitive::<Int64Type>(); Box::new(move |row| array.value(row) as f64) }
-        DataType::Float32 => { let array = array.as_primitive::<Float32Type>(); Box::new(move |row| f64::from(array.value(row))) }
-        DataType::Float64 => { let array = array.as_primitive::<Float64Type>(); Box::new(move |row| array.value(row)) }
-        DataType::Date32 => { let array = array.as_primitive::<Date32Type>(); Box::new(move |row| i64::from(array.value(row)).wrapping_mul(86_400) as f64) }
-        DataType::Date64 => { let array = array.as_primitive::<Date64Type>(); Box::new(move |row| (array.value(row) / 86_400_000).wrapping_mul(86_400) as f64) }
-        DataType::Timestamp(unit, _) => {
-            let scale = per_second(unit);
-            let values: Box<dyn Fn(usize) -> i64 + '_> = match unit {
-                Unit::Second => { let array = array.as_primitive::<TimestampSecondType>(); Box::new(move |row| array.value(row)) }
-                Unit::Millisecond => { let array = array.as_primitive::<TimestampMillisecondType>(); Box::new(move |row| array.value(row)) }
-                Unit::Microsecond => { let array = array.as_primitive::<TimestampMicrosecondType>(); Box::new(move |row| array.value(row)) }
-                Unit::Nanosecond => { let array = array.as_primitive::<TimestampNanosecondType>(); Box::new(move |row| array.value(row)) }
-            };
-            Box::new(move |row| values(row) as f64 / scale)
-        }
-        DataType::Duration(unit) => {
-            let scale = per_second(unit);
-            let values: Box<dyn Fn(usize) -> i64 + '_> = match unit {
-                Unit::Second => { let array = array.as_primitive::<DurationSecondType>(); Box::new(move |row| array.value(row)) }
-                Unit::Millisecond => { let array = array.as_primitive::<DurationMillisecondType>(); Box::new(move |row| array.value(row)) }
-                Unit::Microsecond => { let array = array.as_primitive::<DurationMicrosecondType>(); Box::new(move |row| array.value(row)) }
-                Unit::Nanosecond => { let array = array.as_primitive::<DurationNanosecondType>(); Box::new(move |row| array.value(row)) }
-            };
-            Box::new(move |row| values(row) as f64 / scale)
-        }
-        _ => return None,
-    })
+    use arrow_schema::TimeUnit;
+
+    macro_rules! primitive {
+        ($ty:ty, $convert:expr) => {
+            fold_primitive(array.as_primitive::<$ty>(), mask, bounds, $convert)
+        };
+    }
+
+    match array.data_type() {
+        DataType::Int8 => primitive!(Int8Type, f64::from),
+        DataType::Int16 => primitive!(Int16Type, f64::from),
+        DataType::Int32 => primitive!(Int32Type, f64::from),
+        DataType::Int64 => primitive!(Int64Type, |value| value as f64),
+        DataType::Float32 => primitive!(Float32Type, f64::from),
+        DataType::Float64 => primitive!(Float64Type, |value| value),
+        DataType::Date32 => primitive!(Date32Type, |day| i64::from(day).wrapping_mul(86_400) as f64),
+        DataType::Date64 => primitive!(Date64Type, |millis| (millis / 86_400_000_i64).wrapping_mul(86_400) as f64),
+        DataType::Timestamp(TimeUnit::Second, _) => primitive!(TimestampSecondType, |value| value as f64),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => primitive!(TimestampMillisecondType, |value| value as f64 / 1e3),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => primitive!(TimestampMicrosecondType, |value| value as f64 / 1e6),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => primitive!(TimestampNanosecondType, |value| value as f64 / 1e9),
+        DataType::Duration(TimeUnit::Second) => primitive!(DurationSecondType, |value| value as f64),
+        DataType::Duration(TimeUnit::Millisecond) => primitive!(DurationMillisecondType, |value| value as f64 / 1e3),
+        DataType::Duration(TimeUnit::Microsecond) => primitive!(DurationMicrosecondType, |value| value as f64 / 1e6),
+        DataType::Duration(TimeUnit::Nanosecond) => primitive!(DurationNanosecondType, |value| value as f64 / 1e9),
+        _ => return false,
+    }
+    true
 }
 
 fn numeric_value(value: &Value) -> Result<f64> {
