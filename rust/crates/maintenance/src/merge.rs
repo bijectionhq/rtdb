@@ -63,8 +63,12 @@ impl SegmentCompactor {
         for builder in &self.artefacts {
             let Ok(definitions) = builder.definitions(snapshot, cancellation).await else { continue };
             for definition in definitions.into_iter().filter(|definition| &definition.table == table && crate::wants(definition, trie, size_signed, snapshot.trie_catalog().file_size_target())) {
-                let job = crate::ArtefactJob { definition, trie: trie.clone() };
-                if let Ok(record) = builder.build(&job, crate::ArtefactSource::Local { data, size }, snapshot, cancellation).await { records.push(record); }
+                // Tiered compaction publishes one bucket at a time; the lane sees the whole group once it is live.
+                if trie.part_group().is_some() && definition.group_bytes.is_some_and(|limit| size_signed <= limit) { continue; }
+                let job = crate::ArtefactJob { definition, owner: rtdb_format::keys::ArtefactOwner::Trie(trie.clone()) };
+                if let Ok(record) = builder.build(&job, crate::ArtefactSource::Local { data, size }, snapshot, cancellation).await {
+                    records.push(rtdb_format::log::proto::ArtefactRecord { scope: Some(job.scope() as i32), ..record });
+                }
             }
         }
         records
@@ -133,14 +137,14 @@ fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> R
 }
 
 pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
-    let object = store.head(key).await.map_err(crate::invalid)?;
+    let object = store.head(key).await?;
     let mut file = create_file(path)?;
     let mut position = 0;
     while position < object.size {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let count = usize::try_from((object.size - position).min(1024 * 1024)).map_err(crate::invalid)?;
         let reservation = ReadReservation::new(count, memory.reserve(count)?);
-        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await.map_err(crate::invalid)?;
+        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await?;
         file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
         position += count as u64;
     }

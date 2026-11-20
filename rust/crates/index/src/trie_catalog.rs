@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_types::CivilDate;
-use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::TrieKey, log::proto as log_pb};
+use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{PartGroup, TrieKey}, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +187,14 @@ impl TrieCatalog {
     pub fn current_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         self.all_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).collect()
     }
+    /// The entry the catalog holds for `key`, live, nascent or garbage.
+    pub fn trie(&self, table: &TableRef, key: &TrieKey) -> Option<&CatalogTrie> {
+        self.tables.get(table)?.shards.get(&Shard::of(key))?.tries.get(&key.block_index()).filter(|trie| &trie.key == key)
+    }
+    /// The entries the catalog holds for a partition group's members, in bucket order; a member it does not hold is left out.
+    pub fn group_members(&self, table: &TableRef, group: &PartGroup) -> Vec<&CatalogTrie> {
+        group.members().iter().filter_map(|key| self.trie(table, key)).collect()
+    }
     pub(crate) fn has_current_tries(&self, table: &TableRef) -> bool {
         self.iter_tries(table).any(|trie| trie.state == TrieState::Live)
     }
@@ -215,14 +223,24 @@ impl TrieCatalog {
         }
         next
     }
-    /// A trie the catalog no longer holds takes no record, and a trie keeps the first record for each (kind, definition id, definition version).
+    /// Keeps the first record for each definition version, except when a live trie replaces its obsolete group's record with its own.
     pub fn with_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
         let mut next = self.clone();
         if let Some(state) = next.tables.get_mut(table) {
             for (key, record) in entries {
                 let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
                 let (kind, id, version) = (record.kind(), record.definition_id(), record.definition_version());
-                if trie.artefact(kind, id, version).is_none() { trie.artefacts.push(record); }
+                let held = trie.artefacts.iter_mut().find(|held| same_artefact(held, kind, id, version));
+                match held {
+                    None => trie.artefacts.push(record),
+                    Some(held) if held.scope() == log_pb::ArtefactScope::PartGroup
+                        && record.scope() == log_pb::ArtefactScope::Trie
+                        && trie.state == TrieState::Live
+                        && key.part_group().is_some_and(|group| group.members().iter().any(|member| {
+                            self.trie(table, member).is_none_or(|trie| matches!(trie.state, TrieState::Garbage { .. }))
+                        })) => *held = record,
+                    Some(_) => {}
+                }
             }
         }
         next

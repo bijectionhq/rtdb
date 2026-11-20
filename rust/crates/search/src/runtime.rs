@@ -37,9 +37,9 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
 
 type DefinitionKey = (String, Vec<(Option<(i64, i64)>, Option<i64>)>);
 
-/// A recorded search file a scan could not read, awaiting the lane's check.
+/// A recorded search file a scan could not read, awaiting the lane's check; its owner is the trie or partition group the file was built over.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Suspect { pub database: String, pub table: rtdb_types::TableRef, pub trie: rtdb_format::keys::TrieKey, pub artefact_id: String, pub version: i64 }
+pub struct Suspect { pub database: String, pub table: rtdb_types::TableRef, pub owner: rtdb_format::keys::ArtefactOwner, pub artefact_id: String, pub version: i64 }
 
 /// Postings over a live segment's rows for one column, valid for every segment that starts with the same batches.
 struct LivePostings { batches: Vec<std::sync::Weak<rtdb_index::IndexBatch>>, rows: u32, bytes: usize, postings: std::collections::HashMap<String, Vec<u32>> }
@@ -97,14 +97,15 @@ impl FileError {
 /// An opened file, and the buffer pool it was read through: a pool is one database's storage for as long as it is open.
 type OpenedFile = (std::sync::Weak<BufferPool>, Arc<SearchFile>);
 
-/// A trie's search file as a scan reads it: the data file it indexes, the identity its kept answers go by, and the file.
-pub struct TrieFile { pub trie: rtdb_format::keys::TrieKey, pub data: rtdb_storage::ObjectKey, pub identity: String, pub file: Arc<SearchFile> }
+/// A trie's search file as a scan reads it: the trie's data file, the identity the file's kept answers go by, the file, and which of its members the trie is.
+/// The tries of a partition group share one file, each its own member.
+pub struct TrieFile { pub trie: rtdb_format::keys::TrieKey, pub data: rtdb_storage::ObjectKey, pub identity: String, pub file: Arc<SearchFile>, pub member: u32 }
 
 pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
     live_keys: Mutex<Bounded<(String, rtdb_types::TableRef, usize), Arc<Mutex<LiveKeys>>>>,
-    open_runs: Mutex<Bounded<(String, String), (std::sync::Weak<SearchFile>, Arc<crate::corpus::OpenRuns>)>>,
+    open_runs: Mutex<Bounded<(String, u32, String), (std::sync::Weak<SearchFile>, Arc<crate::corpus::OpenRuns>)>>,
     corpora: Mutex<Bounded<String, Arc<crate::corpus::SnapshotCorpus>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
     built: Mutex<Bounded<(String, String), OpenedFile>>,
@@ -185,13 +186,13 @@ impl SearchRuntime {
         let identity = format!("{data}#{columns:?}");
         let cache_key = (database.to_string(), identity.clone());
         if let Some((pool, file)) = self.built.lock().get(&cache_key) {
-            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file }); }
+            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file, member: 0 }); }
         }
         // A build that fails or whose query is cancelled leaves the cell empty, and the next caller builds.
         let cell = Arc::clone(self.building.lock().entry(cache_key.clone()).or_default());
         let outcome = cell.get_or_try_init(|| async {
             let lease = storage.get(data).await?;
-            let ceiling = crate::file::ceiling_of(trie);
+            let ceiling = crate::file::ceiling_of(trie.recency());
             let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
             let (indexed, token) = (columns.to_vec(), cancellation.clone());
             let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
@@ -208,7 +209,7 @@ impl SearchRuntime {
         let mut building = self.building.lock();
         if building.get(&cache_key).is_some_and(|current| Arc::ptr_eq(current, &cell)) { building.remove(&cache_key); }
         drop(building);
-        Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file: outcome? })
+        Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file: outcome?, member: 0 })
     }
 
     pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) {
@@ -298,9 +299,9 @@ impl SearchRuntime {
 
     /// A file's runs of a column that count where nothing outside the file cuts them, kept for as long as the file is the one held under its identity.
     pub(crate) fn open_runs(&self, trie: &TrieFile, column: &str) -> Result<Arc<crate::corpus::OpenRuns>> {
-        let key = (trie.identity.clone(), column.to_string());
+        let key = (trie.identity.clone(), trie.member, column.to_string());
         if let Some((file, runs)) = self.open_runs.lock().get(&key) { if file.upgrade().is_some_and(|file| Arc::ptr_eq(&file, &trie.file)) { return Ok(runs); } }
-        let runs = Arc::new(crate::corpus::OpenRuns::of(&trie.file, column)?);
+        let runs = Arc::new(crate::corpus::OpenRuns::of(&trie.file, trie.member, column)?);
         self.open_runs.lock().insert(key, (Arc::downgrade(&trie.file), Arc::clone(&runs)), 1);
         Ok(runs)
     }
@@ -308,7 +309,7 @@ impl SearchRuntime {
     /// A column's corpus at a snapshot's instant, computed once for the files and live segments it is made from.
     pub fn snapshot_corpus(&self, database: &str, files: Vec<TrieFile>, segments: &[Arc<rtdb_index::LiveTable>], column: &str, at: i64) -> Result<Arc<crate::corpus::SnapshotCorpus>> {
         let mut key = format!("{database}\u{0}{column}\u{0}{at}");
-        for trie in &files { key.push('\u{0}'); key.push_str(&trie.identity); }
+        for trie in &files { key.push_str(&format!("\u{0}{}\u{0}{}", trie.identity, trie.member)); }
         for segment in segments { key.push_str(&format!("\u{0}{:p}:{}", segment.batches().next().map_or(std::ptr::null(), Arc::as_ptr), segment.row_count())); }
         if let Some(corpus) = self.corpora.lock().get(&key) { return Ok(corpus); }
         let corpus = Arc::new(crate::corpus::SnapshotCorpus::compute(self, database, files, segments, column, at)?);

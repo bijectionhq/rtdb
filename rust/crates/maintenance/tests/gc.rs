@@ -88,3 +88,35 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let add = |catalog: TrieCatalog, key: &str, at: i64| catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(at)).unwrap();
+    let mut catalog = TrieCatalog::new(16).unwrap();
+    for bucket in 0..4 { catalog = add(catalog, &format!("l02-rc-p{bucket}-b00"), 100); }
+    let supersede = |mut catalog: TrieCatalog, part: u8| { for bucket in 0..4 { catalog = add(catalog, &format!("l03-rc-p{part}{bucket}-b01"), 100 + i64::from(part)); } catalog };
+    let group = "l02-rc-p0-b00".parse::<TrieKey>().unwrap().part_group().unwrap();
+    let object = ObjectKey::new(entry.slug.group_artefact_prefix(&group) + "/search/body-v1.bin").unwrap();
+    let store = Arc::new(MemoryStore::default());
+    store.put(&object, Bytes::from_static(b"artefact")).await.unwrap();
+    let collect = |catalog: TrieCatalog| {
+        let (store, tables, entry) = (store.clone(), tables.clone(), entry.clone());
+        async move {
+            let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
+            let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+            let collector = TrieCollector::new(store, state, publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
+            collector.collect_as_of(Timestamp(200), &CancellationToken::new()).await.unwrap();
+            publisher.commits.lock().unwrap().concat()
+        }
+    };
+    let one_superseded = supersede(catalog.clone(), 0);
+    assert_eq!(collect(one_superseded.clone()).await, ["l02-rc-p0-b00".parse::<TrieKey>().unwrap()]);
+    assert!(store.head(&object).await.is_ok(), "three members are still live");
+    let collected = one_superseded.without_tries(&table, &["l02-rc-p0-b00".parse().unwrap()].into());
+    let all_superseded = (1..4).fold(collected, supersede);
+    assert_eq!(collect(all_superseded).await.len(), 3);
+    assert!(store.head(&object).await.is_err(), "the last members take the group's artefacts with them");
+}

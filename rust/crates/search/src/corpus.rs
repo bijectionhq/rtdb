@@ -19,9 +19,10 @@ use crate::SearchRuntime;
 pub(crate) struct OpenRuns { stable: Vec<u64>, stable_docs: u64, stable_tokens: u64, exceptions: Vec<(u32, i64, i64)>, stable_frequencies: Mutex<BTreeMap<String, u64>> }
 
 impl OpenRuns {
-    pub(crate) fn of(file: &crate::SearchFile, column: &str) -> Result<Self> {
-        let latest = file.latest_system_from()?;
-        let docs: BTreeSet<u32> = (0..file.rows()).filter_map(|row| file.run_of(column, row).flatten()).collect();
+    pub(crate) fn of(file: &crate::SearchFile, member: u32, column: &str) -> Result<Self> {
+        let rows = file.member_rows(member)?;
+        let latest = file.latest_system_from(rows.clone())?;
+        let docs: BTreeSet<u32> = rows.filter_map(|row| file.run_of(column, row).flatten()).collect();
         let mut runs = Self { stable: vec![0; docs.last().map_or(0, |last| *last as usize / 64 + 1)], stable_docs: 0, stable_tokens: 0, exceptions: Vec::new(), stable_frequencies: Mutex::new(BTreeMap::new()) };
         for doc in docs {
             let open: Vec<[i64; 4]> = file.rectangles(doc).filter(|rectangle| rectangle[3] == i64::MAX).collect();
@@ -40,11 +41,11 @@ impl OpenRuns {
     fn counted(&self, doc: u32, at: i64) -> bool {
         self.stable(doc) || self.exceptions.iter().any(|(held, from, to)| *held == doc && *from <= at && at < *to)
     }
-    fn stable_frequency(&self, file: &crate::SearchFile, column: &str, term: &str) -> Result<u64> {
-        if let Some(count) = self.stable_frequencies.lock().get(term) { return Ok(*count); }
-        let count = file.holding(column, term)?.into_iter().filter(|doc| self.stable(*doc)).count() as u64;
+    fn stable_frequency(&self, holding: &[u32], term: &str) -> u64 {
+        if let Some(count) = self.stable_frequencies.lock().get(term) { return *count; }
+        let count = holding.iter().filter(|doc| self.stable(**doc)).count() as u64;
         self.stable_frequencies.lock().insert(term.to_string(), count);
-        Ok(count)
+        count
     }
 }
 
@@ -69,7 +70,7 @@ impl SnapshotCorpus {
                 if *from <= at && at < *to { corpus.documents += 1; corpus.tokens += u64::from(corpus.files[index].file.stored_length(column, *doc)?); }
             }
         }
-        let mut resolved: BTreeSet<[u8; 16]> = shared_iids(&corpus.files);
+        let mut resolved: BTreeSet<[u8; 16]> = shared_iids(&corpus.files)?;
         for segment in segments { resolved.extend(runtime.live_iids(database, segment)?); }
         for iid in resolved { corpus.resolve(runtime, database, segments, &iid)?; }
         Ok(corpus)
@@ -82,9 +83,9 @@ impl SnapshotCorpus {
             events.extend(runtime.live_rows_of(database, segment, iid)?.into_iter().map(|(row, event)| (Origin::Live(index, row), event)));
         }
         for (index, trie) in self.files.iter().enumerate() {
-            let rows = trie.file.rows_of(iid)?;
+            let member_rows = trie.file.member_rows(trie.member)?;
             let mut docs = BTreeSet::new();
-            for (row, event) in rows {
+            for (row, event) in trie.file.rows_of(iid)?.into_iter().filter(|(row, _)| member_rows.contains(row)) {
                 if let Some(Some(doc)) = trie.file.run_of(&self.column, row) { docs.insert(doc); }
                 events.push((Origin::File(index, row), event));
             }
@@ -127,11 +128,17 @@ impl SnapshotCorpus {
     pub fn corpus(&self, query: &Query) -> Result<Corpus> {
         let mut corpus = Corpus { documents: self.documents, tokens: self.tokens, frequencies: BTreeMap::new() };
         for term in query.terms() {
-            let holding = self.files.iter().map(|trie| trie.file.holding(&self.column, term)).collect::<Result<Vec<_>>>()?;
-            let holds = |index: usize, doc: u32| holding[index].binary_search(&doc).is_ok();
+            let mut holding = BTreeMap::new();
+            for trie in &self.files {
+                if let std::collections::btree_map::Entry::Vacant(entry) = holding.entry(trie.identity.as_str()) {
+                    entry.insert(trie.file.holding(&self.column, term)?);
+                }
+            }
+            let docs = |index: usize| &holding[self.files[index].identity.as_str()];
+            let holds = |index: usize, doc: u32| docs(index).binary_search(&doc).is_ok();
             let mut frequency = 0i64;
             for (index, runs) in self.open.iter().enumerate() {
-                frequency += runs.stable_frequency(&self.files[index].file, &self.column, term)? as i64;
+                frequency += runs.stable_frequency(docs(index), term) as i64;
                 frequency += runs.exceptions.iter().filter(|(doc, from, to)| *from <= self.at && self.at < *to && holds(index, *doc)).count() as i64;
             }
             frequency -= self.removed.iter().filter(|(index, doc)| holds(*index, *doc)).count() as i64;
@@ -142,9 +149,11 @@ impl SnapshotCorpus {
     }
 }
 
-/// The entities with events in more than one of the files, merged from each file's IIDs in order.
-fn shared_iids(files: &[TrieFile]) -> BTreeSet<[u8; 16]> {
-    let mut streams: Vec<_> = files.iter().map(|trie| trie.file.iids()).collect();
+/// The entities with events in more than one selected trie, merged from each member's IIDs in order.
+fn shared_iids(files: &[TrieFile]) -> Result<BTreeSet<[u8; 16]>> {
+    let mut streams = files.iter().map(|trie| {
+        Ok(trie.file.member_iids(trie.file.member_rows(trie.member)?))
+    }).collect::<Result<Vec<_>>>()?;
     let mut heap: BinaryHeap<std::cmp::Reverse<([u8; 16], usize)>> = BinaryHeap::new();
     for (index, stream) in streams.iter_mut().enumerate() { if let Some(iid) = stream.next() { heap.push(std::cmp::Reverse((iid, index))); } }
     let mut shared = BTreeSet::new();
@@ -154,5 +163,5 @@ fn shared_iids(files: &[TrieFile]) -> BTreeSet<[u8; 16]> {
         last = Some(iid);
         if let Some(next) = streams[index].next() { heap.push(std::cmp::Reverse((next, index))); }
     }
-    shared
+    Ok(shared)
 }

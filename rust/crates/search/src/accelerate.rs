@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rtdb_format::data::StoredOperation;
+use rtdb_format::{data::StoredOperation, keys::ArtefactOwner};
 use rtdb_index::{Snapshot, TrieState};
 use rtdb_plan::{BinaryOp, Expr};
 use rtdb_query::{MatchAnswers, ScanAccelerator, ScanRequest};
@@ -69,13 +69,7 @@ impl ScanAccelerator for SearchAccelerator {
         }
         let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, &definition).await? else { return Ok(None) };
         let cutter = Cutter::new(&files, &skipped, request, &self.runtime);
-        let mut candidates = BTreeSet::new();
-        for (own, trie) in files.iter().enumerate() {
-            for doc in trie.file.matches(column, &query, request.bounds)? {
-                if !matches!(cutter.judge(own, doc)?, Judged::Hidden) { candidates.insert(Iid(doc.iid)); }
-            }
-            if candidates.len() > self.max_candidates { return Ok(None); }
-        }
+        let Some(mut candidates) = file_candidates(&cutter, column, &query, self.max_candidates)? else { return Ok(None) };
         candidates.extend(self.live_candidates(request, column, &query)?);
         Ok((candidates.len() <= self.max_candidates).then_some(candidates))
     }
@@ -85,7 +79,7 @@ impl ScanAccelerator for SearchAccelerator {
         let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => found.files };
         let query = Query::parse(query);
         let mut answers = MatchAnswers::default();
-        for trie in files { answers.insert(&trie.data, self.runtime.match_set(request.database, &trie, column, &query)?); }
+        for trie in files { answers.insert(&trie.data, Arc::new(self.runtime.match_set(request.database, &trie, column, &query)?.member(trie.member)?)); }
         Ok((!answers.is_empty()).then_some(answers))
     }
 }
@@ -109,10 +103,11 @@ impl<'a> Cutter<'a> {
     }
 
     fn judge(&self, own: usize, doc: crate::DocMatch) -> Result<Judged> {
-        let mut rectangles: Vec<[i64; 4]> = self.files[own].file.rectangles(doc.doc).collect();
+        let own = &self.files[own];
+        let mut rectangles: Vec<[i64; 4]> = own.file.rectangles(doc.doc).collect();
         let mut tied = false;
-        for (index, other) in self.files.iter().enumerate() {
-            if index == own || !covers(other.trie.part(), &doc.iid) { continue; }
+        for other in self.files {
+            if other.identity == own.identity || !covers(other.trie.part(), &doc.iid) { continue; }
             tied |= cut(&mut rectangles, other.file.events(&doc.iid)?);
         }
         for segment in &self.segments { tied |= cut(&mut rectangles, self.runtime.live_events(self.database, segment, &doc.iid)?); }
@@ -156,20 +151,22 @@ impl SearchAccelerator {
         Ok(definitions.iter().find(|definition| &definition.table == table && definition.columns.iter().any(|indexed| indexed == column)).cloned())
     }
 
-    /// The key of a trie's recorded search file, if it has one.
-    fn recorded_key(snapshot: &Snapshot, table: &rtdb_types::TableRef, trie: &rtdb_index::CatalogTrie, definition: &SearchDefinition) -> Result<Option<ObjectKey>> {
+    /// Where a trie's recorded search file is, if it has one: its key, the trie or partition group it was built over, and which member of it the trie is.
+    fn recorded_key(snapshot: &Snapshot, table: &rtdb_types::TableRef, trie: &rtdb_index::CatalogTrie, definition: &SearchDefinition) -> Result<Option<Recorded>> {
         let artefact_id = definition.artefact_id();
-        let (Some(entry), Some(_)) = (snapshot.table_entry(table), trie.artefact(KIND, &artefact_id, definition.version)) else { return Ok(None) };
-        Ok(Some(ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?))
+        let (Some(entry), Some(record)) = (snapshot.table_entry(table), trie.artefact(KIND, &artefact_id, definition.version)) else { return Ok(None) };
+        let owner = ArtefactOwner::of(&trie.key, record)?;
+        let member = owner.tries().iter().position(|key| key == &trie.key).unwrap_or_default() as u32;
+        Ok(Some(Recorded { key: ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?, owner, member }))
     }
 
     /// A trie's recorded search file, or `None` where it cannot be read; one that is missing or corrupt is reported to the lane.
-    async fn recorded(&self, request: &ScanRequest<'_>, key: ObjectKey, trie: &rtdb_index::CatalogTrie, definition: &SearchDefinition) -> Result<Option<(ObjectKey, Arc<SearchFile>)>> {
+    async fn recorded(&self, request: &ScanRequest<'_>, recorded: &Recorded, definition: &SearchDefinition) -> Result<Option<Arc<SearchFile>>> {
         let (table, artefact_id) = (&request.scan.table.name.table, definition.artefact_id());
-        match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
-            Ok(file) => Ok(Some((key, file))),
+        match self.runtime.file(request.database, request.storage, &recorded.key, &definition.columns).await {
+            Ok(file) => Ok(Some(file)),
             Err(error) => {
-                if error.needs_repair() { self.runtime.report(Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id, version: definition.version }); }
+                if error.needs_repair() { self.runtime.report(Suspect { database: request.database.to_string(), table: table.clone(), owner: recorded.owner.clone(), artefact_id, version: definition.version }); }
                 Ok(None)
             }
         }
@@ -189,6 +186,7 @@ impl SearchAccelerator {
         let artefact_id = definition.artefact_id();
         let mut skipped = Vec::new();
         let mut files = Vec::new();
+        let mut opened: BTreeMap<ObjectKey, Option<Arc<SearchFile>>> = BTreeMap::new();
         let mut unbuilt = Vec::new();
         let mut unindexed = 0i64;
         let earliest = bounds.valid_time.lower().0.min(bounds.system_time.lower().0);
@@ -198,8 +196,20 @@ impl SearchAccelerator {
             let sections = trie.artefact(KIND, &artefact_id, definition.version).and_then(|record| record.stats.as_deref()).and_then(crate::file::decode_sections);
             if prune && sections.is_some_and(|sections| !sections.iter().any(|section| section.meets(bounds))) { skipped.push(trie.key.clone()); continue; }
             let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
-            let recorded = match Self::recorded_key(snapshot, table, trie, definition)? { Some(key) => self.recorded(request, key, trie, definition).await?, None => None };
-            if let Some((key, file)) = recorded { files.push(TrieFile { trie: trie.key.clone(), data, identity: key.as_str().to_string(), file }); continue; }
+            if let Some(recorded) = Self::recorded_key(snapshot, table, trie, definition)? {
+                let file = match opened.get(&recorded.key) {
+                    Some(file) => file.clone(),
+                    None => {
+                        let file = self.recorded(request, &recorded, definition).await?;
+                        opened.insert(recorded.key.clone(), file.clone());
+                        file
+                    }
+                };
+                if let Some(file) = file {
+                    files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_string(), file, member: recorded.member });
+                    continue;
+                }
+            }
             let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < snapshot.trie_catalog().file_size_target())
                 || (!definition.history && trie.key.recency().is_some());
             if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
@@ -249,6 +259,33 @@ impl SearchAccelerator {
     }
 }
 
+/// Where a trie's recorded search file is, and which of its members the trie is.
+struct Recorded { key: ObjectKey, owner: ArtefactOwner, member: u32 }
+
+/// A shared file's selected members and their positions in the scan's trie list.
+struct FileMembers<'a> { file: &'a Arc<SearchFile>, members: BTreeMap<u32, usize> }
+
+fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers<'_>> {
+    let mut grouped = BTreeMap::new();
+    for (index, trie) in files.iter().enumerate() {
+        let selected = grouped.entry(trie.identity.as_str()).or_insert_with(|| FileMembers { file: &trie.file, members: BTreeMap::new() });
+        selected.members.insert(trie.member, index);
+    }
+    grouped.into_values()
+}
+
+fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize) -> Result<Option<BTreeSet<Iid>>> {
+    let mut candidates = BTreeSet::new();
+    for selected in by_file(cutter.files) {
+        for doc in selected.file.matches(column, query, cutter.bounds)? {
+            let Some(&own) = selected.members.get(&doc.member) else { continue };
+            if !matches!(cutter.judge(own, doc)?, Judged::Hidden) { candidates.insert(Iid(doc.iid)); }
+        }
+        if candidates.len() > max_candidates { return Ok(None); }
+    }
+    Ok(Some(candidates))
+}
+
 /// A row's ranking key: its score, then its IID, so that ties sort deterministically.
 fn descending(left: &(f64, Iid), right: &(f64, Iid)) -> std::cmp::Ordering { right.0.total_cmp(&left.0).then_with(|| left.1.cmp(&right.1)) }
 
@@ -261,7 +298,7 @@ impl Ord for Pending { fn cmp(&self, other: &Self) -> std::cmp::Ordering { desce
 
 /// The IIDs of the matching events that may be visible, each at its best event's score, best first.
 /// Search files are expanded a batch of windows at a time, only while one may hold an event above every event already scored.
-struct Candidates<'a> { files: Vec<(usize, crate::file::Ranked)>, cutter: Cutter<'a>, pending: std::collections::BinaryHeap<Pending>, seen: BTreeSet<Iid>, scored: usize }
+struct Candidates<'a> { files: Vec<(BTreeMap<u32, usize>, crate::file::Ranked)>, cutter: Cutter<'a>, pending: std::collections::BinaryHeap<Pending>, seen: BTreeSet<Iid>, scored: usize }
 
 impl Candidates<'_> {
     fn push(&mut self, iid: Iid, score: f64, exact: bool) { self.scored += 1; self.pending.push(Pending(score, iid, exact)); }
@@ -282,8 +319,8 @@ impl Candidates<'_> {
             self.drop_seen();
             match (self.pending.peek().map(|top| top.0), self.best_file()) {
                 (pending, Some((index, bound))) if pending.is_none_or(|score| bound > score) => {
-                    let own = self.files[index].0;
                     for (doc, score) in self.files[index].1.expand()? {
+                        let Some(&own) = self.files[index].0.get(&doc.member) else { continue };
                         match self.cutter.judge(own, doc)? { Judged::Hidden => {}, Judged::Visible { exact } => self.push(Iid(doc.iid), score, exact) }
                     }
                 }
@@ -311,7 +348,9 @@ impl SearchAccelerator {
         let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition).await? else { return Ok(None) };
         let scoring = Query::parse(&text);
         let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
-        let ranked = files.iter().enumerate().map(|(own, trie)| Ok((own, trie.file.ranked(column, matching, &scoring, corpus.as_ref(), request.bounds)?))).collect::<Result<Vec<_>>>()?;
+        let ranked = by_file(&files).map(|selected| {
+            Ok((selected.members, selected.file.ranked(column, matching, &scoring, corpus.as_ref(), request.bounds)?))
+        }).collect::<Result<Vec<_>>>()?;
         let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, &skipped, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
         // The scan resolves exactly what the index decides only when MATCH is all it filters by; any other predicate is the verifier's to apply.
         let trusted = request.scan.predicates.iter().all(|predicate| match predicate {
@@ -381,6 +420,50 @@ mod tests {
 
     fn at(valid: i64, system: i64) -> TemporalBounds {
         TemporalBounds { valid_time: Interval::new(Timestamp(valid), Timestamp(valid + 1)).unwrap(), system_time: Interval::new(Timestamp(system), Timestamp(system + 1)).unwrap() }
+    }
+
+    #[test]
+    fn shared_search_uses_only_the_selected_members_for_candidates_ranking_and_corpus() {
+        use crate::file::write_group_search_file;
+
+        let columns = vec!["body".to_string()];
+        let row = |id: u8, body: &str| crate::SearchRow {
+            iid: [id; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX,
+            op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens(body))],
+        };
+        let mut bytes = Vec::new();
+        let members = [vec![Ok(vec![row(1, "overdue invoice")])], vec![Ok(vec![row(64, "overdue")])], Vec::new(), Vec::new()];
+        write_group_search_file(&columns, members, "group", None, tantivy::directory::RamDirectory::create(), &mut bytes).unwrap();
+        let file = Arc::new(SearchFile::open(bytes, &columns).unwrap());
+        let trie = |member: u32| TrieFile {
+            trie: format!("l02-rc-p{member}-b00").parse().unwrap(),
+            data: ObjectKey::new(format!("tables/docs/data/l02-rc-p{member}-b00.arrow")).unwrap(),
+            identity: "group".into(), file: Arc::clone(&file), member,
+        };
+        let runtime = crate::SearchRuntime::new(1 << 20);
+        let bounds = at(0, 0);
+        let query = Query::parse("overdue");
+        let files = [trie(1)];
+        let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime, database: "xtdb", bounds };
+        let iids = file_candidates(&cutter, "body", &query, 1).unwrap().unwrap();
+        assert_eq!(iids, BTreeSet::from([Iid([64; 16])]));
+        assert_eq!(by_file(&[trie(0), trie(1)]).count(), 1);
+
+        let ranked = file.ranked("body", &query, &query, None, bounds).unwrap();
+        let mut candidates = Candidates {
+            files: vec![(BTreeMap::from([(1, 0)]), ranked)], cutter,
+            pending: Default::default(), seen: BTreeSet::new(), scored: 0,
+        };
+        assert_eq!(candidates.next().unwrap().map(|(_, iid, exact)| (iid, exact)), Some((Iid([64; 16]), true)));
+        assert!(candidates.next().unwrap().is_none());
+
+        let terms = Query::parse("overdue invoice");
+        let corpus = |member| runtime.snapshot_corpus("xtdb", vec![trie(member)], &[], "body", 0)
+            .unwrap().corpus(&terms).unwrap();
+        let first = corpus(0);
+        let second = corpus(1);
+        assert_eq!((first.documents, first.tokens, first.frequencies["invoice"]), (1, 2, 1));
+        assert_eq!((second.documents, second.tokens, second.frequencies["invoice"]), (1, 1, 0));
     }
 
     #[test]
