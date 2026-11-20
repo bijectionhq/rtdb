@@ -59,13 +59,9 @@ impl RemoteStorageFactory for CellStoreFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let bucket = config.storage.bucket(io).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        let local: Arc<dyn ObjectStore> = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()));
-        claim_root(local.as_ref(), &config.deployment).await?;
-        let base = crate::reference::Base::load(bucket.as_ref(), &store).await?;
-        let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { local } else { Arc::new(crate::reference::ReferencingStore::new(local, bucket, base)) };
+        claim_root(&crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()), &config.deployment).await?;
         let discovery = match self.checkpoint(&config).await? { Some(block) => crate::packing::PackDiscovery::From(block), None => crate::packing::PackDiscovery::List };
-        let packed = crate::packing::PackingStore::open(own, discovery).await?;
-        Ok(GarbageStore::open(packed).await?)
+        Ok(open_deployment_store(bucket, &store, discovery, wall_clock()).await?)
     }
 
     /// A deployment with a published checkpoint recovers from it without listing its store.
@@ -106,6 +102,20 @@ enum Fence {
 /// Whether `key` is a compaction output: a trie data or metadata file above level 0.
 pub fn compaction_output(key: &str) -> bool {
     key.starts_with("tables/") && (key.contains("/data/l") || key.contains("/meta/l")) && !key.contains("/data/l00-") && !key.contains("/meta/l00-")
+}
+
+/// Milliseconds since the epoch, as a store stamps the releases and packs it writes.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+pub fn wall_clock() -> Clock { Arc::new(now_ms) }
+
+/// One store of a deployment in the cell's `bucket` (a prefix and a storage version), as a node opens it below its disk cache: its own objects and those its manifest references, packed, with deletes as releases.
+pub async fn open_deployment_store(bucket: crate::reference::Bucket, store: &str, discovery: crate::packing::PackDiscovery, clock: Clock) -> Result<Arc<GarbageStore>> {
+    let local: Arc<dyn ObjectStore> = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.to_owned()));
+    let base = crate::reference::Base::load(bucket.as_ref(), store).await?;
+    let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { local } else { Arc::new(crate::reference::ReferencingStore::new(local, bucket, base)) };
+    let packed = crate::packing::PackingStore::open_with_clock(own, discovery, Arc::clone(&clock)).await?;
+    GarbageStore::open_with_clock(packed, clock).await
 }
 
 pub struct FencedStore { inner: Arc<dyn ObjectStore>, fence: Fence }
@@ -182,10 +192,12 @@ impl ObjectStore for EncryptingStore {
 pub struct GarbageRecord { pub key: String, pub released_at_ms: i64 }
 
 /// Only a listing needs to know what has been released, so the released set is read on the first one, not on open.
-pub struct GarbageStore { inner: Arc<dyn ObjectStore>, released: tokio::sync::OnceCell<Mutex<BTreeSet<ObjectKey>>> }
+pub struct GarbageStore { inner: Arc<dyn ObjectStore>, released: tokio::sync::OnceCell<Mutex<BTreeSet<ObjectKey>>>, clock: Clock }
 
 impl GarbageStore {
-    pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, released: tokio::sync::OnceCell::new() })) }
+    pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> { Self::open_with_clock(inner, wall_clock()).await }
+
+    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, released: tokio::sync::OnceCell::new(), clock })) }
 
     async fn released(&self) -> rtdb_storage::Result<&Mutex<BTreeSet<ObjectKey>>> {
         self.released.get_or_try_init(|| async {
@@ -215,7 +227,7 @@ impl ObjectStore for GarbageStore {
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         // Before the first listing, a repeated delete writes a second record, which the reaper handles like the first.
         if let Some(released) = self.released.get() { if !released.lock().insert(key.clone()) { return Ok(()); } }
-        let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: now_ms() };
+        let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)() };
         let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
             .map_err(|error| Error::Task(error.to_string()))?;
         self.inner.put(&name, Bytes::from(serde_json::to_vec(&record).expect("a record serializes"))).await
@@ -245,9 +257,14 @@ pub struct Reaped { pub erased: usize, pub waiting: usize }
 /// Erases every object a deployment released more than `grace` ago from the cell's bucket.
 /// An object other deployments still reference is copied into them first; an object this deployment only references is dropped from its manifest.
 pub async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
+    reap_as_of(bucket, record, now_ms(), grace, references).await
+}
+
+/// `reap` as of `now_ms`, in milliseconds since the epoch.
+pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
     use crate::reference::{Base, physical_objects};
     let mut reaped = Reaped::default();
-    let threshold = now_ms() - grace.as_millis() as i64;
+    let threshold = now_ms - grace.as_millis() as i64;
     for store in crate::reference::stores(bucket, &record.storage_prefix()).await? {
         let mut base = Base::load(bucket, &store).await?;
         let before = base.clone();
@@ -312,13 +329,19 @@ pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deploymen
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(interval) => {
-                if let Ok(deployments) = directory.deployments().await {
-                    let Ok(references) = crate::reference::References::scan(bucket.as_ref(), &deployments).await else { continue };
-                    for record in deployments.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) { let _ = reap(bucket.as_ref(), record, grace, &references).await; }
-                }
+                if let Ok(deployments) = directory.deployments().await { let _ = reaper_pass(bucket.as_ref(), &deployments, now_ms(), grace).await; }
             }
         }
     }
+}
+
+/// One pass of the reaper over a cell's `bucket`, whose deployments are `deployments`, as of `now_ms`: every deployment that is not deleted is reaped, in order, against the references of them all.
+/// A deployment that fails to reap does not stop the others'.
+pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration) -> Result<Vec<Result<Reaped>>> {
+    let references = crate::reference::References::scan(bucket, deployments).await?;
+    let mut reaped = Vec::new();
+    for record in deployments.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) { reaped.push(reap_as_of(bucket, record, now_ms, grace, &references).await); }
+    Ok(reaped)
 }
 
 

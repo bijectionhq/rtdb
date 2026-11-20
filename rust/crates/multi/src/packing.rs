@@ -94,12 +94,14 @@ struct State {
     latest_block: Option<i64>,
 }
 
-pub struct PackingStore { inner: Arc<dyn ObjectStore>, state: Mutex<State>, writing: tokio::sync::Mutex<()> }
+pub struct PackingStore { inner: Arc<dyn ObjectStore>, state: Mutex<State>, writing: tokio::sync::Mutex<()>, clock: crate::store::Clock }
 
 impl PackingStore {
     /// Opens a store, reading nothing until an object it holds back is asked for.
-    pub async fn open(inner: Arc<dyn ObjectStore>, discovery: PackDiscovery) -> rtdb_storage::Result<Arc<Self>> {
-        Ok(Arc::new(Self { inner, state: Mutex::new(State { discovery, held: BTreeMap::new(), held_bytes: 0, located: BTreeMap::new(), packs: Vec::new(), latest_block: None }), writing: tokio::sync::Mutex::new(()) }))
+    pub async fn open(inner: Arc<dyn ObjectStore>, discovery: PackDiscovery) -> rtdb_storage::Result<Arc<Self>> { Self::open_with_clock(inner, discovery, crate::store::wall_clock()).await }
+
+    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, discovery: PackDiscovery, clock: crate::store::Clock) -> rtdb_storage::Result<Arc<Self>> {
+        Ok(Arc::new(Self { inner, state: Mutex::new(State { discovery, held: BTreeMap::new(), held_bytes: 0, located: BTreeMap::new(), packs: Vec::new(), latest_block: None }), writing: tokio::sync::Mutex::new(()), clock }))
     }
 
     async fn exists(&self, object: &ObjectKey) -> rtdb_storage::Result<bool> {
@@ -148,9 +150,9 @@ impl PackingStore {
         if held.is_empty() && catalog.is_none() { return Ok(()); }
         let (name, previous) = match catalog {
             Some(catalog) => (key(&block_pack(catalog.as_str()))?, self.state.lock().packs.iter().map(|pack| pack.as_str().to_owned()).collect()),
-            None => (key(&format!("{PACK_DIRECTORY}/p{:020}-{}.pack", rtdb_directory::now_ms(), uuid::Uuid::new_v4().simple()))?, Vec::new()),
+            None => (key(&format!("{PACK_DIRECTORY}/p{:020}-{}.pack", (self.clock)(), uuid::Uuid::new_v4().simple()))?, Vec::new()),
         };
-        let (bytes, index) = encode_pack(&held, previous, rtdb_directory::now_ms());
+        let (bytes, index) = encode_pack(&held, previous, (self.clock)());
         if let Err(error) = self.inner.put(&name, bytes).await {
             // Another store packed the block first: its pack serves, if it holds the same objects.
             if matches!(error, Error::ConflictingObject(_)) && catalog.is_some() && self.same_pack(&name, &held).await? {

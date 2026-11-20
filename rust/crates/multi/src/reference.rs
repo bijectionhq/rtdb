@@ -247,6 +247,14 @@ impl References {
     }
 }
 
+/// Erases every object a deployment's `prefix` holds, first copying what the other deployments of the cell (`others`) reference into them, and returns whether the prefix is then empty.
+pub async fn erase_deployment(bucket: &dyn ObjectStore, prefix: &str, others: &[DeploymentRecord]) -> Result<bool> {
+    let references = References::scan(bucket, others).await?;
+    for store in stores(bucket, prefix).await? { references.erase_store(bucket, &store).await?; }
+    for object in bucket.list(Some(&key(prefix)?)).await.map_err(storage)? { bucket.delete(&object.key).await.map_err(storage)?; }
+    Ok(bucket.list(Some(&key(prefix)?)).await.map_err(storage)?.is_empty())
+}
+
 async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
     let target = key(to)?;
     match to_bucket.head(&target).await { Ok(_) => return Ok(()), Err(Error::MissingObject(_)) => {}, Err(error) => return Err(error.into()) }

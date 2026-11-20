@@ -267,14 +267,9 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     keys.destroy(&fenced.id)?;
     let key_destroyed_at_ms = now_ms();
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
-    let prefix = fenced.storage_prefix();
     // Its forks keep what they share with it: those objects are copied into them before it goes.
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-    let references = crate::reference::References::scan(bucket.as_ref(), &others).await?;
-    for store in crate::reference::stores(bucket.as_ref(), &prefix).await? { references.erase_store(bucket.as_ref(), &store).await?; }
-    let remaining = bucket.list(Some(&rtdb_storage::ObjectKey::new(prefix.clone()).map_err(Anomaly::from)?)).await.map_err(Anomaly::from)?;
-    for object in &remaining { bucket.delete(&object.key).await.map_err(Anomaly::from)?; }
-    let verified_empty = bucket.list(Some(&rtdb_storage::ObjectKey::new(prefix).map_err(Anomaly::from)?)).await.map_err(Anomaly::from)?.is_empty();
+    let verified_empty = crate::reference::erase_deployment(bucket.as_ref(), &fenced.storage_prefix(), &others).await?;
     let deletion = DeletionRecord { deployment: fenced.id.clone(), name: name.to_owned(), key_destroyed_at_ms, objects_erased_at_ms: now_ms(), verified_empty };
     update(directory, name, |record| { record.lifecycle = Lifecycle::Deleted; Ok(()) }).await?;
     Ok(deletion)
