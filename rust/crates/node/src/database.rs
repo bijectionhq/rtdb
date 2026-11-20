@@ -37,6 +37,15 @@ impl Database {
     pub fn is_critical(&self) -> bool { self.name == "xtdb" || self.configuration.critical.unwrap_or(false) }
     pub fn startup_replica_target(&self) -> Result<Option<ReplicaPosition>> { self.logs.startup_replica_target() }
     pub fn latest_submitted_position(&self) -> Result<SourcePosition> { self.logs.latest_source_position() }
+    pub(crate) async fn await_durable_source(&self, cancellation: &CancellationToken) -> Result<()> {
+        if self.external_source() {
+            return Err(Anomaly::incorrect("rtdb/source-barrier", "The database ingests transactions outside its source log"));
+        }
+        let logs = Arc::clone(&self.logs);
+        let position = self.io.run_blocking(move || Ok(logs.latest_source_position())).await??;
+        self.replication.await_source(position, cancellation).await
+    }
+
     pub async fn block_lag(&self) -> Result<i64> {
         let current = self.status().adopted_block.as_ref().map_or(-1, |block| block.block_index().0);
         let prefix = rtdb_storage::ObjectKey::new("blocks")?;

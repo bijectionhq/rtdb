@@ -35,6 +35,11 @@
 --
 --      SET TRANSACTION modes is accepted as SQL from every frontend, classified by the SqlParser, so access mode, read basis, commit-opts and the transaction's time zone are all expressible there.
 --
+-- SHOW rtdb_source_barrier waits for the current database to apply the durable source tip it samples during the command.
+-- It is an idle-session operation and does not open or pin a transaction.
+-- A subsequent read on that connection observes at least that applied cut, including submissions from other sessions.
+-- Databases with external transaction sources and nodes without indexing cannot serve this barrier.
+--
 -- == Boundaries ==
 --
 -- Below: db.allium's submitTx / executeTx. A Writing commit drains the buffer and
