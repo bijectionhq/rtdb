@@ -226,7 +226,11 @@ impl Node {
     pub async fn query_context(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let mut snapshots = BTreeMap::new();
+        // A placed node's databases belong to different tenants: a session sees its own database and no other.
+        let isolated = matches!(self.factory.options.membership, Membership::Placed);
+        let database_name = database;
         for (name, database) in self.catalog.open_databases() {
+            if isolated && name != database_name { continue; }
             if identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
             let snapshot = database.partition.open_snapshot(head);

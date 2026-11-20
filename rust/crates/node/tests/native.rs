@@ -1700,3 +1700,21 @@ async fn a_placed_catalog_starts_empty_and_holds_exactly_what_is_attached_and_de
     node.database_or_attach("shop".into(), DatabaseConfig::default()).await.unwrap().expect("the name is free again once drained");
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_session_on_a_placed_node_sees_its_own_database_and_no_other() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, services()).await;
+    for name in ["shop", "blog"] { node.database_or_attach(name.into(), DatabaseConfig::default()).await.unwrap().unwrap(); }
+    let mut blog = node.session("blog", Arc::new(Authority)).unwrap();
+    assert!(blog.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let mut shop = node.session("shop", Arc::new(Authority)).unwrap();
+    assert!(shop.state_mut().execute_tx(vec![put(&node, 1, 20)], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert_eq!(rows(shop.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
+    let reached = match shop.query_sql("SELECT value FROM blog.public.docs", vec![]).await { Ok(cursor) => Some(rows(cursor).await), Err(_) => None };
+    assert!(reached.as_ref().is_none_or(|rows| rows.is_empty()), "another tenant's table is not reachable by name: {reached:?}");
+    assert_eq!(rows(blog.query_sql("SELECT value FROM blog.public.docs", vec![]).await.unwrap()).await, [vec![Value::I64(10)]], "a session still names its own database");
+    drop((shop, blog));
+    stop(&node, driver).await;
+}

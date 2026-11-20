@@ -113,6 +113,7 @@ entity DatabaseCatalog {
     -- A fixed catalog is given its whole set at startup and never writes one, so the MEMBER axis does not apply to it.
     -- It cannot delete a database by omission, because it never overwrites the record.
     -- A placed catalog starts empty and never writes a set either; local admission and local removal are its only instructions.
+    -- Its databases belong to different tenants, so a query on a placed node resolves names in its own database only (rtdb-multi.allium's OneDatabasePerSession).
     membership_source: durable_record | fixed | placed
 
     entries: DatabaseEntry with catalog = this
