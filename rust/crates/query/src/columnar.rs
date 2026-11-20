@@ -98,44 +98,27 @@ impl ColumnBatch {
     }
 }
 
-/// Hashes the batch addresses that identify gather sources; a multiplicative mix suffices for distinct pointers.
-#[derive(Default)]
-pub(crate) struct AddressHasher(u64);
-impl std::hash::Hasher for AddressHasher {
-    fn finish(&self) -> u64 { self.0 }
-    fn write(&mut self, bytes: &[u8]) { for byte in bytes { self.0 = (self.0.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15); } }
-    fn write_usize(&mut self, value: usize) { self.0 = (self.0.rotate_left(5) ^ value as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15); }
-    fn write_i8(&mut self, value: i8) { self.0 = (self.0.rotate_left(5) ^ value as u8 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15); }
-}
-
 /// The put leg each event batch stores a resolved row's cells in.
 struct Source { batch: Arc<IndexBatch>, put: StructArray }
 
-/// Gathers the scan's columns for rows resolved from any number of event batches, in the order given.
 /// Gathers the scan's columns for rows that name their batch by its place in `sources`, in the order given.
 pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBatch>], columns: &[Field], memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
     let mut sources: Vec<Source> = Vec::new();
     // Each batch's operation union, and the sources its put legs became, found once per batch rather than per row.
     let mut batches: Vec<(UnionArray, Vec<(i8, usize)>)> = Vec::new();
-    let mut index: std::collections::HashMap<*const IndexBatch, usize, std::hash::BuildHasherDefault<AddressHasher>> = Default::default();
+    let mut index = vec![usize::MAX; sources_in.len()];
     let mut cells = Vec::with_capacity(rows.len());
-    let mut previous: Option<(*const IndexBatch, usize)> = None;
     for row in rows {
         let (handle, position) = (row.source.0 as usize, row.source.1 as usize);
         let row_batch = sources_in.get(handle).ok_or_else(|| invalid("column-gather", "A resolved row names no batch"))?;
-        let address = Arc::as_ptr(row_batch);
-        let batch = match previous {
-            Some((last, batch)) if last == address => batch,
-            _ => match index.get(&address) {
-                Some(batch) => *batch,
-                None => {
-                    batches.push((row_batch.view().operations()?.clone(), Vec::new()));
-                    index.insert(address, batches.len() - 1);
-                    batches.len() - 1
-                }
-            },
+        let batch = match index[handle] {
+            usize::MAX => {
+                batches.push((row_batch.view().operations()?.clone(), Vec::new()));
+                index[handle] = batches.len() - 1;
+                batches.len() - 1
+            }
+            batch => batch,
         };
-        previous = Some((address, batch));
         let (op, legs) = &mut batches[batch];
         let leg = op.type_id(position);
         let source = match legs.iter().find(|(known, _)| *known == leg) {
