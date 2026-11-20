@@ -909,3 +909,34 @@ async fn a_mixed_width_id_column_filters_and_reads_as_the_row_path_does() {
     let rows = run("SELECT _id, v FROM mixed ORDER BY v").await;
     assert_eq!(ordered, rows);
 }
+
+#[tokio::test]
+async fn a_column_written_at_several_widths_across_transactions_reads_and_filters_as_written() {
+    let memory = MemoryBudget::new(1 << 28);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    let mut written = Vec::new();
+    for tx in 0..4i64 {
+        let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx + 1), system_time: Timestamp(tx + 1) }, Arc::clone(&memory)).unwrap();
+        for n in (tx * 150)..(tx * 150 + 150) {
+            let id = match (tx, n % 3) { (0, _) | (3, 0) => Value::I16(n as i16), (1, _) | (3, 1) => Value::I32(40_000 + n as i32), _ => Value::I64(n) };
+            let w = if tx % 2 == 0 { Value::I64(n) } else { Value::Utf8(format!("w{n}")) };
+            buffer.put(TableRef::new("public", "widths"), StructFields::from([("_id".into(), id.clone()), ("v".into(), Value::F64(n as f64)), ("w".into(), w.clone())]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+            written.push(vec![id, Value::F64(n as f64), w]);
+        }
+        state.apply(&buffer.stage().unwrap()).unwrap();
+    }
+    let context = context(Some(&state), &memory);
+    let run = |sql: &'static str| { let context = Arc::clone(&context); async move {
+        let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        rows_of(statement.open_query(Arc::clone(&context), vec![]).await.unwrap()).await
+    } };
+    let key = |row: &Vec<Value>| match row[1] { Value::F64(v) => v as i64, _ => panic!("v is a float") };
+    let mut rows = run("SELECT _id, v, w FROM widths").await;
+    rows.sort_by_key(key);
+    written.sort_by_key(key);
+    assert_eq!(rows, written);
+    let id = |value: &Value| match value { Value::I16(id) => i64::from(*id), Value::I32(id) => i64::from(*id), Value::I64(id) => *id, _ => panic!("_id is an integer") };
+    let expected = written.iter().filter(|row| id(&row[0]) < 300).collect::<Vec<_>>();
+    let sum: f64 = expected.iter().map(|row| match row[1] { Value::F64(v) => v, _ => 0.0 }).sum();
+    assert_eq!(run("SELECT COUNT(*), SUM(v) FROM widths WHERE _id < 300").await, vec![vec![Value::I64(expected.len() as i64), Value::F64(sum)]]);
+}

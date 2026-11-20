@@ -169,6 +169,7 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
         let array = interleave(&arrays, cells)?;
         return Ok(Column::Arrow { array, field, logical });
     }
+    if !uniform && let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
     cells.iter().map(|&(source, offset)| match &children[source] {
         None => Ok(Value::Null),
         Some((array, field, logical)) => {
@@ -176,6 +177,73 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
             Ok(if matches!(value, Value::Undefined) { Value::Null } else { value })
         }
     }).collect::<Result<Vec<_>>>().map(Column::Values)
+}
+
+/// Gathers a column whose sources store it in different scalar layouts, as a column written with several integer widths
+/// across transactions is, into the dense union of their layouts. `None` where a leg can't be told apart by its layout.
+fn joined_union(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalType>)>], cells: &[(usize, usize)], name: &str) -> Result<Option<Column>> {
+    enum Layout<'a> { Scalar(i8, &'a dyn Array), Union(&'a UnionArray, Vec<Option<i8>>) }
+    let mut logicals = Vec::with_capacity(children.len());
+    for child in children {
+        let Some((_, field, Some(logical))) = child else { return Ok(None) };
+        if !flat(field.data_type()) { return Ok(None); }
+        logicals.push(logical);
+    }
+    let logical = LogicalType::join_all(logicals.iter().copied());
+    let target = rtdb_columnar::to_field(name, &logical)?;
+    let DataType::Union(legs, arrow_schema::UnionMode::Dense) = target.data_type() else { return Ok(None) };
+    let leg_of = |field: &ArrowField| {
+        let mut found = legs.iter().filter(|(_, leg)| leg.data_type() == field.data_type() && leg.metadata() == field.metadata());
+        let (id, _) = found.next()?;
+        found.next().is_none().then_some(id)
+    };
+    let null_leg = legs.iter().find(|(_, leg)| leg.data_type() == &DataType::Null).map(|(id, _)| id);
+    let mut layouts = Vec::with_capacity(children.len());
+    for (array, field, _) in children.iter().flatten() {
+        layouts.push(match field.data_type() {
+            DataType::Union(source_legs, _) => {
+                let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("column-gather", "A union source is not a union"))?;
+                let mut map = vec![None; source_legs.iter().map(|(id, _)| id as usize + 1).max().unwrap_or(0)];
+                for (id, leg) in source_legs.iter() {
+                    let Some(target) = leg_of(leg) else { return Ok(None) };
+                    map[id as usize] = Some(target);
+                }
+                Layout::Union(union, map)
+            }
+            _ => match leg_of(field) { Some(leg) => Layout::Scalar(leg, array.as_ref()), None => return Ok(None) },
+        });
+    }
+    let mut picks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); legs.iter().map(|(id, _)| id as usize + 1).max().unwrap_or(0)];
+    let mut ids = Vec::with_capacity(cells.len());
+    let mut offsets = Vec::with_capacity(cells.len());
+    for &(source, row) in cells {
+        let (leg, offset) = match &layouts[source] {
+            Layout::Scalar(leg, array) if !array.is_null(row) => (*leg, row),
+            Layout::Scalar(..) => match null_leg { Some(leg) => (leg, row), None => return Ok(None) },
+            Layout::Union(union, map) => match map.get(union.type_id(row) as usize).copied().flatten() {
+                Some(leg) => (leg, union.value_offset(row)),
+                None => return Err(invalid("column-gather", "A union cell names no leg")),
+            },
+        };
+        let picked = &mut picks[leg as usize];
+        offsets.push(i32::try_from(picked.len()).map_err(|_| invalid("column-gather", "A union leg exceeds i32 offsets"))?);
+        picked.push((source, offset));
+        ids.push(leg);
+    }
+    let children = legs.iter().map(|(id, leg)| -> Result<ArrayRef> {
+        let picked = &picks[id as usize];
+        if leg.data_type() == &DataType::Null { return Ok(Arc::new(arrow_array::NullArray::new(picked.len()))); }
+        let empty = arrow_array::new_empty_array(leg.data_type());
+        let arrays: Vec<&dyn Array> = layouts.iter().map(|layout| match layout {
+            Layout::Scalar(source, array) if *source == id => *array,
+            Layout::Scalar(..) => empty.as_ref(),
+            Layout::Union(union, map) => map.iter().position(|target| *target == Some(id)).map_or(empty.as_ref(), |source| union.child(source as i8).as_ref()),
+        }).collect();
+        arrow_select::interleave::interleave(&arrays, picked).map_err(|error| invalid("column-gather", error))
+    }).collect::<Result<Vec<_>>>()?;
+    let array = UnionArray::try_new(legs.clone(), datafusion_common::arrow::buffer::ScalarBuffer::from(ids), Some(datafusion_common::arrow::buffer::ScalarBuffer::from(offsets)), children)
+        .map_err(|error| invalid("column-gather", error))?;
+    Ok(Some(Column::Arrow { array: Arc::new(array), field: Arc::new(target), logical: Some(logical) }))
 }
 
 /// Whether Arrow's interleave copies the layout without validating it: nested layouts are rebuilt and checked, and
