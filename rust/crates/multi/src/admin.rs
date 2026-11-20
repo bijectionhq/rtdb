@@ -24,6 +24,50 @@ pub async fn create_deployment(directory: &dyn Directory, name: &str, org: &str,
     directory.create_deployment(record).await
 }
 
+/// Installs the root named by a hosting authority. A retry recovers the
+/// original installation even if the first directory response was lost.
+pub async fn install_deployment(
+    directory: &dyn Directory,
+    id: uuid::Uuid,
+    name: &str,
+    org: &str,
+    replicas: usize,
+) -> Result<DeploymentRecord> {
+    let safe_name = |part: &str| {
+        !part.is_empty() && part.len() <= 128 && part != "." && part != ".."
+            && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    if id.is_nil() || !safe_name(name) || !safe_name(org) || replicas == 0 {
+        return Err(Anomaly::incorrect("rtdb.multi/install-identity", "Invalid deployment installation identity or ensemble size"));
+    }
+    let id = id.to_string();
+    let mut installation = DeploymentRecord::new(name, org, Vec::new(), now_ms());
+    installation.id = id.clone();
+    installation.lineage = installation.id.clone();
+    installation.linearizable_reads = true;
+    let confirm = |installed: DeploymentRecord| {
+        if installed.id == id && installed.org == org && installed.parent.is_none()
+            && installed.linearizable_reads && matches!(installed.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+            && installed.ensemble.len() == replicas
+        {
+            Ok(installed)
+        } else {
+            Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/install-conflict", format!("{name} belongs to another installation")))
+        }
+    };
+    if let Some(existing) = directory.deployment_by_name(name).await? {
+        return confirm(existing);
+    }
+    installation.ensemble = choose_ensemble(directory, &installation, replicas).await?;
+    match directory.create_deployment(installation).await {
+        Ok(stored) => Ok(stored),
+        Err(error) => match directory.deployment_by_name(name).await {
+            Ok(Some(existing)) => confirm(existing),
+            Ok(None) | Err(_) => Err(error),
+        },
+    }
+}
+
 async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
     let now = now_ms();
     let logkeepers: Vec<MemberRecord> = directory.members().await?.into_iter().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).collect();

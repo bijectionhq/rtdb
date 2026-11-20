@@ -792,6 +792,9 @@ given {
 -- Rules: creation
 ------------------------------------------------------------
 
+-- A hosting installer can supply the root identifier with the deployment name and organisation.
+-- Repeating an installation of the same live authority returns its directory record.
+-- A different identifier or organisation cannot take over an installed name.
 rule CreateDeployment {
     -- Creation allocates identity and nothing else: no objects, no log state, no compute.
     when: CreateRequested(org, cell)

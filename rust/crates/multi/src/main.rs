@@ -22,6 +22,7 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--grace SECONDS]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
+       rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
        rtdb-multi status --directory DIR [--target-per-node N]\n\
@@ -208,6 +209,18 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "create" => {
             let directory = directory(arguments.required("directory")?).await?;
             let record = admin::create_deployment(directory.as_ref(), arguments.required("name")?, arguments.optional("org").unwrap_or("default"), arguments.number("replicas", 3usize)?).await?;
+            println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
+            Ok(())
+        }
+        "install" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let raw_id = arguments.required("id")?;
+            let id = uuid::Uuid::parse_str(raw_id).ok().filter(|id| id.to_string() == raw_id)
+                .ok_or_else(|| usage("--id must be a canonical UUID".into()))?;
+            let record = admin::install_deployment(
+                directory.as_ref(), id, arguments.required("name")?, arguments.required("org")?,
+                arguments.number("replicas", 3usize)?,
+            ).await?;
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
             Ok(())
         }

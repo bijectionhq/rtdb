@@ -51,6 +51,10 @@ A gateway started with `--config` uses the node YAML's `server.ssl` key store an
 It terminates that frontend TLS connection before routing startup.
 The node and cross-cell connections still use the cell's private network transport.
 
+Hosting can install its existing deployment authority with `rtdb-multi install --id UUID --name NAME --org ORG`.
+The directory allocates both name and authority conditionally, and an identical retry returns the same deployment.
+This entry point enables linearizable reads on the holder.
+
 **Fixed on the way.**
 
 - A newly activated fork could publish its parent's boundary and trim its own log before its first flush completed.

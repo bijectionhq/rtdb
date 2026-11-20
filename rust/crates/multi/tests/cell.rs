@@ -10,6 +10,29 @@ use rtdb_multi::admin;
 use tokio_postgres::NoTls;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_install_retries_recover_the_same_authority() {
+    let cell = Cell::start(1, None).await;
+    let id = uuid::Uuid::new_v4();
+    let directory = cell.directory.as_ref();
+    let (first, second) = tokio::join!(
+        admin::install_deployment(directory, id, "shop", "acme", 3),
+        admin::install_deployment(directory, id, "shop", "acme", 3),
+    );
+    let installed = first.unwrap();
+    assert_eq!(second.unwrap(), installed);
+    assert_eq!(installed.id, id.to_string());
+    assert!(installed.linearizable_reads);
+    assert!(admin::install_deployment(directory, uuid::Uuid::new_v4(), "shop", "acme", 3).await.is_err());
+    assert!(admin::install_deployment(directory, id, "other", "acme", 3).await.is_err());
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    drop(client);
+    assert_eq!(admin::install_deployment(directory, id, "shop", "acme", 3).await.unwrap().id, installed.id);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deployment_is_served_through_the_gateway_and_survives_its_holder_dying() {
     let mut cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
