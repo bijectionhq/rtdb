@@ -302,13 +302,13 @@ impl<'a> OpenTransaction<'a> {
                 return Ok(());
             }
             Mutation::CreateTable { table, columns } => return self.declare_table(table.table, columns),
-            Mutation::CreateSearchIndex { name, table, columns } => {
+            Mutation::CreateSearchIndex { name, table, columns, history } => {
                 if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A search index cannot cover another database's table")); }
                 check_search_index_name(&name)?;
                 let document = BTreeMap::from([
                     ("_id".into(), Value::Utf8(name)), ("schema_name".into(), Value::Utf8(table.table.schema.clone())), ("table_name".into(), Value::Utf8(table.table.table.clone())),
                     ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())), ("analyzer".into(), Value::Utf8(rtdb_text::SIMPLE_ANALYZER.into())),
-                    ("version".into(), Value::I64(self.tx_key().tx_id.0)),
+                    ("version".into(), Value::I64(self.tx_key().tx_id.0)), ("history".into(), Value::Bool(history)),
                 ]);
                 return self.buffer.put(TableRef::new("xt", "search_indexes"), document, interval(self.tx_key().system_time, Timestamp::MAX)?);
             }

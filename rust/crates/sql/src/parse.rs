@@ -236,7 +236,7 @@ pub(crate) enum Syntax {
     Records { patch: bool, table: ast::ObjectName, records: Vec<ast::Expr> },
     CreateTable { table: ast::ObjectName, columns: Vec<Identifier> },
     GrantRole { user: Identifier, role: Identifier, revoke: bool },
-    CreateSearchIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier> },
+    CreateSearchIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, history: bool },
     DropSearchIndex { name: Identifier },
     Set { name: Vec<Identifier>, value: ast::Expr, local: bool },
     Show(Vec<Identifier>),
@@ -430,8 +430,19 @@ pub(super) fn parse_statement_syntax<'input>(
             if parser.consume_token(&Token::RParen) { break; }
             parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
         }
+        let mut history = true;
+        if word(Some(&parser.peek_token()), "WITH") {
+            parser.next_token();
+            parser.expect_token(&Token::LParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+            let option = parser.next_token();
+            if !word(Some(&option), "HISTORY") { return Err(sql_error("The only search index option is history", sql, option.span)); }
+            parser.expect_token(&Token::Eq).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+            let value = parser.next_token();
+            history = if word(Some(&value), "TRUE") { true } else if word(Some(&value), "FALSE") { false } else { return Err(sql_error("Expected TRUE or FALSE for history", sql, value.span)) };
+            parser.expect_token(&Token::RParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+        }
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after CREATE SEARCH INDEX", sql, parser.peek_token().span)); }
-        Syntax::CreateSearchIndex { name, table, columns }
+        Syntax::CreateSearchIndex { name, table, columns, history }
     } else if word(tokens.first(), "DROP") && word(tokens.get(1), "SEARCH") && word(tokens.get(2), "INDEX") {
         if tokens.len() != 4 { return Err(sql_error("Expected one search index name", sql, slice[0].span)); }
         Syntax::DropSearchIndex { name: identifier_token(&tokens[3])? }

@@ -100,7 +100,11 @@ async fn search_index_definitions_are_documents_as_of_their_transaction() {
     let created_at = Value::Timestamp { value: created.tx_key().system_time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
     let before_drop = "SELECT _id FROM xt.search_indexes FOR SYSTEM_TIME AS OF ?";
     assert_eq!(rows(session.query_sql(before_drop, vec![created_at]).await.unwrap()).await, [vec![Value::Utf8("docs_text".into())]]);
-    for invalid in ["CREATE SEARCH INDEX docs_text ON docs ()", "CREATE SEARCH INDEX docs_text ON docs (_id)", "CREATE SEARCH INDEX docs_text ON docs (body, body)", "DROP SEARCH INDEX"] {
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_now ON docs (body) WITH (history = false)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let histories = rows(session.query_sql("SELECT _id, history FROM xt.search_indexes", vec![]).await.unwrap()).await;
+    assert_eq!(histories, [vec![Value::Utf8("docs_now".into()), Value::Bool(false)]]);
+    for invalid in ["CREATE SEARCH INDEX docs_text ON docs ()", "CREATE SEARCH INDEX docs_text ON docs (_id)", "CREATE SEARCH INDEX docs_text ON docs (body, body)", "DROP SEARCH INDEX",
+        "CREATE SEARCH INDEX docs_text ON docs (body) WITH (depth = false)", "CREATE SEARCH INDEX docs_text ON docs (body) WITH (history = maybe)", "CREATE SEARCH INDEX docs_text ON docs (body) WITH (history = false) extra"] {
         assert!(session.state_mut().execute_tx(vec![sql(invalid)], AutonomousTxOptions::default()).await.map(|result| !result.committed()).unwrap_or(true), "{invalid}");
     }
     node.shutdown();
@@ -523,6 +527,47 @@ async fn not_match_count_and_null_matches_return_what_the_unpushed_predicate_ret
     }
     assert!(nonempty > 10, "the queries find rows to compare");
     assert!(answering.answered.load(Ordering::Relaxed) > 100, "indexed rows were answered from search files");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn an_index_without_history_answers_past_queries_as_scanning_does_with_no_historical_file() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body) WITH (history = false)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let words = ["invoice", "overdue", "paid", "book"];
+    let mut systems = Vec::new();
+    for round in 0..3 {
+        let operations = (0..60).flat_map(|id| [("01", 0), ("07", 1)].map(|(month, half)| sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{} {}', _valid_from: TIMESTAMP '202{round}-{month}-01Z'}}", words[(id + round + half) % 4], words[(id * 3 + round) % 4])))).collect();
+        systems.push(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().tx_key().system_time);
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+        database.compaction().unwrap().compact_all().await.unwrap();
+        database.build_artefacts().await.unwrap();
+    }
+    let docs = TableRef::new("public", "docs");
+    let catalog = database.trie_catalog();
+    let tries = catalog.current_tries(&docs);
+    let recorded = |trie: &&rtdb_index::CatalogTrie| trie.artefacts.iter().any(|record| record.kind() == "search");
+    assert!(tries.iter().any(|trie| trie.key.recency().is_some()), "compaction wrote history to test against");
+    assert!(tries.iter().filter(|trie| trie.key.recency().is_some()).all(|trie| !recorded(trie)), "no historical trie has a search file");
+    assert!(tries.iter().any(|trie| trie.key.recency().is_none() && recorded(trie)), "the current side has search files");
+    for valid in ["2020-03-01Z", "2020-09-01Z", "2021-06-01Z", "2022-09-01Z"] {
+        for system in [Some(systems[0]), Some(systems[1]), None] {
+            let at = format!("FOR VALID_TIME AS OF TIMESTAMP '{valid}'{}", system.map_or(String::new(), |time| format!(" FOR SYSTEM_TIME AS OF TIMESTAMP '{}'", chrono::DateTime::from_timestamp_micros(time.0).unwrap().to_rfc3339())));
+            for query in ["invoice", "overdue paid"] {
+                let pushed = format!("SELECT _id FROM docs {at} WHERE MATCH(body, '{query}')");
+                let unpushed = format!("SELECT _id FROM docs {at} WHERE MATCH(body, '{query}') OR _id < -1");
+                assert_eq!(ids(rows(session.query_sql(&pushed, vec![]).await.unwrap()).await), ids(rows(session.query_sql(&unpushed, vec![]).await.unwrap()).await), "{pushed}");
+            }
+        }
+    }
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

@@ -15,8 +15,9 @@ use crate::driver::Completion;
 
 /// One version of one definition of an artefact kind over one table.
 /// Its version is the id of the transaction that made it, so a snapshot knows every version up to its basis.
+/// One that is not `historical` covers the current side alone.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ArtefactDefinition { pub table: TableRef, pub kind: String, pub id: String, pub version: i64 }
+pub struct ArtefactDefinition { pub table: TableRef, pub kind: String, pub id: String, pub version: i64, pub historical: bool }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ArtefactJob { pub definition: ArtefactDefinition, pub trie: TrieKey }
@@ -56,11 +57,11 @@ pub trait ArtefactPublisher: Send + Sync {
     async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition>;
 }
 
-/// Live tries above level 0 that lack an artefact for a definition, current side first, then higher levels first.
+/// Live tries above level 0 that lack an artefact for a definition, current side first, then higher levels first; historical tries only for a historical definition.
 /// A level-1 current trie below the file size target is rewritten within a block or two, so it is left to the scan.
 pub fn available_artefact_jobs(catalog: &TrieCatalog, definitions: &[ArtefactDefinition]) -> Vec<ArtefactJob> {
     let mut jobs: Vec<_> = definitions.iter().flat_map(|definition| catalog.current_tries(&definition.table).into_iter()
-        .filter(|trie| trie.state == TrieState::Live && trie.key.level() > 0)
+        .filter(|trie| trie.state == TrieState::Live && trie.key.level() > 0 && (definition.historical || trie.key.recency().is_none()))
         .filter(|trie| !(trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < catalog.file_size_target()))
         .filter(|trie| trie.artefact(&definition.kind, &definition.id, definition.version).is_none())
         .map(|trie| ArtefactJob { definition: definition.clone(), trie: trie.key.clone() })).collect();

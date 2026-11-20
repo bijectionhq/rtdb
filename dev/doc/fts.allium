@@ -40,6 +40,8 @@ value SearchIndexDefinition {
     analyzer: String
     -- The defining transaction's id, so redefining an index under its name is a new version.
     version: Integer
+    -- False when the index covers the current side alone: `WITH (history = false)`; a document without it covers history.
+    history: Boolean
 
     -- Derived
     -- The artefact definition id names the analyzer and search file format versions, so a change to either builds new search files rather than reading old ones.
@@ -96,7 +98,8 @@ config {
 ------------------------------------------------------------
 
 rule DefineSearchIndex {
-    -- CREATE SEARCH INDEX name ON table (column, ...) is a transaction; the indexer writes its document at the transaction's system time, valid from then on.
+    -- CREATE SEARCH INDEX name ON table (column, ...) [WITH (history = true | false)] is a transaction; the indexer writes its document at the transaction's system time, valid from then on.
+    -- An index covers history by default; without it, the lane builds no historical trie's search file, and a past query reads those tries through files its node builds.
     when: SearchIndexDefined(definition)
 
     ensures:
@@ -116,8 +119,8 @@ rule DropSearchIndex {
 ------------------------------------------------------------
 
 -- Search jobs are the artefact lane's jobs (maintenance/src/artefact.rs: available_artefact_jobs) for the definitions in force:
--- a live trie above level 0, other than a level-1 current trie below the file size target, lacking an artefact for the definition's artefact id and version.
--- Level 0 and the partial level-1 current trie are rewritten within a block or two, so the scan evaluates MATCH on them directly.
+-- a live trie above level 0, other than a level-1 current trie below the file size target, and other than a historical trie for a definition without history, lacking an artefact for the definition's artefact id and version.
+-- Level 0 and the partial level-1 current trie are rewritten within a block or two, so a node builds their search files itself when a query needs them.
 -- Jobs run current side first, then higher levels first.
 
 rule SearchJobRuns {
@@ -172,6 +175,7 @@ rule RepairUnreadableSearchFile {
 -- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
 --
 --   1. The scan selects tries exactly as it does without MATCH.
+--      A trie whose recency is at or before the earlier of the query's valid and system lower bounds holds no event the query can see, so no search file of it is read or built.
 --   2. A selected trie whose entry records a search file for that definition contributes the IIDs of its docs whose terms satisfy the query.
 --      A doc whose own valid interval misses the query's, whose system-from is at or after the query's system upper bound, or whose recency is at or before the earlier of the query's valid and system lower bounds, contributes nothing.
 --   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
@@ -318,8 +322,6 @@ surface FullTextSearch {
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
-
-open question "Is the historical side indexed by default, or only on request? As-of-now queries read the current side and recent historical partitions only."
 
 open question "How does fan-out scale? Every current-side search file is a candidate for every query, one per ~100MB trie; term blooms on the artefact record, and search files spanning a completed partition group, are the levers."
 

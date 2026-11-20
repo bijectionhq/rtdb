@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 /// One version of a search index definition, as `xt.search_indexes` holds it (fts.allium: SearchIndexDefinition).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SearchDefinition { pub name: String, pub table: TableRef, pub columns: Vec<String>, pub version: i64 }
+pub struct SearchDefinition { pub name: String, pub table: TableRef, pub columns: Vec<String>, pub version: i64, pub history: bool }
 
 impl SearchDefinition {
     /// The artefact definition id names the analyzer and file format versions, so a change to either builds new search files rather than reading old ones.
@@ -25,7 +25,7 @@ pub async fn definitions_in(database: &str, partitions: Vec<Snapshot>, storage: 
     if !partitions.iter().any(|snapshot| snapshot.contains_table(&table)) { return Ok(Vec::new()); }
     let catalog = CatalogSnapshot::new(database, BTreeMap::from([(database.to_string(), DatabaseSnapshot { partitions, storage })]), false)?;
     let context = QueryContext::new(catalog, Arc::clone(&memory), now, "UTC", QueryOptions::default(), cancellation)?;
-    let sql = "SELECT _id, schema_name, table_name, columns, version FROM xt.search_indexes";
+    let sql = "SELECT _id, schema_name, table_name, columns, version, history FROM xt.search_indexes";
     let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory)?;
     let mut cursor = PreparedQuery::from_prepared(prepared, &memory)?.execute(context, Vec::new()).await?;
     let mut definitions = Vec::new();
@@ -37,7 +37,9 @@ pub async fn definitions_in(database: &str, partitions: Vec<Snapshot>, storage: 
             let text = |value: Value| match value { Value::Utf8(text) => Ok(text), other => Err(malformed(&other)) };
             let columns = match cell(3)? { Value::List(values) => values.into_iter().map(text).collect::<Result<Vec<_>>>()?, other => return Err(malformed(&other)) };
             let version = match cell(4)? { Value::I64(version) => version, other => return Err(malformed(&other)) };
-            definitions.push(SearchDefinition { name: text(cell(0)?)?, table: TableRef::new(text(cell(1)?)?, text(cell(2)?)?), columns, version });
+            // A definition written before the option existed covers history.
+            let history = match cell(5)? { Value::Bool(history) => history, Value::Null => true, other => return Err(malformed(&other)) };
+            definitions.push(SearchDefinition { name: text(cell(0)?)?, table: TableRef::new(text(cell(1)?)?, text(cell(2)?)?), columns, version, history });
         }
     }
     definitions.sort();

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn trie(key: &str, size: i64) -> CatalogTrie { CatalogTrie { key: key.parse().unwrap(), data_file_size: size, metadata: None, state: TrieState::Live, artefacts: Vec::new() } }
-fn definition(id: &str) -> ArtefactDefinition { ArtefactDefinition { table: table(), kind: "search".into(), id: id.into(), version: 1 } }
+fn definition(id: &str) -> ArtefactDefinition { ArtefactDefinition { table: table(), kind: "search".into(), id: id.into(), version: 1, historical: true } }
 fn record(id: &str) -> ArtefactRecord { ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None } }
 fn catalog() -> TrieCatalog {
     let mut catalog = TrieCatalog::new(100).unwrap();
@@ -33,6 +33,8 @@ fn settled_live_tries_lacking_an_artefact_become_jobs_current_side_and_higher_le
     let recorded = catalog.with_artefacts(&table(), jobs.iter().map(|job| (job.trie.clone(), record("body"))));
     assert!(available_artefact_jobs(&recorded, &[definition("body")]).is_empty());
     assert_eq!(available_artefact_jobs(&recorded, &[definition("title")]).len(), jobs.len());
+    let current_only = ArtefactDefinition { historical: false, ..definition("body") };
+    assert_eq!(keys(&available_artefact_jobs(&catalog, &[current_only])), ["body:l02-rc-p0-b00", "body:l02-rc-p1-b00", "body:l02-rc-p2-b00", "body:l02-rc-p3-b00"], "a definition without history leaves historical tries alone");
 }
 
 struct Builder { built: Mutex<Vec<ArtefactJob>> }

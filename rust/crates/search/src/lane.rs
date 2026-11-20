@@ -59,7 +59,7 @@ impl ArtefactBuilder for SearchBuilder {
         Ok(definitions.iter().map(|definition| {
             let id = definition.artefact_id();
             columns.insert((id.clone(), definition.version), definition.columns.clone());
-            ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version }
+            ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version, historical: definition.history }
         }).collect())
     }
 

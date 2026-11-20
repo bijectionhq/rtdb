@@ -118,19 +118,23 @@ impl SearchAccelerator {
         }
     }
 
-    /// The search files of the partition's live tries: every trie's, its recorded one or one this node builds from its data file, unless the tries the lane should have indexed but has not exceed max_unindexed_bytes.
-    /// The lane never indexes level 0 or the partial level-1 current trie, so those do not count.
+    /// The search files of the partition's live tries that can hold a visible event: every such trie's, its recorded one or one this node builds from its data file, unless the tries the lane should have indexed but has not exceed max_unindexed_bytes.
+    /// The lane never indexes level 0, the partial level-1 current trie, or history for a definition that excludes it, so those do not count.
     async fn trie_files(&self, request: &ScanRequest<'_>, definition: &SearchDefinition) -> Result<TrieFiles> {
         let (snapshot, table) = (request.snapshot, &request.scan.table.name.table);
         let Some(entry) = snapshot.table_entry(table) else { return Ok(TrieFiles::Complete(Vec::new())) };
         let mut files = Vec::new();
         let mut unbuilt = Vec::new();
         let mut unindexed = 0i64;
-        for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live) {
+        let earliest = request.bounds.valid_time.lower().0.min(request.bounds.system_time.lower().0);
+        // A trie's recency bounds its rows' recency above, so a trie at or before the query's earliest instant holds nothing it can see.
+        let visible = |trie: &&rtdb_index::CatalogTrie| trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
+        for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).filter(visible) {
             let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
             let recorded = match Self::recorded_key(snapshot, table, trie, definition)? { Some(key) => self.recorded(request, key, trie, definition).await?, None => None };
             if let Some((key, file)) = recorded { files.push(TrieFile { data, identity: key.as_str().to_string(), file }); continue; }
-            let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < snapshot.trie_catalog().file_size_target());
+            let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < snapshot.trie_catalog().file_size_target())
+                || (!definition.history && trie.key.recency().is_some());
             if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
             unbuilt.push(data);
         }
