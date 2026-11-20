@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
@@ -60,6 +60,11 @@ impl std::fmt::Debug for ControlKey {
 
 const CONTROL_SCOPE: &str = "~control";
 
+/// The longest request a node reads.
+const MAXIMUM_REQUEST_BYTES: u64 = 1 << 20;
+/// The longest response a caller reads: a fragment's rows, in base64, are the largest.
+pub const MAXIMUM_RESPONSE_BYTES: u64 = 96 << 20;
+
 impl ControlKey {
     fn grant(&self) -> Option<String> { self.0.as_ref().map(|secret| secret.mint(CONTROL_SCOPE, "~cell-member", false, Duration::from_secs(30))) }
     fn admit(&self, grant: Option<&str>) -> Result<()> {
@@ -98,7 +103,7 @@ pub async fn serve(listener: TcpListener, handler: Arc<dyn Handler>, key: Contro
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let mut line = String::new();
-            if BufReader::new(read).read_line(&mut line).await.is_err() { return; }
+            if BufReader::new(read.take(MAXIMUM_REQUEST_BYTES)).read_line(&mut line).await.is_err() { return; }
             let response = match serde_json::from_str::<Envelope>(&line) {
                 Ok(envelope) => match key.admit(envelope.control_grant.as_deref()) {
                     Ok(()) => handler.handle(envelope.request).await,
@@ -121,7 +126,8 @@ pub async fn call(address: &str, request: &Request, timeout: Duration, key: &Con
         bytes.push(b'\n');
         write.write_all(&bytes).await.map_err(io)?;
         let mut line = String::new();
-        BufReader::new(read).read_line(&mut line).await.map_err(io)?;
+        BufReader::new(read.take(MAXIMUM_RESPONSE_BYTES)).read_line(&mut line).await.map_err(io)?;
+        if !line.ends_with('\n') { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/control-response-size", format!("{address} answered with more than the largest response a caller reads"))); }
         serde_json::from_str::<Response>(&line).map_err(|error| Anomaly::fault("rtdb.multi/control-response", error.to_string()))
     };
     tokio::time::timeout(timeout, exchange).await
@@ -129,3 +135,26 @@ pub async fn call(address: &str, request: &Request, timeout: Duration, key: &Con
 }
 
 fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/control-io", error.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Answers;
+    #[async_trait]
+    impl Handler for Answers { async fn handle(&self, _: Request) -> Response { Response::Done } }
+
+    #[tokio::test]
+    async fn a_node_reads_no_more_of_a_request_than_the_largest_it_takes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, Arc::new(Answers), ControlKey::default(), CancellationToken::new()));
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let _ = stream.write_all(&vec![b'x'; 2 << 20]).await;
+        let mut answer = String::new();
+        BufReader::new(stream).read_line(&mut answer).await.unwrap();
+        assert!(matches!(serde_json::from_str::<Response>(&answer).unwrap(), Response::Refused { .. }), "an oversized request is refused, not read whole: {answer}");
+        assert!(matches!(call(&address.to_string(), &Request::Ping, Duration::from_secs(5), &ControlKey::default()).await.unwrap(), Response::Done));
+    }
+}
+

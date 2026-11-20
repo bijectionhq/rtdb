@@ -313,6 +313,10 @@ impl NodeAgent {
         }
         self.touch(name);
         let bytes = self.node.scan_fragment(fragment, self.options.fragments.catch_up, &CancellationToken::new()).await?;
+        // A slice too large to answer in one response is read by its coordinator instead.
+        if bytes.len() as u64 > crate::control::MAXIMUM_RESPONSE_BYTES / 4 * 3 - 1024 {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/fragment-too-large", format!("A fragment of {name} is larger than one response carries")));
+        }
         let table = fragment.table();
         *self.fragments_read.lock().entry((name.to_owned(), format!("{}.{}", table.schema, table.table), fragment.prefix.to_string())).or_default() += 1;
         Ok(Response::Fragment { batches: base64::engine::general_purpose::STANDARD.encode(bytes) })
