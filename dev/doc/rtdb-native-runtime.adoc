@@ -67,3 +67,11 @@ Those scenarios remain unexecuted and do not establish production fencing, remot
 
 Compilation starts only after the complete source review passes.
 The assertion ledger, runtime denominator, release matrix, matched performance measurements and migration/rollback evidence remain delivery requirements.
+
+
+== Reading after a durable source barrier
+
+Run `SHOW rtdb_source_barrier` outside a transaction before opening a read that must observe transactions already submitted by other clients.
+The command reads the current database's durable source position and waits for local apply through that position.
+Read on the same connection once the command returns `1`.
+The command returns an error on a node without an indexer or a database that ingests transactions through an external source.

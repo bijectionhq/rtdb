@@ -79,6 +79,39 @@ fn put(node: &Node, id: i64, value: i64) -> TxOp {
 }
 
 #[tokio::test]
+async fn source_barrier_waits_for_submitted_transactions_before_the_next_read() {
+    let (node, driver) = Node::open(options(), services()).await.unwrap();
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    writer.state_mut().submit_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(node.catalog().database("xtdb").unwrap().progress().current().tx_key.is_none());
+
+    let token = reader.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("SHOW rtdb_source_barrier", &Default::default()).unwrap().unwrap();
+    let mut barrier = Box::pin(reader.execute_control(&statement, &[], &token));
+    assert!(barrier.as_mut().now_or_never().is_none());
+    let driver = tokio::spawn(driver.run());
+    let ControlResult::Rows(show) = barrier.await.unwrap() else { panic!("expected a barrier acknowledgement"); };
+    assert_eq!(rows(show).await, [vec![Value::Utf8("1".into())]]);
+    assert_eq!(reader.state().status(), TransactionStatus::Idle);
+    assert_eq!(rows(reader.query_sql("SELECT value FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn source_barrier_refuses_a_node_without_an_indexer() {
+    let mut config = options();
+    config.replication.enabled = false;
+    let (node, driver) = Node::open(config, services()).await.unwrap();
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = reader.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("SHOW rtdb_source_barrier", &Default::default()).unwrap().unwrap();
+    let Err(error) = reader.execute_control(&statement, &[], &token).await else { panic!("barrier passed without an indexer"); };
+    assert_eq!(error.code, "xtdb/log-processor-not-initialised");
+    driver.close_without_run().await.unwrap();
+}
+
+#[tokio::test]
 async fn read_transaction_pinned_before_ingestion_retains_a_null_partition_time() {
     let (node, driver) = running(options(), services()).await;
     let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();

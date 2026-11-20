@@ -203,6 +203,17 @@ impl Node {
     fn ensure_indexing(&self) -> Result<()> {
         if self.factory.options.replication.enabled { Ok(()) } else { Err(Anomaly::fault("xtdb/log-processor-not-initialised", "log processor not initialised")) }
     }
+    pub(crate) async fn await_durable_source(
+        &self, database: &str, identity: &dyn SessionIdentity, cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        self.ensure_indexing()?;
+        let database = self.catalog.database(database)?;
+        let barrier = cancellation.run_until_cancelled(database.await_durable_source(cancellation));
+        tokio::time::timeout(Duration::from_secs(60), barrier)
+            .await.map_err(|_| timeout_error())?.ok_or_else(cancelled)?
+    }
+
     pub async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         self.ensure_open()?;
         let Some(basis) = basis else { return Ok(()); };
