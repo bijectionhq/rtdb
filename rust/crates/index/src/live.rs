@@ -734,4 +734,19 @@ mod chunk_tests {
         drop((located, relocated, live, appended));
         assert_eq!(memory.used_bytes(), 0, "located rows are released with the table that holds them");
     }
+
+    #[test]
+    fn a_table_written_a_row_per_transaction_with_long_string_ids_merges_its_chunks() {
+        let memory = MemoryBudget::new(1 << 26);
+        let table = TableRef::new("public", "keys");
+        let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+        for id in 0..1000i64 {
+            let key = format!("{id:032x}/0");
+            let event = StoredEvent { iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Utf8(key))])), recency: None };
+            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id))
+                .unwrap_or_else(|error| panic!("row {id}: {error:?}"));
+        }
+        assert!(live.chunks.len() <= 16, "{} chunks", live.chunks.len());
+    }
 }
