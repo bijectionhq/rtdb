@@ -81,3 +81,20 @@ async fn versions_one_transaction_wrote_resolve_in_its_order_after_compaction_sp
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn compaction_merges_a_column_holding_text_numbers_and_nothing() {
+    let (node, driver) = Node::open(options(), services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    for (id, record) in [(0, "body: 'text'"), (1, "body: 42"), (2, "title: 'untitled'"), (3, "body: 'more text'")] {
+        assert!(session.state_mut().execute_tx(vec![sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, {record}}}"))], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    assert_eq!(rows(session.query_sql("SELECT _id FROM docs ORDER BY _id", vec![]).await.unwrap()).await.len(), 4);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
