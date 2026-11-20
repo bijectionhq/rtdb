@@ -108,6 +108,10 @@ pub trait ObjectStore: Send + Sync {
     /// The object as a file on this node's disk, for a reader that maps it rather than holding its bytes; `None` where the store keeps no local file.
     async fn local_file(&self, _key: &ObjectKey) -> Result<Option<LocalFile>> { Ok(None) }
 
+    /// Opens an immutable object backed by this node's local storage.
+    /// The open file remains readable after a concurrent delete.
+    async fn open_local_object(&self, _key: &ObjectKey) -> Result<Option<File>> { Ok(None) }
+
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
         self.put(destination, self.get(source).await?).await
     }
@@ -394,8 +398,12 @@ impl ObjectStore for LocalStore {
 
     /// A local object is never rewritten under its key, and an open file outlives a delete, so the file is the object for as long as it is held.
     async fn local_file(&self, key: &ObjectKey) -> Result<Option<LocalFile>> {
+        Ok(self.open_local_object(key).await?.map(|file| LocalFile::new(file, None)))
+    }
+
+    async fn open_local_object(&self, key: &ObjectKey) -> Result<Option<File>> {
         let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || Ok(Some(LocalFile::new(open_object(&path, &key)?, None)))).await
+        self.io.run(move || Ok(Some(open_object(&path, &key)?))).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<()> {

@@ -6,7 +6,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_format::{data::{StoredEvent, StoredOperation, EventBatch, build_event_batch}, ipc::{ArrowFile, write_file}, keys::{TableSlug, TrieKey}, metadata::{MetadataBuilder, MetadataFile, MetadataNode}};
 use rtdb_index::{PartitionState, PartitionValue, TableCatalog, TrieCatalog};
 use rtdb_maintenance::{CompactionExecutor, CompactionJob, MergeConfig, RecencyMode, SegmentCompactor, RecencyPartition, recency_partition};
-use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
+use rtdb_storage::{LocalStore, MemoryStore, ObjectKey, ObjectStore};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{BlockIndex, Iid, Interval, LogicalType, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
@@ -168,6 +168,62 @@ async fn compaction_preserves_raw_decimal_coefficients_in_current_and_historical
     assert_eq!(actual, BTreeMap::from([((false, events[0].system_from), events[0].operation.clone()), ((true, events[1].system_from), events[1].operation.clone())]));
     assert_eq!(executor.execute(&job, &CancellationToken::new()).await.unwrap(), notification);
     for (object, bytes) in written { assert_eq!(store.get(&object).await.unwrap(), bytes); }
+    assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn local_compaction_inputs_can_exceed_the_job_temporary_disk_budget() {
+    let temporary = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalStore::open(storage.path()).unwrap());
+    let fallback = Arc::new(MemoryStore::default());
+    let table = TableRef::new("public", "docs");
+    let slug = TableSlug::for_unrecorded_table(&table).unwrap();
+    let input = TrieKey::l0(BlockIndex(0)).unwrap();
+    let output = TrieKey::new(1, None, vec![], BlockIndex(0)).unwrap();
+    let row = StoredEvent {
+        iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+        operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(42))])),
+        recency: None,
+    };
+    let data = build_event_batch(
+        std::slice::from_ref(&row), Some(StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None,
+    ).unwrap();
+    let mut metadata = MetadataBuilder::new(false, true);
+    metadata.write_leaf(&data).unwrap();
+    let (metadata, _) = metadata.finish().unwrap();
+    let mut bytes = write_file(&data.schema(), &[data]).unwrap();
+    let trailer = bytes.len() - 10;
+    let footer_size = i32::from_le_bytes(bytes[trailer..trailer + 4].try_into().unwrap()) as usize;
+    let footer = trailer - footer_size;
+    bytes.splice(footer..footer, std::iter::repeat_n(0, 512 * 1024));
+    let data_key = ObjectKey::new(slug.data_key(&input)).unwrap();
+    let meta_key = ObjectKey::new(slug.metadata_key(&input)).unwrap();
+    let bytes = Bytes::from(bytes);
+    let metadata = Bytes::from(metadata.write().unwrap());
+    store.put(&data_key, bytes.clone()).await.unwrap();
+    store.put(&meta_key, metadata.clone()).await.unwrap();
+    fallback.put(&data_key, bytes).await.unwrap();
+    fallback.put(&meta_key, metadata).await.unwrap();
+
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    let memory = MemoryBudget::new(64 << 20);
+    let executor = SegmentCompactor::new(store.clone(), state.clone(), memory.clone(), StorageVersion(6), StorageEpoch(0), MergeConfig {
+        temporary_directory: temporary.path().into(), temporary_byte_limit: 64 * 1024, ..Default::default()
+    }).unwrap();
+    let job = CompactionJob { table, inputs: vec![input], part: vec![], output: output.clone(), recency_mode: RecencyMode::Partition };
+    let fallback_executor = SegmentCompactor::new(fallback.clone(), state, memory.clone(), StorageVersion(6), StorageEpoch(0), MergeConfig {
+        temporary_directory: temporary.path().into(), ..Default::default()
+    }).unwrap();
+    let local_result = executor.execute(&job, &CancellationToken::new()).await.unwrap();
+    let fallback_result = fallback_executor.execute(&job, &CancellationToken::new()).await.unwrap();
+    assert_eq!(local_result, fallback_result);
+    for key in [slug.data_key(&output), slug.metadata_key(&output)] {
+        let key = ObjectKey::new(key).unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), fallback.get(&key).await.unwrap());
+    }
     assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
     assert_eq!(memory.used_bytes(), 0);
 }

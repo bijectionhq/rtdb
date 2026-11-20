@@ -147,6 +147,19 @@ pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: 
     Ok(file)
 }
 
+async fn open_stored_input(
+    store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, directory: &Path,
+    file_name: &str, disk_limit: u64, cancellation: &CancellationToken,
+) -> Result<File> {
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    if let Some(file) = store.open_local_object(key).await.map_err(crate::invalid)? {
+        return Ok(file);
+    }
+    let size = store.head(key).await.map_err(crate::invalid)?.size;
+    check_disk(directory, disk_limit, size)?;
+    download(store, memory, key, &directory.join(file_name), cancellation).await
+}
+
 pub fn open_input(mut file: File, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
     let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
     let reservation = memory.reserve(layout.opening_allocation_bound()?)?;
@@ -245,10 +258,10 @@ impl CompactionExecutor for SegmentCompactor {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let data_key = ObjectKey::new(entry.slug.data_key(key)).map_err(crate::invalid)?;
             let meta_key = ObjectKey::new(entry.slug.metadata_key(key)).map_err(crate::invalid)?;
-            let size = self.store.head(&data_key).await.map_err(crate::invalid)?.size.checked_add(self.store.head(&meta_key).await.map_err(crate::invalid)?.size).ok_or_else(|| crate::invalid("Input file size overflow"))?;
-            check_disk(directory.path(), self.config.temporary_byte_limit, size)?;
-            let data = download(self.store.as_ref(), &self.memory, &data_key, &directory.path().join(format!("input-{index}.arrow")), cancellation).await?;
-            let mut metadata = download(self.store.as_ref(), &self.memory, &meta_key, &directory.path().join(format!("meta-{index}.arrow")), cancellation).await?;
+            let data = open_stored_input(self.store.as_ref(), &self.memory, &data_key, directory.path(),
+                                         &format!("input-{index}.arrow"), self.config.temporary_byte_limit, cancellation).await?;
+            let mut metadata = open_stored_input(self.store.as_ref(), &self.memory, &meta_key, directory.path(),
+                                                 &format!("meta-{index}.arrow"), self.config.temporary_byte_limit, cancellation).await?;
             let metadata_layout = inspect_file_reserved(&mut metadata, |bytes| self.memory.reserve(bytes))?;
             let metadata_charge = self.memory.reserve(metadata_layout.full_allocation_bound()?)?;
             let metadata = MetadataFile::read_reader(metadata)?;

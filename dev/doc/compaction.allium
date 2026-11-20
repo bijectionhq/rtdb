@@ -130,6 +130,9 @@ config {
 --
 -- Input data and metadata files may use Arrow LZ4-frame or Zstandard buffer compression.
 -- Decompression preserves the rows and metadata supplied to the merge.
+-- Native compaction reads inputs directly from node-local backing storage.
+-- The open file stays available to the job throughout its reads.
+-- Downloaded inputs and intermediate outputs count toward the job's temporary disk budget.
 -- Similarly to the scan operator, we calculate a list of merge tasks.
 -- An input page from an unresolved segment (an L0 file, or the live index) first has its same-system-time events resolved against each other.
 -- Their order holds only within their page, and the recency split separates them into different files.
