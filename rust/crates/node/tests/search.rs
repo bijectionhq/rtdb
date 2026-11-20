@@ -180,6 +180,11 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
             };
             let result = session.state_mut().execute_tx(vec![execute(statement)], AutonomousTxOptions::default()).await.unwrap();
             if id == 0 { systems.push(result.tx_key().system_time); }
+            // Two blocks a round make four full level-1 tries by the second, which compact into a level-2 partition group.
+            if id == 74 && round < 3 {
+                database.flush().await.unwrap();
+                node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+            }
         }
         if round < 3 {
             database.flush().await.unwrap();
@@ -189,6 +194,12 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
         }
     }
     let ids = |rows: Vec<Vec<Value>>| { let mut ids: Vec<_> = rows.into_iter().map(|row| row[0].clone()).map(|value| match value { Value::I64(id) => id, other => panic!("{other:?}") }).collect(); ids.sort_unstable(); ids };
+    let shared: Vec<_> = database.trie_catalog().current_tries(&TableRef::new("public", "docs")).into_iter()
+        .filter(|trie| trie.artefacts.iter().any(|record| record.kind() == "search" && record.scope() == rtdb_format::log::proto::ArtefactScope::PartGroup))
+        .map(|trie| trie.key.clone()).collect();
+    let groups: std::collections::BTreeSet<_> = shared.iter().filter_map(|key| key.part_group()).collect();
+    assert_eq!(shared.len(), groups.len() * 4, "every member of a group shares its file: {shared:?}");
+    assert!(shared.iter().any(|key| key.level() == 2 && key.recency().is_none()), "the level-2 partition group's members share one search file: {shared:?}");
     let mut compared = 0;
     let mut answers = std::collections::BTreeMap::<&str, std::collections::BTreeSet<Vec<i64>>>::new();
     for query in ["overdue", "invoice overdue", "red blue", "paid book", "absent", "\"red blue\"", "overdue \"late book\""] {

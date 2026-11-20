@@ -6,7 +6,7 @@ The behavioural specification is link:fts.allium[fts.allium]; this file is the i
 == Shape
 
 Search is a plugin behind generic extension points in the core.
-The core knows only that a trie may carry *derived artefacts*: extra files built from the trie's data file, recorded on its catalog entry, persisted with it, and deleted with it.
+The core knows only that a trie may carry *derived artefacts*: extra files built from a trie's data file or its group's data files and recorded on the relevant catalog entries.
 It does not know what a search index is.
 
 [cols="1,3"]
@@ -14,17 +14,19 @@ It does not know what a search index is.
 | Core extension point | What search plugs into it
 
 | Artefact records on `TrieDetails` (`format`, `index`)
-| A record per search file: kind `search`, the index definition's id and version, and opaque statistics.
+| A record per search file carries kind `search`, the index definition's id and version, opaque statistics, and the scope.
+  A shared file is recorded on every member.
 
 | `ArtefactsAdded` and `ArtefactsRemoved` source and replica messages (`replication`)
 | The index lane publishes a built search file; the leader accepts it while its trie is live and every node records it.
-  The lane publishes the removal of a retired one's record, and every node removes it.
+  The lane publishes removal of the retired file's records, and every node removes them.
 
 | Artefact deletion in trie GC (`maintenance`)
-| A garbage trie's artefacts are deleted, by listing its artefact prefix, before its data and meta files.
+| GC deletes a trie's artefacts before its data and meta files.
+  It deletes shared files when it collects the last member.
 
 | The artefact lane (`maintenance`)
-| A deterministic job per (live trie, definition) lacking an artefact, run like compaction jobs.
+| A deterministic job per eligible live trie or partition group lacking a file, run like compaction jobs.
   Once a definition leaves force, the lane retires its artefacts: it publishes `ArtefactsRemoved` for their records, then deletes their objects, unrecorded ones included.
 
 | The scan accelerator (`query`)
@@ -45,7 +47,12 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
 == Decisions
 
 * *Index text runs, with where they are visible.*
-  A search file covers exactly one trie data file; a document is every version of one entity there with the same indexed values, with its rectangles of valid time × system time, from the scan's own resolver.
+  A search document is a run of one entity's versions with the same tokens in one column, with its visibility rectangles from the scan's own resolver.
+* *A partition group shares one file.*
+  Each tiered compaction job writes one bucket, so the lane waits until all sibling tries are live.
+  It indexes eligible siblings in bucket order when their combined data fits `GROUP_BYTES` and a quarter of the node's memory budget.
+  Compaction still builds search files inline for eligible outputs that cannot form a shared file based on their own key or size.
+  A scan reads a shared file once and takes candidates and row-level MATCH answers from its selected members.
 * *A search file only nominates candidates, and answers MATCH exactly.*
   The scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
   A `MATCH` with a constant query in a scan predicate becomes a column the scan evaluates: from the search file of the row's data file, null included, and from the row's value where there is none.
@@ -54,7 +61,7 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
 * *Tokens are ours, postings are tantivy's.*
   `rtdb-text` analyses text (Unicode word split, lowercasing); the search file feeds tantivy pre-tokenized strings, so the residual check and the index agree token for token.
 * *Byte-deterministic search files.*
-  Segment ids derive from the trie key and definition, the writer is single-threaded with no merges, and the bundle orders its files by name.
+  Segment ids derive from the artefact owner and definition, the writer is single-threaded with no merges, and the bundle orders its files by name.
   Two builders of one job write identical bytes to one key.
 * *Definitions are documents.*
   `xt.search_indexes` is written by the indexer, so the definitions in force are a function of log position and readable as of any basis.
@@ -70,6 +77,10 @@ Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 | Artefact records and messages
 | `format/src/keys.rs`, `index/src/trie_catalog.rs`, `replication/src/driver.rs` (`accept_artefacts`)
 | `index/tests/catalogs.rs`, `replication/src/tests.rs`
+
+| Partition-group artefacts
+| `format/src/keys.rs` (`PartGroup`, `ArtefactOwner`), `maintenance/src/artefact.rs`, `maintenance/src/gc.rs`
+| `format/tests/persistence.rs`, `maintenance/tests/artefacts.rs`, `maintenance/tests/gc.rs`, `replication/src/tests.rs`
 
 | Artefact GC
 | `maintenance/src/gc.rs`
@@ -87,9 +98,9 @@ Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 | `sql/src/parse.rs`, `tx/src/resolver.rs`
 | `node/tests/search.rs`
 
-| Search files
-| `search/src/file.rs`
-| `search/src/file.rs`
+| Search files for a trie or a partition group
+| `search/src/file.rs`, `search/src/lane.rs`, `search/src/accelerate.rs`
+| `search/src/file.rs`, `search/src/accelerate.rs`, `node/tests/search.rs`
 
 | Lane builder, switches
 | `search/src/lane.rs`, `node/src/node.rs`, `server/src/config`
@@ -104,4 +115,4 @@ Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 
 == Deferred
 
-* Indexing the historical side, and search files spanning a completed partition group.
+* Indexing the historical side, and search files spanning several partition groups.

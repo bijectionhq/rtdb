@@ -51,7 +51,7 @@ value ArtefactRecord {
 enum ArtefactScope { trie | part_group }
 
 value PartGroup {
-    -- The branch_factor sibling tries one tiered compaction job writes at one block (rule InsertTrie_General): the same level, recency and parent part, one per bucket.
+    -- The branch_factor sibling outputs of tiered compaction at one block (rule InsertTrie_General): the same level, recency and parent part, one per bucket.
     -- Only tiered tries belong to one: current tries at level 2 and up, and historical tries at level 3 and up.
     -- The members become live together and are each superseded on their own, so a group-scoped artefact serves whichever members are live.
     -- See: format/src/keys.rs (PartGroup)

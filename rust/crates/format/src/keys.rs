@@ -159,10 +159,10 @@ impl TrieKey {
     }
 }
 
-/// How many sibling tries a tiered compaction job writes, one per IID bucket under their parent part.
+/// How many sibling tries complete a tiered partition group, one per IID bucket under their parent part.
 pub const BRANCH_FACTOR: u8 = 4;
 
-/// The sibling tries one tiered compaction job writes at one block: the same level, recency and parent part, one per bucket.
+/// The sibling outputs of tiered compaction at one block: the same level, recency and parent part, one per bucket.
 /// They become live together; each is superseded on its own.
 /// Its key is its members' with `g` for `l` and the members' own bucket dropped, e.g. `g02-rc-b05` for `l02-rc-p0-b05` to `l02-rc-p3-b05`.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]

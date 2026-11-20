@@ -1,4 +1,4 @@
-//! A search file: one single-segment tantivy index over one trie data file, bundled into one object.
+//! A search file: one single-segment tantivy index over a trie or its partition group, bundled into one object.
 //! A document is a text run: every version of one entity whose indexed values are the same, with the rectangles of valid time × system time where one of them is visible.
 //! Tokens come from `rtdb-text`, so the index and the residual `MATCH` agree.
 
@@ -20,7 +20,7 @@ use tantivy::{Directory, Index, IndexSettings, TantivyDocument, Term};
 
 const MAGIC: &[u8; 8] = b"RTSRCH01";
 /// Bumped with the bundle layout or the tantivy version, either of which changes a search file's bytes.
-pub const FORMAT_VERSION: i32 = 5;
+pub const FORMAT_VERSION: i32 = 6;
 const WRITER_MEMORY: usize = 32 << 20;
 /// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
 const SIDECAR: &str = "rtdb.sidecar";
@@ -74,7 +74,7 @@ impl Section {
 }
 
 /// A trie's recency as an instant: no row of it is visible from then on.
-pub fn ceiling_of(trie: &rtdb_format::keys::TrieKey) -> Option<i64> { trie.recency().map(|date| date.epoch_day().saturating_mul(86_400_000_000)) }
+pub fn ceiling_of(recency: Option<rtdb_types::CivilDate>) -> Option<i64> { recency.map(|date| date.epoch_day().saturating_mul(86_400_000_000)) }
 
 /// Sections as an artefact record's stats hold them.
 pub fn encode_sections(sections: &[Section]) -> Vec<u8> {
@@ -107,7 +107,7 @@ fn lifespan(rectangles: &[[i64; 4]], ceiling: i64) -> (u8, Section) {
 
 /// A document visible somewhere in the bounds asked about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DocMatch { pub doc: u32, pub iid: [u8; 16] }
+pub struct DocMatch { pub doc: u32, pub iid: [u8; 16], pub member: u32 }
 
 /// An event of the file's data, as another file's documents are cut by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,8 +133,12 @@ pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str)
     Ok(bundle)
 }
 
+/// A member's starting offsets in the shared page and document sequences.
+#[derive(Clone, Copy)]
+struct MemberStart { page: u32, doc: u32 }
+
 /// What the writer accumulates beside tantivy's segment, to become the sidecar.
-struct Accumulated { ceiling: i64, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
+struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
 
 /// One entity's rows while they arrive: each row's position and header, and per column, its value as an index into the column's distinct values.
 #[derive(Default)]
@@ -152,32 +156,54 @@ impl Entity {
     }
 }
 
-/// Builds the search file over a data file's pages of rows, in order, building its segment in `directory` and writing the bundle to `output`, and returns its sections.
-/// `ceiling` is the trie's recency, which bounds when any of its rows stops being visible; a current trie has none.
+/// Builds the search file over a data file's pages of rows, in order, building its segment in `directory` and writing the bundle to `output`.
 /// The bytes are a function of the rows, their pages, the columns, `identity` and `ceiling` alone, wherever the segment is built, so every builder of one job writes the same object.
 pub fn write_search_file<D: Directory + Clone + 'static, W: std::io::Write>(columns: &[String], pages: impl IntoIterator<Item = Result<Vec<SearchRow>>>, identity: &str, ceiling: Option<i64>, directory: D, output: W) -> Result<Vec<Section>> {
+    write_group_search_file(columns, [pages], identity, ceiling, directory, output)
+}
+
+/// Builds one search file over its members' data files in bucket order.
+/// Siblings share the same recency ceiling, and the returned sections bound the whole file.
+pub fn write_group_search_file<D, W, P>(columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, ceiling: Option<i64>, directory: D, output: W) -> Result<Vec<Section>>
+where
+    D: Directory + Clone + 'static,
+    W: std::io::Write,
+    P: IntoIterator<Item = Result<Vec<SearchRow>>>,
+{
     let (schema, fields) = schema(columns);
     let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
     let mut writer = Index::builder().schema(schema).settings(settings).single_segment_index_writer(directory.clone(), WRITER_MEMORY).map_err(fault)?;
-    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
-    let mut entity = Entity::new(columns.len());
+    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), member_starts: Vec::new(), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
     let mut rows = 0u32;
-    for page in pages {
-        sidecar.page_starts.push(rows);
-        for row in page? {
-            if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the file's columns")); }
-            if entity.iid.is_some_and(|iid| iid > row.iid) { return Err(fault("Search rows are not in IID order")); }
-            if entity.iid.is_some_and(|iid| iid != row.iid) { runs(&mut writer, &fields, &mut sidecar, std::mem::replace(&mut entity, Entity::new(columns.len())))?; }
-            if entity.rows.last().is_some_and(|(_, last)| last.system_from.0 < row.system_from) { return Err(fault("Search rows are not in system-time-descending order")); }
-            for docs in &mut sidecar.row_docs { docs.push(NO_DOC); }
-            sidecar.keys.extend_from_slice(&row.iid);
-            for value in [row.system_from, row.valid_from, row.valid_to] { sidecar.keys.extend_from_slice(&value.to_le_bytes()); }
-            sidecar.keys.push(op_code(row.op));
-            entity.push(rows, row)?;
-            rows = rows.checked_add(1).ok_or_else(|| fault("A search file holds at most u32::MAX rows"))?;
+    let mut previous_member_iid = None;
+    for pages in members {
+        sidecar.member_starts.push(MemberStart {
+            page: u32::try_from(sidecar.page_starts.len()).map_err(fault)?,
+            doc: u32::try_from(sidecar.doc_iids.len()).map_err(fault)?,
+        });
+        let mut entity = Entity::new(columns.len());
+        for page in pages {
+            sidecar.page_starts.push(rows);
+            for row in page? {
+                if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the file's columns")); }
+                if entity.iid.is_none() && previous_member_iid.is_some_and(|iid| iid >= row.iid) {
+                    return Err(fault("Search file members do not hold disjoint IID ranges in order"));
+                }
+                if entity.iid.is_some_and(|iid| iid > row.iid) { return Err(fault("Search rows are not in IID order")); }
+                if entity.iid.is_some_and(|iid| iid != row.iid) { runs(&mut writer, &fields, &mut sidecar, std::mem::replace(&mut entity, Entity::new(columns.len())))?; }
+                if entity.rows.last().is_some_and(|(_, last)| last.system_from.0 < row.system_from) { return Err(fault("Search rows are not in system-time-descending order")); }
+                for docs in &mut sidecar.row_docs { docs.push(NO_DOC); }
+                sidecar.keys.extend_from_slice(&row.iid);
+                for value in [row.system_from, row.valid_from, row.valid_to] { sidecar.keys.extend_from_slice(&value.to_le_bytes()); }
+                sidecar.keys.push(op_code(row.op));
+                entity.push(rows, row)?;
+                rows = rows.checked_add(1).ok_or_else(|| fault("A search file holds at most u32::MAX rows"))?;
+            }
         }
+        previous_member_iid = entity.iid.or(previous_member_iid);
+        runs(&mut writer, &fields, &mut sidecar, entity)?;
     }
-    runs(&mut writer, &fields, &mut sidecar, entity)?;
+    if sidecar.member_starts.is_empty() { return Err(fault("A search file holds at least one member")); }
     writer.finalize().map_err(fault)?;
     let bytes = encode(&Index::open(directory.clone()).map_err(fault)?, &fields, rows, &sidecar)?;
     directory.atomic_write(Path::new(SIDECAR), &bytes).map_err(fault)?;
@@ -264,11 +290,17 @@ fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tanti
     impacts
 }
 
-/// The sidecar, in order: row, document and page counts, page starts, each column's document count, each row's run in each column, each document's IID, each document's lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
+/// The sidecar, in order: row, document, page and member counts, each member's page and document starts, page starts, each column's document count, each row's run in each column, each document's IID and lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
 fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let documents = sidecar.doc_iids.len() as u32;
-    for count in [rows, documents, sidecar.page_starts.len() as u32] { bytes.extend_from_slice(&count.to_le_bytes()); }
+    for count in [rows, documents, sidecar.page_starts.len() as u32, u32::try_from(sidecar.member_starts.len()).map_err(fault)?] {
+        bytes.extend_from_slice(&count.to_le_bytes());
+    }
+    for member in &sidecar.member_starts {
+        bytes.extend_from_slice(&member.page.to_le_bytes());
+        bytes.extend_from_slice(&member.doc.to_le_bytes());
+    }
     for value in sidecar.page_starts.iter().chain(&sidecar.column_docs).chain(sidecar.row_docs.iter().flatten()) { bytes.extend_from_slice(&value.to_le_bytes()); }
     for iid in &sidecar.doc_iids { bytes.extend_from_slice(iid); }
     bytes.extend_from_slice(&sidecar.doc_classes);
@@ -441,7 +473,7 @@ impl Directory for BundleDirectory {
 }
 
 /// What the sidecar holds, located within the bundle's bytes.
-struct Sidecar { bytes: OwnedBytes, rows: u32, documents: u32, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
+struct Sidecar { bytes: OwnedBytes, rows: u32, documents: u32, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
 
 impl Sidecar {
     fn parse(bytes: OwnedBytes, columns: usize, documents: u32) -> Result<Self> {
@@ -458,6 +490,16 @@ impl Sidecar {
         let u32_at = |range: Range<usize>| u32::from_le_bytes(data[range].try_into().unwrap_or_default());
         let (rows, counted, pages) = (u32_at(take(4)?), u32_at(take(4)?), u32_at(take(4)?) as usize);
         if counted != documents { return Err(corrupt("Search file sidecar counts other documents than its segment")); }
+        let members = u32_at(take(4)?) as usize;
+        let member_starts = (0..members).map(|_| {
+            Ok(MemberStart { page: u32_at(take(4)?), doc: u32_at(take(4)?) })
+        }).collect::<Result<Vec<_>>>()?;
+        if !member_starts.first().is_some_and(|first| first.page == 0 && first.doc == 0)
+            || member_starts.windows(2).any(|pair| pair[0].page > pair[1].page || pair[0].doc > pair[1].doc)
+            || member_starts.last().is_some_and(|last| last.page as usize > pages || last.doc > documents)
+        {
+            return Err(corrupt("Search file member starts are out of order"));
+        }
         let page_starts = (0..pages).map(|_| take(4).map(u32_at)).collect::<Result<Vec<_>>>()?;
         if page_starts.first().is_some_and(|first| *first != 0) || page_starts.windows(2).any(|pair| pair[0] > pair[1]) || page_starts.last().is_some_and(|last| *last > rows) {
             return Err(corrupt("Search file page starts are out of order"));
@@ -492,7 +534,7 @@ impl Sidecar {
             impacts.insert((column, term), range);
         }
         if position != data.len() { return Err(corrupt("Search file sidecar has trailing bytes")); }
-        Ok(Self { bytes, rows, documents, page_starts, column_docs, row_docs: row_docs.start, doc_iids, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
+        Ok(Self { bytes, rows, documents, member_starts, page_starts, column_docs, row_docs: row_docs.start, doc_iids, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
     }
     fn data(&self) -> &[u8] { self.bytes.as_slice() }
     fn u32_at(&self, offset: usize) -> u32 { u32::from_le_bytes(self.data()[offset..offset + 4].try_into().unwrap_or_default()) }
@@ -510,6 +552,16 @@ impl Sidecar {
         match self.u32_at(self.row_docs + (column * self.rows as usize + row as usize) * 4) { NO_DOC => RowDoc::Invisible, NULL_DOC => RowDoc::Null, doc => RowDoc::Run(doc) }
     }
     fn section(&self, doc: u32) -> Option<&Section> { let class = self.data()[self.doc_classes + doc as usize]; self.sections.iter().find(|section| section.class == class) }
+    fn member_pages(&self, member: u32) -> Result<Range<usize>> {
+        let member = member as usize;
+        let first = self.member_starts.get(member).ok_or_else(|| corrupt("Search file has no such member"))?.page as usize;
+        let end = self.member_starts.get(member + 1).map_or(self.page_starts.len(), |start| start.page as usize);
+        Ok(first..end)
+    }
+    fn doc_match(&self, doc: u32) -> DocMatch {
+        let member = self.member_starts.partition_point(|start| start.doc <= doc) - 1;
+        DocMatch { doc, iid: self.doc_iid(doc), member: member as u32 }
+    }
     fn doc_iid(&self, doc: u32) -> [u8; 16] { self.data()[self.doc_iids + doc as usize * 16..][..16].try_into().unwrap_or_default() }
     fn rectangles(&self, doc: u32) -> impl Iterator<Item = [i64; 4]> + '_ {
         let (start, end) = (self.u32_at(self.rectangle_starts + doc as usize * 4), self.u32_at(self.rectangle_starts + (doc as usize + 1) * 4));
@@ -583,15 +635,19 @@ impl SearchFile {
         match self.column(column).map(|index| self.sidecar.row_doc(index, row)) { Some(RowDoc::Run(doc)) => Some(Some(doc)), Some(RowDoc::Null) => Some(None), _ => None }
     }
 
-    pub fn rows(&self) -> u32 { self.sidecar.rows }
-
-    /// Each entity the file holds an event of, in IID order.
-    pub fn iids(&self) -> impl Iterator<Item = [u8; 16]> + '_ {
-        (0..self.sidecar.rows).map(|row| <[u8; 16]>::try_from(self.sidecar.row_iid(row)).unwrap_or_default()).scan(None, |last, iid| { let fresh = *last != Some(iid); *last = Some(iid); Some(fresh.then_some(iid)) }).flatten()
+    pub(crate) fn member_rows(&self, member: u32) -> Result<Range<u32>> {
+        let pages = self.sidecar.member_pages(member)?;
+        let start_row = |page| self.sidecar.page_starts.get(page).copied().unwrap_or(self.sidecar.rows);
+        Ok(start_row(pages.start)..start_row(pages.end))
     }
 
-    /// The latest system-from of any of the file's events.
-    pub fn latest_system_from(&self) -> Result<i64> { (0..self.sidecar.rows).map(|row| self.sidecar.key(row).map(|key| key.system_from)).try_fold(i64::MIN, |latest, system| system.map(|system| latest.max(system))) }
+    pub(crate) fn member_iids(&self, rows: Range<u32>) -> impl Iterator<Item = [u8; 16]> + '_ {
+        rows.map(|row| <[u8; 16]>::try_from(self.sidecar.row_iid(row)).unwrap_or_default()).scan(None, |last, iid| { let fresh = *last != Some(iid); *last = Some(iid); Some(fresh.then_some(iid)) }).flatten()
+    }
+
+    pub(crate) fn latest_system_from(&self, rows: Range<u32>) -> Result<i64> {
+        rows.map(|row| self.sidecar.key(row).map(|key| key.system_from)).try_fold(i64::MIN, |latest, system| system.map(|system| latest.max(system)))
+    }
 
     /// A document's length as the index stores it.
     pub fn stored_length(&self, column: &str, doc: u32) -> Result<u32> {
@@ -632,7 +688,7 @@ impl SearchFile {
 
     /// Every document holding all of the query's terms and phrases in the column that is visible somewhere in `bounds`.
     pub fn matches(&self, column: &str, query: &Query, bounds: TemporalBounds) -> Result<Vec<DocMatch>> {
-        Ok(self.matching_docs(column, query)?.into_iter().filter(|doc| self.visible(*doc, bounds)).map(|doc| DocMatch { doc, iid: self.sidecar.doc_iid(doc) }).collect())
+        Ok(self.matching_docs(column, query)?.into_iter().filter(|doc| self.visible(*doc, bounds)).map(|doc| self.sidecar.doc_match(doc)).collect())
     }
 
     /// The visible documents matching `matching`, with each one's score for `scoring`'s terms, from the postings' frequencies and the stored length.
@@ -702,7 +758,7 @@ impl SearchFile {
     }
 }
 
-/// MATCH of one query on every row of a search file's data file, by page and row, through each row's run.
+/// MATCH of one query on every row of a search file, by page and row, through each row's run.
 pub struct MatchSet { file: Arc<SearchFile>, column: Option<usize>, matching: Vec<u64> }
 
 impl MatchSet {
@@ -719,8 +775,24 @@ impl MatchSet {
             RowDoc::Run(doc) => Ok(Some(self.matching.get(doc as usize / 64).is_some_and(|word| word & (1 << (doc % 64)) != 0))),
         }
     }
+    /// MATCH on one member's data file, by its own page and row.
+    pub fn member(self: &Arc<Self>, member: u32) -> Result<MemberMatches> {
+        let pages = self.file.sidecar.member_pages(member)?;
+        Ok(MemberMatches { set: Arc::clone(self), first: pages.start, pages: pages.len() })
+    }
+
     /// The bytes held, for a cache's weight.
     pub fn bytes(&self) -> usize { self.matching.len() * 8 }
+}
+
+/// MATCH on the rows of one member of a search file.
+pub struct MemberMatches { set: Arc<MatchSet>, first: usize, pages: usize }
+
+impl rtdb_query::FileMatches for MemberMatches {
+    fn value(&self, page: usize, row: usize) -> Result<Option<bool>> {
+        if page >= self.pages { return Err(corrupt("Search file member has no such page")); }
+        self.set.value(self.first + page, row)
+    }
 }
 
 impl rtdb_query::FileMatches for MatchSet {
@@ -782,7 +854,7 @@ impl Windows {
             let (start, stop) = (window.saturating_mul(WINDOW), window.saturating_add(1).saturating_mul(WINDOW));
             let mut doc = if docs.doc() < start { docs.seek(start) } else { docs.doc() };
             while doc < stop && doc != tantivy::TERMINATED {
-                if self.file.visible(doc, self.bounds) { found.push((DocMatch { doc, iid: self.file.sidecar.doc_iid(doc) }, scorer.score(doc))); }
+                if self.file.visible(doc, self.bounds) { found.push((self.file.sidecar.doc_match(doc), scorer.score(doc))); }
                 doc = docs.advance();
             }
         }
@@ -984,6 +1056,42 @@ mod tests {
             assert_eq!(scored.iter().map(|(doc, _)| doc.iid[0]).collect::<Vec<_>>(), expected);
             for (doc, score) in scored { assert_eq!(score, rtdb_text::bm25(&query, rows[doc.iid[0] as usize - 1].values[1].as_deref().unwrap(), Some(&corpus))); }
         }
+    }
+
+    #[test]
+    fn a_group_file_keeps_each_members_runs_and_pages_with_that_member() {
+        use rtdb_query::FileMatches;
+
+        let first = vec![Ok(vec![row(1, 30, "", "overdue"), row(1, 20, "", "paid")]),
+                         Ok(vec![row(1, 10, "", "overdue")])];
+        let third = vec![Ok(vec![row(128, 30, "", "overdue"),
+                                 SearchRow { values: vec![None, None], ..row(129, 30, "", "") }])];
+        let mut bytes = Vec::new();
+        write_group_search_file(&columns(), [first, Vec::new(), third], "group", None, RamDirectory::create(), &mut bytes).unwrap();
+        let file = Arc::new(SearchFile::open(bytes, &columns()).unwrap());
+        let query = Query::parse("overdue");
+        let selected = |bounds| file.matches("body", &query, bounds).unwrap().into_iter()
+            .map(|doc| (doc.member, doc.iid[0])).collect::<Vec<_>>();
+        assert!(selected(at(1, 25)).is_empty());
+        assert_eq!(selected(at(1, 35)), [(0, 1), (2, 128)]);
+        assert_eq!(file.events(&[1; 16]).unwrap().into_iter().map(|key| key.system_from).collect::<Vec<_>>(), [30, 20, 10]);
+        assert_eq!(file.events(&[128; 16]).unwrap().len(), 1);
+
+        let set = Arc::new(file.match_set("body", &query).unwrap());
+        let (first, empty, third) = (set.member(0).unwrap(), set.member(1).unwrap(), set.member(2).unwrap());
+        assert_eq!((first.value(0, 0).unwrap(), first.value(0, 1).unwrap(), first.value(1, 0).unwrap()), (Some(true), Some(false), Some(true)));
+        assert!(first.value(2, 0).is_err());
+        assert!(empty.value(0, 0).is_err());
+        assert_eq!((third.value(0, 0).unwrap(), third.value(0, 1).unwrap()), (Some(true), None));
+        assert!(set.member(3).is_err());
+
+        let mut ranked = file.ranked("body", &query, &query, None, at(1, 35)).unwrap();
+        let mut handed = Vec::new();
+        while ranked.bound().is_some() {
+            handed.extend(ranked.expand().unwrap().into_iter().map(|(doc, _)| (doc.member, doc.iid[0])));
+        }
+        handed.sort_unstable();
+        assert_eq!(handed, [(0, 1), (2, 128)]);
     }
 
     #[test]
