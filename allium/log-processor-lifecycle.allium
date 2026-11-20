@@ -500,7 +500,7 @@ rule ClaimConferredLeadership {
         processor.claim_pos = null
         processor.state = leading
 
-        -- Source-log delivery resumes at the last applied source position, which db.allium owns.
+        -- Source-log delivery resumes at the last applied source position, which db.allium owns — for a term that inherits a block, once it has adopted that block.
         SourceDeliveryResumed(processor: processor)
 }
 

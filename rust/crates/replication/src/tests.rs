@@ -1568,3 +1568,36 @@ async fn a_placed_holder_claims_without_an_election_wait_and_an_idle_term_append
     handle.shutdown();
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_promotion_that_inherits_a_flushed_block_resumes_the_source_after_the_flush() {
+    let config = ReplicationConfig { assertion_interval: Duration::from_millis(10), claim_wait: Some(Duration::from_millis(10)), ..Default::default() };
+    let fixture = fixture(config, 1 << 27).await;
+    let first = submit_recovery_row(&fixture.handle, &fixture.memory, 1, 100).await;
+    let flush = fixture.logs.append_source(&SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(-1) })), Timestamp(200)).await.unwrap();
+    // The previous leader read back its transaction and cut the flush's boundary, then died before uploading the block.
+    for record in [
+        raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })),
+        raw(1, 1, 1, resolved(first.0, first.0)),
+        raw(2, 1, 2, boundary(0, flush.0)),
+    ] {
+        fixture.replica.enqueue(record.payload, record.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    }
+    let next = submit_recovery_row(&fixture.handle, &fixture.memory, 2, 300).await;
+
+    let handle = fixture.handle.clone();
+    let driver = tokio::spawn(fixture.driver.run());
+    let result = tokio::time::timeout(Duration::from_secs(5), handle.await_tx(TxId(next.0), &CancellationToken::new())).await.unwrap().unwrap().unwrap();
+    assert_eq!(result.tx_key().tx_id, TxId(next.0));
+    assert!(handle.status().adopted_block.is_some());
+    handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+
+    let replica = fixture.replica.read_range(LogOffset(3), LogOffset(fixture.replica.latest().unwrap().0 + 1)).await.unwrap();
+    let later_sources: Vec<_> = replica.iter().filter_map(|record| match ReplicaEnvelope::decode(&record.payload).unwrap().unwrap().message {
+        ReplicaBody::ResolvedTx(message) => message.src_msg_id,
+        ReplicaBody::NoOp(message) => message.src_msg_id,
+        _ => None,
+    }).collect();
+    assert_eq!(later_sources, vec![next.0], "the new term resolves each later source message once and nothing at or before the flush");
+}

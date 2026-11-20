@@ -545,7 +545,8 @@ impl ReplicationDriver {
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
         self.flush_timer = FlushTimer::new((self.clock)(), persisted, self.config.flush_timeout)?;
         let cancellation = self.cancellation.child_token();
-        let source_tail = self.logs.source_tail(progress.source_position).await?;
+        // An inherited block's adopt advances applied progress to the position its boundary covers, so the source opens there.
+        let source_tail = if self.pending_block.is_some() { None } else { Some(self.logs.source_tail(progress.source_position).await?) };
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
         let cycle = if self.pending_block.is_some() { BlockCycle::Cut } else { BlockCycle::Filling { rows: self.partition.value().live().block_row_count() } };
@@ -555,7 +556,7 @@ impl ReplicationDriver {
         let job = pump.with_heartbeat(self.config.idle_heartbeat).run(recovery_write.clone());
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed, recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail: Some(source_tail), source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
+            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
         if produce_inherited {
             self.produce_pending()?;
         }
@@ -824,6 +825,9 @@ impl ReplicationDriver {
             if let Some(leader) = &mut self.leader {
                 if leader.resolver()?.staged_rows()? != 0 { return Err(invalid("A block adoption retained unresolved transaction writes")); }
                 leader.resolver = Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?);
+                if self.pending_block.is_none() && leader.source_tail.is_none() && leader.source_poll.is_none() {
+                    leader.source_tail = Some(self.logs.source_tail(progress.source_position).await?);
+                }
             }
         }
         Ok(())
