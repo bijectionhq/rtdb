@@ -840,3 +840,47 @@ async fn a_join_on_two_set_columns_raises_set_equality() {
     };
     assert_eq!(error.code, "xtdb.expression/set-equality");
 }
+
+#[tokio::test]
+async fn a_column_join_returns_the_row_joins_rows_in_its_order() {
+    let memory = MemoryBudget::new(1 << 28);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(1), system_time: Timestamp(1) }, Arc::clone(&memory)).unwrap();
+    for id in 0..400i64 {
+        let customer = match id % 11 { 0 => Value::Null, 1 => Value::Utf8(format!("c{}", id % 7)), _ => Value::I64(id % 37) };
+        buffer.put(TableRef::new("public", "orders"), StructFields::from([("_id".into(), Value::I64(id)), ("customer".into(), customer), ("amount".into(), Value::F64(id as f64 / 8.0))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+    }
+    for id in 0..45i64 {
+        let key = if id % 9 == 0 { Value::Utf8(format!("c{}", id % 7)) } else { Value::I64(id) };
+        buffer.put(TableRef::new("public", "customers"), StructFields::from([("_id".into(), key), ("region".into(), Value::Utf8(["eu", "us", "apac"][id as usize % 3].into()))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+    }
+    state.apply(&buffer.stage().unwrap()).unwrap();
+    let mut results = Vec::new();
+    for build_rows in [100_000, 50] {
+        let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let options = QueryOptions { join_build_rows: build_rows, ..QueryOptions::default() };
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", options, &CancellationToken::new()).unwrap();
+        for suffix in ["", " LIMIT 5000"] {
+            let sql = format!("SELECT c.region, o._id, o.amount, c._id AS customer FROM orders o JOIN customers c ON o.customer = c._id ORDER BY c.region{suffix}");
+            let statement = PreparedSql::prepare(&sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+            results.push(rows_of(statement.open_query(Arc::clone(&context), vec![]).await.unwrap()).await);
+        }
+    }
+    assert!(results[0].len() > 300, "the join should match most orders, matched {}", results[0].len());
+    assert_eq!(results[0], results[1], "in memory, the column join returns the row join's rows in its order");
+    let sorted = |rows: &Vec<Vec<Value>>| { let mut rows = rows.iter().map(|row| format!("{row:?}")).collect::<Vec<_>>(); rows.sort(); rows };
+    assert_eq!(sorted(&results[2]), sorted(&results[0]), "a spilled row join returns the same rows");
+    assert_eq!(sorted(&results[3]), sorted(&results[0]), "a column join that hands a large build to the row join returns the same rows");
+}
+
+async fn rows_of(mut cursor: rtdb_query::QueryCursor) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    while let Some(batch) = cursor.next_batch().await.unwrap() {
+        let schema = batch.batch().schema();
+        for row in 0..batch.batch().num_rows() {
+            rows.push((0..batch.batch().num_columns()).map(|column| read_value(schema.field(column), batch.batch().column(column).as_ref(), row).unwrap()).collect());
+        }
+    }
+    rows
+}

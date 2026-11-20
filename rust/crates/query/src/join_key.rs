@@ -106,6 +106,9 @@ impl JoinInput {
     }
     pub fn output<'a>(&self, row: &'a OwnedRow) -> &'a [rtdb_types::Value] { &row.values[..self.original.len()] }
     pub fn key_count(&self) -> usize { self.key_positions.len() }
+    pub fn key_positions(&self) -> &[usize] { &self.key_positions }
+    /// Whether every key is one of the input's own columns, so the layout adds no computed cells.
+    pub fn computes_no_keys(&self) -> bool { self.expressions.is_empty() }
     pub fn key<'a>(&self,row: &'a OwnedRow,index: usize) -> Result<&'a rtdb_types::Value> {
         self.key_positions.get(index).and_then(|position|row.values.get(*position)).ok_or_else(||invalid("join-key","Join key cell is absent"))
     }

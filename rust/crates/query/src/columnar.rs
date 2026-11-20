@@ -40,7 +40,7 @@ impl Column {
             Self::Values(values) => values.get(row).map_or(Ok(0), |value| value.retained_bytes().map(|bytes| bytes.saturating_add(std::mem::size_of::<Value>()))),
         }
     }
-    fn retained_bytes(&self) -> Result<usize> {
+    pub(crate) fn retained_bytes(&self) -> Result<usize> {
         match self {
             Self::Arrow { array, .. } => Ok(array.get_array_memory_size()),
             Self::Values(values) => values.iter().try_fold(values.capacity().saturating_mul(std::mem::size_of::<Value>()), |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error)),
@@ -60,6 +60,19 @@ impl ColumnBatch {
         Ok(Self { columns, len, _reservation: reservation })
     }
     fn charged(&self) -> usize { self._reservation.bytes() }
+    /// A page of rows as columns of values, charged as each column is built.
+    pub fn from_page(page: &OwnedPage, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let width = page.rows().first().map_or(0, |row| row.values.len());
+        let mut reservation = memory.reserve(256)?;
+        let mut columns = Vec::with_capacity(width);
+        for position in 0..width {
+            let column = Column::Values(page.rows().iter().map(|row| row.values.get(position).cloned().ok_or_else(|| invalid("column-row", "A row is narrower than its page"))).collect::<Result<_>>()?);
+            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+            lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+            columns.push(column);
+        }
+        Self::settled(columns, page.len(), reservation)
+    }
 
     /// Materialises every row, admitting the page's rows together before any is built.
     /// Rows share the page's charge, which ends when the last of them drops.
@@ -156,7 +169,7 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
 
 /// Whether Arrow's interleave copies the layout without validating it: nested layouts are rebuilt and checked, and
 /// stored cells such as nulls under a non-nullable list item fail that check by panicking, so they are read as values.
-fn flat(data_type: &DataType) -> bool {
+pub(crate) fn flat(data_type: &DataType) -> bool {
     data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) | DataType::Null)
 }
 

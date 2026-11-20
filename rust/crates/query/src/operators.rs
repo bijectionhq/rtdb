@@ -25,6 +25,7 @@ pub(crate) struct DeferredInput {
     constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
 }
 impl DeferredInput {
+    pub fn new(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Self { Self { runtime, execution, constraints, pushdowns } }
     pub async fn open_pages(self, own: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<BoxPageCursor> {
         let pushdowns = crate::pushdown::Pushdowns::merge(self.pushdowns.as_ref(), own, &self.execution.context.memory)?;
         build_pages_constrained(self.runtime, self.execution, self.constraints, pushdowns).await
@@ -39,7 +40,7 @@ fn build_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constr
 
 /// Builds a scan, its filters and column-only projections as a batch source, or `None` where the subtree has another shape.
 /// The boolean reports whether the batches passed through a projection.
-fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> { Box::pin(async move {
+pub(crate) fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> { Box::pin(async move {
     let relation = Arc::clone(runtime.relation());
     match relation.node() {
         RelationNode::Scan(scan) if !crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none() => {
@@ -69,9 +70,39 @@ fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution, pushdowns:
             };
             Ok(Some((batches,true)))
         }
+        RelationNode::Join { left,right,kind: rtdb_plan::JoinKind::Inner,condition: Some(condition) } if execution.analysis.is_none() && execution.context.tracer.is_none() => {
+            let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?)?,batch_shape(&runtime.child(1)?)?) else { return Ok(None) };
+            if build_projected != probe_projected || !crate::join::build_left(left,right,rtdb_plan::JoinKind::Inner,&execution)? { return Ok(None); }
+            let mut layout = crate::join_key::JoinLayout::new(left,right,Some(condition),&execution.context.memory)?;
+            layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
+            let Some(order) = crate::batch_join::key_order(&layout) else { return Ok(None) };
+            let Some((build,projected)) = build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await? else { return Ok(None) };
+            if projected != build_projected { return Ok(None); }
+            let probe = crate::batch_join::ProbeInput { runtime: runtime.child(1)?,execution: execution.child(1),pushdowns };
+            Ok(Some((Box::new(crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution)) as crate::columnar::BoxBatchCursor,projected)))
+        }
         _ => Ok(None),
     }
 }) }
+
+/// Whether `build_batches` opens this subtree as batches, and if so whether they pass through a projection.
+fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
+    let relation = Arc::clone(runtime.relation());
+    Ok(match relation.node() {
+        RelationNode::Scan(scan) => (!crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none()).then_some(false),
+        RelationNode::Filter { .. } => {
+            if matches!(runtime.child(0)?.relation().node(), RelationNode::Filter { .. }) { return Ok(None); }
+            match batch_shape(&runtime.child(0)?)? { Some(false) => Some(false), _ => None }
+        }
+        RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
+            let child = runtime.child(0)?;
+            let columns = expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id,.. } if child.schema().position(*id).is_some()));
+            if !columns && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
+            batch_shape(&child)?.map(|_| true)
+        }
+        _ => None,
+    })
+}
 
 fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<crate::pages::BoxPageCursor>> { Box::pin(async move {
     execution.context.check_cancelled()?;
@@ -373,6 +404,12 @@ impl PageCursor for PageProject {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         self.execution.context.check_cancelled()?;
         let Some(page) = self.input.next_page().await? else { return Ok(None); };
+        // Projecting every input column in place copies each cell unchanged unless admitting it rewrites a date.
+        let identity = self.expressions.len() == self.schema.len()
+            && self.expressions.iter().enumerate().all(|(index,named)| matches!(&named.expr, Expr::Column { id, .. } if self.schema.position(*id) == Some(index)));
+        if identity && page.rows().iter().all(|row| row.values.iter().all(|value| !matches!(value, Value::Date(_) | Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Struct(_) | Value::Map { .. }))) {
+            return Ok(Some(page));
+        }
         crate::pages::project(&page,&self.schema,self.expressions.iter().map(|expression|&expression.expr),&self.execution).await.map(Some)
     }
 

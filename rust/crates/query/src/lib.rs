@@ -28,6 +28,7 @@ mod trace;
 mod settings;
 mod pages;
 mod analysis;
+mod batch_join;
 mod explain;
 mod optimize;
 mod materialized;

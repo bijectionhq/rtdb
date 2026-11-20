@@ -155,7 +155,7 @@ fn partition_count(blocks: usize,minimum: usize) -> Result<usize> {
 enum Slot { Empty,Occupied { hash: u32,row: usize } }
 pub(crate) struct HashIndex { slots: Vec<Slot>,mask: usize,_reservation: Arc<MemoryReservation> }
 impl HashIndex {
-    fn new(hashes: &[u32],memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub(crate) fn new(hashes: &[u32],memory: &Arc<MemoryBudget>) -> Result<Self> {
         if hashes.len() > i32::MAX as usize { return Err(size_error()); }
         let expected = (hashes.len() as f64 / 0.6) as u64;
         let capacity = 1usize.checked_shl(u64::BITS - expected.leading_zeros()).ok_or_else(size_error)?;
