@@ -241,7 +241,8 @@ async fn a_read_only_session_is_served_by_a_log_fed_replica() {
     assert_eq!(cell.node(replica).agent.subscribed(), ["shop"], "the read is routed to the node beside the holder");
     let mut seen = Vec::new();
     for _ in 0..100 {
-        seen = values(&reader, "SELECT total FROM orders").await;
+        // Until the replica has replayed the table's creation, the table is unknown there.
+        if reader.simple_query("SELECT total FROM orders").await.is_ok() { seen = values(&reader, "SELECT total FROM orders").await; }
         if seen == ["10"] { break; }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -363,6 +364,24 @@ async fn an_open_connection_survives_a_planned_move_and_its_holders_death() {
     cell.nodes[holder].take().unwrap().kill().await.unwrap();
     tokio::time::sleep(Duration::from_millis(1800)).await;
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"], "and survives its holder's death while idle");
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_small_flush_writes_one_pack_and_its_catalog() {
+    let cell = Cell::start(1, None).await;
+    let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    for table in ["orders", "items", "users"] { client.simple_query(&format!("INSERT INTO {table} (_id, v) VALUES (1, 1)")).await.unwrap(); }
+    drop(client);
+    cell.node(0).agent.park("shop").await.unwrap();
+    let rtdb_multi::deployment::CellStorage::Local { root } = cell.storage();
+    let objects: Vec<String> = files_under(&root.join(record.storage_prefix())).into_iter().map(|path| path.to_string_lossy().into_owned()).collect();
+    assert_eq!(objects.iter().filter(|path| path.contains("/~packs/")).count(), 1, "{objects:#?}");
+    assert_eq!(objects.iter().filter(|path| path.contains("/tables/")).count(), 0, "no table file is its own object: {objects:#?}");
+    let client = cell.connect("shop").await;
+    assert_eq!(values(&client, "SELECT v FROM items").await, ["1"], "a packed block reads back after the park");
     drop(client);
     cell.stop().await;
 }

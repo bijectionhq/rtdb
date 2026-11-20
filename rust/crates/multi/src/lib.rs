@@ -12,6 +12,7 @@ pub mod gateway;
 pub mod keys;
 pub mod lease;
 pub mod logs;
+pub mod packing;
 pub mod process;
 pub mod session;
 pub mod store;

@@ -97,6 +97,8 @@ impl ServerDriver {
             options.membership = rtdb_node::Membership::Placed;
             options.replication.claim_wait = Some(placed.claim_wait);
             options.replication.idle_heartbeat = false;
+            // A placed deployment's tail lives on its logkeepers, which keep tails short: no record waits longer than this for its block.
+            options.replication.flush_timeout = options.replication.flush_timeout.min(Duration::from_secs(15 * 60));
         }
         if memory.limit_bytes() != options.execution_memory_bytes { return Err(Anomaly::incorrect("rtdb.server/invalid-memory-budget", "Supplied execution budget differs from the configured allocation split")); }
         if compactor_only { options.replication.may_lead = false; }

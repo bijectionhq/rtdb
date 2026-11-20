@@ -4,7 +4,7 @@
 //! - `EncryptingStore` seals every object with AES-256-GCM under the deployment's key, bound to the object's key, so destroying the key makes every copy unreadable.
 //! - `GarbageStore` turns a delete into a garbage record; only the reaper erases an object, once it has been garbage for the grace period (`OnlyTheReaperDeletes`, `ReapUnreachable`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,7 +51,8 @@ impl RemoteStorageFactory for CellStoreFactory {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let local = LocalStore::open_in(config.root.join(&config.prefix).join(storage_root.as_str()), io)?;
-        Ok(GarbageStore::open(Arc::new(local)).await?)
+        let packed = crate::packing::PackingStore::open(Arc::new(local)).await?;
+        Ok(GarbageStore::open(packed).await?)
     }
 
     /// Encryption sits above the node's disk cache, which therefore holds ciphertext only: destroying the key leaves no readable copy on any node.
@@ -185,19 +186,44 @@ pub fn reap_local(root: &Path, record: &DeploymentRecord, grace: Duration) -> Re
     let Ok(versions) = std::fs::read_dir(&prefix) else { return Ok(reaped); };
     let threshold = now_ms() - grace.as_millis() as i64;
     for version in versions.flatten() {
-        let garbage = version.path().join(GARBAGE_DIRECTORY);
-        let Ok(records) = std::fs::read_dir(&garbage) else { continue };
+        let Ok(records) = std::fs::read_dir(version.path().join(GARBAGE_DIRECTORY)) else { continue };
+        // A released object is either its own file or one entry of a pack; a pack goes once every entry in it has been released for the grace period.
+        let mut due: BTreeMap<String, PathBuf> = BTreeMap::new();
         for entry in records.flatten() {
             let Ok(bytes) = std::fs::read(entry.path()) else { continue };
             let Ok(released) = serde_json::from_slice::<GarbageRecord>(&bytes) else { continue };
             if released.released_at_ms > threshold { reaped.waiting += 1; continue; }
-            let object = version.path().join(&released.key);
-            if object.exists() { std::fs::remove_file(&object).map_err(io)?; }
-            std::fs::remove_file(entry.path()).map_err(io)?;
-            reaped.erased += 1;
+            due.insert(released.key, entry.path());
+        }
+        let mut erased: BTreeSet<String> = BTreeSet::new();
+        for (key, _) in &due {
+            let object = version.path().join(key);
+            if object.exists() { std::fs::remove_file(&object).map_err(io)?; erased.insert(key.clone()); }
+        }
+        let mut packed: BTreeSet<String> = BTreeSet::new();
+        if let Ok(packs) = std::fs::read_dir(version.path().join(crate::packing::PACK_DIRECTORY)) {
+            for pack in packs.flatten() {
+                let Some(index) = read_pack_index(&pack.path()) else { continue };
+                if index.entries.keys().all(|key| due.contains_key(key)) {
+                    std::fs::remove_file(pack.path()).map_err(io)?;
+                    erased.extend(index.entries.into_keys());
+                } else {
+                    packed.extend(index.entries.into_keys());
+                }
+            }
+        }
+        for (key, record) in &due {
+            if erased.contains(key) || !packed.contains(key) { std::fs::remove_file(record).map_err(io)?; reaped.erased += 1; } else { reaped.waiting += 1; }
         }
     }
     Ok(reaped)
+}
+
+fn read_pack_index(path: &Path) -> Option<crate::packing::PackIndex> {
+    let bytes = std::fs::read(path).ok()?;
+    let length = u64::from_be_bytes(bytes.get(bytes.len().checked_sub(8)?..)?.try_into().ok()?) as usize;
+    let start = bytes.len().checked_sub(8 + length)?;
+    serde_json::from_slice(&bytes[start..bytes.len() - 8]).ok()
 }
 
 pub async fn run_reaper(directory: Arc<dyn Directory>, root: PathBuf, grace: Duration, interval: Duration, cancellation: tokio_util::sync::CancellationToken) {
@@ -264,5 +290,24 @@ mod tests {
         assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 0, promised: 1 })), "a deposed holder writes nothing");
         assert!(store.delete(&key("blocks/a")).await.is_err(), "and releases nothing");
         assert_eq!(store.get(&key("blocks/a")).await.unwrap().as_ref(), b"a", "reads still serve its snapshots");
+    }
+
+    #[tokio::test]
+    async fn the_reaper_erases_a_pack_once_every_object_in_it_is_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let root = directory.path().join(record.storage_prefix()).join("v06");
+        let local: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(&root).unwrap());
+        let store = GarbageStore::open(crate::packing::PackingStore::open(local).await.unwrap()).await.unwrap();
+        for name in ["tables/t/data/l00-rc-b00.arrow", "tables/t/meta/l00-rc-b00.arrow"] { store.put(&key(name), Bytes::from_static(b"x")).await.unwrap(); }
+        store.put(&key("blocks/b00.binpb"), Bytes::from_static(b"catalog")).await.unwrap();
+        let packs = || std::fs::read_dir(root.join(crate::packing::PACK_DIRECTORY)).map(|entries| entries.count()).unwrap_or(0);
+        assert_eq!(packs(), 1);
+        store.delete(&key("tables/t/data/l00-rc-b00.arrow")).await.unwrap();
+        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO).unwrap(), Reaped { erased: 0, waiting: 1 }, "half a pack released keeps the pack");
+        assert_eq!(packs(), 1);
+        store.delete(&key("tables/t/meta/l00-rc-b00.arrow")).await.unwrap();
+        assert_eq!(reap_local(directory.path(), &record, Duration::ZERO).unwrap().erased, 2);
+        assert_eq!(packs(), 0, "a fully released pack is erased");
     }
 }
