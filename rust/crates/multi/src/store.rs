@@ -207,23 +207,30 @@ impl ObjectStore for EncryptingStore {
 pub struct GarbageRecord { pub key: String, pub released_at_ms: i64 }
 
 /// Only a listing needs to know what has been released, so the released set is read on the first one, not on open.
-pub struct GarbageStore { inner: Arc<dyn ObjectStore>, released: tokio::sync::OnceCell<Mutex<BTreeSet<ObjectKey>>>, clock: Clock }
+pub struct GarbageStore {
+    inner: Arc<dyn ObjectStore>,
+    loaded_releases: tokio::sync::OnceCell<()>,
+    released: Mutex<BTreeSet<ObjectKey>>,
+    clock: Clock,
+}
 
 impl GarbageStore {
     pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> { Self::open_with_clock(inner, wall_clock()).await }
 
-    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, released: tokio::sync::OnceCell::new(), clock })) }
+    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeSet::new()), clock })) }
 
-    async fn released(&self) -> rtdb_storage::Result<&Mutex<BTreeSet<ObjectKey>>> {
-        self.released.get_or_try_init(|| async {
+    async fn load_releases(&self) -> rtdb_storage::Result<()> {
+        self.loaded_releases.get_or_try_init(|| async {
             let mut released = BTreeSet::new();
             for object in self.inner.list(Some(&ObjectKey::new(GARBAGE_DIRECTORY).map_err(|error| Error::Task(error.to_string()))?)).await? {
                 if let Ok(record) = serde_json::from_slice::<GarbageRecord>(&self.inner.get(&object.key).await?) {
                     released.insert(ObjectKey::new(record.key).map_err(|error| Error::Task(error.to_string()))?);
                 }
             }
-            Ok(Mutex::new(released))
-        }).await
+            self.released.lock().extend(released);
+            Ok(())
+        }).await?;
+        Ok(())
     }
 }
 
@@ -236,16 +243,19 @@ impl ObjectStore for GarbageStore {
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
-        let released = self.released().await?;
-        Ok(self.inner.list(directory).await?.into_iter().filter(|object| !object.key.as_str().starts_with(GARBAGE_DIRECTORY) && !released.lock().contains(&object.key)).collect())
+        self.load_releases().await?;
+        let objects = self.inner.list(directory).await?;
+        let released = self.released.lock();
+        Ok(objects.into_iter().filter(|object| !object.key.as_str().starts_with(GARBAGE_DIRECTORY) && !released.contains(&object.key)).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        // Before the first listing, a repeated delete writes a second record, which the reaper handles like the first.
-        if let Some(released) = self.released.get() { if !released.lock().insert(key.clone()) { return Ok(()); } }
+        if self.released.lock().contains(key) { return Ok(()); }
         let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)() };
         let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
             .map_err(|error| Error::Task(error.to_string()))?;
-        self.inner.put(&name, Bytes::from(serde_json::to_vec(&record).expect("a record serializes"))).await
+        self.inner.put(&name, Bytes::from(serde_json::to_vec(&record).expect("a record serializes"))).await?;
+        self.released.lock().insert(key.clone());
+        Ok(())
     }
 }
 
@@ -254,15 +264,19 @@ pub const ROOT_MARKER: &str = "~root";
 /// Marks a store as one deployment's, and refuses to open it for any other: a misconfiguration pointing two deployments at one prefix fails at once instead of corrupting both.
 async fn claim_root(store: &dyn ObjectStore, deployment: &str) -> Result<()> {
     let marker = ObjectKey::new(ROOT_MARKER)?;
-    match store.get(&marker).await {
-        Ok(owner) if owner.as_ref() == deployment.as_bytes() => Ok(()),
-        Ok(owner) => Err(Anomaly::incorrect("rtdb.multi/foreign-root", format!("This store belongs to deployment {}, not {deployment}", String::from_utf8_lossy(&owner)))),
-        Err(Error::MissingObject(_)) => match store.put(&marker, Bytes::from(deployment.as_bytes().to_vec())).await {
-            Ok(()) => Ok(()),
-            Err(_) => Box::pin(claim_root(store, deployment)).await,
+    let owner = match store.get(&marker).await {
+        Ok(owner) => owner,
+        Err(Error::MissingObject(_)) => match store.put(&marker, Bytes::copy_from_slice(deployment.as_bytes())).await {
+            Ok(()) => return Ok(()),
+            Err(Error::ConflictingObject(_)) => store.get(&marker).await?,
+            Err(error) => return Err(error.into()),
         },
-        Err(error) => Err(error.into()),
+        Err(error) => return Err(error.into()),
+    };
+    if owner.as_ref() != deployment.as_bytes() {
+        return Err(Anomaly::incorrect("rtdb.multi/foreign-root", format!("This store belongs to deployment {}, not {deployment}", String::from_utf8_lossy(&owner))));
     }
+    Ok(())
 }
 
 /// What a reaper pass did.
@@ -283,9 +297,9 @@ pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now
     for store in crate::reference::stores(bucket, &record.storage_prefix()).await? {
         let mut base = Base::load(bucket, &store).await?;
         let before = base.clone();
-        let own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();
+        let mut own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();
         // Where an object physically is: in this store, or in the one its manifest names.
-        let physical = |name: &str| -> Option<String> {
+        let physical = |own: &BTreeSet<String>, name: &str| -> Option<String> {
             if own.contains(name) { return Some(format!("{store}/{name}")); }
             before.objects.get(name).map(|owner| format!("{owner}/{name}"))
         };
@@ -294,43 +308,57 @@ pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now
         // A released object is either its own object or one entry of a pack; a pack goes once every entry in it has been released for the grace period.
         let mut due: BTreeMap<String, String> = BTreeMap::new();
         for name in records {
-            let Some(location) = physical(&name) else { continue };
+            let Some(location) = physical(&own, &name) else { continue };
             let Ok(bytes) = bucket.get(&crate::reference::key(&location)?).await else { continue };
             let Ok(released) = serde_json::from_slice::<GarbageRecord>(&bytes) else { continue };
             if released.released_at_ms > threshold { reaped.waiting += 1; continue; }
             due.insert(released.key, name);
         }
-        // What this store only references is forgotten rather than erased: the object is its owner's.
-        let mut forgotten: BTreeSet<String> = BTreeSet::new();
-        let mut erased: BTreeSet<String> = BTreeSet::new();
-        for name in due.keys() {
-            if own.contains(name) { references.erase(bucket, &store, name).await?; erased.insert(name.clone()); }
-            else if before.objects.contains_key(name) { forgotten.insert(name.clone()); erased.insert(name.clone()); }
-        }
+        let mut forgotten = BTreeSet::new();
         let packs: BTreeSet<String> = own.iter().chain(before.objects.keys()).filter(|name| name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY))).cloned().collect();
         // The latest block's pack names every other pack, so a cold start finds them all through it: it stays.
         let latest = packs.iter().filter(|pack| pack.starts_with(&format!("{}/b", crate::packing::PACK_DIRECTORY))).max().cloned();
         // A cold start walks block by block from the published checkpoint's pack to the latest, stopping at the first one missing: from the checkpoint on, every block's pack stays.
         let walked = |pack: &str| record.checkpoint.is_some_and(|checkpoint| crate::packing::pack_block(pack).is_some_and(|block| block >= checkpoint.block));
-        let mut packed: BTreeSet<String> = BTreeSet::new();
+        let mut packed = BTreeSet::new();
+        let mut obsolete_packs = Vec::new();
         for pack in packs {
-            let Some(location) = physical(&pack) else { continue };
-            let Ok(index) = crate::packing::read_index(bucket, &crate::reference::key(&location)?).await else { continue };
+            let Some(location) = physical(&own, &pack) else { continue };
+            let index = match crate::packing::read_index(bucket, &crate::reference::key(&location)?).await {
+                Err(Error::MissingObject(_)) if !own.contains(&pack) => {
+                    // The owner can copy this pack into the fork after its inventory was read.
+                    match crate::packing::read_index(bucket, &crate::reference::key(&format!("{store}/{pack}"))?).await {
+                        Ok(index) => { own.insert(pack.clone()); index }
+                        Err(Error::MissingObject(_)) => { forgotten.insert(pack); continue; }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                result => result?,
+            };
             if Some(&pack) != latest.as_ref() && !walked(&pack) && index.entries.keys().all(|name| due.contains_key(name)) {
-                if own.contains(&pack) { references.erase(bucket, &store, &pack).await?; } else { forgotten.insert(pack.clone()); }
-                erased.extend(index.entries.into_keys());
+                obsolete_packs.push(pack);
             } else {
                 packed.extend(index.entries.into_keys());
             }
         }
+        for pack in obsolete_packs {
+            if own.contains(&pack) { references.erase(bucket, &store, &pack).await?; }
+            if before.objects.contains_key(&pack) { forgotten.insert(pack); }
+        }
+        for name in due.keys() {
+            if own.contains(name) { references.erase(bucket, &store, name).await?; }
+            if before.objects.contains_key(name) { forgotten.insert(name.clone()); }
+        }
+        let mut local_records = Vec::new();
         for (name, garbage_record) in &due {
-            if erased.contains(name) || !packed.contains(name) {
-                if own.contains(garbage_record) { references.erase(bucket, &store, garbage_record).await?; } else { forgotten.insert(garbage_record.clone()); }
+            if !packed.contains(name) {
+                if own.contains(garbage_record) { local_records.push(garbage_record); } else { forgotten.insert(garbage_record.clone()); }
                 reaped.erased += 1;
             } else { reaped.waiting += 1; }
         }
         for name in &forgotten { base.objects.remove(name); }
         if base != before { base.save(bucket, &store).await?; }
+        for garbage_record in local_records { references.erase(bucket, &store, garbage_record).await?; }
     }
     Ok(reaped)
 }
@@ -364,7 +392,9 @@ pub async fn finish_moves(bucket: &dyn ObjectStore, deployments: &[DeploymentRec
     for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Deleted && record.moved_at_ms.is_some_and(|moved| moved + grace.as_millis() as i64 <= now_ms)) {
         let prefix = crate::reference::key(&record.storage_prefix())?;
         if !bucket.list(Some(&prefix)).await?.is_empty() {
-            crate::reference::erase_deployment(bucket, &record.storage_prefix(), &others).await?;
+            if !crate::reference::erase_deployment(bucket, &record.storage_prefix(), &others).await? {
+                return Err(Anomaly::fault("rtdb.multi/move-cleanup-incomplete", format!("The source still holds objects for {}", record.name)));
+            }
             finished += 1;
         }
         if let Some(keys) = keys { keys.destroy(&record.id)?; }
@@ -389,6 +419,49 @@ mod tests {
     use rtdb_storage::MemoryStore;
 
     fn key(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
+
+    struct PutFailure {
+        inner: MemoryStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ObjectStore for PutFailure {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+            if self.fail.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::Task("injected object-store write failure".into()));
+            }
+            self.inner.put(key, bytes).await
+        }
+        async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    #[tokio::test]
+    async fn a_failed_root_marker_write_is_returned_to_activation() {
+        let inner = PutFailure { inner: MemoryStore::default(), fail: true.into() };
+        assert_eq!(claim_root(&inner, "shop").await.unwrap_err().code, "rtdb.storage/task");
+        assert!(matches!(inner.get(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
+        claim_root(&inner, "shop").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_is_visible_and_can_be_retried() {
+        let inner = Arc::new(PutFailure { inner: MemoryStore::default(), fail: false.into() });
+        let store = GarbageStore::open(inner.clone()).await.unwrap();
+        let object = key("tables/t/data/a.arrow");
+        store.put(&object, Bytes::from_static(b"rows")).await.unwrap();
+        assert_eq!(store.list(None).await.unwrap().len(), 1);
+        inner.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(store.delete(&object).await.is_err());
+        assert_eq!(store.list(None).await.unwrap().len(), 1);
+        store.delete(&object).await.unwrap();
+        assert!(GarbageStore::open(inner).await.unwrap().list(None).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn objects_are_unreadable_without_their_deployments_key() {

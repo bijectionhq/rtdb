@@ -5,9 +5,11 @@
 //! Time is a simulated clock, which the stores stamp releases and packs from through the real `store::stamps`, so a run is a pure function of its seed.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Range;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,7 +18,7 @@ use rtdb_format::keys::{TrieKey, block_key, lex_hex};
 use rtdb_multi::packing::PackDiscovery;
 use rtdb_multi::reference::{self, Bucket, References};
 use rtdb_multi::store::{self, Clock, GarbageStore};
-use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
+use rtdb_storage::{Error as StoreError, MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::BlockIndex;
 
 use crate::Violation;
@@ -62,6 +64,8 @@ pub struct Summary {
     pub forks: usize,
     pub past_forks: usize,
     pub reaper_passes: usize,
+    pub failed_pack_reads: usize,
+    pub cleaned_moves: usize,
     /// Objects and garbage records the reaper erased.
     pub erased: usize,
     pub deletions: usize,
@@ -82,7 +86,7 @@ struct Deployment {
     record: DeploymentRecord,
     cell: usize,
     /// Every cell it has been in: a move never returns to one, whose directory keeps its tombstone.
-    cells: BTreeSet<usize>,
+    cells: BTreeMap<usize, Option<i64>>,
     state: State,
     /// Each block's digest, inherited and its own; what a block writes is a function of the digests up to it.
     chain: Vec<u64>,
@@ -127,6 +131,29 @@ fn object(name: &str) -> Result<ObjectKey, String> { ObjectKey::new(name).map_er
 fn trie_block(name: &str) -> Option<i64> {
     let stem = name.strip_prefix("tables/")?.rsplit('/').next()?.strip_suffix(".arrow")?;
     TrieKey::from_str(stem).ok().map(|key| key.block_index().0)
+}
+
+struct PackReadFailure<'a> {
+    bucket: &'a dyn ObjectStore,
+    fired: AtomicBool,
+}
+
+const PACK_READ_FAILURE: &str = "injected pack range-read failure";
+
+#[async_trait::async_trait]
+impl ObjectStore for PackReadFailure<'_> {
+    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.bucket.head(key).await }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get(key).await }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+        if key.as_str().contains("/~packs/") && !self.fired.swap(true, Ordering::Relaxed) {
+            return Err(StoreError::Task(PACK_READ_FAILURE.into()));
+        }
+        self.bucket.get_range(key, range).await
+    }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.bucket.put(key, bytes).await }
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.bucket.put_file(key, source).await }
+    async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.bucket.list(directory).await }
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.bucket.delete(key).await }
 }
 
 struct World {
@@ -210,7 +237,7 @@ impl World {
                 while let Some(next) = lineage.pop() { self.dirty.insert(next); lineage.extend(self.deployments[next].children.iter().copied()); }
                 self.dirty.extend(before..self.deployments.len());
             }
-            Some(cells) => self.dirty.extend((0..self.deployments.len()).filter(|&other| cells.iter().any(|cell| self.deployments[other].cells.contains(cell)))),
+            Some(cells) => self.dirty.extend((0..self.deployments.len()).filter(|&other| cells.iter().any(|cell| self.deployments[other].cells.contains_key(cell)))),
         }
         outcome
     }
@@ -222,7 +249,7 @@ impl World {
         record.id = format!("d{index}");
         record.lineage = record.id.clone();
         self.deployments.push(Deployment {
-            record, cell, cells: BTreeSet::from([cell]), state: State::Live, chain: Vec::new(), snapshots: Vec::new(), history: Vec::new(),
+            record, cell, cells: BTreeMap::from([(cell, None)]), state: State::Live, chain: Vec::new(), snapshots: Vec::new(), history: Vec::new(),
             pending: BTreeMap::new(), readable: BTreeMap::new(), optional: BTreeMap::new(), known: BTreeSet::new(), forbidden: BTreeSet::new(), children: Vec::new(), holder: None,
         });
         self.note(format!("create d{index} in cell {cell}"));
@@ -385,7 +412,7 @@ impl World {
             .map_err(|error| format!("forking d{parent} into d{child}: {error}"))?;
         let forked = match at {
             None => Deployment {
-                record, cell: source.cell, cells: BTreeSet::from([source.cell]), state: State::Live,
+                record, cell: source.cell, cells: BTreeMap::from([(source.cell, None)]), state: State::Live,
                 chain: source.chain.clone(), snapshots: source.snapshots.clone(), history: source.history.clone(),
                 pending: BTreeMap::new(), readable: source.readable.clone(), optional: source.optional.clone(), known: source.known.clone(), forbidden: source.forbidden.clone(),
                 children: Vec::new(), holder: None,
@@ -403,7 +430,7 @@ impl World {
                 forbidden.extend(later.iter().map(|write| write.name.clone()).filter(|name| !optional.contains_key(name)));
                 let known = history.iter().map(|write| write.name.clone()).chain(readable.keys().cloned()).chain(optional.keys().cloned()).collect();
                 Deployment {
-                    record, cell: source.cell, cells: BTreeSet::from([source.cell]), state: State::Live,
+                    record, cell: source.cell, cells: BTreeMap::from([(source.cell, None)]), state: State::Live,
                     chain: source.chain[..=block].to_vec(), snapshots: source.snapshots[..=block].to_vec(), history,
                     pending: BTreeMap::new(), readable, optional, known, forbidden, children: Vec::new(), holder: None,
                 }
@@ -422,9 +449,11 @@ impl World {
     fn records(&self, cell: usize, except: Option<usize>) -> Vec<DeploymentRecord> {
         let mut records = Vec::new();
         for (index, deployment) in self.deployments.iter().enumerate() {
-            if Some(index) == except || !deployment.cells.contains(&cell) { continue; }
+            if Some(index) == except { continue; }
+            let Some(&moved_at_ms) = deployment.cells.get(&cell) else { continue };
             let mut record = deployment.record.clone();
-            if !deployment.live() || deployment.cell != cell { record.lifecycle = Lifecycle::Deleted; }
+            record.moved_at_ms = moved_at_ms;
+            if !deployment.live() || moved_at_ms.is_some() { record.lifecycle = Lifecycle::Deleted; }
             records.push(record);
         }
         records
@@ -440,12 +469,44 @@ impl World {
                 for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) { outcomes.push(store::reap_as_of(bucket.as_ref(), record, self.now(), grace, &References::default()).await); }
                 outcomes
             }
-            _ => store::reaper_pass(bucket.as_ref(), &records, self.now(), grace).await.map_err(|error| format!("the reaper's scan of cell {cell} failed: {error}"))?,
+            _ => {
+                if self.rng.chance(20) {
+                    let faulty = PackReadFailure { bucket: bucket.as_ref(), fired: AtomicBool::new(false) };
+                    let first = store::reaper_pass(&faulty, &records, self.now(), grace).await.map_err(|error| error.to_string())?;
+                    let mut saw_failure = false;
+                    for outcome in first {
+                        match outcome {
+                            Ok(result) => self.summary.erased += result.erased,
+                            Err(error) if error.message.as_deref().is_some_and(|message| message.ends_with(PACK_READ_FAILURE)) => saw_failure = true,
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                    if faulty.fired.load(Ordering::Relaxed) != saw_failure {
+                        return Err("the reaper did not report a failed pack read".into());
+                    }
+                    if saw_failure {
+                        self.summary.failed_pack_reads += 1;
+                        self.note(format!("the reaper encounters a pack read failure in cell {cell}"));
+                        self.dirty.extend(self.live());
+                        self.check().await?;
+                    }
+                }
+                store::reaper_pass(bucket.as_ref(), &records, self.now(), grace).await.map_err(|error| format!("the reaper's scan of cell {cell} failed: {error}"))?
+            }
         };
         let mut erased = 0;
         for outcome in outcomes { erased += outcome.map_err(|error| format!("the reaper failed in cell {cell}: {error}"))?.erased; }
         self.summary.reaper_passes += 1;
         self.summary.erased += erased;
+        self.summary.cleaned_moves += store::finish_moves(bucket.as_ref(), &records, self.now(), grace, None)
+            .await.map_err(|error| format!("cleaning up moves from cell {cell}: {error}"))?;
+        for record in &records {
+            if record.moved_at_ms.is_some_and(|moved| moved + GRACE_MS <= self.now())
+                && !bucket.list(Some(&object(&record.storage_prefix())?)).await.map_err(|error| error.to_string())?.is_empty()
+            {
+                return Err(format!("cell {cell} still holds {} after its move grace", record.name));
+            }
+        }
         self.note(format!("the reaper passes over cell {cell}, erasing {erased}"));
         Ok(())
     }
@@ -466,7 +527,8 @@ impl World {
     }
 
     async fn move_cell(&mut self, index: usize) -> Step {
-        let Some(target) = (0..CELLS).find(|cell| !self.deployments[index].cells.contains(cell)) else { return Ok(()) };
+        let Some(target) = (0..CELLS).find(|cell| !self.deployments[index].cells.contains_key(cell)) else { return Ok(()) };
+        let moved_at = self.now();
         let deployment = &mut self.deployments[index];
         let source = deployment.cell;
         deployment.holder = None;
@@ -475,7 +537,8 @@ impl World {
         reference::materialize(self.cells[source].as_ref(), &prefix, self.cells[target].as_ref(), &prefix).await.map_err(|error| format!("moving d{index}: {error}"))?;
         let deployment = &mut self.deployments[index];
         deployment.cell = target;
-        deployment.cells.insert(target);
+        deployment.cells.insert(source, Some(moved_at));
+        deployment.cells.insert(target, None);
         let left = self.cells[source].list(Some(&object(&prefix)?)).await.map_err(|error| error.to_string())?.len();
         self.summary.moves += 1;
         self.summary.left_behind += left;

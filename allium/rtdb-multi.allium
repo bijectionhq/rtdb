@@ -1272,6 +1272,7 @@ rule NoteReleased {
 rule ReapUnreachable {
     -- An object is deleted only when no published manifest of any live deployment in its lineage references it, and reaper_grace has passed since it was released.
     -- The reaper's deletions are conditional on the lineage's version, which every fork and every deletion bumps, so a fork created mid-sweep keeps what it references.
+    -- When the reaper cannot determine reachability, it keeps the affected release records for a later pass.
     when: candidate: GarbageCandidate.released_at + config.reaper_grace <= now
 
     requires: not exists d in LiveDeploymentsOf(candidate.lineage): candidate.object in ReferencedBy(d.checkpoint.manifest)
@@ -1734,6 +1735,8 @@ rule BeginCellMove {
 
 rule MoveCutover {
     -- The source fences the deployment, the target replays the remaining tail, the cell map flips, and the source keeps a forwarding tombstone.
+    -- After the grace period, the source removes the deployment's remaining objects and destroys its copy of the key once the source prefix is empty.
+    -- Forks in the source cell retain access to every object they share.
     when: TargetCaughtUp(record, target_cell)
 
     ensures:

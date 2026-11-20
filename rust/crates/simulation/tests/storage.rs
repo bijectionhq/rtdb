@@ -18,6 +18,8 @@ fn sweep(seeds: std::ops::Range<u64>, steps: usize) -> Summary {
         total.forks += summary.forks;
         total.past_forks += summary.past_forks;
         total.reaper_passes += summary.reaper_passes;
+        total.failed_pack_reads += summary.failed_pack_reads;
+        total.cleaned_moves += summary.cleaned_moves;
         total.erased += summary.erased;
         total.deletions += summary.deletions;
         total.moves += summary.moves;
@@ -43,6 +45,7 @@ fn a_storage_seed_replays_exactly() {
 fn forks_reaping_deletion_and_moves_keep_every_deployments_objects() {
     let total = sweep(0..300, 200);
     eprintln!("{total:?}");
+    assert!(total.failed_pack_reads > 10 && total.cleaned_moves > 10, "{total:?}");
     assert!(total.past_forks > 100 && total.erased > 1_000 && total.deletions > 50 && total.moves > 50, "the sweep forks, reaps, deletes and moves: {total:?}");
 }
 
