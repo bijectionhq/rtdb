@@ -823,3 +823,20 @@ async fn a_list_holding_a_null_among_mixed_types_reads_back_through_every_valid_
     let field = batch.batch().schema().field(0).clone();
     assert_eq!(read_value(&field, batch.batch().column(0).as_ref(), 0).unwrap(), Value::List(vec![Value::Bool(false), Value::Null, Value::I64(0)]));
 }
+
+#[tokio::test]
+async fn a_join_on_two_set_columns_raises_set_equality() {
+    let memory = MemoryBudget::new(1 << 26);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    write(&state, 1, Value::Set(vec![Value::I64(1)]), &memory);
+    let context = context(Some(&state), &memory);
+    let sql = "SELECT a._id FROM docs a JOIN docs b ON a.v = b.v";
+    let error = match PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic) {
+        Err(error) => error,
+        Ok(statement) => match statement.open_query(Arc::clone(&context), vec![]).await {
+            Err(error) => error,
+            Ok(mut cursor) => loop { match cursor.next_batch().await { Err(error) => break error, Ok(Some(_)) => continue, Ok(None) => panic!("joined sets") } },
+        },
+    };
+    assert_eq!(error.code, "xtdb.expression/set-equality");
+}

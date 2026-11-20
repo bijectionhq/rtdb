@@ -286,3 +286,16 @@ fn retained_row_keeps_its_memory_budget_charged_after_partition_close() {
     drop(row);
     assert_eq!(budget.used_bytes(), 0);
 }
+
+#[test]
+fn staging_releases_the_segments_the_transactions_reads_built_before_building_the_write() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 26);
+    let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
+    for id in 0..500 { tx.put(table(), document(id, id), Interval::ALL).unwrap(); }
+    drop(tx.snapshot().unwrap());
+    let before = budget.peak_bytes();
+    let staged = tx.stage().unwrap();
+    assert_eq!(budget.peak_bytes(), before, "staging held the cached segments and the write together");
+    drop(staged);
+}
