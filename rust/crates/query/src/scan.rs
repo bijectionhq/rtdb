@@ -105,11 +105,11 @@ impl ActiveRows {
     fn row(&self, index: usize) -> Result<RowSource> {
         match self { Self::Live { table, located } => table.row_at(located[index]), Self::File(batch) => Ok(RowSource { batch: Arc::clone(batch), row: index }) }
     }
-    /// The batch holding row `index`, and the row's position in it.
-    fn batch(&self, index: usize) -> Result<(&Arc<IndexBatch>, u32)> {
+    /// The batch holding row `index`, the slot that names it within this page, and the row's position in it.
+    fn batch(&self, index: usize) -> Result<(usize, &Arc<IndexBatch>, u32)> {
         match self {
-            Self::Live { table, located } => table.batch_at(located[index]),
-            Self::File(batch) => Ok((batch, u32::try_from(index).map_err(|_| invalid("page-size", "A page row exceeds u32 addressing"))?)),
+            Self::Live { table, located } => { let (batch, row) = table.batch_at(located[index])?; Ok((located[index].0 as usize, batch, row)) }
+            Self::File(batch) => Ok((0, batch, u32::try_from(index).map_err(|_| invalid("page-size", "A page row exceeds u32 addressing"))?)),
         }
     }
     fn header(&self, index: usize) -> Result<EventHeader> {
@@ -517,8 +517,7 @@ impl PartitionScan {
         let active: Vec<&ActiveRows> = selected.iter().map(|index| &self.loaded[index].rows).collect();
         // Resolved rows name their batch by its place here, so a row costs no handle on its batch.
         let mut batches: Vec<Arc<IndexBatch>> = Vec::new();
-        let mut batch_index: std::collections::HashMap<*const IndexBatch, u32, std::hash::BuildHasherDefault<crate::columnar::AddressHasher>> = Default::default();
-        let mut last_batch: Option<(*const IndexBatch, u32)> = None;
+        let mut handles: Vec<Vec<u32>> = vec![Vec::new(); active.len()];
         let mut next = heads.pop();
         while let Some(head) = next.take() {
             self.execution.context.check_cancelled_at(visited)?;
@@ -537,14 +536,11 @@ impl PartitionScan {
             };
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
-            let (batch, row) = rows.batch(head.ordinal)?;
-            let address = Arc::as_ptr(batch);
-            let handle = match last_batch {
-                Some((last, handle)) if last == address => handle,
-                _ => *batch_index.entry(address).or_insert_with(|| { batches.push(Arc::clone(batch)); (batches.len() - 1) as u32 }),
-            };
-            last_batch = Some((address, handle));
-            let source = (handle, row);
+            let (slot, batch, row) = rows.batch(head.ordinal)?;
+            let page = &mut handles[head.active];
+            if page.len() <= slot { page.resize(slot + 1, u32::MAX); }
+            if page[slot] == u32::MAX { batches.push(Arc::clone(batch)); page[slot] = u32::try_from(batches.len() - 1).map_err(|_| invalid("scan-row-size", "A task reads more batches than u32 names"))?; }
+            let source = (page[slot], row);
             let group: &mut Vec<_> = &mut groups[head.active];
             let memory = &self.execution.context.memory;
             resolver.resolve_fragments(&head.header, |valid_time, system_time| {

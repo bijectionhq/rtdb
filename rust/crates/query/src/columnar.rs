@@ -183,7 +183,7 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
     let uniform = children.iter().all(|child| child.as_ref().is_some_and(|(_, other, other_logical)| other == &field && other_logical == &logical));
     if uniform && flat(field.data_type()) {
         let arrays: Vec<&dyn Array> = children.iter().flatten().map(|(array, ..)| array.as_ref()).collect();
-        let array = arrow_select::interleave::interleave(&arrays, cells).map_err(|error| invalid("column-gather", error))?;
+        let array = interleave(&arrays, cells)?;
         return Ok(Column::Arrow { array, field, logical });
     }
     cells.iter().map(|&(source, offset)| match &children[source] {
@@ -197,6 +197,31 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
 
 /// Whether Arrow's interleave copies the layout without validating it: nested layouts are rebuilt and checked, and
 /// stored cells such as nulls under a non-nullable list item fail that check by panicking, so they are read as values.
+/// Interleaves cells of arrays sharing one layout; a dense union gathers each leg's children in bulk, where Arrow's
+/// generic path would extend the union one cell at a time.
+pub(crate) fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Result<ArrayRef> {
+    let DataType::Union(fields, arrow_schema::UnionMode::Dense) = arrays.first().map(|array| array.data_type()).ok_or_else(|| invalid("column-gather", "Nothing to interleave"))? else {
+        return arrow_select::interleave::interleave(arrays, cells).map_err(|error| invalid("column-gather", error));
+    };
+    let unions = arrays.iter().map(|array| array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("column-gather", "A union source is not a union"))).collect::<Result<Vec<_>>>()?;
+    let mut picks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); fields.iter().map(|(id, _)| id as usize + 1).max().unwrap_or(0)];
+    let mut ids = Vec::with_capacity(cells.len());
+    let mut offsets = Vec::with_capacity(cells.len());
+    for &(source, row) in cells {
+        let union = unions[source];
+        let id = union.type_id(row);
+        let leg = picks.get_mut(usize::try_from(id).map_err(|_| invalid("column-gather", "A union cell names no leg"))?).ok_or_else(|| invalid("column-gather", "A union cell names no leg"))?;
+        offsets.push(i32::try_from(leg.len()).map_err(|_| invalid("column-gather", "A union leg exceeds i32 offsets"))?);
+        leg.push((source, union.value_offset(row)));
+        ids.push(id);
+    }
+    let children = fields.iter().map(|(id, _)| {
+        let children: Vec<&dyn Array> = unions.iter().map(|union| union.child(id).as_ref()).collect();
+        arrow_select::interleave::interleave(&children, &picks[id as usize]).map_err(|error| invalid("column-gather", error))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(UnionArray::try_new(fields.clone(), datafusion_common::arrow::buffer::ScalarBuffer::from(ids), Some(datafusion_common::arrow::buffer::ScalarBuffer::from(offsets)), children).map_err(|error| invalid("column-gather", error))?))
+}
+
 pub(crate) fn flat(data_type: &DataType) -> bool {
     scalar_layout(data_type) || matches!(data_type, DataType::Union(fields, arrow_schema::UnionMode::Dense) if fields.iter().all(|(_, field)| scalar_layout(field.data_type())))
 }
@@ -310,7 +335,7 @@ mod kernel {
 
     enum Cells<'a> { Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
         /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
-        Union { array: &'a arrow_array::UnionArray, legs: Vec<(i8, Cells<'a>)> } }
+        Union { array: &'a arrow_array::UnionArray, legs: Vec<Option<Cells<'a>>> } }
 
     impl<'a> Cells<'a> {
         fn of(column: &'a Column) -> Option<Self> {
@@ -330,11 +355,12 @@ mod kernel {
                         DataType::Timestamp(ArrowUnit::Microsecond, _) if matches!(logical, Some(LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, .. })) | None) => any.downcast_ref().map(Self::Micros),
                         DataType::Union(fields, arrow_schema::UnionMode::Dense) => {
                             let array: &arrow_array::UnionArray = any.downcast_ref()?;
-                            let legs = fields.iter().map(|(id, field)| {
-                                if !field.metadata().is_empty() { return None; }
+                            let mut legs: Vec<Option<Self>> = Vec::new();
+                            for (id, field) in fields.iter() {
+                                if id < 0 || !field.metadata().is_empty() { return None; }
                                 let child = array.child(id);
                                 let leg_any = child.as_any();
-                                Some((id, match child.data_type() {
+                                let cells = match child.data_type() {
                                     DataType::Int64 => Self::Int(leg_any.downcast_ref()?),
                                     DataType::Int32 => Self::Int32(leg_any.downcast_ref()?),
                                     DataType::Int16 => Self::Int16(leg_any.downcast_ref()?),
@@ -343,8 +369,11 @@ mod kernel {
                                     DataType::Utf8 => Self::Text(leg_any.downcast_ref()?),
                                     DataType::Boolean => Self::Bool(leg_any.downcast_ref()?),
                                     _ => return None,
-                                }))
-                            }).collect::<Option<Vec<_>>>()?;
+                                };
+                                let id = id as usize;
+                                if legs.len() <= id { legs.resize_with(id + 1, || None); }
+                                legs[id] = Some(cells);
+                            }
                             Some(Self::Union { array, legs })
                         }
                         _ => None,
@@ -367,8 +396,7 @@ mod kernel {
                 Self::Micros(array) => valid(*array, row).then(|| Cell::Micros(array.value(row), matches!(array.data_type(), DataType::Timestamp(_, Some(_))))),
                 Self::Values(values) => scalar(&values[row])?,
                 Self::Union { array, legs } => {
-                    let id = array.type_id(row);
-                    let (_, leg) = legs.iter().find(|(leg, _)| *leg == id).ok_or(())?;
+                    let leg = usize::try_from(array.type_id(row)).ok().and_then(|id| legs.get(id)).and_then(Option::as_ref).ok_or(())?;
                     leg.get(array.value_offset(row))?
                 }
             })

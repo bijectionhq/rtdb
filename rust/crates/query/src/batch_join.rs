@@ -177,7 +177,7 @@ fn gathered(batches: &[ColumnBatch], position: usize, pairs: &[(usize, usize)]) 
     if let Some(arrow) = arrow && let Some((_, field, logical)) = arrow.first()
         && crate::columnar::flat(field.data_type()) && arrow.iter().all(|(_, other, other_logical)| other == field && other_logical == logical) {
         let arrays: Vec<&dyn Array> = arrow.iter().map(|(array, ..)| array.as_ref()).collect();
-        let array = arrow_select::interleave::interleave(&arrays, pairs).map_err(|error| invalid("join-gather", error))?;
+        let array = crate::columnar::interleave(&arrays, pairs)?;
         return Ok(Column::Arrow { array, field: Arc::clone(field), logical: (*logical).clone() });
     }
     pairs.iter().map(|&(batch, row)| batches[batch].columns[position].value(row)).collect::<Result<Vec<_>>>().map(Column::Values)
