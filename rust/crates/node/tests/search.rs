@@ -269,6 +269,39 @@ async fn a_search_file_a_scan_cannot_read_is_rebuilt_to_its_original_bytes() {
 }
 
 #[tokio::test]
+async fn a_search_file_left_unpublished_is_deleted_once_its_definition_leaves_force() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    for id in 0..10 {
+        assert!(session.state_mut().execute_tx(vec![sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'note {id}'}}"))], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let store = Arc::clone(database.object_store());
+    let artefacts = || async { store.list(Some(&rtdb_storage::ObjectKey::new("tables").unwrap())).await.unwrap().into_iter().map(|object| object.key).filter(|key| key.as_str().contains("/artefacts/")).collect::<Vec<_>>() };
+    let recorded = artefacts().await;
+    assert!(!recorded.is_empty());
+    let format = format!("f{}-v", rtdb_search::FORMAT_VERSION);
+    let stray = rtdb_storage::ObjectKey::new(recorded[0].as_str().replace(&format, "f0-v")).unwrap();
+    store.put(&stray, b"uploaded by a builder that failed before publishing".to_vec().into()).await.unwrap();
+    database.build_artefacts().await.unwrap();
+    assert!(artefacts().await.contains(&stray), "the lane looks again only when the table's definitions change");
+    assert!(session.state_mut().execute_tx(vec![sql("DROP SEARCH INDEX docs_body")], AutonomousTxOptions::default()).await.unwrap().committed());
+    database.build_artefacts().await.unwrap();
+    assert_eq!(artefacts().await, recorded, "the stray is deleted; the dropped definition's recorded files stay with their tries");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn live_rows_written_between_queries_are_found_as_the_live_index_grows() {
     let (node, driver) = Node::open(options(), services()).await.unwrap();
     let driver = tokio::spawn(driver.run());

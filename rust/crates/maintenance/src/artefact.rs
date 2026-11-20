@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use rtdb_format::{keys::TrieKey, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactsAdded}};
+use rtdb_format::{keys::{TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactsAdded}};
 use rtdb_index::{PartitionValue, TrieCatalog, TrieState};
+use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, SourcePosition, StorageEpoch, StorageVersion, TableRef};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -13,6 +14,7 @@ use crate::{CompactionFailure, CompactionObserver, SnapshotSource, StderrCompact
 use crate::driver::Completion;
 
 /// One version of one definition of an artefact kind over one table.
+/// Its version is the id of the transaction that made it, so a snapshot knows every version up to its basis.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ArtefactDefinition { pub table: TableRef, pub kind: String, pub id: String, pub version: i64 }
 
@@ -65,6 +67,17 @@ pub fn available_artefact_jobs(catalog: &TrieCatalog, definitions: &[ArtefactDef
     jobs
 }
 
+/// Objects of `kind` under the table's artefacts that no record names and no job will publish: under a live trie, for a definition neither in force nor newer than the snapshot's basis.
+/// A builder uploaded each and failed before publishing it; one under a trie that is not live is left to the collector.
+pub fn stray_artefacts<'a>(catalog: &TrieCatalog, table: &TableRef, slug: &TableSlug, kind: &str, definitions: &[ArtefactDefinition], basis: i64, listed: impl IntoIterator<Item = &'a ObjectKey>) -> Vec<ObjectKey> {
+    listed.into_iter().filter(|object| {
+        let Some((trie, found, id, version)) = slug.parse_artefact_key(object.as_str()) else { return false };
+        found == kind && version <= basis
+            && !definitions.iter().any(|definition| &definition.table == table && definition.kind == kind && definition.id == id && definition.version == version)
+            && catalog.iter_tries(table).any(|candidate| candidate.key == trie && candidate.state == TrieState::Live && candidate.artefact(kind, &id, version).is_none())
+    }).cloned().collect()
+}
+
 #[derive(Clone)]
 pub struct ArtefactHandle { signals: mpsc::Sender<()>, requests: mpsc::Sender<Completion>, capacity: Arc<Semaphore> }
 
@@ -89,15 +102,51 @@ pub struct ArtefactDriver {
     automatic: bool,
     signals: mpsc::Receiver<()>,
     requests: mpsc::Receiver<Completion>,
+    strays: StraySweep,
+}
+
+/// Where the lane looks for its kind's stray objects, the definitions in force per table when it last looked (`None` until its first look, which covers every table), and the tables whose last sweep failed.
+struct StraySweep { kind: String, store: Arc<dyn ObjectStore>, swept: Option<BTreeMap<TableRef, BTreeSet<(String, i64)>>>, failed: BTreeSet<TableRef> }
+
+impl StraySweep {
+    /// Deletes the stray objects of every table whose definitions changed since the last sweep or whose last sweep failed, or of every table on the first.
+    async fn sweep(&mut self, snapshot: &PartitionValue, definitions: &[ArtefactDefinition]) {
+        let mut current: BTreeMap<TableRef, BTreeSet<(String, i64)>> = BTreeMap::new();
+        for definition in definitions { current.entry(definition.table.clone()).or_default().insert((definition.id.clone(), definition.version)); }
+        let snapshot = snapshot.snapshot();
+        let tables: BTreeSet<TableRef> = match &self.swept {
+            None => snapshot.tables(),
+            Some(swept) => swept.keys().chain(current.keys()).filter(|table| swept.get(*table) != current.get(*table)).chain(&self.failed).cloned().collect(),
+        };
+        self.failed.clear();
+        let basis = snapshot.tx_basis().map_or(i64::MIN, |basis| basis.tx_id.0);
+        let mut swept = self.swept.take().unwrap_or_default();
+        for table in tables {
+            let Some(entry) = snapshot.table_entry(&table) else { continue };
+            let outcome: Result<()> = async {
+                let prefix = ObjectKey::new(entry.slug.artefacts_prefix()).map_err(crate::invalid)?;
+                let listed = self.store.list(Some(&prefix)).await.map_err(crate::invalid)?;
+                for key in stray_artefacts(snapshot.trie_catalog(), &table, &entry.slug, &self.kind, definitions, basis, listed.iter().map(|object| &object.key)) {
+                    self.store.delete(&key).await.map_err(crate::invalid)?;
+                }
+                Ok(())
+            }.await;
+            if outcome.is_err() { self.failed.insert(table.clone()); }
+            match current.get(&table) { Some(definitions) => { swept.insert(table, definitions.clone()); } None => { swept.remove(&table); } }
+        }
+        self.swept = Some(swept);
+    }
 }
 
 impl ArtefactDriver {
+    /// `kind` names the builder's artefacts under `store`, where the lane deletes the ones a failed builder left unpublished.
     pub fn new(snapshots: Arc<dyn SnapshotSource>, builder: Arc<dyn ArtefactBuilder>, publisher: Arc<dyn ArtefactPublisher>, storage: (StorageVersion, StorageEpoch),
-        parallelism: usize, request_capacity: usize, automatic: bool) -> Result<(Self, ArtefactHandle)> {
+        kind: &str, store: Arc<dyn ObjectStore>, parallelism: usize, request_capacity: usize, automatic: bool) -> Result<(Self, ArtefactHandle)> {
         if parallelism == 0 || request_capacity == 0 { return Err(crate::invalid("Artefact lane concurrency and request capacity must be positive")); }
         let (signals, signal_receiver) = mpsc::channel(1);
         let (requests, request_receiver) = mpsc::channel(request_capacity);
-        Ok((Self { snapshots, builder, publisher, observer: Arc::new(StderrCompactionObserver), storage, parallelism, automatic, signals: signal_receiver, requests: request_receiver },
+        let strays = StraySweep { kind: kind.to_string(), store, swept: None, failed: BTreeSet::new() };
+        Ok((Self { snapshots, builder, publisher, observer: Arc::new(StderrCompactionObserver), storage, parallelism, automatic, signals: signal_receiver, requests: request_receiver, strays },
             ArtefactHandle { signals, requests, capacity: Arc::new(Semaphore::new(request_capacity)) }))
     }
 
@@ -108,10 +157,11 @@ impl ArtefactDriver {
         self.observer.failed(&CompactionFailure::new(&job.definition.table, &job.trie, error));
     }
 
-    async fn available(&self, cancellation: &CancellationToken) -> Result<Vec<ArtefactJob>> {
+    async fn available(&mut self, cancellation: &CancellationToken) -> Result<Vec<ArtefactJob>> {
         let snapshot = self.snapshots.snapshot();
         let mut jobs = self.builder.repairs(&snapshot, cancellation).await?;
         let definitions = self.builder.definitions(&snapshot, cancellation).await?;
+        self.strays.sweep(&snapshot, &definitions).await;
         jobs.extend(available_artefact_jobs(snapshot.trie_catalog(), &definitions));
         Ok(jobs)
     }

@@ -59,6 +59,22 @@ fn a_tries_artefacts_live_under_one_prefix_of_its_own() {
 }
 
 #[test]
+fn an_artefact_key_names_the_trie_kind_definition_and_version_it_was_made_from() {
+    let slug = TableSlug::recorded("public$docs").unwrap();
+    let key: TrieKey = "l01-rc-b03".parse().unwrap();
+    for (id, version) in [("docs_body~a1f3", 2), ("with-v-inside", 7), ("docs", -1)] {
+        let artefact = slug.artefact_key(&key, "search", id, version).unwrap();
+        assert!(artefact.starts_with(&format!("{}/", slug.artefacts_prefix())));
+        assert_eq!(slug.parse_artefact_key(&artefact), Some((key.clone(), "search".into(), id.into(), version)), "{artefact}");
+    }
+    for stray in ["tables/public$docs/artefacts/l01-rc-b03/search/docs-v2.tmp", "tables/public$docs/artefacts/l01-rc-b03/docs-v2.bin",
+        "tables/public$docs/artefacts/l01-rc-b03/search/x/docs-v2.bin", "tables/public$other/artefacts/l01-rc-b03/search/docs-v2.bin",
+        "tables/public$docs/artefacts/not-a-trie/search/docs-v2.bin", "tables/public$docs/artefacts/l01-rc-b03/search/docs-v02.bin"] {
+        assert_eq!(slug.parse_artefact_key(stray), None, "{stray}");
+    }
+}
+
+#[test]
 fn trie_recency_keys_preserve_the_nonnegative_java_calendar_range() {
     use rtdb_types::CivilDate;
     for (date, text) in [

@@ -131,6 +131,18 @@ rule SearchJobRuns {
         db/ArtefactsAdded(table: job.table, trie_key: job.trie_key, record: search_record(job)) appended to database.source_log
 }
 
+rule SweepStraySearchFiles {
+    -- A builder that uploads a search file and fails before appending ArtefactsAdded leaves an object no record names.
+    -- While its definition is in force, the job stays available, and the next builder to run it writes the same bytes under the same key and records them.
+    -- Once the definition leaves force, no job will, so the lane deletes it: an unrecorded object of kind `search` under a live trie, for a definition neither in force nor made after the snapshot's basis.
+    -- The lane looks at every table when it starts, at a table whenever its definitions in force change, and again at a table whose last look failed.
+    -- An object under a trie that is not live is gc.allium's, deleted with the trie.
+    when: DefinitionsInForceChanged(table)
+
+    ensures:
+        StraySearchFilesDeleted(table)
+}
+
 rule RepairUnreadableSearchFile {
     -- A scan that finds a recorded search file missing, or its bytes unreadable as a search file, evaluates that trie from its data file and reports the file to its database's lane, which wakes for it.
     -- A file that could not be fetched at all is not reported: the store may be briefly unavailable, and the file sound.
@@ -262,12 +274,11 @@ surface FullTextSearch {
 --   search_record(job)                  — the artefact record of a built search file: kind `search`, the definition's artefact id and version
 --   search_candidates(scan, predicate)  — steps 1–4 of the query plan
 --   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the trie's artefact key
+--   StraySearchFilesDeleted(table)      — list the table's artefact objects and delete those SweepStraySearchFiles names (maintenance/src/artefact.rs: stray_artefacts)
 
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
-
-open question "A node that uploads a search file and fails before appending ArtefactsAdded leaves a file no record names until its trie is collected. Is that bounded enough, or does the lane sweep its own unrecorded keys?"
 
 open question "Ranking scores every matching posting before verifying the best; does block-max WAND, skipping postings that cannot reach the bound, earn its complexity?"
 

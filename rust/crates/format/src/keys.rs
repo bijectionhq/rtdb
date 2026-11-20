@@ -87,6 +87,19 @@ impl TableSlug {
     /// Every artefact derived from one trie lives under this prefix, so collecting the trie can list and delete them all.
     pub fn artefact_prefix(&self, trie: &TrieKey) -> String { format!("{}/artefacts/{trie}", self.table_prefix()) }
 
+    /// Every artefact of the table, under each of its tries' prefixes.
+    pub fn artefacts_prefix(&self) -> String { format!("{}/artefacts", self.table_prefix()) }
+
+    /// The trie, kind, definition id and version an artefact key was made from, or `None` for a key `artefact_key` does not make.
+    pub fn parse_artefact_key(&self, key: &str) -> Option<(TrieKey, String, String, i64)> {
+        let rest = key.strip_prefix(&self.artefacts_prefix())?.strip_prefix('/')?;
+        let mut parts = rest.split('/');
+        let (trie, kind, file, None) = (parts.next()?, parts.next()?, parts.next()?, parts.next()) else { return None };
+        let (id, version) = file.strip_suffix(".bin")?.rsplit_once("-v")?;
+        let (trie, version) = (trie.parse::<TrieKey>().ok()?, version.parse::<i64>().ok()?);
+        (self.artefact_key(&trie, kind, id, version).ok()? == key).then(|| (trie, kind.to_string(), id.to_string(), version))
+    }
+
     pub fn artefact_key(&self, trie: &TrieKey, kind: &str, definition_id: &str, definition_version: i64) -> Result<String> {
         for component in [kind, definition_id] {
             if component.is_empty() || matches!(component, "." | "..") || component.contains(['/', '\\', '\0']) { return Err(invalid_key(component)); }

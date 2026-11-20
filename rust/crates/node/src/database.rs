@@ -144,7 +144,7 @@ impl DatabaseFactory {
                     let clock = Arc::clone(&self.clock);
                     let builder = kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), clock: Arc::new(move || clock.now()) })?;
                     let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
-                    let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch),
+                    let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch), kind.name(), Arc::clone(&resources.store),
                         self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
                     artefact_drivers.push(driver);
                     artefacts.push(handle);
