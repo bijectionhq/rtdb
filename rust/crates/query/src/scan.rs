@@ -349,7 +349,7 @@ impl PartitionScan {
                     let bound = layout.full_allocation_bound()?;
                     let reservation = self.execution.context.memory.reserve(bound)?;
                     let metadata = Arc::new(MetadataFile::read_reader(cursor)?);
-                    metadata_cache::insert(&self.storage, &key, Arc::clone(&metadata), bound);
+                    metadata_cache::insert(&self.storage, &key, Arc::clone(&metadata), bound, metadata.stored_bytes());
                     (metadata, reservation)
                 }
             };
@@ -379,11 +379,11 @@ impl PartitionScan {
                     MetadataNode::RecencyBranch(children) => for (upper, node) in children.iter().rev() {
                         pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
                     },
-                    MetadataNode::Leaf { data_page_index, columns } => pages.push(Page { lower, upper, priority: live_segment_count + index,
+                    MetadataNode::Leaf { data_page_index, columns } => { let columns = &*columns.values()?; pages.push(Page { lower, upper, priority: live_segment_count + index,
                         content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
                             && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?,
                         source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
-                            recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?,
+                            recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)? }
                 }
             }
         }
@@ -607,7 +607,8 @@ mod metadata_cache {
 
     const FILES: usize = 1024;
     const BYTES: usize = 256 << 20;
-    struct Entry { storage: Weak<BufferPool>, metadata: Arc<MetadataFile>, bytes: usize, used: u64 }
+    /// `bound` is what a query admits for the file, as it would to decode it; `bytes` is what the cache retains for it.
+    struct Entry { storage: Weak<BufferPool>, metadata: Arc<MetadataFile>, bound: usize, bytes: usize, used: u64 }
     #[derive(Default)]
     struct Cache { entries: HashMap<(usize, String), Entry>, bytes: usize, clock: u64 }
     fn cache() -> &'static Mutex<Cache> { static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new(); CACHE.get_or_init(Default::default) }
@@ -620,7 +621,7 @@ mod metadata_cache {
         let entry = cache.entries.get_mut(&(Arc::as_ptr(storage) as usize, key.as_str().to_owned()))?;
         if !entry.storage.upgrade().is_some_and(|live| Arc::ptr_eq(&live, storage)) { return None; }
         entry.used = clock;
-        Some((Arc::clone(&entry.metadata), entry.bytes))
+        Some((Arc::clone(&entry.metadata), entry.bound))
     }
     /// A data file's inspected IPC layout, which a scan otherwise re-derives from the footer on every open.
     pub(super) fn layout(storage: &Arc<BufferPool>, key: &ObjectKey) -> Option<FileLayout> {
@@ -675,13 +676,13 @@ mod metadata_cache {
         pages.entries.insert((Arc::as_ptr(storage) as usize, key.as_str().to_owned(), page), Page { storage: Arc::downgrade(storage), batch, bound, used });
     }
 
-    pub(super) fn insert(storage: &Arc<BufferPool>, key: &ObjectKey, metadata: Arc<MetadataFile>, bytes: usize) {
+    pub(super) fn insert(storage: &Arc<BufferPool>, key: &ObjectKey, metadata: Arc<MetadataFile>, bound: usize, bytes: usize) {
         if bytes > BYTES / 4 { return; }
         let Ok(mut cache) = cache().lock() else { return };
         cache.clock += 1;
         let used = cache.clock;
         cache.entries.retain(|_, entry| entry.storage.strong_count() > 0);
-        if let Some(previous) = cache.entries.insert((Arc::as_ptr(storage) as usize, key.as_str().to_owned()), Entry { storage: Arc::downgrade(storage), metadata, bytes, used }) {
+        if let Some(previous) = cache.entries.insert((Arc::as_ptr(storage) as usize, key.as_str().to_owned()), Entry { storage: Arc::downgrade(storage), metadata, bound, bytes, used }) {
             cache.bytes -= previous.bytes;
         }
         cache.bytes += bytes;

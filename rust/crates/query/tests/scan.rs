@@ -539,6 +539,7 @@ async fn persisted_root_count(snapshot: &Snapshot, store: &MemoryStore, block: &
     let [MetadataNode::Leaf { columns, .. }] = metadata.nodes() else {
         panic!("Expected one metadata leaf for the persisted block");
     };
+    let columns = columns.values().unwrap();
     let column = columns.iter().find(|column| {
         matches!(column.field("col-name"), Some(Value::Utf8(column_name)) if column_name.as_str() == name)
             && column.field("root-col?") == Some(&Value::Bool(true))
