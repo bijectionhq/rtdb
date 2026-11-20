@@ -34,7 +34,7 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
     fn remove(&mut self, key: &K) { if let Some((_, _, weight)) = self.entries.remove(key) { self.weight -= weight; } }
 }
 
-type DefinitionKey = (String, Option<(i64, i64)>, Option<i64>);
+type DefinitionKey = (String, Vec<(Option<(i64, i64)>, Option<i64>)>);
 
 /// A recorded search file a scan could not read, awaiting the lane's check.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,14 +93,15 @@ impl SearchRuntime {
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
 
-    /// The definitions in force at a snapshot, read once per committed basis.
-    /// They are read as of the basis's own system time in valid time, as well as in system time, so the basis alone decides them; a snapshot carrying a transaction's own writes is read afresh, at `now`.
-    pub async fn definitions(&self, database: &str, snapshot: &Snapshot, storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, now: Instant, cancellation: &CancellationToken) -> Result<Arc<Vec<SearchDefinition>>> {
-        let committed = !snapshot.has_overlays();
-        let key = committed.then(|| (database.to_string(), snapshot.tx_basis().map(|basis| (basis.tx_id.0, basis.system_time.0)), snapshot.system_time_cap().map(|cap| cap.0)));
+    /// The definitions in force in a database's partitions, read once per committed basis.
+    /// They are read as of the latest basis's own system time in valid time, as well as in system time, so the bases alone decide them; partitions carrying a transaction's own writes are read afresh, at `now`.
+    pub async fn definitions(&self, database: &str, partitions: &[Snapshot], storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, now: Instant, cancellation: &CancellationToken) -> Result<Arc<Vec<SearchDefinition>>> {
+        let committed = partitions.iter().all(|snapshot| !snapshot.has_overlays());
+        let key = committed.then(|| (database.to_string(), partitions.iter().map(|snapshot| (snapshot.tx_basis().map(|basis| (basis.tx_id.0, basis.system_time.0)), snapshot.system_time_cap().map(|cap| cap.0))).collect()));
         if let Some(definitions) = key.as_ref().and_then(|key| self.definitions.lock().get(key)) { return Ok(definitions); }
-        let at = match (committed, snapshot.system_time_cap()) { (true, Some(cap)) => cap.into(), _ => now };
-        let definitions = Arc::new(definitions_in(database, vec![snapshot.clone()], Arc::clone(storage), Arc::clone(memory), at, cancellation).await?);
+        let cap = partitions.iter().map(Snapshot::system_time_cap).collect::<Option<Vec<_>>>().and_then(|caps| caps.into_iter().max());
+        let at = match (committed, cap) { (true, Some(cap)) => cap.into(), _ => now };
+        let definitions = Arc::new(definitions_in(database, partitions.to_vec(), Arc::clone(storage), Arc::clone(memory), at, cancellation).await?);
         if let Some(key) = key { self.definitions.lock().insert(key, Arc::clone(&definitions), 1); }
         Ok(definitions)
     }

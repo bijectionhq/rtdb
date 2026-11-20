@@ -376,3 +376,69 @@ async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+/// Records how many IIDs each narrowing named, to tell a ranked narrowing from an unranked one.
+struct Recording { inner: Arc<rtdb_search::SearchAccelerator>, sizes: std::sync::Mutex<Vec<usize>> }
+#[async_trait]
+impl rtdb_query::ScanAccelerator for Recording {
+    async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<std::collections::BTreeSet<rtdb_types::Iid>>> {
+        let candidates = self.inner.candidate_iids(request).await?;
+        if let Some(candidates) = &candidates { self.sizes.lock().unwrap().push(candidates.len()); }
+        Ok(candidates)
+    }
+}
+
+#[tokio::test]
+async fn a_ranked_limit_over_several_partitions_returns_the_same_rows_as_ranking_everything() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let words = ["invoice", "overdue", "paid", "book", "late", "red"];
+    let mut seed = 23u64;
+    let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
+    let mut partitions = Vec::new();
+    for round in 0..2 {
+        let operations = (0..150).map(|id| {
+            let body: Vec<_> = (0..1 + next() % 8).map(|_| words[next() % words.len()]).collect();
+            sql(&format!("INSERT INTO docs RECORDS {{_id: {}, body: '{}'}}", id + 1000 * round, body.join(" ")))
+        }).collect();
+        assert!(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().committed());
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+        database.compaction().unwrap().compact_all().await.unwrap();
+        database.build_artefacts().await.unwrap();
+        partitions.push(database.snapshot());
+    }
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 30);
+    let recording = Arc::new(Recording { inner: rtdb_search::SearchRuntime::new(64 << 20).accelerator(), sizes: Default::default() });
+    let run = |query: String| {
+        let catalog = rtdb_query::CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".to_string(), rtdb_query::DatabaseSnapshot { partitions: partitions.clone(), storage: Arc::clone(database.storage()) })]), false).unwrap();
+        let (memory, recording) = (Arc::clone(&memory), Arc::clone(&recording));
+        async move {
+            let context = rtdb_query::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(i64::MAX / 2), "UTC", rtdb_query::QueryOptions::default(), &tokio_util::sync::CancellationToken::new()).unwrap()
+                .with_accelerators(Arc::from([recording as Arc<dyn rtdb_query::ScanAccelerator>]));
+            let prepared = rtdb_sql::prepare_in(&query, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory).unwrap();
+            let cursor = rtdb_query::PreparedQuery::from_prepared(prepared, &memory).unwrap().execute(context, Vec::new()).await.unwrap();
+            rows(cursor).await.into_iter().map(|row| (row[0].clone(), row[1].clone())).collect::<Vec<_>>()
+        }
+    };
+    for (matching, scoring) in [("invoice", "invoice overdue"), ("overdue late", "late"), ("book", "book red paid")] {
+        let query = format!("SELECT _id, SEARCH_SCORE(body, '{scoring}') AS score FROM docs WHERE MATCH(body, '{matching}') ORDER BY score DESC, _id");
+        let everything = run(query.clone()).await;
+        assert!(everything.len() > 40, "{query} matched only {}", everything.len());
+        for k in [1, 5, 20] {
+            recording.sizes.lock().unwrap().clear();
+            assert_eq!(run(format!("{query} LIMIT {k}")).await, everything.iter().take(k).cloned().collect::<Vec<_>>(), "{query} LIMIT {k}");
+            let sizes = recording.sizes.lock().unwrap().clone();
+            assert_eq!(sizes.len(), 2, "each partition narrowed");
+            assert!(sizes.iter().sum::<usize>() < everything.len(), "{query} LIMIT {k}: each partition was ranked, not merely narrowed: {sizes:?}");
+        }
+    }
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}

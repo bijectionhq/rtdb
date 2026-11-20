@@ -47,7 +47,7 @@ impl SearchBuilder {
         Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()) }
     }
     async fn search_definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Arc<Vec<SearchDefinition>>> {
-        self.runtime.definitions(&self.database, &snapshot.snapshot(), &self.storage, &self.memory, (self.clock)(), cancellation).await
+        self.runtime.definitions(&self.database, &[snapshot.snapshot()], &self.storage, &self.memory, (self.clock)(), cancellation).await
     }
 }
 

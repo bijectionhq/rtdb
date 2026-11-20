@@ -53,7 +53,7 @@ impl ScanAccelerator for SearchAccelerator {
         for predicate in &scan.predicates { match_conjuncts(predicate, &mut conjuncts); }
         if conjuncts.is_empty() { return Ok(None); }
         let table = &scan.table.name.table;
-        let definitions = self.runtime.definitions(request.database, request.snapshot, request.storage, request.memory, request.current_time, request.cancellation).await?;
+        let definitions = self.runtime.definitions(request.database, request.partitions, request.storage, request.memory, request.current_time, request.cancellation).await?;
         let mut chosen: Option<(String, Query, &SearchDefinition)> = None;
         for (id, query) in conjuncts {
             let Some(column) = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.clone()) else { continue };
@@ -128,8 +128,6 @@ impl SearchAccelerator {
     /// Every matching event is scored exactly from the index, and an IID's best event bounds every row it can resolve to.
     /// IIDs are verified best bound first, in batches, until `limit` verified rows outscore every bound still unverified.
     async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition) -> Result<Option<BTreeSet<Iid>>> {
-        // Every partition's files must be registered before a score fixes the corpus, so ranking is left to the sort when there are several.
-        if request.partitions > 1 { return Ok(None); }
         let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { return Ok(None) };
         let limit = match request.constants.constant(&top_k.limit).await.ok().flatten() {
             Some(Value::I64(limit)) => limit, Some(Value::I32(limit)) => i64::from(limit), Some(Value::I16(limit)) => i64::from(limit), _ => return Ok(None),
@@ -158,10 +156,7 @@ impl SearchAccelerator {
                 None => None,
             };
             match file {
-                Some((key, file)) => {
-                    if trie.key.recency().is_none() { request.corpora.register(format!("{key}#{column}"), std::sync::Arc::new(FileCorpus { file: std::sync::Arc::clone(&file), column: column.to_string() })); }
-                    files.push(file);
-                }
+                Some((_, file)) => files.push(file),
                 None => {
                     let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < request.snapshot.trie_catalog().file_size_target());
                     if !by_policy { unindexed_bytes = unindexed_bytes.saturating_add(trie.data_file_size); }
@@ -170,6 +165,7 @@ impl SearchAccelerator {
                 }
             }
         }
+        self.register_corpora(request, column, definition).await?;
         let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
         let mut bounds: std::collections::BTreeMap<Iid, f64> = std::collections::BTreeMap::new();
         let mut bound = |iid: Iid, score: f64| { let best = bounds.entry(iid).or_insert(f64::NEG_INFINITY); *best = best.max(score); };
@@ -234,6 +230,28 @@ impl rtdb_query::CorpusSource for FileCorpus {
 }
 
 impl SearchAccelerator {
+    /// Registers the table's current-side search files in every partition, so the corpus a score fixes is the same whichever partition is ranked first.
+    async fn register_corpora(&self, request: &ScanRequest<'_>, column: &str, definition: &SearchDefinition) -> Result<()> {
+        let table = &request.scan.table.name.table;
+        let artefact_id = definition.artefact_id();
+        for snapshot in request.partitions {
+            let Some(entry) = snapshot.table_entry(table) else { continue };
+            for trie in snapshot.trie_catalog().current_tries(table) {
+                if trie.state != TrieState::Live || trie.key.recency().is_some() || trie.artefact(KIND, &artefact_id, definition.version).is_none() { continue; }
+                let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
+                let name = format!("{key}#{column}");
+                if request.corpora.holds(&name) { continue; }
+                match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
+                    Ok(file) => request.corpora.register(name, std::sync::Arc::new(FileCorpus { file, column: column.to_string() })),
+                    Err(error) => if error.needs_repair() {
+                        self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version });
+                    },
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
         let mut candidates = BTreeSet::new();
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {

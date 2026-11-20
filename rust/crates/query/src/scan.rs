@@ -140,26 +140,31 @@ use crate::analysis::ScanCounts;
 pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, _reservation: Arc<MemoryReservation> }
 impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
+        let context = Arc::clone(&execution.context);
+        let database = context.catalog.database(&scan.table.name.database)?;
+        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage).await
+    }
+    /// A scan of the given partitions of its database, which share `storage`.
+    async fn over(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>) -> Result<Self> {
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
-        let database = execution.context.catalog.database(&scan.table.name.database)?;
         let canonical_entity_iids = scan.iids.is_none()
             && pushdowns.as_ref().is_some_and(|filters| filters.needs_entity_iid_proof(&scan.columns))
-            && database.partitions.iter().all(|snapshot| snapshot.has_canonical_entity_iids(&scan.table.name.table));
+            && database_partitions.iter().all(|snapshot| snapshot.has_canonical_entity_iids(&scan.table.name.table));
         if let (Some(analysis), Some(pushdowns)) = (&execution.analysis, &pushdowns) {
             analysis.set_pushdowns(pushdowns, &scan.columns, canonical_entity_iids, &execution.context.memory)?;
         }
         let name = scan.table.name.database.clone();
         let source = format!("{}.{}", scan.table.name.table.schema, scan.table.name.table.table);
         let mut partitions = VecDeque::new();
-        for snapshot in &database.partitions {
+        for snapshot in database_partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             let mut narrowed = scan.clone();
-            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone() };
+            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage };
             for accelerator in execution.context.accelerators.iter().filter(|_| scan.iids.is_none()) {
-                let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage: &database.storage, bounds, memory: &execution.context.memory,
+                let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                     current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
-                    corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database.partitions.len() };
+                    corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
                 if let Some(mut candidates) = accelerator.candidate_iids(&request).await? {
                     // `path_matches` stops consulting pushdowns once `iids` is set, so they are applied to the candidates here.
                     if let Some(filters) = &pushdowns { candidates.retain(|iid| filters.iid_matches(&scan.columns, *iid, canonical_entity_iids)); }
@@ -167,7 +172,7 @@ impl ScanCursor {
                     narrowed.iids = Some(iids);
                 }
             }
-            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(&database.storage), scan: narrowed, execution: execution.clone(), bounds,
+            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(storage), scan: narrowed, execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
                 output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
         }
@@ -175,8 +180,8 @@ impl ScanCursor {
     }
 }
 
-/// Runs the scan itself restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
-struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>> }
+/// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
+struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool> }
 
 #[async_trait]
 impl crate::CandidateVerifier for ScanVerifier<'_> {
@@ -193,7 +198,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         let (iid_at, column_at) = (position(&|field| field.name == "_iid")?, position(&|field| field.id == column)?);
         let schema = Schema::new(scan.columns.clone())?;
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
-        let mut cursor = ScanCursor::new(scan, self.execution.clone(), self.pushdowns.clone()).await?;
+        let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage).await?;
         let metadata = self.execution.scope()?;
         let invocation = predicate.as_ref().map(|predicate| self.execution.prepare_expression(predicate, &schema, &metadata)).transpose()?;
         let mut visible = Vec::new();

@@ -50,6 +50,9 @@ impl Database {
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
     pub fn trie_catalog(&self) -> Arc<rtdb_index::TrieCatalog> { Arc::clone(self.partition.value().trie_catalog()) }
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { self.storage.object_store() }
+    /// The database's latest applied state, read with no basis or system-time cap.
+    pub fn snapshot(&self) -> rtdb_index::Snapshot { self.partition.value().snapshot() }
+    pub fn storage(&self) -> &Arc<BufferPool> { &self.storage }
     /// Builds every artefact the lanes can currently build, returning once each is published or with the first failure.
     pub async fn build_artefacts(&self) -> Result<()> {
         for lane in &self.artefacts { lane.build_all().await?; }
