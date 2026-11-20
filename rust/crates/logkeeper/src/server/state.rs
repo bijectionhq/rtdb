@@ -125,6 +125,11 @@ impl StreamState {
         if !dense(from, &entries) || entries.iter().any(|entry| entry.epoch > epoch) {
             return invalid("an overwrite's entries must be dense from its first lsn and no later than its epoch");
         }
+        // A writer's own overwrites never cut what it placed, so one that would is a request delivered after newer ones: deciding it would drop entries those may have committed.
+        let own = |held: &Held| held.epoch == epoch;
+        if from <= self.last() && (self.synced == Some(epoch) || self.entries.iter().skip((from - self.trim - 1) as usize).any(own)) {
+            return invalid(format!("an overwrite at epoch {epoch} from {from} would drop entries its own writer placed, up to {}", self.last()));
+        }
         let mut events = Vec::new();
         if epoch > self.promised { events.push(Event::Promise(epoch)); }
         if from <= self.last() { events.push(Event::Truncate(from)); }
@@ -237,6 +242,23 @@ mod tests {
         state.overwrite(2, 2, vec![entry(2, 2)], true, 2);
         assert_eq!((state.last(), state.synced, state.commit), (2, Some(2), 2));
         assert_eq!(state.runs(), vec![EpochRun { start_lsn: 0, epoch: 1 }, EpochRun { start_lsn: 2, epoch: 2 }]);
+    }
+
+    #[test]
+    fn an_overwrite_never_drops_what_its_own_writer_placed() {
+        let mut state = synced(1);
+        state.append(1, 0, vec![entry(0, 1), entry(1, 1), entry(2, 1)], 0);
+        assert!(matches!(reply(state.overwrite(1, 1, Vec::new(), true, 0)), ResponseBody::Failed(_)), "a rejoin delivered after the appends that followed it");
+        assert!(matches!(reply(state.overwrite(1, 3, vec![entry(3, 1)], true, 0)), ResponseBody::Accepted(_)));
+        let mut copying = StreamState::default();
+        copying.seal(2);
+        copying.overwrite(2, 0, vec![entry(0, 1), entry(1, 2)], false, -1);
+        assert!(matches!(reply(copying.overwrite(2, 1, vec![entry(1, 2)], false, -1)), ResponseBody::Failed(_)), "a chunk delivered after the one that followed it");
+        assert!(matches!(reply(copying.overwrite(2, 2, vec![entry(2, 2)], true, -1)), ResponseBody::Accepted(_)));
+        let mut stale = synced(1);
+        stale.append(1, 0, vec![entry(0, 1), entry(1, 1)], -1);
+        stale.seal(2);
+        assert!(matches!(reply(stale.overwrite(2, 1, vec![entry(1, 2)], true, -1)), ResponseBody::Accepted(_)), "a later writer still truncates an earlier writer's uncommitted suffix");
     }
 
     #[test]

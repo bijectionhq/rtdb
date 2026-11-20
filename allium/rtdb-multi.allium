@@ -380,6 +380,7 @@ contract LogService {
         -- A log server accepts an append for a deployment only if its epoch equals the server's promised epoch for that deployment, the server is synced at that epoch, and its lsn is one above the server's last.
         -- A server is synced at e once e's writer has copied its whole recovered history onto it.
         -- A partial copy leaves the server synced at the epoch it was synced at before.
+        -- A server refuses an overwrite at e that would drop anything e's writer has already placed on it.
         --   A deposed writer's append is refused at the server, so no window exists in which two writers both commit.
 
     @invariant CommitIsAWriteQuorum
