@@ -170,6 +170,21 @@ impl LiveTable {
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
+    /// The chunk holding `row`, and the row's position within it.
+    pub fn locate(&self, row: u32) -> Result<(u32, u32)> {
+        if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
+        let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
+        Ok((index as u32, row - self.chunks[index].0))
+    }
+    /// The header of a row `locate` found.
+    pub fn header_at(&self, (chunk, offset): (u32, u32)) -> Result<EventHeader> {
+        self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?.1.header(offset as usize)
+    }
+    /// The row `locate` found.
+    pub fn row_at(&self, (chunk, offset): (u32, u32)) -> Result<RowSource> {
+        let (_, batch) = self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?;
+        Ok(RowSource { batch: Arc::clone(batch), row: offset as usize })
+    }
     /// The header of `row`, without taking a handle on its batch.
     pub fn header(&self, row: u32) -> Result<EventHeader> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
@@ -251,10 +266,7 @@ impl LiveTable {
 }
 
 impl IidReader for LiveTable {
-    fn iid(&self, row: u32) -> Result<Iid> {
-        let source = self.row(row)?;
-        source.batch.view().iid(source.row)
-    }
+    fn iid(&self, row: u32) -> Result<Iid> { self.header(row).map(|header| header.iid) }
 }
 
 pub struct BlockPages<'a> {

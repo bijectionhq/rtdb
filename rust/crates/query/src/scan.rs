@@ -97,15 +97,16 @@ fn summary_bytes(count: usize) -> Result<usize> {
         .ok_or_else(|| invalid("scan-summary-size", "Scan summary capacity exceeds addressable memory"))
 }
 
-enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File(Arc<IndexBatch>) }
+/// A loaded page's rows; a live page's rows are located in their table's chunks once, when it loads.
+enum ActiveRows { Live { table: Arc<LiveTable>, located: Vec<(u32, u32)> }, File(Arc<IndexBatch>) }
 struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation>, _charge: Option<Arc<MemoryReservation>> }
 impl ActiveRows {
-    fn len(&self) -> usize { match self { Self::Live { rows, .. } => rows.len(), Self::File(batch) => batch.len() } }
+    fn len(&self) -> usize { match self { Self::Live { located, .. } => located.len(), Self::File(batch) => batch.len() } }
     fn row(&self, index: usize) -> Result<RowSource> {
-        match self { Self::Live { table, rows } => table.row(rows[index]), Self::File(batch) => Ok(RowSource { batch: Arc::clone(batch), row: index }) }
+        match self { Self::Live { table, located } => table.row_at(located[index]), Self::File(batch) => Ok(RowSource { batch: Arc::clone(batch), row: index }) }
     }
     fn header(&self, index: usize) -> Result<EventHeader> {
-        match self { Self::Live { table, rows } => table.header(rows[index]), Self::File(batch) => batch.header(index) }
+        match self { Self::Live { table, located } => table.header_at(located[index]), Self::File(batch) => batch.header(index) }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,7 +403,10 @@ impl PartitionScan {
             PageSource::Live { .. } => None,
         };
         let rows = match (&page.source, hit) {
-            (PageSource::Live { table, rows }, _) => ActiveRows::Live { table: Arc::clone(table),rows: Arc::clone(rows) },
+            (PageSource::Live { table, rows }, _) => {
+                charge = Some(self.execution.context.memory.reserve(rows.len().checked_mul(std::mem::size_of::<(u32, u32)>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| invalid("page-size", "Live page rows exceed addressable memory"))?)?);
+                ActiveRows::Live { table: Arc::clone(table), located: rows.iter().map(|row| table.locate(*row)).collect::<Result<_>>()? }
+            }
             (PageSource::File { .. }, Some((batch, bound))) => {
                 charge = Some(self.execution.context.memory.reserve(bound)?);
                 cached = true;

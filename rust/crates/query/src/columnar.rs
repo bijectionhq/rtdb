@@ -2,7 +2,7 @@
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, StructArray};
+use arrow_array::{Array, ArrayRef, StructArray, UnionArray};
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, read_execution_value, read_execution_value_as};
 use rtdb_index::{IndexBatch, RowSource};
@@ -98,27 +98,52 @@ impl ColumnBatch {
     }
 }
 
+/// Hashes the batch addresses that identify gather sources; a multiplicative mix suffices for distinct pointers.
+#[derive(Default)]
+struct AddressHasher(u64);
+impl std::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 { self.0 }
+    fn write(&mut self, bytes: &[u8]) { for byte in bytes { self.0 = (self.0.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15); } }
+    fn write_usize(&mut self, value: usize) { self.0 = (self.0.rotate_left(5) ^ value as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15); }
+    fn write_i8(&mut self, value: i8) { self.0 = (self.0.rotate_left(5) ^ value as u8 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15); }
+}
+
 /// The put leg each event batch stores a resolved row's cells in.
-struct Source { batch: Arc<IndexBatch>, leg: i8, put: StructArray }
+struct Source { batch: Arc<IndexBatch>, put: StructArray }
 
 /// Gathers the scan's columns for rows resolved from any number of event batches, in the order given.
 pub(crate) fn gather(rows: &[ResolvedRow<RowSource>], columns: &[Field], memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
     let mut sources: Vec<Source> = Vec::new();
-    let mut index: std::collections::HashMap<(*const IndexBatch, i8), usize> = std::collections::HashMap::new();
+    // Each batch's operation union, and the sources its put legs became, found once per batch rather than per row.
+    let mut batches: Vec<(UnionArray, Vec<(i8, usize)>)> = Vec::new();
+    let mut index: std::collections::HashMap<*const IndexBatch, usize, std::hash::BuildHasherDefault<AddressHasher>> = Default::default();
     let mut cells = Vec::with_capacity(rows.len());
-    let mut previous = None;
+    let mut previous: Option<(*const IndexBatch, usize)> = None;
     for row in rows {
-        let op = row.source.batch.view().operations()?;
-        let leg = op.type_id(row.source.row);
-        let source = match previous.filter(|&previous: &usize| Arc::ptr_eq(&sources[previous].batch, &row.source.batch) && sources[previous].leg == leg) {
-            Some(previous) => previous,
-            None => *index.entry((Arc::as_ptr(&row.source.batch), leg)).or_insert_with(|| sources.len()),
+        let address = Arc::as_ptr(&row.source.batch);
+        let batch = match previous {
+            Some((last, batch)) if last == address => batch,
+            _ => match index.get(&address) {
+                Some(batch) => *batch,
+                None => {
+                    batches.push((row.source.batch.view().operations()?.clone(), Vec::new()));
+                    index.insert(address, batches.len() - 1);
+                    batches.len() - 1
+                }
+            },
         };
-        previous = Some(source);
-        if source == sources.len() {
-            let put = op.child(leg).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?.clone();
-            sources.push(Source { batch: Arc::clone(&row.source.batch), leg, put });
-        }
+        previous = Some((address, batch));
+        let (op, legs) = &mut batches[batch];
+        let leg = op.type_id(row.source.row);
+        let source = match legs.iter().find(|(known, _)| *known == leg) {
+            Some((_, source)) => *source,
+            None => {
+                let put = op.child(leg).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?.clone();
+                sources.push(Source { batch: Arc::clone(&row.source.batch), put });
+                legs.push((leg, sources.len() - 1));
+                sources.len() - 1
+            }
+        };
         cells.push((source, op.value_offset(row.source.row)));
     }
     // How much a gathered column holds depends on which cells it picks, so each is charged as soon as it is built.
