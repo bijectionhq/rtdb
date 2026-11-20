@@ -3,29 +3,49 @@ use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::sync::{Arc, Weak, atomic::{AtomicU64, AtomicUsize, Ordering}};
 
+/// An allocation ceiling shared by every pool drawing on it.
+/// When a reservation does not fit, idle entries are evicted from whichever pool holds the most, so one pool's idle data cannot starve another.
 pub struct CacheBudget {
     limit: usize,
     retained: AtomicUsize,
+    pools: Mutex<Vec<Weak<PoolShared>>>,
 }
 
-struct Reservation { budget: Arc<CacheBudget>, bytes: usize }
+struct Reservation { budget: Arc<CacheBudget>, pool: Arc<AtomicUsize>, bytes: usize }
 
 impl CacheBudget {
-    pub fn new(limit: usize) -> Arc<Self> { Arc::new(Self { limit, retained: AtomicUsize::new(0) }) }
+    pub fn new(limit: usize) -> Arc<Self> { Arc::new(Self { limit, retained: AtomicUsize::new(0), pools: Mutex::new(Vec::new()) }) }
     pub fn retained_bytes(&self) -> usize { self.retained.load(Ordering::Acquire) }
     pub fn limit_bytes(&self) -> usize { self.limit }
-    fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Reservation> {
+    fn reserve(self: &Arc<Self>, pool: &Arc<AtomicUsize>, bytes: usize) -> Result<Reservation> {
         self.retained.fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
             retained.checked_add(bytes).filter(|total| *total <= self.limit)
         }).map_err(|retained| Error::MemoryLimit { requested: bytes, limit: self.limit, retained })?;
-        Ok(Reservation { budget: self.clone(), bytes })
+        pool.fetch_add(bytes, Ordering::AcqRel);
+        Ok(Reservation { budget: self.clone(), pool: Arc::clone(pool), bytes })
+    }
+
+    fn register(&self, pool: &Arc<PoolShared>) {
+        let mut pools = self.pools.lock();
+        pools.retain(|pool| pool.strong_count() > 0);
+        pools.push(Arc::downgrade(pool));
+    }
+
+    /// Evicts the oldest idle entry of the pool retaining the most bytes that has one; false if no pool has an idle entry.
+    fn evict_from_largest(&self) -> bool {
+        let mut pools: Vec<Arc<PoolShared>> = self.pools.lock().iter().filter_map(Weak::upgrade).collect();
+        pools.sort_by_key(|pool| std::cmp::Reverse(pool.retained.load(Ordering::Acquire)));
+        pools.iter().any(|pool| reclaim_oldest_idle(&mut pool.entries.lock()))
     }
 }
 
 impl Drop for Reservation {
-    fn drop(&mut self) { self.budget.retained.fetch_sub(self.bytes, Ordering::AcqRel); }
+    fn drop(&mut self) {
+        self.budget.retained.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.pool.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone)]
@@ -92,9 +112,11 @@ impl Drop for EmptyEntryCleanup<'_> {
     }
 }
 
+struct PoolShared { entries: Mutex<CacheEntries>, retained: Arc<AtomicUsize> }
+
 pub struct BufferPool {
     store: Arc<dyn ObjectStore>,
-    entries: Mutex<CacheEntries>,
+    shared: Arc<PoolShared>,
     budget: Arc<CacheBudget>,
     metadata: Option<Arc<MemoryBudget>>,
     access_clock: AtomicU64,
@@ -105,10 +127,12 @@ impl BufferPool {
         Self::with_budget(store, CacheBudget::new(byte_limit))
     }
 
-    /// Shares an allocation ceiling across pools; each pool evicts only its own idle entries.
+    /// Shares an allocation ceiling across pools; a reservation that does not fit evicts idle entries from the pool retaining the most.
     pub fn with_budget(store: Arc<dyn ObjectStore>, budget: Arc<CacheBudget>) -> Self {
+        let shared = Arc::new(PoolShared { entries: Mutex::new(BTreeMap::new()), retained: Arc::new(AtomicUsize::new(0)) });
+        budget.register(&shared);
         Self {
-            store, entries: Mutex::new(BTreeMap::new()),
+            store, shared,
             budget,
             metadata: None,
             access_clock: AtomicU64::new(0),
@@ -127,7 +151,7 @@ impl BufferPool {
 
     /// An evicted object remains charged while a caller retains any slice of its lease.
     pub fn evict(&self, key: &ObjectKey) -> bool {
-        let mut entries = self.entries.lock();
+        let mut entries = self.shared.entries.lock();
         if entries.get(key).is_some_and(|entry| Arc::strong_count(entry) == 1) {
             remove_entry(&mut entries, key);
             true
@@ -135,7 +159,7 @@ impl BufferPool {
     }
 
     fn entry(&self, key: &ObjectKey) -> Result<Arc<CacheEntry>> {
-        let mut entries = self.entries.lock();
+        let mut entries = self.shared.entries.lock();
         if let Some(entry) = entries.get(key) {
             return Ok(Arc::clone(entry));
         }
@@ -157,23 +181,18 @@ impl BufferPool {
     }
 
     fn reserve(&self, bytes: usize) -> Result<Reservation> {
-        if let Ok(reservation) = self.budget.reserve(bytes) { return Ok(reservation); }
-        let mut entries = self.entries.lock();
-        let mut idle: Vec<_> = entries.iter()
-            .filter(|(_, entry)| Arc::strong_count(entry) == 1)
-            .map(|(key, entry)| (entry.last_used.load(Ordering::Relaxed), key.clone())).collect();
-        idle.sort();
-        for (_, key) in idle {
-            entries.remove(&key);
-            if let Ok(reservation) = self.budget.reserve(bytes) { return Ok(reservation); }
+        loop {
+            match self.budget.reserve(&self.shared.retained, bytes) {
+                Ok(reservation) => return Ok(reservation),
+                Err(error) => if !self.budget.evict_from_largest() { return Err(error); },
+            }
         }
-        self.budget.reserve(bytes)
     }
 
     /// `range` of an object: a slice of the object where the pool holds all of it, and otherwise those bytes alone,
     /// fetched and charged to the pool's budget for as long as the lease lives, but not kept.
     pub async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<CacheLease> {
-        let held = self.entries.lock().get(key).cloned();
+        let held = self.shared.entries.lock().get(key).cloned();
         if let Some(entry) = held && let Ok(slot) = entry.allocation.try_lock() && let Some(allocation) = slot.as_ref() {
             let (start, end) = (usize::try_from(range.start), usize::try_from(range.end));
             if let (Ok(start), Ok(end)) = (start, end) && start <= end && end <= allocation.len() {
@@ -189,14 +208,14 @@ impl BufferPool {
 
     /// Whether the pool holds all of an object, so that a whole read of it costs nothing more.
     pub fn holds(&self, key: &ObjectKey) -> bool {
-        let held = self.entries.lock().get(key).cloned();
+        let held = self.shared.entries.lock().get(key).cloned();
         held.is_some_and(|entry| entry.allocation.try_lock().is_ok_and(|slot| slot.is_some()))
     }
 
     /// Concurrent fetches of a key share one load; cancellation releases that caller's wait.
     /// An empty entry is removed when its last fetcher fails or is cancelled.
     pub async fn get(&self, key: &ObjectKey) -> Result<CacheLease> {
-        let mut cleanup = EmptyEntryCleanup { entries: &self.entries, key, armed: true };
+        let mut cleanup = EmptyEntryCleanup { entries: &self.shared.entries, key, armed: true };
         let allocation = {
             let entry = self.entry(key)?;
             entry.last_used.store(self.access_clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
@@ -218,5 +237,27 @@ impl BufferPool {
         cleanup.armed = false;
         let length = allocation.len();
         Ok(CacheLease { allocation, range: 0..length })
+    }
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    use super::*;
+    use crate::MemoryStore;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn one_pools_idle_entries_cannot_starve_another_pool_sharing_its_budget() {
+        let budget = CacheBudget::new(100);
+        let (first_store, second_store) = (Arc::new(MemoryStore::default()), Arc::new(MemoryStore::default()));
+        for index in 0..4 { first_store.put(&ObjectKey::new(format!("a{index}")).unwrap(), Bytes::from(vec![1u8; 25])).await.unwrap(); }
+        second_store.put(&ObjectKey::new("b").unwrap(), Bytes::from(vec![2u8; 60])).await.unwrap();
+        let first = BufferPool::with_budget(first_store, Arc::clone(&budget));
+        let second = BufferPool::with_budget(second_store, Arc::clone(&budget));
+        for index in 0..4 { drop(first.get(&ObjectKey::new(format!("a{index}")).unwrap()).await.unwrap()); }
+        assert_eq!(budget.retained_bytes(), 100, "the first pool's idle entries fill the budget");
+        let lease = second.get(&ObjectKey::new("b").unwrap()).await.expect("the second pool evicts the first pool's idle entries");
+        assert_eq!(lease.as_slice().len(), 60);
+        assert_eq!(budget.retained_bytes(), 85, "only as many as it needed");
     }
 }
