@@ -4681,6 +4681,7 @@ dependencies = [
  "libc",
  "object_store",
  "parking_lot",
+ "percent-encoding",
  "rtdb-columnar",
  "rtdb-types",
  "serde_json",

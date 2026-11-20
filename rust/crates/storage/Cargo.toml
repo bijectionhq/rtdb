@@ -7,9 +7,10 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-remote = ["dep:object_store", "dep:futures"]
+remote = ["dep:object_store", "dep:futures", "dep:percent-encoding"]
 
 [dependencies]
+percent-encoding = { version = "2.3", optional = true }
 rtdb-types.workspace = true
 rtdb-columnar.workspace = true
 async-trait.workspace = true

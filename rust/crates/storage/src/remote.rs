@@ -120,7 +120,10 @@ impl RemoteObjects {
             Some(prefix) => value.strip_prefix(&format!("{prefix}/")).ok_or_else(|| Error::InvalidKey(value.into()))?,
             None => value,
         };
-        ObjectKey::new(relative)
+        // A provider path is percent-encoded segment by segment, so a key it lists is the key that was put only once decoded.
+        let decoded = relative.split('/').map(|part| percent_encoding::percent_decode_str(part).decode_utf8().map(|part| part.into_owned()))
+            .collect::<std::result::Result<Vec<_>, _>>().map_err(|_| Error::InvalidKey(relative.into()))?.join("/");
+        ObjectKey::new(decoded)
     }
 
     async fn compare_file(&self, key: &ObjectKey, file: &mut tokio::fs::File, source: &std::path::Path, length: u64) -> Result<()> {
@@ -284,5 +287,17 @@ mod tests {
             store: "test", source: Box::new(std::io::Error::other("403 AccessDenied PermissionDenied")),
         };
         assert!(matches!(provider_error(&key, error), Error::Remote { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_listed_key_is_the_key_that_was_put_whatever_the_provider_encodes() {
+        let store = RemoteStore::new_in(Arc::new(object_store::memory::InMemory::new()), Some(ObjectKey::new("cell").unwrap()), crate::IoRegion::new());
+        for name in ["~packs/b00.pack", "tables/public$orders/data/l00-rc-b00.arrow", "notes/50%/a b"] {
+            store.put(&ObjectKey::new(name).unwrap(), bytes::Bytes::from_static(b"x")).await.unwrap();
+        }
+        let listed: Vec<String> = store.list(None).await.unwrap().into_iter().map(|object| object.key.as_str().to_owned()).collect();
+        assert_eq!(listed, ["notes/50%/a b", "tables/public$orders/data/l00-rc-b00.arrow", "~packs/b00.pack"]);
+        for name in &listed { store.get(&ObjectKey::new(name.clone()).unwrap()).await.unwrap(); }
+        assert_eq!(store.list(Some(&ObjectKey::new("~packs").unwrap())).await.unwrap().len(), 1, "and a listing under one finds it");
     }
 }
