@@ -356,6 +356,8 @@ contract Directory {
 
     @invariant WatchesMayLagButNeverRewind
         -- A watcher receives each record's changes in epoch order, possibly late, and discards any change older than the one it holds.
+        -- Sessions in one process that follow the same deployment share the feed and safety-net polls.
+        -- A watch observation earlier than a confirmed route or holder epoch keeps that route or holding valid.
         --   A late change costs a redirect, never a wrong answer, because no watcher authorises anything by what it has seen.
 
     @invariant StaticStability

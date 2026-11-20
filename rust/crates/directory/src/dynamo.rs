@@ -18,7 +18,6 @@ use aws_sdk_dynamodb::types::{
 };
 use aws_sdk_dynamodbstreams::Client as StreamsClient;
 use parking_lot::Mutex;
-use tokio::sync::broadcast;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -382,7 +381,7 @@ impl Directory for DynamoDirectory {
     }
 
     /// Outside a Tokio runtime there is nothing to follow the stream on, so there is no feed.
-    fn deployment_changes(&self) -> Option<broadcast::Receiver<DeploymentRecord>> {
+    fn change_feed(&self) -> Option<&ChangeFeed> {
         let mut following = self.following.lock();
         if !*following {
             let runtime = tokio::runtime::Handle::try_current().ok()?;
@@ -391,13 +390,14 @@ impl Directory for DynamoDirectory {
             runtime.spawn(follower.run());
             *following = true;
         }
-        Some(self.changes.subscribe())
+        Some(&self.changes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use tokio::sync::broadcast;
 
     use super::*;
     use crate::contract;

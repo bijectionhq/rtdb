@@ -236,10 +236,13 @@ pub trait Directory: Send + Sync {
     async fn members(&self) -> Result<Vec<MemberRecord>>;
     async fn replace_member(&self, record: MemberRecord, expected: Version) -> Result<Cas<MemberRecord>>;
 
+    /// Starts the backend's shared feed on demand, when supported.
+    fn change_feed(&self) -> Option<&ChangeFeed> { None }
+
     /// Every deployment record applied from now on, as the backend learns of it; `None` if this backend has no feed, and its watches poll.
     /// A receiver sees each record's versions in order, possibly late; it may miss some, and then sees `RecvError::Lagged` or a later version only.
     /// Called within a Tokio runtime, since a backend may start following its source on the first call.
-    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { None }
+    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { self.change_feed().map(ChangeFeed::subscribe) }
 }
 
 pub fn now_ms() -> i64 {
@@ -313,7 +316,7 @@ impl Directory for MemoryDirectory {
         state.members.insert(record.id.clone(), record.clone());
         Ok(Cas::Applied(record))
     }
-    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { Some(self.changes.subscribe()) }
+    fn change_feed(&self) -> Option<&ChangeFeed> { Some(&self.changes) }
 }
 
 pub mod contract;

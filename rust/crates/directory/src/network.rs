@@ -446,14 +446,14 @@ impl Directory for RemoteDirectory {
         match self.call(Op::ReplaceMember { record, expected }).await? { Reply::MemberCas(cas) => Ok(cas), other => Err(protocol(other)) }
     }
     /// Outside a Tokio runtime there is nothing to relay the server's feed on, so there is no feed.
-    fn deployment_changes(&self) -> Option<broadcast::Receiver<DeploymentRecord>> {
+    fn change_feed(&self) -> Option<&ChangeFeed> {
         let mut subscribed = self.subscribed.lock();
         if !*subscribed {
             let runtime = tokio::runtime::Handle::try_current().ok()?;
             runtime.spawn(relay_changes(self.address.clone(), self.request_timeout, self.changes.clone(), self.shutdown.clone()));
             *subscribed = true;
         }
-        Some(self.changes.subscribe())
+        Some(&self.changes)
     }
 }
 

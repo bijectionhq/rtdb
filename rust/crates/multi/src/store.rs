@@ -142,7 +142,8 @@ impl FencedStore {
             Fence::Compactor if compaction_output(key.as_str()) => Ok(()),
             Fence::Compactor => Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))),
             Fence::Writer { epoch, record } => match &*record.borrow() {
-                Some(current) if current.epoch != *epoch || current.lifecycle != Lifecycle::Live && current.lifecycle != Lifecycle::Quarantined =>
+                Some(current) if current.epoch > *epoch
+                    || current.epoch == *epoch && !matches!(current.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) =>
                     Err(Error::Deposed { epoch: *epoch, promised: current.epoch }),
                 _ => Ok(()),
             },
@@ -534,6 +535,17 @@ mod tests {
         let mut listed: Vec<String> = reopened.list(Some(&key("tables"))).await.unwrap().into_iter().map(|object| object.key.as_str().to_owned()).collect();
         listed.sort();
         assert_eq!(listed, ["tables/t/data/kept.arrow", "tables/t/data/parent-drops.arrow"], "and the fork no longer references it");
+    }
+
+    #[tokio::test]
+    async fn a_store_for_a_confirmed_writer_ignores_an_older_watch_snapshot() {
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let (observations, watch) = watch::channel(Some(record.clone()));
+        let store = FencedStore { inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 1, record: watch } };
+        store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
+        record.epoch = 2;
+        observations.send(Some(record)).unwrap();
+        assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 1, promised: 2 })));
     }
 
     #[tokio::test]

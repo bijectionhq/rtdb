@@ -180,7 +180,7 @@ impl Session {
     }
 
     fn stale(&self, backend: &Backend) -> bool {
-        self.record.borrow().as_ref().is_some_and(|record| record.epoch != backend.epoch)
+        self.record.borrow().as_ref().is_some_and(|record| record.epoch > backend.epoch)
     }
 
     /// Runs the session over an already-routed first backend whose greeting the client has not yet seen.
@@ -420,6 +420,25 @@ mod tests {
     async fn pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
         let near = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         (near, listener.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_session_keeps_a_route_newer_than_its_directory_watch() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stream, _peer) = pair(&listener).await;
+        let backend = Backend::new(stream, 1);
+        let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
+        let mut session = Session::new(Bytes::new(), router, directory.clone(), record.id.clone(), None, false);
+        drop(session.record.wait_for(|snapshot| snapshot.is_some()).await.unwrap());
+        assert!(!session.stale(&backend));
+
+        record.epoch = 2;
+        let version = record.version;
+        directory.replace_deployment(record, version).await.unwrap().applied().unwrap();
+        drop(session.record.wait_for(|snapshot| snapshot.as_ref().is_some_and(|snapshot| snapshot.epoch == 2)).await.unwrap());
+        assert!(session.stale(&backend));
     }
 
     #[tokio::test]

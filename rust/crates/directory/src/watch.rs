@@ -7,16 +7,22 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior};
 
-use crate::{DeploymentRecord, Directory};
+use crate::{DeploymentRecord, Directory, feed::{DeploymentWatch, publish_newer}};
 
 /// With a change feed, the poll is only a safety net against changes the feed lost, so it runs this many times less often.
 pub const SAFETY_NET_FACTOR: u32 = 10;
 
 /// Publishes each record of `id` whose version is above the one last published, reading it at once and then as it changes.
 /// It follows the directory's change feed where the backend has one, polling every `SAFETY_NET_FACTOR` intervals in case the feed lost a change, and polls every `interval` where it has none or the feed ends.
-/// A failed or absent read publishes nothing, so a directory outage leaves watchers on the last record they saw.
+/// On shared feeds, receivers of the same deployment and interval share one watch and safety-net poller.
+/// A failed or absent read leaves the latest known record available.
 /// The watch stops once every receiver has been dropped; it must be called within a Tokio runtime.
 pub fn watch_deployment(directory: Arc<dyn Directory>, id: String, interval: Duration) -> watch::Receiver<Option<DeploymentRecord>> {
+    if let Some(feed) = directory.change_feed() {
+        let (receiver, owner) = feed.acquire_watch(&id, interval);
+        if let Some(sender) = owner { tokio::spawn(poll_shared(directory, id, interval, sender)); }
+        return receiver;
+    }
     let (sender, receiver) = watch::channel(None);
     // Subscribed before the first read, so no change applied after that read can be missed.
     let mut changes = directory.deployment_changes();
@@ -34,14 +40,25 @@ pub fn watch_deployment(directory: Arc<dyn Directory>, id: String, interval: Dur
                 },
             };
             let Some(record) = record else { continue };
-            sender.send_if_modified(|held: &mut Option<DeploymentRecord>| {
-                let newer = held.as_ref().is_none_or(|held| record.version > held.version);
-                if newer { *held = Some(record); }
-                newer
-            });
+            publish_newer(&sender, record);
         }
     });
     receiver
+}
+
+async fn poll_shared(directory: Arc<dyn Directory>, id: String, period: Duration, watcher: Arc<DeploymentWatch>) {
+    let mut ticker = ticker(period.saturating_mul(SAFETY_NET_FACTOR));
+    loop {
+        let record = tokio::select! {
+            _ = watcher.sender.closed() => {
+                if directory.change_feed().is_none_or(|feed| feed.remove_watch_if_idle(&id, period, &watcher)) { return; }
+                None
+            }
+            record = watcher.next() => Some(record),
+            _ = ticker.tick() => directory.deployment(&id).await.ok().flatten(),
+        };
+        if let Some(record) = record { publish_newer(&watcher.sender, record); }
+    }
 }
 
 fn ticker(period: Duration) -> Interval {
