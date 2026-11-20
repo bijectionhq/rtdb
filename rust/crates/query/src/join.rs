@@ -49,7 +49,9 @@ impl JoinPlan {
             let schema = if index < self.build_layout().key_count() { &self.layout.schema } else { &self.layout.theta_schema };
             match expression {
                 rtdb_plan::Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } => match (left.as_ref(),right.as_ref()) {
-                    (rtdb_plan::Expr::Column { id: left, .. },rtdb_plan::Expr::Column { id: right, .. }) => Some((schema.position(*left)?,schema.position(*right)?)),
+                    // The evaluator rejects some declared type pairs before comparing any cells; those keep its path.
+                    (rtdb_plan::Expr::Column { id: left, data_type: left_type },rtdb_plan::Expr::Column { id: right, data_type: right_type })
+                        if rtdb_plan::validate_equality_types(left_type,right_type).is_ok() => Some((schema.position(*left)?,schema.position(*right)?)),
                     _ => None,
                 },
                 _ => None,
