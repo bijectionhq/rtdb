@@ -1,0 +1,139 @@
+= RTDB kernel verification
+
+This is the first study brief for the Rust-native engine of a single database.
+The requirements are proposed for review against the existing Allium contracts.
+The reference state is an ordered history of committed transactions.
+A read selects a committed prefix and asks what the facts in it say at a valid-time and system-time point or range.
+Physical files, live index segments and search indexes are representations of that state.
+
+== Mechanisms
+
+* Admit a record to the replica stream using its authoritative term and sequence, and apply an admitted commit atomically.
+* Pin the applied basis and the data needed to read it, with a separate overlay for staged writes in transaction resolution.
+* Resolve ordered entity events over half-open valid-time and system-time intervals, including same-time precedence, DELETE and ERASE.
+* Publish compaction outputs and switch catalog coverage together, then reclaim objects once their retention and reference obligations allow it.
+* Treat secondary indexes as derived evidence for the scan.
+  A candidate filter may overinclude entity IDs.
+  A ranked cutoff may discard an entity only after a sound bound rules it out against fully admitted rows.
+
+Each mechanism protects a separate transition that can be weakened independently.
+SQL, protocol methods, Arrow layout and Tantivy are entry points or representations.
+Compare an index-free fold, conservative candidate selection followed by a scan, and candidate selection with ranked early termination against the same observation and traces.
+Keep sufficiency, expressiveness and independence claims relative to the agreed requirements.
+
+== Requirements and evidence
+
+[cols="1,3,2",options="header"]
+|===
+|ID |Required property |First verification target
+
+|TX-1
+|The visible state advances by whole applied commits in the admitted order.
+A stale term, rejected transaction or staged write cannot publish rows.
+A success acknowledgement is tied to the applied commit.
+|Verus on term and sequence admission.
+Model-check append, read-back, publish and acknowledgement under failover.
+
+|SNAP-1
+|A pinned basis yields one consistent view for the lifetime the engine promises.
+Replaying equivalent durable inputs from a valid checkpoint reconstructs the same state.
+|Model-check atomic publication and replay.
+Replay the same trace through the node after restart.
+
+|TIME-1
+|At each point, the resolver emits exactly the winning version of the entity or its specified absence.
+Range answers agree with this pointwise definition.
+DELETE changes the covered interval.
+ERASE follows its history-wide semantics with respect to the events in the captured basis.
+|Verus on the ceiling and rectangle decisions used by the scan and compactor, including their admission of ordered input.
+
+|COMPACT-1
+|Changing a pinned basis's physical representation preserves every supported read.
+A partially published replacement cannot hide rows or expose duplicate coverage.
+|Verus on IID path and recency pruning.
+Model-check catalog transitions for incomplete and reordered publication.
+
+|GC-1
+|A reachable reader can open each data object its basis is entitled to use.
+A shared artefact can be reclaimed only when every catalog reference that requires it has gone.
+|Model-check publication, retention, object deletion and retry.
+Exercise cache invalidation and overlapping readers in deterministic simulation.
+
+|FTS-1
+|Accelerated MATCH yields the same rows as the reference scan.
+Under one defined score corpus and SQL tie semantics, ranked pruning preserves the top K.
+Missing indexes and optional work denied by the acceleration budget permit a scan when its inputs are readable.
+|Verus on rectangle merging, temporal cut decisions and cutoff admission.
+Differentially compare accelerated and scan-only execution over the same basis.
+|===
+
+Acceptance traces include a retroactive correction with reads before and after its system timestamp, a partially overlapping delete, erase followed by reinsertion, a pinned read across compaction and collection, failover between append and acknowledgement, duplicate and stale notifications, and ranked search with two independent MATCH predicates.
+Record the expected refusals and observable answers with the trace.
+
+== Assumptions and boundaries
+
+* State the authoritative log and object-store contracts before proving publication or replay.
+  Test stale leaders, duplicates, conflicting sequence positions and interruption between object write and catalog publication.
+* State where IID partition coverage, event ordering and tie precedence are established.
+  The resolver's proof depends on these conditions and the entry-point audit must trace each producer.
+* Erased query results and physical disappearance of data are separate requirements.
+  Physical erasure needs a separate retention contract covering logs, checkpoints, caches, replicas, exports and backups.
+* Treat availability and eventual reclamation as liveness claims under explicit delivery, storage and scheduling assumptions.
+  The first study covers safety.
+
+The initial production seams are the term fence in `rust/crates/replication/src/admission.rs`, atomic partition publication in `rust/crates/index/src/partition.rs`, and the temporal resolver in `rust/crates/temporal/src/lib.rs`.
+The query scan and compaction merge both call the resolver.
+Search narrows the scan earlier and therefore owes a refinement argument of its own.
+Audit all callers and adapters before claiming that a verified decision is unavoidable.
+
+== Study 1 · Search visibility across files
+
+Question.
+Does combining adjacent visibility fragments in the production search builder preserve which points survive a write in another file?
+
+The counterexample has one entity.
+In system-time order, write `apple` over valid time [0, 10) at 10, `pear` over [0, ∞) at 20, then `apple` over [0, 10) at 30.
+Put both finite versions in one historical file and the unbounded version in a current file.
+At valid time 5, searching for `apple` must succeed at system times 15 and 35 and fail at 25.
+When the builder joins the `apple` rectangles across system time, the cut at 20 removes the later match along with the superseded one.
+
+Amendment 001.
+Keep each originating system start and merge adjacent valid-time intervals only when their entire system-time intervals agree.
+Versions with the same tokens still share one posting document.
+Long runs of successive writes may use more sidecar bytes to retain the boundaries.
+The format version identifies bundles built under the new rule.
+
+The working hypothesis is that the valid-only merge preserves both origin and pointwise membership under the declared one-event cut.
+The harness includes the exact function the production builder calls.
+The law's pointwise predicate is independent of the function's postcondition.
+The base and both negative controls must be run from the same source revision.
+
+[cols="1,3,1",options="header"]
+|===
+|Law |Statement |Evidence
+
+|RTDB-FTS-01
+|A merge refuses rectangles with different originating system starts.
+|Proof source drafted.
+
+|RTDB-FTS-02
+|After any one event cut allowed by the model, a point survives a successful merge exactly when it survives in either input.
+|Proof source drafted.
+|===
+
+The single control removes the system-start equality check from production.
+The joint control also weakens the local contract, so the independent laws must reject it.
+The manifest records predicted failure locations.
+The Rust regression case exercises file building and candidate selection over both inputs.
+The study leaves the validity of the full `Cutter`, chronological precedence, artefact decoding and end-to-end scan equivalence as follow-on obligations.
+
+Study files live in `verification/verus/search_visibility/`.
+The proposed first run reuses Bijection's pinned Verus revision `31e44e600408242839ff456e84550e9f849344e3` with Z3 4.16.0 on the shared build core.
+From the RTDB root, the baseline command with that existing runtime is `verus --no-external-by-default --verify-module production --verify-module laws verification/verus/search_visibility/proof.rs`.
+Run each declared mutation in a disposable source copy and retain its diagnostics, tool identity and source revision.
+The baseline, mutations and regression case are pending execution.
+
+The next bitemporal study should compare the direct pointwise reference to the scan ceiling and the search cut.
+The next ranking study should require every predicate to hold before an entity can raise the cutoff.
+The search review also identified outstanding obligations for memory refusal and scan fallback, historical pages with within-file recency branching, and cache invalidation during a shared-file load.
+Track counterexamples by law and amend the mechanism or the production code that owns it.

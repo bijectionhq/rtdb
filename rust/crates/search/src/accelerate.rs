@@ -481,6 +481,40 @@ mod tests {
     fn event(system_from: i64, valid_from: i64, valid_to: i64, op: rtdb_types::EventOp) -> crate::file::KeyedEvent { crate::file::KeyedEvent { system_from, valid_from, valid_to, op } }
 
     #[test]
+    fn an_intervening_write_in_another_file_does_not_hide_the_later_match() {
+        let columns = ["body".to_string()];
+        let iid = [1; 16];
+        let row = |system_from, valid_to, text: &str| crate::SearchRow {
+            iid, system_from, valid_from: 0, valid_to, op: rtdb_types::EventOp::Put,
+            values: vec![Some(rtdb_text::tokens(text))],
+        };
+        let trie = |key: &str, rows: &[crate::SearchRow]| {
+            let bytes = crate::build_search_file(&columns, rows, key).unwrap();
+            TrieFile {
+                trie: key.parse().unwrap(),
+                data: ObjectKey::new(format!("tables/docs/data/{key}.arrow")).unwrap(),
+                identity: key.to_string(),
+                file: Arc::new(SearchFile::open(bytes, &columns).unwrap()),
+                member: 0,
+            }
+        };
+        let files = [
+            trie("l01-r20200101-b00", &[row(30, 10, "apple"), row(10, 10, "apple")]),
+            trie("l01-rc-b00", &[row(20, i64::MAX, "pear")]),
+        ];
+        let runtime = crate::SearchRuntime::new(1 << 20);
+        let query = Query::parse("apple");
+        for (system, expected) in [(15, true), (25, false), (35, true)] {
+            let cutter = Cutter {
+                files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime,
+                database: "xtdb", bounds: at(5, system),
+            };
+            let candidates = file_candidates(&cutter, "body", &query, 1).unwrap().unwrap();
+            assert_eq!(candidates.contains(&Iid(iid)), expected, "at system time {system}");
+        }
+    }
+
+    #[test]
     fn a_later_event_takes_its_valid_interval_from_its_system_time_on_and_an_erase_takes_everything() {
         use rtdb_types::EventOp::{Delete, Erase, Put};
         let whole = [0, 100, 10, i64::MAX];

@@ -18,9 +18,11 @@ use tantivy::store::Compressor;
 use tantivy::tokenizer::{PreTokenizedString, Token};
 use tantivy::{Directory, Index, IndexSettings, TantivyDocument, Term};
 
+use crate::rectangle::merge_adjacent_valid_time;
+
 const MAGIC: &[u8; 8] = b"RTSRCH01";
-/// Bumped with the bundle layout or the tantivy version, either of which changes a search file's bytes.
-pub const FORMAT_VERSION: i32 = 6;
+/// Identifies the bundle bytes produced by the builder, including visibility encoding.
+pub const FORMAT_VERSION: i32 = 7;
 const WRITER_MEMORY: usize = 32 << 20;
 /// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
 const SIDECAR: &str = "rtdb.sidecar";
@@ -211,21 +213,20 @@ where
     Ok(sidecar.sections.into_values().collect())
 }
 
-/// Merges rectangles that share one interval and abut in the other, so a run of versions that each followed the last is one rectangle.
 fn coalesce(mut rectangles: Vec<[i64; 4]>) -> Vec<[i64; 4]> {
-    for (same, abut) in [((0, 1), (2, 3)), ((2, 3), (0, 1))] {
-        rectangles.sort_unstable_by_key(|rectangle| (rectangle[same.0], rectangle[same.1], rectangle[abut.0]));
-        let mut merged: Vec<[i64; 4]> = Vec::with_capacity(rectangles.len());
-        for rectangle in rectangles {
-            match merged.last_mut() {
-                Some(last) if last[same.0] == rectangle[same.0] && last[same.1] == rectangle[same.1] && last[abut.1] == rectangle[abut.0] => last[abut.1] = rectangle[abut.1],
-                _ => merged.push(rectangle),
-            }
+    rectangles.sort_unstable_by_key(|rectangle| (rectangle[2], rectangle[3], rectangle[0]));
+    let mut merged = Vec::with_capacity(rectangles.len());
+    for rectangle in rectangles {
+        if let Some(last) = merged.last_mut()
+            && let Some(joined) = merge_adjacent_valid_time(*last, rectangle)
+        {
+            *last = joined;
+        } else {
+            merged.push(rectangle);
         }
-        rectangles = merged;
     }
-    rectangles.sort_unstable_by_key(|rectangle| (rectangle[2], rectangle[0]));
-    rectangles
+    merged.sort_unstable_by_key(|rectangle| (rectangle[2], rectangle[0]));
+    merged
 }
 
 /// One entity's rows become its text runs, per column: a document for each distinct value its visible versions hold there, with every rectangle where one of them is visible.
@@ -919,15 +920,20 @@ mod tests {
     }
 
     #[test]
-    fn a_column_keeps_one_run_while_only_other_columns_change_and_its_rectangles_coalesce() {
+    fn a_column_shares_postings_while_its_versions_keep_their_system_start() {
         let rows: Vec<SearchRow> = (0..50).map(|version| row(1, 100 - version, &format!("title {version}"), "the same body")).collect();
         let file = open(&rows);
         let body = run(&file, 0).unwrap();
         assert!((0..50).all(|row| run(&file, row) == Some(body)), "the body is one run across fifty title changes");
-        assert_eq!(file.rectangles(body).collect::<Vec<_>>(), [[0, i64::MAX, 51, i64::MAX]], "fifty successive versions' rectangles are one");
+        let expected: Vec<_> = (51..100).map(|s| [0, i64::MAX, s, s + 1])
+            .chain([[0, i64::MAX, 100, i64::MAX]]).collect();
+        assert_eq!(file.rectangles(body).collect::<Vec<_>>(), expected);
         assert_eq!(file.corpus("body", &Query::parse("same")).unwrap().documents, 1);
         assert_eq!(file.corpus("title", &Query::parse("title")).unwrap().documents, 50);
-        assert_eq!(coalesce(vec![[0, 5, 10, 20], [5, 9, 10, 20], [0, 5, 20, 30], [7, 8, 1, 2]]), [[7, 8, 1, 2], [0, 5, 10, 30], [5, 9, 10, 20]]);
+        assert_eq!(
+            coalesce(vec![[0, 5, 10, 20], [5, 9, 10, 20], [0, 5, 20, 30], [7, 8, 1, 2]]),
+            [[7, 8, 1, 2], [0, 9, 10, 20], [0, 5, 20, 30]],
+        );
     }
 
     #[test]

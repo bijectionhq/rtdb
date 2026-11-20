@@ -6,6 +6,7 @@ pub mod corpus;
 pub mod definitions;
 pub mod file;
 pub mod lane;
+mod rectangle;
 pub mod runtime;
 
 pub use file::{DocMatch, FORMAT_VERSION, MemberMatches, SearchFile, SearchRow, Source, build_search_file, write_group_search_file};
