@@ -222,14 +222,14 @@ impl SqlArguments {
     fn append_rows(&mut self, other: Self, start: usize) -> Result<()> {
         if self.types.len() != other.types.len() { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", "Coalesced SQL arguments have different widths")); }
         let count = self.row_count.checked_add(other.row_count).ok_or_else(overflow)?;
-        let types: Vec<_> = self.types.iter().zip(other.types.iter()).map(|(left, right)| left.join(right)).collect();
+        let types: Vec<_> = self.types.iter().zip(other.types.iter()).map(|(left, right)| if left == right { left.clone() } else { left.join(right) }).collect();
         let chunk_count = self.chunks.len().checked_add(other.chunks.len()).ok_or_else(overflow)?;
         let bytes = schema_bytes(&types)?.checked_add(chunk_count.checked_mul(128).ok_or_else(overflow)?).ok_or_else(overflow)?;
         let reservation = self.memory.reserve(bytes)?;
-        let mut chunks = self.chunks.as_ref().clone();
-        for (offset, chunk) in other.chunks.iter() { chunks.push((start.checked_add(*offset).ok_or_else(overflow)?, Arc::clone(chunk))); }
-        self.types = Arc::new(types);
-        self.chunks = Arc::new(chunks);
+        let appended = other.chunks.iter().map(|(offset, chunk)| Ok((start.checked_add(*offset).ok_or_else(overflow)?, Arc::clone(chunk)))).collect::<Result<Vec<_>>>()?;
+        // An unshared chunk list grows in place, so a statement appended to a buffer of many costs no copy of the rest.
+        Arc::make_mut(&mut self.chunks).extend(appended);
+        if *self.types != types { self.types = Arc::new(types); }
         self.schema_reservation = reservation;
         self.row_count = count;
         Ok(())
