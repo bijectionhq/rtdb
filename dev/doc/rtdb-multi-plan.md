@@ -4,6 +4,7 @@ This plan takes RTDB from today's single-cluster model to the endgame specified 
 It is delivered as one long-running branch, `rtdb-multi`, merged as one PR, built from small commits that each carry their own tests and spec changes.
 
 The spec is the target; this document is the route.
+How the endgame fits Bijection's hosting infrastructure, and what it lets Bijection retire, is [`rtdb-multi-bijection.md`](rtdb-multi-bijection.md).
 It names, for every part of the spec, the code it grows from, the code it replaces, and the order in which the work lands.
 Paths are relative to `rust/crates/` unless they start with another top-level directory.
 

@@ -2005,3 +2005,18 @@ open question "How far may placement depart from rank 1 before routing needs the
 
 open question "Can cooperative scheduling isolate tenants well enough inside one process?"
     -- A query that fails to yield, or memory accounting that undercounts Arrow buffers, defeats weighted fairness; a process or microVM boundary per tenant costs density.
+
+open question "How do pins longer than max_snapshot_lifetime keep their objects and tail reachable?"
+    -- Pinned reviews and pinned Flight readers in Bijection hold a basis for hours or days.
+    -- A deployment record would carry pins, each a basis and an expiry; ReapUnreachable would keep everything a pinned manifest references, and a flush would keep a pinned tail reachable.
+
+open question "How does a subscriber that has fallen below the trim point resume its change feed?"
+    -- The log keeps only the tail above the checkpoint.
+    -- Exports, watches and Bijection's `changes` need an unbroken feed: a scan of blocks ordered by system time between two bases, then the log.
+
+open question "What is the node-library form of a holder embedded in another process?"
+    -- Bijection's Conductor would embed the holder role, call it in process instead of through the gateway RPC, and lend it its memory budget and NVMe cache.
+    -- The rules here assume a node is its own process.
+
+open question "Does the directory's envelope count forks?"
+    -- Each durable branch is a DeploymentRecord; a deployment with thousands of branches multiplies directory rows, and cell_max_deployments has to say which it bounds.
