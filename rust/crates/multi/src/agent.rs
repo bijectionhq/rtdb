@@ -3,7 +3,7 @@
 //! The agent never decides safety.
 //! The directory's version check decides who holds an epoch, and the logkeepers refuse every append from an earlier one; the agent only keeps what this node runs in step with what the directory says.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,6 +68,8 @@ pub struct NodeAgent {
     address: String,
     options: AgentOptions,
     holdings: Mutex<BTreeMap<String, LocalHolding>>,
+    /// Deployments a fragment was asked of before this node had them open, whose replicas its next pass opens.
+    warming: Mutex<BTreeSet<String>>,
     /// The cell's secret, which the requests that read a deployment's data or publish for it must carry a grant under.
     secret: Option<Arc<crate::capability::CellSecret>>,
     writers: crate::logs::Writers,
@@ -82,7 +84,7 @@ pub struct NodeAgent {
 
 impl NodeAgent {
     pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, secret, holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
+        Arc::new(Self { directory, node, lease, address, options, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -303,8 +305,12 @@ impl NodeAgent {
     pub async fn scan_fragment(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<Response> {
         use base64::Engine;
         if fragment.database() != name { return Err(Anomaly::incorrect("rtdb.multi/fragment-database", format!("A fragment of {} was sent as one of {name}", fragment.database()))); }
-        let held = self.holdings.lock().contains_key(name);
-        if !held || self.node.catalog().database(name).is_err() { self.subscribe_for(name, true).await?; }
+        // A reader without the deployment open refuses at once, so its coordinator reads the slice itself rather than wait on an open; it opens a replica on its next pass, for the scans after.
+        let open = self.node.catalog().database(name).is_ok() && (self.holdings.lock().contains_key(name) || self.subscriptions.lock().get(name).is_some_and(|subscription| !matches!(subscription.role, Role::Snapshot(_))));
+        if !open {
+            self.warming.lock().insert(name.to_owned());
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/fragment-reader-cold", format!("This node is opening a replica of {name}")));
+        }
         self.touch(name);
         let bytes = self.node.scan_fragment(fragment, self.options.fragments.catch_up, &CancellationToken::new()).await?;
         let table = fragment.table();
@@ -420,6 +426,8 @@ impl NodeAgent {
     /// Gives up every deployment the directory no longer places here under the epoch this node opened it at, every one whose database stopped, every idle one, and the least recently used beyond `max_active`; drops idle or unwanted replicas.
     pub async fn reconcile(&self) {
         let draining = self.lease.record().state == MemberState::Draining;
+        let warming = std::mem::take(&mut *self.warming.lock());
+        if !draining { for name in warming { let _ = self.subscribe_for(&name, true).await; } }
         let me = self.member();
         let mut held: Vec<(String, String, u64, Instant)> = self.holdings.lock().iter().map(|(name, holding)| (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch)).collect();
         held.sort_by_key(|(.., touched)| std::cmp::Reverse(*touched));

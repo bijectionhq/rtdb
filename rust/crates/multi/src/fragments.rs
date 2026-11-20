@@ -39,7 +39,7 @@ pub fn fragment_key(storage_identity: &str, table: &TableRef, prefix: &TriePrefi
 /// The nodes that may read a fragment: every node that may take a placement, compaction workers aside.
 pub fn readers(members: &[MemberRecord]) -> Vec<&MemberRecord> {
     let now = now_ms();
-    members.iter().filter(|member| member.may_receive_placements(now) && member.pool != MemberPool::Compaction && member.control_address.is_some()).collect()
+    members.iter().filter(|member| member.may_receive_placements(now) && member.pool == MemberPool::General && member.control_address.is_some()).collect()
 }
 
 /// A node's fragmenter: places each fragment of its sessions' scans on the reader it ranks first on.
