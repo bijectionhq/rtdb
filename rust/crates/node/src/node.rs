@@ -36,6 +36,8 @@ pub struct NodeServices {
     pub compaction_relay: Option<Arc<dyn crate::database::CompactionRelay>>,
     /// Asked before every query whether this node may still serve its database: a linearizable read waits on it, and a deposed holder is refused.
     pub read_fence: Option<Arc<dyn ReadFence>>,
+    /// Splits a placed database's large scans into fragments other nodes read; absent, every scan reads its tries here.
+    pub scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
 }
 
 #[async_trait::async_trait]
@@ -44,7 +46,7 @@ pub trait ReadFence: Send + Sync {
 }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, compaction_relay: None, read_fence: None }
+        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, compaction_relay: None, read_fence: None, scan_fragmenter: None }
     }
 }
 
@@ -56,6 +58,7 @@ pub struct Node {
     cancellation: CancellationToken,
     pub(crate) runtime: Arc<crate::runtime::RuntimeProviders>,
     read_fence: Option<Arc<dyn ReadFence>>,
+    scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
     /// The idempotency keys of transactions this node submitted and has not yet seen resolved, so an abort by a duplicate key can be answered with the original's outcome.
     keyed: Arc<parking_lot::Mutex<BTreeMap<TxId, String>>>,
 }
@@ -113,11 +116,12 @@ impl Node {
         let catalog = DatabaseCatalog::new(options.membership.clone());
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
         let read_fence = services.read_fence.clone();
+        let scan_fragmenter = services.scan_fragmenter.clone();
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
             external_sources: services.external_sources, compaction_relay: services.compaction_relay, clock: services.clock, options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
-        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, keyed: Arc::default() };
+        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, keyed: Arc::default() };
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
@@ -261,9 +265,29 @@ impl Node {
             let cap = match (cap, basis.snapshot_time) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot.with_system_time_cap(cap)?], storage: Arc::clone(&database.storage) });
         }
-        let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())));
+        let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
+            .with_fragmenter(self.scan_fragmenter.clone());
         QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
+    }
+
+    /// Reads a fragment another node's scan dispatched here, once this node's copy of its database has applied the fragment's basis.
+    /// Waits up to `catch_up` for that; a copy already past the basis cannot read it, and is refused like one that never reaches it.
+    pub async fn scan_fragment(&self, fragment: &rtdb_query::ScanFragment, catch_up: Duration, cancellation: &CancellationToken) -> Result<Vec<u8>> {
+        self.ensure_open()?;
+        let database = self.catalog.database(fragment.database())?;
+        let deadline = tokio::time::Instant::now() + catch_up;
+        while database.partition.value().live().latest_completed_tx().is_none_or(|head| head.tx_id < fragment.basis.tx_id) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/fragment-basis", format!("{} did not reach the fragment's basis in time", database.name())));
+            }
+            cancellation.run_until_cancelled(tokio::time::sleep(Duration::from_millis(5))).await.ok_or_else(cancelled)?;
+        }
+        let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
+        let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
+        let catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
+        let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), self.factory.options.default_timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
+        rtdb_query::evaluate_fragment(context, fragment).await
     }
 
     async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<SubmittedTx> {

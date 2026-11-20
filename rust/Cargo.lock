@@ -4520,6 +4520,7 @@ dependencies = [
  "rtdb-pg-source",
  "rtdb-pgwire",
  "rtdb-plan",
+ "rtdb-query",
  "rtdb-s3",
  "rtdb-storage",
  "rtdb-tls",

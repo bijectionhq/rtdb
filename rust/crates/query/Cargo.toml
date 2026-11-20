@@ -21,6 +21,7 @@ rtdb-expr.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
+arrow-ipc.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -31,7 +32,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
-arrow-ipc.workspace = true
 rtdb-metrics.workspace = true
 
 [lints]
