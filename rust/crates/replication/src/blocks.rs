@@ -108,8 +108,8 @@ pub enum BlockDiscovery {
     /// Lists the block catalogs.
     #[default]
     List,
-    /// Probes forward from a block known to be published (none: from the first), one head per block, never listing; a hint naming a block that is gone falls back to listing.
-    From(Option<BlockIndex>),
+    /// Probes forward from a block known to have been published, one head per block, never listing; a hint naming a block that is gone falls back to listing.
+    From(BlockIndex),
 }
 
 pub struct BlockStore {
@@ -150,15 +150,14 @@ impl BlockStore {
             }
         };
         let mut latest = match discovery {
-            BlockDiscovery::From(Some(hint)) if exists(hint).await? => Some(hint),
-            BlockDiscovery::From(None) => None,
+            BlockDiscovery::From(hint) if exists(hint).await? => hint,
             _ => {
                 let directory = ObjectKey::new("blocks")?;
                 return Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max());
             }
         };
-        while exists(BlockIndex(latest.map_or(0, |index| index.0 + 1))).await? { latest = Some(BlockIndex(latest.map_or(0, |index| index.0 + 1))); }
-        Ok(latest)
+        while exists(BlockIndex(latest.0 + 1)).await? { latest = BlockIndex(latest.0 + 1); }
+        Ok(Some(latest))
     }
 
     async fn load_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {

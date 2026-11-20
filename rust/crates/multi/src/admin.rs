@@ -143,6 +143,8 @@ pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn K
     child.lineage = source.lineage.clone();
     child.parent = Some(source.id.clone());
     child.log_epoch = source.log_epoch + 1;
+    // The fork's store starts as its parent's, so its parent's checkpoint is where its first holder starts.
+    child.checkpoint = source.checkpoint;
     child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
     match storage {
         CellStorage::Local { root } => crate::reference::fork(root, &source.storage_prefix(), &child.storage_prefix())?,

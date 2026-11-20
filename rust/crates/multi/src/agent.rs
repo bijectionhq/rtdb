@@ -283,8 +283,18 @@ impl NodeAgent {
 
     /// Trims the deployment's stream below the boundary of its last adopted block, whose records the block now holds (`TrimFollowsPublication`).
     /// The boundary record itself is kept: it names the source position a later holder's intake starts past.
-    async fn trim_published(&self, name: &str, id: &str) {
+    /// Publishes the holding's last adopted block as the deployment's checkpoint, and trims its stream below that block's boundary.
+    async fn publish_and_trim(&self, name: &str, id: &str, epoch: u64) {
         let Ok(database) = self.node.catalog().database(name) else { return };
+        if let Some(block) = database.status().adopted_block.as_ref().map(|block| block.block_index().0) {
+            if let Ok(Some(record)) = self.directory.deployment(id).await {
+                if record.epoch == epoch && record.holder.as_ref() == Some(&self.member()) && record.checkpoint.is_none_or(|checkpoint| checkpoint.block < block) {
+                    let mut next = record.clone();
+                    next.checkpoint = Some(rtdb_directory::Checkpoint { block });
+                    let _ = self.directory.replace_deployment(next, record.version).await;
+                }
+            }
+        }
         let Some(boundary) = database.status().adopted_block.as_ref().and_then(|block| block.boundary_replica_position()).map(|position| position.offset()) else { return };
         if boundary <= 0 || self.trimmed.lock().get(id).is_some_and(|trimmed| *trimmed >= boundary - 1) { return; }
         let (Ok(Some(record)), Ok(members)) = (self.directory.deployment(id).await, self.members().await) else { return };
@@ -364,7 +374,7 @@ impl NodeAgent {
                 if placed_here && stopped { self.count_crash(&id, Some(epoch)).await; }
                 continue;
             }
-            self.trim_published(&name, &id).await;
+            self.publish_and_trim(&name, &id, epoch).await;
             let over = self.options.max_active.is_some_and(|limit| rank >= limit);
             if draining || over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
         }

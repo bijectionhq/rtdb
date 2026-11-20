@@ -58,8 +58,16 @@ impl RemoteStorageFactory for CellStoreFactory {
         claim_root(&local, &config.deployment).await?;
         let base = crate::reference::Base::load(&directory)?;
         let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { Arc::new(local) } else { Arc::new(crate::reference::ReferencingStore::new(local, config.root.clone(), base, io)) };
-        let packed = crate::packing::PackingStore::open(own).await?;
+        let discovery = match self.checkpoint(&config).await? { Some(block) => crate::packing::PackDiscovery::From(block), None => crate::packing::PackDiscovery::List };
+        let packed = crate::packing::PackingStore::open(own, discovery).await?;
         Ok(GarbageStore::open(packed).await?)
+    }
+
+    /// A deployment with a published checkpoint recovers from it without listing its store.
+    async fn block_discovery(&self, configuration: &Any) -> Result<rtdb_replication::BlockDiscovery> {
+        let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
+            .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
+        Ok(match self.checkpoint(&config).await? { Some(block) => rtdb_replication::BlockDiscovery::From(rtdb_types::BlockIndex(block)), None => rtdb_replication::BlockDiscovery::List })
     }
 
     /// Encryption sits above the node's disk cache, which therefore holds ciphertext only: destroying the key leaves no readable copy on any node.
@@ -73,6 +81,12 @@ impl RemoteStorageFactory for CellStoreFactory {
             (None, false) => Fence::Reader,
         };
         Ok(Arc::new(FencedStore { inner: Arc::new(encrypted), fence }))
+    }
+}
+
+impl CellStoreFactory {
+    async fn checkpoint(&self, config: &CellStoreConfig) -> Result<Option<i64>> {
+        Ok(self.directory.deployment(&config.deployment).await?.and_then(|record| record.checkpoint).map(|checkpoint| checkpoint.block))
     }
 }
 
@@ -161,18 +175,22 @@ impl ObjectStore for EncryptingStore {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GarbageRecord { pub key: String, pub released_at_ms: i64 }
 
-pub struct GarbageStore { inner: Arc<dyn ObjectStore>, released: Mutex<BTreeSet<ObjectKey>> }
+/// Only a listing needs to know what has been released, so the released set is read on the first one, not on open.
+pub struct GarbageStore { inner: Arc<dyn ObjectStore>, released: tokio::sync::OnceCell<Mutex<BTreeSet<ObjectKey>>> }
 
 impl GarbageStore {
-    pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> {
-        let mut released = BTreeSet::new();
-        for object in inner.list(Some(&ObjectKey::new(GARBAGE_DIRECTORY)?)).await? {
-            if let Ok(record) = serde_json::from_slice::<GarbageRecord>(&inner.get(&object.key).await?) { released.insert(ObjectKey::new(record.key)?); }
-        }
-        Ok(Arc::new(Self { inner, released: Mutex::new(released) }))
-    }
-    fn visible(&self, object: &StoredObject) -> bool {
-        !object.key.as_str().starts_with(GARBAGE_DIRECTORY) && !self.released.lock().contains(&object.key)
+    pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, released: tokio::sync::OnceCell::new() })) }
+
+    async fn released(&self) -> rtdb_storage::Result<&Mutex<BTreeSet<ObjectKey>>> {
+        self.released.get_or_try_init(|| async {
+            let mut released = BTreeSet::new();
+            for object in self.inner.list(Some(&ObjectKey::new(GARBAGE_DIRECTORY).map_err(|error| Error::Task(error.to_string()))?)).await? {
+                if let Ok(record) = serde_json::from_slice::<GarbageRecord>(&self.inner.get(&object.key).await?) {
+                    released.insert(ObjectKey::new(record.key).map_err(|error| Error::Task(error.to_string()))?);
+                }
+            }
+            Ok(Mutex::new(released))
+        }).await
     }
 }
 
@@ -185,10 +203,12 @@ impl ObjectStore for GarbageStore {
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
-        Ok(self.inner.list(directory).await?.into_iter().filter(|object| self.visible(object)).collect())
+        let released = self.released().await?;
+        Ok(self.inner.list(directory).await?.into_iter().filter(|object| !object.key.as_str().starts_with(GARBAGE_DIRECTORY) && !released.lock().contains(&object.key)).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        if !self.released.lock().insert(key.clone()) { return Ok(()); }
+        // Before the first listing, a repeated delete writes a second record, which the reaper handles like the first.
+        if let Some(released) = self.released.get() { if !released.lock().insert(key.clone()) { return Ok(()); } }
         let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: now_ms() };
         let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
             .map_err(|error| Error::Task(error.to_string()))?;
@@ -253,9 +273,11 @@ pub fn reap_local(root: &Path, record: &DeploymentRecord, grace: Duration, refer
         let mut packed: BTreeSet<String> = BTreeSet::new();
         let mut packs: BTreeSet<String> = crate::reference::physical_objects(&store.join(crate::packing::PACK_DIRECTORY))?.into_iter().map(|key| format!("{}/{key}", crate::packing::PACK_DIRECTORY)).collect();
         packs.extend(before.objects.keys().filter(|key| key.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY))).cloned());
+        // The latest block's pack names every other pack, so a cold start finds them all through it: it stays.
+        let latest = packs.iter().filter(|pack| pack.starts_with(&format!("{}/b", crate::packing::PACK_DIRECTORY))).max().cloned();
         for pack in packs {
             let Some(index) = physical(&pack).and_then(|path| read_pack_index(&path)) else { continue };
-            if index.entries.keys().all(|key| due.contains_key(key)) {
+            if Some(&pack) != latest.as_ref() && index.entries.keys().all(|key| due.contains_key(key)) {
                 release(&pack, &mut base)?;
                 erased.extend(index.entries.into_keys());
             } else {
@@ -391,17 +413,18 @@ mod tests {
         let record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let root = directory.path().join(record.storage_prefix()).join("v06");
         let local: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(&root).unwrap());
-        let store = GarbageStore::open(crate::packing::PackingStore::open(local).await.unwrap()).await.unwrap();
+        let store = GarbageStore::open(crate::packing::PackingStore::open(local, crate::packing::PackDiscovery::List).await.unwrap()).await.unwrap();
         for name in ["tables/t/data/l00-rc-b00.arrow", "tables/t/meta/l00-rc-b00.arrow"] { store.put(&key(name), Bytes::from_static(b"x")).await.unwrap(); }
         store.put(&key("blocks/b00.binpb"), Bytes::from_static(b"catalog")).await.unwrap();
+        store.put(&key("blocks/b01.binpb"), Bytes::from_static(b"catalog")).await.unwrap();
         let packs = || std::fs::read_dir(root.join(crate::packing::PACK_DIRECTORY)).map(|entries| entries.count()).unwrap_or(0);
-        assert_eq!(packs(), 1);
+        assert_eq!(packs(), 2, "each block has its pack");
         store.delete(&key("tables/t/data/l00-rc-b00.arrow")).await.unwrap();
         assert_eq!(reap_local(directory.path(), &record, Duration::ZERO, &Default::default()).unwrap(), Reaped { erased: 0, waiting: 1 }, "half a pack released keeps the pack");
-        assert_eq!(packs(), 1);
+        assert_eq!(packs(), 2);
         store.delete(&key("tables/t/meta/l00-rc-b00.arrow")).await.unwrap();
         assert_eq!(reap_local(directory.path(), &record, Duration::ZERO, &Default::default()).unwrap().erased, 2);
-        assert_eq!(packs(), 0, "a fully released pack is erased");
+        assert_eq!(packs(), 1, "a fully released pack is erased, and the latest block's, which names every pack, stays");
     }
 
     #[tokio::test]
