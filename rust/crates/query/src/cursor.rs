@@ -71,16 +71,19 @@ impl OwnedRow {
 }
 /// Charges rows from chunks of the budget, so building many rows admits memory once per chunk rather than once per row.
 /// Each row keeps the chunk it was charged from; a chunk is released when its last row drops.
+/// A row the budget can hold is admitted even when a whole chunk is not, by charging it alone.
 pub(crate) struct RowSlab { memory: Arc<MemoryBudget>, current: Option<Arc<MemoryReservation>>, remaining: usize }
 impl RowSlab {
-    const CHUNK: usize = 256 * 1024;
+    const CHUNK: usize = 32 * 1024;
     pub fn new(memory: &Arc<MemoryBudget>) -> Self { Self { memory: Arc::clone(memory), current: None, remaining: 0 } }
     pub fn charge(&mut self, bytes: usize) -> Result<Arc<MemoryReservation>> {
         match &self.current {
             Some(current) if bytes <= self.remaining => { self.remaining -= bytes; Ok(Arc::clone(current)) }
             _ => {
-                let chunk = bytes.max(Self::CHUNK);
-                let reservation = self.memory.reserve(chunk)?;
+                let (reservation, chunk) = match self.memory.reserve(bytes.max(Self::CHUNK)) {
+                    Ok(reservation) => (reservation, bytes.max(Self::CHUNK)),
+                    Err(_) => (self.memory.reserve(bytes)?, bytes),
+                };
                 self.remaining = chunk - bytes;
                 self.current = Some(Arc::clone(&reservation));
                 Ok(reservation)
@@ -325,3 +328,18 @@ struct OwnedRows { rows: std::vec::IntoIter<Vec<Value>>, reservation: Arc<Memory
 #[async_trait]
 impl RowCursor for OwnedRows { async fn next(&mut self) -> Result<Option<OwnedRow>> { Ok(self.rows.next().map(|values| OwnedRow { values, bytes: self.reservation.bytes(), reservation: Arc::clone(&self.reservation) })) } }
 impl Drop for QueryCursor { fn drop(&mut self) { self.context.cancellation.cancel(); self.finish_trace(); } }
+
+#[cfg(test)]
+mod slab_tests {
+    use super::*;
+
+    #[test]
+    fn a_slab_admits_a_row_the_budget_holds_when_a_whole_chunk_does_not_fit() {
+        let memory = MemoryBudget::new(RowSlab::CHUNK / 2);
+        let mut slab = RowSlab::new(&memory);
+        let row = OwnedRow::in_slab(vec![Value::I64(1), Value::I64(2)], &mut slab).unwrap();
+        assert_eq!(memory.used_bytes(), row.bytes());
+        drop((row, slab));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
