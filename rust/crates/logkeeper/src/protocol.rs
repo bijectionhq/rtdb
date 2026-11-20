@@ -117,6 +117,16 @@ pub(crate) struct Trim {
     pub through_lsn: i64,
 }
 
+/// Asks whether the stream is still unsealed beyond `epoch`, for a writer confirming its leadership: `Accepted` when the promise is at most `epoch`, `Refused` carrying the higher promise otherwise.
+/// It changes nothing, so it is answered without a journal round.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct Check {
+    #[prost(string, tag = "1")]
+    pub stream: String,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+}
+
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub(crate) enum RequestBody {
     #[prost(message, tag = "2")]
@@ -133,16 +143,19 @@ pub(crate) enum RequestBody {
     Commit(Commit),
     #[prost(message, tag = "8")]
     Trim(Trim),
+    #[prost(message, tag = "9")]
+    Check(Check),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9")]
     pub body: Option<RequestBody>,
 }
 
+/// An `Accepted` reply to an Append, Overwrite, Commit or Check announces that the stream's promise on this server was still at most the request's epoch when the server decided it, which was after the request was sent.
 #[derive(Clone, Copy, PartialEq, Eq, Message)]
 pub(crate) struct Accepted {
     #[prost(sint64, tag = "1")]

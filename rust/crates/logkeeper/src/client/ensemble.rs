@@ -2,7 +2,7 @@
 
 use super::connection::{Connection, connection, remote};
 use super::StreamConfig;
-use crate::protocol::{Accepted, Commit, Entries, Entry, Fetch, Overwrite, Read, Refused, RequestBody, ResponseBody, Seal, Sealed, Trim};
+use crate::protocol::{Accepted, Check, Commit, Entries, Entry, Fetch, Overwrite, Read, Refused, RequestBody, ResponseBody, Seal, Sealed, Trim};
 use rtdb_storage::{Error, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,6 +70,8 @@ impl Ensemble {
         let reply = self.links[server].call(RequestBody::Commit(Commit { stream: self.stream(), epoch, commit_lsn: commit })).await;
         self.ack(server, reply)
     }
+
+    pub fn check_request(&self, epoch: u64) -> RequestBody { RequestBody::Check(Check { stream: self.stream(), epoch }) }
 
     pub fn overwrite_request(&self, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool, commit: i64) -> RequestBody {
         RequestBody::Overwrite(Overwrite { stream: self.stream(), epoch, from_lsn: from, entries, complete, commit_lsn: commit })

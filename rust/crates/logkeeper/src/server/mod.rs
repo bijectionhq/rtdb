@@ -76,6 +76,7 @@ async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, ca
                 let body = store.fetch(&fetch.stream, fetch.from_lsn, fetch.to_lsn, fetch.max_entries as usize, fetch.max_bytes as usize);
                 let _ = replies.send(reply(body));
             }
+            Some(RequestBody::Check(check)) => { let _ = replies.send(reply(store.check(&check.stream, check.epoch))); }
             Some(RequestBody::Read(read)) => {
                 let (store, replies, cancellation) = (Arc::clone(&store), replies.clone(), cancellation.clone());
                 tasks.spawn(async move {

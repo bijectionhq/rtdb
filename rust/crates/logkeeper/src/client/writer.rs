@@ -43,6 +43,36 @@ struct Buffered {
     receipt: Option<oneshot::Sender<Result<LogMetadata>>>,
 }
 
+/// One leadership confirmation, by identity: a reply counts towards it only if its request was sent while it was the round in flight.
+struct Round {
+    outcome: watch::Sender<Option<Confirmation>>,
+}
+
+#[derive(Clone, Debug)]
+enum Confirmation {
+    Confirmed,
+    Deposed { promised: u64 },
+    Unavailable(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Pending,
+    Confirmed,
+    Failed,
+}
+
+/// The round in flight, what each server has told it, and the round its late callers wait on, which starts when this one ends.
+struct Confirming {
+    round: Arc<Round>,
+    marks: Vec<Mark>,
+    next: Option<Arc<Round>>,
+}
+
+impl Round {
+    fn new() -> Arc<Self> { Arc::new(Self { outcome: watch::channel(None).0 }) }
+}
+
 struct Pipeline {
     next_lsn: i64,
     commit: i64,
@@ -52,6 +82,7 @@ struct Pipeline {
     buffer: VecDeque<Buffered>,
     buffered_bytes: usize,
     replicas: Vec<Replica>,
+    confirming: Option<Confirming>,
 }
 
 enum State {
@@ -154,7 +185,7 @@ impl Writer {
         } else {
             Replica { acked: -1, link: Link::Down(long_ago) }
         }).collect();
-        let pipeline = Pipeline { next_lsn: recovered + 1, commit: recovered, history, buffer_first: recovered + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas };
+        let pipeline = Pipeline { next_lsn: recovered + 1, commit: recovered, history, buffer_first: recovered + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None };
         let writer = Arc::new(Self { ensemble, epoch, state: Mutex::new(State::Open(pipeline)), tip: watch::channel(Tip::Open(recovered)).0 });
         {
             let mut state = writer.state.lock();
@@ -189,25 +220,42 @@ impl Writer {
         for server in 0..pipeline.replicas.len() {
             if matches!(pipeline.replicas[server].link, Link::Live) {
                 let body = RequestBody::Append(Append { stream: self.ensemble.stream(), epoch: self.epoch, first_lsn: lsn, entries: vec![entry.clone()], commit_lsn: pipeline.commit });
-                self.send(server, body);
+                self.send(pipeline, server, body);
             }
         }
         self.repair_down(pipeline);
         Ok(AppendReceipt::new(durable))
     }
 
-    fn send(self: &Arc<Self>, server: usize, body: RequestBody) {
+    /// Sends a pipeline request; its reply also answers the confirmation round in flight when it was sent.
+    fn send(self: &Arc<Self>, pipeline: &Pipeline, server: usize, body: RequestBody) {
         let writer = Arc::downgrade(self);
         let ensemble = Arc::clone(&self.ensemble);
+        let round = pipeline.confirming.as_ref().map(|confirming| Arc::clone(&confirming.round));
         self.ensemble.links[server].send(body, Box::new(move |reply| {
-            if let Some(writer) = Weak::upgrade(&writer) { writer.acknowledged(server, ensemble.ack(server, reply)); }
+            if let Some(writer) = Weak::upgrade(&writer) { writer.acknowledged(server, ensemble.ack(server, reply), round); }
         }));
     }
 
-    fn acknowledged(self: &Arc<Self>, server: usize, ack: Result<Ack>) {
+    fn send_check(self: &Arc<Self>, server: usize, round: &Arc<Round>) {
+        let writer = Arc::downgrade(self);
+        let ensemble = Arc::clone(&self.ensemble);
+        let round = Arc::clone(round);
+        self.ensemble.links[server].send(self.ensemble.check_request(self.epoch), Box::new(move |reply| {
+            let Some(writer) = Weak::upgrade(&writer) else { return };
+            let mut state = writer.state.lock();
+            match ensemble.ack(server, reply) {
+                Ok(Ack::Refused(refused)) if refused.promised > writer.epoch => writer.depose(&mut state, refused.promised),
+                ack => if let State::Open(pipeline) = &mut *state { writer.mark(pipeline, &round, server, ack.is_ok()); },
+            }
+        }));
+    }
+
+    fn acknowledged(self: &Arc<Self>, server: usize, ack: Result<Ack>, round: Option<Arc<Round>>) {
         let mut state = self.state.lock();
         if let Ok(Ack::Refused(refused)) = ack && refused.promised > self.epoch { return self.depose(&mut state, refused.promised); }
         let State::Open(pipeline) = &mut *state else { return };
+        if let Some(round) = &round { self.mark(pipeline, round, server, ack.is_ok()); }
         match ack {
             Ok(Ack::Accepted(accepted)) => {
                 let replica = &mut pipeline.replicas[server];
@@ -241,7 +289,7 @@ impl Writer {
         if pipeline.commit == pipeline.next_lsn - 1 {
             for server in 0..pipeline.replicas.len() {
                 if matches!(pipeline.replicas[server].link, Link::Live) {
-                    self.send(server, RequestBody::Commit(Commit { stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: quorum }));
+                    self.send(pipeline, server, RequestBody::Commit(Commit { stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: quorum }));
                 }
             }
         }
@@ -258,6 +306,9 @@ impl Writer {
         if let State::Open(pipeline) = deposed {
             for buffered in pipeline.buffer {
                 if let Some(receipt) = buffered.receipt { let _ = receipt.send(Err(Error::Deposed { epoch: self.epoch, promised })); }
+            }
+            if let Some(confirming) = pipeline.confirming {
+                for round in std::iter::once(confirming.round).chain(confirming.next) { round.outcome.send_replace(Some(Confirmation::Deposed { promised })); }
             }
         }
         self.tip.send_replace(Tip::Deposed { promised });
@@ -306,7 +357,7 @@ impl Writer {
                     let entries = pipeline.buffer.iter().skip((from - pipeline.buffer_first) as usize).map(|buffered| buffered.entry.clone()).collect();
                     let body = ensemble.overwrite_request(epoch, from, entries, true, pipeline.commit);
                     pipeline.replicas[server].link = Link::Live;
-                    self.send(server, body);
+                    self.send(pipeline, server, body);
                     return Ok(());
                 }
                 let sources: Vec<usize> = (0..pipeline.replicas.len()).filter(|&peer| peer != server && matches!(pipeline.replicas[peer].link, Link::Live)).collect();
@@ -330,6 +381,70 @@ impl Writer {
                 None => return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("no live server holds lsn {from} to repair from") }),
             }
         }
+    }
+
+    /// Succeeds once a write quorum of servers has answered, in a round that started after this call, that the stream is not sealed beyond this writer's epoch.
+    /// So no successor had committed anything when the call began: a successor commits only after sealing a write quorum, which meets the confirming one.
+    /// Concurrent callers share a round, at most one is in flight, and callers arriving during it wait for the next.
+    /// A busy writer's round is answered by the replies to its appends and commits sent after it started; an idle writer's sends each server a check.
+    pub async fn confirm_leadership(self: &Arc<Self>) -> Result<()> {
+        let mut outcome = {
+            let mut state = self.state.lock();
+            match &mut *state {
+                State::Open(pipeline) => self.join_confirmation(pipeline),
+                State::Deposed { promised } => return Err(Error::Deposed { epoch: self.epoch, promised: *promised }),
+            }
+        };
+        let confirmation = outcome.wait_for(Option::is_some).await.map_err(|_| Error::Closed("writer dropped".into()))?.clone().expect("waited for an outcome");
+        match confirmation {
+            Confirmation::Confirmed => Ok(()),
+            Confirmation::Deposed { promised } => Err(Error::Deposed { epoch: self.epoch, promised }),
+            Confirmation::Unavailable(message) => Err(Error::Remote { key: self.ensemble.config.stream.clone(), message }),
+        }
+    }
+
+    fn join_confirmation(self: &Arc<Self>, pipeline: &mut Pipeline) -> watch::Receiver<Option<Confirmation>> {
+        match &mut pipeline.confirming {
+            Some(confirming) => confirming.next.get_or_insert_with(Round::new).outcome.subscribe(),
+            None => {
+                let round = Round::new();
+                let outcome = round.outcome.subscribe();
+                self.start_round(pipeline, round);
+                outcome
+            }
+        }
+    }
+
+    /// A live server with an append in flight is answered by the commit that follows once the pipeline reaches its tip, or by later appends; every other server is sent a check.
+    fn start_round(self: &Arc<Self>, pipeline: &mut Pipeline, round: Arc<Round>) {
+        let tip = pipeline.next_lsn - 1;
+        let busy = pipeline.commit < tip;
+        pipeline.confirming = Some(Confirming { round: Arc::clone(&round), marks: vec![Mark::Pending; pipeline.replicas.len()], next: None });
+        for server in 0..pipeline.replicas.len() {
+            let replica = &pipeline.replicas[server];
+            let answered_by_pipeline = busy && matches!(replica.link, Link::Live) && replica.acked < tip;
+            if !answered_by_pipeline { self.send_check(server, &round); }
+        }
+    }
+
+    /// Records one server's answer to `round` if it is still the round in flight, and ends the round once its outcome is settled.
+    fn mark(self: &Arc<Self>, pipeline: &mut Pipeline, round: &Arc<Round>, server: usize, confirmed: bool) {
+        let Some(confirming) = &mut pipeline.confirming else { return };
+        if !Arc::ptr_eq(&confirming.round, round) { return; }
+        let mark = &mut confirming.marks[server];
+        if confirmed { *mark = Mark::Confirmed; } else if *mark == Mark::Pending { *mark = Mark::Failed; }
+        let quorum = self.ensemble.config.write_quorum;
+        let count = |wanted: Mark| confirming.marks.iter().filter(|mark| **mark == wanted).count();
+        let outcome = if count(Mark::Confirmed) >= quorum {
+            Confirmation::Confirmed
+        } else if count(Mark::Failed) > confirming.marks.len() - quorum {
+            Confirmation::Unavailable(format!("{} of {} servers failed to confirm leadership, a write quorum is {quorum}", count(Mark::Failed), confirming.marks.len()))
+        } else {
+            return;
+        };
+        let finished = pipeline.confirming.take().expect("matched above");
+        finished.round.outcome.send_replace(Some(outcome));
+        if let Some(next) = finished.next { self.start_round(pipeline, next); }
     }
 
     /// Committed entries in `[from, to)` from the buffer, or `None` when it no longer holds `from`.

@@ -371,6 +371,7 @@ contract LogService {
     -- A deployment's log is a dense sequence of records addressed by Lsn, carried by a chain of loglets.
     append: (deployment: DeploymentId, epoch: Epoch, lsn: Lsn, records: List<LogRecord>) -> Lsn
     seal: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> SealReply
+    check: (deployment: DeploymentId, epoch: Epoch) -> Epoch
     read: (deployment: DeploymentId, from: Lsn) -> List<LogRecord>
     subscribe: (deployment: DeploymentId, from: Lsn) -> Stream<LogRecord>
     trim: (deployment: DeploymentId, through: Lsn) -> Lsn
@@ -405,7 +406,8 @@ contract LogService {
         -- A deployment with no appends causes no log traffic: no heartbeat, no no-op, no timer.
 
     @invariant SealsAreAnnounced
-        -- Every durable round's acknowledgement lists the deployments sealed on that server since the previous round to the same writer.
+        -- Every acknowledgement of an append, a commit or a check for a deployment says whether that server's promised epoch for it was still at most the writer's epoch when the server decided the request, which is after the writer sent it.
+        -- A check changes nothing and needs no durable round; it is what an idle writer sends.
         --   This is what a holder serving a linearizable read waits on (ServeLinearizableReadOnWriter).
 
     @invariant TrimFollowsPublication
@@ -602,8 +604,6 @@ entity LogServerStream {
     last_lsn: Lsn
     commit_lsn: Lsn
     trimmed_through: Lsn
-    -- Deployments sealed here since the previous acknowledged round, per writer, for SealsAreAnnounced.
-    sealed_since_last_round: Boolean
 }
 
 entity LogRecord {
@@ -1477,8 +1477,9 @@ rule ServeOnWriter {
 }
 
 rule ServeLinearizableReadOnWriter {
-    -- A holder serves a linearizable read only after the next durable round's acknowledgements from a write quorum show its loglet unsealed.
-    --   That adds at most one group-commit round and involves no clock.
+    -- A holder serves a linearizable read only after acknowledgements from a write quorum, to requests sent after the query arrived, show its loglet unsealed beyond its epoch.
+    --   A busy holder takes them from its next appends and commits, an idle one from a check per server; that adds at most one round and involves no clock.
+    --   Concurrent queries share one confirmation round, at most one is in flight per holder, and a query arriving during one waits for the next.
     when: QueryArrived(holding, query, session)
 
     requires: holding.state = serving

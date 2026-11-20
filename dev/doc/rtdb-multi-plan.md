@@ -44,7 +44,9 @@ Update this section as stages land.
 - **One ensemble for every epoch.**
   A deployment's streams stay on the ensemble chosen at creation; the loglet chain that lets an epoch move to other logkeepers is not built.
 - **Logkeeper storage.**
-  One journal file per stream rather than per writer, retained entries held in memory, no seal announcements (`SealsAreAnnounced`), so linearizable reads (`ServeLinearizableReadOnWriter`) are not available.
+  One journal file per stream rather than per writer, and retained entries held in memory.
+- **Linearizable reads are not wired.**
+  Acknowledgements announce seals (`SealsAreAnnounced`) and `QuorumLog::confirm_leadership` runs the check `ServeLinearizableReadOnWriter` needs, but no holder calls it before serving a linearizable read.
 - **The gateway splices bytes.**
   It does not own session state, so a planned move or a failover drops open connections; clients reconnect.
 - **The controller only reaps expired members.**

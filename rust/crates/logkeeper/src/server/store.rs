@@ -62,7 +62,7 @@ impl Store {
             RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
-            RequestBody::Read(_) | RequestBody::Fetch(_) => return Outcome::Now(failed("not a mutation")),
+            RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) => return Outcome::Now(failed("not a mutation")),
         };
         let slot = self.slot(&stream);
         let mut state = slot.state.lock();
@@ -81,6 +81,10 @@ impl Store {
         }
         if (state.commit, state.trim) != before { slot.progressed.notify_waiters(); }
         Outcome::Durable(durable, decision.reply)
+    }
+
+    pub fn check(&self, stream: &str, epoch: u64) -> ResponseBody {
+        match self.existing(stream) { Some(slot) => slot.state.lock().check(epoch), None => StreamState::default().check(epoch) }
     }
 
     pub fn fetch(&self, stream: &str, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> ResponseBody {

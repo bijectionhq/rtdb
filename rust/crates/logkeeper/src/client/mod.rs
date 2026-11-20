@@ -112,6 +112,20 @@ pub async fn trim(config: &StreamConfig, through: LogOffset) -> rtdb_types::Resu
     Ok(())
 }
 
+impl QuorumLog {
+    /// For the stream's writer: succeeds once a write quorum of servers has confirmed, in a round that started after this call, that the stream is not sealed beyond the writer's epoch.
+    /// A read served afterwards from what the writer had committed is linearizable, since no successor can have committed before the call began; this involves no clock.
+    /// Concurrent callers share one round, so a burst costs at most two; a server reporting a higher promise deposes the writer, failing this and its appends with `Error::Deposed`.
+    pub async fn confirm_leadership(&self) -> rtdb_types::Result<()> {
+        self.shared.check_open()?;
+        let Role::Writer(writer) = &self.shared.role else { return Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream)).into()) };
+        tokio::select! {
+            _ = self.shared.cancellation.cancelled() => Err(Error::Closed("shutdown".into()).into()),
+            confirmed = writer.confirm_leadership() => confirmed.map_err(Into::into),
+        }
+    }
+}
+
 fn record(entry: crate::protocol::Entry) -> LogRecord {
     LogRecord { metadata: LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, payload: entry.payload }
 }

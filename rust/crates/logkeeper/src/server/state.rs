@@ -153,6 +153,10 @@ impl StreamState {
         self.persist(events, Self::accepted)
     }
 
+    pub fn check(&self, epoch: u64) -> ResponseBody {
+        if self.promised > epoch { self.refused() } else { self.accepted() }
+    }
+
     pub fn sealed(&self) -> ResponseBody {
         ResponseBody::Sealed(Sealed {
             promised: self.promised,
@@ -255,6 +259,15 @@ mod tests {
         state.append(1, 0, vec![entry(0, 1)], 0);
         state.trim(5);
         assert_eq!((state.trim, state.last(), state.commit, state.synced), (5, 5, 5, None));
+    }
+
+    #[test]
+    fn a_check_reports_only_a_promise_beyond_the_epoch() {
+        let mut state = synced(2);
+        assert!(matches!(state.check(2), ResponseBody::Accepted(_)));
+        assert!(matches!(state.check(3), ResponseBody::Accepted(_)), "an unsealed or unsynced server is not sealed beyond the epoch");
+        state.seal(3);
+        assert_eq!(state.check(2), ResponseBody::Refused(Refused { promised: 3, last_lsn: -1 }));
     }
 
     #[test]
