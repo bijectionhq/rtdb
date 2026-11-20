@@ -25,6 +25,9 @@ async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, inde
 /// The secret a cell's gateway and nodes share; a test cell's is fixed.
 pub fn secret() -> Arc<rtdb_multi::capability::CellSecret> { Arc::new(rtdb_multi::capability::CellSecret::new(&[7; 32]).unwrap()) }
 
+/// The control key a test cell's members sign with.
+pub fn control() -> rtdb_multi::control::ControlKey { rtdb_multi::control::ControlKey(Some(secret())) }
+
 pub fn lease() -> LeaseOptions { LeaseOptions { lease: Duration::from_millis(1500), heartbeat: Duration::from_millis(200) } }
 
 pub struct Cell {

@@ -81,7 +81,7 @@ impl CellFragmenter {
     async fn read_on(&self, control_address: &str, fragment: &ScanFragment) -> Result<Vec<u8>> {
         let secret = self.secret.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-cell-secret", "Fragments are read elsewhere only in a cell with a secret"))?;
         let request = Request::ScanFragment { name: fragment.database().to_owned(), fragment: fragment.clone(), grant: secret.node_grant(fragment.database()) };
-        match control::call(control_address, &request, self.timeout).await? {
+        match control::call(control_address, &request, self.timeout, &control::ControlKey(self.secret.clone())).await? {
             Response::Fragment { batches } => base64::engine::general_purpose::STANDARD.decode(batches).map_err(|error| Anomaly::fault("rtdb.multi/fragment-response", error.to_string())),
             Response::Refused { code, message } => Err(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
             other => Err(Anomaly::fault("rtdb.multi/fragment-response", format!("A reader answered a fragment with {other:?}"))),

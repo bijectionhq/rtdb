@@ -20,7 +20,7 @@ impl rtdb_node::CompactionRelay for HolderRelay {
         let members = self.directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
         let holder = effective_holder(&record, &members, now_ms()).and_then(|holder| members.get(holder)).and_then(|member| member.control_address.clone())
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-holder", format!("{database} has no holder to publish its compaction")))?;
-        match control::call(&holder, &Request::PublishCompaction { name: database.to_owned(), notification: notification.encode_to_vec(), grant: self.secret.node_grant(database) }, Duration::from_secs(35)).await? {
+        match control::call(&holder, &Request::PublishCompaction { name: database.to_owned(), notification: notification.encode_to_vec(), grant: self.secret.node_grant(database) }, Duration::from_secs(35), &crate::control::ControlKey(Some(Arc::clone(&self.secret)))).await? {
             Response::Published { position } => Ok(SourcePosition(position)),
             Response::Refused { code, message } => Err(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
             other => Err(Anomaly::fault("rtdb.multi/compaction-relay", format!("The holder answered {other:?}"))),

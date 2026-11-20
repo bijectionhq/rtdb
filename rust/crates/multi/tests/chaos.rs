@@ -66,7 +66,7 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
             1 => {
                 let target = live[faults.next(live.len())];
                 println!("round {round}: move to node {target}");
-                let _ = admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id()).await;
+                let _ = admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id(), &control()).await;
             }
             2 => {
                 if let Some(holder) = cell.holder("shop").await {
@@ -81,7 +81,7 @@ async fn acknowledged_writes_survive_a_cell_under_faults() {
             }
             _ => {
                 println!("round {round}: rebalance");
-                let _ = admin::rebalance(cell.directory.as_ref(), 2).await;
+                let _ = admin::rebalance(cell.directory.as_ref(), 2, &control()).await;
             }
         }
     }

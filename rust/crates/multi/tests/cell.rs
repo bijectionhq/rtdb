@@ -161,9 +161,9 @@ async fn a_planned_move_and_a_rebalance_hand_deployments_over_without_losing_the
         client.simple_query(&format!("INSERT INTO items (_id, label) VALUES (1, '{name}')")).await.unwrap();
     }
     let target = cell.node(0).lease.id();
-    for name in ["a1", "a2", "a3", "a4"] { admin::move_deployment(cell.directory.as_ref(), name, &target).await.unwrap(); }
+    for name in ["a1", "a2", "a3", "a4"] { admin::move_deployment(cell.directory.as_ref(), name, &target, &control()).await.unwrap(); }
     assert_eq!(cell.node(0).agent.held().len(), 4, "every deployment moved to the target");
-    let moved = admin::rebalance(cell.directory.as_ref(), 10).await.unwrap();
+    let moved = admin::rebalance(cell.directory.as_ref(), 10, &control()).await.unwrap();
     assert_eq!(moved, 2);
     assert_eq!((cell.node(0).agent.held().len(), cell.node(1).agent.held().len()), (2, 2), "rebalancing evens the holdings out");
     for name in ["a1", "a2", "a3", "a4"] {
@@ -202,7 +202,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
 
-    let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview").await.unwrap();
+    let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
     assert_eq!((child.lineage.as_str(), child.parent.as_deref()), (parent.lineage.as_str(), Some(parent.id.as_str())));
     let rtdb_multi::deployment::CellStorage::Local { root } = cell.storage();
     let own = |prefix: &str| files_under(&root.join(prefix)).into_iter().filter(|path| !path.ends_with(rtdb_multi::reference::BASE_MANIFEST)).count();
@@ -259,7 +259,7 @@ async fn an_open_connection_survives_a_planned_move_and_its_holders_death() {
 
     let first = cell.holder("shop").await.unwrap();
     let target = (first + 1) % 3;
-    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id()).await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id(), &control()).await.unwrap();
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"], "the same connection reads on the new holder");
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     let row = client.query_one(&statement, &[]).await.unwrap();
@@ -327,7 +327,7 @@ async fn the_controller_confirms_a_silent_node_dead_before_its_lease_runs_out() 
 
     let silent = cell.holder("shop").await.unwrap();
     let silent_id = cell.node(silent).lease.id();
-    let options = admin::ControllerOptions { probe_timeout: Duration::from_millis(100), ..Default::default() };
+    let options = admin::ControllerOptions { probe_timeout: Duration::from_millis(100), control: control(), ..Default::default() };
     let mut failures = std::collections::BTreeMap::new();
     assert_eq!(admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap(), 0, "a node that answers is not suspected");
     // Simulate a hung agent: its probes go unanswered while its lease is still being renewed.
@@ -494,7 +494,7 @@ async fn a_command_that_parses_a_statement_is_resent_whole_after_a_move() {
     let client = cell.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     let first = cell.holder("shop").await.unwrap();
-    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(1 - first).lease.id()).await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(1 - first).lease.id(), &control()).await.unwrap();
     let statement = client.prepare("SELECT total FROM orders WHERE _id = 1").await.expect("a named statement parsed as the first command after a move");
     assert_eq!(client.query_one(&statement, &[]).await.unwrap().get::<_, i64>(0), 10);
     drop(client);
@@ -554,8 +554,12 @@ async fn a_node_admits_a_capability_only_for_its_deployment_and_the_gateway_neve
     assert_eq!(greeting(&node, &[("user", "xtdb"), ("database", "shop"), ("rtdb.capability", &foreign)]).await.0, b'E', "another cell's capability is refused");
     assert_eq!(greeting(&cell.gateway.to_string(), &[("user", "xtdb"), ("database", "shop"), ("rtdb.capability", &genuine)]).await, (b'R', [0, 0, 0, 3]), "through the gateway, a client's capability is dropped and the password asked for");
     let control = cell.node(0).control_address.to_string();
+    let ping = |key: rtdb_multi::control::ControlKey| { let control = control.clone(); async move { rtdb_multi::control::call(&control, &rtdb_multi::control::Request::Ping, Duration::from_secs(5), &key).await.unwrap() } };
+    assert!(matches!(ping(common::control()).await, rtdb_multi::control::Response::Done), "a request signed with the cell's secret is served");
+    assert!(matches!(ping(rtdb_multi::control::ControlKey::default()).await, rtdb_multi::control::Response::Refused { .. }), "an unsigned one is refused");
+    assert!(matches!(ping(rtdb_multi::control::ControlKey(Some(std::sync::Arc::new(rtdb_multi::capability::CellSecret::new(&[9; 32]).unwrap())))).await, rtdb_multi::control::Response::Refused { .. }), "and so is one signed by another cell");
     for grant in [genuine.clone(), "forged".to_owned(), rtdb_multi::capability::CellSecret::new(&[9; 32]).unwrap().node_grant("shop")] {
-        let answer = rtdb_multi::control::call(&control, &rtdb_multi::control::Request::PublishCompaction { name: "shop".into(), notification: Vec::new(), grant }, Duration::from_secs(5)).await.unwrap();
+        let answer = rtdb_multi::control::call(&control, &rtdb_multi::control::Request::PublishCompaction { name: "shop".into(), notification: Vec::new(), grant }, Duration::from_secs(5), &common::control()).await.unwrap();
         assert!(matches!(answer, rtdb_multi::control::Response::Refused { .. }), "only another of the cell's nodes may ask for a deployment's data or publish for it: {answer:?}");
     }
     cell.stop().await;

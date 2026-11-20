@@ -10,7 +10,7 @@ use rtdb_storage::log::LogOffset;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::control::{self, Request, Response};
+use crate::control::{self, ControlKey, Request, Response};
 use crate::deployment::{CellStorage, write_quorum};
 use crate::keys::KeyService;
 
@@ -57,15 +57,15 @@ fn control_address(members: &BTreeMap<MemberId, MemberRecord>, member: &MemberId
     members.get(member).and_then(|member| member.control_address.clone()).ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-control", format!("Member {member} has no control address")))
 }
 
-async fn expect(address: &str, request: Request) -> Result<Response> {
-    match control::call(address, &request, CONTROL_TIMEOUT).await? {
+async fn expect(address: &str, request: Request, control: &ControlKey) -> Result<Response> {
+    match control::call(address, &request, CONTROL_TIMEOUT, control).await? {
         Response::Refused { code, message } => Err(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
         response => Ok(response),
     }
 }
 
 /// Makes sure the deployment is held, activating it on the first node of its affinity order if not, and returns its holder.
-pub async fn ensure_held(directory: &dyn Directory, name: &str) -> Result<MemberId> {
+pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &ControlKey) -> Result<MemberId> {
     let current = record(directory, name).await?;
     let members = members(directory).await?;
     if let Some(holder) = effective_holder(&current, &members, now_ms()) { return Ok(holder.clone()); }
@@ -73,7 +73,7 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str) -> Result<Member
     let mut last = None;
     for node in rtdb_affinity::rank(&current.storage_identity(), &nodes, |member| member.id.as_str()) {
         let Some(address) = &node.control_address else { continue };
-        match expect(address, Request::Activate { name: name.to_owned() }).await {
+        match expect(address, Request::Activate { name: name.to_owned() }, control).await {
             Ok(Response::Held { .. }) => return Ok(node.id.clone()),
             Ok(Response::Redirect { holder, .. }) => return Ok(MemberId(holder)),
             Ok(_) => {}
@@ -84,23 +84,23 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str) -> Result<Member
 }
 
 /// A planned move: reserves the next claim for `target`, has the holder park, and has `target` claim.
-pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId) -> Result<()> {
+pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
     let members = members(directory).await?;
     if !members.get(target).is_some_and(|member| member.may_receive_placements(now_ms())) {
         return Err(Anomaly::incorrect("rtdb.multi/not-placeable", format!("{target} may not take placements")));
     }
     let intended = update(directory, name, |record| { record.move_intent = Some(target.clone()); Ok(()) }).await?;
     if let Some(holder) = effective_holder(&intended, &members, now_ms()).filter(|holder| *holder != target) {
-        expect(&control_address(&members, holder)?, Request::Park { name: name.to_owned() }).await?;
+        expect(&control_address(&members, holder)?, Request::Park { name: name.to_owned() }, control).await?;
     }
-    match expect(&control_address(&members, target)?, Request::Activate { name: name.to_owned() }).await? {
+    match expect(&control_address(&members, target)?, Request::Activate { name: name.to_owned() }, control).await? {
         Response::Held { .. } => Ok(()),
         other => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-failed", format!("The target answered {other:?}"))),
     }
 }
 
 /// Moves at most `moves` deployments from the most loaded nodes to the least loaded, where their holding counts differ by more than one.
-pub async fn rebalance(directory: &dyn Directory, moves: usize) -> Result<usize> {
+pub async fn rebalance(directory: &dyn Directory, moves: usize, control: &ControlKey) -> Result<usize> {
     let members = members(directory).await?;
     let now = now_ms();
     let mut load: BTreeMap<MemberId, Vec<String>> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now))
@@ -114,7 +114,7 @@ pub async fn rebalance(directory: &dyn Directory, moves: usize) -> Result<usize>
         let Some((idlest, idle)) = load.iter().min_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
         if busy <= idle + 1 { break; }
         let name = load.get_mut(&busiest).and_then(Vec::pop).expect("the busiest node holds something");
-        move_deployment(directory, &name, &idlest).await?;
+        move_deployment(directory, &name, &idlest, control).await?;
         load.get_mut(&idlest).expect("listed").push(name);
         moved += 1;
     }
@@ -134,10 +134,10 @@ pub async fn unquarantine(directory: &dyn Directory, name: &str) -> Result<Deplo
 }
 
 /// Forks `parent` into a new deployment `name` of the same lineage: the parent is flushed so its whole state is in blocks, its objects are copied under the child's prefix, and the child starts on fresh logs in the next log epoch.
-pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str) -> Result<DeploymentRecord> {
-    let holder = ensure_held(directory, parent).await?;
+pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, control: &ControlKey) -> Result<DeploymentRecord> {
+    let holder = ensure_held(directory, parent, control).await?;
     let members = members(directory).await?;
-    expect(&control_address(&members, &holder)?, Request::Flush { name: parent.to_owned() }).await?;
+    expect(&control_address(&members, &holder)?, Request::Flush { name: parent.to_owned() }, control).await?;
     fork_from(directory, storage, keys, parent, name, None).await
 }
 
@@ -333,10 +333,12 @@ pub struct ControllerOptions {
     /// Consecutive failed probes after which a node is confirmed dead, ahead of its lease.
     pub suspicion_probes: u32,
     pub probe_timeout: Duration,
+    /// The cell's control key, with which the controller signs its probes and moves.
+    pub control: ControlKey,
 }
 
 impl Default for ControllerOptions {
-    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, suspicion_probes: 2, probe_timeout: Duration::from_millis(300) } }
+    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default() } }
 }
 
 /// Probes every live node's agent, and confirms dead those that failed `suspicion_probes` probes in a row (`ConfirmSuspicion`).
@@ -347,7 +349,7 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
     for member in directory.members().await? {
         if member.role != MemberRole::Node || !member.is_live(now) { failures.remove(&member.id); continue; }
         let Some(address) = &member.control_address else { continue };
-        let answered = matches!(control::call(address, &Request::Ping, options.probe_timeout).await, Ok(Response::Done));
+        let answered = matches!(control::call(address, &Request::Ping, options.probe_timeout, &options.control).await, Ok(Response::Done));
         if answered { failures.remove(&member.id); continue; }
         let count = failures.entry(member.id.clone()).or_default();
         *count += 1;
@@ -378,7 +380,7 @@ pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOp
             _ = tokio::time::sleep(options.interval) => {
                 let _ = reap_members(directory.as_ref(), options.grace).await;
                 if options.suspicion_probes > 0 { let _ = confirm_suspicions(directory.as_ref(), &mut failures, &options).await; }
-                if options.rebalance_moves > 0 { let _ = rebalance(directory.as_ref(), options.rebalance_moves).await; }
+                if options.rebalance_moves > 0 { let _ = rebalance(directory.as_ref(), options.rebalance_moves, &options.control).await; }
             }
         }
     }

@@ -1,4 +1,5 @@
 //! The control protocol between the cell and a node's agent: newline-delimited JSON, one request per connection.
+//! In a cell with a secret, every request carries a grant signed with it, and a node refuses one that does not.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +50,35 @@ pub enum Response {
     Refused { code: String, message: String },
 }
 
+/// The secret a cell's members sign their control requests with; a cell without one sends them unsigned, to nodes that take them unsigned.
+#[derive(Clone, Default)]
+pub struct ControlKey(pub Option<Arc<crate::capability::CellSecret>>);
+
+impl std::fmt::Debug for ControlKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str(if self.0.is_some() { "ControlKey(signed)" } else { "ControlKey(unsigned)" }) }
+}
+
+const CONTROL_SCOPE: &str = "~control";
+
+impl ControlKey {
+    fn grant(&self) -> Option<String> { self.0.as_ref().map(|secret| secret.mint(CONTROL_SCOPE, "~cell-member", false, Duration::from_secs(30))) }
+    fn admit(&self, grant: Option<&str>) -> Result<()> {
+        let Some(secret) = &self.0 else { return Ok(()) };
+        let grant = grant.ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/control-unsigned", "This cell's control requests must be signed with its secret"))?;
+        use rtdb_pgwire::CapabilityVerifier;
+        secret.verify(grant, CONTROL_SCOPE).map(|_| ())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Envelope {
+    /// Named apart from any field of a request, which share its JSON object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_grant: Option<String>,
+    #[serde(flatten)]
+    request: Request,
+}
+
 impl Response {
     pub fn refused(error: &Anomaly) -> Self { Self::Refused { code: error.code.to_string(), message: error.message.clone().unwrap_or_default() } }
 }
@@ -58,19 +88,22 @@ pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, request: Request) -> Response;
 }
 
-pub async fn serve(listener: TcpListener, handler: Arc<dyn Handler>, cancellation: CancellationToken) -> Result<()> {
+pub async fn serve(listener: TcpListener, handler: Arc<dyn Handler>, key: ControlKey, cancellation: CancellationToken) -> Result<()> {
     loop {
         let (stream, _) = tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
             accepted = listener.accept() => accepted.map_err(io)?,
         };
-        let handler = Arc::clone(&handler);
+        let (handler, key) = (Arc::clone(&handler), key.clone());
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let mut line = String::new();
             if BufReader::new(read).read_line(&mut line).await.is_err() { return; }
-            let response = match serde_json::from_str::<Request>(&line) {
-                Ok(request) => handler.handle(request).await,
+            let response = match serde_json::from_str::<Envelope>(&line) {
+                Ok(envelope) => match key.admit(envelope.control_grant.as_deref()) {
+                    Ok(()) => handler.handle(envelope.request).await,
+                    Err(error) => Response::refused(&error),
+                },
                 Err(error) => Response::Refused { code: "rtdb.multi/control-request".into(), message: error.to_string() },
             };
             let mut bytes = serde_json::to_vec(&response).expect("a response serializes");
@@ -80,11 +113,11 @@ pub async fn serve(listener: TcpListener, handler: Arc<dyn Handler>, cancellatio
     }
 }
 
-pub async fn call(address: &str, request: &Request, timeout: Duration) -> Result<Response> {
+pub async fn call(address: &str, request: &Request, timeout: Duration, key: &ControlKey) -> Result<Response> {
     let exchange = async {
         let stream = TcpStream::connect(address).await.map_err(io)?;
         let (read, mut write) = stream.into_split();
-        let mut bytes = serde_json::to_vec(request).expect("a request serializes");
+        let mut bytes = serde_json::to_vec(&Envelope { control_grant: key.grant(), request: request.clone() }).expect("a request serializes");
         bytes.push(b'\n');
         write.write_all(&bytes).await.map_err(io)?;
         let mut line = String::new();

@@ -94,7 +94,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     tasks.spawn(driver.run());
     { let lease = Arc::clone(&lease); let cancellation = lease_cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     { let agent = Arc::clone(&agent); let cancellation = cancellation.clone(); tasks.spawn(async move { agent.run(cancellation).await; Ok(()) }); }
-    tasks.spawn(crate::control::serve(control, agent.clone(), cancellation.clone()));
+    tasks.spawn(crate::control::serve(control, agent.clone(), crate::control::ControlKey(settings.capabilities.clone()), cancellation.clone()));
     Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, tasks })
 }
 

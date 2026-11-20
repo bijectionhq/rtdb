@@ -19,17 +19,17 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
-       rtdb-multi controller --directory DIR [--rebalance MOVES]\n\
+       rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--grace SECONDS]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
        rtdb-multi status --directory DIR [--target-per-node N]\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME\n\
-       rtdb-multi move --directory DIR --name NAME --to MEMBER\n\
+       rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
-       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N [--grace SECONDS]]\n\
+       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N [--grace SECONDS]] [--cell-secret FILE]\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --name NAME\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n";
@@ -126,7 +126,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "controller" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", 0usize)?, ..Default::default() };
+            let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", 0usize)?, control: rtdb_multi::control::ControlKey(cell_secret(&arguments)?), ..Default::default() };
             admin::run_controller(directory, options, cancellation).await;
             Ok(())
         }
@@ -158,7 +158,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "move" => {
             let directory = directory(arguments.required("directory")?).await?;
-            admin::move_deployment(directory.as_ref(), arguments.required("name")?, &rtdb_directory::MemberId(arguments.required("to")?.into())).await
+            admin::move_deployment(directory.as_ref(), arguments.required("name")?, &rtdb_directory::MemberId(arguments.required("to")?.into()), &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await
         }
         "read-width" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -177,7 +177,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     let block = block.parse().map_err(|_| usage("--at-block must be a block index".into()))?;
                     admin::fork_at_block(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
                 }
-                None => admin::fork(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name).await?,
+                None => admin::fork(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
             };
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
             Ok(())

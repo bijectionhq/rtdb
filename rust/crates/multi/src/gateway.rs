@@ -93,10 +93,11 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
         let name = name.clone();
         let interval = options.touch_interval;
         let timeout = options.control_timeout;
+        let key = control::ControlKey(options.capabilities.clone());
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let _ = control::call(&control, &Request::Touch { name: name.clone() }, timeout).await;
+                let _ = control::call(&control, &Request::Touch { name: name.clone() }, timeout, &key).await;
             }
         })
     });
@@ -150,7 +151,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snap
     if snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
         for reader in snapshot_readers(&record, &members) {
             let Some(control_address) = &reader.control_address else { continue; };
-            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Snapshot { name: name.to_owned() }, options.control_timeout).await {
+            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Snapshot { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
                 if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
             }
         }
@@ -158,7 +159,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snap
     if read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
         for replica in replicas(&record, &members) {
             let Some(control_address) = &replica.control_address else { continue; };
-            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Subscribe { name: name.to_owned() }, options.control_timeout).await {
+            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Subscribe { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
                 if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
             }
         }
@@ -166,7 +167,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snap
     let mut last = None;
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
-        match control::call(control_address, &Request::Activate { name: name.to_owned() }, options.control_timeout).await {
+        match control::call(control_address, &Request::Activate { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
             Ok(Response::Held { address, epoch }) => return Ok((connect(&address).await?, Some(control_address.clone()), epoch, record.id.clone())),
             Ok(Response::Redirect { holder, address }) => {
                 let control = members.get(&MemberId(holder)).and_then(|member| member.control_address.clone());
