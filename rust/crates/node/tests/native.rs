@@ -1676,3 +1676,27 @@ async fn a_stored_struct_reads_back_with_its_fields_in_written_order() {
     assert_eq!(equal, [vec![Value::Bool(true), Value::Bool(false)]], "structs compare as maps whatever their field order");
     drop(session); stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_placed_catalog_starts_empty_and_holds_exactly_what_is_attached_and_detached_locally() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, services()).await;
+    assert!(node.catalog().database_names().is_empty(), "nothing starts open, not even a primary");
+    assert!(node.catalog().secondary_databases().is_empty());
+    assert_eq!(node.catalog().check_attach("shop", &DatabaseConfig::default()).unwrap_err().code, "xtdb/fixed-database-catalog", "log-borne instructions are refused");
+
+    node.database_or_attach("shop".into(), DatabaseConfig::default()).await.unwrap().expect("a placed catalog attaches locally");
+    let mut session = node.session("shop", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+    drop(session);
+
+    node.detach_local("shop".into()).await.unwrap();
+    assert!(node.catalog().database("shop").is_err(), "a detached database no longer resolves");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while node.catalog().is_draining("shop") { tokio::task::yield_now().await; }
+    }).await.expect("the detach drains");
+    node.database_or_attach("shop".into(), DatabaseConfig::default()).await.unwrap().expect("the name is free again once drained");
+    stop(&node, driver).await;
+}

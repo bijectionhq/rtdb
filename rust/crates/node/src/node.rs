@@ -123,6 +123,7 @@ impl Node {
                     }
                 }
             }
+            Membership::Placed => {}
             Membership::Fixed(databases) => for (name, configuration) in databases {
                 let opened = node.factory.open(name, configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.cancellation).await?;
                 node.catalog.insert_open(Arc::clone(&opened.database))?;
@@ -306,6 +307,14 @@ impl Node {
         self.commands.send(CatalogCommand::AttachLocal { name, configuration, completion }).await.map_err(|_| closed())?;
         result.await.map_err(|_| closed())?
     }
+    /// Stops running a database this node holds under a placed catalog: its driver is cancelled and its resources drained.
+    /// Returns once the detach has begun; the name stays occupied until the drain completes.
+    pub async fn detach_local(&self, name: String) -> Result<()> {
+        self.ensure_open()?;
+        let (completion, result) = oneshot::channel();
+        self.commands.send(CatalogCommand::DetachLocal { name, completion }).await.map_err(|_| closed())?;
+        result.await.map_err(|_| closed())?
+    }
 }
 
 impl NodeDriver {
@@ -315,7 +324,10 @@ impl NodeDriver {
         self.node.shutdown();
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
-            match command { CatalogCommand::Apply { completion, .. } => { let _ = completion.send(Err(closed())); }, CatalogCommand::AttachLocal { completion, .. } => { let _ = completion.send(Err(closed())); } }
+            match command {
+                CatalogCommand::Apply { completion, .. } | CatalogCommand::DetachLocal { completion, .. } => { let _ = completion.send(Err(closed())); },
+                CatalogCommand::AttachLocal { completion, .. } => { let _ = completion.send(Err(closed())); }
+            }
         }
         self.node.catalog.cancel_all();
         self.initial.clear();
@@ -348,7 +360,10 @@ impl NodeDriver {
         self.node.shutdown();
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
-            match command { CatalogCommand::Apply { completion, .. } => { let _ = completion.send(Err(closed())); }, CatalogCommand::AttachLocal { completion, .. } => { let _ = completion.send(Err(closed())); } }
+            match command {
+                CatalogCommand::Apply { completion, .. } | CatalogCommand::DetachLocal { completion, .. } => { let _ = completion.send(Err(closed())); },
+                CatalogCommand::AttachLocal { completion, .. } => { let _ = completion.send(Err(closed())); }
+            }
         }
         self.node.catalog.cancel_all();
         while let Some(completion) = tasks.join_next().await {
@@ -379,7 +394,7 @@ impl NodeDriver {
         match command {
             CatalogCommand::Apply { operation, completion } => {
                 let result = match operation {
-                    DbOp::AttachDatabase(attach) => self.attach(attach.db_name.unwrap_or_default(), attach.config.unwrap_or_default(), tasks).await.map(|_| ()),
+                    DbOp::AttachDatabase(attach) => self.attach(attach.db_name.unwrap_or_default(), attach.config.unwrap_or_default(), false, tasks).await.map(|_| ()),
                     DbOp::DetachDatabase(detach) => self.node.catalog.begin_detach(detach.db_name.as_deref().unwrap_or_default()).map(|ready| {
                         if let Some(database) = ready { Self::drain(database, tasks); }
                     }),
@@ -387,13 +402,17 @@ impl NodeDriver {
                 let _ = completion.send(result);
             }
             CatalogCommand::AttachLocal { name, configuration, completion } => {
-                let result = match self.node.catalog.database(&name) { Ok(database) => Ok(Some(database)), Err(_) => self.attach(name, configuration, tasks).await };
+                let result = match self.node.catalog.database(&name) { Ok(database) => Ok(Some(database)), Err(_) => self.attach(name, configuration, true, tasks).await };
+                let _ = completion.send(result);
+            }
+            CatalogCommand::DetachLocal { name, completion } => {
+                let result = self.node.catalog.begin_local_detach(&name).map(|ready| { if let Some(database) = ready { Self::drain(database, tasks); } });
                 let _ = completion.send(result);
             }
         }
     }
-    async fn attach(&mut self, name: String, configuration: DatabaseConfig, tasks: &mut JoinSet<DatabaseCompletion>) -> Result<Option<Arc<Database>>> {
-        self.node.catalog.check_attach(&name, &configuration)?;
+    async fn attach(&mut self, name: String, configuration: DatabaseConfig, local: bool, tasks: &mut JoinSet<DatabaseCompletion>) -> Result<Option<Arc<Database>>> {
+        if local { self.node.catalog.check_local_attach(&name, &configuration)?; } else { self.node.catalog.check_attach(&name, &configuration)?; }
         if self.node.catalog.skipped(&name) { self.node.catalog.insert_skipped(name, configuration)?; return Ok(None); }
         let opened = self.node.factory.open(name, configuration, Arc::clone(&self.node.catalog), self.node.commands.clone(), &self.node.cancellation).await?;
         let database = Arc::clone(&opened.database);

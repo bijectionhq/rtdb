@@ -45,11 +45,17 @@ pub struct ReplicationConfig {
     pub pending_block_records: usize,
     pub pending_block_bytes: usize,
     pub election_seed: u64,
+    /// Whether an idle leader appends a no-op every `assertion_interval` so that followers can tell a quiet log from a leaderless one.
+    /// A placed holder needs none: only it may claim, and its liveness is its member lease.
+    pub idle_heartbeat: bool,
+    /// How long a node that may lead waits on an empty replica read before claiming, in place of the randomized election wait.
+    pub claim_wait: Option<Duration>,
 }
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: 100_000, assertion_interval: Duration::from_millis(100), flush_timeout: Duration::from_secs(4 * 60 * 60),
-            pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64 }
+            pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64,
+            idle_heartbeat: true, claim_wait: None }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -484,7 +490,11 @@ impl ReplicationDriver {
             if let Some(tail) = self.replica_tail.take() {
                 self.config.election_seed = self.config.election_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let factor = 5 + self.config.election_seed % 6;
-                self.replica_poll = Some(start_poll(tail, self.config.assertion_interval.saturating_mul(factor as u32)));
+                let timeout = match self.config.claim_wait {
+                    Some(wait) if self.config.may_lead && self.leader.is_none() => wait,
+                    _ => self.config.assertion_interval.saturating_mul(factor as u32),
+                };
+                self.replica_poll = Some(start_poll(tail, timeout));
             }
         }
         if let Some(leader) = &mut self.leader {
@@ -542,7 +552,7 @@ impl ReplicationDriver {
         let recovery_write = self.next_recovery_write().await?;
         let produce_inherited = recovery_write.is_none() && self.pending_block.is_some();
         let confirmed = recovery_write.is_none() && !produce_inherited;
-        let job = pump.run(recovery_write.clone());
+        let job = pump.with_heartbeat(self.config.idle_heartbeat).run(recovery_write.clone());
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed, recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
             pending: VecDeque::new(), source_tail: Some(source_tail), source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });

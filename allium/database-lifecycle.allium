@@ -28,6 +28,7 @@
 -- The MEMBER axis only exists where a node writes the record back, and `membership_source` says which kind of node this is.
 -- A durable_record node reads its set at startup and hands it to the recorder thereafter.
 -- A fixed node is given its whole set by the operator and never writes one.
+-- A placed node starts with nothing, and holds exactly what an authority outside it attaches and detaches on it locally; rtdb-multi.allium's directory is that authority.
 -- HOLD and RUN apply to both.
 -- The membership instructions and the membership surface exist only on the first, and a fixed node reaches only `open`.
 --
@@ -111,7 +112,8 @@ entity DatabaseCatalog {
     -- A durable_record catalog reads its set when the node starts and hands it to the recorder from then on.
     -- A fixed catalog is given its whole set at startup and never writes one, so the MEMBER axis does not apply to it.
     -- It cannot delete a database by omission, because it never overwrites the record.
-    membership_source: durable_record | fixed
+    -- A placed catalog starts empty and never writes a set either; local admission and local removal are its only instructions.
+    membership_source: durable_record | fixed | placed
 
     entries: DatabaseEntry with catalog = this
 
@@ -175,6 +177,28 @@ rule StartupCreatesFixedSet {
             catalog: catalog, name: configured.name, config: configured.config,
             lifecycle: open
         )
+}
+
+rule PlacementAdmitsLocally {
+    -- A placed node runs a database when the authority placing it says so, and no log-borne instruction reaches it.
+    when: NodeAdmittedLocally(db_name, db_config)
+    requires: catalog.membership_source = placed
+    requires: not catalog.holds(db_name)
+
+    ensures: DatabaseEntry.created(
+        catalog: catalog, name: db_name, config: db_config, lifecycle: open
+    )
+}
+
+rule PlacementRemovesLocally {
+    -- Removal on a placed node is the same teardown as an instructed removal; the name stays occupied until it completes (TeardownCompletesRemoval).
+    when: NodeRemovedLocally(db_name)
+    let entry = DatabaseEntry{catalog, name: db_name}
+    requires: catalog.membership_source = placed
+    requires: exists entry
+    requires: entry.lifecycle = open
+
+    ensures: entry.lifecycle = detaching
 }
 
 rule AdmitInstructionCreatesEntry {

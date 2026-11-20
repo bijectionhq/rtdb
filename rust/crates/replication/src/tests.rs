@@ -1535,3 +1535,36 @@ fn replacement_clears_only_the_terminal_progress_it_was_prepared_for() {
     monitor.driver_initialized(restart).unwrap();
     monitor.applied(Some(SourcePosition(1)), None, None).unwrap();
 }
+
+async fn placed_driver(replica: Arc<MemoryLog>, config: ReplicationConfig) -> (ReplicationHandle, ReplicationDriver) {
+    let store = Arc::new(MemoryStore::default());
+    let memory = MemoryBudget::new(1 << 28);
+    let cache = Arc::new(BufferPool::new(store.clone(), 1 << 25));
+    let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
+    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let progress = ProgressMonitor::new(recovered.progress.clone());
+    let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 20)), replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
+        store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
+    let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
+        cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
+        execution_observer: None, tracer: None });
+    ReplicationDriver::new(config, logs, blocks, recovered, progress, resolve, Arc::new(NoEffects), CancellationToken::new()).unwrap()
+}
+
+#[tokio::test]
+async fn a_placed_holder_claims_without_an_election_wait_and_an_idle_term_appends_nothing() {
+    let replica = Arc::new(MemoryLog::new(1 << 20));
+    // A previous term exists, so the claim is not the first-ever one that ClaimWhenNoTermHasLed makes at once.
+    replica.enqueue(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).payload, Timestamp(0)).await.unwrap().durable().await.unwrap();
+    let config = ReplicationConfig { assertion_interval: Duration::from_secs(3600), claim_wait: Some(Duration::from_millis(10)), idle_heartbeat: false, ..Default::default() };
+    let (handle, driver) = placed_driver(Arc::clone(&replica), config).await;
+    let task = tokio::spawn(driver.run());
+    let mut status = handle.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| matches!(status.role, Role::Leading(_)))).await
+        .expect("the holder claims within the claim wait, not the hour-long election wait").unwrap();
+    let after_claim = replica.latest().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(replica.latest().unwrap(), after_claim, "an idle term without heartbeats appends nothing");
+    handle.shutdown();
+    task.await.unwrap().unwrap();
+}
