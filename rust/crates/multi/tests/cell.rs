@@ -582,6 +582,9 @@ async fn a_snapshot_session_reads_the_checkpoint_from_object_storage_on_another_
     assert_eq!(values(&snapshot, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"], "a snapshot reads the deployment as of its checkpoint, with no logkeeper up");
     assert!(cell.node(1 - holder).agent.subscribed().contains(&"shop".to_owned()), "on a node that does not hold it");
     assert!(snapshot.simple_query("INSERT INTO orders (_id, total) VALUES (7, 1)").await.is_err(), "and it never writes");
+    let reader = cell.node(1 - holder);
+    assert!(matches!(reader.agent.subscribe("shop").await, Err(_) | Ok(rtdb_multi::control::Response::Subscribed { .. })));
+    assert!(!reader.agent.subscribed_snapshots().contains(&"shop".to_owned()), "asked for a replica, a node replaces its snapshot rather than serve it as one");
     drop((snapshot, client));
     cell.gateway_cancellation.cancel();
     for node in cell.nodes.iter_mut().filter_map(Option::take) { node.kill().await.unwrap(); }

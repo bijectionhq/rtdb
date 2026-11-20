@@ -249,7 +249,6 @@ pub fn reap_local(root: &Path, record: &DeploymentRecord, grace: Duration, refer
     for store in crate::reference::stores(&root.join(record.storage_prefix())) {
         let mut base = Base::load(&store)?;
         let before = base.clone();
-        // Where each object physically is: in this store, or in the one its manifest names.
         let physical = |key: &str| -> Option<PathBuf> {
             let own = store.join(key);
             if own.exists() { return Some(own); }
@@ -265,7 +264,6 @@ pub fn reap_local(root: &Path, record: &DeploymentRecord, grace: Duration, refer
             if released.released_at_ms > threshold { reaped.waiting += 1; continue; }
             due.insert(released.key, name);
         }
-        // Erases an object this store holds, or forgets one it references.
         let release = |key: &str, base: &mut Base| -> Result<()> {
             let own = store.join(key);
             if own.exists() { references.erase(&own, key) } else { base.objects.remove(key); Ok(()) }

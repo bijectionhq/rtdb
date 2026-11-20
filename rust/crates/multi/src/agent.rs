@@ -47,10 +47,13 @@ pub struct AgentOptions {
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
         Self { storage, activation_timeout: Duration::from_secs(30), watch_interval: Duration::from_millis(250), park_after: None,
-            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: Duration::from_secs(30 * 60),
+            unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
     }
 }
+
+/// How long a snapshot stays open by default, which a reaper's grace must exceed (`max_snapshot_lifetime`).
+pub const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
 const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
 
@@ -84,6 +87,8 @@ impl NodeAgent {
 
     pub fn member(&self) -> MemberId { self.lease.id() }
     pub fn held(&self) -> BTreeMap<String, u64> { self.holdings.lock().iter().map(|(name, holding)| (name.clone(), holding.epoch)).collect() }
+    /// The deployments this node has open as snapshots.
+    pub fn subscribed_snapshots(&self) -> Vec<String> { self.subscriptions.lock().iter().filter(|(_, subscription)| matches!(subscription.role, Role::Snapshot(_))).map(|(name, _)| name.clone()).collect() }
     pub fn subscribed(&self) -> Vec<String> { self.subscriptions.lock().keys().cloned().collect() }
     /// The fragments this node has read for other nodes, as (deployment, `schema.table`, prefix) with how often.
     pub fn fragments_read(&self) -> BTreeMap<(String, String, String), u64> { self.fragments_read.lock().clone() }
@@ -272,7 +277,8 @@ impl NodeAgent {
         let record = self.record(name).await?;
         if record.lifecycle != Lifecycle::Live { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/not-live", format!("{name} is not live"))); }
         if let Some(subscription) = self.subscriptions.lock().get_mut(name) {
-            if subscription.id == record.id && self.node.catalog().database(name).is_ok() {
+            // A snapshot never advances, so it is replaced by a replica rather than served as one.
+            if subscription.id == record.id && !matches!(subscription.role, Role::Snapshot(_)) && self.node.catalog().database(name).is_ok() {
                 subscription.last_touch = Instant::now();
                 subscription.fragments |= fragments;
                 return Ok(Response::Subscribed { address: self.address.clone() });
@@ -288,12 +294,12 @@ impl NodeAgent {
         Ok(Response::Subscribed { address: self.address.clone() })
     }
 
-    /// Reads a fragment of another node's scan of `name`, from the holding or replica this node has of it, opening a replica if it has neither.
     fn check_node_grant(&self, grant: &str, name: &str) -> Result<()> {
         let secret = self.secret.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/no-cell-secret", "This node has no cell secret, so it serves no other node's request for data"))?;
         secret.verify_node_grant(grant, name)
     }
 
+    /// Reads a fragment of another node's scan of `name`, from the holding or replica this node has of it, opening a replica if it has neither.
     pub async fn scan_fragment(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<Response> {
         use base64::Engine;
         if fragment.database() != name { return Err(Anomaly::incorrect("rtdb.multi/fragment-database", format!("A fragment of {} was sent as one of {name}", fragment.database()))); }

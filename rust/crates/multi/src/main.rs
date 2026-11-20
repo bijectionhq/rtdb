@@ -151,6 +151,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "reaper" => {
             let directory = directory(arguments.required("directory")?).await?;
             let grace = Duration::from_secs(arguments.number("grace", 3600u64)?);
+            // An open snapshot reads objects its deployment may have released since; the reaper's grace has to outlast it.
+            if grace <= rtdb_multi::agent::SNAPSHOT_LIFETIME { return Err(usage("--grace must exceed a snapshot's lifetime of 30 minutes".into())); }
             rtdb_multi::store::run_reaper(directory, PathBuf::from(arguments.required("storage-root")?), grace, Duration::from_secs(10), cancellation).await;
             Ok(())
         }

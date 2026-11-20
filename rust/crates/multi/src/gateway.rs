@@ -184,7 +184,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snap
 fn snapshot_readers<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
     let now = now_ms();
     let holder = effective_holder(record, members, now).cloned();
-    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now)).collect();
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.pool == rtdb_directory::MemberPool::General && member.may_receive_placements(now)).collect();
     let (mut others, holders): (Vec<&MemberRecord>, Vec<&MemberRecord>) = rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied()
         .partition(|member| holder.as_ref() != Some(&member.id));
     others.extend(holders);

@@ -3,7 +3,7 @@
 //! The gateway reads pgwire frames in both directions.
 //! It learns the session's transaction status from every ReadyForQuery, and remembers the startup message and every named prepared statement.
 //! Whenever the session is idle and its backend is gone or no longer the deployment's holder, it reconnects to the current holder, replays the startup and the prepared statements, swallows their replies, and carries on.
-//! A backend lost in the middle of a command is never replayed: the command may have committed, so the client is told and the session ends.
+//! A backend lost in the middle of a command is replayed only if the command was keyed and none of its replies reached the client; otherwise it may have committed, so the client is told and the session ends.
 //! A reconnection carries no password: once the first holder has authenticated the client, each reconnection's startup carries a capability the gateway mints instead, which needs the gateway to hold the cell's secret, or backends that trust the gateway.
 
 use std::collections::BTreeMap;
@@ -216,6 +216,8 @@ impl Session {
                     }
                     Event::Reply(Some(Ok(frame))) => {
                         if self.swallowing > 0 {
+                            // A key the backend did not take leaves the command unkeyed, and an unkeyed command is never resent.
+                            if frame.tag == b'E' { self.key = None; }
                             if frame.tag == b'Z' { self.swallowing -= 1; }
                             continue;
                         }
@@ -428,5 +430,34 @@ mod tests {
         assert_eq!(greet(vec![status("user", "alice"), status(rtdb_pgwire::DELEGABLE_PARAMETER, "on"), frame(b'Z', b"I")]), None, "nor one never authenticated");
         assert_eq!(greet(vec![ok, status("user", "alice"), status(rtdb_pgwire::DELEGABLE_PARAMETER, "on"), frame(b'Z', b"I"), status("user", "mallory")]).as_deref(), Some("alice"),
             "a user the client sets after the greeting is not the one vouched for");
+    }
+
+    #[tokio::test]
+    async fn a_command_whose_key_the_backend_refused_is_not_resent() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway_side) = pair(&listener).await;
+        let (first, mut dying) = pair(&listener).await;
+        let (second, _unused) = pair(&listener).await;
+        let mut startup = 196608i32.to_be_bytes().to_vec();
+        startup.extend_from_slice(b"user\0xtdb\0database\0shop\0\0");
+        let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&startup);
+        let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
+        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        greet(&mut dying).await;
+        receive(&mut client).await;
+        receive(&mut client).await;
+        send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+        query(&mut dying).await;
+        send(&mut dying, b'E', b"SERROR\0C53200\0Mout of memory\0\0").await;
+        send(&mut dying, b'Z', b"I").await;
+        query(&mut dying).await;
+        drop(dying);
+        let (tag, body) = receive(&mut client).await;
+        assert_eq!(tag, b'E', "the client is told the outcome is unknown, rather than the command being run again unkeyed");
+        assert!(String::from_utf8_lossy(&body).contains("outcome is unknown"), "{}", String::from_utf8_lossy(&body));
+        let _ = running.await;
     }
 }
