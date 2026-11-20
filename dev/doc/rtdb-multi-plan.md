@@ -53,6 +53,12 @@ Update this section as work lands.
 - A planned move whose target died afterwards left a move intent no node could ever satisfy.
 - A recovery that died part-way through copying its history onto a server left that server unsynced, so the next recovery could prefer a staler server and lose committed entries (`StreamState::overwrite`, found by the simulation).
 - An overwrite delivered after the writer's newer requests could truncate entries those had committed (`StreamState::overwrite`, found by the simulation).
+- A live table written a row per transaction with long string ids failed at its 256th row with `rtdb/undersized-reservation` and stopped its database (`LiveTable::merge_small_chunks`); it affected classic mode too.
+- Found reviewing the branch: a reconnection's capability named the user the client claimed rather than the principal its holder authenticated, and the control port served a deployment's rows, and published compactions, for anyone who could reach it.
+
+**Still open.**
+
+- The control requests that reveal no data (activate, park, flush, touch, subscribe, snapshot) are unauthenticated, so anything on a cell's network can disturb placement; signing them needs the cell's secret threaded through every administrative entry point.
 
 ## 1. Ground rules
 
