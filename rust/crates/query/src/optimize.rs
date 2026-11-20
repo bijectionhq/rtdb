@@ -235,7 +235,8 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Ids) 
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Apply { input, dependent, arguments: arguments.clone(), kind: *kind, output: output.clone() })?))
         }
         RelationNode::Aggregate { input, groups, aggregates } => {
-            let input = prepare_with(Arc::clone(input), ids)?;
+            let columns = relation.expressions().into_iter().flat_map(Expr::referenced_columns).collect();
+            let input = annotate_top_k(prune(Arc::clone(input), &columns, ids)?)?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Aggregate { input, groups: groups.clone(), aggregates: aggregates.clone() })?))
         }
         RelationNode::Window { input, partition_by, order_by, expressions } => {
@@ -433,6 +434,21 @@ mod tests {
             assert_eq!(scan.predicates, [Expr::unary(UnaryOp::Not, Expr::Column { id: evaluated.id, data_type: LogicalType::Scalar(ScalarType::Bool).maybe() })]);
             assert_eq!(scan.columns.iter().any(|field| field.id == body.id), reads_body, "{projected:?}");
         }
+    }
+
+    #[test]
+    fn counting_matching_rows_reads_no_column_but_the_scans_own_match() {
+        let body = Field { name: "body".into(), data_type: LogicalType::Scalar(ScalarType::Utf8).maybe(), ..field(1) };
+        let matching = Expr::Call { name: "match".into(), args: vec![body.expression(), Expr::Literal(Value::Utf8("overdue".into()))], return_type: LogicalType::Scalar(ScalarType::Bool).maybe() };
+        let filtered = Arc::new(base_scan(vec![field(0), body.clone()]).filter(matching).unwrap());
+        let count = rtdb_plan::AggregateExpr { field: field(5), function: rtdb_plan::AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![] };
+        let aggregate = Arc::new(Relation::new(Schema::new(vec![field(5)]).unwrap(), RelationNode::Aggregate { input: filtered, groups: vec![], aggregates: vec![count] }).unwrap());
+        let prepared = prepare(aggregate).unwrap();
+        let RelationNode::Aggregate { input, .. } = prepared.node() else { panic!("Expected the aggregate") };
+        let RelationNode::Project { input, expressions } = input.node() else { panic!("Expected the scan's projection, not {:?}", input.node()) };
+        let RelationNode::Scan(scan) = input.node() else { panic!("Expected the scan") };
+        assert!(expressions.is_empty());
+        assert_eq!(scan.columns.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["match(body)"]);
     }
 
     #[test]
