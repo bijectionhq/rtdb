@@ -247,7 +247,7 @@ impl ScanCursor {
             match split {
                 Some((depth, basis)) => for prefix in depth.prefixes() {
                     let fallback = partition(Some(prefix.range()));
-                    parts.push_back(Part::Fragment(Fragment { request: Arc::new(ScanFragment::of(&scan, prefix, basis, bounds)), fallback, state: FragmentState::Pending }));
+                    parts.push_back(Part::Fragment(Fragment { request: Arc::new(ScanFragment::of(&scan, prefix, basis, bounds, &execution.context.timezone)), fallback, state: FragmentState::Pending }));
                 },
                 None => parts.push_back(Part::Local(partition(None))),
             }

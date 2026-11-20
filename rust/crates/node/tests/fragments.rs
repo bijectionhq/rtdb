@@ -213,3 +213,21 @@ async fn a_fragment_reads_as_of_its_basis_on_a_node_at_or_past_it() {
     }
     stop(&node, driver).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fragment_carries_the_predicates_its_reader_evaluates_alike_and_no_others() {
+    let (node, driver, fragmenter) = start().await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    populate(&node, &mut session).await;
+    fragmenter.enabled.store(true, Ordering::Relaxed);
+    let _ = rows(session.query_sql("SELECT _id FROM orders WHERE _id > 500", vec![]).await.unwrap()).await;
+    let filtered = fragmenter.last.lock().clone().unwrap();
+    assert!(!filtered.scan.predicates.is_empty(), "a literal filter travels with the fragment");
+    let mut unfiltered = filtered.clone();
+    unfiltered.scan.predicates.clear();
+    let read = |fragment: rtdb_query::ScanFragment| { let node = node.clone(); async move { node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap().len() } };
+    assert!(read(filtered).await < read(unfiltered).await, "and the reader returns only the rows that pass it");
+    let _ = rows(session.query_sql("SELECT _id FROM orders WHERE _id > ?", vec![Value::I64(500)]).await.unwrap()).await;
+    assert!(fragmenter.last.lock().as_ref().unwrap().scan.predicates.is_empty(), "a filter on a parameter stays with the coordinator");
+    stop(&node, driver).await;
+}

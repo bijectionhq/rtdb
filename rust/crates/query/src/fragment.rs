@@ -73,13 +73,27 @@ impl FragmentDepth {
 }
 
 /// One slice of a scan, as a node other than the coordinator evaluates it: the table's rows under `prefix`, resolved within
-/// `bounds` over the snapshot whose latest transaction is `basis`, projected to the scan's columns and filtered by nothing.
+/// `bounds` over the snapshot whose latest transaction is `basis`, projected to the scan's columns and filtered by those of its predicates any node evaluates alike.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScanFragment {
     pub scan: Scan,
     pub prefix: TriePrefix,
     pub basis: TransactionKey,
     pub bounds: TemporalBounds,
+    /// The coordinator's time zone, under which the predicates' casts read.
+    pub timezone: String,
+}
+
+/// Whether `predicate` evaluates alike on any node: it names no parameter or outer row, and calls nothing that reads the clock, the session or chance.
+fn portable(predicate: &rtdb_plan::Expr) -> bool {
+    const CONTEXTUAL: [&str; 9] = ["random", "now", "current_", "local", "snapshot_", "clock_", "statement_", "transaction_", "gen_random"];
+    let mut portable = true;
+    predicate.visit(&mut |expr| match expr {
+        rtdb_plan::Expr::Parameter { .. } | rtdb_plan::Expr::Correlated { .. } => portable = false,
+        rtdb_plan::Expr::Call { name, .. } if CONTEXTUAL.iter().any(|prefix| name.to_ascii_lowercase().starts_with(prefix)) => portable = false,
+        _ => {}
+    });
+    portable
 }
 
 impl ScanFragment {
@@ -88,14 +102,16 @@ impl ScanFragment {
 
     /// The fragment of `scan` under `prefix`: its predicates and temporal filters stay with the coordinator, which filters
     /// the rows that come back, so the fragment carries only the projection and the bounds already evaluated.
-    pub(crate) fn of(scan: &Scan, prefix: TriePrefix, basis: TransactionKey, mut bounds: TemporalBounds) -> Self {
-        let scan = Scan { predicates: Vec::new(), iids: None, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default, ..scan.clone() };
+    pub(crate) fn of(scan: &Scan, prefix: TriePrefix, basis: TransactionKey, mut bounds: TemporalBounds, timezone: &str) -> Self {
+        // The reader filters by the predicates it would evaluate as the coordinator does; the coordinator filters its rows by all of them again.
+        let predicates = scan.predicates.iter().filter(|predicate| portable(predicate)).cloned().collect();
+        let scan = Scan { predicates, iids: None, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default, ..scan.clone() };
         // A reader ahead of the basis holds later transactions too; bounds ending at the basis keep them out of what it reads.
         let upper = Timestamp(basis.system_time.0.saturating_add(1));
         if bounds.system_time.upper() > upper {
             bounds.system_time = Interval::new(bounds.system_time.lower().min(basis.system_time), upper).expect("a nonempty interval up to the basis");
         }
-        Self { scan, prefix, basis, bounds }
+        Self { scan, prefix, basis, bounds, timezone: timezone.to_owned() }
     }
 }
 
@@ -119,10 +135,21 @@ pub async fn evaluate_fragment(context: Arc<QueryContext>, fragment: &ScanFragme
     }
     let memory = Arc::clone(&context.memory);
     let execution = Execution { parameters: Arc::new(crate::parameters::BoundParameters::new(Vec::new(), Vec::new(), &memory)?), outer: OuterRows::empty(&memory)?, context, bindings: None, analysis: None };
-    let mut scan = crate::scan::PartitionScan::fragment(snapshot.clone(), Arc::clone(&database.storage), fragment, execution);
+    let scan = crate::scan::PartitionScan::fragment(snapshot.clone(), Arc::clone(&database.storage), fragment, execution.clone());
+    let mut batches: crate::columnar::BoxBatchCursor = Box::new(FragmentRows(scan));
+    if let Some(predicate) = fragment.scan.predicates.iter().cloned().reduce(|left, right| rtdb_plan::Expr::binary(rtdb_plan::BinaryOp::And, left, right)) {
+        batches = Box::new(crate::columnar::BatchFilter::new(batches, rtdb_plan::Schema::new(fragment.scan.columns.clone())?, predicate, execution));
+    }
     let mut encoded = Vec::new();
-    while let Some(batch) = scan.next_batch().await? { encode_batch(&batch, &mut encoded)?; }
+    while let Some(batch) = batches.next_batch().await? { encode_batch(&batch, &mut encoded)?; }
     Ok(encoded)
+}
+
+struct FragmentRows(crate::scan::PartitionScan);
+
+#[async_trait::async_trait]
+impl crate::columnar::BatchCursor for FragmentRows {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> { self.0.next_batch().await }
 }
 
 const COLUMN_KEY: &str = "rtdb.fragment.column";

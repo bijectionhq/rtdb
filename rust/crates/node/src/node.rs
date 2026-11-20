@@ -286,7 +286,7 @@ impl Node {
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
         let catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
-        let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), self.factory.options.default_timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
+        let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), fragment.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
         rtdb_query::evaluate_fragment(context, fragment).await
     }
 
