@@ -17,6 +17,7 @@ mod sort;
 mod window;
 mod scan;
 mod columnar;
+mod vector;
 mod page_metadata;
 mod scan_tasks;
 mod spill;

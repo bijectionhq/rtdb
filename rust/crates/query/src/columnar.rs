@@ -268,7 +268,9 @@ impl BatchCursor for BatchFilter {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         while let Some(batch) = self.input.next_batch().await? {
             self.execution.context.check_cancelled()?;
-            let mask = match kernel::truth(&self.predicate, &self.schema, &batch, self.execution.parameters.values()) {
+            let truth = kernel::truth(&self.predicate, &self.schema, &batch, self.execution.parameters.values())
+                .or_else(|| crate::vector::truth(&self.predicate, &self.schema, &batch, self.execution.parameters.values()));
+            let mask = match truth {
                 Some(truth) => truth.into_iter().map(|value| value == Some(true)).collect::<Vec<_>>(),
                 None => {
                     let metadata = self.execution.scope()?;
@@ -687,6 +689,13 @@ impl BatchCursor for BatchExpressions {
                 lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?)?;
                 if let Some(column) = projection::column(expression, &self.schema, &batch, parameters)? { columns.push(column); continue; }
             }
+            if let Some(column) = crate::vector::column(expression, &self.schema, &batch, parameters) {
+                // A vectorised column's size is known once computed; it is charged before the next is built.
+                let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column);
+                continue;
+            }
             if page.is_none() { page = Some(batch.rows(&self.execution.context.memory)?); }
             let rows = page.as_ref().expect("rows were materialised for the evaluator");
             let metadata = self.execution.scope()?;
@@ -801,7 +810,7 @@ pub(crate) mod projection {
             Expr::Literal(value) => constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_)),
             Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => shaped(left) && shaped(right),
             Expr::Struct(fields) => fields.iter().all(|(_, field)| shaped(field)),
-            _ => false,
+            expr => crate::vector::lowerable(expr),
         }
     }
     /// Bounds what `column` allocates for `expr`, or `None` where it would not compute it.
