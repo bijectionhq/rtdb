@@ -27,12 +27,24 @@ impl BloomFilter {
         Ok(output)
     }
 
+    /// Adds bit positions in bulk; sorted and de-duplicated first, they enter the bitmap as one union.
+    pub fn insert_positions(&mut self, positions: &mut Vec<u32>) {
+        positions.sort_unstable();
+        positions.dedup();
+        if let Ok(other) = RoaringBitmap::from_sorted_iter(positions.drain(..)) { self.bitmap |= other; }
+    }
+
     pub fn insert_hashes(&mut self, hash1: i32, hash2: i32) {
         for hash in hashes(hash1, hash2) { self.bitmap.insert(hash); }
     }
 
     /// Adds the five JVM vector hashes, including the null vector's zero hashes.
     /// Struct values must retain the source vector's field order.
+    /// The bit positions `insert_value` sets for `value`.
+    pub fn value_positions(value: &Value) -> Result<[u32; BLOOM_K as usize]> {
+        Ok(hashes(rtdb_columnar::hash_value(value, 0)?, rtdb_columnar::hash_value_murmur3(value, 0)?))
+    }
+
     pub fn insert_value(&mut self, value: &Value) -> Result<()> {
         self.insert_hashes(rtdb_columnar::hash_value(value, 0)?, rtdb_columnar::hash_value_murmur3(value, 0)?);
         Ok(())
@@ -94,4 +106,24 @@ pub fn from_column(field: &Field, array: &dyn Array) -> Result<BloomFilter> {
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-bloom", error.to_string())
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::*;
+
+    #[test]
+    fn positions_added_in_bulk_set_the_same_bits_as_values_added_one_by_one() {
+        let values: Vec<Value> = (0..5000).map(|index| if index % 7 == 0 { Value::Utf8(format!("k{}", index % 300)) } else { Value::I64(index % 1000) }).collect();
+        let mut single = BloomFilter::default();
+        for value in &values { single.insert_value(value).unwrap(); }
+        let mut bulk = BloomFilter::default();
+        let mut pending = Vec::new();
+        for (index, value) in values.iter().enumerate() {
+            pending.extend(BloomFilter::value_positions(value).unwrap());
+            if index % 777 == 0 { bulk.insert_positions(&mut pending); }
+        }
+        bulk.insert_positions(&mut pending);
+        assert_eq!(bulk, single);
+    }
 }
