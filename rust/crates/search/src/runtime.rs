@@ -77,19 +77,23 @@ impl FileError {
 /// An opened file, and the buffer pool it was read through: a pool is one database's storage for as long as it is open.
 type OpenedFile = (std::sync::Weak<BufferPool>, Arc<SearchFile>);
 
+/// A trie's search file as a scan reads it: the data file it indexes, the identity its kept answers go by, and the file.
+pub struct TrieFile { pub data: rtdb_storage::ObjectKey, pub identity: String, pub file: Arc<SearchFile> }
+
 pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
-    matches: Mutex<Bounded<(String, String, String, rtdb_text::Query), (std::sync::Weak<SearchFile>, Arc<crate::file::MatchValues>)>>,
+    built: Mutex<Bounded<(String, String), OpenedFile>>,
+    match_sets: Mutex<Bounded<(String, String, String, rtdb_text::Query), (std::sync::Weak<SearchFile>, Arc<crate::file::MatchSet>)>>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
     reported: Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 impl SearchRuntime {
-    /// `file_bytes` bounds the opened search files kept across queries; each keeps its buffer-pool lease, so its bytes stay charged to the pool.
+    /// `file_bytes` bounds the recorded search files kept across queries, each keeping its buffer-pool lease so its bytes stay charged to the pool; half as much again bounds the files a node builds itself.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), matches: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -125,15 +129,38 @@ impl SearchRuntime {
         Ok(file)
     }
 
-    /// MATCH of a query on every document of an opened file, kept for as long as the file itself is the one this node has open under its key.
-    pub fn match_values(&self, database: &str, key: &rtdb_storage::ObjectKey, file: &Arc<SearchFile>, column: &str, query: &rtdb_text::Query) -> Result<Arc<crate::file::MatchValues>> {
-        let cache_key = (database.to_string(), key.as_str().to_string(), column.to_string(), query.clone());
-        if let Some((opened, values)) = self.matches.lock().get(&cache_key) {
-            if opened.upgrade().is_some_and(|opened| Arc::ptr_eq(&opened, file)) { return Ok(values); }
+    /// MATCH of a query on every document of a trie's file, kept for as long as the file is the one this node holds under its identity.
+    pub fn match_set(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query) -> Result<Arc<crate::file::MatchSet>> {
+        let cache_key = (database.to_string(), trie.identity.clone(), column.to_string(), query.clone());
+        if let Some((opened, set)) = self.match_sets.lock().get(&cache_key) {
+            if opened.upgrade().is_some_and(|opened| Arc::ptr_eq(&opened, &trie.file)) { return Ok(set); }
         }
-        let values = Arc::new(file.match_values(column, query)?);
-        self.matches.lock().insert(cache_key, (Arc::downgrade(file), Arc::clone(&values)), values.bytes());
-        Ok(values)
+        let set = Arc::new(trie.file.match_set(column, query)?);
+        self.match_sets.lock().insert(cache_key, (Arc::downgrade(&trie.file), Arc::clone(&set)), set.bytes());
+        Ok(set)
+    }
+
+    /// A search file built on this node from the data file of a trie the lane has not indexed; a data file is immutable, so a kept one is never stale.
+    /// The build is charged to `memory` while it runs; the files kept are bounded apart from the recorded ones, so building never evicts those.
+    pub async fn built(&self, database: &str, storage: &Arc<BufferPool>, data: &rtdb_storage::ObjectKey, columns: &[String], memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<TrieFile> {
+        let identity = format!("{data}#{columns:?}");
+        let cache_key = (database.to_string(), identity.clone());
+        if let Some((pool, file)) = self.built.lock().get(&cache_key) {
+            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { data: data.clone(), identity, file }); }
+        }
+        let lease = storage.get(data).await?;
+        let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
+        let (indexed, token) = (columns.to_vec(), cancellation.clone());
+        let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let _indexing = indexing;
+            let mut bytes = Vec::new();
+            crate::file::write_search_file(&indexed, crate::search_pages(lease.as_slice(), &indexed, &token)?, "built", tantivy::directory::RamDirectory::create(), &mut bytes)?;
+            Ok(bytes)
+        }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
+        let size = bytes.len();
+        let file = Arc::new(SearchFile::open(bytes, columns)?);
+        self.built.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), size);
+        Ok(TrieFile { data: data.clone(), identity, file })
     }
 
     pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) { self.files.lock().remove(&(database.to_string(), key.as_str().to_string())); }

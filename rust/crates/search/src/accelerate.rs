@@ -1,27 +1,28 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rtdb_format::data::StoredOperation;
-use rtdb_index::TrieState;
+use rtdb_index::{Snapshot, TrieState};
 use rtdb_plan::{BinaryOp, Expr};
-use rtdb_query::{ScanAccelerator, ScanRequest};
+use rtdb_query::{MatchAnswers, ScanAccelerator, ScanRequest};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
 use rtdb_types::{Iid, Result, TemporalBounds, Timestamp, Value};
 
-use crate::{KIND, SearchDefinition, SearchFile, search_rows};
+use crate::{KIND, SearchDefinition, SearchFile, runtime::{Suspect, TrieFile}};
 
-/// Narrows a scan with a `MATCH` predicate to the IIDs whose events hold the query's terms (fts.allium: the query plan).
+/// Narrows a scan with a `MATCH` predicate to the IIDs whose events hold the query's terms, ranks it, and answers its MATCH, from search files (fts.allium: the query plan).
 pub struct SearchAccelerator {
     /// Above this many candidates the scan runs unnarrowed: reading every page costs less than resolving that many point lookups.
     pub max_candidates: usize,
-    /// Above this many bytes of tries the lane should have indexed but has not, the scan runs unnarrowed rather than reading them twice.
+    /// Above this many bytes of tries the lane should have indexed but has not, the scan uses no search file rather than build them all itself.
     pub max_unindexed_bytes: i64,
-    runtime: std::sync::Arc<crate::SearchRuntime>,
+    runtime: Arc<crate::SearchRuntime>,
 }
 
 impl SearchAccelerator {
-    pub fn with_runtime(runtime: std::sync::Arc<crate::SearchRuntime>) -> Self { Self { max_candidates: 100_000, max_unindexed_bytes: 64 * 1024 * 1024, runtime } }
+    pub fn with_runtime(runtime: Arc<crate::SearchRuntime>) -> Self { Self { max_candidates: 100_000, max_unindexed_bytes: 64 * 1024 * 1024, runtime } }
 }
 
 impl Default for SearchAccelerator {
@@ -54,92 +55,122 @@ impl ScanAccelerator for SearchAccelerator {
         let scan = request.scan;
         let mut conjuncts = Vec::new();
         for predicate in &scan.predicates { match_conjuncts(scan, predicate, &mut conjuncts); }
-        if conjuncts.is_empty() { return Ok(None); }
-        let table = &scan.table.name.table;
-        let definitions = self.runtime.definitions(request.database, request.partitions, request.storage, request.memory, request.current_time, request.cancellation).await?;
-        let mut chosen: Option<(String, Query, &SearchDefinition)> = None;
+        let mut chosen = None;
         for (column, query) in conjuncts {
-            let column = column.to_string();
             let Some(Value::Utf8(text)) = request.constants.constant(query).await? else { continue };
-            let Some(definition) = definitions.iter().find(|definition| &definition.table == table && definition.columns.contains(&column)) else { continue };
-            chosen = Some((column, Query::parse(&text), definition));
-            break;
+            if let Some(definition) = self.definition(request, column).await? { chosen = Some((column, Query::parse(&text), definition)); break; }
         }
         let Some((column, query, definition)) = chosen else { return Ok(None) };
         if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
+        self.register_corpora(request, column, &definition).await?;
         if let Some(top_k) = &scan.top_k {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
-            if ranked { if let Some(candidates) = self.top_k(request, top_k, &column, &query, definition).await? { return Ok(Some(candidates)); } }
+            if ranked { if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition).await? { return Ok(Some(candidates)); } }
         }
-        let bounds = request.bounds;
-        let Some(entry) = request.snapshot.table_entry(table) else { return Ok(Some(self.live_candidates(request, &column, &query)?)) };
-        let artefact_id = definition.artefact_id();
-        let tries: Vec<_> = request.snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).collect();
+        let TrieFiles::Complete(files) = self.trie_files(request, &definition).await? else { return Ok(None) };
         let mut candidates = BTreeSet::new();
-        let mut unindexed = Vec::new();
-        let mut unindexed_bytes = 0i64;
-        for trie in tries {
-            let indexed = match trie.artefact(KIND, &artefact_id, definition.version) {
-                Some(_) => {
-                    let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
-                    match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
-                            Ok(file) => {
-                                if trie.key.recency().is_none() { request.corpora.register(format!("{key}#{column}"), std::sync::Arc::new(FileCorpus { file: std::sync::Arc::clone(&file), column: column.clone() })); }
-                                for doc in file.matches(&column, &query)? {
-                                    if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, bounds) { candidates.insert(Iid(doc.iid)); }
-                                }
-                                true
-                            }
-                            Err(error) => {
-                                if error.needs_repair() { self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version }); }
-                                false
-                            }
-                    }
-                }
-                None => false,
-            };
-            if !indexed {
-                // The lane never indexes level 0 or the partial level-1 current trie, so only a trie it should have indexed counts against the budget.
-                let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < request.snapshot.trie_catalog().file_size_target());
-                if !by_policy {
-                    unindexed_bytes = unindexed_bytes.saturating_add(trie.data_file_size);
-                    if unindexed_bytes > self.max_unindexed_bytes { return Ok(None); }
-                }
-                unindexed.push(trie.key.clone());
+        for trie in &files {
+            for doc in trie.file.matches(column, &query)? {
+                if may_be_visible(doc.valid_from, doc.valid_to, doc.system_from, doc.recency, request.bounds) { candidates.insert(Iid(doc.iid)); }
             }
             if candidates.len() > self.max_candidates { return Ok(None); }
         }
-        for key in unindexed {
-            let lease = request.storage.get(&ObjectKey::new(entry.slug.data_key(&key))?).await?;
-            for row in search_rows(lease.as_slice(), std::slice::from_ref(&column))? {
-                if row.values[0].as_deref().is_some_and(|tokens| query.matches(tokens)) && may_be_visible(row.valid_from, row.valid_to, row.system_from, row.recency.unwrap_or(i64::MAX), bounds) {
-                    candidates.insert(Iid(row.iid));
-                }
-            }
-            if candidates.len() > self.max_candidates { return Ok(None); }
-        }
-        candidates.extend(self.live_candidates(request, &column, &query)?);
+        candidates.extend(self.live_candidates(request, column, &query)?);
         Ok((candidates.len() <= self.max_candidates).then_some(candidates))
     }
 
-    async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<Option<rtdb_query::MatchAnswers>> {
-        let table = &request.scan.table.name.table;
+    async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
+        let Some(definition) = self.definition(request, column).await? else { return Ok(None) };
+        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(files) | TrieFiles::Recorded(files) => files };
+        let query = Query::parse(query);
+        let mut answers = MatchAnswers::default();
+        for trie in files { answers.insert(&trie.data, self.runtime.match_set(request.database, &trie, column, &query)?); }
+        Ok((!answers.is_empty()).then_some(answers))
+    }
+}
+
+/// A partition's search files: one for every live trie, or only the recorded ones where building the rest would exceed max_unindexed_bytes.
+enum TrieFiles { Complete(Vec<TrieFile>), Recorded(Vec<TrieFile>) }
+
+impl SearchAccelerator {
+    async fn definition(&self, request: &ScanRequest<'_>, column: &str) -> Result<Option<SearchDefinition>> {
         let definitions = self.runtime.definitions(request.database, request.partitions, request.storage, request.memory, request.current_time, request.cancellation).await?;
-        let Some(definition) = definitions.iter().find(|definition| &definition.table == table && definition.columns.iter().any(|indexed| indexed == column)) else { return Ok(None) };
-        let Some(entry) = request.snapshot.table_entry(table) else { return Ok(None) };
+        let table = &request.scan.table.name.table;
+        Ok(definitions.iter().find(|definition| &definition.table == table && definition.columns.iter().any(|indexed| indexed == column)).cloned())
+    }
+
+    /// The key of a trie's recorded search file, if it has one.
+    fn recorded_key(snapshot: &Snapshot, table: &rtdb_types::TableRef, trie: &rtdb_index::CatalogTrie, definition: &SearchDefinition) -> Result<Option<ObjectKey>> {
         let artefact_id = definition.artefact_id();
-        let mut answers = rtdb_query::MatchAnswers::default();
-        for trie in request.snapshot.trie_catalog().current_tries(table) {
-            if trie.state != TrieState::Live || trie.artefact(KIND, &artefact_id, definition.version).is_none() { continue; }
-            let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
-            match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
-                Ok(file) => answers.insert(&ObjectKey::new(entry.slug.data_key(&trie.key))?, self.runtime.match_values(request.database, &key, &file, column, query)?),
-                Err(error) => if error.needs_repair() {
-                    self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version });
-                },
+        let (Some(entry), Some(_)) = (snapshot.table_entry(table), trie.artefact(KIND, &artefact_id, definition.version)) else { return Ok(None) };
+        Ok(Some(ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?))
+    }
+
+    /// A trie's recorded search file, or `None` where it cannot be read; one that is missing or corrupt is reported to the lane.
+    async fn recorded(&self, request: &ScanRequest<'_>, key: ObjectKey, trie: &rtdb_index::CatalogTrie, definition: &SearchDefinition) -> Result<Option<(ObjectKey, Arc<SearchFile>)>> {
+        let (table, artefact_id) = (&request.scan.table.name.table, definition.artefact_id());
+        match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
+            Ok(file) => Ok(Some((key, file))),
+            Err(error) => {
+                if error.needs_repair() { self.runtime.report(Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id, version: definition.version }); }
+                Ok(None)
             }
         }
-        Ok((!answers.is_empty()).then_some(answers))
+    }
+
+    /// The search files of the partition's live tries: every trie's, its recorded one or one this node builds from its data file, unless the tries the lane should have indexed but has not exceed max_unindexed_bytes.
+    /// The lane never indexes level 0 or the partial level-1 current trie, so those do not count.
+    async fn trie_files(&self, request: &ScanRequest<'_>, definition: &SearchDefinition) -> Result<TrieFiles> {
+        let (snapshot, table) = (request.snapshot, &request.scan.table.name.table);
+        let Some(entry) = snapshot.table_entry(table) else { return Ok(TrieFiles::Complete(Vec::new())) };
+        let mut files = Vec::new();
+        let mut unbuilt = Vec::new();
+        let mut unindexed = 0i64;
+        for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live) {
+            let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
+            let recorded = match Self::recorded_key(snapshot, table, trie, definition)? { Some(key) => self.recorded(request, key, trie, definition).await?, None => None };
+            if let Some((key, file)) = recorded { files.push(TrieFile { data, identity: key.as_str().to_string(), file }); continue; }
+            let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < snapshot.trie_catalog().file_size_target());
+            if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
+            unbuilt.push(data);
+        }
+        if unindexed > self.max_unindexed_bytes { return Ok(TrieFiles::Recorded(files)); }
+        for data in unbuilt { files.push(self.runtime.built(request.database, request.storage, &data, &definition.columns, request.memory, request.cancellation).await?); }
+        Ok(TrieFiles::Complete(files))
+    }
+
+    /// Registers the table's current-side recorded search files in every partition, so the corpus a score fixes is the same whichever partition, or scan, fixes it first.
+    async fn register_corpora(&self, request: &ScanRequest<'_>, column: &str, definition: &SearchDefinition) -> Result<()> {
+        let table = &request.scan.table.name.table;
+        for snapshot in request.partitions {
+            for trie in snapshot.trie_catalog().current_tries(table) {
+                if trie.state != TrieState::Live || trie.key.recency().is_some() { continue; }
+                let Some(key) = Self::recorded_key(snapshot, table, trie, definition)? else { continue };
+                let name = format!("{key}#{column}");
+                if request.corpora.holds(&name) { continue; }
+                let Some((_, file)) = self.recorded(request, key, trie, definition).await? else { continue };
+                request.corpora.register(name, Arc::new(FileCorpus { file, column: column.to_string() }));
+            }
+        }
+        Ok(())
+    }
+    fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
+        let mut candidates = BTreeSet::new();
+        for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
+            for row in self.runtime.live_rows(request.database, segment, column, query)? {
+                let source = segment.row(row)?;
+                let header = source.header()?;
+                if !may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
+                if !query.phrases().is_empty() {
+                    let event = source.event()?;
+                    let StoredOperation::Put(document) = &event.operation else { continue };
+                    let Some(Value::Utf8(text)) = document.get(column) else { continue };
+                    if !query.matches(&rtdb_text::tokens(text)) { continue; }
+                }
+                candidates.insert(header.iid);
+            }
+        }
+        Ok(candidates)
     }
 }
 
@@ -200,51 +231,12 @@ impl SearchAccelerator {
         };
         let Ok(limit) = usize::try_from(limit) else { return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
-        let table = &request.scan.table.name.table;
-        let Some(entry) = request.snapshot.table_entry(table) else { return Ok(None) };
+        let TrieFiles::Complete(files) = self.trie_files(request, definition).await? else { return Ok(None) };
         let scoring = Query::parse(&text);
-        let artefact_id = definition.artefact_id();
-        let mut files = Vec::new();
-        let mut unindexed = Vec::new();
-        let mut unindexed_bytes = 0i64;
-        for trie in request.snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live) {
-            let file = match trie.artefact(KIND, &artefact_id, definition.version) {
-                Some(_) => {
-                    let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
-                    match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
-                        Ok(file) => Some(file),
-                        Err(error) => {
-                            if error.needs_repair() { self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version }); }
-                            None
-                        }
-                    }
-                }
-                None => None,
-            };
-            match file {
-                Some(file) => files.push(file),
-                None => {
-                    let by_policy = trie.key.level() == 0 || (trie.key.level() == 1 && trie.key.recency().is_none() && trie.data_file_size < request.snapshot.trie_catalog().file_size_target());
-                    if !by_policy { unindexed_bytes = unindexed_bytes.saturating_add(trie.data_file_size); }
-                    if unindexed_bytes > self.max_unindexed_bytes { return Ok(None); }
-                    unindexed.push(trie.key.clone());
-                }
-            }
-        }
-        self.register_corpora(request, column, definition).await?;
         let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
-        let ranked = files.iter().map(|file| file.ranked(column, matching, &scoring, corpus.as_ref())).collect::<Result<Vec<_>>>()?;
+        let ranked = files.iter().map(|trie| trie.file.ranked(column, matching, &scoring, corpus.as_ref())).collect::<Result<Vec<_>>>()?;
         let mut candidates = Candidates { files: ranked, pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0, bounds: request.bounds };
-        for key in unindexed {
-            let lease = request.storage.get(&ObjectKey::new(entry.slug.data_key(&key))?).await?;
-            for row in search_rows(lease.as_slice(), std::slice::from_ref(&column.to_string()))? {
-                let Some(tokens) = row.values[0].as_deref() else { continue };
-                if matching.matches(tokens) && may_be_visible(row.valid_from, row.valid_to, row.system_from, row.recency.unwrap_or(i64::MAX), request.bounds) {
-                    candidates.push(Iid(row.iid), rtdb_text::bm25(&scoring, tokens, corpus.as_ref()));
-                }
-            }
-        }
-        for segment in request.snapshot.iter_segments(table) {
+        for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
             for row in self.runtime.live_rows(request.database, segment, column, matching)? {
                 let event = segment.row(row)?.event()?;
                 if !may_be_visible(event.valid_time.lower().0, event.valid_time.upper().0, event.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
@@ -283,53 +275,10 @@ impl SearchAccelerator {
 }
 
 /// A current-side search file a scan opened, counting its column's corpus for whatever terms a score asks about.
-struct FileCorpus { file: std::sync::Arc<SearchFile>, column: String }
+struct FileCorpus { file: Arc<SearchFile>, column: String }
 
 impl rtdb_query::CorpusSource for FileCorpus {
     fn corpus(&self, query: &Query) -> Result<rtdb_text::Corpus> { self.file.corpus(&self.column, query) }
-}
-
-impl SearchAccelerator {
-    /// Registers the table's current-side search files in every partition, so the corpus a score fixes is the same whichever partition is ranked first.
-    async fn register_corpora(&self, request: &ScanRequest<'_>, column: &str, definition: &SearchDefinition) -> Result<()> {
-        let table = &request.scan.table.name.table;
-        let artefact_id = definition.artefact_id();
-        for snapshot in request.partitions {
-            let Some(entry) = snapshot.table_entry(table) else { continue };
-            for trie in snapshot.trie_catalog().current_tries(table) {
-                if trie.state != TrieState::Live || trie.key.recency().is_some() || trie.artefact(KIND, &artefact_id, definition.version).is_none() { continue; }
-                let key = ObjectKey::new(entry.slug.artefact_key(&trie.key, KIND, &artefact_id, definition.version)?)?;
-                let name = format!("{key}#{column}");
-                if request.corpora.holds(&name) { continue; }
-                match self.runtime.file(request.database, request.storage, &key, &definition.columns).await {
-                    Ok(file) => request.corpora.register(name, std::sync::Arc::new(FileCorpus { file, column: column.to_string() })),
-                    Err(error) => if error.needs_repair() {
-                        self.runtime.report(crate::runtime::Suspect { database: request.database.to_string(), table: table.clone(), trie: trie.key.clone(), artefact_id: artefact_id.clone(), version: definition.version });
-                    },
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
-        let mut candidates = BTreeSet::new();
-        for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
-            for row in self.runtime.live_rows(request.database, segment, column, query)? {
-                let source = segment.row(row)?;
-                let header = source.header()?;
-                if !may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
-                if !query.phrases().is_empty() {
-                    let event = source.event()?;
-                    let StoredOperation::Put(document) = &event.operation else { continue };
-                    let Some(Value::Utf8(text)) = document.get(column) else { continue };
-                    if !query.matches(&rtdb_text::tokens(text)) { continue; }
-                }
-                candidates.insert(header.iid);
-            }
-        }
-        Ok(candidates)
-    }
 }
 
 #[cfg(test)]

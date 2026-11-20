@@ -86,7 +86,7 @@ pub trait ScanAccelerator: Send + Sync {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>>;
     /// The values of `match(column, query)` on the rows of whichever of the scan's data files the accelerator can answer for, so the scan reads no text there.
     /// Each answer must equal MATCH evaluated on the row.
-    async fn match_answers(&self, _request: &ScanRequest<'_>, _column: &str, _query: &rtdb_text::Query) -> Result<Option<MatchAnswers>> { Ok(None) }
+    async fn match_answers(&self, _request: &ScanRequest<'_>, _column: &str, _query: &str) -> Result<Option<MatchAnswers>> { Ok(None) }
 }
 
 /// MATCH on the rows of one data file, by page and row within the page: `None` where the column is null or absent, as MATCH is.

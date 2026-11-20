@@ -134,13 +134,11 @@ struct PartitionScan {
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
-    matches: Vec<EvaluatedMatch>,
+    /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
+    matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
     slots: Vec<Option<usize>>,
 }
-
-/// A MATCH the scan evaluates: on its column, for its query (`None` where the query is null, so MATCH is too), with an accelerator's answers for some of the partition's data files.
-struct EvaluatedMatch { column: String, query: Option<rtdb_text::Query>, answers: Option<crate::MatchAnswers> }
 
 use crate::analysis::ScanCounts;
 pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, _reservation: Arc<MemoryReservation> }
@@ -165,7 +163,7 @@ impl ScanCursor {
         let mut queries = Vec::with_capacity(scan.matches.len());
         for evaluated in &scan.matches {
             let constants = crate::accelerate::ExecutionConstants(&execution);
-            queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(rtdb_text::Query::parse(&text)), _ => None });
+            queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(text), _ => None });
         }
         let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
         let mut partitions = VecDeque::new();
@@ -195,7 +193,7 @@ impl ScanCursor {
                         if let Some(found) = accelerator.match_answers(&request, &evaluated.column, query).await? { answers = Some(found); break; }
                     }
                 }
-                matches.push(EvaluatedMatch { column: evaluated.column.clone(), query: query.clone(), answers });
+                matches.push((query.as_deref().map(rtdb_text::Query::parse), answers));
             }
             partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, slots: slots.clone(), scan: narrowed, execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
@@ -531,9 +529,8 @@ impl PartitionScan {
 impl PartitionScan {
     /// The scan's MATCH on a resolved row: from the accelerator's answers where they cover the row's data file, and from the row's own value otherwise.
     fn match_value(&self, row: &ResolvedRow<RowSource>, evaluated: usize, sources: &[(Option<Arc<IndexBatch>>, Option<(usize, usize)>)]) -> Result<Value> {
-        let state = &self.matches[evaluated];
-        let Some(query) = &state.query else { return Ok(Value::Null) };
-        if let Some(answers) = &state.answers {
+        let (Some(query), answers) = &self.matches[evaluated] else { return Ok(Value::Null) };
+        if let Some(answers) = answers {
             let source = sources.iter().find(|(batch, _)| batch.as_ref().is_some_and(|batch| Arc::ptr_eq(batch, &row.source.batch))).and_then(|(_, source)| *source);
             if let Some((file, page)) = source {
                 // An answer the file cannot give for this row is left to the row itself: an index decides cost, never results.
@@ -542,7 +539,7 @@ impl PartitionScan {
                 }
             }
         }
-        Ok(rtdb_expr::match_value(&project(row, &state.column)?, query))
+        Ok(rtdb_expr::match_value(&project(row, &self.scan.matches[evaluated].column)?, query))
     }
 }
 fn project_bound(row: &ResolvedRow<RowSource>,name: &str) -> Result<usize> {

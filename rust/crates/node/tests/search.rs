@@ -455,7 +455,7 @@ struct Answering { inner: Arc<rtdb_search::SearchAccelerator>, answered: Arc<std
 #[async_trait]
 impl rtdb_query::ScanAccelerator for Answering {
     async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<std::collections::BTreeSet<rtdb_types::Iid>>> { self.inner.candidate_iids(request).await }
-    async fn match_answers(&self, request: &rtdb_query::ScanRequest<'_>, column: &str, query: &rtdb_text::Query) -> Result<Option<rtdb_query::MatchAnswers>> {
+    async fn match_answers(&self, request: &rtdb_query::ScanRequest<'_>, column: &str, query: &str) -> Result<Option<rtdb_query::MatchAnswers>> {
         let Some(answers) = self.inner.match_answers(request, column, query).await? else { return Ok(None) };
         let mut counted = rtdb_query::MatchAnswers::default();
         for (key, matches) in answers.iter() {

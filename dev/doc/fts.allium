@@ -86,7 +86,7 @@ config {
     threads: Integer = 1
     -- Above this many candidates, the scan runs unnarrowed.
     max_candidates: Integer = 100000
-    -- Above this many bytes of selected tries the lane should have indexed but has not, the scan runs unnarrowed rather than reading them twice.
+    -- Above this many bytes of selected tries the lane should have indexed but has not, the node builds none of their search files itself.
     -- Level 0 and the partial level-1 current trie, which the lane never indexes, do not count.
     max_unindexed_bytes: Integer = 67108864
 }
@@ -174,15 +174,17 @@ rule RepairUnreadableSearchFile {
 --   1. The scan selects tries exactly as it does without MATCH.
 --   2. A selected trie whose entry records a search file for that definition contributes the IIDs of its docs whose terms satisfy the query.
 --      A doc whose own valid interval misses the query's, whose system-from is at or after the query's system upper bound, or whose recency is at or before the earlier of the query's valid and system lower bounds, contributes nothing.
---   3. A selected trie with no such record, or whose file cannot be read, contributes the IIDs of its matching rows, read from its data file, under the same rule.
+--   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
+--      A data file never changes, so a kept one serves every later query of the trie.
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
 --      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
 --   6. MATCH is evaluated on each resolved row, as MatchEvaluatedByTheScan says.
 --
--- Past max_candidates candidates, or max_unindexed_bytes of tries without a search file, the scan runs unnarrowed instead.
+-- Past max_candidates candidates, the scan runs unnarrowed instead.
+-- Past max_unindexed_bytes of tries the lane should have indexed but has not, the node builds none of them: the scan is neither narrowed nor ranked, and only rows of tries with a recorded file take MATCH from it.
 --
--- Each current-side search file the narrowing opens is registered with the query as a corpus source, once however often the scan reopens.
+-- Each current-side search file the lane recorded, in every partition the query reads, is registered with the query as a corpus source, once however often the scan reopens.
 -- A query text's corpus is fixed at its first use, so every score in one query is relative to the same corpus.
 --
 -- A score from the index equals SEARCH_SCORE on the resolved row: both take each term's frequency and the document's length rounded to the index's stored lengths.
@@ -192,7 +194,7 @@ rule RepairUnreadableSearchFile {
 --   0. The table's current-side search files in every partition the query reads are registered as corpus sources, so the corpus a score fixes is the same whichever partition is ranked first.
 --
 --   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
---      Events in tries without a search file, and in live segments, are scored from their rows.
+--      Events in live segments are scored from their rows.
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
 --   2. IIDs are verified best bound first, in batches, by running the scan itself over the partition restricted to them, with its own predicates.
 --   3. Verification stops once n verified rows score strictly above every bound not yet verified, every unscored window's included.
@@ -216,9 +218,9 @@ rule MatchIsAResidualPredicate {
 rule MatchEvaluatedByTheScan {
     -- A MATCH with a constant query in a predicate the scan filters by, under NOT and IS NULL as much as bare, is a boolean column the scan evaluates on each resolved row.
     -- The text column is then read only for the rows the scan cannot answer otherwise, and projected only if something else needs it.
-    -- A row whose data file has a search file for a definition covering the column takes MATCH from it: true where the document matches, null where the column is null or absent, and false otherwise.
-    -- Any other row, in a trie without a readable search file or in a live segment, takes MATCH from its own value.
-    -- NOT MATCH, which no candidate set narrows, and count(*) over MATCH thus tokenise no text of indexed rows.
+    -- A row of a trie takes MATCH from its search file for a definition covering the column: true where the document matches, null where the column is null or absent, and false otherwise.
+    -- A row in a trie with no readable recorded file takes it from the file the node builds, and a row in a live segment, or in a trie the node does not build, from its own value.
+    -- NOT MATCH, which no candidate set narrows, and count(*) over MATCH thus tokenise no text but the live index's.
     when: ScanWithMatch(scan, predicate)
 
     ensures:
@@ -274,8 +276,8 @@ contract SearchCorrectness {
         -- A document's own columns only ever rule a candidate out: resolution narrows an event's interval and never widens it.
 
     @invariant SearchFilesFromTheSnapshot
-        -- A scan reads the search files its snapshot's catalog records, and no others.
-        -- A node keeps opened files across queries by object key, which names immutable bytes, so a kept file is never stale.
+        -- A scan reads the search files its snapshot's catalog records, and those its node builds from the snapshot's data files, and no others.
+        -- A node keeps recorded files by object key, and the files it builds by data-file key and columns, each naming immutable bytes, and uses one only while the database's storage is the one it was read through, so a kept file is never stale.
 }
 
 ------------------------------------------------------------

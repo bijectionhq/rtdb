@@ -133,7 +133,7 @@ impl ArtefactBuilder for SearchBuilder {
 }
 
 /// The heap a segment's indexing may take, besides the page being read: tantivy holds a segment's postings in memory until it serializes them.
-fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie_size.max(0)).unwrap_or(usize::MAX).saturating_add(32 << 20) }
+pub(crate) fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie_size.max(0)).unwrap_or(usize::MAX).saturating_add(32 << 20) }
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/build", error.to_string()) }
 
@@ -173,13 +173,17 @@ impl Iterator for PageRows<'_> {
     }
 }
 
-/// Every row of a data file in order, with the tokens of each column's value.
-pub fn search_rows(data: &[u8], columns: &[String]) -> Result<Vec<SearchRow>> {
+/// A data file's pages of rows in order, read one at a time, with the tokens of each column's value.
+pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &'a CancellationToken) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
     let mut file = ArrowFile::open(Arc::from(data), None)?;
-    let mut rows = Vec::new();
-    for page in 0..file.page_count() {
-        let batch = EventBatch::new(file.read_page(page)?)?;
-        for row in 0..batch.len() { rows.push(search_row(&batch.read_event(row)?, columns)); }
-    }
-    Ok(rows)
+    let mut page = 0;
+    Ok(std::iter::from_fn(move || {
+        if page == file.page_count() { return None; }
+        if cancellation.is_cancelled() { return Some(Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled"))); }
+        page += 1;
+        Some(file.read_page(page - 1).and_then(|batch| {
+            let batch = EventBatch::new(batch)?;
+            (0..batch.len()).map(|row| Ok(search_row(&batch.read_event(row)?, columns))).collect()
+        }))
+    }))
 }

@@ -50,7 +50,7 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
   The scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
   A `MATCH` with a constant query in a scan predicate becomes a column the scan evaluates: from the search file of the row's data file, null included, and from the row's value where there is none.
 * *A missing search file is never an error.*
-  The accelerator treats it as absent and brute-forces that trie, which is what makes deleting one always safe.
+  The accelerator treats it as absent and builds the trie's search file itself from the immutable data file, which is what makes deleting one always safe.
 * *Tokens are ours, postings are tantivy's.*
   `rtdb-text` analyses text (Unicode word split, lowercasing); the search file feeds tantivy pre-tokenized strings, so the residual check and the index agree token for token.
 * *Byte-deterministic search files.*

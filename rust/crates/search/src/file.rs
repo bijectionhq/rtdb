@@ -375,7 +375,9 @@ impl SearchFile {
         let index = Index::open(directory).map_err(fault)?;
         let (expected, _) = schema(columns);
         if index.schema() != expected { return Err(corrupt("Search file schema does not match its definition")); }
-        let documents = index.searchable_segment_metas().map_err(fault)?.iter().map(|segment| segment.max_doc()).sum();
+        let segments = index.searchable_segment_metas().map_err(fault)?;
+        if segments.len() > 1 { return Err(corrupt("A search file holds at most one segment")); }
+        let documents = segments.iter().map(|segment| segment.max_doc()).sum();
         Ok(Self { sidecar: Sidecar::parse(sidecar, columns.len(), documents)?, index, columns: columns.to_vec(), documents })
     }
 
@@ -396,22 +398,24 @@ impl SearchFile {
         BooleanQuery::new(clauses)
     }
 
-    /// Every document holding all of the query's terms in the column.
-    pub fn matches(&self, column: &str, query: &Query) -> Result<Vec<DocMatch>> {
+    /// The ids of every document holding all of the query's terms and phrases in the column, in order.
+    fn matching_docs(&self, column: &str, query: &Query) -> Result<Vec<u32>> {
         let Some(field) = self.field(column) else { return Ok(Vec::new()) };
         if query.terms().is_empty() { return Ok(Vec::new()); }
+        let found = self.searcher()?.search(&Self::conjunction(field, query), &DocSetCollector).map_err(fault)?;
+        let mut docs: Vec<u32> = found.into_iter().map(|address| address.doc_id).collect();
+        docs.sort_unstable();
+        Ok(docs)
+    }
+
+    /// Every document holding all of the query's terms and phrases in the column, with its own temporal columns.
+    pub fn matches(&self, column: &str, query: &Query) -> Result<Vec<DocMatch>> {
+        let docs = self.matching_docs(column, query)?;
+        if docs.is_empty() { return Ok(Vec::new()); }
         let searcher = self.searcher()?;
-        let found = searcher.search(&Self::conjunction(field, query), &DocSetCollector).map_err(fault)?;
-        let mut docs: Vec<_> = found.into_iter().collect();
-        docs.sort();
-        let mut matches = Vec::with_capacity(docs.len());
-        let mut columns: Option<(u32, DocColumns)> = None;
-        for address in docs {
-            if columns.as_ref().is_none_or(|(ordinal, _)| *ordinal != address.segment_ord) { columns = Some((address.segment_ord, DocColumns::open(searcher.segment_reader(address.segment_ord))?)); }
-            let Some((_, columns)) = &columns else { continue };
-            matches.push(columns.doc(address.doc_id)?);
-        }
-        Ok(matches)
+        let Some(segment) = searcher.segment_readers().first() else { return Ok(Vec::new()) };
+        let columns = DocColumns::open(segment)?;
+        docs.into_iter().map(|doc| columns.doc(doc)).collect()
     }
 
     /// Every document matching `matching`, with its score for `scoring`'s terms, from the postings' frequencies and the stored length.
@@ -420,7 +424,7 @@ impl SearchFile {
         let Some(field) = self.field(column) else { return Ok(Vec::new()) };
         let docs = self.matches(column, matching)?;
         let searcher = self.searcher()?;
-        let [segment] = searcher.segment_readers() else { return Err(corrupt("A search file holds exactly one segment")) };
+        let Some(segment) = searcher.segment_readers().first() else { return Ok(Vec::new()) };
         let mut scorer = ExactScorer::open(segment, field, scoring, corpus)?;
         docs.into_iter().map(|doc| Ok((doc, scorer.score(doc.doc)))).collect()
     }
@@ -429,8 +433,7 @@ impl SearchFile {
     pub fn ranked(&self, column: &str, matching: &Query, scoring: &Query, corpus: Option<&Corpus>) -> Result<Ranked> {
         let searcher = self.searcher()?;
         let (Some(column), Some(field)) = (self.column(column), self.field(column)) else { return Ok(Ranked(None)) };
-        if matching.terms().is_empty() { return Ok(Ranked(None)); }
-        if searcher.segment_readers().len() != 1 { return Err(corrupt("A search file holds exactly one segment")); }
+        if matching.terms().is_empty() || searcher.segment_readers().is_empty() { return Ok(Ranked(None)); }
         let segment = &searcher.segment_readers()[0];
         let inverted = segment.inverted_index(field).map_err(fault)?;
         let lengths = segment.get_fieldnorms_reader(field).map_err(fault)?;
@@ -462,14 +465,14 @@ impl SearchFile {
     }
 
     /// Whether MATCH holds on each document: `None` where the column is null or absent, as MATCH is on such a row.
-    pub fn match_values(&self, column: &str, query: &Query) -> Result<MatchValues> {
+    pub fn match_set(&self, column: &str, query: &Query) -> Result<MatchSet> {
         let documents = self.documents;
-        let Some(index) = self.column(column) else { return Ok(MatchValues { present: Vec::new(), matching: Vec::new(), page_starts: self.sidecar.page_starts.clone(), documents }) };
+        let Some(index) = self.column(column) else { return Ok(MatchSet { present: Vec::new(), matching: Vec::new(), page_starts: self.sidecar.page_starts.clone(), documents }) };
         let mut present = vec![0u64; documents.div_ceil(64) as usize];
         for doc in 0..documents { if self.sidecar.present(index, doc) { present[doc as usize / 64] |= 1 << (doc % 64); } }
         let mut matching = vec![0u64; present.len()];
-        for doc in self.matches(column, query)? { matching[doc.doc as usize / 64] |= 1 << (doc.doc % 64); }
-        Ok(MatchValues { present, matching, page_starts: self.sidecar.page_starts.clone(), documents })
+        for doc in self.matching_docs(column, query)? { matching[doc as usize / 64] |= 1 << (doc % 64); }
+        Ok(MatchSet { present, matching, page_starts: self.sidecar.page_starts.clone(), documents })
     }
 
     /// The column's corpus statistics for the query's terms: documents, tokens, and each term's document frequency.
@@ -490,9 +493,9 @@ impl SearchFile {
 }
 
 /// MATCH of one query on every document of a search file, by data-file page and row.
-pub struct MatchValues { present: Vec<u64>, matching: Vec<u64>, page_starts: Vec<u32>, documents: u32 }
+pub struct MatchSet { present: Vec<u64>, matching: Vec<u64>, page_starts: Vec<u32>, documents: u32 }
 
-impl MatchValues {
+impl MatchSet {
     /// MATCH on the row at `row` of data page `page`: `None` where the column is null or absent; an error where the file has no such row.
     pub fn value(&self, page: usize, row: usize) -> Result<Option<bool>> {
         let start = *self.page_starts.get(page).ok_or_else(|| corrupt("Search file has no such page"))?;
@@ -505,8 +508,8 @@ impl MatchValues {
     pub fn bytes(&self) -> usize { (self.present.len() + self.matching.len()) * 8 + self.page_starts.len() * 4 }
 }
 
-impl rtdb_query::FileMatches for MatchValues {
-    fn value(&self, page: usize, row: usize) -> Result<Option<bool>> { MatchValues::value(self, page, row) }
+impl rtdb_query::FileMatches for MatchSet {
+    fn value(&self, page: usize, row: usize) -> Result<Option<bool>> { MatchSet::value(self, page, row) }
 }
 
 /// Scores documents in ascending order from the postings of the scoring terms.
@@ -698,16 +701,16 @@ mod tests {
         write_search_file(&columns(), pages.iter().cloned().map(Ok), "job", RamDirectory::create(), &mut bytes).unwrap();
         let file = SearchFile::open(bytes, &columns()).unwrap();
         let query = Query::parse("invoice");
-        let values = file.match_values("body", &query).unwrap();
+        let set = file.match_set("body", &query).unwrap();
         for (page, rows) in pages.iter().enumerate() {
             for (row, search_row) in rows.iter().enumerate() {
                 let expected = search_row.values[1].as_ref().map(|tokens| query.matches(tokens));
-                assert_eq!(values.value(page, row).unwrap(), expected, "page {page} row {row}");
+                assert_eq!(set.value(page, row).unwrap(), expected, "page {page} row {row}");
             }
-            assert!(values.value(page, rows.len()).is_err() || page + 1 < pages.len(), "past the last row of the last page");
+            assert!(set.value(page, rows.len()).is_err() || page + 1 < pages.len(), "past the last row of the last page");
         }
-        assert!(values.value(pages.len(), 0).is_err());
-        assert!(file.match_values("title", &query).unwrap().value(0, 0).unwrap().is_none(), "a column no row holds is null everywhere");
+        assert!(set.value(pages.len(), 0).is_err());
+        assert!(file.match_set("title", &query).unwrap().value(0, 0).unwrap().is_none(), "a column no row holds is null everywhere");
     }
 
     #[test]

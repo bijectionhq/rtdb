@@ -52,7 +52,6 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rtdb-text.workspace = true
 
 [lints]
 workspace = true
