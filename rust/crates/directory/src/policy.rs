@@ -17,7 +17,8 @@ pub fn claim(record: &DeploymentRecord, claimant: &MemberId, members: &BTreeMap<
     let member = members.get(claimant).filter(|member| member.may_receive_placements(now_ms))?;
     let pool = match record.lifecycle { Lifecycle::Live => MemberPool::General, Lifecycle::Quarantined => MemberPool::Isolation, _ => return None };
     if member.pool != pool { return None; }
-    if record.move_intent.as_ref().is_some_and(|target| target != claimant) { return None; }
+    // A move reserves the claim for its target only while the target can still take it; a move to a member that has since died binds nobody.
+    if record.move_intent.as_ref().is_some_and(|target| target != claimant && members.get(target).is_some_and(|target| target.may_receive_placements(now_ms))) { return None; }
     if effective_holder(record, members, now_ms).is_some_and(|holder| holder != claimant) { return None; }
     let mut next = record.clone();
     next.epoch += 1;
@@ -75,6 +76,8 @@ mod tests {
         record.move_intent = Some(MemberId("b".into()));
         assert!(claim(&record, &MemberId("a".into()), &members, 10).is_none(), "a move reserves the next claim for its target");
         assert_eq!(claim(&record, &MemberId("b".into()), &members, 10).unwrap().move_intent, None, "claiming completes the move");
+        record.move_intent = Some(MemberId("gone".into()));
+        assert!(claim(&record, &MemberId("a".into()), &members, 10).is_some(), "a move to a member that is gone binds nobody");
     }
 
     #[test]
