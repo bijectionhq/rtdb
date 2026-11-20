@@ -8,7 +8,7 @@ use rtdb_types::{Result, Value};
 
 use crate::context::Execution;
 use crate::cursor::{BoxCursor, OwnedRow};
-use crate::spill::{SpillReader, SpillWriter};
+use crate::spill::SpillReader;
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
 use crate::{invalid, QueryContext};
 use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
@@ -527,32 +527,65 @@ pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory
     }
     Ok(true)
 }
-pub(crate) struct SeenRows { writer: SpillWriter, runtime: Arc<RuntimeSchema>, context: Arc<QueryContext> }
-impl SeenRows {
-    pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeSchema>) -> Result<Self> { Ok(Self { writer: context.spill.create()?, runtime, context: Arc::clone(context) }) }
-    pub fn insert(&mut self, values: &[Value]) -> Result<bool> {
-        for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
-        let mut reader = self.writer.reader(Arc::clone(&self.context.memory))?;
-        while let Some(row) = reader.next()? {
-            self.context.check_cancelled()?;
-            if rows_equal(values, &row.values, &self.context.timezone, &self.context.memory)? { return Ok(false); }
+/// A hash that rows equal under `rows_equal` share.
+/// A date-time equals one of another unit or zone once the session zone localizes it, so date-times all hash alike, and `rows_equal` tells them apart.
+fn equality_hash(values: &[Value]) -> u32 {
+    fn temporal(value: &Value) -> bool {
+        match value {
+            Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
+            Value::List(values) | Value::FixedSizeList(values) | Value::Set(values) => values.iter().any(temporal),
+            Value::Struct(fields) => fields.values().any(temporal),
+            Value::Map { entries, .. } => entries.iter().any(|(key, value)| temporal(key) || temporal(value)),
+            _ => false,
         }
-        self.writer.write(values, &self.context.memory)?;
+    }
+    values.iter().fold(0u32, |hash, value| {
+        let cell = if temporal(value) { 0x7e3a_11c5 } else { rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32) };
+        (hash ^ cell.wrapping_mul(0xcc9e_2d51).rotate_left(15)).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64)
+    })
+}
+/// The distinct rows seen so far, found through an index from their hash to the rows that share it.
+pub(crate) struct SeenRows { rows: Vec<OwnedRow>, index: std::collections::HashMap<u32, Vec<usize>>, validated: bool, runtime: Arc<RuntimeSchema>, context: Arc<QueryContext>, _reservation: Option<Arc<rtdb_columnar::MemoryReservation>> }
+impl SeenRows {
+    pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeSchema>) -> Result<Self> { Ok(Self { rows: Vec::new(), index: Default::default(), validated: false, runtime, context: Arc::clone(context), _reservation: None }) }
+    pub fn insert(&mut self, values: &[Value]) -> Result<bool> {
+        if !self.validated {
+            for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
+            self.validated = true;
+        }
+        let hash = equality_hash(values);
+        if let Some(candidates) = self.index.get(&hash) {
+            for &candidate in candidates {
+                if rows_equal(values, &self.rows[candidate].values, &self.context.timezone, &self.context.memory)? { return Ok(false); }
+            }
+        }
+        let row = OwnedRow::copy_parts(&[values], 0, 0, &self.context.memory)?;
+        if self.rows.len() == self.rows.capacity() {
+            let capacity = self.rows.capacity().saturating_mul(2).max(16);
+            let bytes = capacity.checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>())
+                .ok_or_else(|| invalid("distinct-size", "Distinct rows exceed addressable memory"))?;
+            self._reservation = Some(self.context.memory.reserve(bytes)?);
+            self.rows.reserve_exact(capacity - self.rows.len());
+        }
+        self.index.entry(hash).or_default().push(self.rows.len());
+        self.rows.push(row);
         Ok(true)
     }
 }
-pub(crate) struct OrdinalSet { writer: SpillWriter, context: Arc<QueryContext> }
+/// The ordinals of right rows already matched.
+pub(crate) struct OrdinalSet { ordinals: std::collections::HashSet<u64>, context: Arc<QueryContext>, _reservation: Option<Arc<rtdb_columnar::MemoryReservation>> }
 impl OrdinalSet {
-    pub fn new(context: &Arc<QueryContext>) -> Result<Self> { Ok(Self { writer: context.spill.create()?, context: Arc::clone(context) }) }
-    pub fn contains(&mut self, ordinal: u64) -> Result<bool> {
-        let mut reader = self.writer.reader(Arc::clone(&self.context.memory))?;
-        while let Some(row) = reader.next()? {
-            self.context.check_cancelled()?;
-            if row.values.first() == Some(&Value::U64(ordinal)) { return Ok(true); }
+    pub fn new(context: &Arc<QueryContext>) -> Result<Self> { Ok(Self { ordinals: Default::default(), context: Arc::clone(context), _reservation: None }) }
+    pub fn contains(&mut self, ordinal: u64) -> Result<bool> { Ok(self.ordinals.contains(&ordinal)) }
+    pub fn insert(&mut self, ordinal: u64) -> Result<()> {
+        if self.ordinals.len() == self.ordinals.capacity() {
+            let capacity = self.ordinals.capacity().saturating_mul(2).max(16);
+            self._reservation = Some(self.context.memory.reserve(capacity.checked_mul(2 * std::mem::size_of::<u64>()).ok_or_else(|| invalid("set-size", "Set ordinals exceed addressable memory"))?)?);
+            self.ordinals.reserve(capacity - self.ordinals.len());
         }
-        Ok(false)
+        self.ordinals.insert(ordinal);
+        Ok(())
     }
-    pub fn insert(&mut self, ordinal: u64) -> Result<()> { self.writer.write(&[Value::U64(ordinal)], &self.context.memory) }
 }
 struct Distinct { input: BoxPageCursor, seen: SeenRows, execution: Execution }
 #[async_trait]

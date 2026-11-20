@@ -159,7 +159,7 @@ impl AggregateCursor {
 
     async fn aggregate(&mut self, mut input: AggregateInput) -> Result<Option<OwnedPage>> {
         let memory = &self.execution.context.memory;
-        let mut keys = GroupKeys::new(self.groups.is_empty(),&self.execution)?;
+        let mut keys = GroupKeys::new(self.groups.is_empty())?;
         let _columns = memory.reserve(self.aggregates.len().checked_mul(std::mem::size_of::<AggregateColumn>()).ok_or_else(||invalid("aggregate-size","Aggregate column container overflow"))?)?;
         let mut columns = self.aggregates.iter().map(|aggregate|AggregateColumn::new(aggregate,&self.execution)).collect::<Result<Vec<_>>>()?;
         let positions = self.column_positions();
@@ -215,9 +215,9 @@ impl AggregateCursor {
             }
         }
         let mut output = PageBuilder::new(keys.count,memory)?;
-        let mut reader = keys.rows.reader(Arc::clone(memory))?;
-        while let Some(key) = reader.next()? {
-            self.execution.context.check_cancelled()?;
+        if keys.global { output.push(OwnedRow::copy_parts(&[],0,self.aggregates.len(),memory)?)?; }
+        for (index,key) in keys.keys.iter().enumerate() {
+            self.execution.context.check_cancelled_at(index)?;
             output.push(OwnedRow::copy_parts(&[&key.values[2..]],0,self.aggregates.len(),memory)?)?;
         }
         for (index,((column,aggregate),types)) in columns.into_iter().zip(&self.aggregates).zip(self.runtime.aggregates()?).enumerate() {
@@ -235,13 +235,11 @@ impl PageCursor for AggregateCursor {
     }
 }
 
-/// Group keys in first-seen order, spilled for output, with an in-memory index from key hash to the groups that share it.
-struct GroupKeys { rows: SpillWriter, count: usize, global: bool, index: std::collections::HashMap<u32, Vec<usize>>, keys: Vec<OwnedRow>, _index_reservation: Option<Arc<rtdb_columnar::MemoryReservation>>, inserts: usize }
+/// Group keys in first-seen order, with an index from key hash to the groups that share it.
+struct GroupKeys { count: usize, global: bool, index: std::collections::HashMap<u32, Vec<usize>>, keys: Vec<OwnedRow>, _index_reservation: Option<Arc<rtdb_columnar::MemoryReservation>>, inserts: usize }
 impl GroupKeys {
-    fn new(global: bool,execution: &Execution) -> Result<Self> {
-        let mut rows = execution.context.spill.create()?;
-        if global { rows.write(&[Value::U64(0),Value::U32(0)],&execution.context.memory)?; }
-        Ok(Self { rows,count: usize::from(global),global,index: Default::default(),keys: Vec::new(),_index_reservation: None,inserts: 0 })
+    fn new(global: bool) -> Result<Self> {
+        Ok(Self { count: usize::from(global),global,index: Default::default(),keys: Vec::new(),_index_reservation: None,inserts: 0 })
     }
     fn insert(&mut self,values: &[Value],execution: &Execution) -> Result<usize> {
         self.inserts = self.inserts.wrapping_add(1);
@@ -256,7 +254,6 @@ impl GroupKeys {
         let id = self.count;
         self.count = self.count.checked_add(1).filter(|count|*count <= i32::MAX as usize).ok_or_else(||invalid("group-count","Aggregate group count exceeds the reference vector limit"))?;
         let key = OwnedRow::copy_parts(&[&[Value::U64(id as u64),Value::U32(hash)],values],0,0,&execution.context.memory)?;
-        self.rows.write(&key.values,&execution.context.memory)?;
         if self.keys.len() == self.keys.capacity() {
             let capacity = self.keys.capacity().saturating_mul(2).max(16);
             let bytes = capacity.checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>())
