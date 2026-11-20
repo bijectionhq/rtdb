@@ -38,13 +38,12 @@ impl KeyService for LocalKeyService {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut key = [0u8; KEY_BYTES];
                 SystemRandom::new().fill(&mut key).map_err(|_| Anomaly::fault("rtdb.multi/random", "No randomness for a new key"))?;
-                let temporary = path.with_extension("tmp");
+                let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
                 std::fs::write(&temporary, key).map_err(io)?;
-                // Two nodes racing to create a key must agree on one: the first rename wins and the loser reads it.
-                match std::fs::hard_link(&temporary, &path) {
-                    Ok(()) => { let _ = std::fs::remove_file(&temporary); Ok(key) }
-                    Err(_) => { let _ = std::fs::remove_file(&temporary); self.key(deployment) }
-                }
+                // Two nodes racing to create a key must agree on one: the first link wins, and everyone uses what the key file holds.
+                let _ = std::fs::hard_link(&temporary, &path);
+                let _ = std::fs::remove_file(&temporary);
+                self.key(deployment)
             }
             Err(error) => Err(io(error)),
         }
@@ -80,5 +79,15 @@ mod tests {
         keys.destroy("a").unwrap();
         assert_ne!(keys.key("a").unwrap(), key, "a destroyed key is never recovered");
         assert_eq!(keys.key("b").unwrap(), key, "a fork's copy survives its parent's deletion");
+    }
+
+    #[test]
+    fn concurrent_first_uses_agree_on_one_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys: Vec<[u8; KEY_BYTES]> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16).map(|_| scope.spawn(|| LocalKeyService::new(directory.path()).unwrap().key("raced").unwrap())).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+        assert!(keys.windows(2).all(|pair| pair[0] == pair[1]), "every racer uses the key that was stored");
     }
 }

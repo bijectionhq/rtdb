@@ -447,3 +447,49 @@ async fn a_node_over_its_tail_budget_flushes_its_largest_tail_first() {
     drop((big, small));
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers() {
+    let mut cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    for round in 0..3 {
+        for id in 0..5 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({}, 1)", round * 10 + id)).await.unwrap(); }
+        let holder = cell.holder("shop").await.unwrap();
+        cell.node(holder).agent.flush("shop").await.unwrap();
+    }
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (99, 1)").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    let members: std::collections::BTreeMap<_, _> = cell.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
+    let servers: Vec<String> = record.ensemble.iter().map(|id| members[id].address.clone()).collect();
+    let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig { write_quorum: 2, servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 }, Default::default()).await.unwrap();
+    use rtdb_storage::log::Log;
+    assert!(matches!(reader.read_range(rtdb_storage::log::LogOffset(0), rtdb_storage::log::LogOffset(1)).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })), "the stream is trimmed below the published blocks");
+    drop(client);
+
+    let holder = cell.holder("shop").await.unwrap();
+    cell.nodes[holder].take().unwrap().kill().await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT COUNT(*) FROM orders").await, ["16"], "a new holder recovers from the block and the trimmed tail");
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (100, 1)").await.unwrap();
+    let report = admin::audit(cell.directory.as_ref(), &cell.keys(), "shop", 4 << 20).await.unwrap();
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    drop(client);
+    cell.add_node().await;
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_that_parses_a_statement_is_resent_whole_after_a_move() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let first = cell.holder("shop").await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(1 - first).lease.id()).await.unwrap();
+    let statement = client.prepare("SELECT total FROM orders WHERE _id = 1").await.expect("a named statement parsed as the first command after a move");
+    assert_eq!(client.query_one(&statement, &[]).await.unwrap().get::<_, i64>(0), 10);
+    drop(client);
+    cell.stop().await;
+}

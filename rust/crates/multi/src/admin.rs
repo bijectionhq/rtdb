@@ -263,7 +263,11 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     let mut report = AuditReport::default();
     let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);
     while next <= latest {
-        let records = log.read_range(rtdb_storage::log::LogOffset(next), rtdb_storage::log::LogOffset((next + 1024).min(latest + 1))).await?;
+        let records = match log.read_range(rtdb_storage::log::LogOffset(next), rtdb_storage::log::LogOffset((next + 1024).min(latest + 1))).await {
+            // The stream is trimmed below the last published block: the audit covers what remains.
+            Err(rtdb_storage::Error::UnavailableLogRange { first_retained, .. }) if first_retained > next => { next = first_retained; continue; }
+            records => records?,
+        };
         if records.is_empty() { report.violations.push(format!("no record at position {next}")); break; }
         for record in records {
             if record.metadata.offset.0 != next { report.violations.push(format!("position {} follows {}", record.metadata.offset.0, next - 1)); }

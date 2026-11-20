@@ -122,10 +122,13 @@ impl Session {
         stream.write_all(&self.startup).await.map_err(io)?;
         let mut backend = Backend::new(stream, epoch);
         let mut replay = BytesMut::new();
-        for frame in self.prepared.values() { replay.extend_from_slice(&frame.encode()); }
-        if !self.prepared.is_empty() { replay.extend_from_slice(&Frame { tag: b'S', body: Bytes::new() }.encode()); }
+        // A statement the pending command itself parses is defined again when that command is resent, so it is not replayed here.
+        let resent: std::collections::BTreeSet<String> = self.pending.iter().filter(|frame| frame.tag == b'P').map(parse_name).collect();
+        let replayed: Vec<&Frame> = self.prepared.iter().filter(|(name, _)| !resent.contains(*name)).map(|(_, frame)| frame).collect();
+        for frame in &replayed { replay.extend_from_slice(&frame.encode()); }
+        if !replayed.is_empty() { replay.extend_from_slice(&Frame { tag: b'S', body: Bytes::new() }.encode()); }
         // Swallow the backend's greeting, and the replies to the replayed statements, through to the last ReadyForQuery.
-        let mut ready_expected = 1 + usize::from(!self.prepared.is_empty());
+        let mut ready_expected = 1 + usize::from(!replayed.is_empty());
         let mut replayed = false;
         while ready_expected > 0 {
             let frame = backend.frames.recv().await.ok_or_else(|| lost("the new backend closed during its greeting"))?.map_err(io)?;
@@ -170,10 +173,11 @@ impl Session {
                             if let Some(current) = backend.as_mut() { let _ = current.writer.write_all(&request.encode()).await; }
                             break Ok(());
                         }
+                        // A request sent while idle starts a new command: the previous command's frames are no longer pending, and must not shape a reconnection's replay.
+                        if self.status == Status::Idle { self.pending.clear(); self.answered = false; }
                         if self.status == Status::Idle && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
                         if backend.is_none() { backend = Some(self.connect().await?); }
                         self.remember(&request);
-                        if self.status == Status::Idle { self.pending.clear(); self.answered = false; }
                         self.pending.push(request.clone());
                         self.status = Status::Busy;
                         let current = backend.as_mut().expect("connected");
@@ -216,7 +220,7 @@ impl Session {
     fn remember(&mut self, request: &Frame) {
         match request.tag {
             b'P' => {
-                let name = request.body.split(|byte| *byte == 0).next().map(|name| String::from_utf8_lossy(name).into_owned()).unwrap_or_default();
+                let name = parse_name(request);
                 if !name.is_empty() { self.prepared.insert(name, request.clone()); }
             }
             b'C' if request.body.first() == Some(&b'S') => {
@@ -230,6 +234,10 @@ impl Session {
 
 /// Whether an ErrorResponse is a placed node's refusal of a database it no longer holds, raised before the command ran.
 fn not_held(frame: &Frame) -> bool { frame.body.windows(rtdb_node::NOT_HELD.len()).any(|window| window == rtdb_node::NOT_HELD.as_bytes()) }
+
+fn parse_name(frame: &Frame) -> String {
+    frame.body.split(|byte| *byte == 0).next().map(|name| String::from_utf8_lossy(name).into_owned()).unwrap_or_default()
+}
 
 pub fn error_frame(sqlstate: &str, message: &str) -> Frame {
     let mut body = BytesMut::new();

@@ -47,6 +47,8 @@ impl AgentOptions {
     }
 }
 
+const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
+
 struct LocalHolding { id: String, epoch: u64, last_touch: Instant, linearizable: bool }
 struct LocalSubscription { id: String, last_touch: Instant, role: Role }
 
@@ -59,13 +61,15 @@ pub struct NodeAgent {
     holdings: Mutex<BTreeMap<String, LocalHolding>>,
     writers: crate::logs::Writers,
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
+    /// The lsn each deployment's stream was last trimmed through by this node.
+    trimmed: Mutex<HashMap<String, i64>>,
     /// One activation, subscription or park at a time per deployment name.
     turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl NodeAgent {
     pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()) })
+        Arc::new(Self { directory, node, lease, address, options, holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -168,7 +172,11 @@ impl NodeAgent {
         let Some(id) = self.holdings.lock().get(name).filter(|holding| holding.linearizable).map(|holding| holding.id.clone()) else { return Ok(()) };
         let writer = self.writers.lock().get(&id).and_then(std::sync::Weak::upgrade)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}")))?;
-        writer.confirm_leadership().await.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}")))
+        match tokio::time::timeout(CONFIRM_WITHIN, writer.confirm_leadership()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}"))),
+            Err(_) => Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/leadership-unconfirmed", format!("A quorum of {name}'s logkeepers did not confirm its holder in time"))),
+        }
     }
 
     async fn await_leadership(&self, name: &str, database: &Arc<Database>) -> Result<()> {
@@ -273,6 +281,18 @@ impl NodeAgent {
         Ok(Response::Published { position: position.0 })
     }
 
+    /// Trims the deployment's stream below the boundary of its last adopted block, whose records the block now holds (`TrimFollowsPublication`).
+    /// The boundary record itself is kept: it names the source position a later holder's intake starts past.
+    async fn trim_published(&self, name: &str, id: &str) {
+        let Ok(database) = self.node.catalog().database(name) else { return };
+        let Some(boundary) = database.status().adopted_block.as_ref().and_then(|block| block.boundary_replica_position()).map(|position| position.offset()) else { return };
+        if boundary <= 0 || self.trimmed.lock().get(id).is_some_and(|trimmed| *trimmed >= boundary - 1) { return; }
+        let (Ok(Some(record)), Ok(members)) = (self.directory.deployment(id).await, self.members().await) else { return };
+        let Ok(servers) = Self::servers(&record, &members) else { return };
+        let stream = rtdb_logkeeper::StreamConfig { write_quorum: crate::deployment::write_quorum(servers.len()), servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 };
+        if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(boundary - 1)).await.is_ok() { self.trimmed.lock().insert(id.to_owned(), boundary - 1); }
+    }
+
     #[doc(hidden)]
     pub async fn bound_tails_for_test(&self, limit: u64) { self.bound_tails(limit).await }
 
@@ -337,10 +357,14 @@ impl NodeAgent {
             if !placed_here || stopped {
                 let turn = self.turn(&name);
                 let _turn = turn.lock().await;
+                // An activation or park may have replaced the holding while this pass waited for its turn; only the holding it looked at is given up.
+                if !self.holdings.lock().get(&name).is_some_and(|holding| holding.id == id && holding.epoch == epoch) { continue; }
+                let stopped = self.node.catalog().database(&name).map_or(true, |database| matches!(database.status().role, DriverRole::Stopped));
                 self.stop_running(&name).await;
                 if placed_here && stopped { self.count_crash(&id, Some(epoch)).await; }
                 continue;
             }
+            self.trim_published(&name, &id).await;
             let over = self.options.max_active.is_some_and(|limit| rank >= limit);
             if draining || over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
         }

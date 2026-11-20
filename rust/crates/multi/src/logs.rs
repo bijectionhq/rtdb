@@ -87,7 +87,7 @@ impl LogFactory for LogkeeperLogFactory {
         let replica: Arc<dyn Log> = Arc::new(SealedLog { inner: quorum, cipher: Arc::new(Cipher::new(&self.keys.key(&config.deployment)?)?), stream: Arc::from(config.replica_stream.as_str()) });
         let epoch = StorageEpoch(config.log_epoch);
         let next = next_source_offset(replica.as_ref(), epoch).await?;
-        let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)) });
+        let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
         let trimming = {
             let intake = Arc::clone(&intake);
             async move {
@@ -109,28 +109,46 @@ pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Resul
     let latest = replica.latest()?.0;
     let mut end = latest + 1;
     let mut after_newest = 0i64;
-    while end > 0 {
-        let start = (end - SCAN_WINDOW).max(0);
-        let records = replica.read_range(LogOffset(start), LogOffset(end)).await?;
+    let mut floor = 0;
+    while end > floor {
+        let start = (end - SCAN_WINDOW).max(floor);
+        let records = match replica.read_range(LogOffset(start), LogOffset(end)).await {
+            Ok(records) => records,
+            // Trimmed below here: the scan continues from the first retained record.
+            Err(rtdb_storage::Error::UnavailableLogRange { first_retained, .. }) if first_retained > start && first_retained < end => { floor = first_retained; continue; }
+            Err(rtdb_storage::Error::UnavailableLogRange { .. }) => break,
+            Err(error) => return Err(error.into()),
+        };
         for record in records.iter().rev() {
-            if let Some(position) = source_position(&record.payload, epoch)? { return Ok(position + 1 + after_newest); }
-            after_newest += 1;
+            match source_position(&record.payload, epoch)? {
+                Scanned::Position(position) => return Ok(position + 1 + after_newest),
+                Scanned::MayConsume => after_newest += 1,
+                Scanned::Consumes => {}
+            }
         }
         end = start;
     }
     Ok(after_newest)
 }
 
-fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Option<i64>> {
-    let Some(envelope) = ReplicaEnvelope::decode(payload)? else { return Ok(None); };
+enum Scanned { Position(i64), MayConsume, Consumes }
+
+/// What one replica record says about the source positions consumed up to it.
+/// A claim or heartbeat (a no-op naming no source position) and a leader's own deletion notice consume none; anything else whose position it does not name may have consumed one.
+fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
+    let Some(envelope) = ReplicaEnvelope::decode(payload)? else { return Ok(Scanned::MayConsume); };
     let position = match &envelope.message {
         ReplicaBody::ResolvedTx(tx) => tx.src_msg_id,
-        ReplicaBody::NoOp(noop) => noop.src_msg_id,
+        ReplicaBody::NoOp(noop) => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
         ReplicaBody::BlockBoundary(boundary) => boundary.latest_processed_msg_id,
         ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
+        ReplicaBody::TriesDeleted(_) => return Ok(Scanned::Consumes),
         _ => None,
     };
-    Ok(position.filter(|position| *position >= 0).map(SourcePosition).filter(|position| position.epoch() == epoch).map(SourcePosition::offset))
+    Ok(match position.filter(|position| *position >= 0).map(SourcePosition).filter(|position| position.epoch() == epoch) {
+        Some(position) => Scanned::Position(position.offset()),
+        None => Scanned::MayConsume,
+    })
 }
 
 /// A log whose payloads are sealed under the deployment's key, so a logkeeper never holds a row in the clear.
@@ -195,7 +213,7 @@ impl LogRange for SealedRange {
 }
 
 /// The holder's in-process source log: it remembers how far its reader has got, and drops what lies well behind it.
-pub struct IntakeLog { log: MemoryLog, consumed: Arc<AtomicI64> }
+pub struct IntakeLog { log: MemoryLog, consumed: Arc<AtomicI64>, start: i64 }
 
 impl IntakeLog {
     fn trim(&self) {
@@ -209,6 +227,8 @@ impl Log for IntakeLog {
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> { self.log.enqueue(payload, timestamp).await }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
+        // Positions below the intake's start were never assigned to it, so a reader asking for them starts at the start; trimmed positions above it still fail as unavailable.
+        let after = LogOffset(after.0.max(self.start - 1));
         Ok(Box::new(IntakeTail { tail: self.log.tail(after).await?, consumed: Arc::clone(&self.consumed) }))
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> { self.log.range(from, to).await }
@@ -263,17 +283,21 @@ mod tests {
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42);
         append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
         append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
-        assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 44, "each later record may have consumed one position");
+        assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42, "a claim consumes no source position");
+        append(&replica, ReplicaBody::TriesAdded(Default::default())).await;
+        assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 43, "a record that names no position may have consumed one");
     }
 
     #[tokio::test]
     async fn the_intake_drops_what_lies_well_behind_its_reader() {
-        let intake = IntakeLog { log: MemoryLog::starting_at(1 << 20, LogOffset(10)), consumed: Arc::new(AtomicI64::new(9)) };
+        let intake = IntakeLog { log: MemoryLog::starting_at(1 << 20, LogOffset(10)), consumed: Arc::new(AtomicI64::new(9)), start: 10 };
         for _ in 0..(INTAKE_RETAINED_BEHIND + 100) { intake.enqueue(Bytes::from_static(b"x"), Timestamp(0)).await.unwrap().durable().await.unwrap(); }
         let mut tail = intake.tail(LogOffset(9)).await.unwrap();
         let mut read = 0;
         while read < INTAKE_RETAINED_BEHIND + 100 { read += tail.poll(Duration::from_millis(10)).await.unwrap().len() as i64; }
+        assert!(intake.tail(LogOffset(-1)).await.is_ok(), "a reader asking for positions from before the intake started begins at its start");
         intake.trim();
         assert_eq!(intake.log.first_retained(), LogOffset(10 + 100), "everything but the retained window behind the reader is dropped");
+        assert!(intake.tail(LogOffset(50)).await.is_err(), "a trimmed position still fails");
     }
 }
