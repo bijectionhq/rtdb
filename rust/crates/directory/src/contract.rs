@@ -1,6 +1,9 @@
 //! The `Directory` contract suite: every backend runs it.
 
-use crate::{Cas, DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole, MemberState};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::{claim, now_ms, park, Cas, DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole, MemberState};
 
 /// Panics on the first violation.
 /// Uses fresh ids and names, so it can run against a shared, non-empty directory.
@@ -45,4 +48,46 @@ pub async fn run(directory: &dyn Directory) {
 
     let missing = DeploymentRecord::new(format!("missing-{suffix}"), "acme", vec![], 0);
     assert!(matches!(directory.replace_deployment(missing, 1).await.unwrap(), Cas::Conflict(None)), "replacing an absent record conflicts");
+}
+
+/// `EveryEpochHasOneClaimant` under contention: in each round, every claimant reads the deployment and races its claim through one of `directories`, and exactly one wins.
+/// The winner then parks, so the next round races for the next epoch.
+/// `directories` may be distinct clients of one shared directory.
+pub async fn concurrent_claims(directories: &[Arc<dyn Directory>], claimants: usize, rounds: usize) {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let admin = &directories[0];
+    let lease = now_ms() + 3_600_000;
+    let mut members = BTreeMap::new();
+    for index in 0..claimants {
+        let member = MemberRecord { id: MemberId(format!("claimant-{index}-{suffix}")), role: MemberRole::Node, address: String::new(), control_address: None,
+            availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: lease, state: MemberState::Eligible, version: 0 };
+        let registered = admin.register_member(member).await.expect("register claimant");
+        members.insert(registered.id.clone(), registered);
+    }
+    let members = Arc::new(members);
+    let id = admin.create_deployment(DeploymentRecord::new(format!("race-{suffix}"), "acme", vec![], 0)).await.expect("create").id;
+
+    let mut last_epoch = 0;
+    for round in 0..rounds {
+        let mut attempts = tokio::task::JoinSet::new();
+        for (index, claimant) in members.keys().cloned().enumerate() {
+            let directory = directories[index % directories.len()].clone();
+            let (members, id) = (members.clone(), id.clone());
+            attempts.spawn(async move {
+                let current = directory.deployment(&id).await.expect("read").expect("the deployment exists");
+                let next = claim(&current, &claimant, &members, now_ms())?;
+                directory.replace_deployment(next, current.version).await.expect("replace").applied()
+            });
+        }
+        let mut winners = Vec::new();
+        while let Some(attempt) = attempts.join_next().await {
+            winners.extend(attempt.expect("claimant task"));
+        }
+        assert_eq!(winners.len(), 1, "round {round}: exactly one claimant wins, not {winners:?}");
+        let won = winners.pop().unwrap();
+        assert!(won.epoch > last_epoch, "EpochsOnlyRise: {} after {last_epoch}", won.epoch);
+        let holder = won.holder.clone().expect("a claim names its holder");
+        let parked = park(&won, &holder, won.epoch).expect("the winner may park");
+        last_epoch = admin.replace_deployment(parked, won.version).await.expect("park").applied().expect("nobody else writes a held deployment").epoch;
+    }
 }

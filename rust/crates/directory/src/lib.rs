@@ -14,8 +14,18 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 
 pub mod policy;
+pub mod watch;
+#[cfg(feature = "network")]
+pub mod network;
+#[cfg(feature = "dynamodb")]
+pub mod dynamo;
 
 pub use policy::{claim, effective_holder, park};
+pub use watch::watch_deployment;
+#[cfg(feature = "network")]
+pub use network::{serve, RemoteDirectory};
+#[cfg(feature = "dynamodb")]
+pub use dynamo::{DynamoDirectory, DynamoTables};
 
 /// Bumped by the directory on every applied replace; the condition every replace is checked against.
 pub type Version = u64;
@@ -146,7 +156,7 @@ pub fn fnv16(bytes: &[u8]) -> u16 {
 }
 
 /// The outcome of a conditional replace.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cas<T> {
     /// The replace applied; this is the stored record, with its new version.
     Applied(T),
@@ -258,6 +268,12 @@ mod tests {
     #[tokio::test]
     async fn memory_directory_meets_the_contract() {
         contract::run(MemoryDirectory::new().as_ref()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_claims_on_memory_have_one_winner_per_epoch() {
+        let directory: Arc<dyn Directory> = MemoryDirectory::new();
+        contract::concurrent_claims(&[directory], 16, 25).await;
     }
 
     #[test]
