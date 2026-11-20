@@ -74,7 +74,7 @@ async fn registry_avro_records_become_documents_and_a_rule_failure_reaches_the_d
     let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 27)), Arc::new(MemoryLog::new(1 << 27)), StorageEpoch(0), StorageEpoch(0),
         rtdb_format::keys::CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
     let blocks = BlockStore::new(store, Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
-    let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), rtdb_replication::BlockDiscovery::List).await.unwrap();
     let partition = Arc::clone(&recovered.partition);
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let resolve = Arc::new(rtdb_tx::ResolveContext { database: "connect".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(),

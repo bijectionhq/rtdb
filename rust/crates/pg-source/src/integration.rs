@@ -79,7 +79,7 @@ async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_ex
     let memory = MemoryBudget::new(1 << 30); let store = Arc::new(MemoryStore::default()); let cache = Arc::new(BufferPool::new(store.clone(), 1 << 27));
     let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 27)), Arc::new(MemoryLog::new(1 << 27)), StorageEpoch(0), StorageEpoch(0), rtdb_format::keys::CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
     let blocks = BlockStore::new(store, Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
-    let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), rtdb_replication::BlockDiscovery::List).await.unwrap();
     let partition = Arc::clone(&recovered.partition); let progress = ProgressMonitor::new(recovered.progress.clone());
     let resolve = Arc::new(rtdb_tx::ResolveContext { database: "cdc".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
     let (handle, driver) = ReplicationDriver::new(ReplicationConfig { external_source: true, ..Default::default() }, logs, Arc::clone(&blocks), recovered, progress, resolve, Arc::new(Effects), CancellationToken::new()).unwrap();
@@ -102,7 +102,7 @@ async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_ex
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     cancellation.cancel(); source_job.await.unwrap().unwrap(); handle.shutdown(); replica_job.await.unwrap().unwrap();
-    let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), rtdb_replication::BlockDiscovery::List).await.unwrap();
     assert_eq!(crate::ResumeToken::decode(recovered.progress.external_token.as_deref().unwrap()).unwrap().lsn, durable);
     wait_for_slot_release(&mut control, &slot).await;
     control.query(&format!("SELECT pg_drop_replication_slot('{slot}')")).await.unwrap(); control.query(&format!("DROP PUBLICATION {publication}")).await.unwrap(); control.query(&format!("DROP TABLE {table}")).await.unwrap();

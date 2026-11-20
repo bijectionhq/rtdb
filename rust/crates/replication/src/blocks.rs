@@ -102,6 +102,16 @@ pub struct ProducedBlock {
     pub tries: BTreeMap<rtdb_types::TableRef, Vec<CatalogTrie>>,
 }
 
+/// How recovery finds a partition's latest block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockDiscovery {
+    /// Lists the block catalogs.
+    #[default]
+    List,
+    /// Probes forward from a block known to be published (none: from the first), one head per block, never listing; a hint naming a block that is gone falls back to listing.
+    From(Option<BlockIndex>),
+}
+
 pub struct BlockStore {
     store: Arc<dyn ObjectStore>,
     cache: Arc<BufferPool>,
@@ -114,13 +124,10 @@ impl BlockStore {
         TrieCatalog::new(file_size_target)?;
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
-    pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp) -> Result<RecoveredPartition> {
-        let directory = ObjectKey::new("blocks")?;
-        let latest = self.store.list(Some(&directory)).await?.into_iter()
-            .filter_map(|entry| block_index_from_key(entry.key.as_str()).ok().map(|index| (index, entry.key)))
-            .max_by_key(|(index, _)| *index);
+    pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery) -> Result<RecoveredPartition> {
+        let latest = self.latest_block(discovery).await?;
         let (block, table_blocks) = match latest {
-            Some((index, _)) => { let loaded = self.load(index).await?; (Some(loaded.0), loaded.1) }
+            Some(index) => { let loaded = self.load(index).await?; (Some(loaded.0), loaded.1) }
             None => (None, BTreeMap::new()),
         };
         let tables = TableCatalog::load(block.clone(), &table_blocks)?.with_system_tables()?;
@@ -134,6 +141,26 @@ impl BlockStore {
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         Ok(RecoveredPartition { partition, block, progress, fence, table_blocks }.with_source_floor(source_floor))
     }
+    async fn latest_block(&self, discovery: BlockDiscovery) -> Result<Option<BlockIndex>> {
+        let exists = |index: BlockIndex| async move {
+            match self.store.head_fresh(&ObjectKey::new(block_key(index)?)?).await {
+                Ok(_) => Ok(true),
+                Err(rtdb_storage::Error::MissingObject(_)) => Ok(false),
+                Err(error) => Err(rtdb_types::Anomaly::from(error)),
+            }
+        };
+        let mut latest = match discovery {
+            BlockDiscovery::From(Some(hint)) if exists(hint).await? => Some(hint),
+            BlockDiscovery::From(None) => None,
+            _ => {
+                let directory = ObjectKey::new("blocks")?;
+                return Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max());
+            }
+        };
+        while exists(BlockIndex(latest.map_or(0, |index| index.0 + 1))).await? { latest = Some(BlockIndex(latest.map_or(0, |index| index.0 + 1))); }
+        Ok(latest)
+    }
+
     async fn load_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
         let lease = self.cache.get(&ObjectKey::new(block_key(index)?)?).await?;
         let reservation = self.reserve_decode(lease.as_slice().len())?;

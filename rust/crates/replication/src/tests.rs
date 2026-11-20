@@ -45,7 +45,7 @@ async fn fixture_with_clock(config: ReplicationConfig, replica_message_limit: us
     let cache = Arc::new(BufferPool::new(store.clone(), 1 << 27));
     let logs = PartitionLogs::new(source.clone(), replica.clone(), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
-    let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
     let effects = Arc::new(NoEffects);
@@ -356,10 +356,14 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     fixture.driver.consume(raw(1, 1, 1, ReplicaBody::BlockUploaded(uploaded))).await.unwrap();
     assert_eq!(fixture.driver.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     assert_eq!(fixture.driver.partition.value().live().block_row_count(), 0);
-    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000)).await.unwrap();
-    assert_eq!(recovered.progress.tx_key, Some(key));
-    assert_eq!(recovered.fence.position(), TermPosition::Expecting(TermSequence(1)));
-    assert_eq!(recovered.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
+    use crate::BlockDiscovery::{From, List};
+    for discovery in [List, From(None), From(Some(BlockIndex(0))), From(Some(BlockIndex(5)))] {
+        let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), discovery).await.unwrap();
+        assert_eq!(recovered.block.as_ref().map(|block| block.block_index()), Some(BlockIndex(0)), "{discovery:?} finds the latest block");
+        assert_eq!(recovered.progress.tx_key, Some(key));
+        assert_eq!(recovered.fence.position(), TermPosition::Expecting(TermSequence(1)));
+        assert_eq!(recovered.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
+    }
 }
 
 #[tokio::test]
@@ -373,7 +377,7 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
     let pending = fixture.driver.pending_block.as_ref().unwrap();
     fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
     for (floor, expected) in [(SourcePosition(-1), SourcePosition(4)), (SourcePosition::from_epoch_offset(StorageEpoch(1), -1).unwrap(), SourcePosition::from_epoch_offset(StorageEpoch(1), -1).unwrap())] {
-        let recovered = fixture.blocks.recover(TrieConfig::default(), floor, Timestamp(1000)).await.unwrap();
+        let recovered = fixture.blocks.recover(TrieConfig::default(), floor, Timestamp(1000), crate::BlockDiscovery::List).await.unwrap();
         assert_eq!(recovered.progress.source_position, expected);
         assert_eq!(recovered.progress.tx_key, Some(TransactionKey { tx_id: TxId(7), system_time: Timestamp(800) }));
         assert_eq!(recovered.progress.external_token.as_deref(), Some(token.as_slice()));
@@ -414,7 +418,7 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     handle.shutdown();
     writer.await.unwrap().unwrap();
     assert!(status.borrow().last_block_upload_epoch_seconds > 0);
-    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000)).await.unwrap();
+    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), crate::BlockDiscovery::List).await.unwrap();
     assert_eq!(recovered.progress.tx_key.unwrap().tx_id, TxId(position.0));
     assert_eq!(recovered.partition.value().table_catalog().metadata(&TableRef::new("public", "docs")).unwrap().row_count, 1);
 }
@@ -425,7 +429,7 @@ async fn local_recovery_driver(
     let memory = MemoryBudget::new(1 << 28);
     let cache = Arc::new(BufferPool::new(store.clone(), 1 << 25));
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
-    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
@@ -667,7 +671,7 @@ async fn reopen_memory_checkpoint(fixture: &Fixture) -> (ReplicationHandle, Repl
 }
 
 async fn reopen_memory_checkpoint_with_config(fixture: &Fixture, config: ReplicationConfig) -> (ReplicationHandle, ReplicationDriver) {
-    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     assert!(recovered.confirmation(StorageEpoch(1), CURRENT_STORAGE_VERSION, StorageEpoch(0), &fixture.memory).unwrap().is_none());
     let progress = ProgressMonitor::new(recovered.progress.clone());
     ReplicationDriver::new(config, Arc::clone(&fixture.logs), Arc::clone(&fixture.blocks), recovered,
@@ -1541,7 +1545,7 @@ async fn placed_driver(replica: Arc<MemoryLog>, config: ReplicationConfig) -> (R
     let memory = MemoryBudget::new(1 << 28);
     let cache = Arc::new(BufferPool::new(store.clone(), 1 << 25));
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
-    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 20)), replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
