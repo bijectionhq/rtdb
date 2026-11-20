@@ -817,8 +817,8 @@ impl ReplicationDriver {
                             let slug = self.partition.value().table_catalog().entry(&table).map(|entry| entry.slug.clone());
                             self.partition.remove_artefacts(&table, entries.clone());
                             // The lane deletes the objects from the store next; this node's cached copies are its own to drop.
-                            let keys = slug.iter().flat_map(|slug| entries.iter().filter_map(move |(trie, record)| slug.artefact_key(trie, record.kind(), record.definition_id(), record.definition_version()).ok()));
-                            for key in keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<Vec<_>>() { let _ = self.resolve.storage.invalidate(&key).await; }
+                            let keys = slug.iter().flat_map(|slug| entries.iter().filter_map(move |(trie, record)| slug.recorded_artefact_key(trie, record).ok()));
+                            for key in keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<BTreeSet<_>>() { let _ = self.resolve.storage.invalidate(&key).await; }
                         }
                     }
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
@@ -1112,31 +1112,39 @@ fn additions(details: &[proto::TrieDetails]) -> Result<BTreeMap<TableRef, Vec<Ca
 /// Keeps the entries whose trie is live in the durable catalog under this node's storage version and epoch, and returns the object keys of refused entries to delete.
 /// Artefacts are advisory, so an entry that does not parse is dropped rather than faulting the log.
 /// An entry under another storage version or epoch is dropped without deleting: its key is computed here, under this node's storage root, and may name another builder's file.
+/// A group's object is deleted only when the catalog holds none of its members, since a member it still holds may take the same object later or be collected with it.
 fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::Snapshot, version: i32, epoch: i32) -> Vec<rtdb_storage::ObjectKey> {
     let entries = std::mem::take(&mut message.entries);
     let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) else { return Vec::new() };
     if message.storage_version != Some(version) || message.storage_epoch.unwrap_or_default() != epoch { return Vec::new(); }
     let slug = durable.table_entry(&table).map(|entry| entry.slug.clone());
-    let mut rejected = Vec::new();
+    let catalog = durable.trie_catalog();
+    let mut rejected = BTreeSet::new();
     for entry in entries {
         let (Ok(key), Some(record)) = (entry.trie_key.as_deref().unwrap_or_default().parse::<TrieKey>(), &entry.record) else { continue };
-        if durable.trie_catalog().iter_tries(&table).any(|trie| trie.key == key && trie.state == rtdb_index::TrieState::Live) { message.entries.push(entry); continue; }
-        if let Some(object) = slug.as_ref().and_then(|slug| slug.artefact_key(&key, record.kind(), record.definition_id(), record.definition_version()).ok()).and_then(|key| rtdb_storage::ObjectKey::new(key).ok()) {
-            rejected.push(object);
+        if catalog.trie(&table, &key).is_some_and(|trie| trie.state == rtdb_index::TrieState::Live) { message.entries.push(entry); continue; }
+        let Ok(owner) = rtdb_format::keys::ArtefactOwner::of(&key, record) else { continue };
+        if owner.tries().iter().any(|member| member != &key && catalog.trie(&table, member).is_some()) { continue; }
+        if let Some(object) = slug.as_ref().and_then(|slug| slug.owner_artefact_key(&owner, record.kind(), record.definition_id(), record.definition_version()).ok()).and_then(|key| rtdb_storage::ObjectKey::new(key).ok()) {
+            rejected.insert(object);
         }
     }
-    rejected
+    rejected.into_iter().collect()
 }
 
 /// The objects of collected tries this node may hold copies of: data, meta, and the artefacts their entries record.
+/// A group's artefact goes only with the last member the catalog holds.
 fn cached_objects(value: &rtdb_index::PartitionValue, table: &TableRef, keys: &BTreeSet<TrieKey>) -> Vec<rtdb_storage::ObjectKey> {
     let Some(entry) = value.table_catalog().entry(table) else { return Vec::new() };
     let tries = value.trie_catalog();
-    keys.iter().flat_map(|key| {
-        let artefacts = tries.iter_tries(table).filter(|trie| &trie.key == key).flat_map(|trie| trie.artefacts.iter())
-            .filter_map(|record| entry.slug.artefact_key(key, record.kind(), record.definition_id(), record.definition_version()).ok());
+    let objects: BTreeSet<String> = keys.iter().flat_map(|key| {
+        let artefacts = tries.trie(table, key).into_iter().flat_map(|trie| trie.artefacts.iter())
+            .filter_map(|record| rtdb_format::keys::ArtefactOwner::of(key, record).ok().map(|owner| (owner, record)))
+            .filter(|(owner, _)| owner.tries().iter().all(|member| keys.contains(member) || tries.trie(table, member).is_none()))
+            .filter_map(|(owner, record)| entry.slug.owner_artefact_key(&owner, record.kind(), record.definition_id(), record.definition_version()).ok());
         [entry.slug.data_key(key), entry.slug.metadata_key(key)].into_iter().chain(artefacts).collect::<Vec<_>>()
-    }).filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect()
+    }).collect();
+    objects.into_iter().filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect()
 }
 
 fn artefact_entries(entries: &[proto::ArtefactEntry]) -> Vec<(TrieKey, proto::ArtefactRecord)> {

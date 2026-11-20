@@ -968,6 +968,7 @@ rule LeaderProcessesArtefactsAdded {
     -- Artefacts from an artefact lane, forwarded to the replica log, where every node records them on its trie catalog, this one included.
     -- An entry is accepted when its trie is live in the leader's durable catalog and its storage version and epoch are the leader's.
     -- The leader deletes the file of an entry whose trie is not live: a reader treats a missing artefact as absent, so deleting one is never wrong, and a file nothing records would otherwise wait for its trie's collection.
+    -- A group-scoped entry's file is deleted only while the catalog holds none of the group's other members: one it holds may record the file, and is collected with it otherwise.
     -- An entry under another storage version or epoch, or one that does not parse, is dropped without deleting anything, the key this node would compute for it being under its own storage root.
     -- The deletes run beside resolution, never ahead of it.
     -- The message is forwarded even with no entry accepted, because it carries the source watermark forward.
@@ -986,8 +987,9 @@ rule LeaderProcessesArtefactsAdded {
             source_msg_id: msg.msg_id
         ))
         for entry in msg.entries
-            where not accepted.contains(entry) and storage_matches(msg):
-            ObjectStoreDelete(trie_cat/artefact_key(msg.table, entry.trie_key, entry.record.kind, entry.record.definition_id, entry.record.definition_version))
+            where not accepted.contains(entry) and storage_matches(msg)
+              and (entry.record.scope = trie or trie_cat/group_members(msg.table, part_group(entry.trie_key)).all(m => m.trie_key = entry.trie_key)):
+            ObjectStoreDelete(trie_cat/recorded_artefact_key(msg.table, entry.trie_key, entry.record))
 
         log_processor.last_resolved_src_msg_id = msg.msg_id
 }
@@ -1399,7 +1401,7 @@ rule HandleReplicaMessage {
                 trie_cat/trie_catalog.withoutArtefacts(msg.table, msg.entries)
                 -- The lane deletes the objects from the store; each node drops its own cached copies.
                 for entry in msg.entries:
-                    NodeCacheInvalidate(trie_cat/artefact_key(msg.table, entry.trie_key, entry.record.kind, entry.record.definition_id, entry.record.definition_version))
+                    NodeCacheInvalidate(trie_cat/recorded_artefact_key(msg.table, entry.trie_key, entry.record))
             watchers.notifyMsg(msg.source_msg_id)
 
         if msg.kind = TriesDeletedMessage:
@@ -1763,6 +1765,7 @@ open question "What processing obligations apply to a database opened with index
 
 -- Black box helpers for artefacts:
 --   accepted_artefacts(msg)  — the entries whose trie the leader's durable catalog holds live, under the leader's storage version and epoch
+--   part_group(trie_key)     — the partition group a tiered trie belongs to (trie-cat.allium: PartGroup)
 --   storage_matches(msg)     — whether the message's storage version and epoch are the leader's
 --   ObjectStoreDelete(key)   — as in gc.allium
 --   NodeCacheInvalidate(key) — drop this node's cached copies of the object, leaving the store's untouched (storage/src/cache.rs: BufferPool::invalidate)

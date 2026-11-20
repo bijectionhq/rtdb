@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_types::CivilDate;
-use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::TrieKey, log::proto as log_pb};
+use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{PartGroup, TrieKey}, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +186,14 @@ impl TrieCatalog {
     }
     pub fn current_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         self.all_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).collect()
+    }
+    /// The entry the catalog holds for `key`, live, nascent or garbage.
+    pub fn trie(&self, table: &TableRef, key: &TrieKey) -> Option<&CatalogTrie> {
+        self.tables.get(table)?.shards.get(&Shard::of(key))?.tries.get(&key.block_index()).filter(|trie| &trie.key == key)
+    }
+    /// The entries the catalog holds for a partition group's members, in bucket order; a member it does not hold is left out.
+    pub fn group_members(&self, table: &TableRef, group: &PartGroup) -> Vec<&CatalogTrie> {
+        group.members().iter().filter_map(|key| self.trie(table, key)).collect()
     }
     pub(crate) fn has_current_tries(&self, table: &TableRef) -> bool {
         self.iter_tries(table).any(|trie| trie.state == TrieState::Live)

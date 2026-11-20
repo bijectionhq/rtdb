@@ -59,7 +59,7 @@ impl ArtefactBuilder for SearchBuilder {
         Ok(definitions.iter().map(|definition| {
             let id = definition.artefact_id();
             columns.insert((id.clone(), definition.version), definition.columns.clone());
-            ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version, historical: definition.history }
+            ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version, historical: definition.history, group_bytes: None }
         }).collect())
     }
 
@@ -73,7 +73,7 @@ impl ArtefactBuilder for SearchBuilder {
             let recorded = snapshot.trie_catalog().iter_tries(&suspect.table)
                 .any(|trie| trie.key == suspect.trie && trie.state == rtdb_index::TrieState::Live && trie.artefact(KIND, &suspect.artefact_id, suspect.version).is_some());
             match definition {
-                Some(definition) if recorded => jobs.push(ArtefactJob { definition: definition.clone(), trie: suspect.trie.clone() }),
+                Some(definition) if recorded => jobs.push(ArtefactJob { definition: definition.clone(), owner: rtdb_format::keys::ArtefactOwner::Trie(suspect.trie.clone()) }),
                 _ => self.runtime.clear(&suspect),
             }
         }
@@ -84,18 +84,18 @@ impl ArtefactBuilder for SearchBuilder {
 
     async fn build(&self, job: &ArtefactJob, source: rtdb_maintenance::ArtefactSource<'_>, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         let definition = &job.definition;
-        let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), trie: job.trie.clone(), artefact_id: definition.id.clone(), version: definition.version };
+        let rtdb_format::keys::ArtefactOwner::Trie(trie) = &job.owner else { return Err(Anomaly::unsupported("rtdb.search/group-job", "Search files cover one trie each")) };
+        let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), trie: trie.clone(), artefact_id: definition.id.clone(), version: definition.version };
         let repairing = matches!(source, rtdb_maintenance::ArtefactSource::Stored) && self.runtime.is_suspect(&suspect);
-        let record = || ArtefactRecord { kind: Some(KIND.into()), definition_id: Some(definition.id.clone()), definition_version: Some(definition.version), stats: None };
+        let record = || ArtefactRecord { kind: Some(KIND.into()), definition_id: Some(definition.id.clone()), definition_version: Some(definition.version), stats: None, scope: None };
         let known = self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned();
         let columns = match known { Some(columns) => columns, None => {
             self.definitions(snapshot, cancellation).await?;
             self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned().ok_or_else(|| Anomaly::incorrect("rtdb.search/definition-dropped", "The search index definition is no longer in force"))?
         } };
         let entry = snapshot.table_catalog().entry(&definition.table).ok_or_else(|| Anomaly::fault("rtdb.search/unknown-table", "Search job targets a table the catalog does not hold"))?;
-
-        let identity = format!("{}/{}/{}-v{}", entry.slug.as_str(), job.trie, definition.id, definition.version);
-        let key = ObjectKey::new(entry.slug.artefact_key(&job.trie, KIND, &definition.id, definition.version)?)?;
+        let identity = format!("{}/{}/{}-v{}", entry.slug.as_str(), trie, definition.id, definition.version);
+        let key = ObjectKey::new(entry.slug.artefact_key(trie, KIND, &definition.id, definition.version)?)?;
         if repairing {
             // Often only this node's cached copy was bad, so the object is read afresh before anything is rebuilt.
             self.runtime.forget_file(&self.database, &key);
@@ -116,8 +116,8 @@ impl ArtefactBuilder for SearchBuilder {
         let (input, trie_size) = match source {
             rtdb_maintenance::ArtefactSource::Local { data, size } => (std::fs::File::open(data).map_err(fault)?, i64::try_from(size).unwrap_or(i64::MAX)),
             rtdb_maintenance::ArtefactSource::Stored => {
-                let size = snapshot.trie_catalog().iter_tries(&definition.table).find(|trie| trie.key == job.trie).map_or(0, |trie| trie.data_file_size);
-                (download(self.store.as_ref(), &self.memory, &ObjectKey::new(entry.slug.data_key(&job.trie))?, &workdir.path().join("input.arrow"), cancellation).await?, size)
+                let size = snapshot.trie_catalog().trie(&definition.table, trie).map_or(0, |trie| trie.data_file_size);
+                (download(self.store.as_ref(), &self.memory, &ObjectKey::new(entry.slug.data_key(trie))?, &workdir.path().join("input.arrow"), cancellation).await?, size)
             }
         };
         let indexing = self.memory.reserve(indexing_allowance(trie_size))?;

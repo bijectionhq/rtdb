@@ -63,8 +63,12 @@ impl SegmentCompactor {
         for builder in &self.artefacts {
             let Ok(definitions) = builder.definitions(snapshot, cancellation).await else { continue };
             for definition in definitions.into_iter().filter(|definition| &definition.table == table && crate::wants(definition, trie, size_signed, snapshot.trie_catalog().file_size_target())) {
-                let job = crate::ArtefactJob { definition, trie: trie.clone() };
-                if let Ok(record) = builder.build(&job, crate::ArtefactSource::Local { data, size }, snapshot, cancellation).await { records.push(record); }
+                // Tiered compaction publishes one bucket at a time; the lane sees the whole group once it is live.
+                if trie.part_group().is_some() && definition.group_bytes.is_some_and(|limit| size_signed <= limit) { continue; }
+                let job = crate::ArtefactJob { definition, owner: rtdb_format::keys::ArtefactOwner::Trie(trie.clone()) };
+                if let Ok(record) = builder.build(&job, crate::ArtefactSource::Local { data, size }, snapshot, cancellation).await {
+                    records.push(rtdb_format::log::proto::ArtefactRecord { scope: Some(job.scope() as i32), ..record });
+                }
             }
         }
         records

@@ -29,19 +29,38 @@ value TrieDetails {
     trie_metadata: TrieMetadata
     trie_state: TrieState
     garbage_as_of: Instant?
-    -- Files derived from this trie's data file, at most one per (kind, definition id, definition version).
+    -- Files derived from this trie's data file, or from its partition group's data files, at most one per (kind, definition id, definition version).
     -- Empty for a trie no artefact lane has reached.
     artefacts: List<ArtefactRecord>
 }
 
 value ArtefactRecord {
-    -- One file derived from a trie's data file, such as a search file (fts.allium).
+    -- One file derived from a trie's data file, or from its partition group's, such as a search file (fts.allium).
     -- See: log/proto/log.proto (ArtefactRecord), index/src/trie_catalog.rs
     kind: String
     definition_id: String
     definition_version: Integer
     -- Opaque to the catalog: the artefact kind owns its encoding.
     stats: Bytes
+    -- A record without one is its trie's.
+    scope: ArtefactScope
+}
+
+-- trie: derived from its trie's data file alone, and stored under the trie's artefact prefix.
+-- part_group: derived from every member's data file of its trie's partition group, stored once under the group's artefact prefix, and recorded alike on each member's entry.
+enum ArtefactScope { trie | part_group }
+
+value PartGroup {
+    -- The branch_factor sibling tries one tiered compaction job writes at one block (rule InsertTrie_General): the same level, recency and parent part, one per bucket.
+    -- Only tiered tries belong to one: current tries at level 2 and up, and historical tries at level 3 and up.
+    -- The members become live together and are each superseded on their own, so a group-scoped artefact serves whichever members are live.
+    -- See: format/src/keys.rs (PartGroup)
+    level: Long
+    recency: LocalDate?
+    parent_part: Bytes
+    block_index: Long
+
+    -- Serialised as the members' key with `g` for `l` and the members' own bucket dropped, e.g. g02-rc-b05 for l02-rc-p0-b05 to l02-rc-p3-b05.
 }
 
 value TrieMetadata {
@@ -152,6 +171,9 @@ entity TrieCatalog {
     -- artefact_prefix(table, trie_key): tables/<slug>/artefacts/<trie_key>, under which every artefact of the trie lives.
     -- artefact_key(table, trie_key, kind, definition_id, definition_version): <prefix>/<kind>/<definition_id>-v<definition_version>.bin.
     --   A function of its arguments alone, so every builder of one job writes to one key.
+    -- group_members(table, group): the entries the catalog holds for the group's members, live, nascent or garbage; a member it does not hold is left out.
+    -- group_artefact_prefix(table, group): tables/<slug>/artefacts/<group>, under which every artefact of the group lives.
+    -- recorded_artefact_key(table, trie_key, record): artefact_key under the trie's prefix for a trie-scoped record, and under its group's prefix for a group-scoped one.
     tries: Map<TableRef, Map<Shard, ShardState>>
 }
 
