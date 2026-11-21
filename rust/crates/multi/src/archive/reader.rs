@@ -347,6 +347,7 @@ struct StageObjects {
 
 #[async_trait::async_trait]
 impl ObjectStore for StageObjects {
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.files.supports_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         self.objects
             .get(key)

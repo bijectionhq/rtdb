@@ -265,6 +265,12 @@ fn joined_union(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalTyp
 /// Interleaves cells of arrays sharing one layout; a dense union gathers each leg's children in bulk, where Arrow's
 /// generic path would extend the union one cell at a time.
 pub(crate) fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Result<ArrayRef> {
+    if let Some(&(source, start)) = cells.first()
+        && let Some(array) = arrays.get(source)
+        && start.checked_add(cells.len()).is_some_and(|end| end <= array.len())
+        && cells.iter().enumerate().all(|(offset, &(index, row))| index == source && row == start + offset) {
+        return Ok(array.slice(start, cells.len()));
+    }
     let DataType::Union(fields, arrow_schema::UnionMode::Dense) = arrays.first().map(|array| array.data_type()).ok_or_else(|| invalid("column-gather", "Nothing to interleave"))? else {
         return arrow_select::interleave::interleave(arrays, cells).map_err(|error| invalid("column-gather", error));
     };
@@ -285,6 +291,15 @@ pub(crate) fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Res
         arrow_select::interleave::interleave(&children, &picks[id as usize]).map_err(|error| invalid("column-gather", error))
     }).collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(UnionArray::try_new(fields.clone(), datafusion_common::arrow::buffer::ScalarBuffer::from(ids), Some(datafusion_common::arrow::buffer::ScalarBuffer::from(offsets)), children).map_err(|error| invalid("column-gather", error))?))
+}
+
+#[test]
+fn interleaving_a_contiguous_range_keeps_its_input_buffer() {
+    let values = arrow_array::Int64Array::from(vec![10, 20, 30, 40]);
+    let selected = interleave(&[&values], &[(0, 1), (0, 2)]).unwrap();
+    let selected = selected.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+    assert_eq!(selected.values().as_ref(), &[20, 30]);
+    assert_eq!(selected.values().as_ptr(), values.values()[1..].as_ptr());
 }
 
 pub(crate) fn flat(data_type: &DataType) -> bool {

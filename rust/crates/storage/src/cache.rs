@@ -169,6 +169,7 @@ impl AsRef<[u8]> for CacheLease {
 
 impl CacheLease {
     pub fn as_slice(&self) -> &[u8] { &self.allocation.as_slice()[self.range.clone()] }
+    pub fn is_partial_allocation(&self) -> bool { self.range.len() != self.allocation.len() }
 
     /// The slice retains the entire allocation and its byte reservation.
     pub fn slice(&self, range: Range<usize>) -> Result<Self> {
@@ -322,6 +323,22 @@ impl BufferPool {
     pub async fn get_range_or(&self, key: &ObjectKey, range: Range<u64>, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
         if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
         self.fetch(key, range, |length| self.budget.reserve(length).or_else(|_| reserve_from(fallback, length))).await
+    }
+
+    pub async fn scan_length(&self, key: &ObjectKey) -> Result<u64> {
+        if let Some(entry) = self.held(key) {
+            if let Some(allocation) = entry.allocation.lock().await.as_ref() { return Ok(allocation.len() as u64); }
+        }
+        Ok(self.store.head(key).await?.size)
+    }
+
+    pub async fn scan_range(&self, key: &ObjectKey, range: Range<u64>, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
+        if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
+        let length = range.end.checked_sub(range.start).and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| Error::Task("Scan range is inverted or exceeds addressable memory".into()))?;
+        let reservation = ReadReservation::new(length, self.budget.reserve(length).or_else(|_| reserve_from(fallback, length))?);
+        let allocation = Arc::new(self.store.get_reserved_scan_range(key, range, reservation).await?);
+        Ok(CacheLease { allocation, range: 0..length })
     }
 
     /// As `get`, except that an object the pool cannot admit is read whole under `fallback`, and not kept.

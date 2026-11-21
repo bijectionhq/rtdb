@@ -82,6 +82,8 @@ impl RetainedBytes {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Whether a scan can read a slice without repeatedly loading the whole object.
+    fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { true }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.
@@ -99,6 +101,10 @@ pub trait ObjectStore: Send + Sync {
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
         reservation.finish(self.get_range(key, range).await?)
+    }
+    /// Reads part of an object without filling a whole-object disk cache on a miss.
+    async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        self.get_reserved_range(key, range, reservation).await
     }
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
@@ -180,6 +186,20 @@ pub struct LocalFile { file: std::fs::File, _lease: Option<crate::disk_cache::Di
 impl LocalFile {
     pub(crate) fn new(file: std::fs::File, lease: Option<crate::disk_cache::DiskLease>) -> Self { Self { file, _lease: lease } }
     pub fn file(&self) -> &std::fs::File { &self.file }
+}
+
+pub(crate) fn map_range(file: LocalFile, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+    reservation.check_range(&range)?;
+    let length = file.file().metadata().map_err(|error| Error::io(Path::new(key.as_str()), error))?.len();
+    let range = checked_range(key, range, length)?;
+    if range.is_empty() { return reservation.finish(Bytes::new()); }
+
+    struct MappedRange { map: memmap2::Mmap, _lease: Option<crate::disk_cache::DiskLease> }
+    impl AsRef<[u8]> for MappedRange { fn as_ref(&self) -> &[u8] { &self.map } }
+    // SAFETY: object files are published atomically and never modified in place. The retained file also pins any disk-cache entry.
+    let map = unsafe { memmap2::MmapOptions::new().offset(range.start as u64).len(range.len()).map(file.file()) }
+        .map_err(|error| Error::io(Path::new(key.as_str()), error))?;
+    reservation.finish(Bytes::from_owner(MappedRange { map, _lease: file._lease }))
 }
 
 pub struct LocalStore {
@@ -321,6 +341,11 @@ impl ObjectStore for LocalStore {
         reservation.check_range(&range)?;
         let (path, key) = (self.path(key), key.clone());
         self.io.run(move || reservation.finish(read_local_range(&path, &key, range)?)).await
+    }
+
+    async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        let (path, key) = (self.path(key), key.clone());
+        self.io.run(move || map_range(LocalFile::new(open_object(&path, &key)?, None), &key, range, reservation)).await
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {

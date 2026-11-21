@@ -5009,11 +5009,13 @@ name = "rtdb-query"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
  "arrow-select",
  "async-stream",
  "async-trait",
+ "bytes",
  "chrono",
  "datafusion-common",
  "datafusion-expr",
@@ -5214,6 +5216,7 @@ dependencies = [
  "fs2",
  "futures",
  "libc",
+ "memmap2",
  "object_store",
  "parking_lot",
  "percent-encoding",

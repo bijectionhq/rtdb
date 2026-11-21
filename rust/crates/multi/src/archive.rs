@@ -229,6 +229,7 @@ struct CheckpointStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for CheckpointStore {
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { !self.archive.objects.contains_key(key) && self.serving.supports_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         match self.archive.objects.get(key) {
             Some(object) => Ok(StoredObject { key: key.clone(), size: object.bytes }),
