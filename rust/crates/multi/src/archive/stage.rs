@@ -27,6 +27,8 @@ use crate::{
     },
 };
 
+pub(super) const STAGED_MANIFEST: &str = "~checkpoint-stage";
+
 /// Stage ciphertext in the capture's original cell. The source keeps its
 /// current authority. The target remains held with no placement or log;
 /// its historical application state must be readmitted before activation.
@@ -207,7 +209,7 @@ fn staged(
 
 /// Keep the archive key or target upload under its original directory
 /// inventory until all asynchronous storage operations have drained.
-async fn with_region<T, F, Fut>(
+pub(super) async fn with_region<T, F, Fut>(
     directory: &dyn Directory,
     keys: &dyn KeyService,
     deployment: &str,
@@ -316,7 +318,7 @@ async fn copy_checkpoint(
     );
     crate::store::confirm_root(&destination, &target.id, true).await?;
     let mut objects = Vec::with_capacity(capture.objects.len());
-    let manifest_name = key("~checkpoint-stage")?;
+    let manifest_name = key(STAGED_MANIFEST)?;
     let mut expected = BTreeSet::from([key(ROOT_MARKER)?, manifest_name.clone()]);
     for object in &capture.objects {
         let name = key(&object.name)?;

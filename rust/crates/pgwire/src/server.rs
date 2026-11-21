@@ -42,6 +42,9 @@ pub struct ServerDriver { listener: TcpListener, config: Arc<ServerConfig>, node
 impl ServerDriver {
     pub async fn bind(config: ServerConfig, node: Node, auth: Arc<Authenticator>) -> Result<(ServerHandle, Self)> {
         if config.maximum_connections == 0 || config.maximum_message_bytes < 4 || config.maximum_message_bytes > 0x3fff_ffff || config.authentication_timeout.is_zero() { return Err(Anomaly::incorrect("xtdb.pgwire/configuration", "PostgreSQL capacities and authentication timeout must be positive")); }
+        if config.require_tls && config.tls.is_none() {
+            return Err(Anomaly::incorrect("xtdb.pgwire/configuration", "This listener requires a TLS identity"));
+        }
         let listener = TcpListener::bind(config.address).await.map_err(network)?;
         let address = listener.local_addr().map_err(network)?;
         let shutdown = node.cancellation().child_token();

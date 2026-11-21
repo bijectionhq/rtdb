@@ -1,6 +1,6 @@
 //! Assembling the cell's processes: a node (server, agent, lease, control listener) and a logkeeper (server and lease).
 
-mod standalone;
+pub(crate) mod standalone;
 
 pub use standalone::{STANDALONE_PROTOCOL, StandaloneSettings, initialize_standalone, serve_standalone};
 

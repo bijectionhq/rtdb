@@ -47,6 +47,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
        rtdb-multi stage-checkpoint --directory DIR --archive-root PATH --storage-root PATH --keys PATH --stage-request FILE [--ecs-cluster ARN]\n\
+       rtdb-multi read-checkpoint-stage --directory DIR --storage-root PATH --keys PATH --id UUID --operation UUID --manifest-sha256 SHA256 --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--ecs-cluster ARN] [--parent-stdin]\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for the deployments, deployment-names, members and stopped-tasks tables\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
@@ -283,6 +284,16 @@ fn required_uuid(arguments: &Arguments, name: &str) -> Result<uuid::Uuid> {
         .ok_or_else(|| usage(format!("--{name} must be a canonical, nonzero UUID")))
 }
 
+fn watch_parent(arguments: &Arguments, cancellation: &CancellationToken) {
+    if arguments.present("parent-stdin") {
+        let stop = cancellation.clone();
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            stop.cancel();
+        });
+    }
+}
+
 async fn run(arguments: Vec<String>) -> Result<()> {
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
     if command == "--build-info" {
@@ -313,13 +324,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             process::initialize_standalone(std::path::Path::new(arguments.required("state")?), arguments.required("name")?, installation_id(&arguments)?).await
         }
         "standalone" => {
-            if arguments.present("parent-stdin") {
-                let stop = cancellation.clone();
-                std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-                    stop.cancel();
-                });
-            }
+            watch_parent(&arguments, &cancellation);
             process::serve_standalone(process::StandaloneSettings {
                 root: arguments.required("state")?.into(),
                 name: arguments.required("name")?.into(),
@@ -595,6 +600,27 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 directory, &archive, &storage, keys.as_ref(), intent, hosted_task(&arguments)?,
             ).await?;
             println!("{}", serde_json::to_string(&receipt).expect("a stage receipt serializes"));
+        }
+        "read-checkpoint-stage" => {
+            if std::env::var_os("RTDB_TRANSFER_BINDING").is_some() {
+                return Err(usage("Checkpoint inspection requires a recovery operator".into()));
+            }
+            let directory = directory(arguments.required("directory")?).await?;
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let settings = rtdb_multi::archive::StagedReaderSettings {
+                destination: installation_id(&arguments)?,
+                operation: required_uuid(&arguments, "operation")?,
+                manifest_sha256: arguments.required("manifest-sha256")?.to_owned(),
+                certificate: arguments.required("certificate")?.into(),
+                private_key: arguments.required("private-key")?.into(),
+                password_file: arguments.required("password-file")?.into(),
+                ready_file: arguments.required("ready-file")?.into(),
+            };
+            watch_parent(&arguments, &cancellation);
+            rtdb_multi::archive::serve_staged_checkpoint(
+                directory, &storage, keys.as_ref(), settings, hosted_task(&arguments)?, cancellation,
+            ).await
         }
         "restore" => {
             let directory = directory(arguments.required("directory")?).await?;

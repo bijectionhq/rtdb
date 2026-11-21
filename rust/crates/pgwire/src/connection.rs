@@ -89,7 +89,13 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
             80877104 => return Err(protocol("GSSAPI is not supported")),
             80877102 => { let process = input.integer()?; let _secret = input.integer()?; input.end()?; registry.cancel(process); return Ok(None); }
             196608 => {
+                if config.require_tls && !encrypted {
+                    return Err(protocol("This PostgreSQL listener requires TLS"));
+                }
                 let mut requested = input.startup()?; input.end()?;
+                if requested.keys().any(|key| key.eq_ignore_ascii_case(crate::config::CHECKPOINT_STAGE_PARAMETER)) {
+                    return Err(protocol("The checkpoint stage is assigned by the reader"));
+                }
                 let capability = requested.remove(CAPABILITY_PARAMETER);
                 let database = requested.get("database").map_or("xtdb", String::as_str);
                 if config.playground { node.database_or_attach(database.to_owned(), Default::default()).await?; }

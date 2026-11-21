@@ -1784,6 +1784,18 @@ rule StageHistoricalCheckpoint {
         KeepPlacementAndLogsClosed(target)
 }
 
+rule ReadHeldCheckpoint {
+    when: HeldStageReadRequested(target, operation, inventory_digest)
+
+    requires: ExactHeldStage(target, operation, inventory_digest)
+
+    ensures:
+        AcquireHeldStageStorageRegion(target)
+        VerifyAndReadFrozenInventory(target, inventory_digest)
+        AuthenticateReaderAsOriginalCapture(target)
+        DrainReadersBeforeReleasingStageStorage(target)
+}
+
 rule RetireCheckpointArchives {
     when: RecoveryRetirementAuthorized(record)
 

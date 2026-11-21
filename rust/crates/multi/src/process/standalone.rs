@@ -282,7 +282,7 @@ fn digest(key: &[u8; 32]) -> String {
         .encode(ring::digest::digest(&ring::digest::SHA256, key))
 }
 
-fn gateway_tls(certificate: &Path, key: &Path) -> Result<Arc<rustls::ServerConfig>> {
+pub(crate) fn gateway_tls(certificate: &Path, key: &Path) -> Result<Arc<rustls::ServerConfig>> {
     let chain = CertificateDer::pem_file_iter(certificate)
         .map_err(|error| invalid(error.to_string()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -299,7 +299,7 @@ fn gateway_tls(certificate: &Path, key: &Path) -> Result<Arc<rustls::ServerConfi
     Ok(Arc::new(config))
 }
 
-fn read_bounded(path: &Path, maximum: usize) -> Result<String> {
+pub(crate) fn read_bounded(path: &Path, maximum: usize) -> Result<String> {
     if !fs::symlink_metadata(path).map_err(io)?.is_file() {
         return Err(invalid(
             "The standalone RTDB configuration must be a regular file",
@@ -317,7 +317,7 @@ fn read_bounded(path: &Path, maximum: usize) -> Result<String> {
     Ok(text)
 }
 
-fn write_private(path: &Path, value: &impl Serialize, durable: bool) -> Result<()> {
+pub(crate) fn write_private(path: &Path, value: &impl Serialize, durable: bool) -> Result<()> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]

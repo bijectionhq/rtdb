@@ -174,6 +174,13 @@ placement, logkeeper ensemble or published checkpoint. The application
 restore owner must admit its historical state before the target can serve.
 Backing out uses ordinary exact-residence disposal.
 
+`rtdb-multi read-checkpoint-stage` holds the exact staged inventory open on a
+private loopback TLS reader. It authenticates the stage during PgWire startup,
+exposes only its frozen block, and joins the reader's I/O before releasing its
+storage admission. The reader has no disk cache or access to the source's
+application key vault. A consuming restore owner must apply current
+application custody and erasure authority before releasing protected data.
+
 `rtdb-multi restore` accepts the live directory's current checkpoint with
 the original archive manifest and current key. It records a restore intent,
 fences the old writer at the logkeepers, and verifies the objects. The

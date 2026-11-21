@@ -77,6 +77,25 @@ impl EnsembleRecorder for DirectoryRecorder {
     }
 }
 
+/// A frozen checkpoint's logs end at its original boundary. They do not
+/// consult a live ensemble and never resolve a new transaction.
+pub(crate) fn frozen_checkpoint(
+    checkpoint: rtdb_directory::Checkpoint,
+    epoch: StorageEpoch,
+    maximum_message_bytes: usize,
+) -> Result<OpenedLogs> {
+    let end = |position: i64| position.checked_add(1).filter(|next| *next >= 0)
+        .ok_or_else(|| Anomaly::incorrect("rtdb.multi/checkpoint-boundary", "Invalid frozen checkpoint boundary"));
+    let replica = Arc::new(MemoryLog::starting_at(maximum_message_bytes, LogOffset(end(checkpoint.boundary)?)));
+    let start = end(checkpoint.source)?;
+    let intake = Arc::new(IntakeLog {
+        log: MemoryLog::starting_at(maximum_message_bytes, LogOffset(start)),
+        consumed: Arc::new(AtomicI64::new(start - 1)),
+        start,
+    });
+    Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, drivers: Vec::new() })
+}
+
 #[async_trait]
 impl LogFactory for LogkeeperLogFactory {
     async fn open(&self, configuration: &Any, access: LogAccess, cancellation: CancellationToken) -> Result<OpenedLogs> {
@@ -84,11 +103,7 @@ impl LogFactory for LogkeeperLogFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/log-config", format!("Logkeeper log configuration is malformed: {error}")))?;
         let epoch = StorageEpoch(config.log_epoch);
         if let Some(checkpoint) = config.frozen_at {
-            // A snapshot's logs are empty and end where its block does: there is nothing to replay, and they never advance.
-            let replica = Arc::new(MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(checkpoint.boundary + 1)));
-            let start = checkpoint.source + 1;
-            let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(start)), consumed: Arc::new(AtomicI64::new(start - 1)), start });
-            return Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, drivers: Vec::new() });
+            return frozen_checkpoint(checkpoint, epoch, self.maximum_message_bytes);
         }
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
         let quorum: Arc<dyn Log> = match access {
