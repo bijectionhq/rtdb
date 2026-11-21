@@ -131,7 +131,8 @@ pub enum BlockDiscovery {
     /// Lists the block catalogs.
     #[default]
     List,
-    /// Probes forward from a block known to have been published, one head per block, never listing; a hint naming a block that is gone falls back to listing.
+    /// Probes forward from a known block, one head per block.
+    /// A missing hint or checkpoint metadata triggers ordinary discovery by listing.
     From(BlockIndex),
     /// Recovers exactly this block, for a reader of the state as of it.
     At(BlockIndex),
@@ -150,7 +151,8 @@ impl BlockStore {
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
     pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery) -> Result<RecoveredPartition> {
-        self.recover_selected(config, source_floor, now, self.latest_block(discovery).await?).await
+        let latest = self.latest_block(discovery).await?;
+        self.recover_selected(config, source_floor, now, latest, !matches!(discovery, BlockDiscovery::At(_))).await
     }
 
     /// Admit the replica cursor for ordinary recovery at the selected checkpoint.
@@ -173,19 +175,29 @@ impl BlockStore {
                 };
                 let previous = recovered.block.as_ref().map(BlockCatalog::block_index);
                 drop(recovered);
-                let Some(newer) = self.latest_block(BlockDiscovery::List).await?
-                    .filter(|newer| previous.is_none_or(|previous| newer.0 > previous.0)) else {
+                let Some(newer) = self.newer_block(previous).await? else {
                     return Err(gap.into());
                 };
-                recovered = self.recover_selected(config, source_floor, now, Some(newer)).await?;
+                recovered = self.recover_selected(config, source_floor, now, Some(newer), true).await?;
             }
         };
         cancellation.run_until_cancelled(work).await.ok_or_else(crate::progress::cancelled)?
     }
 
-    async fn recover_selected(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, latest: Option<BlockIndex>) -> Result<RecoveredPartition> {
+    async fn recover_selected(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp,
+        latest: Option<BlockIndex>, refresh: bool) -> Result<RecoveredPartition> {
         let (block, table_blocks) = match latest {
-            Some(index) => { let loaded = self.load(index).await?; (Some(loaded.0), loaded.1) }
+            Some(mut index) => loop {
+                match self.load(index).await {
+                    Ok((catalog, tables)) => break (Some(catalog), tables),
+                    Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {
+                        // Collection can overtake the listing or the read of a table block.
+                        let Some(newer) = self.newer_block(Some(index)).await? else { return Err(error); };
+                        index = newer;
+                    }
+                    Err(error) => return Err(error),
+                }
+            },
             None => (None, BTreeMap::new()),
         };
         let tables = TableCatalog::load(block.clone(), &table_blocks)?.with_system_tables()?;
@@ -199,6 +211,12 @@ impl BlockStore {
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         Ok(RecoveredPartition { partition, block, progress, fence, replay_tail: None, table_blocks }.with_source_floor(source_floor))
     }
+
+    async fn newer_block(&self, previous: Option<BlockIndex>) -> Result<Option<BlockIndex>> {
+        Ok(self.latest_block(BlockDiscovery::List).await?
+            .filter(|newer| previous.is_none_or(|previous| *newer > previous)))
+    }
+
     async fn latest_block(&self, discovery: BlockDiscovery) -> Result<Option<BlockIndex>> {
         let exists = |index: BlockIndex| async move {
             match self.store.head_fresh(&ObjectKey::new(block_key(index)?)?).await {

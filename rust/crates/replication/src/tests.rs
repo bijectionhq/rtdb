@@ -881,6 +881,29 @@ async fn a_trimmed_replay_anchor_can_advance_only_for_latest_checkpoint_recovery
 }
 
 #[tokio::test]
+async fn exact_checkpoint_recovery_refuses_missing_table_metadata() {
+    use rtdb_format::{block::proto::Block, catalog::{BlockCatalog, TableEntry}, keys::block_key};
+    use rtdb_storage::ObjectKey;
+
+    let fixture = fixture(ReplicationConfig::default(), 4096).await;
+    let old = ObjectKey::new(block_key(BlockIndex(0)).unwrap()).unwrap();
+    let latest = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
+    let incomplete = BlockCatalog::from_proto(Block {
+        block_index: Some(0),
+        tables: vec![TableEntry::new(16_384, TableRef::new("public", "docs")).unwrap().to_proto()],
+        ..Default::default()
+    }).unwrap();
+    let complete = BlockCatalog::from_proto(Block { block_index: Some(1), ..Default::default() }).unwrap();
+    fixture.store.put(&old, incomplete.encode().into()).await.unwrap();
+    fixture.store.put(&latest, complete.encode().into()).await.unwrap();
+
+    let error = fixture.blocks.recover(
+        TrieConfig::default(), SourcePosition(-1), Timestamp(1000), BlockDiscovery::At(BlockIndex(0)),
+    ).await.err().unwrap();
+    assert_eq!(error.code, "rtdb.storage/missing-object");
+}
+
+#[tokio::test]
 async fn promotion_ignores_a_deleted_historical_catalog_still_present_in_the_disk_cache() {
     let fixture = produced_memory_checkpoint(true).await;
     produce_newer_memory_checkpoint(&fixture).await;
