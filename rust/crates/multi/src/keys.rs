@@ -56,6 +56,10 @@ impl LocalKeyService {
             Err(error) => return Err(io(error)),
         }
         published.map_err(io)?;
+        self.sync_directory()
+    }
+
+    fn sync_directory(&self) -> Result<()> {
         File::open(&self.directory).and_then(|directory| directory.sync_all()).map_err(io)
     }
 }
@@ -93,7 +97,11 @@ impl KeyService for LocalKeyService {
         Ok(())
     }
     fn destroy(&self, deployment: &str) -> Result<()> {
-        self.publish(&self.path(deployment), &[], true)
+        let path = self.path(deployment);
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0) {
+            return self.sync_directory();
+        }
+        self.publish(&path, &[], true)
     }
 }
 

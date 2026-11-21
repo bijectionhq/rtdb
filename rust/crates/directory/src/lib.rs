@@ -163,8 +163,17 @@ pub struct DeploymentRecord {
     /// When a deployment that moved to another cell left this one: the tombstone's objects here are erased once the reaper's grace has passed since.
     #[serde(default)]
     pub moved_at_ms: Option<i64>,
+    pub cell_transfer: Option<CellTransfer>,
     pub disposal: Option<DisposalReceipt>,
     pub version: Version,
+}
+
+/// Both directories retain the same routing decision through a cell transfer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellTransfer {
+    pub source: String,
+    pub destination: String,
+    pub epoch: u64,
 }
 
 /// The cell's completed serving disposal, retained on the installation's tombstone.
@@ -192,7 +201,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, disposal: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, version: 0 }
     }
 
     /// The affinity key: stable across epochs and residency, distinct across incarnations.

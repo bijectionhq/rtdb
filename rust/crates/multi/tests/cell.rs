@@ -2,13 +2,22 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use common::*;
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemoryDirectory};
 use rtdb_multi::admin;
+use rtdb_multi::cells::{CellMap, MemoryCellMap};
 use rtdb_multi::deployment::CellStorage;
 use rtdb_multi::keys::LocalKeyService;
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_postgres::NoTls;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -55,7 +64,7 @@ async fn failed_disposal_reuses_the_fence_on_retry() {
 
     for _ in 0..2 {
         let error = admin::delete_deployment(directory.as_ref(), &storage, &keys, &installation.id, 4 << 20).await.unwrap_err();
-        assert_eq!(error.code, "rtdb.multi/disposal-ensemble");
+        assert_eq!(error.code, "rtdb.multi/administration-ensemble");
         let pending = directory.deployment(&installation.id).await.unwrap().unwrap();
         assert_eq!(pending.lifecycle, Lifecycle::Deleting);
         assert_eq!(pending.epoch, installation.epoch + 1);
@@ -464,9 +473,41 @@ async fn a_deposed_holder_refuses_a_linearizable_read_instead_of_serving_it_stal
     cell.stop().await;
 }
 
+struct LoseTransferReply {
+    inner: Arc<MemoryCellMap>,
+    lost: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl CellMap for LoseTransferReply {
+    async fn register_cell(&self, cell: &str, gateway: &str) -> Result<()> {
+        self.inner.register_cell(cell, gateway).await
+    }
+
+    async fn gateway(&self, cell: &str) -> Result<Option<String>> {
+        self.inner.gateway(cell).await
+    }
+
+    async fn cells(&self) -> Result<BTreeMap<String, String>> {
+        self.inner.cells().await
+    }
+
+    async fn cell_of(&self, deployment: &str) -> Result<Option<String>> {
+        self.inner.cell_of(deployment).await
+    }
+
+    async fn assign(&self, deployment: &str, cell: &str, expected: Option<&str>) -> Result<bool> {
+        let assigned = self.inner.assign(deployment, cell, expected).await?;
+        if assigned && expected.is_some() && !self.lost.swap(true, Ordering::SeqCst) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "test/lost-transfer-reply", "The assignment reply was lost"));
+        }
+        Ok(assigned)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_forwards() {
-    let map: std::sync::Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::MemoryCellMap::new();
+    let map: Arc<dyn CellMap> = Arc::new(LoseTransferReply { inner: MemoryCellMap::new(), lost: AtomicBool::new(false) });
     let east = Cell::start_in("east", map.clone(), 1).await;
     let west = Cell::start_in("west", map.clone(), 1).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
@@ -480,7 +521,17 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
 
-    let arrived = admin::move_cell(map.as_ref(), &handle("east", &east, &east_storage, &east_keys, 10), &handle("west", &west, &west_storage, &west_keys, 10), "shop", 4 << 20).await.unwrap();
+    let source = handle("east", &east, &east_storage, &east_keys, 10);
+    let destination = handle("west", &west, &west_storage, &west_keys, 10);
+    let error = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20).await.unwrap_err();
+    assert_eq!(error.code, "test/lost-transfer-reply");
+    let fenced = east.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert_eq!(fenced.lifecycle, Lifecycle::Moving);
+    let pending = west.directory.deployment(&fenced.id).await.unwrap().unwrap();
+    assert_eq!(pending.lifecycle, Lifecycle::Moving);
+
+    let arrived = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20).await.unwrap();
+    assert_eq!(arrived.epoch, fenced.epoch);
     assert_eq!(map.cell_of("shop").await.unwrap().as_deref(), Some("west"));
     let through_east = connect_eventually(&east, "shop").await;
     assert_eq!(values(&through_east, "SELECT total FROM orders").await, ["10", "20"], "the unflushed tail moved with it, and the old cell's gateway forwards");
@@ -501,7 +552,11 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms(), hour, Some(&keys)).await.unwrap(), 0, "and keeps them within the grace");
     assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms() + hour.as_millis() as i64, hour, Some(&keys)).await.unwrap(), 1);
     assert_eq!(left_behind().await, 0, "after the grace, the old cell erases what the move left");
-    assert!(!east.data.path().join("keys").join(format!("{}.key", tombstone.id)).exists(), "and destroys its copy of the key");
+    assert!(rtdb_multi::keys::KeyService::key(&keys, &tombstone.id).is_err(), "the source key stays withdrawn");
+    let recovered = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20).await.unwrap();
+    assert_eq!(recovered.id, arrived.id);
+    assert_eq!(recovered.cell_transfer, arrived.cell_transfer);
+    assert_eq!(east.directory.deployment(&tombstone.id).await.unwrap().unwrap().version, tombstone.version);
     assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"], "while the deployment reads on in its new cell");
     drop((through_east, through_west));
     east.stop().await;
