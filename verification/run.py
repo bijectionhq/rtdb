@@ -137,13 +137,25 @@ def verify_lean(args, scratch):
             raise ValueError(f"{case}: proof or axiom audit failed")
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
         if not mutation:
+            env = os.environ | {"LEAN_PATH": str(directory)}
+            independence = Path("verification/lean/Minimality.lean")
+            clone_file(independence, directory)
+            checked = run_case(
+                [args.lean, str(independence)], directory, args.evidence, "lean-minimality", env,
+            )
+            audited = re.findall(r"depends on axioms: \[([^\]]*)\]", checked.stdout)
+            if checked.returncode or not audited or any(
+                set(axioms.split(", ")) - allowed for axioms in audited
+            ):
+                raise ValueError("Lean independence proofs or axiom audit failed")
+            print("lean-minimality: independence witnesses checked")
             trace = Path("verification/traces/temporal.tsv")
             replay = Path("verification/lean/Trace.lean")
             clone_file(trace, directory)
             clone_file(replay, directory)
             checked = run_case(
                 [args.lean, "--run", str(replay), str(trace)], directory, args.evidence,
-                "lean-shared-trace", os.environ | {"LEAN_PATH": str(directory)},
+                "lean-shared-trace", env,
             )
             if checked.returncode or "13 trace observations match" not in checked.stdout:
                 raise ValueError("Lean shared trace failed")
@@ -167,6 +179,13 @@ TLA_CASES = (
     ("Kernel", "unfair-apply", ("SPECIFICATION FairSpec", "SPECIFICATION Spec"), "temporal"),
     ("CacheGeneration", "cache-current-publisher", None, None),
     ("CacheGeneration", "cache-late-publisher", ("LatePublish = FALSE", "LatePublish = TRUE"), "FreshLeaseReachable"),
+    ("ReadBack", "readback", None, None),
+    ("ReadBack", "apply-before-readback", ('Mutation = "none"', 'Mutation = "skip_readback"'), "AppliedAfterReadBack"),
+    ("ReadBack", "ack-after-append", ('Mutation = "none"', 'Mutation = "ack_on_append"'), "AckAfterApply"),
+    ("LeaseAdmission", "validated-reader-lease", None, None),
+    ("LeaseAdmission", "coordinated-reader-pin", ('Mode = "validated_lease"', 'Mode = "pin"'), None),
+    ("LeaseAdmission", "age-only-collection", ('Mode = "validated_lease"', 'Mode = "age_only"'), "LiveReaderHasObject"),
+    ("LeaseAdmission", "stale-follower-admission", ('Mode = "validated_lease"', 'Mode = "stale_follower"'), "LiveReaderHasObject"),
 )
 
 

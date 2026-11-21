@@ -154,11 +154,71 @@ theorem cutoff_keeps_possible_ties (actual frontier kth : Int)
     (isBound : actual ≤ frontier) (canTie : kth ≤ actual) :
     ¬ frontier < kth := by omega
 
+theorem keeping_first_rows_preserves_top_k {Row : Type} (keep : Row → Bool)
+    (count : Nat) (ordered : List Row)
+    (preserved : ∀ row ∈ ordered.take count, keep row = true) :
+    (ordered.filter keep).take count = ordered.take count := by
+  induction count generalizing ordered with
+  | zero => rfl
+  | succ count ih =>
+    cases ordered with
+    | nil => rfl
+    | cons first rest =>
+      have keepsFirst : keep first = true := preserved first (by simp)
+      have keepsRest : ∀ row ∈ rest.take count, keep row = true :=
+        fun row member => preserved row (by simp [member])
+      simp [keepsFirst, ih rest keepsRest]
+
 theorem compaction_equivalence_composes (old middle replacement : List Event)
     (first : ∀ s k v, point old s k v = point middle s k v)
     (second : ∀ s k v, point middle s k v = point replacement s k v) :
     ∀ s k v, point old s k v = point replacement s k v :=
   fun system key valid => (first system key valid).trans (second system key valid)
+
+structure RecencyRange where
+  validFrom : Int
+  validTo : Int
+  systemTo : Int
+
+def extendBound (prior : Int) (span : RecencyRange) : Int :=
+  max prior (min span.validTo span.systemTo)
+
+def fullRecency : List RecencyRange → Int → Int
+  | [], prior => prior
+  | span :: tail, prior => fullRecency tail (extendBound prior span)
+
+def earlyRecency : List RecencyRange → Int → Int
+  | [], prior => prior
+  | span :: tail, prior =>
+    let bound := extendBound prior span
+    if span.validFrom ≤ bound then bound else earlyRecency tail bound
+
+theorem bounded_valid_ends_cannot_raise_recency (ranges : List RecencyRange)
+    (bound : Int) (bounded : ∀ span ∈ ranges, span.validTo ≤ bound) :
+    fullRecency ranges bound = bound := by
+  induction ranges with
+  | nil => rfl
+  | cons span tail ih =>
+    have canKeep := bounded span (by simp)
+    have same : extendBound bound span = bound := by
+      unfold extendBound
+      omega
+    simp [fullRecency, same, ih (fun item member => bounded item (List.mem_cons_of_mem span member))]
+
+theorem ordered_recency_shortcut_refines_full_fold (ranges : List RecencyRange) (prior : Int)
+    (ordered : ranges.Pairwise (fun later earlier => earlier.validTo ≤ later.validFrom)) :
+    earlyRecency ranges prior = fullRecency ranges prior := by
+  induction ranges generalizing prior with
+  | nil => rfl
+  | cons span tail ih =>
+    rw [List.pairwise_cons] at ordered
+    by_cases stop : span.validFrom ≤ extendBound prior span
+    · have earlier : ∀ item ∈ tail, item.validTo ≤ extendBound prior span :=
+        fun item member => by
+          have adjacent := ordered.1 item member
+          omega
+      simp [earlyRecency, fullRecency, stop, bounded_valid_ends_cannot_raise_recency tail _ earlier]
+    · simp [earlyRecency, fullRecency, stop, ih _ ordered.2]
 
 def Fact.key : Fact → Nat
   | .put key _ _ | .delete key _ | .erase key => key
@@ -264,8 +324,10 @@ example : point (admit [correction.reverse, original] 2) 2 0 3 = none := by deci
 #print axioms resolution_sees_last_tentative_put
 #print axioms candidate_superset_refines_scan
 #print axioms cutoff_keeps_possible_ties
+#print axioms keeping_first_rows_preserves_top_k
 #print axioms key_partition_preserves_answer
 #print axioms scan_constant_between_valid_endpoints
 #print axioms scan_constant_between_system_commits
+#print axioms ordered_recency_shortcut_refines_full_fold
 
 end RTDB

@@ -98,11 +98,14 @@ The optional Rust boundary check compiles an unchanged copy and two mutated copi
 
 * `lean/History.lean` proves laws over a mathematical history and audits the axioms used.
   `lean/Trace.lean` and the Rust temporal tests read the same fixture in `traces/temporal.tsv`.
+  `lean/Minimality.lean` exhibits requirements that need a distinct admission horizon, a private resolution prefix, a whole batch boundary, or intra-batch order.
 * `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
   It assumes durable append is atomic and does not implement a consensus provider.
 * `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.
   Apalache checks the same TLA+ transitions symbolically and `maude/Resolution.maude` gives an independent rewrite model.
 * `tla/CacheGeneration.tla` models the cache pathname ownership race independently from the shared artefact reference counts.
+* `tla/ReadBack.tla` separates append, record delivery, apply, and acknowledgement across a crash and restart.
+* `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `alloy/Reclamation.als` independently checks the structural last-reference rule over a finite scope, including one deliberately faulty collector.
 * `verus/` checks the exact Rust functions called by the search builder, temporal resolvers and replica fence.
   The proofs cover their stated decisions.

@@ -116,3 +116,33 @@ The search ranking proof still needs coverage of the production floating-point s
 The durable protocol models assume provider behavior.
 Provider faults, object-store recovery, the full trie coverage transition and cross-node lease accounting need production refinement evidence.
 The observations here support specific component claims and bounded protocol claims.
+
+== Expanded refinement run
+
+Production sources through `b2609268a` now use the Verus-checked single-event rectangle subtraction and temporal recency fold step.
+The combined proof run verified 19 functions across three areas and rejected all nine Verus mutations at their declared functions.
+Lean checked the full mathematical recency fold against the early-exit fold for ordered valid intervals.
+It also proved that retaining the required ordered prefix preserves top K and gave independence witnesses for whole batches, the admission horizon, the private prefix and operation order.
+Public `Polygon::recency` preserves its existing behavior for arbitrary constructed shapes.
+The early-exit refinement relies on ordered native intervals.
+
+Seventeen node search tests passed.
+The new tests compare plain MATCH and exact scores with a scan corpus when an index build exceeds the memory budget or historical physical pages are out of global IID order.
+The count-star plan also keeps the projection empty when only cardinality is needed.
+
+[cols="2,1,3",options="header"]
+|===
+|Additional TLC model |Distinct states |Rejected alternatives
+|Read-back and acknowledgement |195
+|Apply before delivery and acknowledgement on append each violate their own invariant.
+|Validated generation lease |350
+|Age-only collection and stale-follower admission can strand a reader.
+|Coordinated generation pin |415
+|The reader remains entitled until release, so the model forbids deletion while it holds the generation.
+|===
+
+The native trie collector currently selects garbage from the latest catalog and a retention timestamp.
+It has no distributed evidence of which generations readers still need.
+The lease model requires generation validation at admission and an enforced expiry on reads.
+The coordinated pin model requires an authority that serializes pin acquisition and reclamation, plus a contract for abandoned readers.
+Both alternatives are conditional on the modeled provider and clock assumptions.
