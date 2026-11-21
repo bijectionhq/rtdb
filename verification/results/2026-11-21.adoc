@@ -158,3 +158,35 @@ The combined local runner passed from `5076d2cd1` with both Rust options enabled
 The native package run passed 532 tests across query, search, temporal, replication, storage and maintenance, with one ignored benchmark.
 The native node search suite passed all 17 tests.
 The retention protocol and provider refinement remain open.
+
+== Binary64 score bounds and frontier
+
+The combined runner passed from `5daed1770` with both Rust options enabled, using the toolchain listed in link:../README.adoc[the runner instructions].
+The underlying scorer preserves the BM25 expression and its addition order.
+Window, candidate and SQL scoring now share one computed set of term weights.
+The old unpadded extremum can be one representable value below a row's score. The previous aggregate margin was present and this witness does not refute it.
+
+|===
+|Evidence |Result and scope
+
+|Lean 4.36.0
+|The frontier of pending scores and unexpanded windows covers every row with evidence in either source.
+A possible tie prevents a strict cutoff.
+Dropping unexpanded windows fails at `frontier_covers_supported_row`, and admitting equality fails the tied-cutoff controls.
+
+|Z3 4.16.0
+|Five counterexample queries are unsatisfiable over the exact-real model of rounded BM25.
+Removing the per-term padding and reversing the length premise each makes just its own query satisfiable.
+Separate binary64 queries check the one-value reversal and its repaired bound.
+
+|Native Rust replay
+|The binary64 witness passes on the exact production scorer.
+The source mutation that removes padding compiles and fails at the bound assertion.
+The text and search unit suites passed all 32 tests, and the node search suite passed all 17 tests, including ranked-versus-full sorting and candidate reduction across partitions.
+The combined runner also replayed all 4,096 native temporal observations.
+|===
+
+The numeric proof depends on the IEEE round-to-nearest operations and the source-to-model correspondence stated in link:../../dev/doc/rtdb-verification.adoc[Study 2].
+The frontier proof assumes completeness of the qualifying row's matching event in a pending entry or unexpanded window.
+The production evidence exercises those paths, including shared-file members, without a general proof of index decoding, temporal candidate coverage or planner eligibility.
+The durable storage and cross-node reader-retention obligations remain open.
