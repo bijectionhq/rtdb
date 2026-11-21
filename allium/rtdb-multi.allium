@@ -1384,6 +1384,21 @@ rule ParkUnderPressure {
             ParkStarted(holding)
 }
 
+rule ReclaimExecutionMemory {
+    -- The placed node starts reclamation at 80 percent of its execution budget and targets 75 percent.
+    -- It attempts a bounded batch of parks, ordered by last activity across its holdings.
+    -- A holding with an open session can be selected under execution-memory pressure.
+    -- A newly touched candidate or a candidate already undergoing a holding operation is skipped.
+    -- A candidate that lost its placement is detached without flushing.
+    -- On activation the node preserves the requested holding and checks headroom again before attempting a claim.
+    -- Gateways retry temporary pressure refusals within an activation deadline.
+    -- A planned handoff keeps its reservation while retrying a target's pressure refusal.
+    when: ExecutionBudgetHigh(member)
+
+    ensures:
+        ReclamationPass(member)
+}
+
 rule Park {
     -- Parking flushes whatever tail remains, commits Parked, then clears the holder and the loglets in one cas.
     when: ParkStarted(holding)

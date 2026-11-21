@@ -61,6 +61,33 @@ async fn a_partitioned_holder_cannot_commit_once_another_member_takes_over() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_activation_parks_a_cold_holding_under_execution_memory_pressure() {
+    let cell = Cell::start(1, None).await;
+    let node = cell.node(0);
+    let memory = node.server.node().memory();
+    admin::create_deployment(cell.directory.as_ref(), "cold", "acme", 3).await.unwrap();
+    let cold = cell.connect("cold").await;
+    cold.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(cold);
+    admin::create_deployment(cell.directory.as_ref(), "next", "acme", 3).await.unwrap();
+    let high_water = memory.limit_bytes() - memory.limit_bytes() / 5;
+    let pressure = memory.reserve(high_water).unwrap();
+
+    let refused = node.agent.activate("next").await.unwrap_err();
+    assert_eq!(refused.code, "rtdb.multi/node-under-pressure");
+    assert_eq!(cell.holder("cold").await, None);
+    assert_eq!(cell.holder("next").await, None);
+    drop(pressure);
+    let next = cell.connect("next").await;
+    assert_eq!(cell.holder("next").await, Some(0));
+    drop(next);
+    let cold = cell.connect("cold").await;
+    assert_eq!(values(&cold, "SELECT total FROM orders").await, ["10"]);
+    drop(cold);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_deployment_parks_and_wakes_on_its_next_connection() {
     let cell = Cell::start(1, Some(Duration::from_millis(800))).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

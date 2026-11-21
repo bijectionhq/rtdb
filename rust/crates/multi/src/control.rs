@@ -1,6 +1,7 @@
 //! The control protocol between the cell and a node's agent: newline-delimited JSON, one request per connection.
 //! In a cell with a secret, every request carries a grant signed with it, and a node refuses one that does not.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +11,21 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+
+pub(crate) const NODE_UNDER_PRESSURE: &str = "rtdb.multi/node-under-pressure";
+pub(crate) const NOT_CLAIMABLE: &str = "rtdb.multi/not-claimable";
+
+pub(crate) async fn retry_pressure<T, F: Future<Output = Result<T>>>(window: Duration, mut attempt: impl FnMut() -> F) -> Result<T> {
+    let latest_start = tokio::time::Instant::now() + window;
+    loop {
+        let result = attempt().await;
+        if !matches!(&result, Err(error) if error.code == NODE_UNDER_PRESSURE) { return result; }
+        let retry_at = tokio::time::Instant::now() + Duration::from_millis(25);
+        if retry_at >= latest_start { return result; }
+        tokio::time::sleep_until(retry_at).await;
+        if tokio::time::Instant::now() >= latest_start { return result; }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "op")]
@@ -147,6 +163,49 @@ fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavaila
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn activation_retries_pressure_and_reports_any_other_failure() {
+        let mut calls = 0;
+        let result = retry_pressure(Duration::from_secs(1), || {
+            calls += 1;
+            let error = if calls <= 2 {
+                Anomaly::new(AnomalyCategory::Unavailable, NODE_UNDER_PRESSURE, "reclaiming memory")
+            } else {
+                Anomaly::incorrect("test/deployment-gone", "the deployment was deleted")
+            };
+            std::future::ready(Err::<(), _>(error))
+        }).await;
+        assert_eq!(result.unwrap_err().code, "test/deployment-gone");
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn an_activation_started_within_the_retry_window_keeps_its_result() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let (started, finish) = (started.clone(), finish.clone());
+            tokio::spawn(async move {
+                let mut calls = 0;
+                retry_pressure(Duration::from_millis(500), || {
+                    calls += 1;
+                    let (calls, started, finish) = (calls, started.clone(), finish.clone());
+                    async move {
+                        if calls == 1 { return Err(Anomaly::new(AnomalyCategory::Unavailable, NODE_UNDER_PRESSURE, "reclaiming memory")); }
+                        started.notify_one();
+                        finish.notified().await;
+                        Ok(())
+                    }
+                }).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), started.notified()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(!task.is_finished());
+        finish.notify_one();
+        task.await.unwrap().unwrap();
+    }
 
     struct Answers;
     #[async_trait]

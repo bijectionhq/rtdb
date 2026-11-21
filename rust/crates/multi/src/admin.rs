@@ -111,7 +111,7 @@ pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &Mem
     let reservation = PlacementMove {
         request: uuid::Uuid::new_v4(),
         target: target.clone(),
-        expires_at_ms: now_ms().saturating_add((2 * CONTROL_TIMEOUT).as_millis() as i64),
+        expires_at_ms: now_ms().saturating_add((3 * CONTROL_TIMEOUT).as_millis() as i64),
     };
     let intended = update(directory, name, |record| {
         let now = now_ms();
@@ -136,7 +136,10 @@ pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &Mem
         if let Some(holder) = effective_holder(&intended, &members, now_ms()) {
             expect(&control_address(&members, holder)?, Request::ParkForMove { name: name.to_owned(), epoch: intended.epoch, ticket: ticket.clone() }, control).await?;
         }
-        match expect(&address, Request::ActivateForMove { name: name.to_owned(), ticket }, control).await? {
+        let activation = Request::ActivateForMove { name: name.to_owned(), ticket };
+        let reserved_for = Duration::from_millis(reservation.expires_at_ms.saturating_sub(now_ms()).max(0) as u64);
+        let retry_window = reserved_for.saturating_sub(CONTROL_TIMEOUT).min(CONTROL_TIMEOUT);
+        match control::retry_pressure(retry_window, || expect(&address, activation.clone(), control)).await? {
             Response::Held { .. } => Ok(()),
             other => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-failed", format!("The target answered {other:?}"))),
         }

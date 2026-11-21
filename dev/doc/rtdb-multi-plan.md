@@ -425,6 +425,14 @@ A parked deployment must cost nothing but its record and objects (`CostFollowsAc
 1. `Holding.residency` with `active`, `resident_idle` and `parked`.
    Resident-idle drops the tail live index and keeps catalogs; parked releases the holder in one CAS after a final flush and `Parked` record.
 2. LRU parking under memory pressure after `min_residency` (`ParkUnderPressure`).
+   The placed node starts parking its least recently touched holdings at 80 percent of the execution-memory limit and targets 75 percent.
+   A new activation rechecks headroom after reclamation before claiming.
+   It skips busy or recently touched candidates if their local operation state changed during selection.
+   Reclamation takes up to eight candidates per pass and bounds the wait on another reclamation pass or a candidate's flush to 500 ms.
+   It can park a holding with an open session when older holdings do not release enough memory.
+   Gateways try the other eligible nodes and retry temporary pressure within an activation deadline.
+   A planned handoff retains its reservation while retrying its target under pressure.
+   A separate minimum-residency policy remains open.
 3. Activation on demand from the gateway or the intake (`ActivateOnDemand`), admitted per node at `activations_per_node_per_second`.
 4. Everything per database that today lives for the database's lifetime (tasks, timers, log tails, pools) is made lazy, guided by the stage 0 measurements.
 
@@ -500,6 +508,22 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 Simulation: scale-out moves only the keys that prefer the new member; scale-in retires members only when empty; a poisonous deployment is quarantined after `quarantine_crashes`; the balancer converges without oscillating.
 
 **Done when** a simulated cell under Zipf load scales out and in with planned-handoff write stalls under 30 ms.
+
+**Local handoff and failover check**
+
+The release workload placed 1,000 deployments on three nodes, moved each to a second node, and then killed the holder with the most current placements.
+The three logkeepers used fsync and a two-member quorum.
+Every deployment returned the result of exactly three counter writes, and each of the 285 deployments held by the failed node advanced to a later directory epoch.
+The surviving nodes peaked at 443,264,941 and 442,159,543 execution bytes against a 512 MiB limit each.
+A previous run without memory reclamation reached the execution budget and could not finish the same workload.
+With the JVM suite running on the same host, the interval from move request to the first successful write had a median of 184.7 ms and p99 of 725.0 ms.
+The 30 ms stall gate still needs an isolated workload that measures admission during handoff.
+
+```sh
+RTDB_CELL_HANDOFF_DEPLOYMENTS=1000 \
+  cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
+  a_thousand_deployments_keep_their_history_through_handoff_and_failover -- --ignored --nocapture
+```
 
 ### Stage 12: encryption, lineages, forks and deletion
 

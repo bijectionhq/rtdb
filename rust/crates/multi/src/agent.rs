@@ -15,7 +15,7 @@ use rtdb_replication::Role as DriverRole;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::control::{Handler, MoveTicket, Request, Response};
+use crate::control::{Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, select_logkeepers};
 use crate::lease::MemberLease;
 
@@ -56,6 +56,8 @@ impl AgentOptions {
 pub const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
 const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
+const PRESSURE_WAIT: Duration = Duration::from_millis(500);
+const PRESSURE_PARKS_PER_PASS: usize = 8;
 
 struct LocalHolding {
     id: String,
@@ -85,6 +87,10 @@ impl<'a> DeploymentTurn<'a> {
 
     async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.gate.as_ref().expect("the turn still holds its gate").lock().await
+    }
+
+    fn try_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.gate.as_ref().expect("the turn still holds its gate").try_lock().ok()
     }
 }
 
@@ -117,13 +123,14 @@ pub struct NodeAgent {
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
     /// One activation, subscription or park at a time per deployment name.
     turns: Turns,
+    memory_relief: tokio::sync::Mutex<()>,
     /// How many fragments this node has read for other nodes' scans, by deployment, table and prefix.
     fragments_read: Mutex<BTreeMap<(String, String, String), u64>>,
 }
 
 impl NodeAgent {
     pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
+        Arc::new(Self { directory, node, lease, address, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -150,9 +157,10 @@ impl NodeAgent {
 
     async fn activate_holding(&self, name: &str, moving: Option<&MoveTicket>) -> Result<Response> {
         let turn = self.turn(name);
-        let _turn = turn.lock().await;
         let me = self.member();
+        let mut attempted_relief = false;
         for _ in 0..4 {
+            let active_turn = turn.lock().await;
             let record = self.record(name).await?;
             if moving.is_some_and(|ticket| ticket.deployment != record.id) {
                 return Err(stale_handoff(name));
@@ -176,10 +184,19 @@ impl NodeAgent {
                 }
             }
             let Some(mut next) = claim(&record, &me, &members, now) else {
-                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/not-claimable", format!("{name} cannot be claimed by this member now")));
+                return Err(Anomaly::new(AnomalyCategory::Conflict, NOT_CLAIMABLE, format!("{name} cannot be claimed by this member now")));
             };
             if record.storage_namespaces.is_some() {
                 crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
+            }
+            if self.execution_memory_pressured() {
+                if attempted_relief {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, NODE_UNDER_PRESSURE, "The node has no execution-memory headroom for another deployment"));
+                }
+                drop(active_turn);
+                self.relieve_execution_memory(Some(name)).await;
+                attempted_relief = true;
+                continue;
             }
             next.storage_namespaces = Some(self.storage_namespaces);
             match self.directory.replace_deployment(next, record.version).await? {
@@ -307,7 +324,7 @@ impl NodeAgent {
     }
 
     /// Flushes `database` and waits until the block that was open is adopted.
-    async fn flush_and_adopt(&self, database: &Arc<Database>, id: &str, epoch: u64) -> Result<()> {
+    async fn flush_and_adopt(&self, database: &Arc<Database>, id: &str, epoch: u64, wait: Duration) -> Result<()> {
         let member = self.member();
         let mut watched = rtdb_directory::watch_deployment(self.directory.clone(), id.to_owned(), Duration::from_millis(100));
         let deposed = watched.wait_for(|snapshot| snapshot.as_ref().is_some_and(|record| {
@@ -323,7 +340,7 @@ impl NodeAgent {
         };
         tokio::select! {
             _ = deposed => Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder was deposed while waiting for its flush")),
-            flushed = tokio::time::timeout(self.options.activation_timeout, flush) => flushed.unwrap_or_else(|_| {
+            flushed = tokio::time::timeout(wait, flush) => flushed.unwrap_or_else(|_| {
                 Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/flush-timeout", "The flush did not complete in time"))
             }),
         }
@@ -335,7 +352,7 @@ impl NodeAgent {
         let (id, epoch) = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch))
             .ok_or_else(|| Anomaly::incorrect("rtdb.multi/not-held", format!("This node does not hold {name}")))?;
         let database = self.node.catalog().database(name)?;
-        self.flush_and_adopt(&database, &id, epoch).await?;
+        self.flush_and_adopt(&database, &id, epoch, self.options.activation_timeout).await?;
         Ok(Response::Done)
     }
 
@@ -344,6 +361,10 @@ impl NodeAgent {
     async fn park_holding(&self, name: &str, moving: Option<(u64, &MoveTicket)>) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
+        self.park_with_turn(name, moving, self.options.activation_timeout).await
+    }
+
+    async fn park_with_turn(&self, name: &str, moving: Option<(u64, &MoveTicket)>, flush_wait: Duration) -> Result<Response> {
         let Some((id, epoch)) = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch)) else { return Ok(Response::Done); };
         let is_requested = |record: &DeploymentRecord| moving.is_none_or(|(epoch, ticket)| {
             record.id == ticket.deployment && record.epoch == epoch && record.holder.as_ref() == Some(&self.member())
@@ -357,7 +378,7 @@ impl NodeAgent {
         }
 
         // The next holder starts from a closed block once the flushed block has been adopted.
-        if let Ok(database) = self.node.catalog().database(name) { self.flush_and_adopt(&database, &id, epoch).await?; }
+        if let Ok(database) = self.node.catalog().database(name) { self.flush_and_adopt(&database, &id, epoch, flush_wait).await?; }
         for _ in 0..8 {
             let Some(record) = self.directory.deployment(&id).await? else { break };
             if !is_requested(&record) { return Err(stale_handoff(name)); }
@@ -372,6 +393,43 @@ impl NodeAgent {
         }
         self.stop_running(name).await;
         Ok(Response::Done)
+    }
+
+    fn execution_memory_pressured(&self) -> bool {
+        let budget = self.node.memory();
+        budget.used_bytes() >= budget.limit_bytes() - budget.limit_bytes() / 5
+    }
+
+    async fn relieve_execution_memory(&self, protected: Option<&str>) {
+        if !self.execution_memory_pressured() { return; }
+        let Ok(_relief) = tokio::time::timeout(PRESSURE_WAIT, self.memory_relief.lock()).await else { return };
+        if !self.execution_memory_pressured() { return; }
+        let budget = self.node.memory();
+        let target = budget.limit_bytes() - budget.limit_bytes() / 4;
+        let mut candidates: Vec<_> = self.holdings.lock().iter()
+            .filter(|(name, _)| Some(name.as_str()) != protected)
+            .map(|(name, holding)| (holding.last_touch, name.clone(), holding.id.clone(), holding.epoch))
+            .collect();
+        candidates.sort_unstable();
+        let mut attempted = 0;
+        for (touched, name, id, epoch) in candidates {
+            if budget.used_bytes() <= target || attempted == PRESSURE_PARKS_PER_PASS { break; }
+            let turn = self.turn(&name);
+            let Some(_turn) = turn.try_lock() else { continue };
+            let same_activity = || self.holdings.lock().get(&name).is_some_and(|holding| {
+                holding.id == id && holding.epoch == epoch && holding.last_touch == touched
+            });
+            if !same_activity() { continue; }
+            attempted += 1;
+            let member = self.member();
+            match self.directory.deployment(&id).await {
+                Ok(Some(record)) if record.epoch == epoch && record.holder.as_ref() == Some(&member) => {
+                    if same_activity() { let _ = self.park_with_turn(&name, None, PRESSURE_WAIT).await; }
+                }
+                Ok(_) => self.stop_running(&name).await,
+                Err(_) => continue,
+            }
+        }
     }
 
     pub async fn subscribe(&self, name: &str) -> Result<Response> { self.subscribe_for(name, false).await }
@@ -559,6 +617,7 @@ impl NodeAgent {
 
     /// Gives up every deployment the directory no longer places here under the epoch this node opened it at, every one whose database stopped, every idle one, and the least recently used beyond `max_active`; drops idle or unwanted replicas.
     pub async fn reconcile(&self) {
+        self.relieve_execution_memory(None).await;
         let draining = self.lease.record().state == MemberState::Draining;
         let warming = std::mem::take(&mut *self.warming.lock());
         if !draining { for name in warming { let _ = self.subscribe_for(&name, true).await; } }
