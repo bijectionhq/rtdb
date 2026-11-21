@@ -105,7 +105,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | TX05 · Ordered apply | Partial | [Lean prefix equivalence and native leader/follower replay](rtdb-engine-proof-evidence.md#ordered-apply-produces-the-same-leader-and-follower-prefix) |
 | TX06 · Read-back agreement | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Pending sequence, full-frame fingerprint and staged-head checks](rtdb-engine-proof-evidence.md#a-leaders-read-back-agrees-with-its-pending-transaction) |
 | TX07 · Atomic snapshot publication | Open | — |
-| TX08 · Progress monitor | Open | — |
+| TX08 · Progress monitor | Partial | [Lean terminal selection and native cancellation isolation](rtdb-engine-proof-evidence.md#progress-waits-use-their-observed-watermark) |
 | TX09 · Transaction clocks | Partial | [Mixed system-clock proof and replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | TX10 · Statement semantics at commit | Open | — |
 | TX11 · Known outcome | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Native submission clock and durable retry attribution](rtdb-engine-proof-evidence.md#submission-clock-and-durable-retry-attribution) · [Private replay admission and marker authority](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority) |

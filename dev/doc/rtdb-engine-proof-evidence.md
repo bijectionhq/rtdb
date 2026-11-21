@@ -222,6 +222,23 @@ The existing attach regression checks that the catalog effect occurs on valid re
 The remaining Kotlin refinement needs a check of exact append and frame agreement beyond comparing their transaction IDs.
 Inherited recovery still relies on the log and object providers to return the stored records and on the follower decoder to reconstruct the same effects.
 
+### Progress waits use their observed watermark
+
+Lean checks terminal-state selection for both engines on a single observed progress snapshot.
+The Kotlin comparison covers transaction and source waits and the ingestion-fault state.
+The model's separate stopped state represents the native monitor.
+A native wait can observe progress that reached its target before ingestion failed.
+A Kotlin wait observing a failed state receives an `IngestionStoppedException` carrying the fault.
+An unmet request continues waiting on an active snapshot and reports failure when it observes a terminal snapshot.
+An older transaction request can observe that its watermark was reached while receiving no exact result from the monitor.
+Cancelling one pending wait preserves the other subscription and the shared snapshot. [Lean wait model](../../verification/lean/ProgressWait.lean)
+
+The native regression polls two waiting subscriptions, cancels one, then publishes a transaction and source progress to the other.
+It checks the surviving wait's transaction result, source position and resume token together, and checks that an older transaction ID receives no newer result.
+Existing native coverage exercises the reached-prefix and unmet-fault cases. [Native progress tests](../../rust/crates/replication/tests/progress.rs) · [Kotlin watchers](../../core/src/main/kotlin/xtdb/api/log/Watchers.kt)
+
+Scheduler liveness, concurrent notification and cancellation races, and restart refinement remain open.
+
 ### Limit opening and count admission
 
 The ordinary native limit opens the input before evaluating OFFSET and then FETCH.

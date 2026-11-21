@@ -240,7 +240,9 @@ entity Watchers {
     --
     -- A block's covered source position is reported on the ADOPT, by whichever role adopts the block: a node that has not recorded the block claims none of the position it covers, so a caller that flushes a block and then awaits this watermark is told of it once the flush is done.
     --
-    -- An ingestion fault puts them into a failed state, and every subsequent await throws (see ProcessingErrorHaltsNode).
+    -- A Kotlin wait that observes a failed state receives an IngestionStoppedException carrying the fault, including when its watermark was reached before the fault.
+    -- The native monitor checks its applied watermarks first and reports the fault to requests the applied prefix has yet to satisfy.
+    -- Cancelling a wait releases that subscription and leaves the other waits and applied watermarks in place.
     latest_tx_id: MessageId
     latest_source_msg_id: MessageId
     latest_tx_result: TransactionResult?
@@ -1582,7 +1584,7 @@ rule ExternalSourceLearnsDurableExtent {
 ---- Rules: Error Handling
 
 rule ProcessingErrorHaltsNode {
-    -- A genuine ingestion fault: the watchers move to a failed state, and every subsequent await throws.
+    -- A genuine ingestion fault marks the watchers as failed and surfaces the cause according to the engine's wait rules.
     --
     -- A SUPERSESSION is not one of these, and neither is an interruption of the term: see LeaderSuperseded.
     -- Poisoning the watchers on a routine leadership handover would surface it to queries as a failed database.

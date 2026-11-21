@@ -1107,6 +1107,32 @@ def verify_replica_prefix(args, scratch):
     verify_lean_model(args, scratch, path, "replica-prefix", controls, 4)
 
 
+def verify_progress_wait(args, scratch):
+    path = Path("verification/lean/ProgressWait.lean")
+    native_ready = "if engine = .native ∧ ready snapshot request = true then reached snapshot request"
+    controls = {
+        "native-fault-before-ready": (
+            native_ready, "if False then reached snapshot request",
+            ["native_wait_can_observe_an_applied_prefix_after_failure"],
+        ),
+        "kotlin-ready-before-fault": (
+            native_ready, "if ready snapshot request = true then reached snapshot request",
+            ["kotlin_wait_reports_the_observed_terminal_state"],
+        ),
+        "return-newer-result": (
+            "(snapshot.latestResult.filter (fun receipt => receipt.1 == id)).map Prod.snd",
+            "snapshot.latestResult.map Prod.snd",
+            ["an_older_wait_never_reuses_a_newer_transaction_result"],
+        ),
+        "cancel-the-other-wait": (
+            "{ subscriptions with first := .cancelled }",
+            "{ subscriptions with first := .cancelled, second := .cancelled }",
+            ["cancelling_one_wait_preserves_the_other_and_the_snapshot"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "progress-wait", controls, 5)
+
+
 def verify_limit_open(args, scratch):
     path = Path("verification/lean/LimitOpen.lean")
     controls = {
@@ -1535,6 +1561,7 @@ def verify_lean(args, scratch):
             verify_queued_read_back(args, scratch)
             verify_read_back_interleaving(args, scratch)
             verify_replica_prefix(args, scratch)
+            verify_progress_wait(args, scratch)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
