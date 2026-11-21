@@ -136,7 +136,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | IDX01 · Exact lookup | Partial | [Lean routed lookup and Rust comparison with flat history](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) |
 | IDX02 · Total coverage | Partial | [Lean row occurrence conservation and Rust traversal checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) |
 | IDX03 · Leaf order | Open | — |
-| IDX04 · Bucket routing | Partial | [Production base-four bucket and symbolic bucketer](rtdb-engine-proof-evidence.md#main-evidence) · [Rust IID bucket selection](rtdb-engine-proof-evidence.md#multi-evidence) |
+| IDX04 · Bucket routing | Partial | [Verified production base-four bucket and path comparison](rtdb-engine-proof-evidence.md#production-iid-path-comparison) · [Rust IID bucket selection](rtdb-engine-proof-evidence.md#multi-evidence) |
 | IDX05 · Immutable ancestors | Open | — |
 | IDX06 · Bulk insertion equivalence | Partial | [Lean batch regrouping and Rust range, batch, and single insertion checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) |
 | IDX07 · Structural rewrite equivalence | Open | — |

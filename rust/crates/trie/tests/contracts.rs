@@ -54,6 +54,29 @@ fn incrementing_last_path_has_no_successor() {
 }
 
 #[test]
+fn base_four_path_comparison_matches_unsigned_lexicographic_prefix_order() {
+    let last = Iid([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let iids = [iid(0), last, iid(0x4000_0000), iid(0x8000_0000), Iid([u8::MAX; 16])];
+    let digits = |iid: Iid| -> Vec<_> {
+        iid.0.iter().flat_map(|&byte| [byte / 64, byte / 16 % 4, byte / 4 % 4, byte % 4]).collect()
+    };
+    let bucketer = Bucketer::DEFAULT;
+    for left in iids {
+        let left_digits = digits(left);
+        for right in iids {
+            let right_digits = digits(right);
+            for depth in 0..=left_digits.len() {
+                let path = Path::new(right_digits[..depth].to_vec(), bucketer).unwrap();
+                assert_eq!(
+                    bucketer.compare_path(left, &path).unwrap(),
+                    left_digits[..depth].cmp(&right_digits[..depth]),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn rows_sort_by_iid_then_descending_row_index() {
     let iids = vec![iid(2), iid(1), iid(2), iid(1), iid(3)];
     let trie = MemoryHashTrie::default().add_range(&iids, 0, 5).unwrap();

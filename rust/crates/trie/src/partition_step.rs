@@ -3,6 +3,8 @@
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
+use std::cmp::Ordering;
+
 #[cfg(verus_keep_ghost)]
 verus! {
     pub open spec fn digit(byte: int, lane: int) -> int {
@@ -51,4 +53,52 @@ pub fn base4_bucket(iid: &[u8; 16], depth: usize) -> Option<u8> {
         assert(bucket < 4);
     }
     Some(bucket)
+}
+
+#[cfg(verus_keep_ghost)]
+verus! {
+    pub open spec fn iid_digit(iid: Seq<u8>, level: int) -> int {
+        digit(iid[level / 4] as int, level % 4)
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires path@.len() <= 64,
+    ensures
+        out == Ordering::Equal ==> forall |i: int| 0 <= i < path@.len() ==>
+            #[trigger] iid_digit(iid@, i) == path@[i] as int,
+        out != Ordering::Equal ==> exists |first: int| 0 <= first < path@.len() &&
+            (forall |i: int| 0 <= i < first ==>
+                #[trigger] iid_digit(iid@, i) == path@[i] as int) &&
+            (match out {
+                Ordering::Less => #[trigger] iid_digit(iid@, first) < path@[first] as int,
+                Ordering::Greater => iid_digit(iid@, first) > path@[first] as int,
+                Ordering::Equal => false,
+            }),
+))]
+pub(crate) fn compare_base4_path(iid: &[u8; 16], path: &[u8]) -> Ordering {
+    let mut level = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            level <= path@.len() <= 64,
+            forall |i: int| 0 <= i < level ==>
+                #[trigger] iid_digit(iid@, i) == path@[i] as int,
+        decreases path@.len() - level,
+    ))]
+    while level < path.len() {
+        let bucket = base4_bucket(iid, level).unwrap();
+        let expected = path[level];
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(bucket as int == iid_digit(iid@, level as int));
+        }
+        if bucket < expected {
+            return Ordering::Less;
+        }
+        if bucket > expected {
+            return Ordering::Greater;
+        }
+        level += 1;
+    }
+    Ordering::Equal
 }

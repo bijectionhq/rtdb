@@ -1,7 +1,7 @@
 {
-  "summary": "Query and compaction share the same base-four IID digit for every valid depth.",
+  "summary": "Query and compaction share the base-four IID digit, and the memory trie compares paths by their first differing digit.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 7,
+  "min_verified_functions": 9,
   "controls": {
     "drop_last_digit": {
       "defect": "The final base-four digit cannot be selected.",
@@ -15,7 +15,7 @@
         "function": "base4_bucket",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 6
+      "min_verified_functions": 8
     },
     "drop_last_digit_with_weakened_contract": {
       "defect": "Both the function and the local contract promise only the first 63 digits.",
@@ -32,8 +32,16 @@
         "file": "verification/verus/iid_partition/laws.rs",
         "function": "every_iid_digit_can_be_selected",
         "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "compare_base4_path",
+        "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "compare_base4_path",
+        "category": "precondition not satisfied"
       }],
-      "min_verified_functions": 6
+      "min_verified_functions": 7
     },
     "collapse_buckets": {
       "defect": "Only bucket zero is returned for every valid IID depth.",
@@ -47,7 +55,7 @@
         "function": "base4_bucket",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 6
+      "min_verified_functions": 8
     },
     "collapse_buckets_with_weakened_contract": {
       "defect": "Both the function and its local contract assign all valid inputs to bucket zero.",
@@ -64,8 +72,26 @@
         "file": "verification/verus/iid_partition/laws.rs",
         "function": "a_high_leading_byte_cannot_belong_to_bucket_zero",
         "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "compare_base4_path",
+        "category": "assertion failed"
       }],
-      "min_verified_functions": 6
+      "min_verified_functions": 7
+    },
+    "accept_smaller_iid_digit": {
+      "defect": "An IID whose first differing digit is smaller is accepted under that path.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "return Ordering::Less;",
+        "replace": "return Ordering::Equal;"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "compare_base4_path",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 8
     }
   }
 }

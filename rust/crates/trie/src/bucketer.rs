@@ -30,6 +30,9 @@ impl Bucketer {
 
     pub fn compare_path(self, iid: Iid, path: &Path) -> Result<Ordering> {
         self.validate(path)?;
+        if self == Self::DEFAULT {
+            return Ok(crate::partition_step::compare_base4_path(&iid.0, path.as_slice()));
+        }
         for (level, value) in path.as_slice().iter().enumerate() {
             let order = self.bucket(iid, level)?.cmp(value);
             if order != Ordering::Equal { return Ok(order); }
