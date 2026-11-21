@@ -1,18 +1,18 @@
 //! Cell administration: creating, moving, rebalancing, forking and deleting deployments, and confirming dead members (`CreateDeployment`, `IntendMove`, `Rebalance`, `Fork`, `BeginDeletion`, `EraseAndProve`, `ExpireLease`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use rtdb_directory::DeletionRecord;
-use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeploymentRecord, DisposalReceipt, ServingInventory, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::Log;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
-use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_storage_namespaces, select_logkeepers, storage_namespaces, write_quorum};
+use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
@@ -173,6 +173,11 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &Contro
 
 /// Reserves the next claim for `target` during the handoff.
 pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
+    move_from_holding(directory, name, target, None, control).await
+}
+
+pub(crate) async fn move_from_holding(directory: &dyn Directory, name: &str, target: &MemberId,
+                                      source: Option<(&MemberId, u64)>, control: &ControlKey) -> Result<()> {
     let members = members(directory).await?;
     let address = control_address(&members, target)?;
     let reservation = PlacementMove {
@@ -182,10 +187,14 @@ pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &Mem
     };
     let intended = update(directory, name, |record| {
         let now = now_ms();
+        let holder = effective_holder(record, &members, now);
+        if source.is_some_and(|(member, epoch)| record.epoch != epoch || holder != Some(member)) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-source-changed", format!("{name} has already changed holders")));
+        }
         if !members.get(target).is_some_and(|member| record.may_place_on(member, now)) {
             return Err(Anomaly::incorrect("rtdb.multi/not-placeable", format!("{target} may not take placements of {name}")));
         }
-        if effective_holder(record, &members, now) == Some(target) { return Ok(()); }
+        if holder == Some(target) { return Ok(()); }
         if record.active_move(now).is_some_and(|intent| members.get(&intent.target).is_some_and(|member| record.may_place_on(member, now))) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} already has a reserved placement")));
         }
@@ -236,25 +245,64 @@ pub async fn rebalance(directory: &dyn Directory, moves: usize, control: &Contro
     let now = now_ms();
     let mut moved = 0;
     for pool in [MemberPool::General, MemberPool::Isolation] {
-        let mut load: BTreeMap<MemberId, Vec<&str>> = members.values()
+        let mut load: BTreeMap<MemberId, Vec<&DeploymentRecord>> = members.values()
             .filter(|member| member.pool == pool && member.may_receive_placements(now) && member.control_address.is_some())
             .map(|member| (member.id.clone(), Vec::new())).collect();
         for record in deployments.iter().filter(|record| record.writer_pool() == Some(pool)) {
             if let Some(held) = effective_holder(record, &members, now).and_then(|holder| load.get_mut(holder)) {
-                held.push(&record.name);
+                held.push(record);
             }
         }
         while moved < moves {
-            let Some((busiest, busy)) = load.iter().max_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
-            let Some((idlest, idle)) = load.iter().min_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
-            if busy <= idle + 1 { break; }
-            let name = load.get_mut(&busiest).and_then(Vec::pop).expect("the busiest node holds something");
-            move_deployment(directory, name, &idlest, control).await?;
-            load.get_mut(&idlest).expect("listed").push(name);
+            let mut ranked: Vec<_> = load.iter().collect();
+            ranked.sort_by_key(|(_, held)| held.len());
+            let planned = ranked.iter().rev().find_map(|&(source, holdings)| {
+                ranked.iter().take_while(|(_, held)| holdings.len() > held.len() + 1).find_map(|&(target, _)| {
+                    holdings.iter().rposition(|record| record.may_place_on(&members[target], now))
+                        .map(|index| (source.clone(), target.clone(), index))
+                })
+            });
+            let Some((source, target, index)) = planned else { break };
+            let deployment = load.get_mut(&source).expect("listed").swap_remove(index);
+            move_deployment(directory, &deployment.name, &target, control).await?;
+            load.get_mut(&target).expect("listed").push(deployment);
             moved += 1;
         }
     }
     Ok(moved)
+}
+
+pub(crate) fn validate_engine_version(version: &str) -> Result<()> {
+    if version.is_empty() || version.len() > 128 || version.chars().any(|character| character.is_whitespace() || character.is_control()) {
+        return Err(Anomaly::incorrect("rtdb.multi/engine-version", "An engine version must be a nonempty identifier of at most 128 bytes"));
+    }
+    Ok(())
+}
+
+pub async fn pin_engine(directory: &dyn Directory, name: &str, version: Option<&str>) -> Result<DeploymentRecord> {
+    if let Some(version) = version { validate_engine_version(version)?; }
+    let members = members(directory).await?;
+    update(directory, name, |record| {
+        if !record.can_fork() { return Err(Anomaly::incorrect("rtdb.multi/engine-pin", format!("{name} cannot change its engine pin in its current state"))); }
+        if record.engine_pin.as_deref() == version { return Ok(()); }
+        if let Some(version) = version {
+            let now = now_ms();
+            let serves_version = |id| members.get(id).is_some_and(|member| member.engine_version == version);
+            if effective_holder(record, &members, now).is_some_and(|id| !serves_version(id))
+                || record.active_move(now).is_some_and(|reservation| !serves_version(&reservation.target))
+            {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/engine-pin-in-use", format!("Park {name} and let its placement reservation finish before changing the engine pin")));
+            }
+            if !members.values().any(|member| member.engine_version == version && record.writer_pool() == Some(member.pool)
+                && member.control_address.is_some() && member.may_receive_placements(now)
+                && record.storage_namespaces.is_none_or(|namespaces| member.storage_namespaces == Some(namespaces)))
+            {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/engine-pin-no-target", format!("No eligible node can serve {name} on engine {version}")));
+            }
+        }
+        record.engine_pin = version.map(str::to_owned);
+        Ok(())
+    }).await
 }
 
 pub async fn set_read_width(directory: &dyn Directory, name: &str, width: u32) -> Result<DeploymentRecord> {
@@ -336,6 +384,7 @@ async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::Ob
     let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
     child.lineage = source.lineage.clone();
     child.parent = Some(source.id.clone());
+    child.engine_pin = source.engine_pin.clone();
     child.log_epoch = source.log_epoch + 1;
     child.storage_namespaces = source.storage_namespaces;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
@@ -386,7 +435,7 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
         let current = directory.deployment(&source.id).await.map_err(ForkPublicationError::Rejected)?
             .filter(|current| current.can_fork() && current.epoch == source.epoch
                 && current.log_epoch == source.log_epoch && current.storage_prefix() == source.storage_prefix()
-                && current.storage_namespaces == child.storage_namespaces)
+                && current.storage_namespaces == child.storage_namespaces && current.engine_pin == child.engine_pin)
             .ok_or_else(|| ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{} changed while the fork was prepared", source.name))))?;
         match directory.create_fork(child.clone(), current.version).await {
             Ok(stored) => return Ok(stored),
@@ -491,6 +540,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     if ready.is_some() {
         return finish_cell_move(map, from, to, &current).await;
     }
+    require_cell_move_engine(to.directory, &current, StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys }).await?;
 
     let previous_ensemble = replica_servers(from.directory, &current).await?;
     let key = if existing.is_some() { from.keys.existing(&current.id).await? } else { from.keys.key(&current.id).await? };
@@ -551,6 +601,15 @@ fn move_conflict(name: &str, reason: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-raced", format!("Cannot move {name}: {reason}"))
 }
 
+async fn require_cell_move_engine(directory: &dyn Directory, record: &DeploymentRecord, namespaces: StorageNamespaces) -> Result<()> {
+    let Some(version) = record.engine_pin.as_deref() else { return Ok(()) };
+    let now = now_ms();
+    if directory.members().await?.iter().any(|member| member.engine_version == version && member.pool == MemberPool::General
+        && member.may_receive_placements(now) && member.control_address.is_some() && member.storage_namespaces == Some(namespaces))
+    { return Ok(()); }
+    Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/engine-pin-no-target", format!("The destination cell has no eligible node for {} on engine {version}", record.name)))
+}
+
 async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, to: &CellHandle<'_>, source: &DeploymentRecord) -> Result<DeploymentRecord> {
     let name = &source.name;
     let Some(CellMove { phase: CellMovePhase::Ready { generation, previous_ensemble, ensemble }, namespaces, .. }) = source.cell_move.as_ref() else {
@@ -559,7 +618,9 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     let mut incoming = source.clone();
     incoming.lifecycle = Lifecycle::Moving;
     incoming.storage_generation = Some(*generation);
-    incoming.storage_namespaces = Some(StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys });
+    let destination_namespaces = StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys };
+    incoming.storage_namespaces = Some(destination_namespaces);
+    incoming.s3_write_lease_until_ms = None;
     incoming.cell_move = None;
     incoming.moved_at_ms = None;
     incoming.source_cleanup = None;
@@ -579,7 +640,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     let waiting_for_cutover = |record: &DeploymentRecord| record.lifecycle == Lifecycle::Moving && record.cell_move.is_none();
     let valid_staged = |record: &DeploymentRecord| {
         record.epoch == incoming.epoch && record.holder.is_none() && record.checkpoint == incoming.checkpoint
-            && record.ensemble == incoming.ensemble && record.move_from == incoming.move_from
+            && record.ensemble == incoming.ensemble && record.move_from == incoming.move_from && record.engine_pin == incoming.engine_pin
     };
     let destination = match to.directory.deployment_by_name(name).await? {
         Some(found) => found,
@@ -597,6 +658,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
 
     if map.cell_of(name).await?.as_deref() == Some(from.name) {
         if !waiting_for_cutover(&destination) { return Err(move_conflict(name, "the destination is already serving")); }
+        require_cell_move_engine(to.directory, &incoming, destination_namespaces).await?;
         map.assign(name, to.name, Some(from.name)).await?;
     }
     let placement = map.cell_of(name).await?;
@@ -649,15 +711,18 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
                 record.lifecycle = Lifecycle::Deleting;
                 record.epoch += 1;
                 record.holder = None;
-                Ok(())
             }
             Lifecycle::Deleting => {
                 if record.storage_namespaces.is_none() { record.storage_namespaces = legacy_namespace; }
-                require_storage_namespaces(record, namespaces)
+                require_storage_namespaces(record, namespaces)?;
             }
-            Lifecycle::Moving | Lifecycle::Restoring => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} is moving or restoring"))),
-            Lifecycle::Deleted => Ok(()),
+            Lifecycle::Moving | Lifecycle::Restoring => return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} is moving between cells"))),
+            Lifecycle::Deleted => return Ok(()),
         }
+        if matches!(storage, CellStorage::S3 { .. }) && record.deletion_observation.is_none() {
+            record.deletion_observation = Some(DeletionObservation::Fenced { leases_expire_at_ms: s3_write_lease_horizon(now_ms()) });
+        }
+        Ok(())
     }).await?;
     if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
     await_storage_drain(directory, storage, keys, &fenced).await?;
@@ -683,9 +748,17 @@ fn deletion_receipt(mut tombstone: DeploymentRecord) -> Result<DeletionRecord> {
     let receipt = tombstone.deletion_record.take()
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/deleted", format!("{} is already deleted", tombstone.name)))?;
     let facts = &receipt.facts;
+    let observation_matches = match tombstone.deletion_observation {
+        None => facts.first_empty_observed_at_ms.is_none(),
+        Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms }) => {
+            facts.first_empty_observed_at_ms == Some(first_empty_at_ms) && facts.objects_erased_at_ms == last_empty_at_ms
+                && last_empty_at_ms >= first_empty_at_ms
+        }
+        Some(DeletionObservation::Empty { .. } | DeletionObservation::Fenced { .. }) => false,
+    };
     if tombstone.lifecycle != Lifecycle::Deleted || !facts.verified_empty || facts.deployment != tombstone.id
         || facts.name != tombstone.name || facts.epoch != tombstone.epoch || facts.storage_prefix != tombstone.storage_prefix()
-        || Some(facts.namespaces) != tombstone.storage_namespaces
+        || Some(facts.namespaces) != tombstone.storage_namespaces || !observation_matches
     {
         return Err(Anomaly::fault("rtdb.multi/deletion-receipt-mismatch", format!("The stored receipt for {} does not match its tombstone", tombstone.name)));
     }
@@ -794,6 +867,19 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         _ => return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-unaccepted", format!("The directory has not accepted disposal of {id}"))),
     }
     require_storage_drained(&fenced)?;
+    if matches!(storage, CellStorage::S3 { .. }) && fenced.deletion_observation.is_none() {
+        advance_observation(directory, &fenced, Some(DeletionObservation::Fenced {
+            leases_expire_at_ms: s3_write_lease_horizon(now_ms()),
+        })).await?;
+        fenced = directory.deployment(id).await?.ok_or_else(|| deletion_changed(id))?;
+    }
+    let wait_until = match fenced.deletion_observation {
+        Some(DeletionObservation::Fenced { leases_expire_at_ms }) => Some(leases_expire_at_ms),
+        _ => None,
+    }.max(fenced.s3_write_lease_until_ms);
+    if let Some(deadline) = wait_until.filter(|&deadline| now_ms() < deadline) {
+        return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/storage-lease-active", format!("The storage write lease expires at Unix milliseconds {deadline}")));
+    }
     let mut stream = administration_stream(directory, &fenced, maximum_message_bytes).await?;
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     let namespaces = storage_namespaces(bucket.as_ref(), keys).await?;
@@ -826,9 +912,16 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
     }
     let journals_retired_at_ms = now_ms();
-    let (signed, serving_inventory) = erase_and_sign_disposal(
-        storage, bucket.as_ref(), keys, &fenced, &prefix, &others, namespaces, journals_retired_at_ms,
-    ).await?;
+    let (signed, serving_inventory) = match storage {
+        CellStorage::Local { .. } => erase_and_sign_disposal(
+            storage, bucket.as_ref(), keys, &fenced, &prefix, &others, namespaces, journals_retired_at_ms,
+        ).await?,
+        CellStorage::S3 { config } => {
+            let (first, last) = observe_s3_inventory(directory, storage, config, bucket.as_ref(), &fenced).await?;
+            let signed = sign_disposal(&fenced, keys, namespaces, DeletionInventory::AllVersionsAndMultipartUploads, Some(first), last).await?;
+            (signed, ServingInventory::S3VersionsAndUploads)
+        }
+    };
     let key_withdrawn_at_ms = signed.facts.key_destroyed_at_ms;
     let receipt = DisposalReceipt {
         deployment: fenced.id,
@@ -848,6 +941,13 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => {
+                if let Some(first_empty_at_ms) = signed.facts.first_empty_observed_at_ms
+                    && record.deletion_observation != Some(DeletionObservation::Verified {
+                        first_empty_at_ms, last_empty_at_ms: signed.facts.objects_erased_at_ms,
+                    })
+                {
+                    return Err(deletion_changed(id));
+                }
                 record.disposal = Some(receipt.clone());
                 record.deletion_record = Some(signed.clone());
                 record.lifecycle = Lifecycle::Deleted;
@@ -875,18 +975,21 @@ async fn erase_and_sign_disposal(
     }
     let serving_inventory = storage.purge_serving_inventory(prefix).await?;
     let objects_erased_at_ms = now_ms().max(journals_retired_at_ms);
-    keys.destroy(&fenced.id).await?;
-    let key_withdrawn_at_ms = now_ms().max(objects_erased_at_ms);
-    let signed = keys.sign_deletion(DeletionFacts {
-        deployment: fenced.id.clone(), name: fenced.name.clone(), epoch: fenced.epoch,
-        storage_prefix: prefix.to_string(), namespaces,
-        inventory: match serving_inventory {
-            ServingInventory::LocalDirectory => rtdb_directory::DeletionInventory::CurrentObjects,
-            ServingInventory::S3VersionsAndUploads => rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads,
-        },
-        key_destroyed_at_ms: key_withdrawn_at_ms, objects_erased_at_ms, verified_empty: true,
-    }).await?;
+    let signed = sign_disposal(fenced, keys, namespaces, DeletionInventory::CurrentObjects, None, objects_erased_at_ms).await?;
     Ok((signed, serving_inventory))
+}
+
+async fn sign_disposal(
+    fenced: &DeploymentRecord, keys: &dyn KeyService, namespaces: StorageNamespaces,
+    inventory: DeletionInventory, first_empty_observed_at_ms: Option<i64>, objects_erased_at_ms: i64,
+) -> Result<DeletionRecord> {
+    keys.destroy(&fenced.id).await?;
+    keys.sign_deletion(DeletionFacts {
+        deployment: fenced.id.clone(), name: fenced.name.clone(), epoch: fenced.epoch,
+        storage_prefix: fenced.storage_prefix(), namespaces, inventory,
+        key_destroyed_at_ms: now_ms().max(objects_erased_at_ms), objects_erased_at_ms,
+        first_empty_observed_at_ms, verified_empty: true,
+    }).await
 }
 
 fn require_storage_drained(record: &DeploymentRecord) -> Result<()> {
@@ -920,6 +1023,74 @@ pub(crate) async fn await_storage_drain(directory: &dyn Directory, storage: &Cel
             ))
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/storage-drain-fence", "The installation left its storage drain fence"))?;
     }
+}
+
+async fn deletion_neighbors(directory: &dyn Directory, deployment: &DeploymentRecord) -> Result<Vec<DeploymentRecord>> {
+    Ok(directory.deployments().await?.into_iter().filter(|record| record.id != deployment.id).collect())
+}
+
+fn observation_pending(first_empty_at_ms: i64) -> Anomaly {
+    let deadline = s3_write_lease_horizon(first_empty_at_ms);
+    Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/deletion-verification-pending", format!("The second empty inventory is due at Unix milliseconds {deadline}"))
+}
+
+async fn advance_observation(directory: &dyn Directory, deployment: &DeploymentRecord, observation: Option<DeletionObservation>) -> Result<()> {
+    update_installation(directory, &deployment.id, |current| {
+        if current.epoch != deployment.epoch || current.lifecycle != Lifecycle::Deleting
+            || current.storage_namespaces != deployment.storage_namespaces || current.storage_prefix() != deployment.storage_prefix()
+            || current.deletion_observation != deployment.deletion_observation
+        {
+            return Err(deletion_changed(&deployment.name));
+        }
+        current.deletion_observation = observation;
+        Ok(())
+    }).await?;
+    Ok(())
+}
+
+async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, config: &rtdb_s3::S3Config,
+                             bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord) -> Result<(i64, i64)> {
+    let first_empty_at_ms = match deployment.deletion_observation {
+        Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms }) => {
+            if first_empty_at_ms < 0 || last_empty_at_ms < s3_write_lease_horizon(first_empty_at_ms) || last_empty_at_ms > now_ms() {
+                return Err(Anomaly::fault("rtdb.multi/deletion-observation", "The stored empty inventory timestamps are inconsistent"));
+            }
+            return Ok((first_empty_at_ms, last_empty_at_ms));
+        }
+        Some(DeletionObservation::Empty { observed_at_ms }) => observed_at_ms,
+        Some(DeletionObservation::Fenced { .. }) => {
+            let others = deletion_neighbors(directory, deployment).await?;
+            erase_inventory(storage, bucket, deployment, &others).await?;
+            let observed_at_ms = now_ms();
+            advance_observation(directory, deployment, Some(DeletionObservation::Empty { observed_at_ms })).await?;
+            return Err(observation_pending(observed_at_ms));
+        }
+        None => return Err(deletion_changed(&deployment.name)),
+    };
+    if now_ms() < s3_write_lease_horizon(first_empty_at_ms) { return Err(observation_pending(first_empty_at_ms)); }
+
+    let cell = rtdb_storage::ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
+    let inventory = config.versioned_inventory(&cell, &BTreeMap::new()).await?;
+    let prefix = rtdb_storage::ObjectKey::new(deployment.storage_prefix())?;
+    if !inventory.is_empty(&prefix).await? {
+        advance_observation(directory, deployment, Some(DeletionObservation::Fenced { leases_expire_at_ms: now_ms() })).await?;
+        return Err(deletion_incomplete(deployment));
+    }
+    let last_empty_at_ms = now_ms();
+    if last_empty_at_ms < s3_write_lease_horizon(first_empty_at_ms) { return Err(observation_pending(first_empty_at_ms)); }
+    advance_observation(directory, deployment, Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms })).await?;
+    Ok((first_empty_at_ms, last_empty_at_ms))
+}
+
+fn deletion_incomplete(deployment: &DeploymentRecord) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name))
+}
+
+async fn erase_inventory(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord]) -> Result<DeletionInventory> {
+    let storage_prefix = deployment.storage_prefix();
+    if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? { return Err(deletion_incomplete(deployment)); }
+    storage.purge_inventory(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await
+}
 }
 
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
@@ -986,16 +1157,57 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     Ok(report)
 }
 
-/// Starts scaling a node in: it keeps serving what it holds, receives no new placements, and parks everything it holds so that each deployment's next request activates it elsewhere.
+/// Stops adding placements to a node and lets its agent hand off or park its holdings.
 pub async fn drain(directory: &dyn Directory, member: &MemberId) -> Result<()> {
+    mark_draining(directory, member, None).await.map(|_| ())
+}
+
+async fn mark_draining(directory: &dyn Directory, member: &MemberId, target_engine: Option<&str>) -> Result<bool> {
     for _ in 0..8 {
         let current = directory.member(member).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-member", format!("No member {member}")))?;
-        if current.state != MemberState::Eligible { return Ok(()); }
+        if current.state != MemberState::Eligible { return Ok(false); }
         let mut draining = current.clone();
         draining.state = MemberState::Draining;
-        if let Cas::Applied(_) = directory.replace_member(draining, current.version).await? { return Ok(()); }
+        draining.drain_target_engine = target_engine.map(str::to_owned);
+        if let Cas::Applied(_) = directory.replace_member(draining, current.version).await? { return Ok(true); }
     }
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/drain-contended", "The member kept changing while being drained"))
+}
+
+/// Starts drains on older nodes whose current deployments can all run on the requested engine in the same pool.
+pub async fn roll_engine(directory: &dyn Directory, version: &str) -> Result<Vec<MemberId>> {
+    validate_engine_version(version)?;
+    let members = members(directory).await?;
+    let now = now_ms();
+    let deployments = directory.deployments().await?;
+    let mut parked_pins = HashSet::new();
+    let mut held: BTreeMap<&MemberId, Vec<&DeploymentRecord>> = BTreeMap::new();
+    for record in &deployments {
+        let holder = effective_holder(record, &members, now);
+        if let Some(holder) = holder { held.entry(holder).or_default().push(record); }
+        if let Some((pin, pool)) = record.engine_pin.as_deref().zip(record.writer_pool())
+            && holder.and_then(|id| members.get(id)).is_none_or(|member| !member.may_receive_placements(now) || member.control_address.is_none())
+        {
+            parked_pins.insert((pin, pool, record.storage_namespaces));
+        }
+    }
+    let mut draining = Vec::new();
+    for older in members.values().filter(|member| member.engine_version != version && member.may_receive_placements(now)
+        && member.control_address.is_some() && member.pool != MemberPool::Compaction)
+    {
+        let serves_bound_pin = parked_pins.remove(&(older.engine_version.as_str(), older.pool, older.storage_namespaces));
+        let serves_unbound_pin = parked_pins.remove(&(older.engine_version.as_str(), older.pool, None));
+        if serves_bound_pin || serves_unbound_pin { continue; }
+        let targets: Vec<_> = members.values().filter(|target| {
+            target.engine_version == version && target.pool == older.pool && target.may_receive_placements(now) && target.control_address.is_some()
+        }).collect();
+        if targets.is_empty() { continue; }
+        if held.get(&older.id).is_some_and(|records| records.iter().any(|record| !targets.iter().any(|target| {
+            record.may_place_on(target, now) && record.storage_namespaces.is_none_or(|namespaces| target.storage_namespaces == Some(namespaces))
+        }))) { continue; }
+        if mark_draining(directory, &older.id, Some(version)).await? { draining.push(older.id.clone()); }
+    }
+    Ok(draining)
 }
 
 /// Marks every member whose lease expired more than `grace` ago as dead.

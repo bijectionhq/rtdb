@@ -68,6 +68,8 @@ const PRESSURE_WAIT: Duration = Duration::from_millis(500);
 const PRESSURE_PARKS_PER_PASS: usize = 8;
 const HANDOFF_REPLAY_ROWS: u64 = 64;
 const HANDOFF_REPLAY_RECORDS: i64 = 16;
+const DRAIN_HANDOFFS_PER_PASS: usize = 8;
+const ACTIVE_DRAIN_WINDOW: Duration = Duration::from_secs(60);
 
 fn require_recovered_checkpoint(record: &DeploymentRecord, database: &Database) -> Result<()> {
     let Some(required) = record.checkpoint else { return Ok(()); };
@@ -513,6 +515,10 @@ impl NodeAgent {
 
     async fn relieve_execution_memory(&self, protected: Option<&str>) {
         if !self.execution_memory_pressured() { return; }
+        let member = self.member();
+        let Ok(Some(local_member)) = self.directory.member(&member).await else { return };
+        let draining = local_member.state == MemberState::Draining;
+        if draining && local_member.drain_target_engine.is_some() { return; }
         let Ok(_relief) = tokio::time::timeout(PRESSURE_WAIT, self.memory_relief.lock()).await else { return };
         if !self.execution_memory_pressured() { return; }
         let budget = self.node.memory();
@@ -532,9 +538,9 @@ impl NodeAgent {
             });
             if !same_activity() { continue; }
             attempted += 1;
-            let member = self.member();
             match self.directory.deployment(&id).await {
                 Ok(Some(record)) if record.epoch == epoch && record.holder.as_ref() == Some(&member) => {
+                    if draining && record.engine_pin.is_some() { continue; }
                     if same_activity() { let _ = self.park_with_turn(&name, None, PRESSURE_WAIT).await; }
                 }
                 Ok(_) => self.stop_running(&name).await,
@@ -689,7 +695,8 @@ impl NodeAgent {
         let me = self.member();
         let assigned_here = |record: &DeploymentRecord| {
             if record.lifecycle != Lifecycle::Live || record.move_from.is_some() || effective_holder(record, &members, now).is_none() { return false; }
-            let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &workers, |member| member.id.as_str());
+            let compatible: Vec<_> = workers.iter().copied().filter(|member| record.permits_engine(member)).collect();
+            let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &compatible, |member| member.id.as_str());
             ranked.first().is_some_and(|first| first.id == me)
         };
         let mut wanted: BTreeMap<_, _> = deployments.into_iter().filter(&assigned_here).map(|record| (record.name.clone(), record)).collect();
@@ -726,13 +733,18 @@ impl NodeAgent {
         if let Some(subscription) = self.subscriptions.lock().get_mut(name) { subscription.last_touch = Instant::now(); }
     }
 
-    /// Gives up every deployment the directory no longer places here under the epoch this node opened it at, every one whose database stopped, every idle one, and the least recently used beyond `max_active`; drops idle or unwanted replicas.
+    /// Reconciles holdings and replicas with the directory, handing off recently used holdings when draining.
     pub async fn reconcile(&self) {
         self.relieve_execution_memory(None).await;
-        let draining = self.lease.record().state == MemberState::Draining;
+        let local_member = self.lease.record();
+        let draining = local_member.state == MemberState::Draining;
+        let target_engine = local_member.drain_target_engine.as_deref();
         let warming = std::mem::take(&mut *self.warming.lock());
         if !draining { for name in warming { let _ = self.subscribe_for(&name, true).await; } }
         let me = self.member();
+        let destinations = if draining { self.members().await.ok() } else { None };
+        let active_within = self.options.park_after.map_or(ACTIVE_DRAIN_WINDOW, |after| after.min(ACTIVE_DRAIN_WINDOW));
+        let mut handoffs = Vec::new();
         let mut held: Vec<(String, String, u64, Instant)> = self.holdings.lock().iter().map(|(name, holding)| (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch)).collect();
         held.sort_by_key(|(.., touched)| std::cmp::Reverse(*touched));
         for (rank, (name, id, epoch, last_touch)) in held.into_iter().enumerate() {
@@ -750,8 +762,34 @@ impl NodeAgent {
                 continue;
             }
             self.publish_and_trim(&name, &id, epoch).await;
+            if draining {
+                let Some(record) = current.as_ref() else { continue };
+                if target_engine.is_none() && record.engine_pin.is_none() && last_touch.elapsed() >= active_within {
+                    let _ = self.park(&name).await;
+                } else if handoffs.len() < DRAIN_HANDOFFS_PER_PASS
+                    && let Some(members) = destinations.as_ref()
+                {
+                    let now = now_ms();
+                    let candidates: Vec<_> = members.values().filter(|member| member.id != me
+                        && member.control_address.is_some() && record.may_place_on(member, now)
+                        && target_engine.is_none_or(|target| member.engine_version == target)
+                        && record.storage_namespaces.is_none_or(|namespaces| member.storage_namespaces == Some(namespaces))).collect();
+                    if let Some(target) = rtdb_affinity::rank(&record.storage_identity(), &candidates, |member| member.id.as_str()).first() {
+                        handoffs.push((name, epoch, target.id.clone()));
+                    }
+                }
+                continue;
+            }
             let over = self.options.max_active.is_some_and(|limit| rank >= limit);
-            if draining || over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
+            if over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
+        }
+        if !handoffs.is_empty() {
+            let control = crate::control::ControlKey(self.secret.clone());
+            let control = &control;
+            let source = &me;
+            futures::future::join_all(handoffs.into_iter().map(|(name, epoch, target)| async move {
+                let _ = crate::admin::move_from_holding(self.directory.as_ref(), &name, &target, Some((source, epoch)), control).await;
+            })).await;
         }
         if self.options.compaction_worker { self.reconcile_compaction().await; }
         if let Some(limit) = self.options.max_tail_rows { self.bound_tails(limit).await; }

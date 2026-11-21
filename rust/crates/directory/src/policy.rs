@@ -9,7 +9,7 @@ use crate::{DeploymentRecord, MemberId, MemberRecord};
 /// The holder that counts: the recorded holder, only while its member may hold.
 pub fn effective_holder<'a>(record: &'a DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>, now_ms: i64) -> Option<&'a MemberId> {
     record.holder.as_ref().filter(|holder| members.get(*holder)
-        .is_some_and(|member| record.writer_pool() == Some(member.pool) && member.may_hold(now_ms)))
+        .is_some_and(|member| record.may_hold_on(member, now_ms)))
 }
 
 /// The record that makes `claimant` the holder under the next epoch, or `None` if the deployment may not be claimed by it now.
@@ -46,7 +46,7 @@ mod tests {
 
     fn node(id: &str, state: MemberState, lease: i64) -> MemberRecord {
         MemberRecord { id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None, availability_zone: "a".into(),
-            engine_version: "0".into(), lease_expires_at_ms: lease, state, pool: MemberPool::General, storage_namespaces: None, version: 1 }
+            engine_version: "0".into(), lease_expires_at_ms: lease, state, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 1 }
     }
 
     fn members(list: &[MemberRecord]) -> BTreeMap<MemberId, MemberRecord> { list.iter().map(|member| (member.id.clone(), member.clone())).collect() }

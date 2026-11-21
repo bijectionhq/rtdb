@@ -24,6 +24,7 @@ use crate::lease::{LeaseOptions, MemberLease, Registration};
 use crate::logs::LogkeeperLogFactory;
 
 const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct NodeSettings {
     pub configuration: NodeConfiguration,
@@ -32,6 +33,7 @@ pub struct NodeSettings {
     /// The address peers use when the listeners bind on all interfaces.
     pub advertise_host: Option<String>,
     pub availability_zone: String,
+    pub engine_version: Option<String>,
     pub agent: AgentOptions,
     pub lease: LeaseOptions,
     pub pool: rtdb_directory::MemberPool,
@@ -60,6 +62,8 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    let engine_version = settings.engine_version.take().unwrap_or_else(|| ENGINE_VERSION.into());
+    crate::admin::validate_engine_version(&engine_version)?;
     let scoped_writes = match (&settings.agent.s3_write_role, &settings.agent.storage) {
         (Some(role), crate::deployment::CellStorage::S3 { config }) => {
             let issuer = rtdb_s3::ScopedS3Writes::new(&role.arn, config.region.as_deref(), role.sts_endpoint.as_deref(),
@@ -112,7 +116,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let pgwire_endpoint = advertised(pgwire_address, settings.advertise_host.as_deref())?;
     let control_endpoint = advertised(control_address, settings.advertise_host.as_deref())?;
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
-        role: MemberRole::Node, address: pgwire_endpoint.clone(), control_address: Some(control_endpoint), availability_zone: settings.availability_zone, pool: settings.pool, storage_namespaces: Some(storage_namespaces),
+        role: MemberRole::Node, address: pgwire_endpoint.clone(), control_address: Some(control_endpoint), availability_zone: settings.availability_zone, pool: settings.pool, engine_version, storage_namespaces: Some(storage_namespaces),
     }, settings.lease).await?;
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
@@ -216,7 +220,7 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     }
     let lease = MemberLease::reclaim_logkeeper(directory, Registration {
         role: MemberRole::Logkeeper, address: endpoint, control_address: None,
-        availability_zone: settings.availability_zone, pool: Default::default(), storage_namespaces: None,
+        availability_zone: settings.availability_zone, engine_version: ENGINE_VERSION.into(), pool: Default::default(), storage_namespaces: None,
     }, MemberId(identity), settings.advertise_host.is_some(), settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();

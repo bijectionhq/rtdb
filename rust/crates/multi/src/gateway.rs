@@ -41,6 +41,7 @@ pub struct GatewayOptions {
     pub control_timeout: Duration,
     /// When set, every frontend must negotiate TLS before startup.
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub startup_timeout: Duration,
     /// How often an open connection tells its holder it is in use.
     pub touch_interval: Duration,
     /// The cell's secret, with which the gateway mints a capability for each reconnection of an authenticated session.
@@ -48,7 +49,7 @@ pub struct GatewayOptions {
 }
 
 impl Default for GatewayOptions {
-    fn default() -> Self { Self { cells: None, tls: None, control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10), capabilities: None } }
+    fn default() -> Self { Self { cells: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN, control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10), capabilities: None } }
 }
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
@@ -60,7 +61,12 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         let directory = Arc::clone(&directory);
         let options = options.clone();
         let cancellation = cancellation.child_token();
-        tokio::spawn(async move { let _ = connection(client, directory, options, cancellation).await; });
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {}
+                _ = connection(client, directory, options) => {}
+            }
+        });
     }
 }
 
@@ -90,7 +96,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 type Client = Box<dyn Transport>;
 
 async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
-    let startup = tokio::time::timeout(options.control_timeout, read_startup(Box::new(client), options.tls.as_ref()));
+    let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
+    let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(client), options.tls.as_ref()));
     let Some(result) = cancellation.run_until_cancelled(startup).await else { return Ok(()); };
     let Some((mut client, mut startup)) = result.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/startup-timeout", "PostgreSQL startup did not finish"))?? else { return Ok(()); };
     let selector = startup.parameters.get("database");
@@ -103,13 +110,21 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         Ok(_) => return refuse(&mut client, "3D000", "The startup message names no database").await,
         Err(error) => return refuse(&mut client, "3D000", error.message.as_deref().unwrap_or_default()).await,
     };
-    if let Some(gateway) = elsewhere(&directory, &name, &options).await {
-        let mut forward = match connect(&gateway).await { Ok(forward) => forward, Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await };
-        forward.write_all(&startup.bytes).await.map_err(io)?;
-        return tokio::select! {
-            _ = cancellation.cancelled() => Ok(()),
-            copied = tokio::io::copy_bidirectional(&mut client, &mut forward) => copied.map(|_| ()).map_err(io),
+    let Ok(remote_gateway) = tokio::time::timeout_at(startup_deadline, elsewhere(&directory, &name, &options)).await else {
+        return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await;
+    };
+    if let Some(gateway) = remote_gateway {
+        let forward = tokio::time::timeout_at(startup_deadline, async {
+            let mut forward = connect(&gateway).await?;
+            forward.write_all(&startup.bytes).await.map_err(io)?;
+            Ok::<_, Anomaly>(forward)
+        }).await;
+        let mut forward = match forward {
+            Ok(Ok(forward)) => forward,
+            Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await,
+            Err(_) => return refuse(&mut client, "57P03", "Timed out forwarding startup to the deployment's cell").await,
         };
+        return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
     }
     if expected.is_some() {
         startup.parameters.insert("database".into(), name.clone());
@@ -118,12 +133,13 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     let read_only = startup.read_only();
     let snapshot = startup.snapshot();
     let expected_history = expected.map(|id| id.hyphenated().to_string());
-    let route_initial = control::retry_activation(options.control_timeout, || {
+    let route_initial = tokio::time::timeout_at(startup_deadline, control::retry_activation(options.control_timeout, || {
         route(&directory, &name, expected_history.as_deref(), read_only, snapshot, &options)
-    }).await;
+    })).await;
     let (server, control, epoch, deployment) = match route_initial {
-        Ok(route) => route,
-        Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
+        Ok(Ok(route)) => route,
+        Err(_) => return refuse(&mut client, "57P03", "Timed out routing startup to the deployment's holder").await,
+        Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
     };
     let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name, deployment: deployment.clone(), read_only, snapshot, options: options.clone() });
     let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
@@ -132,7 +148,7 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         .with_installation(expected);
     tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
-        outcome = session.run(client, server, control, epoch) => outcome,
+        outcome = session.run_before(client, server, control, epoch, startup_deadline) => outcome,
     }
 }
 

@@ -11,13 +11,13 @@ use serde_json::json;
 
 use crate::{S3Authorization, S3Config};
 
-const SESSION_SECONDS: i32 = 15 * 60;
-const CLOCK_ALLOWANCE: Duration = Duration::from_secs(1);
+pub const SCOPED_S3_WRITE_TTL: Duration = Duration::from_secs(15 * 60);
+pub const SCOPED_S3_CLOCK_ALLOWANCE: Duration = Duration::from_secs(1);
 
 #[async_trait]
 pub trait WriteAuthorization: Send + Sync {
-    /// Confirms that the application still authorizes minting credentials for the store.
-    async fn authorize(&self) -> Result<()>;
+    /// Confirms authorization and records the session expiry when STS has supplied one.
+    async fn authorize(&self, expires: Option<SystemTime>) -> Result<()>;
 }
 
 /// The STS configuration shared by a node's deployment stores.
@@ -62,7 +62,7 @@ impl ScopedS3Writes {
     fn provider(&self, storage: &S3Config, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>) -> Result<SharedCredentialsProvider> {
         let policy = write_policy(storage, root, &self.partition, self.require_conditional_put)?;
         let request = self.sts.assume_role().role_arn(&self.role).role_session_name("rtdb-deployment-write")
-            .duration_seconds(SESSION_SECONDS).policy(policy);
+            .duration_seconds(SCOPED_S3_WRITE_TTL.as_secs() as i32).policy(policy);
         Ok(SharedCredentialsProvider::new(AuthorizedRole { request, authorization }))
     }
 }
@@ -139,7 +139,7 @@ mod tests {
 
         struct Permit;
         #[async_trait]
-        impl WriteAuthorization for Permit { async fn authorize(&self) -> Result<()> { Ok(()) } }
+        impl WriteAuthorization for Permit { async fn authorize(&self, _: Option<SystemTime>) -> Result<()> { Ok(()) } }
         let provider = role.provider(&storage, &root, Arc::new(Permit)).unwrap();
         let scoped = aws_sdk_s3::Client::from_conf(client.credentials_provider(provider).build());
         scoped.put_object().bucket(&storage.bucket).key(&own).if_none_match("*")
@@ -164,16 +164,16 @@ impl std::fmt::Debug for AuthorizedRole {
 impl ProvideCredentials for AuthorizedRole {
     fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a> where Self: 'a {
         future::ProvideCredentials::new(async move {
-            self.authorization.authorize().await.map_err(|error| CredentialsError::provider_error(error.to_string()))?;
+            self.authorization.authorize(None).await.map_err(|error| CredentialsError::provider_error(error.to_string()))?;
             let response = self.request.clone().send().await.map_err(CredentialsError::provider_error)?;
             let credentials = response.credentials().ok_or_else(|| CredentialsError::provider_error("STS returned no credentials"))?;
             let expires = SystemTime::try_from(*credentials.expiration()).map_err(CredentialsError::provider_error)?;
             let now = SystemTime::now();
-            let maximum = now + Duration::from_secs(SESSION_SECONDS as u64) + CLOCK_ALLOWANCE;
+            let maximum = now + SCOPED_S3_WRITE_TTL + SCOPED_S3_CLOCK_ALLOWANCE;
             if credentials.session_token().is_empty() || expires <= now || expires > maximum {
                 return Err(CredentialsError::provider_error("STS returned invalid session credentials"));
             }
-            self.authorization.authorize().await.map_err(|error| CredentialsError::provider_error(error.to_string()))?;
+            self.authorization.authorize(Some(expires)).await.map_err(|error| CredentialsError::provider_error(error.to_string()))?;
             Ok(Credentials::new(credentials.access_key_id(), credentials.secret_access_key(),
                 Some(credentials.session_token().to_owned()), Some(expires), "rtdb-scoped-s3"))
         })

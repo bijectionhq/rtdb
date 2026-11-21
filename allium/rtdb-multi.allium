@@ -572,12 +572,13 @@ entity DeploymentRecord {
     -- The KeyService key wrapping this deployment's object data keys.
     key_id: String
     lifecycle: Lifecycle
+    deletion_observation: DeletionObservation?
     deletion_record: DeletionRecord?
     isolation_class: IsolationClass
     -- Members permitted when isolation_class is pinned or dedicated.
     pinned_members: Set<MemberId>
-    -- The engine versions permitted to hold this deployment.
-    engine_pin: String
+    -- An exact engine version for the holder and its compaction worker.
+    engine_pin: String?
     format_version: Integer
     quotas: Quotas
 
@@ -669,6 +670,9 @@ entity LogServerStream {
     last_lsn: Lsn
     commit_lsn: Lsn
     trimmed_through: Lsn
+    -- Consecutive retained log positions grouped by their writer epoch.
+    retained_epoch_runs: List<EpochRun>
+    retained_bytes: Integer
 }
 
 entity LogRecord {
@@ -830,6 +834,12 @@ entity GarbageCandidate {
     object: ObjectRef
     lineage: LineageId
     released_at: Timestamp
+}
+
+value DeletionObservation {
+    leases_expire_at: Timestamp?
+    first_empty_at: Timestamp?
+    second_empty_at: Timestamp?
 }
 
 entity DeletionRecord {
@@ -1580,13 +1590,15 @@ rule AnswerMoved {
 
 rule DrainMember {
     -- Scale-in, replacement and rollout drain a member by handing off its active deployments and parking its idle ones, at most moves_per_node_per_pass per pass.
+    -- The source's identity and epoch still match when the drain reserves a handoff.
+    -- A recent holding stays on its source while the placement pool has no eligible destination.
     when: member: MemberRecord.state becomes draining
 
     ensures:
         for holding in HoldingsOf(member):
-            if holding.residency = active:
+            if RecentlyUsed(holding) and HasEligibleDestination(holding):
                 MoveChosen(holding.deployment, Affinity.next_rank(holding.deployment, excluding: member))
-            else:
+            if IdleForDrain(holding):
                 ParkStarted(holding)
 }
 
@@ -1603,6 +1615,17 @@ rule Rebalance {
 ------------------------------------------------------------
 -- Rules: reads
 ------------------------------------------------------------
+
+rule BoundInitialGreeting {
+    when: StartupDeadlineElapsed(connection)
+
+    requires: connection.ready = false
+
+    ensures:
+        if connection.startup_received:
+            ClientMayRetryStartup(connection)
+        ConnectionClosed(connection)
+}
 
 rule RouteRead {
     -- The gateway walks the deployment's affinity order within its read width.
@@ -1857,6 +1880,8 @@ rule BeginDeletion {
             holder: null,
             lifecycle: deleting
         })
+        if RecordUsesS3(record):
+            RecordLeaseHorizon(record, now + config.credential_ttl)
         for loglet in record.loglets:
             SealSent(loglet, epoch: Epoch(value: record.epoch.value + 1))
         StreamDropped(record.id)
@@ -1899,7 +1924,8 @@ rule RefreshScopedS3Session {
     ensures:
         let session = ProviderAssumedWriteRole(prefix: record.storage_root.prefix, max_age: config.credential_ttl)
         if WriterOrCompactorAuthorized(record, writer_epoch):
-            ScopedWriteSessionIssued(session)
+            if DirectoryRecordsMaximumWriteExpiry(record, session.expiration):
+                ScopedWriteSessionIssued(session)
         else:
             WriteRefused(record)
 }
@@ -1941,6 +1967,8 @@ rule PublishInventoryReceipt {
 
     requires: record.lifecycle = deleting
     requires: record.storage_namespaces = namespaces
+    requires: RecordedWriteLeasesExpired(record)
+    requires: LocalStorage(record) or record.deletion_observation.second_empty_at != null
 
     ensures:
         KeyService.destroy(record.key_id)
@@ -1983,6 +2011,26 @@ rule RetireCheckpointArchives {
         RetireRegisteredArchiveCopies(record)
 }
 
+rule ObserveS3Inventory {
+    when: S3DeletionContinued(record)
+
+    requires: record.lifecycle = deleting
+    requires: RecordUsesS3(record)
+    requires: RecordedWriteLeasesExpired(record)
+    requires: S3LeaseHorizonElapsed(record)
+    requires: StreamDropped(record.id)
+
+    ensures:
+        if record.deletion_observation.first_empty_at = null:
+            EraseS3Inventory(record.storage_root.prefix)
+            Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(first_empty_at: now, second_empty_at: null) })
+        else if record.deletion_observation.second_empty_at = null and now >= record.deletion_observation.first_empty_at + config.credential_ttl:
+            if S3InventoryIsEmpty(record.storage_root.prefix):
+                Directory.cas(record.id, record.version, change: { deletion_observation.second_empty_at: now })
+            else:
+                Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(leases_expire_at: now) })
+}
+
 ------------------------------------------------------------
 -- Rules: upgrades
 ------------------------------------------------------------
@@ -1993,8 +2041,20 @@ rule RollEngine {
     when: EngineRolloutStarted(cell, version)
 
     ensures:
-        for member in cell.members where member.engine_version != version:
-            DrainScheduled(member)
+        for member in cell.members where member.engine_version != version and member.may_receive_placements:
+            if EligibleTargetOfVersionAndPoolExists(member, version) and EveryHoldingHasEligibleTargetOfVersion(member, version) and ParkedPinsRetainEligibleMembers(member):
+                DrainScheduled(member, target_engine: version)
+}
+
+rule SetEnginePin {
+    when: EnginePinRequested(record, version)
+
+    requires: record.lifecycle in {live, quarantined}
+    requires: version = null or HolderAndActivePlacementMatchEngine(record, version)
+    requires: version = null or EligibleEngineExists(record, version)
+
+    ensures:
+        Directory.cas(record.id, record.version, change: { engine_pin: version })
 }
 
 rule UpgradeFormatLazily {
@@ -2021,6 +2081,7 @@ rule BeginCellMove {
 
     requires: record.lifecycle = live
     requires: DestinationDeploymentPrefixIsDisjoint(record, target_cell)
+    requires: DestinationCanServeEnginePin(record, target_cell)
 
     ensures:
         Directory.cas(record.id, record.epoch, change: {
@@ -2039,6 +2100,7 @@ rule MoveCutover {
     when: DestinationPrepared(record, target_cell)
 
     requires: record.lifecycle = moving
+    requires: DestinationCanServeEnginePin(record, target_cell)
 
     ensures:
         CellMapRowWritten(deployment: record.id, cell: target_cell)
@@ -2054,6 +2116,7 @@ rule CleanUpMovedSource {
     requires: record.source_namespaces != null
     requires: StorageNamespacesMatchSource(record)
     requires: DeploymentPrefixIsDisjoint(record)
+    requires: RecordedWriteLeasesExpired(record)
 
     ensures:
         EraseSourceCopyAfterTransferringSharedObjects(record)

@@ -290,12 +290,14 @@ mod tests {
             inventory: rtdb_directory::DeletionInventory::CurrentObjects,
             key_destroyed_at_ms: 2,
             objects_erased_at_ms: 1,
+            first_empty_observed_at_ms: None,
             verified_empty: true,
         };
         let receipt = keys.sign_deletion(facts).await.unwrap();
         let json = serde_json::to_string_pretty(&receipt).unwrap();
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["facts"]["verified_empty"], true);
+        assert!(value["facts"].get("first_empty_observed_at_ms").is_none());
         value["facts"]["inventory_claim"] = serde_json::json!("all_versions");
         assert!(serde_json::from_value::<DeletionRecord>(value).is_err());
         let mut receipt: DeletionRecord = serde_json::from_str(&json).unwrap();

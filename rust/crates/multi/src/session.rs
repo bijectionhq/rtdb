@@ -20,6 +20,8 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::task::AbortOnDropHandle;
 
 const MAXIMUM_FRAME_BYTES: usize = 1 << 30;
+pub(crate) const STARTUP_WITHIN: Duration = Duration::from_secs(35);
+const STARTUP_TIMEOUT: &str = "rtdb.multi/startup-timeout";
 const RECONNECT_WITHIN: Duration = Duration::from_secs(30);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// A capability serves one reconnection, so it only has to outlive the startup it is sent in.
@@ -216,10 +218,12 @@ impl Session {
     }
 
     /// Runs the session over an already-routed first backend whose greeting the client has not yet seen.
-    pub async fn run(
-        mut self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        first: TcpStream, first_control: Option<String>, first_epoch: u64,
-    ) -> Result<()> {
+    pub async fn run(self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, first: TcpStream, first_control: Option<String>, first_epoch: u64) -> Result<()> {
+        self.run_before(client, first, first_control, first_epoch, tokio::time::Instant::now() + STARTUP_WITHIN).await
+    }
+
+    pub(crate) async fn run_before(mut self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, first: TcpStream, first_control: Option<String>, first_epoch: u64,
+                                   startup_deadline: tokio::time::Instant) -> Result<()> {
         let (client_read, mut client_write) = tokio::io::split(client);
         let (mut requests, _client_reader) = pump(client_read);
         let mut first = Backend::new(first, first_epoch);
@@ -231,7 +235,8 @@ impl Session {
             Retired,
         }
         let outcome = async {
-            backend.as_mut().expect("just set").writer.write_all(&self.startup).await.map_err(io)?;
+            tokio::time::timeout_at(startup_deadline, backend.as_mut().expect("just set").writer.write_all(&self.startup))
+                .await.map_err(|_| startup_timeout())?.map_err(io)?;
             loop {
                 let event = {
                     let Some(current) = backend.as_mut() else { break Ok(()) };
@@ -241,6 +246,7 @@ impl Session {
                             matches!(record.lifecycle, Lifecycle::Deleting | Lifecycle::Restoring)
                                 || record.lifecycle == Lifecycle::Deleted && record.moved_at_ms.is_none()
                         })) => Event::Retired,
+                        _ = tokio::time::sleep_until(startup_deadline), if !self.greeting.done => return Err(startup_timeout()),
                         event = async {
                             if let Some(deadline) = current.drain_deadline {
                                 let reply = tokio::time::timeout_at(deadline, current.frames.recv()).await
@@ -268,7 +274,8 @@ impl Session {
                             break Ok(());
                         }
                         if !self.greeting.done {
-                            backend.as_mut().expect("greeting backend").writer.write_all(&request.encode()).await.map_err(io)?;
+                            tokio::time::timeout_at(startup_deadline, backend.as_mut().expect("greeting backend").writer.write_all(&request.encode()))
+                                .await.map_err(|_| startup_timeout())?.map_err(io)?;
                             continue;
                         }
                         if request.tag == b'H' {
@@ -291,14 +298,17 @@ impl Session {
                     Event::Reply(Some(Ok(frame))) => {
                         if !self.greeting.done {
                             self.greeting.observe(&frame, &mut self.authenticated);
-                            if self.greeting.done {
-                                self.status = Status::Idle;
-                                if let Some(installation) = self.installation_status.take() {
-                                    client_write.write_all(&installation.encode()).await.map_err(io)?;
+                            tokio::time::timeout_at(startup_deadline, async {
+                                if self.greeting.done {
+                                    self.status = Status::Idle;
+                                    if let Some(installation) = self.installation_status.take() {
+                                        client_write.write_all(&installation.encode()).await.map_err(io)?;
+                                    }
                                 }
-                            }
-                            client_write.write_all(&frame.encode()).await.map_err(io)?;
-                            client_write.flush().await.map_err(io)?;
+                                client_write.write_all(&frame.encode()).await.map_err(io)?;
+                                client_write.flush().await.map_err(io)?;
+                                Ok::<_, Anomaly>(())
+                            }).await.map_err(|_| startup_timeout())??;
                             if frame.tag == b'E' { break Ok(()); }
                             continue;
                         }
@@ -366,7 +376,13 @@ impl Session {
             }
         }.await;
         if let Err(error) = &outcome {
-            let _ = client_write.write_all(&error_frame("08006", error.message.as_deref().unwrap_or(error.code.as_ref())).encode()).await;
+            let code = if error.code == STARTUP_TIMEOUT { "57P03" } else { "08006" };
+            let reply = error_frame(code, error.message.as_deref().unwrap_or(error.code.as_ref())).encode();
+            if error.code == STARTUP_TIMEOUT {
+                let _ = tokio::time::timeout(Duration::from_millis(100), client_write.write_all(&reply)).await;
+            } else {
+                let _ = client_write.write_all(&reply).await;
+            }
             let _ = client_write.flush().await;
         }
         outcome
@@ -478,6 +494,7 @@ pub fn error_frame(sqlstate: &str, message: &str) -> Frame {
 }
 
 fn lost(message: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/holder-lost", message) }
+fn startup_timeout() -> Anomaly { Anomaly::new(AnomalyCategory::Busy, STARTUP_TIMEOUT, "The holder did not finish session startup before the deadline") }
 fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/session-io", error.to_string()) }
 
 #[cfg(test)]
@@ -521,6 +538,24 @@ mod tests {
     async fn pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
         let near = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         (near, listener.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_accepts_the_connection_but_never_greets_expires_startup() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, _silent_backend) = pair(&listener).await;
+        let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
+        let session = Session::new(Bytes::from_static(b"startup"), router, directory, record.id, None, true);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        let running = tokio::spawn(session.run_before(gateway, first, None, 0, deadline));
+
+        let (tag, body) = tokio::time::timeout(Duration::from_secs(3), receive(&mut client)).await.unwrap();
+        assert_eq!(tag, b'E');
+        assert!(body.split(|byte| *byte == 0).any(|field| field == b"C57P03"));
+        assert_eq!(running.await.unwrap().unwrap_err().code, STARTUP_TIMEOUT);
     }
 
     #[tokio::test]

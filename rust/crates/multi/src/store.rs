@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -77,18 +77,31 @@ struct ScopedWriter {
 
 #[async_trait]
 impl rtdb_s3::WriteAuthorization for ScopedWriter {
-    async fn authorize(&self) -> Result<()> {
-        let (current, member) = tokio::try_join!(self.directory.deployment(&self.deployment), self.directory.member(&self.member))?;
-        let now = now_ms();
-        let admitted = current.zip(member).is_some_and(|(current, member)| current.storage_prefix() == self.prefix
-            && match self.epoch {
-                Some(epoch) => current.epoch == epoch && current.holder.as_ref() == Some(&self.member)
-                    && current.writer_pool() == Some(member.pool) && member.may_hold(now),
+    async fn authorize(&self, expires: Option<SystemTime>) -> Result<()> {
+        let inactive = || Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The deployment's write grant is fenced");
+        let lease_until = expires.map(|expires| {
+            let expires = expires.checked_add(rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE)
+                .ok_or_else(|| Anomaly::fault("rtdb.multi/storage-lease", "The storage lease expiration is out of range"))?;
+            let elapsed = expires.duration_since(UNIX_EPOCH).map_err(|error| Anomaly::fault("rtdb.multi/storage-lease", error.to_string()))?;
+            i64::try_from(elapsed.as_millis()).map_err(|error| Anomaly::fault("rtdb.multi/storage-lease", error.to_string()))
+        }).transpose()?;
+        for _ in 0..8 {
+            let (current, member) = tokio::try_join!(self.directory.deployment(&self.deployment), self.directory.member(&self.member))?;
+            let (mut current, member) = current.zip(member).ok_or_else(&inactive)?;
+            let now = now_ms();
+            let admitted = current.storage_prefix() == self.prefix && match self.epoch {
+                Some(epoch) => current.epoch == epoch && current.holder.as_ref() == Some(&self.member) && current.may_hold_on(&member, now),
                 None => current.lifecycle == Lifecycle::Live && member.role == MemberRole::Node && member.pool == MemberPool::Compaction
-                    && member.state == MemberState::Eligible && member.is_live(now),
-            });
-        if admitted { return Ok(()); }
-        Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The deployment's write grant is fenced"))
+                    && member.state == MemberState::Eligible && member.is_live(now) && current.permits_engine(&member),
+            };
+            if !admitted { return Err(inactive()); }
+            let Some(lease_until) = lease_until.filter(|deadline| current.s3_write_lease_until_ms.is_none_or(|existing| *deadline > existing))
+                else { return Ok(()); };
+            current.s3_write_lease_until_ms = Some(lease_until);
+            let version = current.version;
+            if let Cas::Applied(_) = self.directory.replace_deployment(current, version).await? { return Ok(()); }
+        }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Busy, "rtdb.multi/storage-lease-contended", "The deployment kept changing while recording a write session"))
     }
 }
 
@@ -620,7 +633,7 @@ pub async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Du
 pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
     use crate::reference::{Base, physical_objects};
     let mut reaped = Reaped::default();
-    if record.lifecycle == Lifecycle::Moving { return Ok(reaped); }
+    if matches!(record.lifecycle, Lifecycle::Moving | Lifecycle::Deleting | Lifecycle::Deleted) { return Ok(reaped); }
     let threshold = now_ms - grace.as_millis() as i64;
     for store in crate::reference::stores(bucket, &record.storage_prefix()).await? {
         let mut base = Base::load(bucket, &store).await?;
@@ -760,7 +773,9 @@ pub async fn finish_moves(directory: &dyn Directory, storage: &crate::deployment
     let completion = if keys.is_some() { SourceCleanup::ObjectsAndKeyErased } else { SourceCleanup::ObjectsErased };
     let grace = grace.as_millis().min(i64::MAX as u128) as i64;
     let pending = |record: &DeploymentRecord| record.lifecycle == Lifecycle::Deleted
-        && record.moved_at_ms.is_some_and(|moved| now_ms.saturating_sub(moved) >= grace)
+        && record.moved_at_ms.is_some_and(|moved| now_ms.saturating_sub(moved) >= grace
+            && (!matches!(storage, crate::deployment::CellStorage::S3 { .. }) || now_ms >= crate::deployment::s3_write_lease_horizon(moved)))
+        && record.active_s3_write_lease(now_ms).is_none()
         && record.source_cleanup.is_none_or(|done| done == SourceCleanup::ObjectsErased && keys.is_some());
     if !deployments.iter().any(pending) { return Ok(0); }
     let bucket = storage.bucket(IoRegion::new()).await?;
@@ -1261,7 +1276,7 @@ mod tests {
         let register = |id: &str, pool| rtdb_directory::MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None,
             availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: now_ms() + 60_000,
-            state: MemberState::Eligible, pool, storage_namespaces: None, version: 0,
+            state: MemberState::Eligible, drain_target_engine: None, pool, storage_namespaces: None, version: 0,
         };
         let mut holder = directory.register_member(register("holder", MemberPool::General)).await.unwrap();
         let worker = directory.register_member(register("compactor", MemberPool::Compaction)).await.unwrap();
@@ -1273,20 +1288,26 @@ mod tests {
             prefix: record.storage_prefix(), epoch: Some(record.epoch), member: holder.id.clone() };
         let compactor = ScopedWriter { directory: directory.clone(), deployment: record.id.clone(),
             prefix: record.storage_prefix(), epoch: None, member: worker.id };
-        writer.authorize().await.unwrap();
-        compactor.authorize().await.unwrap();
+        let latest = SystemTime::now() + Duration::from_secs(60);
+        writer.authorize(Some(latest)).await.unwrap();
+        record = directory.deployment(&record.id).await.unwrap().unwrap();
+        let recorded = record.s3_write_lease_until_ms;
+        assert_eq!(recorded, Some((latest + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE).duration_since(UNIX_EPOCH).unwrap().as_millis() as i64));
+        compactor.authorize(Some(latest - Duration::from_secs(30))).await.unwrap();
+        assert_eq!(directory.deployment(&record.id).await.unwrap().unwrap().s3_write_lease_until_ms, recorded);
 
         holder.lease_expires_at_ms = 0;
         directory.replace_member(holder.clone(), holder.version).await.unwrap().applied().unwrap();
-        assert_eq!(writer.authorize().await.unwrap_err().code, rtdb_node::NOT_HELD);
+        assert_eq!(writer.authorize(None).await.unwrap_err().code, rtdb_node::NOT_HELD);
 
         record.epoch += 1;
         record = directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
-        assert_eq!(writer.authorize().await.unwrap_err().code, rtdb_node::NOT_HELD);
-        compactor.authorize().await.unwrap();
+        assert_eq!(writer.authorize(None).await.unwrap_err().code, rtdb_node::NOT_HELD);
+        compactor.authorize(None).await.unwrap();
 
         record.lifecycle = Lifecycle::Deleting;
         directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
-        assert_eq!(compactor.authorize().await.unwrap_err().code, rtdb_node::NOT_HELD);
+        assert_eq!(compactor.authorize(Some(latest + Duration::from_secs(30))).await.unwrap_err().code, rtdb_node::NOT_HELD);
+        assert_eq!(directory.deployment(&record.id).await.unwrap().unwrap().s3_write_lease_until_ms, recorded);
     }
 }

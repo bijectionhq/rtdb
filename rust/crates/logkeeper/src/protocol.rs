@@ -275,6 +275,7 @@ pub(crate) async fn read_frame<M: Message + Default>(reader: &mut (impl AsyncRea
 }
 
 /// Groups consecutive lsns written at the same epoch.
+#[cfg(test)]
 pub(crate) fn runs_of(entries: impl IntoIterator<Item = (i64, u64)>) -> Vec<EpochRun> {
     let mut runs: Vec<EpochRun> = Vec::new();
     for (lsn, epoch) in entries {

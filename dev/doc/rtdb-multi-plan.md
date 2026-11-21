@@ -431,6 +431,8 @@ A cell needs a quorum log shared by every deployment, with group commit across d
 
 1. **Crate `logkeeper`.**
    One append-only segment file per writer member, a per-deployment index mapping `(deployment, lsn)` to segment offsets, a per-deployment `LogServerStream` (promised epoch, last epoch and lsn, trim point), fsync before acknowledgement, group commit within `group_commit_window`, seal announcements in every round's acknowledgement, trim and segment reclamation.
+   The logkeeper maintains retained byte counts and epoch ranges while applying journal records.
+   A seal reads the epoch ranges without scanning each retained entry, and compaction eligibility reads the byte count of each stream.
 2. **Logkeeper loglet.**
    A client in `loglet` holding one connection per ensemble member per node, multiplexing every deployment the node holds, with write quorum 2 of 3 across zones.
 3. **Ensemble assignment.**
@@ -497,6 +499,8 @@ A deposed holder must be unable to damage storage, and recovery must not depend 
    The role session requests a 15-minute lifetime and permits writes under the deployment's existing storage prefix and version.
    The node rejects returned expirations beyond that lifetime plus one second of clock allowance.
    The node verifies the current writer or live compaction member against the directory before and after refreshing a session.
+   Before the node uses a session, a conditional directory write retains the latest issued expiration for that deployment prefix plus the clock allowance.
+   Upgrade every directory writer before relying on the recorded expiration, including writers of packed parked records.
    The session policy denies deletes and out-of-prefix writes, and requires conditional PUTs by default. [Enforce S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html)
    For providers such as MinIO that reject the S3 condition key, `--s3-compat-write-policy` keeps the prefix and delete restrictions, and the client sends the conditional header.
    Use `--sts-endpoint URL` when the STS service is at a custom endpoint.
@@ -610,6 +614,8 @@ Moves are invisible to clients only if the gateway owns connections and session 
 3. **Crate `affinity`**, ported from Bijection's `crates/affinity` with its score vectors, and routing by it (`RouteRead`), with per-key in-flight bounds and pressure.
 4. **Redirects**: `NotHolder`, `Moved`, `Behind`, followed by the gateway without the client noticing.
    The gateway renews a deployment's idle protection at the backend connected to the session, including after a move.
+   Local pgwire startup, including routing and the holder's greeting, has a 35-second deadline.
+   If a holder accepts a socket but stalls before `ReadyForQuery`, the gateway closes startup with SQLSTATE `57P03` so the client can retry.
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
    A driver that stops during execution can leave the outcome unknown.
    The gateway replays the command under its original key when the client has received no answer.
@@ -654,6 +660,9 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 **Changes.**
 
 1. Crate `controller`: suspicion confirmation from corroborated gateway reports; admission of prewarmed members; drain (`DrainMember`); rebalancing on `LoadVector` watermarks (`Rebalance`); the drainer for orphaned tails (`DrainOrphanedTails`); quarantine (`CountActivationCrash`); engine rollouts (`RollEngine`).
+   A draining node hands off up to eight recently used deployments per pass and parks its idle deployments.
+   The source's identity and epoch must still match at reservation.
+   A recently used deployment keeps serving on a draining node while its pool has no eligible successor.
 2. Planned handoff (`IntendMove`, `HandOff`): subscription warm-up, hot-range prefetch from the source, admission pause, `Handoff` record, claim by move intent.
    The gateway, claim rule, and rebalancer use the same eligibility check for the general and isolation pools.
    Clearing quarantine fences the isolation holder so the next claim returns the deployment to the general pool.
@@ -666,6 +675,18 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    Larger tails use the source's flush path, and the source stops serving before it resumes admission.
    A placed writer waits 2 ms at the committed log tip before its claim.
    Control requests observe the replication driver's leadership and block-adoption updates directly.
+   Start nodes with `--engine-version VERSION` when the package version does not identify their image.
+   `pin-engine --name NAME --version VERSION` restricts claims, planned moves and compaction to the named engine version.
+   With an active holder or placement reservation, a new pin must match that engine version.
+   Forks inherit the pin, and DynamoDB keeps it when writing a packed parked record.
+   After adding eligible nodes of the desired version, `roll-engine --version VERSION` starts drains where every current holding has a compatible destination in its pool.
+   It reads the deployment inventory and preserves an eligible member for a pool with a parked deployment or an already-draining holding pinned to the old version.
+   Serialize engine-pin changes with rollout scheduling for the same cell.
+   These drains send holdings to the selected version, including idle holdings.
+   A pinned cell move checks for an eligible destination of the pinned version before fencing the source and before changing cell placement.
+   To move a deployment between compatible images, clear its pin, move it to a member of the new version, and set the new pin.
+   Upgrade all placement and directory writers before using pins or starting a version-targeted drain.
+   Lazy format conversion and mixed engine storage-format validation remain open.
 3. Autoscaling signals per pool, published as metrics through `metrics` and `server/src/metric_export`: nodes by the binding `LoadVector` dimension, logkeepers by ingest, workers by queue depth, gateways by connections.
 
 **Tests.**
@@ -740,19 +761,30 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    All logkeepers must support the drop operation before using this deletion path, and binaries predating it cannot open a journal containing its record.
    Replica addresses retired before ensemble-transfer tracking was introduced require separate inventory.
    The current deletion path keeps a deployment in `deleting` for retry if objects remain.
-   After an empty current inventory and local key destruction, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
+   Deletion fences the deployment and waits for recorded S3 write sessions to expire before touching its object inventory or key.
+   While the lease is active the delete command reports the earliest retry time and the deployment stays fenced.
+   S3 deletion also waits 15 minutes and one second from fencing to cover credentials issued before lease tracking was enabled.
+   Source-cell cleanup on S3 waits until the same interval has passed since cutover as well as for the configured reaper grace and any recorded write lease.
+   Ordinary garbage collection skips a deployment once its lifecycle reaches `deleting`.
+   After verifying the inventory and destroying the local key, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
    Retrying a completed deletion returns the stored receipt.
    Export the trusted public key with `rtdb-multi deletion-key --keys PATH` and verify the JSON from `delete` with `rtdb-multi verify-deletion --record PATH --public-key KEY`.
    The signed `facts` name the deployment, its fencing epoch, prefix, object and key namespaces, and the inventory scope.
    A local receipt has scope `current_objects`.
    Below the slash-delimited deployment prefix, S3 deletion aborts incomplete multipart uploads and verifies that their parts are gone, then removes retained versions and delete markers by version ID.
-   It confirms both inventories are empty during the attempt before signing scope `all_versions_and_multipart_uploads`.
+   It rechecks both inventories after these mutations before recording the first empty observation.
+   It stores the first empty version and multipart inventories in the directory and reports the next retry time.
+   Retry `delete` at least 15 minutes and one second after the first observation for a read-only second inventory.
+   If the second inventory finds an object version or multipart upload, it resets the observation and keeps the key.
+   A further `delete` attempt erases and starts the observation interval again.
+   Once both empty observations are durable, the key service destroys the key and the signed receipt includes `first_empty_observed_at_ms` and `objects_erased_at_ms`.
    The S3 deletion role needs `s3:ListBucketVersions` and `s3:DeleteObjectVersion` alongside its current-object permissions. [ListObjectVersions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html) [DeleteObjects](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html)
    Multipart cleanup uses `s3:ListBucketMultipartUploads`, `s3:AbortMultipartUpload` and `s3:ListMultipartUploadParts`. [Multipart upload permissions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html#mpuAndPermissions)
    MinIO's multipart prefix query returns exact key matches.
    Custom S3 endpoints use a paged bucket listing for multipart uploads and abort only entries under the deployment prefix.
    Upgrade all directory readers before an S3 deletion writes the new scope to its tombstone.
-   The timestamps record successful observations during the attempt that publishes the receipt.
+   Upgrade directory readers, writers, and receipt verifiers before an S3 deletion writes the observation journal and its signed timestamps.
+   The earlier single-observation receipt remains verifiable with upgraded tools.
    A new deployment or fork uses an organisation identifier that fits one storage path component.
    Prefix erasure rejects overlap with another recorded deployment's prefix, including legacy records with older organisation identifiers.
    A holder binds its deployment to the node's configured namespaces in its first claim, and forks and cell moves carry the binding into their destination records.
@@ -763,7 +795,7 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    Upgrade directory writers before relying on recorded copy history for new ensemble changes.
    An existing deployment without a binding acquires one from a configured holder before forking or moving.
    An older deletion already in progress can adopt the binding when all live nodes publish the same configuration.
-   Credential expiry, provider KMS erasure and the second observation are still required for the full proof.
+   The full proof also requires a separately trusted, epoch-scoped storage credential issuer, provider KMS erasure and exclusion of concurrent administrative writers such as earlier reaper or lineage-transfer passes.
    A deployment moving between cells keeps ownership of its source tail until cutover.
 
 **Tests.**
@@ -798,6 +830,7 @@ Unbounded means adding cells (spec contract `CellMap`).
    The source reaper verifies the recorded object namespace and any supplied key namespace before erasing the old copy.
    Legacy tombstones without a recorded source binding require recovery of those historical namespace IDs before automatic cleanup.
    With S3 it empties the source's multipart and version inventories before destroying the source key copy.
+   Source cleanup also waits for the stored write lease to expire.
    The tombstone records successful cleanup so future passes can skip it.
    A later pass with `--keys` rechecks storage before finishing a previous objects-only cleanup.
 3. Format upgrades: readers for N-2 to N, rewrite on flush and compaction, a maintenance trickle for the rest.
@@ -894,14 +927,42 @@ Each scale-in drained 10–11 deployments over 275–385 ms while 751–1,328 wr
 Every counter matched, with 1,488–2,965 updates/s and p99 of 27.7–97.7 ms across the trials.
 Three repeats with placement-triggered reconnects and cancellation-aware block collection matched all counters at 1,678–3,290 updates/s.
 The repeats measured p95 of 17.4–19.2 ms and p99 of 21.2–112.0 ms.
+Three warm trials with direct drain handoffs matched all 32,768 writes per run.
+Their p99 was 25.0–151.9 ms during scale-out, 96.6–132.5 ms during scale-in, and 104.1–128.4 ms outside both transitions.
+With the client queue measured separately, one further warm trial with all 32,768 writes matched recorded 146.8 ms p99 waiting for the hottest deployment's connection and 13.1 ms p99 from send to reply on that connection.
+The remaining 31 deployments recorded 17.6 ms end-to-end p99 in that trial.
+Send-to-reply p99 was 25.3 ms during scale-out, 34.3 ms during scale-in, and 12.8 ms outside these intervals.
+Other Rust builds were running on the host during part of the additional measurements.
 The continuous workload still has inconsistent tail latency.
+The workload reports latency separately for commands overlapping each transition and for commands outside both transitions.
 
 ```sh
 RTDB_CELL_BENCH_SCALE=1 cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
   durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
 ```
 
-The staging acceptance run needs a production directory, lazy activation of parked deployments and repeatable p99 across live scale transitions.
+A local run with `RTDB_CELL_BENCH_COLD=1 RTDB_CELL_BENCH_PARKED=100000 RTDB_CELL_BENCH_SCALE=1` added 100,000 parked records and activated the 32 queried deployments on demand.
+All counters matched the 32,768 writes, with 1,013 updates/s and 155.2 ms p99 including the connection queue.
+Send-to-reply p99 was 31.9 ms during scale-out, 27.6 ms during scale-in, and 16.0 ms outside these intervals.
+The staging acceptance run needs a production directory, ten million parked deployments, and repeatable p99 across live scale transitions.
+
+Two paired release trials per connection setting used 16 workers, 16,384 writes, and a 256-connection limit on each holder.
+All counters matched in every trial.
+The four-connection workload used up to 128 pgwire sessions on the cell.
+
+| Connections per deployment | Durable updates/s | Overall p99 (ms) | Scale-out p99 (ms) | Scale-in p99 (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 3,489–3,736 | 17.5–24.9 | 16.1–16.6 | 39.3–43.9 |
+| 4 | 5,218–5,385 | 11.5–11.8 | 14.2–19.3 | 32.4–39.3 |
+
+With four connections, scale-in send-to-reply p99 was 10.7–19.1 ms.
+The scale-in end-to-end p99 still exceeded 30 ms.
+
+```sh
+RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_COMMANDS=1024 RTDB_CELL_BENCH_SCALE=1 \
+  cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
+  durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
+```
 
 ## 6. Existing specs affected
 

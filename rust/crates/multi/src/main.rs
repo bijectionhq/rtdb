@@ -21,7 +21,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--park-after SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
@@ -34,10 +34,12 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
+       rtdb-multi roll-engine --directory DIR --version VERSION\n\
        rtdb-multi status --directory DIR [--target-per-node N]\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
+       rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
@@ -184,7 +186,9 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let node = process::start_node(directory, process::NodeSettings {
                 advertise_host: arguments.optional("advertise-host").map(str::to_owned),
                 configuration, allocation_limit_bytes: arguments.number("memory-limit", 1usize << 30)?, control: arguments.address("control", "127.0.0.1:0")?,
-                availability_zone: arguments.optional("zone").unwrap_or("local").into(), agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(2),
+                availability_zone: arguments.optional("zone").unwrap_or("local").into(),
+                engine_version: if arguments.present("engine-version") { Some(arguments.required("engine-version")?.to_owned()) } else { None },
+                agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(2),
                 pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
                 local_compaction: !arguments.present("no-local-compaction"), capabilities: cell_secret(&arguments)?,
                 keys: key_service(arguments.required("keys")?).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
@@ -312,6 +316,20 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "move" => {
             let directory = directory(arguments.required("directory")?).await?;
             admin::move_deployment(directory.as_ref(), arguments.required("name")?, &rtdb_directory::MemberId(arguments.required("to")?.into()), &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await
+        }
+        "pin-engine" => {
+            let version = match (arguments.present("clear"), arguments.present("version")) {
+                (false, true) => Some(arguments.required("version")?),
+                (true, false) if arguments.optional("clear").is_none() => None,
+                _ => return Err(usage("Specify exactly one of --version VERSION or --clear".into())),
+            };
+            let directory = directory(arguments.required("directory")?).await?;
+            admin::pin_engine(directory.as_ref(), arguments.required("name")?, version).await.map(|_| ())
+        }
+        "roll-engine" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            for member in admin::roll_engine(directory.as_ref(), arguments.required("version")?).await? { println!("{member}"); }
+            Ok(())
         }
         "read-width" => {
             let directory = directory(arguments.required("directory")?).await?;
