@@ -294,10 +294,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             #[serde(flatten)]
             provenance: rtdb_types::BuildInfo,
             standalone_protocol: u32,
+            hosted_protocol: u32,
         }
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
+            // Exact historical checkpoint staging under a fresh, held installation.
+            hosted_protocol: 6,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
