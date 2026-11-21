@@ -534,6 +534,30 @@ def verify_live_row_address(args, scratch):
     verify_lean_model(args, scratch, path, "live-row-address", controls, 5)
 
 
+def verify_jvm_trie_pending_logs(args, scratch):
+    path = Path("verification/lean/JvmTriePendingLogs.lean")
+    controls = {
+        "overwrite-shared-buffer": (
+            "(buffers ++ [log], ⟨buffers.length, log.length⟩)",
+            "(buffers.set parent.buffer log, ⟨parent.buffer, log.length⟩)",
+            ["child_reads_its_parent_prefix_and_added_rows",
+             "fork_history_extends_the_allocated_buffers",
+             "fork_preserves_every_retained_log"],
+        ),
+        "discard-parent-prefix": (
+            "let log := read buffers parent ++ added\n  (buffers",
+            "let log := added\n  (buffers",
+            ["child_reads_its_parent_prefix_and_added_rows"],
+        ),
+        "copy-only-one-new-row": (
+            "destination.take start ++ rows ++ destination.drop (start + rows.length)",
+            "destination.take start ++ rows.take 1 ++ destination.drop (start + rows.length)",
+            ["bounded_batch_matches_visible_append"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "jvm-trie-pending-logs", controls, 6)
+
+
 def verify_outer_join(args, scratch):
     path = Path("verification/lean/OuterJoin.lean")
     controls = {
@@ -813,6 +837,7 @@ def verify_lean(args, scratch):
             verify_memory_admission(args, scratch)
             verify_memory_trie(args, scratch)
             verify_live_row_address(args, scratch)
+            verify_jvm_trie_pending_logs(args, scratch)
             verify_outer_join(args, scratch)
             verify_table_slugs(args, scratch)
             verify_explicit_session(args, scratch)

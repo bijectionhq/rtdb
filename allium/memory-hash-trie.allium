@@ -19,6 +19,7 @@
 --     This holds across a transaction boundary as well as within one — a trie derived for a transaction
 --     that is never applied leaves the trie it came from as it was, and the entries it added are free to
 --     be reused by the next transaction.
+--   - Two tries derived from the same earlier trie each retain their own pending rows.
 --
 -- Critical invariants:
 --   - The trie stores INTEGER INDICES, not actual row data
@@ -155,12 +156,11 @@ rule AddIndex {
 rule AddToLeaf {
     when: Leaf.add(leaf, trie, new_idx)
 
-    -- Append to log (O(1) operation, no sorting)
     let new_log_count = leaf.log_count + 1
     let new_leaf = Leaf.created(
         path: leaf.path,
         data: leaf.data,
-        log: leaf.log.with(leaf.log_count, new_idx),
+        log: append_pending_rows(leaf.log, leaf.log_count, [new_idx]),
         log_count: new_log_count
     )
 

@@ -183,31 +183,25 @@ class MemoryHashTrie(
         }
 
         override fun add(trie: MemoryHashTrie, newIdx: Int): Node {
-            var logCount = logCount
-            log[logCount++] = newIdx
-            val newLeaf = Leaf(trie.pageLimit, path, data, log, logCount)
+            val nextCount = logCount + 1
+            val nextLog = log.copyOf(nextCount)
+            nextLog[logCount] = newIdx
+            val newLeaf = Leaf(trie.pageLimit, path, data, nextLog, nextCount)
 
-            return if (logCount == trie.logLimit) newLeaf.compactLogs(trie) else newLeaf
+            return if (nextCount == trie.logLimit) newLeaf.compactLogs(trie) else newLeaf
         }
 
         override fun addAll(trie: MemoryHashTrie, newIdxs: IntArray): Node {
             val n = newIdxs.size
             if (n == 0) return this
 
-            val combinedLogCount = logCount + n
+            if (n <= trie.logLimit - logCount) {
+                val nextCount = logCount + n
+                val nextLog = log.copyOf(nextCount)
+                System.arraycopy(newIdxs, 0, nextLog, logCount, n)
+                val newLeaf = Leaf(trie.pageLimit, path, data, nextLog, nextCount)
 
-            // Fast path: appended log stays under the compaction threshold.
-            // Mutates `log` in place to match the existing single-add semantics.
-            if (combinedLogCount < trie.logLimit) {
-                System.arraycopy(newIdxs, 0, log, logCount, n)
-                return Leaf(trie.pageLimit, path, data, log, combinedLogCount)
-            }
-
-            // Boundary: appended log exactly fills the limit; mirror single-add by
-            // appending in place and compacting once.
-            if (combinedLogCount == trie.logLimit) {
-                System.arraycopy(newIdxs, 0, log, logCount, n)
-                return Leaf(trie.pageLimit, path, data, log, combinedLogCount).compactLogs(trie)
+                return if (nextCount == trie.logLimit) newLeaf.compactLogs(trie) else newLeaf
             }
 
             // Bulk path: too many to log without overflow. Bypass the log entirely:
