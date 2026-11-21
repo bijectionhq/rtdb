@@ -55,6 +55,11 @@ tokio-util.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rtdb-text.workspace = true
+tantivy.workspace = true
+
+[[example]]
+name = "fts_architecture_bench"
+required-features = ["search"]
 
 [lints]
 workspace = true
