@@ -494,6 +494,7 @@ entity MemberRecord {
     pool: general | isolation | dedicated
     -- The member renews this every member_heartbeat while alive.
     lease_expires_at: Timestamp
+    storage_namespaces: StorageNamespaces?
     state: MemberState
 
     transitions state {
@@ -517,6 +518,11 @@ value PlacementMove {
     expires_at: Timestamp
 }
 
+value StorageNamespaces {
+    objects: String
+    keys: String
+}
+
 entity DeploymentRecord {
     -- One deployment, as the directory records it.
     -- About 300 bytes when parked.
@@ -529,9 +535,11 @@ entity DeploymentRecord {
     parent: DeploymentId?
     fork_basis: Basis?
     storage_root: StorageRoot
+    storage_namespaces: StorageNamespaces?
     -- The KeyService key wrapping this deployment's object data keys.
     key_id: String
     lifecycle: Lifecycle
+    deletion_record: DeletionRecord?
     isolation_class: IsolationClass
     -- Members permitted when isolation_class is pinned or dedicated.
     pinned_members: Set<MemberId>
@@ -790,12 +798,16 @@ entity GarbageCandidate {
 }
 
 entity DeletionRecord {
-    -- The signed proof that a deployment's data is gone.
+    -- A cell signs the inventory it observed and the key destruction it confirmed.
     deployment: DeploymentId
+    epoch: Epoch
+    storage_prefix: String
+    namespaces: StorageNamespaces
+    inventory_scope: current_objects | all_versions
     key_destroyed_at: Timestamp
     prefix_empty_first_at: Timestamp
-    prefix_empty_second_at: Timestamp
-    transferred_objects: Integer
+    prefix_empty_second_at: Timestamp?
+    transferred_objects: Integer?
     signature: String
 }
 
@@ -1690,6 +1702,10 @@ rule ForkReadsAreCapped {
 
 rule BeginDeletion {
     -- The epoch bump fences every writer before anything is destroyed.
+    -- The holder's claim binds the object and key namespaces before it writes.
+    -- The deletion uses those namespaces.
+    -- A pristine root can bind its namespaces in the deletion CAS.
+    -- An unbound deletion started before namespace binding resumes once the live nodes all report the same configuration.
     when: DeleteRequested(record)
 
     requires: record.lifecycle in {live, quarantined}
@@ -1719,14 +1735,27 @@ rule TransferSharedObjects {
 rule EraseAndProve {
     -- If the inventory still contains objects, the deployment remains deleting and can retry with the same epoch.
     -- A destroyed key cannot be installed or allocated again under the same deployment identity in that cell.
+    -- The terminal CAS keeps the signed receipt with the tombstone so a retry returns the same receipt.
     when: SharedObjectsTransferred(record)
 
     ensures:
         DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
         AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
         KeyService.destroy(record.key_id)
-        DeletionRecord.created(deployment: record.id, signature: SignedByCell())
-        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted })
+        let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, inventory_scope: all_versions, signature: SignedByCell())
+        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
+}
+
+rule PublishCurrentInventoryReceipt {
+    when: CurrentInventoryEmptied(record, namespaces)
+
+    requires: record.lifecycle = deleting
+    requires: record.storage_namespaces = namespaces
+
+    ensures:
+        KeyService.destroy(record.key_id)
+        let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, namespaces: namespaces, inventory_scope: current_objects, signature: SignedByCell())
+        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
 }
 
 ------------------------------------------------------------

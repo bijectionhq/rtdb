@@ -95,6 +95,18 @@ pub(crate) async fn storage_namespace(bucket: &dyn ObjectStore) -> Result<uuid::
     uuid::Uuid::from_slice(&bytes).map_err(|_| Anomaly::fault("rtdb.multi/storage-namespace", "The cell storage has an invalid namespace marker"))
 }
 
+pub(crate) async fn storage_namespaces(bucket: &dyn ObjectStore, keys: &dyn crate::keys::KeyService) -> Result<rtdb_directory::StorageNamespaces> {
+    Ok(rtdb_directory::StorageNamespaces { objects: storage_namespace(bucket).await?, keys: keys.namespace_id()? })
+}
+
+pub(crate) fn require_storage_namespaces(record: &DeploymentRecord, namespaces: rtdb_directory::StorageNamespaces) -> Result<()> {
+    match record.storage_namespaces {
+        Some(stored) if stored == namespaces => Ok(()),
+        Some(_) => Err(rtdb_types::Anomaly::incorrect("rtdb.multi/storage-binding-mismatch", format!("{} belongs to a different object or key namespace", record.name))),
+        None => Err(rtdb_types::Anomaly::incorrect("rtdb.multi/storage-binding-missing", format!("{} has no storage binding", record.name))),
+    }
+}
+
 /// How a node holds a deployment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -197,7 +209,7 @@ mod tests {
         let member = |id: &str, address: &str, zone: &str| MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
             availability_zone: zone.into(), engine_version: "test".into(), lease_expires_at_ms: 100,
-            state: rtdb_directory::MemberState::Eligible, pool: Default::default(), version: 1,
+            state: rtdb_directory::MemberState::Eligible, pool: Default::default(), storage_namespaces: None, version: 1,
         };
         let (a, alternative, b, c, reused) = (member("a", "a", "one"), member("a2", "a2", "one"),
             member("b", "b", "two"), member("c", "c", "three"), member("reused", "a", "one"));

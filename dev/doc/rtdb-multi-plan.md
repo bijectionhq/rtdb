@@ -507,6 +507,16 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
 3. Fork: a new record in the lineage with a fork checkpoint referencing the parent's objects plus one pack of the parent's tail to the fork basis; inherited reads capped at the fork basis; cross-organisation forks copied and re-encrypted.
 4. Deletion: fence by epoch bump, seal and drop the stream, wait `credential_ttl`, re-wrap shared objects to a surviving referrer, delete all versions, prove the prefix empty twice, destroy the key, sign the deletion record.
    The current deletion path keeps a deployment in `deleting` for retry if objects remain.
+   After an empty current inventory and local key destruction, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
+   Retrying a completed deletion returns the stored receipt.
+   Export the trusted public key with `rtdb-multi deletion-key --keys PATH` and verify the JSON from `delete` with `rtdb-multi verify-deletion --record PATH --public-key KEY`.
+   The signed `facts` name the deployment, its fencing epoch, prefix, object and key namespaces, and scope `current_objects`.
+   The timestamps record successful observations during the attempt that publishes the receipt.
+   A holder binds its deployment to the node's configured namespaces in its first claim, and forks and cell moves carry the binding into their destination records.
+   Deletion checks that binding before fencing, and a pristine root may take its first binding in the deletion CAS.
+   An existing deployment without a binding acquires one from a configured holder before forking or moving.
+   An older deletion already in progress can adopt the binding when all live nodes publish the same configuration.
+   Versioned inventory, credential expiry, provider KMS erasure and the second observation are still required for the full proof.
    A deployment moving between cells keeps ownership of its source tail until cutover.
 
 **Tests.**

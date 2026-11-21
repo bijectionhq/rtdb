@@ -24,7 +24,14 @@ pub struct MemberLease {
     lost: CancellationToken,
 }
 
-pub struct Registration { pub role: MemberRole, pub address: String, pub control_address: Option<String>, pub availability_zone: String, pub pool: rtdb_directory::MemberPool }
+pub struct Registration {
+    pub role: MemberRole,
+    pub address: String,
+    pub control_address: Option<String>,
+    pub availability_zone: String,
+    pub pool: rtdb_directory::MemberPool,
+    pub storage_namespaces: Option<rtdb_directory::StorageNamespaces>,
+}
 
 impl MemberLease {
     pub async fn register(directory: Arc<dyn Directory>, registration: Registration, options: LeaseOptions) -> Result<Arc<Self>> {
@@ -32,6 +39,7 @@ impl MemberLease {
             id: MemberId::fresh(), role: registration.role, address: registration.address, control_address: registration.control_address,
             availability_zone: registration.availability_zone, engine_version: env!("CARGO_PKG_VERSION").into(),
             lease_expires_at_ms: now_ms() + options.lease.as_millis() as i64, state: MemberState::Eligible, pool: registration.pool, version: 0,
+            storage_namespaces: registration.storage_namespaces,
         }).await?;
         Ok(Arc::new(Self { directory, record: Mutex::new(record), options, lost: CancellationToken::new() }))
     }

@@ -80,6 +80,8 @@ pub struct MemberRecord {
     /// Which nodes may hold what: a quarantined deployment is placed only on the isolation pool.
     #[serde(default)]
     pub pool: MemberPool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_namespaces: Option<StorageNamespaces>,
     pub version: Version,
 }
 
@@ -157,6 +159,40 @@ impl CellMovePhase {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageNamespaces {
+    pub objects: uuid::Uuid,
+    pub keys: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionInventory {
+    CurrentObjects,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletionFacts {
+    pub deployment: String,
+    pub name: String,
+    pub epoch: u64,
+    pub storage_prefix: String,
+    pub namespaces: StorageNamespaces,
+    pub inventory: DeletionInventory,
+    pub key_destroyed_at_ms: i64,
+    pub objects_erased_at_ms: i64,
+    pub verified_empty: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletionRecord {
+    pub facts: DeletionFacts,
+    pub signature: String,
+}
+
 /// One deployment, as the directory records it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentRecord {
@@ -207,6 +243,10 @@ pub struct DeploymentRecord {
     /// Each attempted copy uses a different prefix, so a superseded copier can never modify a live destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_generation: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_namespaces: Option<StorageNamespaces>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_record: Option<DeletionRecord>,
     pub version: Version,
 }
 
@@ -225,7 +265,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_move: None, storage_generation: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {

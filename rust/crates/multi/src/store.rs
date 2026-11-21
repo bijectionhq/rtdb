@@ -49,6 +49,7 @@ pub struct CellStoreConfig {
 pub struct CellStoreFactory {
     pub directory: Arc<dyn Directory>,
     pub keys: Arc<dyn KeyService>,
+    pub storage_namespaces: rtdb_directory::StorageNamespaces,
     pub fence_interval: Duration,
 }
 
@@ -59,8 +60,11 @@ impl RemoteStorageFactory for CellStoreFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let bucket = config.storage.bucket(io).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        claim_root(&crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()), &config.deployment).await?;
         let record = self.directory.deployment(&config.deployment).await?;
+        if let Some(record) = record.as_ref().filter(|record| record.storage_namespaces.is_some()) {
+            crate::deployment::require_storage_namespaces(record, self.storage_namespaces)?;
+        }
+        claim_root(&crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()), &config.deployment).await?;
         Ok(open_cell_store(bucket, &store, record.as_ref(), wall_clock()).await?)
     }
 

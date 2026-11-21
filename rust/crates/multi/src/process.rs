@@ -52,6 +52,8 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    let bucket = settings.agent.storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), settings.keys.as_ref()).await?;
     if settings.configuration.disk_cache.is_none() {
         settings.configuration.disk_cache = Some(rtdb_server::config::DiskCacheSettings { path: settings.cache_dir.clone(), maximum_bytes: Some(1 << 30), maximum_ratio: 0.5 });
     }
@@ -64,7 +66,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let recorder = Arc::new(crate::logs::DirectoryRecorder { directory: Arc::clone(&directory) });
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
     let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
-    let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys), fence_interval: Duration::from_millis(100) });
+    let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys), storage_namespaces, fence_interval: Duration::from_millis(100) });
     let placed = PlacedOptions {
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
@@ -84,9 +86,10 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let control_address = control.local_addr().map_err(io)?;
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
         role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone, pool: settings.pool,
+        storage_namespaces: Some(storage_namespaces),
     }, settings.lease).await?;
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent, writers, settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent, storage_namespaces, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::clone(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();
@@ -148,7 +151,7 @@ pub struct RunningLogkeeper {
 pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperSettings) -> Result<RunningLogkeeper> {
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
-    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: address.to_string(), control_address: None, availability_zone: settings.availability_zone, pool: Default::default() }, settings.lease).await?;
+    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: address.to_string(), control_address: None, availability_zone: settings.availability_zone, pool: Default::default(), storage_namespaces: None }, settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
     tasks.spawn(rtdb_logkeeper::serve(listener, rtdb_logkeeper::ServerOptions { data_dir: settings.data_dir, fsync: settings.fsync, cache_bytes: settings.cache_bytes }, cancellation.clone()));

@@ -4,14 +4,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_directory::{Cas, CellMove, CellMovePhase, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, effective_holder, now_ms};
+pub use rtdb_directory::DeletionRecord;
+use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeletionInventory, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
-use crate::deployment::{CellStorage, ensemble_servers, select_logkeepers, write_quorum};
+use crate::deployment::{CellStorage, ensemble_servers, require_storage_namespaces, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
@@ -43,12 +44,13 @@ async fn record(directory: &dyn Directory, name: &str) -> Result<DeploymentRecor
     directory.deployment_by_name(name).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))
 }
 
-/// Applies `change` to the named deployment's current record until a conditional replace succeeds.
+/// Applies `change` to the current record, replacing it conditionally if it changed.
 async fn update(directory: &dyn Directory, name: &str, change: impl Fn(&mut DeploymentRecord) -> Result<()>) -> Result<DeploymentRecord> {
     for _ in 0..8 {
         let current = record(directory, name).await?;
         let mut next = current.clone();
         change(&mut next)?;
+        if next == current { return Ok(current); }
         if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await? { return Ok(stored); }
     }
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{name} kept changing while being updated")))
@@ -59,6 +61,16 @@ async fn replica_servers(directory: &dyn Directory, record: &DeploymentRecord) -
         Some(previous) => Ok(previous.clone()),
         None => ensemble_servers(record, &members(directory).await?),
     }
+}
+
+fn bind_admin_storage(record: &mut DeploymentRecord, namespaces: StorageNamespaces) -> Result<()> {
+    if record.storage_namespaces.is_none() && record.lifecycle == Lifecycle::Live && record.epoch == 0
+        && record.holder.is_none() && record.checkpoint.is_none() && record.parent.is_none()
+        && record.storage_generation.is_none() && record.log_epoch == 0 && record.move_from.is_none()
+    {
+        record.storage_namespaces = Some(namespaces);
+    }
+    require_storage_namespaces(record, namespaces)
 }
 
 fn control_address(members: &BTreeMap<MemberId, MemberRecord>, member: &MemberId) -> Result<String> {
@@ -205,6 +217,12 @@ async fn fork_source(directory: &dyn Directory, parent: &str) -> Result<Deployme
     Ok(source)
 }
 
+async fn fork_bucket(storage: &CellStorage, keys: &dyn KeyService, source: &DeploymentRecord) -> Result<crate::reference::Bucket> {
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    require_storage_namespaces(source, storage_namespaces(bucket.as_ref(), keys).await?)?;
+    Ok(bucket)
+}
+
 /// Forks `parent` into a new deployment in its lineage.
 /// The parent is flushed, and the child references its objects and starts on fresh logs.
 pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, control: &ControlKey) -> Result<DeploymentRecord> {
@@ -212,17 +230,18 @@ pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn K
     let members = members(directory).await?;
     expect(&control_address(&members, &holder)?, Request::Flush { name: parent.to_owned() }, control).await?;
     let source = fork_source(directory, parent).await?;
-    fork_with_tail(directory, storage, keys, &source, name, None, Vec::new(), 4 << 20).await
+    let bucket = fork_bucket(storage, keys, &source).await?;
+    fork_with_tail(directory, bucket.as_ref(), keys, &source, name, None, Vec::new(), 4 << 20).await
 }
 
 /// Forks `parent` as of one of its past blocks: the fork's state is that block's, and what the parent wrote after it is not the fork's.
 /// Only a block younger than the reaper's `grace` can be forked from: an object it needs that the parent released since is erased only once the grace has passed.
 pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: std::time::Duration) -> Result<DeploymentRecord> {
     let source = fork_source(directory, parent).await?;
-    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let bucket = fork_bucket(storage, keys, &source).await?;
     let age = now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), block).await?;
     if age >= grace.as_millis() as i64 { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age / 1000, grace.as_secs()))); }
-    fork_with_tail(directory, storage, keys, &source, name, Some(block), Vec::new(), 4 << 20).await
+    fork_with_tail(directory, bucket.as_ref(), keys, &source, name, Some(block), Vec::new(), 4 << 20).await
 }
 
 /// Forks `parent` as of a system time at or after its checkpoint: the fork starts from the checkpoint's block, with the parent's transactions after it up to `system_time` copied into its own stream.
@@ -231,7 +250,7 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
     let source = fork_source(directory, parent).await?;
     let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
     if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
-    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let bucket = fork_bucket(storage, keys, &source).await?;
     if now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), checkpoint.block).await? >= grace.as_millis() as i64 {
         return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace")));
     }
@@ -239,14 +258,15 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
     let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?, &keys.existing(&source.id)?, &stream.stream)?;
     let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
-    fork_with_tail(directory, storage, keys, &source, name, Some(checkpoint.block), tail, maximum_message_bytes).await
+    fork_with_tail(directory, bucket.as_ref(), keys, &source, name, Some(checkpoint.block), tail, maximum_message_bytes).await
 }
 
-async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, source: &DeploymentRecord, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, source: &DeploymentRecord, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
     let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
     child.lineage = source.lineage.clone();
     child.parent = Some(source.id.clone());
     child.log_epoch = source.log_epoch + 1;
+    child.storage_namespaces = source.storage_namespaces;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
     child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
     let key = keys.existing(&source.id)?;
@@ -259,9 +279,8 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: 
         let servers = replica_servers(directory, &child).await?;
         Some(StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes })
     };
-    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     let prepared = async {
-        crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
+        crate::reference::fork(bucket, &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
         keys.install(&child.id, key)?;
         if let Some(stream) = &child_stream {
             let writer = rtdb_logkeeper::open_writer(stream.clone(), child.epoch, CancellationToken::new()).await?;
@@ -280,7 +299,7 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: 
         Ok(stored) => Ok(stored),
         Err(ForkPublicationError::Uncertain(error)) => Err(error),
         Err(ForkPublicationError::Rejected(error)) => {
-            if let Err(cleanup) = discard_fork(bucket.as_ref(), keys, &child, child_stream.as_ref()).await {
+            if let Err(cleanup) = discard_fork(bucket, keys, &child, child_stream.as_ref()).await {
                 eprintln!("RTDB fork cleanup failed for {}: {cleanup}", child.id);
             }
             Err(error)
@@ -294,7 +313,8 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
     for _ in 0..8 {
         let current = directory.deployment(&source.id).await.map_err(ForkPublicationError::Rejected)?
             .filter(|current| current.can_fork() && current.epoch == source.epoch
-                && current.log_epoch == source.log_epoch && current.storage_prefix() == source.storage_prefix())
+                && current.log_epoch == source.log_epoch && current.storage_prefix() == source.storage_prefix()
+                && current.storage_namespaces == child.storage_namespaces)
             .ok_or_else(|| ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{} changed while the fork was prepared", source.name))))?;
         match directory.create_fork(child.clone(), current.version).await {
             Ok(stored) => return Ok(stored),
@@ -389,6 +409,10 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     if existing.is_some_and(|existing| existing.namespaces != namespaces) {
         return Err(move_conflict(name, "the move is bound to different storage or key namespaces"));
     }
+    let mut fencing = current.clone();
+    if existing.is_none() || current.storage_namespaces.is_some() {
+        bind_admin_storage(&mut fencing, StorageNamespaces { objects: namespaces.source_objects, keys: namespaces.source_keys })?;
+    }
     if ready.is_some() {
         return finish_cell_move(map, from, to, &current).await;
     }
@@ -397,7 +421,6 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     let key = if existing.is_some() { from.keys.existing(&current.id)? } else { from.keys.key(&current.id)? };
     to.keys.validate_install(&current.id, &key)?;
 
-    let mut fencing = current.clone();
     if fencing.lifecycle == Lifecycle::Live {
         fencing.lifecycle = Lifecycle::Moving;
         fencing.epoch += 1;
@@ -451,12 +474,13 @@ fn move_conflict(name: &str, reason: &str) -> Anomaly {
 
 async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, to: &CellHandle<'_>, source: &DeploymentRecord) -> Result<DeploymentRecord> {
     let name = &source.name;
-    let Some(CellMovePhase::Ready { generation, previous_ensemble, ensemble }) = source.cell_move.as_ref().map(|plan| &plan.phase) else {
+    let Some(CellMove { phase: CellMovePhase::Ready { generation, previous_ensemble, ensemble }, namespaces, .. }) = source.cell_move.as_ref() else {
         return Err(move_conflict(name, "the destination copy has not been recorded"));
     };
     let mut incoming = source.clone();
     incoming.lifecycle = Lifecycle::Moving;
     incoming.storage_generation = Some(*generation);
+    incoming.storage_namespaces = Some(StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys });
     incoming.cell_move = None;
     incoming.moved_at_ms = None;
     incoming.move_intent = None;
@@ -468,6 +492,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     let matches_destination = |record: &DeploymentRecord| {
         record.id == incoming.id && record.log_epoch == incoming.log_epoch && record.storage_prefix() == incoming_prefix
             && record.epoch >= incoming.epoch
+            && record.storage_namespaces.is_none_or(|binding| Some(binding) == incoming.storage_namespaces)
     };
     let waiting_for_cutover = |record: &DeploymentRecord| record.lifecycle == Lifecycle::Moving && record.cell_move.is_none();
     let valid_staged = |record: &DeploymentRecord| {
@@ -515,6 +540,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
             if !matches_destination(record) { return Err(move_conflict(name, "the destination changed before publication")); }
             if waiting_for_cutover(record) {
                 if !valid_staged(record) { return Err(move_conflict(name, "the destination lost its staged state")); }
+                record.storage_namespaces = incoming.storage_namespaces;
                 record.lifecycle = Lifecycle::Live;
             }
             Ok(())
@@ -524,51 +550,97 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     Ok(destination)
 }
 
-/// What a deletion did, kept as its record.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DeletionRecord { pub deployment: String, pub name: String, pub key_destroyed_at_ms: i64, pub objects_erased_at_ms: i64, pub verified_empty: bool }
-
 /// Fences every writer, seals and trims the deployment's stream, erases its objects, and removes its key after verifying the prefix is empty.
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<DeletionRecord> {
+    let current = record(directory, name).await?;
+    if current.lifecycle == Lifecycle::Deleted { return deletion_receipt(current); }
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let namespaces = storage_namespaces(bucket.as_ref(), keys).await?;
+    let legacy_namespace = if current.lifecycle == Lifecycle::Deleting && current.storage_namespaces.is_none() {
+        Some(configured_cell_storage(directory, name).await?)
+    } else { None };
     let fenced = update(directory, name, |record| {
+        if record.id != current.id { return Err(deletion_changed(name)); }
         match record.lifecycle {
             Lifecycle::Live | Lifecycle::Quarantined => {
+                bind_admin_storage(record, namespaces)?;
                 record.lifecycle = Lifecycle::Deleting;
                 record.epoch += 1;
                 record.holder = None;
                 Ok(())
             }
-            Lifecycle::Deleting => Ok(()),
+            Lifecycle::Deleting => {
+                if record.storage_namespaces.is_none() { record.storage_namespaces = legacy_namespace; }
+                require_storage_namespaces(record, namespaces)
+            }
             Lifecycle::Moving => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} is moving between cells"))),
-            Lifecycle::Deleted => Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} is already deleted"))),
+            Lifecycle::Deleted => Ok(()),
         }
     }).await?;
+    if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
     let servers = replica_servers(directory, &fenced).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
     let last = rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
     if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
-    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-    let deletion = finish_deletion(bucket.as_ref(), &fenced, &others, keys).await?;
-    update(directory, name, |record| {
-        if record.id != fenced.id || record.epoch != fenced.epoch || record.lifecycle != Lifecycle::Deleting {
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/deletion-changed", format!("The deletion of {name} changed before it could be recorded")));
+    let receipt = finish_deletion(bucket.as_ref(), &fenced, &others, keys).await?;
+    let deleted = update(directory, name, |record| {
+        if record.id != fenced.id || record.epoch != fenced.epoch || record.storage_prefix() != receipt.facts.storage_prefix {
+            return Err(deletion_changed(name));
         }
+        require_storage_namespaces(record, namespaces)?;
+        if record.lifecycle == Lifecycle::Deleted { return Ok(()); }
+        if record.lifecycle != Lifecycle::Deleting { return Err(deletion_changed(name)); }
+        record.deletion_record = Some(receipt.clone());
         record.lifecycle = Lifecycle::Deleted;
         Ok(())
     }).await?;
-    Ok(deletion)
+    deletion_receipt(deleted)
+}
+
+async fn configured_cell_storage(directory: &dyn Directory, name: &str) -> Result<StorageNamespaces> {
+    let now = now_ms();
+    let members = directory.members().await?;
+    let mut nodes = members.iter().filter(|member| member.role == MemberRole::Node && member.is_live(now));
+    nodes.next().and_then(|member| member.storage_namespaces)
+        .filter(|expected| nodes.all(|member| member.storage_namespaces == Some(*expected)))
+        .ok_or_else(|| Anomaly::incorrect("rtdb.multi/storage-binding-missing", format!("Resuming the legacy deletion of {name} requires live nodes that agree on the cell's storage configuration")))
+}
+
+fn deletion_changed(name: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/deletion-changed", format!("The deletion of {name} changed before it could be recorded"))
+}
+
+fn deletion_receipt(mut tombstone: DeploymentRecord) -> Result<DeletionRecord> {
+    let receipt = tombstone.deletion_record.take()
+        .ok_or_else(|| Anomaly::incorrect("rtdb.multi/deleted", format!("{} is already deleted", tombstone.name)))?;
+    let facts = &receipt.facts;
+    if tombstone.lifecycle != Lifecycle::Deleted || !facts.verified_empty || facts.deployment != tombstone.id
+        || facts.name != tombstone.name || facts.epoch != tombstone.epoch || facts.storage_prefix != tombstone.storage_prefix()
+        || Some(facts.namespaces) != tombstone.storage_namespaces
+    {
+        return Err(Anomaly::fault("rtdb.multi/deletion-receipt-mismatch", format!("The stored receipt for {} does not match its tombstone", tombstone.name)));
+    }
+    Ok(receipt)
 }
 
 async fn finish_deletion(bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord], keys: &dyn KeyService) -> Result<DeletionRecord> {
-    if !crate::reference::erase_deployment(bucket, &deployment.storage_prefix(), others).await? {
+    let storage_prefix = deployment.storage_prefix();
+    let namespaces = deployment.storage_namespaces.ok_or_else(|| {
+        Anomaly::fault("rtdb.multi/storage-binding-missing", format!("{} has no storage binding", deployment.name))
+    })?;
+    if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name)));
     }
     let objects_erased_at_ms = now_ms();
     keys.destroy(&deployment.id)?;
-    Ok(DeletionRecord {
+    keys.sign_deletion(DeletionFacts {
         deployment: deployment.id.clone(),
         name: deployment.name.clone(),
+        epoch: deployment.epoch,
+        storage_prefix,
+        namespaces,
+        inventory: DeletionInventory::CurrentObjects,
         key_destroyed_at_ms: now_ms(),
         objects_erased_at_ms,
         verified_empty: true,
@@ -770,6 +842,7 @@ mod tests {
         deployment.lifecycle = Lifecycle::Deleting;
         let key = keys.key(&deployment.id).unwrap();
         let bucket = MemoryStore::default();
+        deployment.storage_namespaces = Some(super::storage_namespaces(&bucket, &keys).await.unwrap());
         let object = ObjectKey::new(format!("{}/v06/rows", deployment.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
 
@@ -778,8 +851,8 @@ mod tests {
         assert_eq!(keys.key(&deployment.id).unwrap(), key);
 
         let proof = finish_deletion(&bucket, &deployment, &[], &keys).await.unwrap();
-        assert!(proof.verified_empty);
-        assert!(bucket.list(None).await.unwrap().is_empty());
+        assert!(proof.facts.verified_empty);
+        assert!(bucket.list(Some(&ObjectKey::new(deployment.storage_prefix()).unwrap())).await.unwrap().is_empty());
         assert_eq!(keys.existing(&deployment.id).unwrap_err().code, "rtdb.multi/key-destroyed");
     }
 
@@ -791,7 +864,9 @@ mod tests {
         let keys = LocalKeyService::new(&key_dir).unwrap();
         let storage = CellStorage::Local { root: data.path().join("objects") };
         let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
-        let source = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let mut source = DeploymentRecord::new("shop", "acme", vec![], 0);
+        source.storage_namespaces = Some(super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
+        let source = directory.create_deployment(source).await.unwrap();
         let key = keys.key(&source.id).unwrap();
         let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
@@ -799,7 +874,7 @@ mod tests {
         let mut updated = source.clone();
         updated.read_width = 2;
         let updated = directory.replace_deployment(updated, source.version).await.unwrap().applied().unwrap();
-        let child = super::fork_with_tail(directory.as_ref(), &storage, &keys, &source, "child", None, Vec::new(), 4 << 20).await.unwrap();
+        let child = super::fork_with_tail(directory.as_ref(), bucket.as_ref(), &keys, &source, "child", None, Vec::new(), 4 << 20).await.unwrap();
         assert_eq!(keys.existing(&child.id).unwrap(), key);
         let before = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
 
@@ -807,13 +882,14 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         deleting.epoch += 1;
         directory.replace_deployment(deleting, updated.version).await.unwrap().applied().unwrap();
-        let error = super::fork_with_tail(directory.as_ref(), &storage, &keys, &updated, "refused", None, Vec::new(), 4 << 20).await.unwrap_err();
+        let error = super::fork_with_tail(directory.as_ref(), bucket.as_ref(), &keys, &updated, "refused", None, Vec::new(), 4 << 20).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/fork-unavailable");
         assert!(directory.deployment_by_name("refused").await.unwrap().is_none());
         let after = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
         assert_eq!(after, before);
-        let live_keys = std::fs::read_dir(key_dir).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len())
-            .filter(|length| *length == crate::keys::KEY_BYTES as u64).count();
+        let live_keys = std::fs::read_dir(key_dir).unwrap().map(|entry| entry.unwrap())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "key")
+                && entry.metadata().unwrap().len() == crate::keys::KEY_BYTES as u64).count();
         assert_eq!(live_keys, 2);
     }
 

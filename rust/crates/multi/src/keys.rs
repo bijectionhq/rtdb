@@ -3,11 +3,15 @@
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use rtdb_directory::{DeletionFacts, DeletionRecord};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 pub const KEY_BYTES: usize = 32;
 const DESTROYED: &[u8] = b"RTDB-key-destroyed-v1";
+const DELETION_SIGNATURE_DOMAIN: &[u8] = b"rtdb.multi.deletion.v1\0";
 
 pub trait KeyService: Send + Sync {
     /// A durable identity for the namespace in which this service creates and destroys keys.
@@ -22,6 +26,8 @@ pub trait KeyService: Send + Sync {
     fn validate_install(&self, deployment: &str, key: &[u8; KEY_BYTES]) -> Result<()>;
     /// Installs a key brought from another cell's key service, for a deployment that moved here.
     fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
+    fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord>;
+    fn deletion_verification_key(&self) -> Result<String>;
 }
 
 /// Keys kept as files in a directory apart from the objects they protect, standing in for a key-management service.
@@ -49,6 +55,11 @@ impl LocalKeyService {
 
     fn sync_directory(&self) -> Result<()> {
         std::fs::File::open(&self.directory).and_then(|directory| rtdb_storage::sync_file(&directory)).map_err(io)
+    }
+
+    fn deletion_signer(&self) -> Result<Ed25519KeyPair> {
+        let seed = self.get_or_create(&self.directory.join(".deletion-signer"))?;
+        Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| Anomaly::fault("rtdb.multi/deletion-key", "The deletion signing seed is invalid"))
     }
 
     fn install_if_missing(&self, path: &Path, key: [u8; KEY_BYTES]) -> Result<[u8; KEY_BYTES]> {
@@ -109,6 +120,33 @@ impl KeyService for LocalKeyService {
         replacement.persist(&path).map_err(|error| io(error.error))?;
         self.sync_directory()
     }
+
+    fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord> {
+        let signature = self.deletion_signer()?.sign(&deletion_message(&facts));
+        Ok(DeletionRecord { facts, signature: URL_SAFE_NO_PAD.encode(signature.as_ref()) })
+    }
+
+    fn deletion_verification_key(&self) -> Result<String> {
+        Ok(URL_SAFE_NO_PAD.encode(self.deletion_signer()?.public_key().as_ref()))
+    }
+}
+
+fn deletion_message(facts: &DeletionFacts) -> Vec<u8> {
+    let mut message = DELETION_SIGNATURE_DOMAIN.to_vec();
+    serde_json::to_writer(&mut message, facts).expect("deletion facts serialize into memory");
+    message
+}
+
+/// Verifies the receipt using a cell public key obtained through a trusted channel.
+pub fn verify_deletion(receipt: &DeletionRecord, public_key: &str) -> Result<()> {
+    let public_key = URL_SAFE_NO_PAD.decode(public_key).map_err(|_| {
+        Anomaly::incorrect("rtdb.multi/deletion-key", "The verification key must be base64url")
+    })?;
+    let invalid_signature = || Anomaly::incorrect("rtdb.multi/deletion-signature", "The deletion receipt signature is invalid");
+    let signature = URL_SAFE_NO_PAD.decode(&receipt.signature).map_err(|_| invalid_signature())?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(&deletion_message(&receipt.facts), &signature)
+        .map_err(|_| invalid_signature())
 }
 
 fn require_matching_key(deployment: &str, key: &[u8; KEY_BYTES], installed: &[u8; KEY_BYTES]) -> Result<()> {
@@ -130,6 +168,50 @@ fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavaila
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_survives_a_key_service_restart_and_binds_the_inventory_and_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(directory.path()).unwrap();
+        let public_key = keys.deletion_verification_key().unwrap();
+        let facts = DeletionFacts {
+            deployment: "deployment-id".into(),
+            name: "shop".into(),
+            epoch: 14,
+            storage_prefix: "1234/acme/lineage/deployment-id/1".into(),
+            namespaces: rtdb_directory::StorageNamespaces {
+                objects: uuid::Uuid::new_v4(),
+                keys: keys.namespace_id().unwrap(),
+            },
+            inventory: rtdb_directory::DeletionInventory::CurrentObjects,
+            key_destroyed_at_ms: 2,
+            objects_erased_at_ms: 1,
+            verified_empty: true,
+        };
+        let receipt = keys.sign_deletion(facts).unwrap();
+        let json = serde_json::to_string_pretty(&receipt).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["facts"]["verified_empty"], true);
+        value["facts"]["inventory_claim"] = serde_json::json!("all_versions");
+        assert!(serde_json::from_value::<DeletionRecord>(value).is_err());
+        let mut receipt: DeletionRecord = serde_json::from_str(&json).unwrap();
+
+        let restarted = LocalKeyService::new(directory.path()).unwrap();
+        assert_eq!(restarted.deletion_verification_key().unwrap(), public_key);
+        verify_deletion(&receipt, &public_key).unwrap();
+        let other_directory = tempfile::tempdir().unwrap();
+        let other_key = LocalKeyService::new(other_directory.path()).unwrap().deletion_verification_key().unwrap();
+        assert!(verify_deletion(&receipt, &other_key).is_err());
+        receipt.facts.epoch += 1;
+        assert!(verify_deletion(&receipt, &public_key).is_err());
+        receipt.facts.epoch -= 1;
+        let objects = receipt.facts.namespaces.objects;
+        receipt.facts.namespaces.objects = uuid::Uuid::new_v4();
+        assert!(verify_deletion(&receipt, &public_key).is_err());
+        receipt.facts.namespaces.objects = objects;
+        receipt.facts.verified_empty = false;
+        assert!(verify_deletion(&receipt, &public_key).is_err());
+    }
 
     #[test]
     fn a_destroyed_key_cannot_be_read_recreated_or_reinstalled() {

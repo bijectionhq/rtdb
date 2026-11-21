@@ -59,7 +59,7 @@ async fn exercise_cell(storage: CellStorage) {
 
     eprintln!("S3 phase: delete parent");
     let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
-    assert!(deletion.verified_empty, "the parent's objects are gone from S3");
+    assert!(deletion.facts.verified_empty, "the parent's current objects are gone from S3");
     let prefix = rtdb_storage::ObjectKey::new(parent.storage_prefix()).unwrap();
     assert!(bucket.list(Some(&prefix)).await.unwrap().is_empty());
     let preview = connect_eventually(&cell, "shop-preview").await;

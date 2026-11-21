@@ -102,6 +102,7 @@ impl Drop for DeploymentTurn<'_> {
 struct LocalSubscription { id: String, last_touch: Instant, opened: Instant, role: Role, fragments: bool }
 
 pub struct NodeAgent {
+    storage_namespaces: rtdb_directory::StorageNamespaces,
     directory: Arc<dyn Directory>,
     node: Node,
     lease: Arc<MemberLease>,
@@ -121,8 +122,8 @@ pub struct NodeAgent {
 }
 
 impl NodeAgent {
-    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
+    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, node, lease, address, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -174,9 +175,13 @@ impl NodeAgent {
                     return Ok(Response::Redirect { holder: holder.to_string(), address });
                 }
             }
-            let Some(next) = claim(&record, &me, &members, now) else {
+            let Some(mut next) = claim(&record, &me, &members, now) else {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/not-claimable", format!("{name} cannot be claimed by this member now")));
             };
+            if record.storage_namespaces.is_some() {
+                crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
+            }
+            next.storage_namespaces = Some(self.storage_namespaces);
             match self.directory.replace_deployment(next, record.version).await? {
                 Cas::Applied(held) => return self.open(held, &members).await,
                 Cas::Conflict(_) => continue,

@@ -283,16 +283,70 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     cell.node(holder).agent.park("shop-preview").await.unwrap();
     let written = own(&child.storage_prefix());
 
-    let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
-    assert!(deletion.verified_empty);
+    let keys = cell.keys();
+    let before = cell.directory.deployment(&parent.id).await.unwrap().unwrap();
+    let wrong_root = rtdb_multi::deployment::CellStorage::Local { root: cell.data.path().join("wrong-objects") };
+    let wrong_keys = rtdb_multi::keys::LocalKeyService::new(cell.data.path().join("wrong-keys")).unwrap();
+    for (storage, keys) in [(&wrong_root, &keys), (&cell.storage(), &wrong_keys)] {
+        let error = admin::delete_deployment(cell.directory.as_ref(), storage, keys, "shop", 4 << 20).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/storage-binding-mismatch");
+        let current = cell.directory.deployment(&parent.id).await.unwrap().unwrap();
+        assert_eq!((current.epoch, current.lifecycle), (before.epoch, before.lifecycle));
+        assert!(current.deletion_record.is_none());
+        assert!(!files_under(&root.join(parent.storage_prefix())).is_empty());
+    }
+    assert!(keys.existing(&parent.id).is_ok());
+    let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &keys, "shop", 4 << 20).await.unwrap();
+    assert!(deletion.facts.verified_empty);
     assert!(files_under(&root.join(parent.storage_prefix())).is_empty(), "the parent's objects are erased");
     assert!(own(&child.storage_prefix()) > written, "after the fork's shared objects were copied into it");
     assert_eq!(cell.keys().existing(&parent.id).unwrap_err().code, "rtdb.multi/key-destroyed");
-    assert_eq!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
+    let tombstone = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert_eq!(tombstone.lifecycle, rtdb_directory::Lifecycle::Deleted);
+    assert_eq!(tombstone.deletion_record.as_ref(), Some(&deletion));
+    assert_eq!(deletion.facts.deployment, tombstone.id);
+    assert_eq!(deletion.facts.epoch, tombstone.epoch);
+    assert_eq!(deletion.facts.storage_prefix, parent.storage_prefix());
+    assert_eq!(Some(deletion.facts.namespaces), tombstone.storage_namespaces);
+    let retry = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
+    assert_eq!(retry, deletion);
+    assert_eq!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap(), tombstone);
+    rtdb_multi::keys::verify_deletion(&retry, &cell.keys().deletion_verification_key().unwrap()).unwrap();
     assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await.is_err(), "a deleted deployment is refused");
     let preview = connect_eventually(&cell, "shop-preview").await;
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20", "30"], "a fork outlives its parent's deletion");
     drop(preview);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unopened_root_can_be_deleted_and_a_legacy_fenced_deletion_can_resume() {
+    use rtdb_directory::Lifecycle;
+    let cell = Cell::start(1, None).await;
+    let (storage, keys) = (cell.storage(), cell.keys());
+    let unopened = admin::create_deployment(cell.directory.as_ref(), "unopened", "acme", 3).await.unwrap();
+    let receipt = admin::delete_deployment(cell.directory.as_ref(), &storage, &keys, "unopened", 4 << 20).await.unwrap();
+    assert_eq!((receipt.facts.deployment, receipt.facts.epoch), (unopened.id, 1));
+
+    admin::create_deployment(cell.directory.as_ref(), "legacy", "acme", 3).await.unwrap();
+    let client = cell.connect("legacy").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    cell.node(0).agent.park("legacy").await.unwrap();
+    let mut legacy = cell.directory.deployment_by_name("legacy").await.unwrap().unwrap();
+    let version = legacy.version;
+    legacy.epoch += 1;
+    legacy.lifecycle = Lifecycle::Deleting;
+    legacy.storage_namespaces = None;
+    let legacy = cell.directory.replace_deployment(legacy, version).await.unwrap().applied().unwrap();
+    let wrong_root = rtdb_multi::deployment::CellStorage::Local { root: cell.data.path().join("wrong-objects") };
+    let error = admin::delete_deployment(cell.directory.as_ref(), &wrong_root, &keys, "legacy", 4 << 20).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.multi/storage-binding-mismatch");
+    assert_eq!(cell.directory.deployment_by_name("legacy").await.unwrap().unwrap(), legacy);
+
+    let receipt = admin::delete_deployment(cell.directory.as_ref(), &storage, &keys, "legacy", 4 << 20).await.unwrap();
+    assert_eq!((receipt.facts.deployment, receipt.facts.epoch), (legacy.id, legacy.epoch));
+    assert!(files_under(&cell.data.path().join("objects").join(receipt.facts.storage_prefix)).is_empty());
     cell.stop().await;
 }
 
@@ -506,6 +560,8 @@ impl KeyService for InterruptedInstall {
     fn existing(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.existing(deployment) }
     fn destroy(&self, deployment: &str) -> rtdb_types::Result<()> { self.keys.destroy(deployment) }
     fn validate_install(&self, deployment: &str, key: &[u8; 32]) -> rtdb_types::Result<()> { self.keys.validate_install(deployment, key) }
+    fn sign_deletion(&self, facts: rtdb_directory::DeletionFacts) -> rtdb_types::Result<rtdb_directory::DeletionRecord> { self.keys.sign_deletion(facts) }
+    fn deletion_verification_key(&self) -> rtdb_types::Result<String> { self.keys.deletion_verification_key() }
 
     fn install(&self, deployment: &str, key: [u8; 32]) -> rtdb_types::Result<()> {
         if !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed) {

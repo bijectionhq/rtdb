@@ -32,6 +32,8 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --name NAME\n\n\
+       rtdb-multi deletion-key --keys PATH\n\n\
+       rtdb-multi verify-deletion --record PATH --public-key KEY\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
 DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n";
@@ -201,6 +203,17 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
             let deletion = admin::delete_deployment(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), arguments.required("name")?, 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&deletion).expect("a record serializes"));
+            Ok(())
+        }
+        "deletion-key" => {
+            println!("{}", keys(&arguments)?.deletion_verification_key()?);
+            Ok(())
+        }
+        "verify-deletion" => {
+            let contents = std::fs::read(arguments.required("record")?).map_err(io)?;
+            let receipt = serde_json::from_slice(&contents).map_err(|error| usage(format!("Invalid deletion receipt: {error}")))?;
+            rtdb_multi::keys::verify_deletion(&receipt, arguments.required("public-key")?)?;
+            println!("Deletion receipt signature verified");
             Ok(())
         }
         "create" => {
