@@ -5,6 +5,7 @@ mod gc;
 mod job;
 mod merge;
 mod publication;
+mod retention;
 
 pub use artefact::{ArtefactBuilder, ArtefactSource, wants, ArtefactDatabase, ArtefactDefinition, ArtefactKind, ArtefactDriver, ArtefactHandle, ArtefactJob, ArtefactPublisher, available_artefact_jobs, retired_artefacts, stray_artefacts};
 pub use driver::{CompactionDriver, CompactionHandle, CompactionExecutor, CycleDriver, CycleHandle, CycleWorker};

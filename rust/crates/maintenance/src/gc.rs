@@ -37,7 +37,7 @@ pub trait CollectionObserver: Send + Sync {
 }
 
 pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> bool {
-    block != latest && i128::from(block.0) <= i128::from(latest.0) - keep as i128
+    crate::retention::block_is_eligible(block.0, latest.0, keep)
 }
 
 pub struct TrieCollector {
@@ -117,9 +117,18 @@ impl TrieCollector {
 
 /// The partition groups of tries being collected none of whose members the catalog holds besides them: their artefacts serve no trie once these go.
 fn finished_groups(catalog: &rtdb_index::TrieCatalog, table: &TableRef, keys: &[TrieKey]) -> BTreeSet<PartGroup> {
+    use rtdb_format::keys::BRANCH_FACTOR;
+
     let collected: BTreeSet<&TrieKey> = keys.iter().collect();
     keys.iter().filter_map(TrieKey::part_group)
-        .filter(|group| catalog.group_members(table, group).iter().all(|member| collected.contains(&member.key)))
+        .filter(|group| {
+            let members = group.members();
+            let held: [Option<bool>; BRANCH_FACTOR as usize] = std::array::from_fn(|bucket| {
+                let key = &members[bucket];
+                catalog.trie(table, key).map(|_| collected.contains(key))
+            });
+            crate::retention::all_held_members_scheduled(held)
+        })
         .collect()
 }
 

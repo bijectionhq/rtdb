@@ -312,3 +312,20 @@ Reproduce the witness in an isolated checkout at `cb9a0c795` by appending the re
 BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --locked -p rtdb-conformance \
   --test node_faults eligible_trie_collection_strands_an_admitted_native_reader -- --exact --nocapture
 ----
+
+== Catalog reclamation decisions
+
+Verus checked four functions in link:../verus/catalog_reclamation/proof.rs[the production reclamation area].
+The block decision is equivalent to requiring a strictly earlier block and a position at least the configured distance behind the latest block.
+The calculation uses widened arithmetic and covers zero retention and all representable arguments.
+The group decision permits reclamation only when every catalog-held member of the candidate group is in the selected batch.
+Each of the four slots comes from the same catalog snapshot, for the exact table and trie key returned by the group's bucket order.
+The batch contains only garbage tries eligible at its cutoff.
+
+Verus rejected selecting the latest block at zero retention and ignoring the fourth member.
+In two additional joint controls the weakened function still met its local contract.
+The independent latest-block or surviving-sibling law failed at the expected assertion.
+
+The proof covers the two synchronous predicates.
+It depends on the listed catalog lookups and the caller's batch construction.
+Reader and recovery dependencies outside that snapshot, generation fencing, provider outcomes, and effects after admission remain separate obligations.

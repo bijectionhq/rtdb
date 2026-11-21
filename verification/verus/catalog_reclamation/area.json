@@ -1,0 +1,71 @@
+{
+  "summary": "Catalog reclamation preserves the latest block and every surviving sibling's shared artefact.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 4,
+  "controls": {
+    "collect_latest": {
+      "defect": "A zero-retention setting allows selection of the latest block.",
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/retention.rs",
+        "find": "block != latest && ",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "rust/crates/maintenance/src/retention.rs",
+        "function": "block_is_eligible",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 3
+    },
+    "collect_latest_with_weakened_contract": {
+      "defect": "The implementation and its contract agree that zero retention permits selection of the latest block.",
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/retention.rs",
+        "find": "block != latest && ",
+        "replace": ""
+      }, {
+        "file": "rust/crates/maintenance/src/retention.rs",
+        "find": "block < latest && ",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "verification/verus/catalog_reclamation/laws.rs",
+        "function": "latest_block_stays",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 3
+    },
+    "ignore_last_bucket": {
+      "defect": "The fourth held member is ignored when deciding whether the shared artefact can be collected.",
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/retention.rs",
+        "find": "\n        && members[3] != Some(false)",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "rust/crates/maintenance/src/retention.rs",
+        "function": "all_held_members_scheduled",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 3
+    },
+    "ignore_last_bucket_with_weakened_contract": {
+      "defect": "The implementation and its contract both ignore the fourth held member.",
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/retention.rs",
+        "find": "\n        && members[3] != Some(false)",
+        "replace": ""
+      }, {
+        "file": "rust/crates/maintenance/src/retention.rs",
+        "find": "0 <= i < 4",
+        "replace": "0 <= i < 3"
+      }],
+      "expect": [{
+        "file": "verification/verus/catalog_reclamation/laws.rs",
+        "function": "a_retained_sibling_keeps_the_group",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 3
+    }
+  }
+}
