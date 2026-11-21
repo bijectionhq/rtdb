@@ -3,6 +3,10 @@ use std::sync::Arc;
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, MemoryBudget, MemoryReservation, Result, TemporalBounds, Timestamp};
 use serde::{Deserialize, Serialize};
 
+#[allow(unexpected_cfgs)]
+#[cfg(kani)]
+mod proofs;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "PolygonParts", into = "PolygonParts")]
 pub struct Polygon {

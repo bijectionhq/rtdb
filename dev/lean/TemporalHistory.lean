@@ -165,4 +165,74 @@ theorem replay_segments (point : Point) (initial : Option Value)
       recent.foldl (applyEvent point) (older.foldl (applyEvent point) initial) := by
   rw [newest_append, newest_reverse_eq_replay, newest_reverse_eq_replay]
 
+def validAt (point : Point) (event : Event Value) : Prop :=
+  event.validFrom ≤ point.validTime ∧ point.validTime < event.validTo
+
+instance (point : Point) (event : Event Value) : Decidable (validAt point event) :=
+  inferInstanceAs (Decidable (_ ∧ _))
+
+def ceilingRows (point : Point) (ceiling : Int) : List (Event Value) → List Value
+  | [] => []
+  | event :: older =>
+    if event.iid ≠ point.iid then ceilingRows point ceiling older
+    else match event.mutation with
+    | .erase => []
+    | .delete =>
+      if validAt point event then ceilingRows point event.systemFrom older
+      else ceilingRows point ceiling older
+    | .put value =>
+      if validAt point event then
+        let emitted := if event.systemFrom ≤ point.systemTime ∧ point.systemTime < ceiling
+          then [value] else []
+        emitted ++ ceilingRows point event.systemFrom older
+      else ceilingRows point ceiling older
+
+theorem ceilingRows_none_above_ceiling (point : Point) (ceiling : Int)
+    (history : List (Event Value)) (closed : ceiling ≤ point.systemTime)
+    (older : ∀ event ∈ history, event.iid = point.iid → event.systemFrom ≤ point.systemTime) :
+    ceilingRows point ceiling history = [] := by
+  induction history generalizing ceiling with
+  | nil => rfl
+  | cons event history ih =>
+    have tailOlder : ∀ entry ∈ history, entry.iid = point.iid → entry.systemFrom ≤ point.systemTime :=
+      fun entry member => older entry (List.mem_cons_of_mem _ member)
+    have cannotEmit : ¬ point.systemTime < ceiling := by omega
+    by_cases entity : event.iid = point.iid
+    · have atOrBefore := older event (List.mem_cons_self ..) entity
+      cases op : event.mutation <;> by_cases valid : validAt point event <;>
+        simp [ceilingRows, entity, op, valid, cannotEmit, ih ceiling closed tailOlder,
+          ih event.systemFrom atOrBefore tailOlder]
+    · simp [ceilingRows, entity, ih ceiling closed tailOlder]
+
+def DescendingPerEntity (history : List (Event Value)) : Prop :=
+  history.Pairwise (fun newer older => newer.iid = older.iid → older.systemFrom ≤ newer.systemFrom)
+
+theorem ceilingRows_eq_newest (point : Point) (ceiling : Int)
+    (history : List (Event Value)) (openAtPoint : point.systemTime < ceiling)
+    (descending : DescendingPerEntity history) :
+    ceilingRows point ceiling history = (newest point none history).toList := by
+  induction history generalizing ceiling with
+  | nil => rfl
+  | cons event older ih =>
+    obtain ⟨earlier, order⟩ := List.pairwise_cons.mp descending
+    by_cases entity : event.iid = point.iid
+    · by_cases valid : event.validFrom ≤ point.validTime ∧ point.validTime < event.validTo
+      · by_cases committed : event.systemFrom ≤ point.systemTime
+        · have noOlder := ceilingRows_none_above_ceiling point event.systemFrom older committed
+            (fun entry member sameIid => Int.le_trans (earlier entry member (entity.trans sameIid.symm)) committed)
+          cases op : event.mutation <;> simp [ceilingRows, newest, decision, entity, op, valid,
+            validAt, committed, openAtPoint, noOlder]
+        · have future : point.systemTime < event.systemFrom := by omega
+          cases op : event.mutation <;> simp [ceilingRows, newest, decision, entity, op, valid,
+            validAt, committed, ih event.systemFrom future order]
+      · cases op : event.mutation <;> simp [ceilingRows, newest, decision, entity, op, valid,
+          validAt, ← and_assoc, ih ceiling openAtPoint order]
+    · simp [ceilingRows, newest, decision, entity, ih ceiling openAtPoint order]
+
+theorem ceilingRows_eq_chronological_replay (point : Point) (ceiling : Int)
+    (history : List (Event Value)) (openAtPoint : point.systemTime < ceiling)
+    (descending : DescendingPerEntity history.reverse) :
+    ceilingRows point ceiling history.reverse = (history.foldl (applyEvent point) none).toList := by
+  rw [ceilingRows_eq_newest point ceiling history.reverse openAtPoint descending, newest_reverse_eq_replay]
+
 end RTDB.Temporal

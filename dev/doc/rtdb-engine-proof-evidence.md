@@ -1,6 +1,6 @@
 # RTDB engine verification record
 
-This record traces local evidence to the [engine property catalog](rtdb-engine-proof-properties.md).
+This record traces local evidence to the [engine property catalog](rtdb-engine-proof-properties.md) and the [per-property ledger](rtdb-engine-verification-ledger.md).
 The code baseline for the checks is `e86af7f12`, with the proof harnesses and SQL regressions in this branch.
 Abstract theorems, checks of actual Rust functions, and observations through the SQL interface have separate scopes.
 The table records remaining end-to-end obligations for each area checked here.
@@ -10,10 +10,11 @@ Catalog targets absent from this table remain open in this verification pass.
 
 | Catalog target | Evidence | Open obligation |
 | --- | --- | --- |
+| TIME01 · Two independent axes | The Lean projection theorem agrees with chronological replay for a point on both axes within an already captured history. | Refine query basis capture, SQL binding, and snapshot assembly. |
 | TIME02 · Interval endpoints | Kani checks the production Rust interval intersection and overlap predicates for all valid half-open intervals and points over signed 64-bit timestamps. | SQL syntax normalization and the other interval conversions. |
-| TIME04–TIME09 · Point history | Lean proves that newest-first lookup equals chronological replay and that an IID filter preserves the result. Separate lemmas cover valid-time locality, delete, erase, writes after erase, exclusive valid-time ends, and future ordinary mutations. | An implementation refinement for arbitrary-length input, including the ordered trace supplied by the scan. |
-| TIME10 · Rectangle projection | Lean proves that point visibility is constant within a rectangle whose interior crosses no relevant event boundary on either time axis. | Prove that the Rust resolver's output rectangles cover exactly the visible cells and report the specified bounds. |
-| TIME11 · Specialized equivalence | The native SQL regression compares point reads with a separate chronological reference. | A theorem relating every applicable specialized and general execution path. |
+| TIME04–TIME09 · Point history | Lean proves that newest-first lookup and the descending interval ceiling scan have the same per-point result as chronological replay. Separate lemmas cover valid-time locality, delete, erase, writes after erase, exclusive valid-time ends, entity isolation, and future ordinary mutations. | Refine the Rust calculators and prove that the scan supplies the required event order and coverage. |
+| TIME10 · Rectangle projection | Lean proves exact per-point coverage and multiplicity after clipping and updating a partition of valid time. Kani checks the Rust `PolygonView` for all signed 64-bit endpoints and ceilings when the domain has one interior split, including empty intervals at both timestamp extrema. | Prove the Rust slice selection, ceiling updates, and fragment emission for arbitrary partitions, including the exact bounds for the supported query projections. |
+| TIME11 · Specialized equivalence | Lean relates the modeled range output to the point reference inside the query bounds. The native SQL regression compares point reads with a separate chronological reference. | Refine each implemented specialized path and the general resolver to the common semantics. |
 | SCAN01–SCAN05 · Scan soundness | Lean proves that dropping events which cannot decide a point observation preserves that observation. The native regression checks results with temporal pruning enabled and bypassed, including a predicate that should exclude a corrected value. | Establish the proof premise for each implementation selector and all supported history and metadata layouts. |
 | LOG08 and FMT01 · Packed positions | Kani checks Rust source and replica packing, extraction, natural order, and same-epoch and foreign-epoch resume for epochs 0 through 32,767 and nonnegative 48-bit offsets. A separate harness checks all negative message IDs and the packed `-1` start sentinel for those epochs. | Show that callers establish the checked packing domain, and prove the catalog-to-log boundary and persistent codec contracts. |
 | IDX04 · Bucket routing | Kani checks the production Rust IID bucket against independent bit extraction for every legal depth, every 128-bit IID, and bucket widths of 2, 4, and 8 bits. | Prove that every insertion, split, and serialized traversal uses the corresponding correct path. |
@@ -21,10 +22,14 @@ Catalog targets absent from this table remain open in this verification pass.
 | COMP05 · Recency agreement | Lean proves that early-exit recency equals a full fold over any list of descending, non-overlapping valid-time ranges. Kani checks Rust `Polygon::recency` for three ranges with arbitrary ordered signed 64-bit bounds and signed 64-bit ceilings. | Prove that the Rust writer and readers establish the ordering premise, and establish the implementation refinement for arbitrary range counts and supported storage layouts. |
 | CELL09 and recovery S2 and S5 · Recovery after worker loss | A multi-mode SQL fixture preserves a published checkpoint row, acknowledged tail updates and deletes, and subsequent writes through the loss of one, two, and all three serving workers. | Prove the recovery and readiness guarantees across all admitted traces and provider implementations, including the control-plane and key prerequisites. |
 | Recovery S4 · Logkeeper recovery decisions | Kani checks the production recovery winner for all triples of sealed replies by synced epoch, last position, and reply index on a tie. Lean proves that the first retained epoch divergence is detectable at the start or at a breakpoint from either run list. | Relate Rust `plan_repair` inputs and returned positions to the theorem, and prove that equal epochs imply equal payload prefixes under the protocol. |
-| Recovery S1–S7 and conditional progress | Locally reran seven Lean files and 14 TLC configurations covering log recovery, journal identity, cell transfer, and erasure. Five configurations satisfied their checks, and nine produced their expected invariant violation or reachability trace. | The recovery proof inventory lists the remaining protocol and implementation obligations. |
+| Recovery S1–S7 and conditional progress | The proof runner checks the Lean files and 14 TLC configurations covering log recovery, journal identity, cell transfer, and erasure. Five configurations satisfy their checks, and nine produce their expected invariant violation or reachability trace. | The recovery proof inventory lists the remaining protocol and implementation obligations. |
 
 The Lean point model takes an already captured history in transaction order, with equal-time events ordered by input position.
 It treats an erase in that history according to the documented erase semantics.
+The projection theorem assumes nonincreasing system times for each IID in the descending input, a query point inside the valid-time domain, and a system time below the initial ceiling and query upper bound.
+It shows zero or one observed range row at each point and permits eliding ordinary events at or above the query's exclusive system-time upper bound while retaining erases.
+The valid-time clipping theorem preserves observations inside the query's valid-time range. [Ceiling model](../lean/TemporalCeiling.lean) · [Projection theorem](../lean/TemporalProjection.lean)
+
 The filtering theorem assumes that every omitted event has no decision at the requested point, including when the event belongs to an older segment.
 The recency theorem assumes each remaining range ends at or before the current range's lower bound.
 The repair theorem compares epoch labels within a common retained interval using newest-first run lists, including the interval start as a possible boundary.
@@ -50,6 +55,7 @@ The Logkeeper segment test `streams_share_segments_that_a_trim_compacts_and_a_re
 ## Reproduce locally
 
 Run Lean 4.36.0 and TLC 1.7.4 from the repository root.
+The runner checks that the ledger covers the full catalog and compiles the Lean files, including their local imports.
 The runner checks each committed configuration against its expected status and invariant diagnostic.
 Its logs go under the ignored `build/proof-runs` directory.
 
@@ -63,6 +69,7 @@ The unwinding checks are part of each bounded result. [Kani installation](https:
 ```sh
 cd rust
 cargo kani -p rtdb-temporal -p rtdb-types -p rtdb-trie --tests --output-format terse
+cargo kani -p rtdb-temporal --lib --output-format terse
 cargo kani -p rtdb-logkeeper --lib --output-format terse
 ```
 

@@ -4,12 +4,20 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${TLA2TOOLS_JAR:?Set TLA2TOOLS_JAR to the TLA+ tool jar}"
 lean="${LEAN:-lean}"
+
+catalog=dev/doc/rtdb-engine-proof-properties.md
+ledger=dev/doc/rtdb-engine-verification-ledger.md
+diff -u <(sed -nE 's/^- \*\*([A-Z]+[0-9]{2}) · .*/\1/p' "$catalog") \
+        <(sed -nE 's/^\| ([A-Z]+[0-9]{2}) · .*/\1/p' "$ledger")
+
 mkdir -p build/proof-runs
 run="$(mktemp -d "$PWD/build/proof-runs/run.XXXXXXXX")"
+export LEAN_PATH="$run${LEAN_PATH:+:$LEAN_PATH}"
 
 for proof in dev/lean/*.lean; do
-    log="$run/${proof##*/}.log"
-    if ! "$lean" -DwarningAsError=true "$proof" > "$log" 2>&1; then
+    file="${proof##*/}"
+    log="$run/$file.log"
+    if ! "$lean" -DwarningAsError=true --root=dev/lean -o "$run/${file%.lean}.olean" "$proof" > "$log" 2>&1; then
         cat "$log" >&2
         exit 1
     fi

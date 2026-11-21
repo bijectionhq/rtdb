@@ -9,6 +9,7 @@ Unmarked entries restate a documented contract or express a proof obligation for
 Each entry is a verification target, and the linked sources establish its intended scope.
 The recovery study records which abstract theorems, bounded model checks, and implementation observations already exist for recovery properties S1–S7 and conditional progress. [Recovery proof status](rtdb-recovery-properties.md#proof-status)
 Locally checked evidence for the engine catalog is tracked in the [engine verification record](rtdb-engine-proof-evidence.md).
+The [verification ledger](rtdb-engine-verification-ledger.md) tracks each property by its catalog ID.
 
 The scope is exhaustive at the contract level covered by the cited engine specifications and crate map.
 Use the applicable language, format, frontend, and provider conformance inventories to enumerate individual inputs and supported versions. [Crate map and parity inventory](rtdb-crates-and-test-parity.md) · [Conformance lanes](../../rust/conformance/README.adoc)
