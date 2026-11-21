@@ -426,11 +426,18 @@ async fn source_files(
             continue;
         };
         let block = trie.block_index().0;
-        if trie == TrieKey::l0(trie.block_index())? && block > after && block <= through {
+        if trie == TrieKey::l0(trie.block_index())?
+            && object.key.as_str() == table.slug.data_key(&trie)
+            && block > after
+            && block <= through
+        {
             files.push((block, object.key));
         }
     }
     files.sort_unstable_by_key(|(block, _)| *block);
+    if files.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(incomplete_source());
+    }
     if files.last().map(|(block, _)| *block) != Some(through) {
         return Err(format_error(
             "The index source's latest flushed block is unavailable",

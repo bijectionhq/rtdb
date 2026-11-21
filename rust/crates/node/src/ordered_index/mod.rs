@@ -1,5 +1,6 @@
 mod accelerate;
 mod checkpoint;
+mod domain;
 mod key;
 mod maintenance;
 mod projection;

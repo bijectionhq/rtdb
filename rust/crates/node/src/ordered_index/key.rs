@@ -1,6 +1,8 @@
 use rtdb_types::{Interval, LogicalType, ScalarType, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 
+use super::domain::{offset, upper_bound};
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum Atom {
     Bool(bool),
@@ -100,7 +102,7 @@ pub(super) struct Bucket {
 
 impl Bucket {
     pub fn at(time: Timestamp) -> impl Iterator<Item = Self> {
-        let point = Self::offset(time);
+        let point = offset(time.0);
         (0..=64).map(move |level| Self {
             level,
             start: (point >> level << level) as u64,
@@ -108,12 +110,8 @@ impl Bucket {
     }
 
     pub fn cover(interval: Interval) -> impl Iterator<Item = Self> {
-        let mut start = Self::offset(interval.lower());
-        let end = if interval.upper() == Timestamp::MAX {
-            1_u128 << 64
-        } else {
-            Self::offset(interval.upper())
-        };
+        let mut start = offset(interval.lower().0);
+        let end = upper_bound(interval.upper().0);
         let empty = interval.is_empty();
         std::iter::from_fn(move || {
             if empty || start >= end {
@@ -127,9 +125,5 @@ impl Bucket {
             start += 1_u128 << level;
             Some(bucket)
         })
-    }
-
-    fn offset(time: Timestamp) -> u128 {
-        ((time.0 as u64) ^ (1 << 63)) as u128
     }
 }

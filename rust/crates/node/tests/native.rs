@@ -2007,3 +2007,31 @@ async fn an_unreadable_ordered_root_falls_back_and_maintenance_rebuilds_it() {
     assert!(observer.take().is_empty());
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn ordered_coverage_ignores_a_nested_copy_of_a_canonical_l0_file() {
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (priority, _id)").await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, priority: 9}").await;
+    index_flush(&node, &database).await;
+
+    let snapshot = database.snapshot();
+    let table = TableRef::new("public", "orders");
+    let entry = snapshot.table_entry(&table).unwrap();
+    let trie = rtdb_format::keys::TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
+    let canonical = entry.slug.data_key(&trie);
+    let (directory, file) = canonical.rsplit_once('/').unwrap();
+    let copy = rtdb_storage::ObjectKey::new(format!("{directory}/staging/{file}")).unwrap();
+    let canonical = rtdb_storage::ObjectKey::new(canonical).unwrap();
+    let store = database.object_store();
+    store.put(&copy, store.get(&canonical).await.unwrap()).await.unwrap();
+
+    database.build_artefacts().await.unwrap();
+    let query = "SELECT _id FROM orders ORDER BY priority, _id LIMIT 1";
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+    stop(&node, driver).await;
+}
