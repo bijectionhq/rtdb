@@ -881,7 +881,7 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    Consecutive failures count only for one unchanged address pair.
    A ready round resets the count, and a member with either address changed cannot be confirmed dead by the old observation.
    A capable listener answers a private serving preface before the gateway sends a Pgwire startup message.
-   The gateway can retry a missed preface without repeating authentication.
+   The gateway can retry a missed preface or a failed control connection before the startup deadline.
    The controller clears failure evidence when it observes startup inspection overflow during a probe.
    A gateway with a failed direct route can reach the same writer through a signed control-plane relay to that writer's local Pgwire listener.
    The relay runs the ordinary Pgwire authentication and is available when the node's authentication rules are independent of the peer address.

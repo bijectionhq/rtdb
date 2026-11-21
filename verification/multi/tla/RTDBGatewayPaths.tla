@@ -1,14 +1,15 @@
 ---------------------------- MODULE RTDBGatewayPaths ----------------------------
 EXTENDS Naturals
 
-CONSTANTS CheckWireReply, AllowRelay, RequireEquivalentAuth, IgnoreCrowdedSample
+CONSTANTS CheckWireReply, AllowRelay, RequireEquivalentAuth, IgnoreCrowdedSample, PreferRelay
 VARIABLES scenario, signed, addressRules, failures, holder, connected
 
 Vars == <<scenario, signed, addressRules, failures, holder, connected>>
-Scenarios == {"gateway-isolated", "writer-stalled", "startup-overflow"}
-LocalPgwireReady == scenario = "gateway-isolated"
-ControllerPgwireReady == LocalPgwireReady \/ ~CheckWireReply
-                         \/ (scenario = "startup-overflow" /\ IgnoreCrowdedSample)
+Scenarios == {"gateway-isolated", "writer-stalled", "startup-overflow", "isolated-and-crowded"}
+Isolated == scenario \in {"gateway-isolated", "isolated-and-crowded"}
+Overflow == scenario \in {"startup-overflow", "isolated-and-crowded"}
+ControllerPgwireReady == scenario = "gateway-isolated" \/ ~CheckWireReply
+                         \/ (Overflow /\ IgnoreCrowdedSample)
 
 Init ==
     /\ scenario \in Scenarios
@@ -34,16 +35,17 @@ Connect ==
     /\ connected = "pending"
     /\ IF holder = "successor" \/ scenario = "startup-overflow"
        THEN connected' = "direct"
-       ELSE /\ AllowRelay /\ LocalPgwireReady /\ signed
+       ELSE /\ AllowRelay /\ Isolated /\ signed
             /\ (~RequireEquivalentAuth \/ ~addressRules)
+            /\ (~Overflow \/ PreferRelay)
             /\ connected' = "relayed"
     /\ UNCHANGED <<scenario, signed, addressRules, failures, holder>>
 
 Spec == Init /\ [][Probe \/ Promote \/ Connect]_Vars
              /\ WF_Vars(Probe) /\ WF_Vars(Promote) /\ WF_Vars(Connect)
 
-IsolatedGatewayKeepsWriter == scenario = "gateway-isolated" => holder = "original"
-CrowdedProbeKeepsWriter == scenario = "startup-overflow" => holder = "original"
+IsolatedGatewayKeepsWriter == Isolated /\ ~Overflow => holder = "original"
+CrowdedProbeKeepsWriter == Overflow => holder = "original"
 RelayPreservesAuthentication == connected = "relayed" => signed /\ ~addressRules
 EligibleStartupCompletes ==
     (scenario = "writer-stalled" \/ (signed /\ ~addressRules)) ~> (connected # "pending")

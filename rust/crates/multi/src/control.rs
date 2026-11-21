@@ -20,8 +20,13 @@ pub(crate) const CLAIM_CONTENDED: &str = "rtdb.multi/claim-contended";
 pub(crate) const ACTIVATION_RATE_LIMITED: &str = "rtdb.multi/activation-rate-limited";
 
 pub(crate) const WRITER_PGWIRE_UNREACHABLE: &str = "rtdb.multi/writer-pgwire-unreachable";
+pub(crate) const WRITER_CONTROL_UNREACHABLE: &str = "rtdb.multi/writer-control-unreachable";
+const CONTROL_IO: &str = "rtdb.multi/control-io";
+const CONTROL_TIMEOUT: &str = "rtdb.multi/control-timeout";
 
-pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED | ACTIVATION_RATE_LIMITED | WRITER_PGWIRE_UNREACHABLE) }
+pub(crate) fn unreachable_control(code: &str) -> bool { matches!(code, CONTROL_IO | CONTROL_TIMEOUT) }
+
+pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED | ACTIVATION_RATE_LIMITED | WRITER_PGWIRE_UNREACHABLE | WRITER_CONTROL_UNREACHABLE) }
 
 pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: Duration, mut attempt: impl FnMut() -> F) -> Result<T> {
     let latest_start = tokio::time::Instant::now() + window;
@@ -29,7 +34,7 @@ pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: D
         let result = attempt().await;
         let Err(error) = &result else { return result; };
         if !retryable_activation(&error.code) { return result; }
-        let delay = if matches!(error.code.as_ref(), ACTIVATION_RATE_LIMITED | WRITER_PGWIRE_UNREACHABLE) { Duration::from_millis(100) } else { Duration::from_millis(25) };
+        let delay = if matches!(error.code.as_ref(), ACTIVATION_RATE_LIMITED | WRITER_PGWIRE_UNREACHABLE | WRITER_CONTROL_UNREACHABLE) { Duration::from_millis(100) } else { Duration::from_millis(25) };
         let retry_at = tokio::time::Instant::now() + delay;
         if retry_at >= latest_start { return result; }
         tokio::time::sleep_until(retry_at).await;
@@ -202,10 +207,12 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
                             Response::Refused { code: "rtdb.multi/pgwire-relay-unavailable".into(), message: "This control endpoint cannot open a Pgwire connection".into() }
                         }
                         request => {
-                            if matches!(request, Request::Ping | Request::Activate { .. } | Request::Subscribe { .. } | Request::Snapshot { .. }) {
+                            let reports_probe = matches!(request, Request::Ping | Request::Activate { .. } | Request::Subscribe { .. } | Request::Snapshot { .. });
+                            let response = handler.handle(request).await;
+                            if reports_probe {
                                 startup_probe_overflows = pgwire.as_ref().map(|endpoint| endpoint.status.borrow().startup_probe_overflows);
                             }
-                            handler.handle(request).await
+                            response
                         }
                     },
                     Err(error) => Response::refused(&error),
@@ -228,7 +235,7 @@ async fn exchange(address: &str, request: Request, timeout: Duration, key: &Cont
         Ok((stream, response))
     };
     tokio::time::timeout(timeout, transfer).await
-        .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/control-timeout", format!("No answer from {address}")))?
+        .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, CONTROL_TIMEOUT, format!("No answer from {address}")))?
 }
 
 pub async fn call(address: &str, request: &Request, timeout: Duration, key: &ControlKey) -> Result<Response> {
@@ -256,7 +263,7 @@ pub(crate) async fn open_pgwire(address: &str, timeout: Duration, key: &ControlK
     Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/pgwire-relay-unavailable", "No signed Pgwire relay is available"))
 }
 
-fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/control-io", error.to_string()) }
+fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, CONTROL_IO, error.to_string()) }
 
 #[cfg(test)]
 mod tests {

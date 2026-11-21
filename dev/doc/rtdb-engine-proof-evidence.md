@@ -572,10 +572,12 @@ The native cell regression keeps the control endpoint responsive, breaks pgwire,
 A separate native test changes the pgwire address between the probe and publication.
 The serving probe runs before Pgwire authentication and occupies no authenticated session slot.
 The capacity regression fills the writer's configured session slots and verifies that the controller keeps the writer live.
-The gateway sends a Pgwire startup only after a supported endpoint answers the serving preface.
+The serving preface runs before Pgwire startup.
+If both preface paths fail and a fresh control sample reports overflow, the gateway can offer ordinary Pgwire startup on a direct connection.
 An eligible gateway can relay through the same writer's signed control endpoint while the controller continues to see a healthy writer.
 The relay is available when the writer's authentication rules are independent of peer addresses.
-TLC checks a writer-wide serving stall, a gateway-only isolation, and a missed probe during inspection overflow.
+TLC checks a writer-wide serving stall, a gateway-only isolation, and missed probes during inspection overflow.
+The gateway-only case includes simultaneous overflow and requires attempting the verified relay before accepting the direct fallback.
 Removing the wire reply, fallback, authorization constraint, or overflow check produces a counterexample.
 These results cover the serving handshake under a reachable successor or an authorized relay path. [Lean proof](../../verification/multi/lean/ServingFailure.lean) · [TLA+ serving paths](../../verification/multi/tla/RTDBGatewayPaths.tla) · [Verus checks](../../verification/verus/member_probe/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)
 

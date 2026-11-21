@@ -2131,6 +2131,49 @@ async fn exercise_pgwire_failover(stalls_after_connect: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_waits_for_replacement_when_the_writer_control_port_closes() {
+    use rtdb_directory::MemberState;
+    use tokio::net::TcpListener;
+
+    let cell = Cell::start(2, None).await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let original = cell.holder("shop").await.unwrap();
+    let member = cell.node(original).lease.id();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed = listener.local_addr().unwrap();
+    drop(listener);
+    loop {
+        let mut record = cell.directory.member(&member).await.unwrap().unwrap();
+        let previous = record.version;
+        record.control_address = Some(closed.to_string());
+        if cell.directory.replace_member(record, previous).await.unwrap().applied().is_some() { break; }
+    }
+
+    let gateway = cell.gateway;
+    let mut startup = tokio::spawn(async move {
+        tokio_postgres::Config::new().host("127.0.0.1").port(gateway.port())
+            .user("xtdb").password("cell-test").dbname("shop").connect(NoTls).await
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(250), &mut startup).await.is_err());
+    let options = admin::ControllerOptions { control: control(), ..Default::default() };
+    let mut failures = BTreeMap::new();
+    for _ in 0..options.suspicion_probes {
+        admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap();
+    }
+    assert_eq!(cell.directory.member(&member).await.unwrap().unwrap().state, MemberState::Dead);
+    let (client, driver) = tokio::time::timeout(Duration::from_secs(5), startup).await.unwrap().unwrap().unwrap();
+    let driver = tokio::spawn(driver);
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    assert_eq!(cell.directory.deployment(&deployment.id).await.unwrap().unwrap().holder, Some(cell.node(1 - original).lease.id()));
+    drop(client);
+    driver.await.unwrap().unwrap();
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_asymmetric_gateway_stall_uses_the_existing_writer_and_preserves_authentication() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
@@ -2159,11 +2202,17 @@ async fn an_asymmetric_gateway_stall_uses_the_existing_writer_and_preserves_auth
                 let op: serde_json::Value = serde_json::from_str(&request).unwrap();
                 let mut target = TcpStream::connect(actual_control).await.unwrap();
                 target.write_all(request.as_bytes()).await.unwrap();
-                if op["op"] == "activate" {
+                if op["op"] == "activate" || op["op"] == "ping" {
                     let mut reply = String::new();
                     BufReader::new(&mut target).read_line(&mut reply).await.unwrap();
                     let mut reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
-                    if reply["outcome"] == "held" { reply["address"] = stalled_address.to_string().into(); }
+                    if reply["outcome"] == "held" {
+                        reply["address"] = stalled_address.to_string().into();
+                    }
+                    if op["op"] == "ping" {
+                        let overflows = reply["startup_probe_overflows"].as_u64().unwrap();
+                        reply["startup_probe_overflows"] = (overflows + 1).into();
+                    }
                     let _ = gateway.write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes()).await;
                 } else {
                     if op["op"] == "open_pgwire" { attempts.fetch_add(1, Ordering::Relaxed); }

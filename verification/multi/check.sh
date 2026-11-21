@@ -72,6 +72,7 @@ RTDBGatewayPaths|RTDBGatewayPathsTcpOnly|13|Temporal property EligibleStartupCom
 RTDBGatewayPaths|RTDBGatewayPathsDirectOnly|13|Temporal property EligibleStartupCompletes was violated
 RTDBGatewayPaths|RTDBGatewayPathsChangedAuth|12|Invariant RelayPreservesAuthentication is violated
 RTDBGatewayPaths|RTDBGatewayPathsCrowded|12|Invariant CrowdedProbeKeepsWriter is violated
+RTDBGatewayPaths|RTDBGatewayPathsOverflowFirst|13|Temporal property EligibleStartupCompletes was violated
 RTDBReplayPermit|RTDBReplayPermit|0|No error has been found
 RTDBReplayPermit|RTDBReplayPermitBatch|12|Invariant OneMutation is violated
 RTDBReplayPermit|RTDBReplayPermitDelayedOriginal|12|Invariant OneMutation is violated

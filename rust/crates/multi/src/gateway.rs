@@ -384,6 +384,10 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
             }
             Ok((Response::Refused { code, message }, _, _)) => refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
             Ok(_) => {}
+            Err(error) if control::unreachable_control(&error.code) => {
+                retryable.get_or_insert_with(|| Anomaly::new(AnomalyCategory::Unavailable, control::WRITER_CONTROL_UNREACHABLE,
+                    error.message.as_deref().unwrap_or("The writer's control endpoint is unreachable")));
+            }
             Err(error) => last = Some(error),
         }
     }
@@ -448,18 +452,19 @@ async fn connect_serving(address: &str, control: &str, probe: Option<u64>, optio
         Ok::<_, Anomaly>(stream)
     };
     if let Ok(Ok(stream)) = tokio::time::timeout(timeout, direct).await { return Ok(stream); }
+    let relay = async {
+        let mut stream = control::open_pgwire(control, timeout, &key).await?;
+        check_pgwire_serving(&mut stream, rtdb_pgwire::SERVING_STARTUP).await?;
+        Ok::<_, Anomaly>(stream)
+    };
+    if let Ok(Ok(stream)) = tokio::time::timeout(timeout, relay).await { return Ok(stream); }
     if let Some(before) = probe
         && matches!(control::ping(control, timeout, &key).await, Ok(Some(after)) if after != before)
         && let Ok(Ok(stream)) = tokio::time::timeout(timeout, connect(address)).await
     {
         return Ok(stream);
     }
-    let relay = async {
-        let mut stream = control::open_pgwire(control, timeout, &key).await?;
-        check_pgwire_serving(&mut stream, rtdb_pgwire::SERVING_STARTUP).await?;
-        Ok::<_, Anomaly>(stream)
-    };
-    tokio::time::timeout(timeout, relay).await.map_err(|_| writer_unreachable())?.map_err(|_| writer_unreachable())
+    Err(writer_unreachable())
 }
 
 async fn check_pgwire_serving(stream: &mut TcpStream, preface: [u8; 8]) -> Result<()> {
