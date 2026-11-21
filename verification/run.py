@@ -1056,6 +1056,31 @@ def verify_queued_read_back(args, scratch):
     verify_lean_model(args, scratch, path, "queued-read-back", controls, 5)
 
 
+def verify_read_back_interleaving(args, scratch):
+    path = Path("verification/lean/ReadBackInterleaving.lean")
+    controls = {
+        "expose-before-stamp": (
+            "if flow.stamped then { flow with exposed := true } else flow",
+            "{ flow with exposed := true }",
+            ["transition_preserves_safe"],
+        ),
+        "hold-before-confirmation": (
+            "if frame = .original then",
+            "if frame = .original ∨ resolverBorrowed = true then",
+            ["transition_preserves_safe"],
+        ),
+        "apply-after-term-loss": (
+            "if flow.active && flow.exposed then", "if flow.exposed then",
+            ["an_ended_term_step_preserves_import"],
+        ),
+        "wait-for-append-receipt": (
+            "if flow.active && flow.exposed then", "if flow.active && flow.exposed && flow.receiptSeen then",
+            ["a_visible_frame_can_apply_before_its_receipt"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "read-back-interleaving", controls, 5)
+
+
 def verify_limit_open(args, scratch):
     path = Path("verification/lean/LimitOpen.lean")
     controls = {
@@ -1482,6 +1507,7 @@ def verify_lean(args, scratch):
             verify_staged_prefix(args, scratch, directory)
             verify_read_back_identity(args, scratch)
             verify_queued_read_back(args, scratch)
+            verify_read_back_interleaving(args, scratch)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)

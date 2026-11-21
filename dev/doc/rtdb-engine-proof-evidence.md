@@ -195,6 +195,11 @@ The native regressions exercise the appender and driver with an absent transacti
 They check that a rejected record leaves the transaction's partition state, catalog effects and applied progress untouched.
 The positive oversized case reaches the original caller with the corresponding transaction result. [Native replication tests](../../rust/crates/replication/src/tests.rs)
 
+The native interleaving regressions confirm a transaction while the provider's enqueue call still holds back its receipt, and reject a changed frame while an in-flight resolution owns the resolver queue.
+The second regression checks that demotion has no mismatched held transaction to replay.
+Lean checks a single pending write across all schedules of stamping, provider visibility, receipt, delivery and term end.
+The model admits a valid frame before the receipt arrives, prevents a changed frame from becoming held or imported, and prevents a frame made visible after term end from applying in the ended term. [Lean interleaving model](../../verification/lean/ReadBackInterleaving.lean) · [Native interleaving regressions](../../rust/crates/replication/src/tests.rs)
+
 End-to-end refinement still needs the concurrent appender and driver to refine the queue model, including a provider append that becomes durable after cancellation and replay through a later term.
 The frame check applies to the native driver when it admits read-back at the current leader's term.
 The Kotlin path checks the transaction ID against the staged head and still applies the replica record's catalog operation ahead of that check.

@@ -38,12 +38,17 @@ async fn fixture(config: ReplicationConfig, replica_message_limit: usize) -> Fix
 }
 
 async fn fixture_with_clock(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>) -> Fixture {
+    fixture_with_replica(config, replica_message_limit, clock, |replica| replica).await
+}
+
+async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>,
+    wrap_replica: impl FnOnce(Arc<MemoryLog>) -> Arc<dyn Log>) -> Fixture {
     let memory = MemoryBudget::new(1 << 30);
     let source = Arc::new(MemoryLog::new(1 << 28));
     let replica = Arc::new(MemoryLog::new(replica_message_limit));
     let store = Arc::new(MemoryStore::default());
     let cache = Arc::new(BufferPool::new(store.clone(), 1 << 27));
-    let logs = PartitionLogs::new(source.clone(), replica.clone(), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
+    let logs = PartitionLogs::new(source.clone(), wrap_replica(replica.clone()), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
@@ -1455,13 +1460,89 @@ async fn attach_readback_fixture(replica_message_limit: usize) -> (Fixture, DbOp
     let mut fixture = fixture(ReplicationConfig {
         may_lead: false, assertion_interval: Duration::from_secs(3600), ..Default::default()
     }, replica_message_limit).await;
+    let (operation, called, finish) = hold_catalog_effect(&mut fixture);
+    (fixture, operation, called, finish)
+}
+
+fn hold_catalog_effect(fixture: &mut Fixture) -> (DbOp, oneshot::Receiver<DbOp>, oneshot::Sender<Result<()>>) {
     let (entered, called) = oneshot::channel();
     let (finish, release) = oneshot::channel();
     fixture.driver.effects = Arc::new(HeldDatabaseEffect { called: Mutex::new(Some(entered)), release: Mutex::new(Some(release)) });
     let operation = DbOp::AttachDatabase(proto::AttachDatabase {
         db_name: Some("secondary".into()), config: Some(DatabaseConfig::default()),
     });
-    (fixture, operation, called, finish)
+    (operation, called, finish)
+}
+
+struct EnqueueReturnGate {
+    log: Arc<MemoryLog>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Log for EnqueueReturnGate {
+    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<rtdb_storage::log::AppendReceipt> {
+        let receipt = self.log.enqueue(payload, timestamp).await?;
+        self.release.notified().await;
+        Ok(receipt)
+    }
+
+    fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
+    async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogTail>> { self.log.tail(after).await }
+    async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogRange>> { self.log.range(from, to).await }
+    async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.log.read_range(from, to).await }
+}
+
+#[tokio::test]
+async fn own_transaction_can_apply_before_the_provider_returns_its_append_receipt() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut fixture = fixture_with_replica(ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() },
+        1 << 27, None, |log| Arc::new(EnqueueReturnGate { log, release: Arc::clone(&release) })).await;
+    let (operation, mut called, finish) = hold_catalog_effect(&mut fixture);
+    let (key, mut receipt, record) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+    finish.send(Ok(())).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), fixture.driver.consume(record)).await.unwrap().unwrap();
+    assert_eq!(called.try_recv().unwrap(), operation);
+    assert!(matches!(receipt.try_recv().unwrap().unwrap(), Applied::Transaction(result) if result.tx_key() == key));
+    assert_eq!(fixture.handle.progress().current().tx_key, Some(key));
+    release.notify_one();
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn mismatched_readback_faults_before_buffering_during_resolution() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, idle_heartbeat: false, external_source: true, ..Default::default() }, 1 << 27).await;
+    let (operation, mut called, _finish) = hold_catalog_effect(&mut fixture);
+    let (_, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
+    let before = fixture.driver.partition.value();
+    let (completion, mut waiting) = oneshot::channel();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    fixture.driver.command(super::Command::External {
+        term: Term(1), writer: Box::new(WaitingWriter { started: None, dropped: Arc::clone(&dropped) }),
+        system_time: None, token: None, completion,
+    }).await.unwrap();
+    {
+        let leader = fixture.driver.leader.as_mut().unwrap();
+        assert!(leader.resolver.is_none());
+        let resolution = super::pending_resolution(&mut leader.resolution);
+        tokio::pin!(resolution);
+        assert!(futures::poll!(&mut resolution).is_pending());
+    }
+    let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+    let ReplicaBody::ResolvedTx(message) = &mut envelope.message else { panic!("expected transaction"); };
+    message.db_op = None;
+    readback.payload = envelope.encode().into();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), fixture.driver.consume(readback)).await.unwrap().unwrap_err();
+    assert_eq!(error.code, "xtdb.indexer/leader-read-back-mismatch");
+    assert_eq!(receipt.try_recv().unwrap().unwrap_err(), error);
+    assert!(Arc::ptr_eq(&fixture.driver.partition.value(), &before));
+    assert!(matches!(called.try_recv(), Err(Empty)));
+    assert!(fixture.handle.progress().current().tx_key.is_none());
+    assert!(fixture.driver.demote().await.unwrap().is_empty());
+    assert!(dropped.load(Ordering::Acquire));
+    assert_eq!(waiting.try_recv().unwrap().unwrap_err().code, "xtdb/leader-term-ended");
 }
 
 #[tokio::test]
