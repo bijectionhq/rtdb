@@ -134,6 +134,7 @@ struct RecoveryGate {
 struct ObservedDirectory {
     inner: Arc<MemoryDirectory>,
     recovery_gate: std::sync::Mutex<Option<Arc<RecoveryGate>>>,
+    opening_gate: std::sync::Mutex<Option<(String, Arc<RecoveryGate>)>>,
     lost_anchor_reply: std::sync::Mutex<Option<(u64, Arc<RecoveryGate>)>>,
     restore_interruption: std::sync::atomic::AtomicUsize,
     reads: std::sync::atomic::AtomicUsize,
@@ -143,7 +144,7 @@ struct ObservedDirectory {
 
 impl ObservedDirectory {
     fn new() -> Arc<Self> {
-        Arc::new(Self { inner: MemoryDirectory::new(), recovery_gate: Default::default(), lost_anchor_reply: Default::default(), restore_interruption: Default::default(), reads: Default::default(), holder_queries: Default::default(), membership_scans: Default::default() })
+        Arc::new(Self { inner: MemoryDirectory::new(), recovery_gate: Default::default(), opening_gate: Default::default(), lost_anchor_reply: Default::default(), restore_interruption: Default::default(), reads: Default::default(), holder_queries: Default::default(), membership_scans: Default::default() })
     }
 }
 
@@ -184,6 +185,21 @@ impl Directory for ObservedDirectory {
             gate.resume.notified().await;
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "test/anchor-reply-lost", "The anchor update reply was lost"));
         }
+        let opening = match &result {
+            rtdb_directory::Cas::Applied(record) if !record.storage_regions.is_empty() => {
+                let mut gate = self.opening_gate.lock().unwrap();
+                if gate.as_ref().is_some_and(|(deployment, _)| deployment == &record.id) {
+                    gate.take().map(|(_, gate)| gate)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(gate) = opening {
+            gate.registered.notify_one();
+            gate.resume.notified().await;
+        }
         let gate = match &result {
             rtdb_directory::Cas::Applied(record) if record.storage_regions.values().any(|region| matches!(region, rtdb_directory::StorageRegion::ReplicaReplay { .. })) => {
                 self.recovery_gate.lock().unwrap().take()
@@ -204,6 +220,28 @@ impl Directory for ObservedDirectory {
     }
     async fn replace_member(&self, member: rtdb_directory::MemberRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<rtdb_directory::MemberRecord>> { self.inner.replace_member(member, expected).await }
     fn change_feed(&self) -> Option<&rtdb_directory::ChangeFeed> { self.inner.change_feed() }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unrelated_cold_start_finishes_while_the_first_waits_for_storage() {
+    let directory = ObservedDirectory::new();
+    let cell = Cell::start_with_directory(directory.clone()).await;
+    let waiting = admin::create_deployment(directory.as_ref(), "waiting", "acme", 3).await.unwrap();
+    admin::create_deployment(directory.as_ref(), "independent", "acme", 3).await.unwrap();
+    let gate = Arc::new(RecoveryGate::default());
+    *directory.opening_gate.lock().unwrap() = Some((waiting.id, gate.clone()));
+    let agent = cell.node(0).agent.clone();
+    let first = tokio::spawn(async move { agent.activate("waiting").await });
+    tokio::time::timeout(Duration::from_secs(5), gate.registered.notified()).await.unwrap();
+    assert!(cell.node(0).server.node().catalog().database("waiting").is_err());
+    let second = tokio::time::timeout(Duration::from_secs(4), cell.connect("independent")).await.unwrap();
+    second.simple_query("INSERT INTO orders (_id, total) VALUES (1, 7)").await.unwrap();
+    assert_eq!(values(&second, "SELECT total FROM orders").await, ["7"]);
+    assert!(!first.is_finished());
+    gate.resume.notify_one();
+    assert!(matches!(tokio::time::timeout(Duration::from_secs(5), first).await.unwrap().unwrap().unwrap(), Response::Held { .. }));
+    drop(second);
+    cell.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1,5 +1,5 @@
 use rtdb_types::StructFields;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -13,12 +13,12 @@ use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext,
 use rtdb_storage::cache::CacheBudget;
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
 use rtdb_types::{Anomaly, AnomalyCategory, Instant, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::{Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, QueryBasis, ResourceFactory, Session, SessionIdentity, SessionService, SystemClock,
-    catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory}, statement::prepare_query};
+    catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory, OpenedDatabase}, statement::prepare_query};
 
 
 #[derive(Clone)]
@@ -79,15 +79,36 @@ pub struct Node {
     pub(crate) runtime: Arc<crate::runtime::RuntimeProviders>,
     read_fence: Option<Arc<dyn ReadFence>>,
     scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
+    placement_slots: Option<Arc<Semaphore>>,
 }
 
 pub struct NodeDriver {
     node: Node,
     commands: mpsc::Receiver<CatalogCommand>,
     initial: Vec<(Arc<Database>, DatabaseDriver)>,
+    local_opens: BTreeMap<String, LocalOpen>,
 }
 
-enum DatabaseCompletion { Worker { database: Arc<Database>, result: Result<()> }, Drained(Arc<Database>) }
+type AttachResult = oneshot::Sender<Result<Option<Arc<Database>>>>;
+
+struct LocalOpen {
+    _slot: OwnedSemaphorePermit,
+    completion: AttachResult,
+    queued: VecDeque<LocalRequest>,
+}
+
+enum LocalRequest {
+    Attach { configuration: DatabaseConfig, slot: OwnedSemaphorePermit, completion: AttachResult },
+    Detach { completion: oneshot::Sender<Result<()>> },
+}
+
+enum DatabaseCompletion {
+    Worker { database: Arc<Database>, result: Result<()> },
+    Drained(Arc<Database>),
+    LocalOpened { name: String, result: Result<OpenedDatabase> },
+}
+
+const MAXIMUM_PLACED_OPENS: usize = 8;
 
 impl Node {
     /// The provider observes current catalog generations and keeps no node or database alive between samples.
@@ -143,7 +164,8 @@ impl Node {
             external_sources: services.external_sources, compaction_relay: services.compaction_relay, compaction_slots, clock: services.clock, artefact_kinds: services.artefact_kinds,
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
-        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter };
+        let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));
+        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, placement_slots };
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
@@ -170,7 +192,7 @@ impl Node {
                 initial.push((opened.database, opened.driver));
             },
         }
-        Ok((node.clone(), NodeDriver { node, commands: receiver, initial }))
+        Ok((node.clone(), NodeDriver { node, commands: receiver, initial, local_opens: BTreeMap::new() }))
     }
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> { &self.catalog }
     pub fn memory(&self) -> &Arc<MemoryBudget> { &self.factory.memory }
@@ -536,8 +558,14 @@ impl Node {
     pub async fn database_or_attach(&self, name: String, configuration: DatabaseConfig) -> Result<Option<Arc<Database>>> {
         self.ensure_open()?;
         if let Ok(database) = self.catalog.database(&name) { return Ok(Some(database)); }
+        let slot = if let Some(slots) = &self.placement_slots {
+            let permit = self.cancellation.run_until_cancelled(Arc::clone(slots).acquire_owned()).await
+                .ok_or_else(closed)?.map_err(|_| closed())?;
+            if let Ok(database) = self.catalog.database(&name) { return Ok(Some(database)); }
+            Some(permit)
+        } else { None };
         let (completion, result) = oneshot::channel();
-        self.commands.send(CatalogCommand::AttachLocal { name, configuration, completion }).await.map_err(|_| closed())?;
+        self.commands.send(CatalogCommand::AttachLocal { name, configuration, slot, completion }).await.map_err(|_| closed())?;
         result.await.map_err(|_| closed())?
     }
     /// Stops running a database this node holds under a placed catalog: its driver is cancelled and its resources drained.
@@ -573,6 +601,14 @@ impl NodeDriver {
         for (database, driver) in self.initial.drain(..) { tasks.spawn(async move { DatabaseCompletion::Worker { database, result: driver.run().await } }); }
         let mut failure = None;
         loop {
+            if self.node.cancellation.is_cancelled() { break; }
+            if self.node.catalog.is_placed() && let Some(completion) = tasks.try_join_next() {
+                match completion {
+                    Ok(completion) => { let _ = self.complete(completion, &mut tasks); }
+                    Err(error) => { failure = Some(Anomaly::fault("rtdb.node/database-task", error.to_string())); break; }
+                }
+                continue;
+            }
             tokio::select! {
                 biased;
                 _ = self.node.cancellation.cancelled() => break,
@@ -613,7 +649,7 @@ impl NodeDriver {
     fn drain(database: Arc<Database>, tasks: &mut JoinSet<DatabaseCompletion>) {
         tasks.spawn(async move { database.close_io().await; DatabaseCompletion::Drained(database) });
     }
-    fn complete(&self, completion: DatabaseCompletion, tasks: &mut JoinSet<DatabaseCompletion>) -> Result<()> {
+    fn complete(&mut self, completion: DatabaseCompletion, tasks: &mut JoinSet<DatabaseCompletion>) -> Result<()> {
         match completion {
             DatabaseCompletion::Worker { database, result } => {
                 if let Err(error) = &result { database.progress().ingestion_failed(error.clone()); }
@@ -621,8 +657,74 @@ impl NodeDriver {
                 result
             }
             DatabaseCompletion::Drained(database) => { self.node.catalog.teardown_finished(&database); Ok(()) }
+            DatabaseCompletion::LocalOpened { name, result } => {
+                self.finish_local_open(name, result, tasks);
+                Ok(())
+            }
         }
     }
+
+    fn dispatch_local(&mut self, name: String, request: LocalRequest, tasks: &mut JoinSet<DatabaseCompletion>) {
+        if self.node.cancellation.is_cancelled() {
+            match request {
+                LocalRequest::Attach { completion, .. } => { let _ = completion.send(Err(closed())); }
+                LocalRequest::Detach { completion } => { let _ = completion.send(Err(closed())); }
+            }
+            return;
+        }
+        if let Some(opening) = self.local_opens.get_mut(&name) {
+            opening.queued.push_back(request);
+            return;
+        }
+        match request {
+            LocalRequest::Attach { configuration, slot, completion } => {
+                if let Ok(database) = self.node.catalog.database(&name) {
+                    let _ = completion.send(Ok(Some(database)));
+                    return;
+                }
+                if let Err(error) = self.node.catalog.check_local_attach(&name, &configuration) {
+                    let _ = completion.send(Err(error));
+                    return;
+                }
+                self.local_opens.insert(name.clone(), LocalOpen { _slot: slot, completion, queued: VecDeque::new() });
+                let node = self.node.clone();
+                tasks.spawn(async move {
+                    let prepare = node.factory.open(name.clone(), configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.cancellation);
+                    let result = node.cancellation.run_until_cancelled(prepare).await.unwrap_or_else(|| Err(closed()));
+                    DatabaseCompletion::LocalOpened { name, result }
+                });
+            }
+            LocalRequest::Detach { completion } => {
+                let result = self.node.catalog.begin_local_detach(&name).map(|ready| {
+                    if let Some(database) = ready { Self::drain(database, tasks); }
+                });
+                let _ = completion.send(result);
+            }
+        }
+    }
+
+    fn finish_local_open(&mut self, name: String, result: Result<OpenedDatabase>, tasks: &mut JoinSet<DatabaseCompletion>) {
+        let opening = self.local_opens.remove(&name).expect("an open owns its name until it completes");
+        let result = result.and_then(|opened| {
+            let database = Arc::clone(&opened.database);
+            let admitted = if self.node.cancellation.is_cancelled() { Err(closed()) }
+                else { self.node.catalog.insert_open(Arc::clone(&database)) };
+            match admitted {
+                Ok(()) => {
+                    tasks.spawn(async move { DatabaseCompletion::Worker { database: opened.database, result: opened.driver.run().await } });
+                    Ok(Some(database))
+                }
+                Err(error) => {
+                    drop(opened);
+                    Self::drain(database, tasks);
+                    Err(error)
+                }
+            }
+        });
+        let _ = opening.completion.send(result);
+        for request in opening.queued { self.dispatch_local(name.clone(), request, tasks); }
+    }
+
     async fn command(&mut self, command: CatalogCommand, tasks: &mut JoinSet<DatabaseCompletion>) {
         match command {
             CatalogCommand::Apply { operation, completion } => {
@@ -634,7 +736,13 @@ impl NodeDriver {
                 };
                 let _ = completion.send(result);
             }
-            CatalogCommand::AttachLocal { name, configuration, completion } => {
+            CatalogCommand::AttachLocal { name, configuration, slot: Some(slot), completion } => {
+                self.dispatch_local(name, LocalRequest::Attach { configuration, slot, completion }, tasks);
+            }
+            CatalogCommand::DetachLocal { name, completion } if self.node.catalog.is_placed() => {
+                self.dispatch_local(name, LocalRequest::Detach { completion }, tasks);
+            }
+            CatalogCommand::AttachLocal { name, configuration, slot: None, completion } => {
                 let result = match self.node.catalog.database(&name) { Ok(database) => Ok(Some(database)), Err(_) => self.attach(name, configuration, true, tasks).await };
                 let _ = completion.send(result);
             }

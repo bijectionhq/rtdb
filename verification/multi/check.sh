@@ -62,6 +62,9 @@ RTDBJournalReplacement|RTDBJournalReplacementUnpublishedTrim|12|Invariant Acknow
 RTDBCatalogReaderBatch|RTDBCatalogReaderBatch|0|No error has been found
 RTDBCatalogReaderBatch|RTDBCatalogReaderBatchStaleVersion|12|Invariant AdmissionsRespectFloor is violated
 RTDBCatalogReaderBatch|RTDBCatalogReaderBatchAbsentRelease|12|Invariant ReleaseFencesAdmission is violated
+RTDBPlacedOpen|RTDBPlacedOpen|0|No error has been found
+RTDBPlacedOpen|RTDBPlacedOpenSerial|13|Temporal property IndependentEventuallyOpens was violated
+RTDBPlacedOpen|RTDBPlacedOpenAfterShutdown|12|Invariant ShutdownFencesPublication is violated
 RTDBGatewayReplay|RTDBGatewayReplay|0|No error has been found
 RTDBGatewayReplay|RTDBGatewayReplaySqlKey|12|Invariant OneEffect is violated
 RTDBGatewayReplay|RTDBGatewayReplayMalformedKey|12|Invariant OneEffect is violated

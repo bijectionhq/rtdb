@@ -608,3 +608,12 @@ A batch resolves each admission against the authoritative floor and uses a CAS t
 An uncertain release fences a stale admission even when its reader is absent.
 The TCP directory regression confirms that 64 concurrent readers all receive distinct holds and require fewer directory updates than one CAS per reader.
 TLC checks that batching respects the floor and that a completed release cannot be reversed by a stale admission. [TLA+ model](../../verification/multi/tla/RTDBCatalogReaderBatch.tla) · [Native regression](../../rust/crates/multi/src/catalog_readers.rs)
+
+### Independent placed startup
+
+A placed node prepares up to eight database opens concurrently and installs each result through its catalog owner.
+Requests for the same name share an ordered queue.
+The native test pauses a real storage admission after its directory CAS and verifies that a different deployment on the same node opens, writes, and reads while the first stays paused.
+TLC checks progress for the second deployment even if the first remains blocked, and prohibits publication after the catalog owner observes shutdown.
+Serial preparation and unfenced late publication produce counterexamples.
+The progress argument assumes a free preparation slot, successful backing services for the independent deployment, and fair execution. [TLA+ model](../../verification/multi/tla/RTDBPlacedOpen.tla) · [Native regression](../../rust/crates/multi/tests/cell.rs)
