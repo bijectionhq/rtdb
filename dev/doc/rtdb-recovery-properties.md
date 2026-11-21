@@ -1,0 +1,131 @@
+# RTDB multi recovery properties
+
+Draft for formal verification, based on the `rtdb-multi` implementation at `cafde446`.
+The first question is whether any allowed loss of compute can make a synchronous commit unrecoverable.
+The second is when replacement compute can begin serving the correct state.
+
+Start with **TLA+ and TLC** to check the interaction between Logkeeper recovery, checkpoint publication, and worker replacement.
+Use **Verus** for a small Rust function once its contract is clear, and consider **Lean** if an unbounded protocol proof would justify maintaining a separate formalization.
+These are proposed properties and experiments.
+
+## Failure model and durable dependencies
+
+The unit of safety is one deployment, including its storage generation and Logkeeper stream.
+A worker crash clears the holder's in-memory intake, speculative state, and live index.
+Recovery must work with empty replacement caches.
+Any number of compute workers may disappear together, including the whole fleet.
+A separate Logkeeper process crash preserves its journal if the disk survives, while permanent disk loss destroys that copy.
+Messages and replies may be delayed, dropped, duplicated, or delivered after a lease expires.
+An expired lease may trigger replacement, and fencing must remain safe if the previous holder is still running.
+
+The normal recovery claim assumes surviving S3 objects, a consistent authoritative directory, the original decryption keys, and access to an intact quorum of the currently authoritative Logkeeper ensemble.
+A three-member ensemble requires a quorum of two.
+Durable Logkeeper replies assume successful journal sync, and quorum votes must come from distinct, correctly bound journals admitted to the ensemble.
+A process restarted with its old journal and an empty process listening on the old address are separate model transitions.
+In multi mode, the durable log contains resolved transactions on Logkeepers and the holder's intake is in memory.
+Kafka inputs alone cannot reconstruct that log. [Log wiring](../../rust/crates/multi/src/logs.rs#L83-L119) · [Quorum and address resolution](../../rust/crates/multi/src/deployment.rs#L192-L217) · [Process startup](../../rust/crates/multi/src/process.rs#L151-L159)
+
+Model the `COMMIT ASYNC` receipt, durable quorum commit, and synchronous success observed by a client as distinct events.
+An async receipt can precede durable commit and its pending write may disappear with the holder.
+A quorum-committed command whose reply was lost must survive, even though the client can be uncertain of its outcome.
+An unacknowledged, uncommitted write may be kept or discarded by recovery under the protocol rules. [Commit modes](../../rust/crates/node/src/session.rs#L420-L450) · [Quorum receipts](../../rust/crates/logkeeper/src/client/writer.rs#L299-L339) · [Multi Allium spec](../../allium/rtdb-multi.allium)
+
+## Safety properties
+
+**S1 · One committed history.** Within a deployment's stream generation, a committed position identifies one resolved record for the rest of that generation.
+After a Logkeeper durably seals a higher epoch, it refuses further appends from older epochs, including delayed requests.
+Once a quorum has sealed, an older writer cannot commit an append first issued after the seal.
+An append that overlaps the seal can finish using earlier durable acceptances, and its outcome must agree with recovery.
+
+**S2 · Durable commit survives allowed loss.** Given the durable dependencies above and a live deployment, discarding any set of compute workers leaves every quorum-committed effect recoverable from the published checkpoint and a contiguous suffix.
+Successful synchronous client responses are a subset of these commits.
+Recovery represents each effect once and preserves its recorded order.
+
+**S3 · Checkpoint publication authorizes trim.** A trim can discard a record only after an epoch-checked directory update publishes a usable checkpoint that covers it in the same stream.
+A usable checkpoint references durable, readable objects and represents the committed prefix through its declared boundary.
+Keep the boundary record required by the current implementation to resume source numbering.
+A fork checkpoint from the parent's stream grants no permission to trim the child's stream.
+
+**S4 · Repair preserves the committed prefix.** The winning history contains all committed records above the checkpoint.
+A partial copy cannot advertise the target epoch as fully synced.
+A delayed overwrite cannot drop records that the current writer already placed at that epoch.
+An ensemble replacement must preserve the old committed suffix before acknowledging new work on the replacement.
+
+**S5 · Readiness implies correct recovery.** A replacement reports writable readiness only after checkpoint load, required replay, and epoch confirmation.
+A read that succeeds at a supported basis sees the state at that basis.
+A checkpoint-only snapshot serves supported reads at or below its checkpoint and cannot satisfy a request for a later basis.
+
+**S6 · A quorum represents real journals.** A new blank disk at a previously used address must enter through a safe admission or repair path before its vote represents an existing replica.
+A failed journal open must leave that instance ineligible for quorum routing.
+Check these as target properties and attempt to produce counterexamples for the current startup and address-binding paths.
+
+**S7 · A keyed retry has one effect.** Within the supported idempotency window, replaying an eligible command under the same key after loss of its response returns the original committed outcome with no second mutation.
+Transaction or protocol states that cannot be safely replayed may surface an unknown outcome.
+
+Use a history of committed resolved records as a reference, independent of the candidate recovery algorithm.
+Compare the recovered state with the fold of that history through the claimed basis, using an operation such as increment to expose duplicate application.
+For a checkpoint at position `c` and a recovered basis `b`, the check is `Apply(CheckpointState(c), RecoveredSuffix(c, b)) = Apply(InitialState, CommittedPrefix(b))`.
+The suffix excludes `c` and ends at `b`.
+Use the initial empty state when no checkpoint has been published.
+Fixed logical records are enough for the first model.
+Later extensions can model bitemporal history and authorized erasure, fork lineage, and reclamation of objects shared by multiple deployments.
+Relevant implementation paths include [writer recovery](../../rust/crates/logkeeper/src/client/writer.rs#L105-L226), [recovery decisions](../../rust/crates/logkeeper/src/client/recovery.rs#L24-L68), [activation and trimming](../../rust/crates/multi/src/agent.rs#L240-L333), [checkpoint publication](../../rust/crates/multi/src/agent.rs#L575-L608), [snapshot opening](../../rust/crates/multi/src/agent.rs#L544-L563), and [gateway retry](../../rust/crates/multi/src/session.rs#L311-L345).
+
+### Failure cases that should be reachable
+
+- A holder issues an async receipt and crashes before quorum append, and the pending write is absent after recovery.
+- Two of three journals are unreachable, and a writer cannot reopen while that quorum remains unavailable.
+- A write reaches only two journals before any checkpoint covers it, both copies are permanently destroyed, and the write is absent from the surviving S3 checkpoint and journal.
+- Losing the directory or the encryption keys can make an otherwise intact S3 checkpoint unusable by the normal recovery path.
+
+These cases make the durability boundary explicit.
+In particular, survival with only Kafka and S3 is outside the current multi-mode guarantee.
+
+## Progress and recovery time
+
+For one affected deployment, assume that dependencies recover and remain available, an eligible worker remains alive, and a client keeps retrying with an admitted demand for that deployment.
+Assume eventual delivery of retried requests and fair scheduling of continuously enabled recovery work.
+Under those conditions, model the property that the deployment eventually has a confirmed writable holder and can serve a read at the required basis and commit a new request.
+Exercise the same property after one worker goes down, after several do, and after every worker goes down and replacements register with empty caches.
+A lost gateway connection can be re-established by the client under these assumptions.
+A follow-up model can verify that concurrent cold opens stay within a configured budget and that background warming leaves capacity for admitted foreground work.
+Compaction workers can be modeled as background I/O load and resumable work.
+
+Treat recovery time as a separate staging measurement.
+Time the first correct read at a defined basis, the first successful synchronous write, and the return to warm latency under a concurrent workload.
+Record the costs of lease expiry, placement and queueing, journal reopen, checkpoint request count, replay bytes, and hot-cache refill.
+Use remote S3 and a production-like directory with a client ledger of acknowledged operations independent of the failed workers.
+The existing local benchmark verifies one killed holder with surviving nodes and batches of reconnecting clients. [Load harness](../../rust/crates/multi/tests/load.rs#L141-L225) · [Reported results](rtdb-multi-plan.md#L530-L560)
+
+## Verification plan
+
+1. **Model the protocol in TLA+.**
+   Start with one deployment, three Logkeepers, two successive holders, one checkpoint, and a handful of writes with distinct payloads.
+   Model pending messages and volatile state separately from synced journal state, published metadata, and durable objects.
+   Use actions for append, sync, acknowledge, seal, partial repair, checkpoint upload, directory publication, trim, loss, restart, and reopen.
+   Add a commit to the reference history when it first gains durable quorum coverage, including a minority record that recovery subsequently commits and a commit whose client reply is lost.
+2. **Check safety first, then progress.**
+   Use TLC to check S1–S5 on a fixed ensemble, then check the progress property with explicit fairness.
+   Confirm that crash, restart, and a subsequent read and write are reachable, so the check exercises the recovery path.
+   Add a second stream to check fork checkpoint and trim isolation, then add replacement admission, ensemble moves, and keyed retries.
+   Record the finite bounds, assumptions, and counterexamples with the model. [TLC documentation](https://docs.tlapl.us/) · [Temporal properties and fairness](https://learning.tlapl.us/intro/tlc-config/)
+3. **Validate the model against the Rust behavior.**
+   Deliberately permit trim before publication, let an incomplete repair advance its synced epoch, and let a fresh disk vote under an old address.
+   Each weakened rule should produce the expected invariant violation in a reachable test configuration.
+   Map each transition to Rust and the Allium rule it represents, then turn relevant counterexamples into deterministic simulation or Rust regression tests. [Multi simulation and audit coverage](rtdb-multi-plan.md#stage-14-hardening-at-scale)
+4. **Prove the narrowest useful implementation contract in Verus.**
+   Start with the pure `winner` and `plan_repair` logic, after checking that the current Rust fits the supported subset.
+   Specify the selected reply's ordering and the repair boundary, given valid seal replies and the protocol's agreed-prefix invariant.
+   Keep network, async runtime, journal sync, and object-store contracts explicit at the proof boundary.
+   Any trusted external specification remains an assumption of the proof. [Verus](https://github.com/verus-lang/verus) · [Trusted components](https://verus-lang.github.io/verus/guide/tcb.html)
+5. **Choose one route to an unbounded protocol proof if needed.**
+   Keep an inductive safety proof in TLAPS if the TLA+ model is the main artifact and the needed proof features fit.
+   Lean is a viable alternative for an abstract, parameterized theorem that quorum intersection, durable seals, and recovery rules preserve the committed prefix across arbitrarily many epochs, with checkpoint correctness stated as a premise or proved separately.
+   A Lean theorem needs an explicit mapping to the TLA+ model or the implementation before it can support claims about either. [TLA+ Proof System](https://proofs.tlapl.us/) · [Validating a Lean proof](https://lean-lang.org/doc/reference/latest/ValidatingProofs/)
+
+Keep the first model faithful to the implementation where the Allium target runs ahead of it.
+The Allium `RecoverTail` rule calls for verifying a checkpoint-anchored hash chain, while the Rust winner is selected by synced epoch and last LSN and replica digest comparison is a separate audit over a common retained interval.
+The first model should expose the actual assumptions of that selection and leave a checkpoint-anchored digest as a possible extension. [Allium target](../../allium/rtdb-multi.allium#L1014-L1040) · [Rust selection](../../rust/crates/logkeeper/src/client/writer.rs#L197-L220) · [Retained audit](../../rust/crates/multi/src/admin.rs#L726-L735)
+
+Turbopuffer is a reference for treating cache warmth separately from durability and minimizing the work on a cold read.
+For RTDB, keep Logkeeper quorum commits and use those ideas to guide bounded warming and cold-read measurements. [turbopuffer architecture](https://turbopuffer.com/docs/architecture) · [Warm cache](https://turbopuffer.com/docs/warm-cache)
