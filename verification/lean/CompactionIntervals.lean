@@ -205,3 +205,94 @@ theorem normalization_makes_all_output_fragments_disjoint (commands : List Comma
 #print axioms normalization_makes_all_output_fragments_disjoint
 
 end RTDB.CompactionIntervals
+
+namespace RTDB.CompactionHistory
+
+open CompactionIntervals
+
+def encode (key commit : Nat) (command : Command) : Event :=
+  ⟨commit, match command.value with
+    | some value => .put key value command.span
+    | none => .delete key command.span⟩
+
+def readCohort (commands : List Command) (key commit : Nat)
+    (system queried : Nat) (valid : Int) (later : List Event) : Option Nat :=
+  if key = queried ∧ commit ≤ system then
+    (winningCommand valid commands).getD (scan system queried valid later)
+  else scan system queried valid later
+
+theorem read_cohort_matches_scan (commands : List Command) (key commit system queried : Nat)
+    (valid : Int) (later : List Event) :
+    scan system queried valid (commands.map (encode key commit) ++ later) =
+      readCohort commands key commit system queried valid later := by
+  induction commands with
+  | nil => simp [readCohort, winningCommand]
+  | cons command rest ih =>
+    cases payload : command.value <;> cases covers : command.span.contains valid
+    all_goals
+      by_cases keyMatches : queried = key
+      · subst queried
+        by_cases visible : commit ≤ system
+        · simp [encode, payload, scan, readCohort, winningCommand, covers, visible] at ih ⊢
+          all_goals try exact ih
+        · simp [encode, payload, scan, readCohort, covers, visible] at ih ⊢
+          all_goals try exact ih
+      · have other : key ≠ queried := Ne.symm keyMatches
+        simp [encode, payload, scan, readCohort, covers, keyMatches, other] at ih ⊢
+        all_goals try exact ih
+
+theorem replacing_a_cohort_preserves_its_answer (commands : List Command)
+    (key commit system queried : Nat) (valid : Int) (later : List Event) :
+    scan system queried valid (((normalize [] commands).map (encode key commit)) ++ later) =
+      scan system queried valid (commands.map (encode key commit) ++ later) := by
+  rw [read_cohort_matches_scan, read_cohort_matches_scan]
+  unfold readCohort
+  simp [normalization_preserves_visible_winners]
+
+inductive Piece where
+  | cohort (key commit : Nat) (commands : List Command)
+  | event (event : Event)
+
+def Piece.original : Piece → List Event
+  | .cohort key commit commands => commands.map (encode key commit)
+  | .event passthrough => [passthrough]
+
+def Piece.compacted : Piece → List Event
+  | .cohort key commit commands => (normalize [] commands).map (encode key commit)
+  | .event passthrough => [passthrough]
+
+theorem equal_suffix_answers_survive_an_event (event : Event) (left right : List Event)
+    (system queried : Nat) (valid : Int)
+    (answer : scan system queried valid left = scan system queried valid right) :
+    scan system queried valid (event :: left) = scan system queried valid (event :: right) := by
+  cases event.fact <;> simp [scan, answer]
+
+theorem equal_suffix_answers_survive_a_prefix (earlier left right : List Event)
+    (system queried : Nat) (valid : Int)
+    (answer : scan system queried valid left = scan system queried valid right) :
+    scan system queried valid (earlier ++ left) = scan system queried valid (earlier ++ right) := by
+  induction earlier with
+  | nil => exact answer
+  | cons event rest ih => exact equal_suffix_answers_survive_an_event event _ _ _ _ _ ih
+
+theorem normalization_preserves_arbitrary_surrounding_history
+    (pieces : List Piece) (system queried : Nat) (valid : Int) :
+    point (pieces.flatMap Piece.compacted) system queried valid =
+      point (pieces.flatMap Piece.original) system queried valid := by
+  simp only [← scan_refines_point]
+  induction pieces with
+  | nil => rfl
+  | cons piece tail ih =>
+    simp only [List.flatMap_cons]
+    cases piece with
+    | event passthrough =>
+      exact equal_suffix_answers_survive_an_event passthrough _ _ _ _ _ ih
+    | cohort key commit commands =>
+      unfold Piece.compacted Piece.original
+      exact (replacing_a_cohort_preserves_its_answer commands key commit system queried valid
+        (tail.flatMap Piece.compacted)).trans
+        (equal_suffix_answers_survive_a_prefix _ _ _ _ _ _ ih)
+
+#print axioms normalization_preserves_arbitrary_surrounding_history
+
+end RTDB.CompactionHistory

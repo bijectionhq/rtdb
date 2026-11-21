@@ -138,7 +138,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/CompactionMerge.lean` proves that taking minimum heads from ordered input pages emits all occurrences in key order.
   Every finite input admits a complete execution, and equal keys can preserve different payload orders across input pages.
   `lean/CompactionIntervals.lean` proves exact half-open interval subtraction and that normalizing a same-IID, same-system-time put and delete cohort preserves its winner at every valid instant.
-  Its output fragments are disjoint. The native replay checks the production normalizer on finite cohorts.
+  Its output fragments are disjoint.
+  Substituting any number of normalized cohorts in a surrounding history preserves the reference point query if the other events retain their positions.
+  The native replays check finite cohorts and an encoded history with an erase and untouched older rows.
   The merge replay checks the native heap and page adapter on finite batches. Temporal resolution and compaction output layout have separate refinement obligations.
 * `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
   It assumes durable append is atomic and does not implement a consensus provider.

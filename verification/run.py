@@ -384,9 +384,19 @@ def verify_compaction_intervals(args, scratch, history):
             "map fun piece => { command with span := piece }", "map fun piece => { command with span := piece, value := none }",
             ["clipped_command_preserves_payload_when_visible"] * 2,
         ),
+        "drop-passthrough-event": (
+            "| .cohort key commit commands => (normalize [] commands).map (encode key commit)\n  | .event passthrough => [passthrough]",
+            "| .cohort key commit commands => (normalize [] commands).map (encode key commit)\n  | .event _ => []",
+            ["normalization_preserves_arbitrary_surrounding_history"],
+        ),
+        "reverse-command-priority": (
+            "| .cohort key commit commands => (normalize [] commands).map (encode key commit)",
+            "| .cohort key commit commands => (normalize [] commands.reverse).map (encode key commit)",
+            ["normalization_preserves_arbitrary_surrounding_history"],
+        ),
     }
     env = os.environ | {"LEAN_PATH": str(history)}
-    verify_lean_model(args, scratch, path, "compaction-intervals", controls, 6, env)
+    verify_lean_model(args, scratch, path, "compaction-intervals", controls, 7, env)
 
 
 def verify_system_time(args, scratch):
@@ -1204,6 +1214,25 @@ def verify_same_time_replay(args, source):
         finally:
             merge.write_bytes(original)
     print("rust-same-time-replay: winners and non-overlap checked, both mutations rejected")
+
+    history_test = "same_time_clipping_and_erase_preserve_the_surrounding_history"
+    history_command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--test", "merge", history_test, "--", "--exact"]
+    checked = run_case(history_command, source / "rust", args.evidence, "rust-compaction-history-baseline", env)
+    if checked.returncode or f"{history_test} ... ok" not in checked.stdout:
+        raise ValueError("native compaction changed historical query points")
+    try:
+        replace_once(merge, "buckets.entry(target).or_default().push(event);",
+                     "if event.op != EventOp::Erase { buckets.entry(target).or_default().push(event); }")
+        checked = run_case(history_command, source / "rust", args.evidence, "rust-compaction-history-drop-erase", env)
+        if (
+            checked.returncode != 101 or f"{history_test} ... FAILED" not in checked.stdout
+            or "compaction changed the historical point" not in checked.stdout
+            or "0 passed; 1 failed" not in checked.stdout
+        ):
+            raise ValueError("expected the historical oracle to reject dropping the erase barrier")
+    finally:
+        merge.write_bytes(original)
+    print("rust-compaction-history: historical points matched, erase mutation rejected")
 
 
 def verify_azure_replay(args, source):

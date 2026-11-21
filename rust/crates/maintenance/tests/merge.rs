@@ -99,6 +99,81 @@ async fn mixed_trie_depths_preserve_every_row_in_the_requested_partition() {
 }
 
 #[tokio::test]
+async fn same_time_clipping_and_erase_preserve_the_surrounding_history() {
+    let temporary = tempfile::tempdir().unwrap();
+    let table = TableRef::new("public", "docs");
+    let slug = TableSlug::for_unrecorded_table(&table).unwrap();
+    let input = TrieKey::l0(BlockIndex(1)).unwrap();
+    let output = TrieKey::new(1, None, Vec::new(), BlockIndex(1)).unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let a = Iid([1; 16]);
+    let b = Iid([2; 16]);
+    let row = |iid, system, lower, upper, operation| StoredEvent {
+        iid, system_from: Timestamp(system), valid_time: Interval::from_micros(lower, upper).unwrap(), operation, recency: None,
+    };
+    let put = |value| StoredOperation::Put(StructFields::from([("value".into(), Value::I64(value))]));
+    let selected = [
+        row(a, 300, 5, 10, StoredOperation::Delete),
+        row(a, 300, 0, 10, put(30)),
+        row(a, 200, i64::MIN, i64::MAX, StoredOperation::Erase),
+        row(a, 100, -4, 12, put(10)),
+        row(b, 150, 5, 13, put(15)),
+    ];
+    let untouched = [row(a, 50, -4, 12, put(5)), row(b, 50, -6, 2, put(6))];
+    let fields = StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
+    let data = build_event_batch(&selected, Some(fields), None).unwrap();
+    let mut metadata = MetadataBuilder::new(false, true);
+    metadata.write_leaf(&data).unwrap();
+    let (metadata, _) = metadata.finish().unwrap();
+    let bytes = write_file(&data.schema(), &[data]).unwrap();
+    store.put(&ObjectKey::new(slug.data_key(&input)).unwrap(), bytes.into()).await.unwrap();
+    store.put(&ObjectKey::new(slug.metadata_key(&input)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    let memory = MemoryBudget::new(64 * 1024 * 1024);
+    let executor = SegmentCompactor::new(store.clone(), state, Arc::clone(&memory), StorageVersion(6), StorageEpoch(0), MergeConfig {
+        page_size: 2, temporary_directory: temporary.path().into(), ..Default::default()
+    }).unwrap();
+    let job = CompactionJob { table, inputs: vec![input], part: Vec::new(), output: output.clone(), recency_mode: RecencyMode::Preserve };
+    let notice = executor.execute(&job, &CancellationToken::new()).await.unwrap();
+    assert_eq!(notice.tries.len(), 1);
+    let compacted = store.get(&ObjectKey::new(slug.data_key(&output)).unwrap()).await.unwrap();
+    let mut reader = ArrowFile::open(Arc::from(compacted.as_ref()), None).unwrap();
+    let mut rows = Vec::new();
+    for page in 0..reader.page_count() {
+        let batch = EventBatch::new(reader.read_page(page).unwrap()).unwrap();
+        for index in 0..batch.len() { rows.push(batch.read_event(index).unwrap()); }
+    }
+    assert!(rows.iter().all(|row| row.iid != a || row.system_from != Timestamp(100)));
+
+    let read = |input: &[StoredEvent], iid, system: i64, valid: i64| {
+        for row in input.iter().filter(|row| row.iid == iid) {
+            if matches!(row.operation, StoredOperation::Erase) { return None; }
+            if row.system_from.0 <= system && row.valid_time.lower().0 <= valid && valid < row.valid_time.upper().0 {
+                return match &row.operation {
+                    StoredOperation::Put(document) => document.get("value").cloned(),
+                    StoredOperation::Delete => None,
+                    StoredOperation::Erase => unreachable!(),
+                };
+            }
+        }
+        None
+    };
+    let original: Vec<_> = selected.into_iter().chain(untouched.iter().cloned()).collect();
+    rows.extend(untouched);
+    for iid in [a, b] {
+        for system in [0, 50, 99, 100, 150, 199, 200, 299, 300, 301] {
+            for valid in -7..=14 {
+                assert_eq!(read(&rows, iid, system, valid), read(&original, iid, system, valid),
+                    "compaction changed the historical point for {iid}, system {system}, valid {valid}");
+            }
+        }
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn l0_merge_splits_recency_retries_identically_and_removes_temporary_files() {
     let temp = tempfile::tempdir().unwrap();
     let table = TableRef::new("public", "docs");

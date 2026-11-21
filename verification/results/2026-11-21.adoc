@@ -871,5 +871,8 @@ For each cohort it checks six valid instants against a direct first-matching-com
 The replay rejected preserving a shadowed fragment and dropping a visible leading fragment.
 The `--native-replay` option runs the test and both controls, using an archive of the production Rust source.
 
-The model isolates a single put-and-delete cohort.
-Composition with erase barriers, whole-page temporal ceilings, and the published history still needs its own refinement proof.
+The history theorem proves that substituting normalized cohorts anywhere in the reference history preserves every point query when all other events retain their positions.
+Its controls discard intervening events or reverse the priority of same-time commands.
+A native replay compacts an Arrow input containing a same-time put and delete and an erase, then combines the decoded output with untouched older rows.
+It matches the original history at 440 combinations of IID, system time, and valid time, and rejects dropping the erase from the output.
+General refinement of cohort formation, erase handling, and final layout through catalog publication remains open.
