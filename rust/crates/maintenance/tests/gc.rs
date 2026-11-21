@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, atomic::{AtomicI64, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicI64, Ordering}};
 use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -140,6 +140,27 @@ impl TrieDeletionPublisher for InstallingPublisher {
     }
 }
 
+struct CatalogFloorStore {
+    inner: Arc<LocalStore>,
+    blocked: AtomicBool,
+    proposals: Mutex<Vec<CatalogCut>>,
+}
+
+#[async_trait]
+impl ObjectStore for CatalogFloorStore {
+    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::object_store::StoredObject> { self.inner.head(key).await }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
+    async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+    async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, path).await }
+    async fn list(&self, prefix: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::object_store::StoredObject>> { self.inner.list(prefix).await }
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    async fn advance_catalog_floor(&self, installed: CatalogCut) -> Result<bool> {
+        self.proposals.lock().unwrap().push(installed);
+        Ok(!self.blocked.load(Ordering::Relaxed))
+    }
+}
+
 #[tokio::test]
 async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_installation() {
     for failed in [Removal::StopBeforeInstall, Removal::StopAfterInstall] {
@@ -161,7 +182,7 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
         let publisher = |phase, store: Arc<LocalStore>| Arc::new(InstallingPublisher {
             phase, state: state.clone(), scope, store, pending: pending.clone(), requests: Mutex::new(Vec::new()),
         });
-        let collector = |store: Arc<LocalStore>, publisher: Arc<InstallingPublisher>, observer: Arc<Observer>| {
+        let collector = |store: Arc<dyn ObjectStore>, publisher: Arc<InstallingPublisher>, observer: Arc<Observer>| {
             TrieCollector::new(store, state.clone(), publisher, observer, unleased(), fixed_clock()).unwrap()
         };
         let owner = publisher(failed, store.clone());
@@ -196,15 +217,26 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
 
         let store = Arc::new(LocalStore::open(directory.path()).unwrap());
         let replacement = publisher(Removal::Complete, store.clone());
-        let next = collector(store.clone(), replacement.clone(), Arc::new(Observer::default()));
+        let coordination = Arc::new(CatalogFloorStore { inner: store.clone(), blocked: AtomicBool::new(true), proposals: Mutex::new(Vec::new()) });
+        let next = collector(coordination.clone(), replacement.clone(), Arc::new(Observer::default()));
         next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(*replacement.requests.lock().unwrap(), [vec![old.clone()]], "the successor must confirm the staged removal");
         assert!(!state.value().retains_trie(&table, &old));
-        assert!(store.list(Some(&pending)).await.unwrap().is_empty());
+        assert_eq!(store.list(Some(&pending)).await.unwrap().len(), 1, "a hold blocking the floor keeps the intent durable");
         let receipts = store.list(Some(&installed)).await.unwrap();
         assert_eq!(receipts.len(), 1);
         let receipt = store.get(&receipts[0].key).await.unwrap();
         assert_eq!(&receipt[8..], staged_bytes.as_ref(), "the receipt retains the accepted intent");
+        let installed_cut = state.value().snapshot().catalog_cut().unwrap();
+        assert_eq!(*coordination.proposals.lock().unwrap(), [installed_cut]);
+
+        // A successor can retry floor admission from the receipt without submitting another removal.
+        drop(next);
+        coordination.blocked.store(false, Ordering::Relaxed);
+        let next = collector(coordination.clone(), replacement.clone(), Arc::new(Observer::default()));
+        next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+        assert_eq!(*coordination.proposals.lock().unwrap(), [installed_cut, installed_cut]);
+        assert!(store.list(Some(&pending)).await.unwrap().is_empty());
 
         store.put(&staged[0].key, staged_bytes).await.unwrap();
         next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();

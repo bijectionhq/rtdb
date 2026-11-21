@@ -105,6 +105,12 @@ pub trait ObjectStore: Send + Sync {
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
     }
+    /// Records an installed retirement as a lower bound for new hosted catalog captures.
+    /// Returns false while a reader still needs a catalog before the proposed floor.
+    /// Standalone stores have no coordinated catalog admissions.
+    async fn advance_catalog_floor(&self, _installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        Ok(true)
+    }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.

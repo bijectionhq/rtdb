@@ -78,7 +78,8 @@ One composed TLA+ model of the residence is checked against traces emitted at ev
 
 |4
 |Residence ledger with holds and collection floor; delete the timer stack.
-|Planned
+|Multi admission floor and durable retry landed.
+Renewal, recovery-root integration, identity-bound certification and timer removal remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.

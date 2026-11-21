@@ -394,6 +394,10 @@ contract Directory {
     @invariant DirectoryFormatsPreservePlacement
         -- During the parked-row format rollout, upgraded readers accept both layouts.
         -- Both layouts carry the same deployment state and use the item's version for CAS.
+        -- A catalog admission floor persists in both layouts, scoped to its residence, storage root, object namespace and replica journal.
+        -- The current serving writer advances the floor from a durable installed trie-removal receipt.
+        -- The same versioned update coordinates floor advancement and reader admission.
+        -- An older or untracked held catalog blocks advancement, and a new reader at an older or untracked cut is refused once the floor exists.
         -- Enable packed writes after all readers can decode them.
 
     @invariant PlacementWorkScalesWithHoldings

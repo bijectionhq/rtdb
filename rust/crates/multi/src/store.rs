@@ -241,7 +241,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             let serving = Arc::get_mut(&mut opened).expect("the new store has one owner");
             serving.index_pages = Some(pages);
             serving.catalog_readers = Some(CatalogReaders::new(
-                self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner,
+                self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
             ));
             Ok::<_, Anomaly>(opened)
         }).await?;
@@ -824,6 +824,9 @@ impl ObjectStore for EncryptingStore {
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
         self.inner.retain_catalog(cut).await
     }
+    async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
+        self.inner.advance_catalog_floor(installed).await
+    }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
@@ -903,6 +906,10 @@ impl ObjectStore for GarbageStore {
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
         let Some(readers) = &self.catalog_readers else { return Ok(None); };
         readers.retain(cut).await.map(Some)
+    }
+    async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
+        let Some(readers) = &self.catalog_readers else { return Ok(true); };
+        readers.advance(installed).await
     }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }

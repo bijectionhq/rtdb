@@ -2,7 +2,7 @@ use prost::Message;
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
 
-use crate::{Checkpoint, DeploymentRecord, JournalAnchor, Lifecycle, MemberId, StorageNamespaces, Version};
+use crate::{CatalogAdmissionFloor, Checkpoint, DeploymentRecord, JournalAnchor, Lifecycle, MemberId, StorageNamespaces, Version};
 
 const WIRE_VERSION: u8 = 1;
 
@@ -46,6 +46,26 @@ struct ParkedDeployment {
     compaction_replay_cutoff: Option<i64>,
     #[prost(message, optional, tag = "19")]
     replica_anchor: Option<PackedJournalAnchor>,
+    #[prost(message, repeated, tag = "20")]
+    catalog_admission_floors: Vec<PackedCatalogFloor>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PackedCatalogFloor {
+    #[prost(string, tag = "1")]
+    root: String,
+    #[prost(string, tag = "2")]
+    residence: String,
+    #[prost(bytes = "vec", tag = "3")]
+    object_namespace: Vec<u8>,
+    #[prost(sint32, tag = "4")]
+    storage_version: i32,
+    #[prost(sint32, tag = "5")]
+    storage_epoch: i32,
+    #[prost(sint32, tag = "6")]
+    replica_epoch: i32,
+    #[prost(sint64, tag = "7")]
+    through: i64,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -77,7 +97,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, resident_idle: _, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, replica_anchor, storage_generation,
         storage_namespaces, s3_write_lease_until_ms, engine_pin, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
-        source_cleanup, deletion_record, replica_journals, storage_regions, catalog_readers, ordered_indexes, ordered_index_catalogs,
+        source_cleanup, deletion_record, replica_journals, storage_regions, catalog_readers, catalog_admission_floors, ordered_indexes, ordered_index_catalogs,
         cell_transfer, disposal, checkpoint_recovery,
         checkpoint_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_capture_retirements,
         archive_retirement, compaction_replay_cutoff, retired_residences, version: _,
@@ -122,6 +142,15 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         }),
         storage_generation: storage_generation.map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
         storage_namespaces: namespaces,
+        catalog_admission_floors: catalog_admission_floors.iter().map(|(root, floor)| PackedCatalogFloor {
+            root: root.clone(),
+            residence: floor.residence.clone(),
+            object_namespace: floor.object_namespace.as_bytes().to_vec(),
+            storage_version: floor.cut.storage_version.0,
+            storage_epoch: floor.cut.storage_epoch.0,
+            replica_epoch: floor.cut.replica_epoch.0,
+            through: floor.cut.through.0,
+        }).collect(),
         quarantined: *lifecycle == Lifecycle::Quarantined,
         replica_journals: replica_journals.iter().cloned().collect(),
         compaction_replay_cutoff: *compaction_replay_cutoff,
@@ -164,6 +193,20 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         let digest = anchor.digest.try_into().map_err(|_| invalid("Invalid replica anchor digest"))?;
         Ok(Box::new(JournalAnchor { root_incarnation: anchor.root_incarnation, interval: [anchor.first, anchor.through], digest }))
     }).transpose()?;
+    let mut catalog_admission_floors = std::collections::BTreeMap::new();
+    for floor in packed.catalog_admission_floors {
+        let object_namespace = Uuid::from_slice(&floor.object_namespace).map_err(|_| invalid("Invalid catalog floor namespace"))?;
+        let cut = rtdb_types::CatalogCut {
+            storage_version: rtdb_types::StorageVersion(floor.storage_version),
+            storage_epoch: rtdb_types::StorageEpoch(floor.storage_epoch),
+            replica_epoch: rtdb_types::StorageEpoch(floor.replica_epoch),
+            through: rtdb_types::ReplicaPosition(floor.through),
+        };
+        let value = CatalogAdmissionFloor { residence: floor.residence, object_namespace, cut };
+        if catalog_admission_floors.insert(floor.root, value).is_some() {
+            return Err(invalid("A parked record contains multiple catalog floors for a storage root"));
+        }
+    }
     Ok(DeploymentRecord {
         id: id.to_owned(),
         name: name.to_owned(),
@@ -199,6 +242,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         replica_journals: packed.replica_journals.into_iter().collect(),
         storage_regions: Default::default(),
         catalog_readers: Default::default(),
+        catalog_admission_floors,
         ordered_indexes: Default::default(),
         ordered_index_catalogs: Default::default(),
         cell_transfer: None,
@@ -237,6 +281,21 @@ mod tests {
         assert_eq!(read_back, record);
         assert_eq!(read_back.active_s3_write_lease(901_999), Some(902_000));
         assert_eq!(read_back.active_s3_write_lease(902_000), None);
+    }
+
+    #[test]
+    fn parking_preserves_catalog_admission_floors() {
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 1_000);
+        let cut = rtdb_types::CatalogCut {
+            storage_version: rtdb_types::StorageVersion(6),
+            storage_epoch: rtdb_types::StorageEpoch(2),
+            replica_epoch: rtdb_types::StorageEpoch(0),
+            through: rtdb_types::ReplicaPosition(63),
+        };
+        let floor = CatalogAdmissionFloor { residence: record.storage_prefix(), object_namespace: Uuid::new_v4(), cut };
+        record.catalog_admission_floors.insert("v06_e02".into(), floor);
+        let bytes = encode(&record).unwrap();
+        assert_eq!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).unwrap(), record);
     }
 
     #[test]

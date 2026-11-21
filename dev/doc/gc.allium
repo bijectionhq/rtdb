@@ -38,6 +38,9 @@
 -- A skipped replay record or an unrecognized prefix cannot supply this acknowledgement.
 -- When its partition has an installed catalog cut, the native collector persists an intent for each batch before releasing files or submitting the removal.
 -- It records a later receipt from that journal before releasing the intent marker.
+-- In Multi the serving writer proposes that installed cut as the admission floor for its storage root.
+-- If an older or opaque catalog is still held, the marker stays pending until a successor can install or observe the floor.
+-- The floor is a bound on future reader admission; physical erasure continues through the timed release path.
 -- A new collector checks pending intents in the same storage root and journal.
 -- Where the installed catalog and checkpoint already exclude the requested keys, it can re-confirm their removal through replication.
 -- Source-residence retirement metadata stays outside fork publication and cell materialization.

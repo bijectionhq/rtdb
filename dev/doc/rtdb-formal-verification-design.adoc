@@ -845,7 +845,15 @@ It checks the requested trie keys against the current catalog and the installed 
 An unrecognized prefix or a removal skipped under the recovery cutoff cannot produce the reply.
 This reply is evidence of logical exclusion for the requested trie keys.
 The retirement protocol still needs to connect publication identities to the catalog and install the certificate and admission floor together. link:../../verification/verus/trie_removal_receipt/area.json[Native receipt proof and mutation controls] · link:../../verification/verus/trie_retirement_intent/area.json[Intent receipt proof and controls]
-Publishing the certificate and its admission floor belongs in one directory CAS for that residence.
+Multi already coordinates its reader registrations with a monotone admission floor on the same directory version.
+The current writer proposes the installed cut from a durable receipt.
+Every older or opaque registration in that root and journal blocks the advance.
+If the floor cannot yet advance, the pending marker remains available so the next collector can retry from the receipt without re-submitting the removal.
+The floor persists through leader replacement and DynamoDB parking.
+A new capture that precedes the floor, or lacks a cut after a floor exists, fails with a retryable `rtdb.node/catalog-not-current`.
+A new read at the floor is admissible.
+These rules constrain reader admission while serving object erasure continues to use timed releases.
+Publishing the deletion certificate and its admission floor belongs in one directory CAS for that residence.
 The effect can be retried against the same certified identity after loss of a provider reply.
 A checkpoint can retain the intent or its completion through a journal trim only when the new recovery anchor supplies the same evidence.
 
@@ -1357,6 +1365,12 @@ A local node test observes a successful attach and a refused detach advance past
 Compiler controls reject forging and raw use of the replica admission witness.
 Each of the two new storage and compaction areas includes production-only and joint contract mutations.
 |Extend coverage from these functions to their effect paths, concurrent publication, reader protection, and ranked pipeline decisions.
+
+|Hosted catalog admission
+|The same directory CAS coordinates reader registration and an installed retirement floor.
+TLC explores stale reads and writes, opaque captures and writer replacement.
+Verus checks the exact cutoff decision.
+|Bind the floor and exact physical grant at one linearization point, bring recovery roots under the same authority and emit refinement traces.
 
 |Physical retirement identity
 |The trie retirement intent and installed receipt preserve the observed logical file plan and exact version metadata where the serving store can supply it.

@@ -1394,6 +1394,18 @@ TLA_CASES = (
     ("RetirementPublication", "retirement-collection-and-reuse",
      ("INVARIANTS CertificateFollowsInstall CurrentCatalogReadable AdmittedReaderReadable",
       "INVARIANT NeverCollectsAndReuses"), "NeverCollectsAndReuses"),
+    ("CatalogAdmissionFloor", "catalog-admission-floor", None, None),
+    ("CatalogAdmissionFloor", "catalog-floor-admit-older", (
+        'Mutation = "none"', 'Mutation = "ignore_floor"'), "HeldViewAdmissible"),
+    ("CatalogAdmissionFloor", "catalog-floor-ignore-opaque", (
+        'Mutation = "none"', 'Mutation = "ignore_opaque"'), "HeldViewAdmissible"),
+    ("CatalogAdmissionFloor", "catalog-read-without-cas", (
+        'Mutation = "none"', 'Mutation = "read_without_cas"'), "HeldViewAdmissible"),
+    ("CatalogAdmissionFloor", "catalog-floor-without-cas", (
+        'Mutation = "none"', 'Mutation = "floor_without_cas"'), "HeldViewAdmissible"),
+    ("CatalogAdmissionFloor", "catalog-floor-failover-witness", (
+        "INVARIANTS CoveredByReceipt HeldViewAdmissible",
+        "INVARIANT FreshReadAfterFailoverWitness"), "FreshReadAfterFailoverWitness"),
     ("ResidenceRetirement", "residence-retirement", None, None),
     ("ResidenceRetirement", "residence-early-reply",
      ('Mutation = "none"', 'Mutation = "reply_before_install"'), "ReceiptCoversInstalled"),
@@ -1637,6 +1649,11 @@ def verify_apalache(args, scratch):
         ('Mutation = "none"', 'Mutation = "remote_status"'), "replica receipt ahead of catalog",
     )
     check_apalache(args, scratch, "RecoveryCollection", "recovery-collection", "RecoverySafe", 10)
+    check_apalache(args, scratch, "CatalogAdmissionFloor", "catalog-admission-floor", "Safety", 8)
+    check_apalache(
+        args, scratch, "CatalogAdmissionFloor", "catalog-floor-without-cas", "HeldViewAdmissible", 8,
+        ('Mutation = "none"', 'Mutation = "floor_without_cas"'), "a stale floor write crosses a reader admission",
+    )
     check_apalache(args, scratch, "ResidenceRetirement", "residence-retirement", "Safety", 10)
     check_apalache(
         args, scratch, "ResidenceRetirement", "residence-retirement-forget-checkpoint", "RetainedRootsReadable", 10,
@@ -1970,6 +1987,9 @@ def verify_durable_trie_retirement(args, source):
         "omit-files": ("tries: keys.iter().map(TrieKey::to_string).collect(), files };",
                        "tries: keys.iter().map(TrieKey::to_string).collect(), files: Vec::new() };",
                        "the staged intent must include the file plan"),
+        "drop-before-floor": ("if store.advance_catalog_floor(cut).await? {",
+                              "if { store.advance_catalog_floor(cut).await?; true } {",
+                              "a hold blocking the floor keeps the intent durable"),
     }
     for name, (before, after, failure) in controls.items():
         try:
@@ -1980,7 +2000,40 @@ def verify_durable_trie_retirement(args, source):
                 raise ValueError(f"trie retirement control {name} did not fail at its declared assertion")
         finally:
             journal.write_bytes(original)
-    print("rust-trie-retirement-intent: restart passed, omitting stage, replay or file plan failed")
+    print("rust-trie-retirement-intent: restart passed, omitting stage, replay, the file plan or the floor gate failed")
+
+
+def verify_catalog_admission_floor(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "catalog_readers::tests::floor_installation_and_reader_admission_share_one_cas"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-catalog-floor-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("the residence did not coordinate reader admission with the floor")
+
+    readers = source / "rust/crates/multi/src/catalog_readers.rs"
+    original = readers.read_bytes()
+    controls = {
+        "skip-reader-check": ("if all_readers_allow {", "if true {", "an older held catalog must block the floor"),
+        "ignore-floor": (
+            "if !admits_after_floor(cut.map(|cut| cut.through.0), self.floor(record).map(|floor| floor.0)) {",
+            "if false && !admits_after_floor(cut.map(|cut| cut.through.0), self.floor(record).map(|floor| floor.0)) {",
+            "a capture older than the installed floor must refuse",
+        ),
+    }
+    for name, (before, after, failure) in controls.items():
+        try:
+            replace_once(readers, before, after)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-catalog-floor-{name}", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"catalog floor control {name} did not fail at its declared assertion")
+        finally:
+            readers.write_bytes(original)
+    print("rust-catalog-floor: directory replay passed, both missing-admission controls failed")
 
 
 def verify_s3_object_version(args, source):
@@ -2646,6 +2699,7 @@ def main():
         "rust/crates/multi/src/catalog_readers.rs",
         "rust/crates/multi/src/packing.rs",
         "rust/crates/directory/src/lib.rs",
+        "rust/crates/directory/src/dynamo/parked.rs",
         "rust/crates/node/src/resources.rs",
         "rust/crates/multi/src/agent.rs",
         "rust/crates/multi/src/control.rs",
@@ -2697,6 +2751,7 @@ def main():
             verify_checkpoint_trie_retention(args, source)
             verify_trie_removal_readback(args, source)
             verify_durable_trie_retirement(args, source)
+            verify_catalog_admission_floor(args, source)
             verify_s3_object_version(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)

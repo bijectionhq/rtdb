@@ -72,17 +72,18 @@ impl PendingRetirement {
         Ok(())
     }
 
-    async fn installed(&self, store: &dyn ObjectStore) -> Result<bool> {
+    async fn installed(&self, store: &dyn ObjectStore) -> Result<Option<ReplicaPosition>> {
         match store.get_fresh_exact(&self.receipt, 8 + self.encoded.len()).await {
             Ok(receipt) => {
                 let (position, selected) = receipt.split_at_checked(8)
                     .ok_or_else(|| crate::invalid("A trie removal receipt has no installed position"))?;
                 if selected != self.encoded.as_ref() { return Err(crate::invalid("A trie removal receipt names a different intent")); }
                 let position = position.try_into().map_err(|_| crate::invalid("A trie removal receipt position must be eight bytes"))?;
-                self.validate_receipt(ReplicaPosition(i64::from_be_bytes(position)))?;
-                Ok(true)
+                let position = ReplicaPosition(i64::from_be_bytes(position));
+                self.validate_receipt(position)?;
+                Ok(Some(position))
             }
-            Err(Error::MissingObject(_)) => Ok(false),
+            Err(Error::MissingObject(_)) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -92,10 +93,18 @@ impl PendingRetirement {
         let mut receipt = BytesMut::with_capacity(8 + self.encoded.len());
         receipt.put_i64(position.0);
         receipt.extend_from_slice(&self.encoded);
-        if let Err(error) = store.put(&self.receipt, receipt.freeze()).await {
-            if !self.installed(store).await? { return Err(error.into()); }
+        let installed = match store.put(&self.receipt, receipt.freeze()).await {
+            Ok(()) => position,
+            Err(error) => self.installed(store).await?.ok_or(error)?,
+        };
+        self.release_intent(store, installed).await
+    }
+
+    async fn release_intent(&self, store: &dyn ObjectStore, installed: ReplicaPosition) -> Result<()> {
+        let cut = CatalogCut { through: installed, ..self.selected };
+        if store.advance_catalog_floor(cut).await? {
+            store.delete(&self.intent).await?;
         }
-        store.delete(&self.intent).await?;
         Ok(())
     }
 }
@@ -120,8 +129,8 @@ pub(crate) async fn resume(
             return Err(crate::invalid("A trie retirement intent does not match its journal address"));
         }
         if intent.selected.through > cut.through { continue; }
-        if pending.installed(store).await? {
-            store.delete(&pending.intent).await?;
+        if let Some(installed) = pending.installed(store).await? {
+            if installed <= cut.through { pending.release_intent(store, installed).await?; }
             continue;
         }
         let keys = intent.tries.iter().map(|key| key.parse()).collect::<Result<Vec<TrieKey>>>()?;

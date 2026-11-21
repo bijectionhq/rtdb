@@ -257,6 +257,9 @@ pub struct DeploymentRecord {
     pub storage_regions: BTreeMap<uuid::Uuid, StorageRegion>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalog_readers: BTreeMap<uuid::Uuid, CatalogReader>,
+    /// Installed catalog admission floors, keyed by storage root.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub catalog_admission_floors: BTreeMap<String, CatalogAdmissionFloor>,
     /// Page custody for ordered indexes, keyed by their physical index prefix.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ordered_indexes: BTreeMap<String, OrderedIndexStorage>,
@@ -367,6 +370,13 @@ impl HostedTask {
 
     pub fn cluster_arn(&self) -> &str { &self.cluster_arn }
     pub fn task_arn(&self) -> &str { &self.task_arn }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogAdmissionFloor {
+    pub residence: String,
+    pub object_namespace: uuid::Uuid,
+    pub cut: rtdb_types::CatalogCut,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -654,7 +664,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
             cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(),
             checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
