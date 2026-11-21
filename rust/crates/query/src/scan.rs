@@ -270,6 +270,13 @@ fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::B
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IidOrder { Ascending, Descending }
 
+/// Whether every `_id` the snapshots hold for the table is a UUID, each then being its own IID. A plan records the type
+/// it was prepared against, and a row of another ID type may have been written since.
+fn stores_uuid_ids(table: &rtdb_types::TableRef, snapshots: &[Snapshot]) -> bool {
+    let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
+    snapshots.iter().all(|snapshot| snapshot.column_types_for(table, ["_id".to_owned()]).get("_id").is_some_and(|ty| *ty == uuid || *ty == rtdb_types::LogicalType::Nothing))
+}
+
 /// The UUID a literal or parameter is, or that the cast of a string one to UUID gives, which is how `UUID '...'` is bound.
 fn uuid_constant(expr: &Expr, parameters: &[Value]) -> Option<[u8; 16]> {
     fn constant<'v>(expr: &'v Expr, parameters: &'v [Value]) -> Option<&'v Value> {
@@ -397,9 +404,11 @@ impl ScanCursor {
     async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>) -> Result<Self> {
         let fixed_iids = scan.iids.is_some();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
-        let interval = match id_interval(&scan, execution.parameters.values()) {
-            Ok(interval) => interval,
-            Err(Unsatisfiable) => { scan.iids = Some(Default::default()); None }
+        let interval = if !stores_uuid_ids(&scan.table.name.table, database_partitions) { None } else {
+            match id_interval(&scan, execution.parameters.values()) {
+                Ok(interval) => interval,
+                Err(Unsatisfiable) => { scan.iids = Some(Default::default()); None }
+            }
         };
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
@@ -482,7 +491,8 @@ impl PartitionScan {
     #[allow(clippy::too_many_arguments)]
     fn new(snapshot: Snapshot, storage: Arc<BufferPool>, mut scan: Scan, execution: Execution, bounds: TemporalBounds, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, canonical_entity_iids: bool, fragment: Option<(Iid, Iid)>) -> Self {
         let slots = vec![None; scan.columns.len()];
-        let confined = id_interval(&scan, execution.parameters.values()).and_then(|interval| intersect(fragment, interval)).unwrap_or_else(|Unsatisfiable| {
+        let interval = if stores_uuid_ids(&scan.table.name.table, std::slice::from_ref(&snapshot)) { id_interval(&scan, execution.parameters.values()) } else { Ok(None) };
+        let confined = interval.and_then(|interval| intersect(fragment, interval)).unwrap_or_else(|Unsatisfiable| {
             scan.iids = Some(Default::default());
             fragment
         });
@@ -558,7 +568,7 @@ async fn iid_ordered_input(scan: &Scan, execution: &Execution, limit: usize, off
     if crate::inspection::is_inspection(table) || crate::system_schema::definition(table).is_some() { return Ok(None); }
     let database = execution.context.catalog.database(&scan.table.name.database)?;
     // Partitions are read one after another, which orders nothing across them.
-    if database.partitions.len() != 1 { return Ok(None); }
+    if database.partitions.len() != 1 || !stores_uuid_ids(table, &database.partitions) { return Ok(None); }
     let order = if key.descending { IidOrder::Descending } else { IidOrder::Ascending };
     let schema = Schema::new(scan.columns.clone())?;
     let predicate = scan.predicates.iter().chain(&top.residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));

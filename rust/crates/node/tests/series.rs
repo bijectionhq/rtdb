@@ -289,6 +289,44 @@ async fn a_limit_over_uuid_ids_in_id_order_stops_reading_once_it_has_its_rows() 
     fixture.close().await;
 }
 
+/// The first column of a cursor's rows, or the code of the error that ended it.
+async fn first_column(cursor: Result<rtdb_query::QueryCursor>) -> std::result::Result<Vec<Value>, String> {
+    let mut cursor = cursor.map_err(|error| error.code)?;
+    let mut values = Vec::new();
+    while let Some(batch) = cursor.next_batch().await.map_err(|error| error.code)? {
+        for row in 0..batch.batch().num_rows() { values.push(read_value(batch.batch().schema().field(0), batch.batch().column(0).as_ref(), row).unwrap()); }
+    }
+    Ok(values)
+}
+
+#[tokio::test]
+async fn a_plan_prepared_over_uuid_ids_answers_as_a_fresh_one_once_the_table_holds_another_id_type() {
+    let mut fixture = Fixture::open().await;
+    let rows = |ids: std::ops::Range<u64>| ids.map(|index| vec![uuid(u128::from(index) << 64), Value::I64(index as i64)]).collect::<Vec<_>>();
+    fixture.commit("INSERT INTO docs (_id, v) VALUES (?, ?)", rows(0..2_000)).await.unwrap();
+    fixture.flush().await;
+    let statements = ["SELECT v FROM docs WHERE _id >= ? AND _id < ? ORDER BY v", "SELECT v FROM docs WHERE v < ? OR v > ? ORDER BY _id DESC LIMIT 2"];
+    let arguments = [vec![uuid(100u128 << 64), uuid(110u128 << 64)], vec![Value::I64(0), Value::I64(0)]];
+    let context = fixture.session.query_context().await.unwrap();
+    let prepared: Vec<PreparedSql> = statements.iter().zip(&arguments).map(|(sql, arguments)| {
+        let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
+        PreparedSql::prepare(sql, &context, options, ResultSignaturePolicy::Dynamic).unwrap()
+    }).collect();
+    assert_eq!(first_column(prepared[0].open_query(Arc::clone(&context), arguments[0].clone()).await).await, Ok((100..110).map(Value::I64).collect()));
+    assert_eq!(first_column(prepared[1].open_query(Arc::clone(&context), arguments[1].clone()).await).await, Ok(vec![Value::I64(1_999), Value::I64(1_998)]));
+    drop(context);
+
+    // A text ID arrives after the plans were made. Its IID is a hash, wherever its ID sorts, so the plans may no
+    // longer read by IID: whatever a fresh plan answers over the mixed IDs, a comparison error included, they answer.
+    fixture.commit("INSERT INTO docs (_id, v) VALUES (?, ?)", vec![vec![Value::Utf8("zzz".into()), Value::I64(-1)]]).await.unwrap();
+    for ((sql, arguments), prepared) in statements.iter().zip(&arguments).zip(&prepared) {
+        let fresh = first_column(fixture.session.query_sql(sql, arguments.clone()).await).await;
+        let context = fixture.session.query_context().await.unwrap();
+        assert_eq!(first_column(prepared.open_query(context, arguments.clone()).await).await, fresh, "{sql}");
+    }
+    fixture.close().await;
+}
+
 #[tokio::test]
 async fn a_limit_over_hashed_ids_in_id_order_sorts_them() {
     let mut fixture = Fixture::open().await;
