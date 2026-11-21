@@ -1033,3 +1033,24 @@ TLC checked 171 reachable states of link:../tla/PreparedReplay.tla[PreparedRepla
 The controls reject installation without admission, refusal without refresh, and use of a different cursor by the driver.
 Two additional traces witness successful recovery on a newer checkpoint and trimming after admission.
 The latter remains possible because cursor admission carries no retention entitlement on a remote log.
+
+The native suites passed 433 tests on `773adfde9`, including the Multi and logkeeper cold-start path after trimming.
+The gated native case checks the selected block before the consumer starts, the recovered SQL result, two recovery admissions, and zero independent tail opens by the driver.
+The source control run at `1740907ed` rejected leaving admission out of startup and discarding the admitted cursor.
+Use `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked --no-fail-fast -p rtdb-node -p rtdb-storage -p rtdb-replication -p rtdb-logkeeper -p rtdb-multi -p rtdb-conformance --lib --test native --test contract --test node_faults --test cell -- --test-threads=4`.
+The combined formal runner passed at `773adfde9` with input manifest SHA-256 `9198b230b9f18f27d4280e3ff32da536919f4bd4085e9bd55d0df6e66ce55b7e`.
+The combined run used the formal flags and the separate native run exercised the actual cursor handoff.
+
+=== Shared authorization for replay retention
+
+Link:../tla/ReplicaTrimAdmission.tla[ReplicaTrimAdmission] studies the next protocol with two simultaneous recovery handles, three candidate offsets and delayed physical trimming.
+A trim authorization advances a durable floor, which new recovery admissions consult even while the physical trim is pending.
+Authorization must preserve the smallest position required by every active recovery.
+TLC checked all 75 reachable states and caught both weakened rules.
+The reachability witness admits a new reader after an actual trim.
+
+Link:../lean/ReplicaTrimAdmission.lean[The Lean model] proves that no authorized physical trim removes an active recovery's starting position, for arbitrary finite histories and any reader type with decidable equality.
+The three audited theorems use only `propext` and `Quot.sound`.
+Both admission-control mutations fail the invariant-preservation theorem.
+This model assumes one stream with one durable authority, atomic registration and trim authorization, and a provider that completes only authorized trims.
+The proposed shared authority and recovery holds are still open production work.

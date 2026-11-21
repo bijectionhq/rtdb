@@ -519,6 +519,23 @@ def verify_table_slugs(args, scratch):
     verify_lean_model(args, scratch, path, "table-slugs", controls, 6)
 
 
+def verify_replica_trim_admission(args, scratch):
+    path = Path("verification/lean/ReplicaTrimAdmission.lean")
+    controls = {
+        "trust-physical-floor": (
+            "  state.authorized ≤ first\n",
+            "  state.floor ≤ first\n",
+            ["step_preserves_admission"],
+        ),
+        "ignore-recovery": (
+            "  ∀ reader lowest, state.held reader = some lowest → first ≤ lowest\n",
+            "  True\n",
+            ["step_preserves_admission"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "replica-trim-admission", controls, 3)
+
+
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
     controls = {
@@ -634,6 +651,7 @@ def verify_lean(args, scratch):
             verify_table_slugs(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
+            verify_replica_trim_admission(args, scratch)
             verify_compaction_projection(args, scratch, directory)
             verify_compaction_planner(args, scratch)
             verify_compaction_merge(args, scratch)
@@ -802,6 +820,14 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "ignore_nascent"'), "InstalledReadable"),
     ("InstalledCheckpoint", "installed-checkpoint-collection-witness",
      ("INVARIANTS TypeOK InstalledReadable ReaderReadable", "INVARIANT OldFilesNeverCollected"), "OldFilesNeverCollected"),
+    ("ReplicaTrimAdmission", "replica-trim-admission", None, None),
+    ("ReplicaTrimAdmission", "replica-trim-trust-physical-floor",
+     ('Mutation = "none"', 'Mutation = "trust_physical_floor"'), "ActiveRecoveryCovered"),
+    ("ReplicaTrimAdmission", "replica-trim-ignore-recovery",
+     ('Mutation = "none"', 'Mutation = "ignore_recovery"'), "ActiveRecoveryCovered"),
+    ("ReplicaTrimAdmission", "replica-trim-replacement-witness",
+     ("INVARIANTS PublishedCheckpointCovered ActiveRecoveryCovered",
+      "INVARIANT NeverRecoveredAfterTrim"), "NeverRecoveredAfterTrim"),
     ("PreparedReplay", "prepared-replay", None, None),
     ("PreparedReplay", "prepared-replay-skip-admission",
      ('Mutation = "none"', 'Mutation = "install_without_admission"'), "InstallHasAdmission"),

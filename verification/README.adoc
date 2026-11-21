@@ -163,6 +163,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   TLC explores its finite state space, and Apalache cross-checks retention through ten transitions.
 * `tla/RecoveryDiscovery.tla` models a separate fallback for missing checkpoint metadata during startup.
   The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
+* `tla/ReplicaTrimAdmission.tla` models shared recovery admission and trim authorization separately from physical deletion.
+  `lean/ReplicaTrimAdmission.lean` proves safety for an arbitrary number of readers and finite histories.
 * `tla/PreparedReplay.tla` models admitting a replica cursor before installing an ordinary checkpoint and transferring that cursor to the driver.
   Its controls check early installation, early refusal, and reopening an admitted cursor.
   The reachability witnesses show a successful refresh and a separate trim after admission.
