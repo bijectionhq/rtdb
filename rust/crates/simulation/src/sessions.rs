@@ -373,6 +373,8 @@ impl Router for Backends {
         self.tasks.lock().expect("unpoisoned").push(task);
         Ok((near, None, 0))
     }
+
+    async fn route_holder(&self) -> rtdb_types::Result<(TcpStream, Option<String>, u64)> { self.route().await }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
