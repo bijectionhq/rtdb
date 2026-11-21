@@ -330,7 +330,7 @@ impl World {
         self.summary.flushes += 1;
         // The holder publishes the block as its checkpoint, unless the directory is out of its reach for now.
         let published = self.rng.chance(70);
-        if published { self.deployments[index].record.checkpoint = Some(Checkpoint { block: block as i64, boundary: 0, source: 0, system_time: 0 }); }
+        if published { self.deployments[index].record.checkpoint = Some(Checkpoint { block: block as i64, boundary: 0, source: 0, system_time: 0, root_sha256: None }); }
         self.note(format!("d{index} flushes block {block}, packing {} objects{}", names.len(), if published { ", and publishes it" } else { "" }));
         Ok(())
     }

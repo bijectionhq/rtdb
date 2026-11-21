@@ -41,6 +41,7 @@ impl TableEntry {
 #[derive(Clone, Debug)]
 pub struct BlockCatalog {
     wire: Arc<pb::Block>,
+    publication_sha256: Option<[u8; 32]>,
     charge: Option<Arc<MemoryReservation>>,
 }
 
@@ -48,7 +49,9 @@ impl PartialEq for BlockCatalog { fn eq(&self, other: &Self) -> bool { self.wire
 
 impl BlockCatalog {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        Self::from_proto(pb::Block::decode(bytes).map_err(invalid)?)
+        let mut catalog = Self::from_proto(pb::Block::decode(bytes).map_err(invalid)?)?;
+        catalog.publication_sha256 = Some(publication_digest(bytes));
+        Ok(catalog)
     }
 
     /// The reservation must cover the decoded graph and any derived values that retain its charge.
@@ -62,7 +65,7 @@ impl BlockCatalog {
 
     pub fn from_proto(wire: pb::Block) -> Result<Self> {
         if wire.block_index.unwrap_or_default() < 0 { return Err(invalid("Block index is negative")); }
-        let catalog = Self { wire: Arc::new(wire), charge: None };
+        let catalog = Self { wire: Arc::new(wire), charge: None, publication_sha256: None };
         let entries = catalog.table_entries()?;
         if let Some(manifest) = &catalog.wire.table_block_manifest {
             let digests = &manifest.sha256_by_oid;
@@ -76,6 +79,13 @@ impl BlockCatalog {
     }
 
     pub fn encode(&self) -> Vec<u8> { self.wire.encode_to_vec() }
+    /// Binds the catalog to the exact bytes that the writer will publish.
+    pub fn encode_for_publication(&mut self) -> Vec<u8> {
+        let bytes = self.encode();
+        self.publication_sha256 = Some(publication_digest(&bytes));
+        bytes
+    }
+    pub fn publication_sha256(&self) -> Option<[u8; 32]> { self.publication_sha256 }
     pub fn as_proto(&self) -> &pb::Block { &self.wire }
     pub fn block_index(&self) -> BlockIndex { BlockIndex(self.wire.block_index.unwrap_or_default()) }
     pub fn boundary_term(&self) -> Term { Term(self.wire.term_id.unwrap_or_default()) }
@@ -120,6 +130,12 @@ impl BlockCatalog {
         }
         Ok(entries)
     }
+}
+
+/// Digest of the encoded checkpoint root, before encryption or packing.
+pub fn publication_digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
 }
 
 pub fn legacy_table_ref(name: &str) -> Result<TableRef> {

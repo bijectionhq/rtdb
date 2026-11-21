@@ -1392,6 +1392,10 @@ rule PublishCheckpoint {
     -- An explicit flush returns after publishing its adopted checkpoint for the current holding.
     -- Publication is a cas conditional on the epoch, batched per node.
     -- A checkpointed store with an independent object inventory can recover its packs by name.
+    -- The directory receipt binds the adopted logical root bytes to the published coordinate.
+    -- Ordinary startup of a receipted cut protects its root metadata and replay suffix in a single compare-and-replace.
+    -- Startup verifies the root bytes against the receipt before following its table pointers.
+    -- Opening a replacement after a gap requires a fresh directory admission.
     when: AppendCommitted(holding, record: BlockUploaded)
 
     ensures:

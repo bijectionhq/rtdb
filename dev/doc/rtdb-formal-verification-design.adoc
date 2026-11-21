@@ -1448,6 +1448,10 @@ Verus verifies checked pack extents. The bounded model distinguishes evidence at
 For versioned S3 packs the packing adapter uses the provider identity from the same response as each observation.
 A cached index is scoped to that publication, and opening a relocated fork copy checks its own index.
 Lean proves preservation over finite observation schedules. TLC and Apalache check the bounded failure and copy transitions.
+New hosted directory checkpoints bind the exact adopted catalog bytes by SHA-256.
+Cold startup uses the admitted receipt for its root selection and validates a fresh read before loading table blocks.
+The same startup registration protects the catalog metadata and first required replica offset until the prepared cursor takes over.
+Lean checks preservation through finite schedules under the abstract effect guards, and the bounded model checks the joint admission and handoff.
 Verus checks the exact first-required-offset rule.
 The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
 TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.

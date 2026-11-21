@@ -590,6 +590,7 @@ fn archive_witness(deployment: Uuid, operation: Uuid) -> Result<ObjectKey> {
 
 fn verify_cut(catalog: &BlockCatalog, checkpoint: Checkpoint, epoch: StorageEpoch) -> Result<()> {
     if catalog.block_index().0 != checkpoint.block
+        || checkpoint.root_sha256.is_some_and(|digest| catalog.publication_sha256() != Some(digest))
         || catalog
             .boundary_replica_position()
             .map_or(-1, |position| position.after_offset(epoch))
@@ -766,7 +767,7 @@ pub async fn capture(
             });
         }
         record.storage_regions.insert(region, if local {
-            rtdb_directory::StorageRegion::Local { archive: Some(operation), tracks_ordered_index_pages: true, checkpoint_metadata_from: None }
+            rtdb_directory::StorageRegion::Local { archive: Some(operation), tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, }
         } else {
             crate::store::remote_storage_region(Some(operation), hosted_task.clone())
         });
@@ -888,6 +889,7 @@ async fn capture_registered(
     .await?;
     let plaintext = EncryptingStore::new(sealed as Arc<dyn ObjectStore>, &serving_material)?;
     let closure = checkpoint_objects(&plaintext, &point).await?;
+    let root_object = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
 
     let mut bytes = 0u64;
     let mut objects = Vec::with_capacity(closure.len());
@@ -901,7 +903,9 @@ async fn capture_registered(
             .filter(|total| *total <= MAXIMUM_BYTES)
             .ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
         let content = plaintext.get(&object).await?;
-        if content.len() as u64 != metadata.size {
+        if content.len() as u64 != metadata.size
+            || object == root_object && point.checkpoint.root_sha256.is_some_and(|expected| rtdb_format::catalog::publication_digest(&content) != expected)
+        {
             return Err(inconsistent("Checkpoint object changed during capture"));
         }
         let ciphertext = archive_cipher.seal_deterministic(object.as_str(), &content)?;
@@ -1413,6 +1417,7 @@ mod tests {
                     boundary: 3,
                     source: 2,
                     system_time: 100,
+                    root_sha256: None,
                 },
                 media_bound: true,
                 manifest_sha256: None,

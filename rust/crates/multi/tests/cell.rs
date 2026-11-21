@@ -748,7 +748,7 @@ async fn the_hosted_source_barrier_refuses_a_missing_directory_checkpoint() {
 
     let mut record = directory.deployment(&history.to_string()).await.unwrap().unwrap();
     let expected_version = record.version;
-    record.checkpoint = Some(rtdb_directory::Checkpoint { block: 7, boundary: 11, source: 11, system_time: 100 });
+    record.checkpoint = Some(rtdb_directory::Checkpoint { block: 7, boundary: 11, source: 11, system_time: 100, root_sha256: None });
     assert!(matches!(directory.replace_deployment(record, expected_version).await.unwrap(), rtdb_directory::Cas::Applied(_)));
 
     let refusal = client.simple_query("SHOW rtdb_hosted_source_barrier").await.unwrap_err();
@@ -1907,6 +1907,10 @@ async fn explicit_flush_publishes_a_checkpoint_before_replying() {
 
     let held = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     let checkpoint = held.checkpoint.expect("the flush has a publicly visible checkpoint");
+    let key = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(rtdb_types::BlockIndex(checkpoint.block)).unwrap()).unwrap();
+    let root = database.storage().get(&key).await.unwrap();
+    assert_eq!(checkpoint.root_sha256, Some(rtdb_format::catalog::publication_digest(root.as_slice())),
+        "a reported flush must publish a receipt for its stored root");
     assert_eq!(held.holder, Some(cell.node(0).lease.id()));
     assert!(checkpoint.source >= position.after_offset(rtdb_types::StorageEpoch(held.log_epoch)));
     drop((database, client));

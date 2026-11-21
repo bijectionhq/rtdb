@@ -2417,3 +2417,56 @@ The checked property covers coherence within a versioned pack observation and ac
 For a transferred fork reference it assumes the reference and copy path preserves the logical data.
 Stores without a provider identity rely on the immutable-object contract.
 Cold directory admission still needs a durable receipt for the exact selected publication, its dependency closure and the joint checkpoint-and-suffix hold.
+
+=== Directory root receipts and the startup replay hold
+
+The directory now records the SHA-256 digest carried by the adopted block, alongside its block and journal coordinates.
+The producer binds the bytes it writes, and adoption or publication retry reads the current stored root.
+Receipt-bearing cold opens read the exact admitted block and verify its fresh logical bytes before following any table pointers.
+A newer stored root requires its own directory admission, including after an unexpected replay gap.
+Current archive capture and fork copies check the logical root binding when one is present.
+
+Ordinary hosted startup installs the metadata hold and its first required replica offset in one directory compare-and-replace.
+The admission checks previously authorized trim before registering, and the trimmer accounts for both startup regions and active replay cursors.
+The startup registration is cleared after cursor admission and after its owned provider effects drain.
+
+TLC explored all 222 states for two successively published roots, one startup, one replay cursor and a delayed retirement plan.
+It rejected five weakened rules and reached successful recovery followed by collection and trim.
+Apalache checked ten transitions and found counterexamples for an omitted startup suffix hold and a gap before cursor admission.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-models-d47w9gbf/`. link:../tla/ReceiptedCheckpointStartup.tla[Model and controls]
+Lean 4.36.0 proved preservation in one abstract effect and over arbitrary finite schedules and natural offsets, under the declared collection and trim guards.
+The two controls drop one guard each and fail at the preservation law.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-lean-87lflwhx/`. link:../lean/ReceiptedCheckpointStartup.lean[Schedule laws]
+The combined Verus pass checked 36 areas and matched all 181 controls, including the production decisions for the first retained range and trimming below holds.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-verus-mrrzcuy4/`.
+
+The initial affected crate, cell and conformance run passed 413 cases on parent `d9eb3a115` after accounting for the new receipt's encoding size, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-d9-rust-retry.log`.
+After rebasing onto `ab41896bc`, six exact receipt replays passed and eight mutations failed at their named assertions.
+The native controls cover receipt publication, changed bytes, warm cache bypass, admitted root selection, retry after a gap, prior trim, and acquisition and release of the startup suffix hold.
+The existing metadata and replica-retention replays also passed, with both collection controls failing as expected.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-native-t5oxiq9x/`.
+The affected Rust suites also passed all 413 cases on `ab41896bc` with the final sources, including 95 hosted cell cases and eight node-fault cases.
+One optional case was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-ab4-rust.log`.
+The storage and gateway-session simulations passed eight cases with three optional cases ignored after adapting the simulation router to the holder-routing contract.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-ab4-simulation-fixed.log`.
+The standard JVM run passed 3,198 cases on `ab41896bc` with the receipt change and rebuilt FFI library, SHA-256 `e3645927398efe1c5ff3e30c6c71f49b55df2becadb3432fbf03a20a6cfcd643`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-ab4-jvm.log`.
+The affected Rust selections passed 414 cases after rebasing onto `4095189a7`, including 96 hosted cell cases and the scoped attempt outcome replay.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-409-rust.log`.
+The storage and session simulations also passed all eight selected cases on that tree, with three optional sweeps ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-409-simulation.log`.
+The standard JVM run on `4095189a7` regenerated the updated log Protobuf classes, recompiled core Kotlin and Java, and passed all 3,198 cases.
+Its FFI library SHA-256 is `265f0176da3562253dc8924ab3662d5e853f6ca13e579c5fbbc088a085d8f27b`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-409-jvm.log`.
+The combined TLC rerun on that tree checked the existing scoped attempt outcome model and the new startup model with their declared controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-models-ymmurzsx/`.
+After the Arrow and ranked-search rebase onto `1a45f529b`, all 23 focused checkpoint tests passed, including nine hosted cell cases.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-root-receipt-1a45-rust.log`.
+The compact directory test preserves the existing under-300-byte bound for the old shape and separately checks the exact 34-byte cost of a SHA-256 receipt in its fixtures.
+The fixture with journal custody is 306 bytes with its receipt.
+
+The receipt authenticates logical bytes under the SHA-256 premise and assumes directory writers preserve the receipt and startup hold fields.
+The startup guarantee covers the metadata root and existing replay suffix for ordinary receipt-bearing opens.
+Complete physical dependency closure, exact provider deletion authorization and the corresponding holds for legacy and archived recovery remain open.

@@ -299,15 +299,30 @@ fn discovery_from_admitted_record(config: &CellStoreConfig, record: &DeploymentR
     let Some(checkpoint) = record.checkpoint else { return Ok(BlockDiscovery::List); };
     let block = BlockIndex(checkpoint.block);
     let exact = config.snapshot_block.is_some();
-    if let Some(cutoff) = record.compaction_replay_cutoff {
-        return Ok(if exact { BlockDiscovery::At(block) }
-            else { BlockDiscovery::FromRestored { checkpoint: block, compaction_cutoff: ReplicaPosition(cutoff) } });
+    if !exact && let Some(cutoff) = record.compaction_replay_cutoff {
+        return Ok(BlockDiscovery::FromRestored { checkpoint: block, compaction_cutoff: ReplicaPosition(cutoff), root_sha256: checkpoint.root_sha256 });
+    }
+    if exact && record.compaction_replay_cutoff.is_some() && checkpoint.root_sha256.is_none() {
+        return Ok(BlockDiscovery::At(block));
     }
     if checkpoint.boundary < 0 { return Err(storage_region_error("The published checkpoint has no replica boundary")); }
     let published = PublishedCheckpoint {
         block, boundary: ReplicaPosition::from_epoch_offset(StorageEpoch(record.log_epoch), checkpoint.boundary)?,
+        root_sha256: checkpoint.root_sha256,
     };
     Ok(if exact { BlockDiscovery::AtPublished(published) } else { BlockDiscovery::FromPublished(published) })
+}
+
+fn checkpoint_startup_replay(record: &DeploymentRecord) -> Result<Option<i64>> {
+    let Some(checkpoint) = record.checkpoint.filter(|checkpoint| checkpoint.root_sha256.is_some()) else { return Ok(None); };
+    let first_required = checkpoint.boundary.checked_add(1).filter(|first| *first > 0)
+        .ok_or_else(|| storage_region_error("The published checkpoint has an invalid replay boundary"))?;
+    if let Some(anchor) = &record.replica_anchor
+        && let Some((requested, first_retained)) = crate::replica_retention::excluded_replay_start(checkpoint.boundary, anchor.interval[1])
+    {
+        return Err(rtdb_storage::Error::UnavailableLogRange { requested, first_retained }.into());
+    }
+    Ok(Some(first_required))
 }
 
 impl CellStoreFactory {
@@ -360,13 +375,16 @@ impl CellStoreFactory {
                     return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, CHECKPOINT_ADVANCED, "The snapshot's checkpoint changed before storage admission"));
                 }
                 let checkpoint_metadata_from = Some(record.checkpoint.map_or(0, |checkpoint| checkpoint.block));
+                let checkpoint_replay_from = if config.snapshot_block.is_none() && record.compaction_replay_cutoff.is_none() {
+                    checkpoint_startup_replay(record)?
+                } else { None };
                 let repair = record.checkpoint_recovery.as_ref()
                     .filter(|repair| repair.completed_at_ms.is_some())
                     .map(|repair| repair.operation);
                 record.storage_regions.insert(id, if local {
-                    StorageRegion::Local { archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from }
+                    StorageRegion::Local { archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from }
                 } else {
-                    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from, archive: None, repair_archive: repair, owner: hosted_task.clone(),
+                    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from, archive: None, repair_archive: repair, owner: hosted_task.clone(),
                         closed: false, publications: BTreeMap::new() }
                 });
                 Ok(())
@@ -376,6 +394,7 @@ impl CellStoreFactory {
             // refusals. Other directory errors may hide an applied CAS.
             let uncertain = accepted.as_ref().err().is_some_and(|error| !matches!(
                 error.code.as_str(), rtdb_node::NOT_HELD | "rtdb.multi/unknown-installation" | CHECKPOINT_ADVANCED
+                    | "rtdb.storage/log-range-unavailable" | "rtdb.multi/storage-region"
             ));
             if ready.send(accepted.map(|record| (record, io.clone()))).is_ok() && opened {
                 tokio::select! {
@@ -383,7 +402,7 @@ impl CellStoreFactory {
                     _ = read => loop {
                         let result = crate::admin::update_installation(directory.as_ref(), &config.deployment, |record| {
                             if let Some(region) = record.storage_regions.get_mut(&id) {
-                                region.release_checkpoint_metadata();
+                                region.release_checkpoint_startup();
                             }
                             Ok(())
                         }).await;
@@ -422,7 +441,7 @@ impl CellStoreFactory {
 }
 
 pub(crate) fn remote_storage_region(archive: Option<Uuid>, owner: Option<HostedTask>) -> StorageRegion {
-    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from: None, archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
+    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
 }
 
 pub(crate) fn track_publications(
@@ -1640,7 +1659,7 @@ mod tests {
         let before = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(before.storage_regions[&region], StorageRegion::Remote {
             tracks_ordered_index_pages: true,
-            checkpoint_metadata_from: None,
+            checkpoint_metadata_from: None, checkpoint_replay_from: None,
             archive: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
@@ -1649,7 +1668,7 @@ mod tests {
         let retained = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(retained.storage_regions[&region], StorageRegion::Remote {
             tracks_ordered_index_pages: true,
-            checkpoint_metadata_from: None,
+            checkpoint_metadata_from: None, checkpoint_replay_from: None,
             archive: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
     }
@@ -1733,7 +1752,7 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
-        record.storage_regions.insert(region, StorageRegion::Local { archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None });
+        record.storage_regions.insert(region, StorageRegion::Local { archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, });
         let record = directory.create_deployment(record).await.unwrap();
         crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
 
@@ -1777,7 +1796,7 @@ mod tests {
     async fn the_reaper_erases_a_pack_once_every_object_in_it_is_released() {
         let directory = tempfile::tempdir().unwrap();
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
-        record.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0 });
+        record.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: None });
         let root = directory.path().join(record.storage_prefix()).join("v06");
         let local: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(&root).unwrap());
         let store = GarbageStore::open(crate::packing::PackingStore::open(local, crate::packing::PackDiscovery::List).await.unwrap()).await.unwrap();
@@ -1796,8 +1815,23 @@ mod tests {
         assert_eq!(packs(), 1, "a fully released pack is erased, and the latest block's, which names every pack, stays");
     }
 
+    #[test]
+    fn checkpoint_startup_refuses_a_trim_authorization_ahead_of_its_receipt() {
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.checkpoint = Some(rtdb_directory::Checkpoint {
+            block: 4, boundary: 5, source: 1, system_time: 0, root_sha256: Some([42; 32]),
+        });
+        record.replica_anchor = Some(Box::new(rtdb_directory::JournalAnchor { root_incarnation: 1, interval: [0, 5], digest: [1; 32] }));
+        assert_eq!(checkpoint_startup_replay(&record).unwrap(), Some(6));
+        record.replica_anchor.as_mut().unwrap().interval[1] = 6;
+        let error = checkpoint_startup_replay(&record).unwrap_err();
+        assert_eq!(error.code, "rtdb.storage/log-range-unavailable", "a committed trim intent excludes this startup receipt");
+        assert_eq!(error.context["requested"], 6);
+        assert_eq!(error.context["first-retained"], 7);
+    }
+
     #[tokio::test]
-    async fn an_admitted_checkpoint_keeps_packed_and_loose_metadata_until_provider_reads_drain() {
+    async fn an_admitted_checkpoint_keeps_metadata_and_replay_until_provider_reads_drain() {
         use rtdb_directory::{Checkpoint, MemoryDirectory};
         use rtdb_replication::BlockDiscovery;
         use rtdb_types::BlockIndex;
@@ -1809,7 +1843,7 @@ mod tests {
         let io = IoRegion::new();
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
-        let checkpoint = |block| Checkpoint { block, boundary: block + 1, source: block, system_time: 0 };
+        let checkpoint = |block| Checkpoint { block, boundary: block + 1, source: block, system_time: 0, root_sha256: Some([42; 32]) };
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         record.storage_namespaces = Some(storage_namespaces);
         record.checkpoint = Some(checkpoint(0));
@@ -1840,10 +1874,13 @@ mod tests {
         }).unwrap() };
         let mut opened = storage_factory.open_for_recovery(&configuration(None), &key("v06"), io.clone()).await.unwrap();
         assert_eq!(opened.blocks, BlockDiscovery::FromPublished(rtdb_replication::PublishedCheckpoint {
-            block: BlockIndex(0), boundary: rtdb_types::ReplicaPosition(1),
+            block: BlockIndex(0), boundary: rtdb_types::ReplicaPosition(1), root_sha256: Some([42; 32]),
         }));
         let mut current = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(current.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).collect::<Vec<_>>(), [0]);
+        let first_required = current.storage_regions.values().filter_map(StorageRegion::first_required_replica).min();
+        assert_eq!(first_required, Some(2), "startup must admit the checkpoint and its replica suffix together");
+        assert_eq!(crate::replica_retention::replica_trim_through(8, first_required.unwrap()), Some(1));
         let version = current.version;
         current.checkpoint = Some(checkpoint(1));
         let held = directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
@@ -1867,7 +1904,9 @@ mod tests {
         reader.abort();
         assert!(reader.await.unwrap_err().is_cancelled());
         let current = directory.deployment(&record.id).await.unwrap().unwrap();
-        assert!(current.storage_regions.values().any(|region| region.checkpoint_metadata_from() == Some(0)));
+        assert!(current.storage_regions.values().any(|region| {
+            region.checkpoint_metadata_from() == Some(0) && region.first_required_replica() == Some(2)
+        }), "both holds must outlive cancellation of a provider read");
         resume.send(()).unwrap();
         let released = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1877,6 +1916,8 @@ mod tests {
             }
         }).await.unwrap();
         assert_eq!(released.storage_regions.len(), 1);
+        assert!(released.storage_regions.values().all(|region| region.first_required_replica().is_none()),
+            "startup must release both holds after the effects drain");
         reap_as_of(bucket.as_ref(), &released, i64::MAX, Duration::ZERO, &refs).await.unwrap();
         for name in ["~packs/b00.pack", spill, loose] {
             assert!(matches!(bucket.head(&physical(name)).await, Err(Error::MissingObject(_))));
@@ -1925,7 +1966,7 @@ mod tests {
             writer.put(&key(&format!("tables/t/data/l00-rc-b0{block}.arrow")), Bytes::from(format!("rows {block}"))).await.unwrap();
             writer.put(&key(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block)).unwrap()), Bytes::from_static(b"catalog")).await.unwrap();
         }
-        record.checkpoint = Some(rtdb_directory::Checkpoint { block: 0, boundary: 0, source: 0, system_time: 0 });
+        record.checkpoint = Some(rtdb_directory::Checkpoint { block: 0, boundary: 0, source: 0, system_time: 0, root_sha256: None });
         for name in ["tables/t/data/l00-rc-b01.arrow", "blocks/b01.binpb"] { writer.delete(&key(name)).await.unwrap(); }
         reap(bucket.as_ref(), &record, Duration::ZERO, &Default::default()).await.unwrap();
         raw.deny_list.store(true, std::sync::atomic::Ordering::Relaxed);

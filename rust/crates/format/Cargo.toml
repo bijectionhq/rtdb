@@ -30,6 +30,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 roaring.workspace = true
+sha2.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

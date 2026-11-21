@@ -883,8 +883,11 @@ impl NodeAgent {
         for _ in 0..8 {
             if record.epoch != epoch || record.holder.as_ref() != Some(&member) { return Err(deposed()); }
             let Some(checkpoint) = checkpoint_for_block(block, StorageEpoch(record.log_epoch)) else { return Ok(None); };
-            if record.checkpoint.is_some_and(|published| published.block >= checkpoint.block) {
-                return Ok(Some((record, checkpoint)));
+            if let Some(published) = record.checkpoint {
+                if published.block == checkpoint.block && published.root_sha256.is_some() && published != checkpoint {
+                    return Err(Anomaly::fault("rtdb.multi/checkpoint-receipt", "The adopted checkpoint disagrees with the directory receipt"));
+                }
+                if published.block >= checkpoint.block { return Ok(Some((record, checkpoint))); }
             }
             let mut next = record.clone();
             next.checkpoint = Some(checkpoint);
@@ -914,10 +917,7 @@ impl NodeAgent {
         if !needs_trim { return; }
         let Some(published) = record.checkpoint else { return; };
         let boundary = published.boundary.min(checkpoint.boundary);
-        let oldest_replay = record.storage_regions.values().filter_map(|region| match region {
-            StorageRegion::ReplicaReplay { first_required, .. } => Some(*first_required),
-            _ => None,
-        }).min().unwrap_or(boundary);
+        let oldest_replay = record.storage_regions.values().filter_map(StorageRegion::first_required_replica).min().unwrap_or(boundary);
         let Some(through) = replica_trim_through(boundary, oldest_replay).filter(|through| *through > trimmed_through) else { return; };
         let Ok(members) = self.members().await else { return };
         let Ok(servers) = ensemble_servers(&record, &members) else { return };
@@ -1158,6 +1158,7 @@ fn checkpoint_for_block(block: &BlockCatalog, log_epoch: StorageEpoch) -> Option
         boundary,
         source: block.latest_source_position().map_or(-1, |position| position.after_offset(log_epoch)),
         system_time: block.latest_completed_tx().map_or(i64::MIN, |tx| tx.system_time.0),
+        root_sha256: Some(block.publication_sha256()?),
     })
 }
 

@@ -397,12 +397,16 @@ pub enum StorageRegion {
         tracks_ordered_index_pages: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         checkpoint_metadata_from: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_replay_from: Option<i64>,
     },
     Remote {
         #[serde(default)]
         tracks_ordered_index_pages: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         checkpoint_metadata_from: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_replay_from: Option<i64>,
         archive: Option<uuid::Uuid>,
         /// Serving I/O can read its repair archive while writing its own prefix.
         repair_archive: Option<uuid::Uuid>,
@@ -435,9 +439,21 @@ impl StorageRegion {
         }
     }
 
-    pub fn release_checkpoint_metadata(&mut self) {
-        if let Self::Local { checkpoint_metadata_from, .. } | Self::Remote { checkpoint_metadata_from, .. } = self {
+    pub fn release_checkpoint_startup(&mut self) {
+        if let Self::Local { checkpoint_metadata_from, checkpoint_replay_from, .. }
+            | Self::Remote { checkpoint_metadata_from, checkpoint_replay_from, .. } = self
+        {
             *checkpoint_metadata_from = None;
+            *checkpoint_replay_from = None;
+        }
+    }
+
+    pub fn first_required_replica(&self) -> Option<i64> {
+        match self {
+            Self::Local { checkpoint_replay_from, .. }
+            | Self::Remote { checkpoint_replay_from, closed: false, .. } => *checkpoint_replay_from,
+            Self::Remote { closed: true, .. } => None,
+            Self::ReplicaReplay { first_required, .. } => Some(*first_required),
         }
     }
 
@@ -615,6 +631,9 @@ pub struct Checkpoint {
     /// The system time, in microseconds, of the last transaction the block holds.
     #[serde(default)]
     pub system_time: i64,
+    /// Digest of the adopted catalog's exact logical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_sha256: Option<[u8; 32]>,
 }
 
 /// The digest of an inclusive replica interval, rooted in its first physical residence.

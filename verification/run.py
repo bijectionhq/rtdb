@@ -729,6 +729,19 @@ def verify_pack_publication_lean(args, scratch):
                       "pack-publication-observation", controls, 2)
 
 
+def verify_receipted_checkpoint_lean(args, scratch):
+    controls = {
+        "ignore-trim-bound": (
+            "keeps : state.phase ≠ .finished → first ≤ state.firstRequired", "keeps : True", ["each_effect_preserves_recovery"],
+        ),
+        "collect-during-startup": (
+            "released : state.phase ≠ .startup", "released : True", ["each_effect_preserves_recovery"],
+        ),
+    }
+    verify_lean_model(args, scratch, Path("verification/lean/ReceiptedCheckpointStartup.lean"),
+                      "receipted-checkpoint-startup", controls, 2)
+
+
 def verify_reader_reclamation_minimality(args, scratch):
     path = Path("verification/lean/ReaderReclamationMinimality.lean")
     controls = {
@@ -1653,6 +1666,7 @@ def verify_lean(args, scratch):
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
+            verify_receipted_checkpoint_lean(args, scratch)
             verify_residence_reader_retention(args, scratch)
             verify_delegated_scan(args, scratch, directory)
             verify_compaction_projection(args, scratch, directory)
@@ -1909,6 +1923,19 @@ TLA_CASES = (
      ("INVARIANT Safe", "INVARIANT NeverReadsOriginal"), "NeverReadsOriginal"),
     ("PackPublicationObservation", "pack-publication-copy-witness",
      ("INVARIANT Safe", "INVARIANT NeverReadsCopy"), "NeverReadsCopy"),
+    ("ReceiptedCheckpointStartup", "receipted-checkpoint-startup", None, None),
+    ("ReceiptedCheckpointStartup", "receipted-checkpoint-unchecked-root",
+     ('Mutation = "none"', 'Mutation = "ignore_digest"'), "Safe"),
+    ("ReceiptedCheckpointStartup", "receipted-checkpoint-root-unheld",
+     ('Mutation = "none"', 'Mutation = "ignore_root_hold"'), "Safe"),
+    ("ReceiptedCheckpointStartup", "receipted-checkpoint-no-startup-suffix",
+     ('Mutation = "none"', 'Mutation = "omit_suffix_hold"'), "Safe"),
+    ("ReceiptedCheckpointStartup", "receipted-checkpoint-handoff-gap",
+     ('Mutation = "none"', 'Mutation = "release_before_cursor"'), "Safe"),
+    ("ReceiptedCheckpointStartup", "receipted-checkpoint-stale-trim-plan",
+     ('Mutation = "none"', 'Mutation = "trust_stale_trim"'), "Safe"),
+    ("ReceiptedCheckpointStartup", "receipted-checkpoint-retirement-witness",
+     ("INVARIANT Safe", "INVARIANT NeverRetiresAfterRecovery"), "NeverRetiresAfterRecovery"),
     ("CheckpointPackEvidence", "checkpoint-pack-evidence", None, None),
     ("CheckpointPackEvidence", "checkpoint-pack-evidence-trust-staged",
      ('Mode = "fresh"', 'Mode = "trust_staged"'), "CheckRequiresStoredPack"),
@@ -2319,6 +2346,11 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-reuse-after-copy", "IndexCoherent", 6,
                    ('Mutation = "none"', 'Mutation = "reuse_copied_index"'),
                    "a moved reference supplies stale index evidence")
+    check_apalache(args, scratch, "ReceiptedCheckpointStartup", "receipted-checkpoint-startup", "Safe", 10)
+    check_apalache(args, scratch, "ReceiptedCheckpointStartup", "receipted-checkpoint-no-startup-suffix", "SuffixProtected", 10,
+                   ('Mutation = "none"', 'Mutation = "omit_suffix_hold"'), "startup loses its replay suffix")
+    check_apalache(args, scratch, "ReceiptedCheckpointStartup", "receipted-checkpoint-handoff-gap", "SuffixProtected", 10,
+                   ('Mutation = "none"', 'Mutation = "release_before_cursor"'), "the startup hold ends before the cursor takes over")
     check_apalache(args, scratch, "CheckpointPackEvidence", "checkpoint-pack-evidence", "CheckRequiresStoredPack", 7)
     check_apalache(args, scratch, "CheckpointPackEvidence", "checkpoint-pack-evidence-collection-between-check-and-submit",
                    "SubmitRequiresStoredPack", 7, counterexample="collection follows the fresh check before submission")
@@ -2533,7 +2565,7 @@ def verify_checkpoint_replay(args, source):
             self.store.put(&ObjectKey::new(entry.slug.block_key(index)?)?, Bytes::from(block.encode())).await?;
         }
 """
-    root_write = "        self.store.put(&key, Bytes::from(catalog.encode())).await?;\n"
+    root_write = "        self.store.put(&key, Bytes::from(catalog.encode_for_publication())).await?;\n"
     test = "recovery_reads_the_complete_checkpoint_if_interrupted_after_putting_the_root"
     try:
         replace_once(blocks, table_write, "")
@@ -3173,14 +3205,96 @@ def verify_delegated_scan_replay(args, source):
     print(f"{label}: both baseline cases passed and both source controls failed at their expected assertions")
 
 
+def verify_checkpoint_receipts(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    cargo = ["cargo", "test", "--locked"]
+    replica = [*cargo, "-p", "rtdb-replication", "--lib"]
+    multi = [*cargo, "-p", "rtdb-multi", "--features", "dynamodb", "--lib"]
+    directory = [*cargo, "-p", "rtdb-directory", "--features", "dynamodb", "--lib"]
+    cell = [*cargo, "-p", "rtdb-multi", "--features", "dynamodb", "--test", "cell"]
+    root = "driver::tests::a_receipted_checkpoint_checks_the_exact_root_bytes_before_opening"
+    successor = "driver::tests::a_receipted_checkpoint_accepts_only_a_directory_admitted_successor"
+    expired = "store::tests::checkpoint_startup_refuses_a_trim_authorization_ahead_of_its_receipt"
+    held = "store::tests::an_admitted_checkpoint_keeps_metadata_and_replay_until_provider_reads_drain"
+    parked = "dynamo::tests::common_parked_items_round_trip_below_the_record_budget"
+    flush = "explicit_flush_publishes_a_checkpoint_before_replying"
+    blocks = "rust/crates/replication/src/blocks.rs"
+    store = "rust/crates/multi/src/store.rs"
+    fields = "rust/crates/directory/src/lib.rs"
+    cases = (
+        ("root", replica, root, None),
+        ("successor", replica, successor, None),
+        ("released-prefix", multi, expired, None),
+        ("joint-hold", multi, held, None),
+        ("parked", directory, parked, None),
+        ("publish", cell, flush, None),
+        ("trust-unchecked-bytes", replica, root, (
+            blocks, "if root_sha256.is_some_and(|expected| block.publication_sha256() != Some(expected)) {",
+            "if false && root_sha256.is_some_and(|expected| block.publication_sha256() != Some(expected)) {",
+            "receipt validation must read the current root bytes",
+        )),
+        ("use-cached-root", replica, root, (
+            blocks, "let block = if root_sha256.is_some() { self.load_fresh_catalog(index).await? } else { self.load_catalog(index).await? };",
+            "let block = self.load_catalog(index).await?;", "receipt validation must read the current root bytes",
+        )),
+        ("skip-admitted-root", replica, successor, (
+            blocks, "            BlockDiscovery::FromPublished(published) if published.root_sha256.is_some() => BlockDiscovery::At(published.block),",
+            "", "an unadmitted stored successor cannot replace the receipt",
+        )),
+        ("forget-receipt-on-gap", replica, successor, (
+            blocks, "\n                        && recovered.published_checkpoint.is_none_or(|checkpoint| checkpoint.root_sha256.is_none())", "",
+            "the selected receipt must survive a replay gap",
+        )),
+        ("ignore-authorized-trim", multi, expired, (
+            store, "if let Some(anchor) = &record.replica_anchor\n        && let Some((requested, first_retained))",
+            "if false && let Some(anchor) = &record.replica_anchor\n        && let Some((requested, first_retained))",
+            "called `Result::unwrap_err()` on an `Ok` value",
+        )),
+        ("omit-startup-suffix", multi, held, (
+            store, "                    checkpoint_startup_replay(record)?", "                    None",
+            "startup must admit the checkpoint and its replica suffix together",
+        )),
+        ("keep-startup-suffix", multi, held, (
+            fields, "            *checkpoint_replay_from = None;", "",
+            "startup must release both holds after the effects drain",
+        )),
+        ("publish-without-receipt", cell, flush, (
+            "rust/crates/multi/src/agent.rs", "root_sha256: Some(block.publication_sha256()?),", "root_sha256: None,",
+            "a reported flush must publish a receipt for its stored root",
+        )),
+    )
+    for name, command, test, control in cases:
+        command = [*command, test, "--", "--exact"]
+        case = f"rust-checkpoint-receipt-{name}"
+        if not control:
+            result = run_case(command, source / "rust", args.evidence, case, env)
+            if result.returncode or f"{test} ... ok" not in result.stdout or "1 passed; 0 failed" not in result.stdout:
+                raise ValueError(f"checkpoint receipt replay {name} failed")
+            continue
+        relative, before, after, failure = control
+        path = source / relative
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            result = run_case(command, source / "rust", args.evidence, case, env)
+        finally:
+            path.write_bytes(original)
+        if result.returncode != 101 or failure not in result.stdout or f"{test} ... FAILED" not in result.stdout or "0 passed; 1 failed" not in result.stdout:
+            raise ValueError(f"checkpoint receipt control {name} missed its declared assertion")
+    print("rust-checkpoint-receipt: six replays passed and eight controls failed")
+
+
 def verify_checkpoint_metadata_replay(args, source):
     env = os.environ | {
-        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
         "CARGO_PROFILE_DEV_DEBUG": "0",
         "CARGO_PROFILE_TEST_DEBUG": "0",
-        "CARGO_INCREMENTAL": "0",
+        "CARGO_INCREMENTAL": os.environ.get("CARGO_INCREMENTAL", "0"),
     }
-    test = "store::tests::an_admitted_checkpoint_keeps_packed_and_loose_metadata_until_provider_reads_drain"
+    test = "store::tests::an_admitted_checkpoint_keeps_metadata_and_replay_until_provider_reads_drain"
     command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", test, "--", "--exact"]
     label = "rust-multi-checkpoint-metadata"
     baseline = run_case(command, source / "rust", args.evidence, f"{label}-baseline", env)
@@ -3206,10 +3320,10 @@ def verify_checkpoint_metadata_replay(args, source):
 
 def verify_recovery_hold_replay(args, source):
     env = os.environ | {
-        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
         "CARGO_PROFILE_DEV_DEBUG": "0",
         "CARGO_PROFILE_TEST_DEBUG": "0",
-        "CARGO_INCREMENTAL": "0",
+        "CARGO_INCREMENTAL": os.environ.get("CARGO_INCREMENTAL", "0"),
     }
     test = "a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim"
     command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--test", "cell", test, "--", "--exact"]
@@ -3221,8 +3335,9 @@ def verify_recovery_hold_replay(args, source):
     agent = source / "rust/crates/multi/src/agent.rs"
     original = agent.read_bytes()
     try:
-        replace_once(agent, "StorageRegion::ReplicaReplay { first_required, .. } => Some(*first_required),",
-                     "StorageRegion::ReplicaReplay { .. } => None,")
+        replace_once(agent,
+                     "let oldest_replay = record.storage_regions.values().filter_map(StorageRegion::first_required_replica).min().unwrap_or(boundary);",
+                     "let oldest_replay = boundary;")
         control = run_case(command, source / "rust", args.evidence, f"{label}-ignore-holds", env)
         if (
             control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
@@ -3722,6 +3837,7 @@ def main():
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
             verify_recovery_hold_replay(args, source)
+            verify_checkpoint_receipts(args, source)
             verify_checkpoint_metadata_replay(args, source)
             verify_delegated_scan_replay(args, source)
             verify_fragment_residence_replay(args, source)

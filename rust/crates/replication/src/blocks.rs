@@ -136,6 +136,7 @@ pub struct ProducedBlock {
 pub struct PublishedCheckpoint {
     pub block: BlockIndex,
     pub boundary: ReplicaPosition,
+    pub root_sha256: Option<[u8; 32]>,
 }
 
 impl PublishedCheckpoint {
@@ -162,7 +163,7 @@ pub enum BlockDiscovery {
     FromPublished(PublishedCheckpoint),
     /// A restored serving generation requires its archived checkpoint and suppresses
     /// physical compaction effects from the sealed history preceding restoration.
-    FromRestored { checkpoint: BlockIndex, compaction_cutoff: ReplicaPosition },
+    FromRestored { checkpoint: BlockIndex, compaction_cutoff: ReplicaPosition, root_sha256: Option<[u8; 32]> },
     /// Recovers exactly this block, for a reader of the state as of it.
     At(BlockIndex),
     /// Recovers exactly the block and journal boundary admitted by the directory.
@@ -207,7 +208,8 @@ impl BlockStore {
                         recovered.replay_tail = tail.map(|tail| PreparedReplay { logs: Arc::clone(logs), after, tail });
                         return Ok(recovered.with_source_floor(source_floor));
                     }
-                    Err(error) if logs.is_recovery_prefix_gap(after, &error) => error,
+                    Err(error) if logs.is_recovery_prefix_gap(after, &error)
+                        && recovered.published_checkpoint.is_none_or(|checkpoint| checkpoint.root_sha256.is_none()) => error,
                     Err(error) => return Err(error.into()),
                 };
                 let previous = recovered.block.as_ref().map(BlockCatalog::block_index);
@@ -243,8 +245,10 @@ impl BlockStore {
         };
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         let refresh_allowed = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
-        let published_checkpoint = published.and(block.as_ref()).and_then(|block| {
-            block.boundary_replica_position().map(|boundary| PublishedCheckpoint { block: block.block_index(), boundary })
+        let published_checkpoint = published.zip(block.as_ref()).and_then(|(admitted, block)| {
+            block.boundary_replica_position().map(|boundary| PublishedCheckpoint {
+                block: block.block_index(), boundary, root_sha256: admitted.root_sha256,
+            })
         });
         Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff, refresh_allowed, published_checkpoint, replay_tail: None }.with_source_floor(source_floor))
     }
@@ -256,9 +260,13 @@ impl BlockStore {
             None => latest,
         };
         let Some(mut index) = selected else { return Ok(None); };
-        let refresh = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
+        let root_sha256 = match discovery {
+            BlockDiscovery::FromRestored { root_sha256, .. } => root_sha256,
+            _ => published.and_then(|checkpoint| checkpoint.root_sha256),
+        };
+        let refresh = root_sha256.is_none() && matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
         loop {
-            match self.load_checkpoint(index, published).await {
+            match self.load_checkpoint(index, published, root_sha256).await {
                 Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {
                     let listed = self.latest_block(BlockDiscovery::List).await?.map(|index| index.0);
                     let Some(next) = crate::checkpoint_discovery::newer_checkpoint(index.0, listed) else {
@@ -281,6 +289,8 @@ impl BlockStore {
         };
         let discovery = match discovery {
             BlockDiscovery::AtPublished(published) => BlockDiscovery::At(published.block),
+            BlockDiscovery::FromPublished(published) if published.root_sha256.is_some() => BlockDiscovery::At(published.block),
+            BlockDiscovery::FromRestored { checkpoint, root_sha256: Some(_), .. } => BlockDiscovery::At(checkpoint),
             other => other,
         };
         let mut latest = match discovery {
@@ -318,8 +328,20 @@ impl BlockStore {
 
     async fn load_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
         let lease = self.cache.get(&ObjectKey::new(block_key(index)?)?).await?;
-        let reservation = self.reserve_decode(lease.as_slice().len())?;
-        let block = BlockCatalog::decode_reserved(lease.as_slice(), reservation)?;
+        self.decode_catalog(index, lease.as_slice())
+    }
+
+    async fn load_fresh_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
+        let key = ObjectKey::new(block_key(index)?)?;
+        let size = usize::try_from(self.store.head_fresh(&key).await?.size)
+            .map_err(|_| invalid("Checkpoint root exceeds addressable memory"))?;
+        let read = self.memory.reserve(size)?;
+        let bytes = rtdb_storage::IoRegion::retaining(read.clone(), self.store.get_fresh_exact(&key, size)).await?;
+        self.decode_catalog(index, &bytes)
+    }
+
+    fn decode_catalog(&self, index: BlockIndex, bytes: &[u8]) -> Result<BlockCatalog> {
+        let block = BlockCatalog::decode_reserved(bytes, self.reserve_decode(bytes.len())?)?;
         if block.block_index() != index { return Err(invalid("Block filename and payload index differ")); }
         Ok(block)
     }
@@ -374,14 +396,25 @@ impl BlockStore {
     }
 
     pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
-        self.load_checkpoint(index, None).await
+        let block = self.load_fresh_catalog(index).await?;
+        let tables = self.load_tables(&block).await?;
+        Ok((block, tables))
     }
 
-    async fn load_checkpoint(&self, index: BlockIndex, published: Option<PublishedCheckpoint>) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
-        let block = self.load_catalog(index).await?;
+    async fn load_checkpoint(&self, index: BlockIndex, published: Option<PublishedCheckpoint>, root_sha256: Option<[u8; 32]>) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
+        let block = if root_sha256.is_some() { self.load_fresh_catalog(index).await? } else { self.load_catalog(index).await? };
+        if root_sha256.is_some_and(|expected| block.publication_sha256() != Some(expected)) {
+            return Err(invalid("The stored checkpoint root does not match the directory receipt"));
+        }
         if published.is_some_and(|expected| !expected.accepts(&block)) {
             return Err(invalid("The stored checkpoint does not match or advance the admitted checkpoint in its replica journal"));
         }
+        let tables = self.load_tables(&block).await?;
+        Ok((block, tables))
+    }
+
+    async fn load_tables(&self, block: &BlockCatalog) -> Result<BTreeMap<rtdb_types::TableRef, TableBlock>> {
+        let index = block.block_index();
         let mut tables = BTreeMap::new();
         for entry in block.table_entries()? {
             let lease = self.cache.get(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;
@@ -394,7 +427,7 @@ impl BlockStore {
             let reservation = self.reserve_decode(lease.as_slice().len())?;
             tables.insert(entry.table, TableBlock::decode_reserved(lease.as_slice(), reservation)?);
         }
-        Ok((block, tables))
+        Ok(tables)
     }
     pub async fn produce(&self, prepared: &BlockPreparation, boundary: &ReplicaRecord, databases: BTreeMap<String, DatabaseConfig>) -> Result<ProducedBlock> {
         self.produce_cancellable(prepared, boundary, databases, &CancellationToken::new()).await
@@ -452,7 +485,7 @@ impl BlockStore {
         }
         let tx_key = prepared.value().live().latest_completed_tx();
         check_cancelled(cancellation)?;
-        let catalog = BlockCatalog::from_proto(block_pb::Block {
+        let mut catalog = BlockCatalog::from_proto(block_pb::Block {
             block_index: Some(index.0), latest_completed_tx: tx_key.map(|key| block_pb::TxKey { tx_id: Some(key.tx_id.0), system_time: Some(key.system_time.0) }),
             latest_processed_msg_id: message.latest_processed_msg_id,
             table_names: table_catalog.entries().map(|entry| entry.table.schema_and_table()).collect(),
@@ -462,7 +495,7 @@ impl BlockStore {
             naming_epoch: Some(i64::try_from(prepared.value().trie_catalog().naming_epoch()).map_err(|_| invalid("Naming epoch exceeds the block format"))?),
             table_block_manifest: Some(block_pb::TableBlockManifest { sha256_by_oid }),
         })?;
-        self.store.put(&key, Bytes::from(catalog.encode())).await?;
+        self.store.put(&key, Bytes::from(catalog.encode_for_publication())).await?;
         Ok(ProducedBlock { catalog, tries })
     }
     fn reserve_decode(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {

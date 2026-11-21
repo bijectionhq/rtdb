@@ -217,6 +217,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/PackPublicationObservation.tla` checks the identity shared by pack metadata, the trailer, the index and member reads, including a fork copy.
   `lean/PackPublicationObservation.lean` proves preservation through arbitrary finite schedules in the versioned read model.
   The Rust replays use a versioned memory store for pack inspection and a loopback S3 provider for version evidence from a ranged response.
+* `tla/ReceiptedCheckpointStartup.tla` checks exact root selection, joint metadata and replay retention, and their handoff to a cursor.
+  `lean/ReceiptedCheckpointStartup.lean` proves preservation under arbitrary finite effect schedules and replay offsets in the abstract model.
+  Native cases exercise a directory receipt, a stored successor, an authorized trim, cancellation, packed directory serialization and the real flush path.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `hyperltl/CheckpointRecovery.hltl` compares every pair of modeled startup schedules with the same stable, readable replacement.

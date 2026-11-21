@@ -517,7 +517,7 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     assert_eq!(fixture.driver.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     assert_eq!(fixture.driver.partition.value().live().block_row_count(), 0);
     use crate::BlockDiscovery::{At, From, FromPublished, List};
-    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(0) };
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(0), root_sha256: None };
     for discovery in [List, From(BlockIndex(0)), From(BlockIndex(5)), FromPublished(published), At(BlockIndex(0))] {
         let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), discovery).await.unwrap();
         assert_eq!(recovered.block.as_ref().map(|block| block.block_index()), Some(BlockIndex(0)), "{discovery:?} finds the latest block");
@@ -526,7 +526,7 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
         assert_eq!(recovered.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     }
     let missing = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000),
-        FromPublished(PublishedCheckpoint { block: BlockIndex(5), boundary: ReplicaPosition(5) }))
+        FromPublished(PublishedCheckpoint { block: BlockIndex(5), boundary: ReplicaPosition(5), root_sha256: None }))
         .await.err().expect("an admitted published bound cannot fall back to an older block");
     assert_eq!(missing.code, "rtdb.replication/block-gone");
 }
@@ -537,7 +537,7 @@ async fn hosted_checkpoint_recovery_preserves_its_admitted_journal_boundary() {
     use rtdb_storage::ObjectKey;
 
     let fixture = produced_memory_checkpoint(true).await;
-    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(1) };
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(1), root_sha256: None };
     let snapshot = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
         BlockDiscovery::AtPublished(published)).await.unwrap();
     assert_eq!(snapshot.block.as_ref().unwrap().boundary_replica_position(), Some(published.boundary));
@@ -575,9 +575,64 @@ async fn hosted_checkpoint_recovery_preserves_its_admitted_journal_boundary() {
 }
 
 #[tokio::test]
+async fn a_receipted_checkpoint_checks_the_exact_root_bytes_before_opening() {
+    use rtdb_format::{catalog::{BlockCatalog, publication_digest}, keys::block_key};
+    use rtdb_storage::{ObjectKey, ObjectStore};
+
+    let fixture = produced_memory_checkpoint(true).await;
+    let block = BlockIndex(0);
+    let key = ObjectKey::new(block_key(block).unwrap()).unwrap();
+    let bytes = fixture.store.get(&key).await.unwrap();
+    let cached = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), BlockDiscovery::List).await.unwrap();
+    let catalog = cached.block.unwrap();
+    let admitted = BlockDiscovery::AtPublished(PublishedCheckpoint {
+        block,
+        boundary: ReplicaPosition(1),
+        root_sha256: Some(publication_digest(&bytes)),
+    });
+    assert_eq!(catalog.publication_sha256(), Some(publication_digest(&bytes)));
+    fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted).await.unwrap();
+
+    let mut different = bytes.to_vec();
+    different.extend_from_slice(&[0xa0, 0x06, 0x01]);
+    assert_eq!(BlockCatalog::decode(&different).unwrap(), catalog);
+    fixture.store.delete(&key).await.unwrap();
+    fixture.store.put(&key, different.into()).await.unwrap();
+    let error = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted)
+        .await.err().expect("receipt validation must read the current root bytes");
+    assert_eq!(error.message.as_deref(), Some("The stored checkpoint root does not match the directory receipt"));
+}
+
+#[tokio::test]
+async fn a_receipted_checkpoint_accepts_only_a_directory_admitted_successor() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (catalog, _) = fixture.blocks.load(BlockIndex(0)).await.unwrap();
+    let admitted = BlockDiscovery::FromPublished(PublishedCheckpoint {
+        block: BlockIndex(0), boundary: ReplicaPosition(1), root_sha256: catalog.publication_sha256(),
+    });
+    let mut writer = produce_newer_memory_checkpoint(&fixture).await;
+    deliver_checkpoint_record(&fixture, &mut writer, 2, 2, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    let (later, _) = fixture.blocks.load(BlockIndex(1)).await.unwrap();
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted)
+        .await.expect("an unadmitted stored successor cannot replace the receipt");
+    assert_eq!(recovered.block.as_ref().unwrap().block_index(), BlockIndex(0));
+    fixture.replica.truncate_before(LogOffset(4)).unwrap();
+    let error = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &CancellationToken::new())
+        .await.err().expect("a suffix gap requires fresh directory admission");
+    assert_eq!(error.code, "rtdb.storage/log-range-unavailable", "the selected receipt must survive a replay gap");
+
+    let admitted = BlockDiscovery::FromPublished(PublishedCheckpoint {
+        block: later.block_index(), boundary: later.boundary_replica_position().unwrap(), root_sha256: later.publication_sha256(),
+    });
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted).await.unwrap();
+    let recovered = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &CancellationToken::new()).await.unwrap();
+    assert_eq!(recovered.block.unwrap().block_index(), BlockIndex(1));
+}
+
+#[tokio::test]
 async fn hosted_checkpoint_recovery_can_use_a_later_boundary_after_prefix_collection() {
     let fixture = produced_memory_checkpoint(true).await;
-    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(1) };
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(1), root_sha256: None };
     let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
         BlockDiscovery::FromPublished(published)).await.unwrap();
     let mut writer = produce_newer_memory_checkpoint(&fixture).await;
@@ -2333,7 +2388,7 @@ async fn exact_and_restored_recovery_require_the_selected_checkpoint() {
     fixture.store.delete(&old).await.unwrap();
     let restored = fixture.blocks.recover(
         TrieConfig::default(), SourcePosition(-1), Timestamp(1000),
-        BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: ReplicaPosition(0) },
+        BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: ReplicaPosition(0), root_sha256: None },
     ).await.err().unwrap();
     assert_eq!(restored.code, "rtdb.replication/block-gone");
 }
@@ -2359,7 +2414,7 @@ async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss(
     let cancellation = CancellationToken::new();
     for (discovery, cutoff) in [
         (BlockDiscovery::At(BlockIndex(0)), None),
-        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary }, Some(boundary)),
+        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary, root_sha256: None }, Some(boundary)),
     ] {
         let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), discovery).await.unwrap();
         let selected = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &cancellation).await.unwrap();

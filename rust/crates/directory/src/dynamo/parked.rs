@@ -68,7 +68,7 @@ struct PackedCatalogFloor {
     through: i64,
 }
 
-#[derive(Clone, Copy, PartialEq, Message)]
+#[derive(Clone, PartialEq, Message)]
 struct PackedCheckpoint {
     #[prost(sint64, tag = "1")]
     block: i64,
@@ -78,6 +78,8 @@ struct PackedCheckpoint {
     source: i64,
     #[prost(sint64, tag = "4")]
     system_time: i64,
+    #[prost(bytes = "vec", tag = "5")]
+    root_sha256: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -136,7 +138,9 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         log_epoch: *log_epoch,
         parent: parent.clone(),
         linearizable_reads: *linearizable_reads,
-        checkpoint: checkpoint.map(|Checkpoint { block, boundary, source, system_time }| PackedCheckpoint { block, boundary, source, system_time }),
+        checkpoint: checkpoint.map(|Checkpoint { block, boundary, source, system_time, root_sha256 }| PackedCheckpoint {
+            block, boundary, source, system_time, root_sha256: root_sha256.map_or_else(Vec::new, |bytes| bytes.to_vec()),
+        }),
         replica_anchor: replica_anchor.as_deref().map(|anchor| PackedJournalAnchor {
             root_incarnation: anchor.root_incarnation, first: anchor.interval[0], through: anchor.interval[1], digest: anchor.digest.to_vec(),
         }),
@@ -207,6 +211,12 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
             return Err(invalid("A parked record contains multiple catalog floors for a storage root"));
         }
     }
+    let checkpoint = packed.checkpoint.map(|PackedCheckpoint { block, boundary, source, system_time, root_sha256 }| {
+        let root_sha256 = if root_sha256.is_empty() { None } else {
+            Some(root_sha256.try_into().map_err(|_| invalid("Invalid checkpoint root digest"))?)
+        };
+        Ok::<_, Anomaly>(Checkpoint { block, boundary, source, system_time, root_sha256 })
+    }).transpose()?;
     Ok(DeploymentRecord {
         id: id.to_owned(),
         name: name.to_owned(),
@@ -228,7 +238,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         move_from: None,
         log_copy_servers: Vec::new(),
         linearizable_reads: packed.linearizable_reads,
-        checkpoint: packed.checkpoint.map(|PackedCheckpoint { block, boundary, source, system_time }| Checkpoint { block, boundary, source, system_time }),
+        checkpoint,
         replica_anchor,
         moved_at_ms: None,
         source_cleanup: None,

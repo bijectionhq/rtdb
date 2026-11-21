@@ -660,6 +660,10 @@ config {
 -- A packed file's check requires the containing pack to be present in storage.
 -- The pack index confines entries to the payload before the trailer.
 -- With provider versions, the pack metadata, trailer, index and each returned member range must name the same physical publication.
+-- Hosted publication records the digest of the adopted catalog bytes next to its checkpoint coordinate.
+-- Opening a directory receipt verifies fresh root bytes before loading table metadata.
+-- An ordinary startup admits the root metadata and first required replica offset in one directory update.
+-- The startup grant lasts through cursor admission and the drain of the provider reads it owns.
 -- Those files remain required until follower adoption.
 -- A failed historical check or older candidate preparation discards the remaining older confirmations.
 -- The writer continues recovery of the selected checkpoint.

@@ -505,7 +505,7 @@ mod tests {
         holds.tasks.wait().await;
         record = directory.deployment(&record.id).await.unwrap().unwrap();
         let version = record.version;
-        record.checkpoint = Some(Checkpoint { block: 1, boundary: 5, source: 1, system_time: 0 });
+        record.checkpoint = Some(Checkpoint { block: 1, boundary: 5, source: 1, system_time: 0, root_sha256: None });
         record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation: record.incarnation, interval: [0, 4], digest: [0; 32] }));
         let Cas::Applied(mut record) = directory.replace_deployment(record, version).await.unwrap() else { panic!("failed to authorize trim"); };
         assert_eq!(provider.first_retained(), LogOffset(0));
