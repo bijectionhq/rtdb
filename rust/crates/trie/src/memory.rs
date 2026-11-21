@@ -7,7 +7,8 @@ use rtdb_types::{Anomaly, Iid, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::bucketer::invalid_bucket_depth;
-use crate::leaf_merge_step::{compare_row_keys, merge_sorted_rows};
+use crate::leaf_merge_step::compare_row_keys;
+use crate::leaf_sort_step::{merge_overflow_rows, merge_pending_rows};
 use crate::partition_step::group_base4_rows;
 use crate::{Bucketer, Path};
 
@@ -59,8 +60,9 @@ impl Leaf {
     pub fn sorted_rows<R: IidReader + ?Sized>(&self, reader: &R) -> Result<Arc<[u32]>> {
         if self.log.is_empty() { return Ok(Arc::clone(&self.data)); }
         if let Some(sorted) = self.sorted.get() { return Ok(Arc::clone(sorted)); }
-        let log = sort(reader, self.log.iter().copied())?;
-        let merged: Arc<[u32]> = merge(reader, &self.data, &log)?.into();
+        let merged: Arc<[u32]> = merge_pending_rows(&self.data, self.log.iter().copied(), |row| {
+            reader.iid(row).map(|iid| iid.0)
+        })?.into();
         let _ = self.sorted.set(Arc::clone(&merged));
         Ok(merged)
     }
@@ -180,18 +182,6 @@ fn compare<R: IidReader + ?Sized>(reader: &R, left: u32, right: u32) -> Result<O
     Ok(compare_row_keys(&left_iid.0, left, &right_iid.0, right))
 }
 
-fn sort<R: IidReader + ?Sized>(reader: &R, rows: impl Iterator<Item = u32>) -> Result<Vec<u32>> {
-    let mut keyed = rows.map(|row| Ok((reader.iid(row)?, row))).collect::<Result<Vec<_>>>()?;
-    keyed.sort_unstable_by(|(left_iid, left), (right_iid, right)| {
-        compare_row_keys(&left_iid.0, *left, &right_iid.0, *right)
-    });
-    Ok(keyed.into_iter().map(|(_, row)| row).collect())
-}
-
-fn merge<R: IidReader + ?Sized>(reader: &R, left: &[u32], right: &[u32]) -> Result<Vec<u32>> {
-    merge_sorted_rows(left, right, |left, right| compare(reader, left, right))
-}
-
 fn insert_rows<R: IidReader + ?Sized>(
     node: &Arc<TrieNode>, reader: &R, rows: impl ExactSizeIterator<Item = u32>, config: TrieConfig,
 ) -> Result<Arc<TrieNode>> {
@@ -219,9 +209,9 @@ fn insert_rows<R: IidReader + ?Sized>(
                 let next = Arc::new(TrieNode::Leaf(Leaf::new(leaf.path.clone(), Arc::clone(&leaf.data), log.into())));
                 if count == config.log_limit { compact(&next, reader, config) } else { Ok(next) }
             } else {
-                let new_rows = sort(reader, rows)?;
-                let pending = sort(reader, leaf.log.iter().copied())?;
-                let merged = merge(reader, &leaf.data, &merge(reader, &pending, &new_rows)?)?;
+                let merged = merge_overflow_rows(&leaf.data, leaf.log.iter().copied(), rows, |row| {
+                    reader.iid(row).map(|iid| iid.0)
+                })?;
                 build_subtree(leaf.path.clone(), merged, reader, config, true)
             }
         }

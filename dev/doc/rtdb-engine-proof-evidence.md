@@ -34,7 +34,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | LOG13 · Journal retirement | Lean proves that replay and compaction preserve the retirement marker, and that completion requires every addressed replica. Kani checks replay of the production `Drop` event and subsequent commit refusal on an empty stream. Native replicas exercise retirement retry, restart, and direct checks for removed payloads. | Prove the runtime journal and fsync transitions, the inventory of all required replicas after copy or move, and the storage and deletion receipt contracts. |
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
 | IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, and stable partition of an insertion or split batch at every valid depth. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Compose grouping, leaf ordering, and recursive replacement at actual Rust and JVM call sites, then connect the resulting trees to traversal and replay. |
-| IDX02, IDX03, IDX07 | Verus checks that the production Rust leaf merge returns every input occurrence in order. An injective logical rank uniquely determines the successful output sequence from those occurrences. | Compose the checked comparator and merge with the production readers, sorted-run construction, and the JVM merge. |
+| IDX02, IDX03, IDX07 | Verus checks that the production Rust sort and merge in cache fill, compaction and bulk overflow return every input occurrence in IID order or report a reader error. An injective logical rank uniquely determines the successful output sequence. | Establish the stable-IID premise at each runtime reader, prove that persisted and split runs preserve all stored-run premises in the actual tree, and compose the JVM paths. |
 | IDX01, IDX08 | Verus checks the production Rust search, append, and adjacent chunk replacement against one contiguous-layout invariant. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Prove the Arrow row-content obligation and refine snapshot ownership across block transitions in both engines. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
@@ -162,14 +162,27 @@ The native run passed 497 tests with `cargo test --manifest-path rust/Cargo.toml
 
 ### Production leaf merge
 
-Rust leaf sorting and compaction use the verified two-run merge.
-With sorted input runs, representable output capacity, and a fallible comparator consistent with a stable rank, Verus proves that a successful merge is sorted and its row multiset is the sum of the two input multisets.
+The production Rust merge reads both input heads through the IID reader and passes their keys and ordinals to the checked comparator.
+Verus proves that with ordered input runs, representable allocation capacity, and stable IIDs on successful reads, the resulting run is ordered and contains every occurrence from the two runs.
+The checked invariant accounts for each row exactly once between the emitted prefix and the two unread suffixes.
 An injective rank gives one ordered output sequence for that multiset.
-The rank law proves that a fixed-width IID interpreted as an unsigned big-endian number, with a descending row-index suffix, agrees with the specified bytewise IID and row-index order.
-The merge proof takes sorted input runs and the production comparator's agreement with that rank as premises.
-The native tests exercise repeated rows, the unconsumed tail, and propagation of a comparison failure.
-Verus 0.2026.11.05.31e44e6 checked fourteen functions and rejected four mutations that select the larger head, omit the tail, consume a row without emitting it, or reverse the order within an IID.
-The native run passed 499 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production merge and tests](../../rust/crates/trie/src/leaf_merge_step.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
+The error postcondition requires the returned error to come from a read of an input row.
+The Rust tests pin the order of the reads, stopping on the first failure, and copying the unread tail.
+An additional regression runs through the public leaf API and checks that a failed merge publishes no cache entry, a retry yields the complete sorted leaf, and later reads reuse that cached result.
+The merge controls include reading the wrong head or returning a partial result as success after an IID read failed. [Production merge](../../rust/crates/trie/src/leaf_merge_step.rs) · [Leaf retry regression](../../rust/crates/trie/tests/contracts.rs)
+
+### Production leaf sort and composition
+
+Verus checks the native decoration loop that reads the IID for each pending ordinal and the projection that extracts every ordinal after sorting.
+The proof assumes iterator laws, stable IIDs on successful reads, and the Rust standard library's `sort_unstable_by` contract that a total-order comparison yields an ordered permutation on return.
+The actual comparison in the sort is checked against the same rank used for merging.
+The composition used by a cache miss sorts the pending log and merges it with the stored run.
+The composition used by a bulk overflow sorts the new batch and the pending log, merges them, and merges the result with the stored run.
+Given an ordered stored run and representable total capacity, both results are ordered and contain every input occurrence, including duplicate ordinals.
+A returned error comes from an input-row lookup.
+The new native regression checks that a read failure stops each sort, a retry returns the full duplicate-preserving order, and a failed bulk insertion leaves the original trie readable.
+Verus 0.2026.11.05.31e44e6 checked thirty-one functions and rejected fourteen mutations, including reversing the sort, discarding projected rows, and losing a run at either composed merge.
+The native run passed 506 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production sort and composition](../../rust/crates/trie/src/leaf_sort_step.rs) · [Trie call sites](../../rust/crates/trie/src/memory.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
 
 ### Production leaf comparison
 
@@ -177,8 +190,7 @@ The Rust pending-log sort, two-run merge and persisted-leaf validation use the s
 Verus checks that the production comparator returns Less exactly when the logical rank is smaller and Equal exactly when both IID and ordinal agree.
 The proof takes the standard Rust array comparator's lexicographic contract as a library assumption and uses Verus's specification for unsigned integer comparisons.
 It checks the row tie-break and the combination with IID order in the actual Rust function.
-Verus 0.2026.11.05.31e44e6 checked fifteen functions in the comparator and merge study.
-It rejected six controls, including reversing either the IID comparison or the row tie-break in the production comparator.
+The comparison controls reverse either the IID comparison or the row tie-break in the production comparator.
 
 The JVM comparator uses Arrow's comparison of sixteen-byte IID views and compares row indices in descending order when the IIDs match.
 Inspection of Arrow 19.0.0 bytecode found two word comparisons with byte-order normalization and a sign-bit flip before signed long comparison.

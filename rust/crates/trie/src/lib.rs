@@ -1,5 +1,6 @@
 mod bucketer;
 mod leaf_merge_step;
+mod leaf_sort_step;
 mod partition_step;
 mod memory;
 mod merge;

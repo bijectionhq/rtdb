@@ -4,10 +4,58 @@ use std::cmp::Ordering;
 
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use vstd::multiset::Multiset;
 
 #[cfg(verus_keep_ghost)]
 verus! {
 pub(crate) type RowRank = spec_fn(u32) -> int;
+pub(crate) type IidAt = spec_fn(u32) -> Seq<u8>;
+
+#[verifier::opaque]
+pub(crate) closed spec fn iid_rank(iid_at: IidAt) -> RowRank {
+    |row| crate::laws::row_rank(iid_at(row), row)
+}
+
+pub(crate) proof fn iid_rank_exposes_the_row_key(iid_at: IidAt, row: u32)
+    ensures iid_rank(iid_at)(row) == crate::laws::row_rank(iid_at(row), row),
+{
+    reveal(iid_rank);
+}
+
+pub(crate) closed spec fn declined_row<F, E>(
+    left: Seq<u32>, right: Seq<u32>, reader: &F, error: E,
+) -> bool
+where F: Fn(u32) -> Result<[u8; 16], E>
+{
+    exists |row: u32| (left.contains(row) || right.contains(row))
+        && #[trigger] reader.ensures((row,), Err(error))
+}
+
+pub(crate) proof fn record_iid_error<F, E>(left: Seq<u32>, right: Seq<u32>, reader: &F, row: u32, error: E)
+where F: Fn(u32) -> Result<[u8; 16], E>
+requires
+    left.contains(row) || right.contains(row),
+    reader.ensures((row,), Err(error)),
+ensures declined_row(left, right, reader, error),
+{
+}
+
+pub(crate) proof fn widen_iid_error<F, E>(
+    left: Seq<u32>, right: Seq<u32>, allowed: Seq<u32>, reader: &F, error: E,
+)
+where F: Fn(u32) -> Result<[u8; 16], E>
+requires
+    declined_row(left, right, reader, error),
+    forall |row: u32| #![trigger left.contains(row)] #![trigger right.contains(row)]
+        (left.contains(row) || right.contains(row))
+        ==> allowed.contains(row),
+ensures declined_row(allowed, Seq::empty(), reader, error),
+{
+    let row = choose |row: u32| (left.contains(row) || right.contains(row))
+        && #[trigger] reader.ensures((row,), Err(error));
+    assert(allowed.contains(row));
+}
 
 broadcast use {vstd::seq_lib::group_seq_properties, vstd::multiset::group_multiset_properties};
 
@@ -26,6 +74,31 @@ proof fn append_sorted(prefix: Seq<u32>, suffix: Seq<u32>, rank: RowRank)
 {
     assert forall |i: int, j: int| 0 <= i < j < (prefix + suffix).len() implies
         rank(#[trigger] (prefix + suffix)[i]) <= rank(#[trigger] (prefix + suffix)[j]) by {}
+}
+
+spec fn total_bag(prefix: Seq<u32>, left: Seq<u32>, right: Seq<u32>) -> Multiset<u32> {
+    prefix.to_multiset().add(left.to_multiset()).add(right.to_multiset())
+}
+
+proof fn transfer_head(prefix: Seq<u32>, chosen: Seq<u32>, other: Seq<u32>)
+    requires chosen.len() > 0,
+    ensures
+        total_bag(prefix.push(chosen[0]), chosen.drop_first(), other)
+            == total_bag(prefix, chosen, other),
+        total_bag(prefix.push(chosen[0]), other, chosen.drop_first())
+            == total_bag(prefix, other, chosen),
+{
+    broadcast use vstd::multiset::group_multiset_axioms;
+
+    let head = seq![chosen[0]];
+    assert(prefix.push(chosen[0]) =~= prefix + head);
+    assert(chosen =~= head + chosen.drop_first());
+    vstd::seq_lib::lemma_multiset_commutative(prefix, head);
+    vstd::seq_lib::lemma_multiset_commutative(head, chosen.drop_first());
+    assert(total_bag(prefix.push(chosen[0]), chosen.drop_first(), other)
+        =~= total_bag(prefix, chosen, other));
+    assert(total_bag(prefix.push(chosen[0]), other, chosen.drop_first())
+        =~= total_bag(prefix, other, chosen));
 }
 
 proof fn push_minimum(prefix: Seq<u32>, chosen: Seq<u32>, other: Seq<u32>, rank: RowRank)
@@ -81,28 +154,33 @@ pub(crate) fn compare_row_keys(
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
-    with Ghost(rank): Ghost<RowRank>
+    with Ghost(iid_at): Ghost<IidAt>
     requires
         left@.len() + right@.len() <= usize::MAX,
-        ordered(left@, rank),
-        ordered(right@, rank),
-        forall |l: u32, r: u32| #[trigger] compare.requires((l, r)),
-        forall |l: u32, r: u32, result: Result<Ordering, E>|
-            #[trigger] compare.ensures((l, r), result) && result is Ok
-                ==> (result->Ok_0 == Ordering::Less) == (rank(l) < rank(r)),
+        ordered(left@, iid_rank(iid_at)),
+        ordered(right@, iid_rank(iid_at)),
+        forall |row: u32| #[trigger] read_iid.requires((row,)),
+        forall |row: u32, found: Result<[u8; 16], E>|
+            #[trigger] read_iid.ensures((row,), found) && found is Ok ==> found->Ok_0@ == iid_at(row),
     ensures
-        result is Ok ==> ordered(result->Ok_0@, rank) &&
+        result is Ok ==> ordered(result->Ok_0@, iid_rank(iid_at)) &&
             result->Ok_0@.to_multiset() == (left@ + right@).to_multiset(),
+        result is Err ==> declined_row(left@, right@, &read_iid, result->Err_0),
 ))]
-pub(crate) fn merge_sorted_rows<F, E>(left: &[u32], right: &[u32], compare: F) -> Result<Vec<u32>, E>
+pub(crate) fn merge_sorted_rows<F, E>(left: &[u32], right: &[u32], read_iid: F) -> Result<Vec<u32>, E>
 where
-    F: Fn(u32, u32) -> Result<Ordering, E>,
+    F: Fn(u32) -> Result<[u8; 16], E>,
 {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost rank = iid_rank(iid_at);
+    }
     let mut merged = Vec::with_capacity(left.len() + right.len());
     let mut li = 0;
     let mut ri = 0;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant
+            rank == iid_rank(iid_at),
             li <= left@.len(),
             ri <= right@.len(),
             ordered(left@, rank),
@@ -110,24 +188,51 @@ where
             ordered(merged@, rank),
             before(merged@, left@.skip(li as int), rank),
             before(merged@, right@.skip(ri as int), rank),
-            (merged@ + left@.skip(li as int) + right@.skip(ri as int)).to_multiset() ==
-                (left@ + right@).to_multiset(),
-            forall |l: u32, r: u32| #[trigger] compare.requires((l, r)),
-            forall |l: u32, r: u32, result: Result<Ordering, E>|
-                #[trigger] compare.ensures((l, r), result) && result is Ok
-                    ==> (result->Ok_0 == Ordering::Less) == (rank(l) < rank(r)),
+            total_bag(merged@, left@.skip(li as int), right@.skip(ri as int))
+                == left@.to_multiset().add(right@.to_multiset()),
+            forall |row: u32| #[trigger] read_iid.requires((row,)),
+            forall |row: u32, found: Result<[u8; 16], E>|
+                #[trigger] read_iid.ensures((row,), found) && found is Ok ==> found->Ok_0@ == iid_at(row),
         decreases (left@.len() - li) + (right@.len() - ri),
     ))]
     while li < left.len() && ri < right.len() {
-        let compared = compare(left[li], right[ri]);
+        let left_row = left[li];
+        let right_row = right[ri];
+        let read_left = read_iid(left_row);
         #[cfg(verus_keep_ghost)]
         proof! {
-            assert(compare.ensures((left@[li as int], right@[ri as int]), compared));
+            assert(read_iid.ensures((left_row,), read_left));
+            assert(left@.contains(left_row));
         }
-        let order = match compared {
-            Ok(order) => order,
-            Err(error) => return Err(error),
+        let left_iid = match read_left {
+            Ok(iid) => iid,
+            Err(error) => {
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert(read_iid.ensures((left_row,), Err(error)));
+                    assert(declined_row(left@, right@, &read_iid, error));
+                }
+                return Err(error);
+            }
         };
+        let read_right = read_iid(right_row);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(read_iid.ensures((right_row,), read_right));
+            assert(right@.contains(right_row));
+        }
+        let right_iid = match read_right {
+            Ok(iid) => iid,
+            Err(error) => {
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert(read_iid.ensures((right_row,), Err(error)));
+                    assert(declined_row(left@, right@, &read_iid, error));
+                }
+                return Err(error);
+            }
+        };
+        let order = compare_row_keys(&left_iid, left_row, &right_iid, right_row);
         #[cfg(verus_keep_ghost)]
         proof_decl! {
             let ghost l = left@.skip(li as int);
@@ -136,6 +241,16 @@ where
         }
         #[cfg(verus_keep_ghost)]
         proof! {
+            assert(read_left == Ok(left_iid));
+            assert(read_right == Ok(right_iid));
+            assert(left_iid@ == iid_at(left_row));
+            assert(right_iid@ == iid_at(right_row));
+            assert(l[0] == left_row);
+            assert(r[0] == right_row);
+            iid_rank_exposes_the_row_key(iid_at, left_row);
+            iid_rank_exposes_the_row_key(iid_at, right_row);
+            assert(rank(left_row) == crate::laws::row_rank(left_iid@, left_row));
+            assert(rank(right_row) == crate::laws::row_rank(right_iid@, right_row));
             assert((order == Ordering::Less) == (rank(l[0]) < rank(r[0])));
             assert(ordered(l, rank));
             assert(ordered(r, rank));
@@ -150,7 +265,9 @@ where
             li += 1;
             #[cfg(verus_keep_ghost)]
             proof! {
-                assert(merged@ + left@.skip(li as int) + r =~= old_prefix + l + r);
+                assert(merged@ =~= old_prefix.push(l[0]));
+                assert(left@.skip(li as int) =~= l.drop_first());
+                transfer_head(old_prefix, l, r);
             }
         } else {
             #[cfg(verus_keep_ghost)]
@@ -162,17 +279,9 @@ where
             ri += 1;
             #[cfg(verus_keep_ghost)]
             proof! {
-                let single = seq![r[0]];
-                let tail = right@.skip(ri as int);
-                vstd::seq_lib::lemma_seq_union_to_multiset_commutative(single, l);
-                assert(merged@ + l + tail =~= old_prefix + (single + l) + tail);
-                assert(old_prefix + l + r =~= old_prefix + (l + single) + tail);
-                vstd::seq_lib::lemma_multiset_commutative(old_prefix, single + l);
-                vstd::seq_lib::lemma_multiset_commutative(old_prefix, l + single);
-                vstd::seq_lib::lemma_multiset_commutative(old_prefix + (single + l), tail);
-                vstd::seq_lib::lemma_multiset_commutative(old_prefix + (l + single), tail);
-                assert((merged@ + l + tail).to_multiset()
-                    =~= (old_prefix + l + r).to_multiset());
+                assert(merged@ =~= old_prefix.push(r[0]));
+                assert(right@.skip(ri as int) =~= r.drop_first());
+                transfer_head(old_prefix, r, l);
             }
         }
     }
@@ -197,6 +306,9 @@ where
         assert(before(prefix + l, r, rank));
         append_sorted(prefix + l, r, rank);
         assert(merged@ =~= prefix + l + r);
+        vstd::seq_lib::lemma_multiset_commutative(prefix, l);
+        vstd::seq_lib::lemma_multiset_commutative(prefix + l, r);
+        vstd::seq_lib::lemma_multiset_commutative(left@, right@);
     }
     Ok(merged)
 }
@@ -210,20 +322,25 @@ mod tests {
 
     #[test]
     fn merge_counts_every_occurrence_and_keeps_the_remaining_suffix() {
-        let merged = merge_sorted_rows(&[9, 7, 7, 5], &[10, 7, 3, 1], |left, right| {
-            Ok::<_, Infallible>(right.cmp(&left))
+        let merged = merge_sorted_rows(&[9, 7, 7, 5], &[10, 7, 3, 1], |_| {
+            Ok::<_, Infallible>([0; 16])
         });
         assert_eq!(merged.unwrap(), [10, 9, 7, 7, 7, 5, 3, 1]);
     }
 
     #[test]
-    fn merge_propagates_a_comparison_error_at_the_current_heads() {
-        let compared = RefCell::new(Vec::new());
-        let merged = merge_sorted_rows(&[2, 4, 7], &[1, 5, 8], |left, right| {
-            compared.borrow_mut().push((left, right));
-            if right == 5 { Err(right) } else { Ok(left.cmp(&right)) }
+    fn merge_stops_on_the_first_failed_iid_read() {
+        let visited = RefCell::new(Vec::new());
+        let merged = merge_sorted_rows(&[2, 4, 7], &[1, 5, 8], |row| {
+            visited.borrow_mut().push(row);
+            if row == 5 {
+                return Err(row);
+            }
+            let mut iid = [0; 16];
+            iid[..4].copy_from_slice(&row.to_be_bytes());
+            Ok(iid)
         });
         assert_eq!(merged, Err(5));
-        assert_eq!(compared.into_inner(), [(2, 1), (2, 5)]);
+        assert_eq!(visited.into_inner(), [2, 1, 2, 5]);
     }
 }

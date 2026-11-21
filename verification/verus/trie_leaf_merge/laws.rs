@@ -1,4 +1,6 @@
-use crate::production::{ordered, RowRank};
+use std::cmp::Ordering;
+
+use crate::leaf_merge_step::{ordered, RowRank};
 use vstd::prelude::*;
 use vstd::relations::{sorted_by, total_ordering};
 use vstd::seq_lib::lemma_sorted_unique;
@@ -10,6 +12,32 @@ pub assume_specification<T: Ord, const N: usize> [<[T; N] as Ord>::cmp](
     left: &[T; N], right: &[T; N],
 ) -> (result: core::cmp::Ordering)
     ensures T::obeys_cmp_spec() ==> result == lex_order(left@, right@),
+;
+
+pub open spec fn ordered_by<T>(rows: Seq<T>, rank: spec_fn(T) -> int) -> bool {
+    forall |i: int, j: int| 0 <= i < j < rows.len() ==>
+        rank(#[trigger] rows[i]) <= rank(#[trigger] rows[j])
+}
+
+#[verifier::opaque]
+pub open spec fn consistent_comparison<T, F>(
+    compare: F, rank: spec_fn(T) -> int,
+) -> bool
+where F: FnMut(&T, &T) -> Ordering
+{
+    forall |a: T, b: T, order: Ordering| #[trigger] compare.ensures((&a, &b), order) ==>
+        ((order == Ordering::Less) == (rank(a) < rank(b))) &&
+        ((order == Ordering::Equal) == (rank(a) == rank(b)))
+}
+
+pub assume_specification<T, F>[ <[T]>::sort_unstable_by ](rows: &mut [T], compare: F)
+where F: FnMut(&T, &T) -> Ordering
+requires
+    forall |a: T, b: T| #[trigger] compare.requires((&a, &b)),
+ensures
+    final(rows)@.to_multiset() == old(rows)@.to_multiset(),
+    forall |rank: spec_fn(T) -> int| #[trigger] consistent_comparison(compare, rank)
+        ==> ordered_by(final(rows)@, rank),
 ;
 
 pub(crate) proof fn multiplicities_determine_the_ordered_row_sequence(

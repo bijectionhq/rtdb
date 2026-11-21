@@ -244,6 +244,91 @@ fn leaf_order_matches_unsigned_iids_and_descending_row_indices() {
 }
 
 #[test]
+fn failed_merge_lookup_can_be_retried_before_the_leaf_is_cached() {
+    struct Reader<'a> {
+        iids: &'a [Iid],
+        rejected: Option<u32>,
+        visited: RefCell<Vec<u32>>,
+    }
+
+    impl IidReader for Reader<'_> {
+        fn iid(&self, row: u32) -> Result<Iid> {
+            self.visited.borrow_mut().push(row);
+            if self.rejected == Some(row) {
+                return Err(rtdb_types::Anomaly::incorrect("test/iid-read", "IID lookup failed"));
+            }
+            self.iids.iid(row)
+        }
+    }
+
+    let iids = [iid(1), iid(3), iid(2)];
+    let persisted = PersistedTrie {
+        log_limit: 4,
+        page_limit: 4,
+        root_path: vec![],
+        root: PersistedNode::Leaf(vec![0, 1]),
+    };
+    let trie = MemoryHashTrie::from_persisted(persisted, &iids[..]).unwrap()
+        .add(&iids[..], 2).unwrap();
+    let mut reader = Reader { iids: &iids, rejected: Some(0), visited: RefCell::new(Vec::new()) };
+
+    assert_eq!(trie.sorted_rows(&reader).unwrap_err().code, "test/iid-read");
+    assert_eq!(reader.visited.get_mut().as_slice(), &[2, 0]);
+
+    reader.rejected = None;
+    assert_eq!(trie.sorted_rows(&reader).unwrap(), [0, 2, 1]);
+
+    reader.rejected = Some(0);
+    reader.visited.get_mut().clear();
+    assert_eq!(trie.sorted_rows(&reader).unwrap(), [0, 2, 1]);
+    assert!(reader.visited.get_mut().is_empty());
+}
+
+#[test]
+fn pending_and_bulk_sorts_preserve_duplicate_rows_after_a_lookup_retry() {
+    struct Reader<'a> {
+        iids: &'a [Iid],
+        reject_at: usize,
+        visited: RefCell<Vec<u32>>,
+    }
+
+    impl IidReader for Reader<'_> {
+        fn iid(&self, row: u32) -> Result<Iid> {
+            let mut visited = self.visited.borrow_mut();
+            visited.push(row);
+            if visited.len() == self.reject_at {
+                return Err(rtdb_types::Anomaly::incorrect("test/iid-read", "IID lookup failed"));
+            }
+            self.iids.iid(row)
+        }
+    }
+
+    let iids = [iid(2), iid(0), iid(2), iid(1), iid(3)];
+    let persisted = PersistedTrie {
+        log_limit: 5,
+        page_limit: 10,
+        root_path: vec![],
+        root: PersistedNode::Leaf(vec![3, 4]),
+    };
+    let base = MemoryHashTrie::from_persisted(persisted, &iids[..]).unwrap()
+        .add_all(&iids[..], &[2, 0, 2]).unwrap();
+    let mut reader = Reader { iids: &iids, reject_at: 2, visited: RefCell::new(Vec::new()) };
+
+    assert_eq!(base.sorted_rows(&reader).unwrap_err().code, "test/iid-read");
+    assert_eq!(reader.visited.get_mut().as_slice(), &[2, 0]);
+    assert_eq!(base.sorted_rows(&iids[..]).unwrap(), [3, 2, 2, 0, 4]);
+
+    reader.reject_at = 5;
+    reader.visited.get_mut().clear();
+    let inserted = [1, 2, 1];
+    assert_eq!(base.add_all(&reader, &inserted).unwrap_err().code, "test/iid-read");
+    assert_eq!(reader.visited.get_mut().as_slice(), &[1, 2, 1, 1, 2]);
+    assert_eq!(base.sorted_rows(&iids[..]).unwrap(), [3, 2, 2, 0, 4]);
+    let retried = base.add_all(&iids[..], &inserted).unwrap();
+    assert_eq!(retried.sorted_rows(&iids[..]).unwrap(), [1, 1, 3, 2, 2, 2, 0, 4]);
+}
+
+#[test]
 fn maximum_depth_leaf_retains_every_version_of_one_iid() {
     let iids = vec![iid(42); 50_000];
     let trie = MemoryHashTrie::new(TrieConfig::new(8, 32).unwrap()).add_range(&iids, 0, 50_000).unwrap();
