@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, rustls};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::control::{self, Request, Response};
 
@@ -22,6 +23,16 @@ const CANCEL_REQUEST: i32 = 80877102;
 const PROTOCOL_3: i32 = 196608;
 const MAXIMUM_STARTUP_BYTES: usize = 10_000;
 const SNAPSHOT_PARAMETER: &str = "rtdb.read";
+
+fn database_selector(selector: &str) -> Result<(&str, Option<Uuid>)> {
+    let Some((name, authority)) = selector.split_once('@') else {
+        return Ok((selector, None));
+    };
+    let authority = Uuid::parse_str(authority).ok().filter(|id| {
+        !id.is_nil() && !name.is_empty() && id.simple().to_string() == authority
+    }).ok_or_else(|| Anomaly::incorrect("rtdb.multi/database-selector", "Expected a database name followed by its installation ID"))?;
+    Ok((name, Some(authority)))
+}
 
 #[derive(Clone)]
 pub struct GatewayOptions {
@@ -81,9 +92,16 @@ type Client = Box<dyn Transport>;
 async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
     let startup = tokio::time::timeout(options.control_timeout, read_startup(Box::new(client), options.tls.as_ref()));
     let Some(result) = cancellation.run_until_cancelled(startup).await else { return Ok(()); };
-    let Some((mut client, startup)) = result.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/startup-timeout", "PostgreSQL startup did not finish"))?? else { return Ok(()); };
-    let Some(name) = startup.parameters.get("database").or_else(|| startup.parameters.get("user")).cloned() else {
-        return refuse(&mut client, "3D000", "The startup message names no database").await;
+    let Some((mut client, mut startup)) = result.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/startup-timeout", "PostgreSQL startup did not finish"))?? else { return Ok(()); };
+    let selector = startup.parameters.get("database");
+    let selection = match selector {
+        Some(selector) => database_selector(selector),
+        None => Ok((startup.parameters.get("user").map(String::as_str).unwrap_or_default(), None)),
+    };
+    let (name, expected) = match selection {
+        Ok((name, expected)) if !name.is_empty() => (name.to_owned(), expected),
+        Ok(_) => return refuse(&mut client, "3D000", "The startup message names no database").await,
+        Err(error) => return refuse(&mut client, "3D000", error.message.as_deref().unwrap_or_default()).await,
     };
     if let Some(gateway) = elsewhere(&directory, &name, &options).await {
         let mut forward = match connect(&gateway).await { Ok(forward) => forward, Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await };
@@ -93,7 +111,11 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
             copied = tokio::io::copy_bidirectional(&mut client, &mut forward) => copied.map(|_| ()).map_err(io),
         };
     }
-    let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), read_only: startup.read_only(), snapshot: startup.snapshot(), options: options.clone() });
+    if expected.is_some() {
+        startup.parameters.insert("database".into(), name.clone());
+        startup.bytes = encode_startup(&startup.parameters);
+    }
+    let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), expected, read_only: startup.read_only(), snapshot: startup.snapshot(), options: options.clone() });
     let (server, control, epoch, deployment) = match router.route_with_record().await {
         Ok(route) => route,
         Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
@@ -112,7 +134,8 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     });
     let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
     let keyed = !startup.read_only();
-    let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed);
+    let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed)
+        .with_installation(expected);
     let outcome = tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
         outcome = session.run(client, server, epoch) => outcome,
@@ -131,11 +154,18 @@ async fn elsewhere(directory: &Arc<dyn Directory>, name: &str, options: &Gateway
     map.gateway(&living).await.ok().flatten()
 }
 
-struct GatewayRouter { directory: Arc<dyn Directory>, name: String, read_only: bool, snapshot: bool, options: GatewayOptions }
+struct GatewayRouter {
+    directory: Arc<dyn Directory>,
+    name: String,
+    expected: Option<Uuid>,
+    read_only: bool,
+    snapshot: bool,
+    options: GatewayOptions,
+}
 
 impl GatewayRouter {
     async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
-        route(&self.directory, &self.name, self.read_only, self.snapshot, &self.options).await
+        route(&self.directory, &self.name, self.expected, self.read_only, self.snapshot, &self.options).await
     }
 }
 
@@ -148,9 +178,12 @@ impl crate::session::Router for GatewayRouter {
 }
 
 /// The open connection to the deployment's holder, and that holder's control address.
-async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snapshot: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>, u64, String)> {
+async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<Uuid>, read_only: bool, snapshot: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>, u64, String)> {
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
+    if expected.is_some_and(|id| id.hyphenated().to_string() != record.id) {
+        return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
+    }
     match record.lifecycle {
         Lifecycle::Live | Lifecycle::Quarantined => {}
         Lifecycle::Moving => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/moving", format!("{name} is moving to another cell; retry shortly"))),

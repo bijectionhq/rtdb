@@ -92,6 +92,7 @@ pub struct Grants { pub secret: Arc<crate::capability::CellSecret>, pub paramete
 
 pub struct Session {
     startup: Bytes,
+    installation_status: Option<Frame>,
     grants: Option<Grants>,
     /// The principal the first backend authenticated and reported it may be vouched for, for whom the gateway mints its reconnections' capabilities.
     authenticated: Option<String>,
@@ -121,7 +122,17 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, std::time::Duration::from_millis(100));
-        Self { startup, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+    }
+
+    pub(crate) fn with_installation(mut self, installation: Option<uuid::Uuid>) -> Self {
+        self.installation_status = installation.map(|id| {
+            let mut body = BytesMut::from(&b"rtdb_installation_id\0"[..]);
+            body.extend_from_slice(id.simple().to_string().as_bytes());
+            body.put_u8(0);
+            Frame { tag: b'S', body: body.freeze() }
+        });
+        self
     }
 
     /// Reconnects to the current holder, retrying through a failover: until the dead holder's lease expires, no other node may claim.
@@ -232,7 +243,12 @@ impl Session {
                     Event::Reply(Some(Ok(frame))) => {
                         if !self.greeting.done {
                             self.greeting.observe(&frame, &mut self.authenticated);
-                            if self.greeting.done { self.status = Status::Idle; }
+                            if self.greeting.done {
+                                self.status = Status::Idle;
+                                if let Some(installation) = self.installation_status.take() {
+                                    client_write.write_all(&installation.encode()).await.map_err(io)?;
+                                }
+                            }
                             client_write.write_all(&frame.encode()).await.map_err(io)?;
                             client_write.flush().await.map_err(io)?;
                             if frame.tag == b'E' { break Ok(()); }
