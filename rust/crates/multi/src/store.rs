@@ -67,7 +67,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         }
         let bucket = config.storage.bucket(io).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        claim_root(&crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()), &config.deployment).await?;
+        check_root(&crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()), &config.deployment, config.writer_epoch.is_some()).await?;
         Ok(open_cell_store(bucket, &store, Some(&record), wall_clock()).await?)
     }
 
@@ -85,7 +85,12 @@ impl RemoteStorageFactory for CellStoreFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let encrypted = EncryptingStore::new(cached, &self.keys.key(&config.deployment)?)?;
         let fence = match (config.writer_epoch, config.compactor) {
-            (Some(epoch), _) => Fence::Writer { epoch, record: rtdb_directory::watch_deployment(Arc::clone(&self.directory), config.deployment.clone(), self.fence_interval) },
+            (Some(epoch), _) => Fence::Writer {
+                epoch,
+                record: rtdb_directory::watch_deployment(Arc::clone(&self.directory), config.deployment.clone(), self.fence_interval),
+                directory: Arc::clone(&self.directory),
+                deployment: config.deployment,
+            },
             (None, true) => Fence::Compactor { deployment: config.deployment, prefix: config.prefix, directory: Arc::clone(&self.directory) },
             (None, false) => Fence::Reader,
         };
@@ -100,7 +105,7 @@ impl CellStoreFactory {
 }
 
 enum Fence {
-    Writer { epoch: u64, record: watch::Receiver<Option<DeploymentRecord>> },
+    Writer { epoch: u64, record: watch::Receiver<Option<DeploymentRecord>>, directory: Arc<dyn Directory>, deployment: String },
     /// May write a compaction output, whose name its job fixes and whose effect waits on the holder's adoption.
     Compactor { deployment: String, prefix: String, directory: Arc<dyn Directory> },
     Reader,
@@ -166,12 +171,20 @@ impl FencedStore {
                 if current.is_some_and(|record| record.lifecycle == Lifecycle::Live && record.storage_prefix() == *prefix) { return Ok(()); }
                 Err(Error::PermissionDenied { key: key.to_string(), message: "The compactor's deployment no longer uses this store".into() })
             }
-            Fence::Writer { epoch, record } => match &*record.borrow() {
-                Some(current) if current.epoch > *epoch
-                    || current.epoch == *epoch && !matches!(current.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) =>
-                    Err(Error::Deposed { epoch: *epoch, promised: current.epoch }),
-                _ => Ok(()),
-            },
+            Fence::Writer { epoch, record, directory, deployment } => {
+                let writer_state = |current: &DeploymentRecord| (current.epoch,
+                    current.holder.is_some() && matches!(current.lifecycle, Lifecycle::Live | Lifecycle::Quarantined));
+                let observed = record.borrow().as_ref().filter(|current| current.epoch >= *epoch).map(writer_state);
+                let (current_epoch, held) = match observed {
+                    Some(state) => state,
+                    None => directory.deployment(deployment).await.map_err(|error| Error::Task(error.to_string()))?
+                        .as_ref().map(writer_state).ok_or_else(|| Error::PermissionDenied {
+                            key: key.to_string(), message: "The deployment is no longer recorded".into(),
+                        })?,
+                };
+                if current_epoch == *epoch && held { Ok(()) }
+                else { Err(Error::Deposed { epoch: *epoch, promised: current_epoch }) }
+            }
         }
     }
 }
@@ -287,11 +300,12 @@ impl ObjectStore for GarbageStore {
 
 pub const ROOT_MARKER: &str = "~root";
 
-/// Marks a store as one deployment's, and refuses to open it for any other: a misconfiguration pointing two deployments at one prefix fails at once instead of corrupting both.
-async fn claim_root(store: &dyn ObjectStore, deployment: &str) -> Result<()> {
+/// Verifies the store's owner and lets a holder claim a new root.
+async fn check_root(store: &dyn ObjectStore, deployment: &str, claim: bool) -> Result<()> {
     let marker = ObjectKey::new(ROOT_MARKER)?;
     let owner = match store.get(&marker).await {
         Ok(owner) => owner,
+        Err(Error::MissingObject(_)) if !claim => return Ok(()),
         Err(Error::MissingObject(_)) => match store.put(&marker, Bytes::copy_from_slice(deployment.as_bytes())).await {
             Ok(()) => return Ok(()),
             Err(Error::ConflictingObject(_)) => store.get(&marker).await?,
@@ -546,9 +560,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_root_marker_write_is_returned_to_activation() {
         let inner = StoreFaults { inner: MemoryStore::default(), fail: true.into(), deny_list: false.into() };
-        assert_eq!(claim_root(&inner, "shop").await.unwrap_err().code, "rtdb.storage/task");
+        assert_eq!(check_root(&inner, "shop", true).await.unwrap_err().code, "rtdb.storage/task");
         assert!(matches!(inner.get(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
-        claim_root(&inner, "shop").await.unwrap();
+        check_root(&inner, "shop", true).await.unwrap();
     }
 
     #[tokio::test]
@@ -639,27 +653,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_for_a_confirmed_writer_ignores_an_older_watch_snapshot() {
-        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
-        let (observations, watch) = watch::channel(Some(record.clone()));
-        let store = FencedStore { inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 1, record: watch } };
+    async fn a_writer_checks_the_directory_while_its_watch_has_an_older_snapshot() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let (_observations, watched) = watch::channel(Some(record.clone()));
+        record.epoch = 1;
+        record.holder = Some(rtdb_directory::MemberId("holder".into()));
+        record = directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        let store = FencedStore { inner: Arc::new(MemoryStore::default()), fence: Fence::Writer {
+            epoch: 1, record: watched, directory: directory.clone(), deployment: record.id.clone(),
+        } };
         store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
         record.epoch = 2;
-        observations.send(Some(record)).unwrap();
+        directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
         assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 1, promised: 2 })));
     }
 
     #[tokio::test]
     async fn a_holders_store_refuses_writes_once_the_directory_moves_past_its_epoch() {
         let directory = rtdb_directory::MemoryDirectory::new();
-        let mut record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
-        let watched = rtdb_directory::watch_deployment(directory.clone(), record.id.clone(), Duration::from_millis(5));
-        let store = FencedStore { inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 0, record: watched } };
-        store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         record.epoch = 1;
+        record.holder = Some(rtdb_directory::MemberId("holder".into()));
+        let mut record = directory.create_deployment(record).await.unwrap();
+        let watched = rtdb_directory::watch_deployment(directory.clone(), record.id.clone(), Duration::from_millis(5));
+        let store = FencedStore { inner: Arc::new(MemoryStore::default()), fence: Fence::Writer {
+            epoch: 1, record: watched, directory: directory.clone(), deployment: record.id.clone(),
+        } };
+        store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
+        record.epoch = 2;
         directory.replace_deployment(record.clone(), record.version).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 0, promised: 1 })), "a deposed holder writes nothing");
+        assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 1, promised: 2 })), "a deposed holder writes nothing");
         assert!(store.delete(&key("blocks/a")).await.is_err(), "and releases nothing");
         assert_eq!(store.get(&key("blocks/a")).await.unwrap().as_ref(), b"a", "reads still serve its snapshots");
     }
@@ -736,8 +761,18 @@ mod tests {
     async fn a_store_refuses_a_deployment_it_was_not_created_for() {
         let directory = tempfile::tempdir().unwrap();
         let store = LocalStore::open(directory.path()).unwrap();
-        claim_root(&store, "one").await.unwrap();
-        claim_root(&store, "one").await.unwrap();
-        assert_eq!(claim_root(&store, "two").await.unwrap_err().code, "rtdb.multi/foreign-root");
+        check_root(&store, "one", true).await.unwrap();
+        check_root(&store, "one", true).await.unwrap();
+        assert_eq!(check_root(&store, "two", true).await.unwrap_err().code, "rtdb.multi/foreign-root");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_attach_verifies_root_ownership_without_writing() {
+        let store = MemoryStore::default();
+        check_root(&store, "one", false).await.unwrap();
+        assert!(matches!(store.head(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
+        check_root(&store, "two", true).await.unwrap();
+        assert_eq!(check_root(&store, "one", false).await.unwrap_err().code, "rtdb.multi/foreign-root");
+        check_root(&store, "two", false).await.unwrap();
     }
 }

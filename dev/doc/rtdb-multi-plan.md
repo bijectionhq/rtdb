@@ -358,6 +358,8 @@ A deposed holder must be unable to damage storage, and recovery must not depend 
    Crate `credentials` mints per-(deployment, epoch) put-if-absent credentials scoped to the epoch prefix with a lifetime of at most `credential_ttl` (S3 STS session policies, GCS downscoped tokens, Azure user-delegation SAS).
    The provider crates (`s3`, `gcs`, `azure`) accept a refreshing credential source per store.
    Multi checks the deployment's current lifecycle and prefix before an attach claims the store root.
+   Readers verify an existing root marker and only a holder can create it.
+   A writer confirms its epoch from the directory while its watch has no observation at or beyond that epoch.
    A compaction worker checks the current live deployment and prefix before writing each output.
 4. **No deletes from nodes.**
    Trie GC and block GC (`maintenance/src/gc.rs`, started per leader term by `MaintenanceSupervisor::start_term` in `node/src/database.rs`) emit `TriesReleased` records instead of deleting.

@@ -1831,7 +1831,23 @@ rule ClaimStoreRoot {
     requires: writer_epoch = null or writer_epoch = record.epoch
 
     ensures:
-        StoreRootClaimed(record.id, storage_prefix)
+        if writer_epoch != null:
+            StoreRootClaimed(record.id, storage_prefix)
+        else:
+            ExistingRootOwnerVerified(record.id, storage_prefix)
+}
+
+rule VerifyWriterDuringWatchStartup {
+    when: StoreWriteRequested(record, epoch)
+
+    requires: WatchHasNoObservationAtOrAfter(record.id, epoch)
+
+    ensures:
+        let current = Directory.read(record.id)
+        if current.epoch = epoch and current.holder != null and current.lifecycle in {live, quarantined}:
+            WriteMayProceed(record)
+        else:
+            WriteRefused(record)
 }
 
 rule TransferSharedObjects {
