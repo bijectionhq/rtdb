@@ -2533,6 +2533,110 @@ async fn a_command_that_parses_a_statement_is_resent_whole_after_a_move() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_commit_reply_replays_on_the_replacement_with_one_effect() {
+    use rtdb_directory::Cas;
+    use rtdb_multi::control::{self, Handler};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_util::sync::CancellationToken;
+
+    struct ProxyRoute { control: String, pgwire: String }
+
+    #[async_trait::async_trait]
+    impl Handler for ProxyRoute {
+        async fn handle(&self, request: Request) -> Response {
+            match control::call(&self.control, &request, Duration::from_secs(5), &common::control()).await {
+                Ok(Response::Held { epoch, .. }) => Response::Held { epoch, address: self.pgwire.clone() },
+                Ok(response) => response,
+                Err(error) => Response::refused(&error),
+            }
+        }
+    }
+
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let setup = cell.connect("shop").await;
+    setup.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(setup);
+    let source = cell.holder("shop").await.unwrap();
+    let source_member = cell.node(source).lease.id();
+    let target = cell.node(1 - source).lease.id();
+
+    let pgwire_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pgwire = pgwire_listener.local_addr().unwrap().to_string();
+    let writer = cell.node(source).pgwire_address;
+    let committed = Arc::new(tokio::sync::Notify::new());
+    let cut = CancellationToken::new();
+    let connection_proxy = {
+        let committed = Arc::clone(&committed);
+        let cut = cut.clone();
+        tokio::spawn(async move {
+            let (gateway, _) = pgwire_listener.accept().await.unwrap();
+            let backend = TcpStream::connect(writer).await.unwrap();
+            let (mut gateway_in, mut gateway_out) = gateway.into_split();
+            let (mut backend_in, mut backend_out) = backend.into_split();
+            let forward_replies = async {
+                let mut greeted = false;
+                loop {
+                    let tag = backend_in.read_u8().await.unwrap();
+                    let length = backend_in.read_i32().await.unwrap();
+                    assert!((4..1_048_576).contains(&length));
+                    let mut body = vec![0; (length - 4) as usize];
+                    backend_in.read_exact(&mut body).await.unwrap();
+                    if !greeted {
+                        gateway_out.write_u8(tag).await.unwrap();
+                        gateway_out.write_i32(length).await.unwrap();
+                        gateway_out.write_all(&body).await.unwrap();
+                        greeted = tag == b'Z';
+                    } else if tag == b'C' {
+                        committed.notify_one();
+                        cut.cancelled().await;
+                        return;
+                    } else {
+                        assert_ne!(tag, b'E', "{}", String::from_utf8_lossy(&body));
+                    }
+                }
+            };
+            tokio::select! {
+                () = forward_replies => {}
+                result = tokio::io::copy(&mut gateway_in, &mut backend_out) => panic!("gateway closed before the reply was cut: {result:?}"),
+            }
+        })
+    };
+
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_address = control_listener.local_addr().unwrap().to_string();
+    let handler = Arc::new(ProxyRoute { control: cell.node(source).control_address.to_string(), pgwire });
+    let stop = CancellationToken::new();
+    let control_proxy = tokio::spawn(control::serve(control_listener, handler, common::control(), stop.clone()));
+    loop {
+        let mut member = cell.directory.member(&source_member).await.unwrap().unwrap();
+        member.control_address = Some(control_address.clone());
+        let version = member.version;
+        if let Cas::Applied(_) = cell.directory.replace_member(member, version).await.unwrap() { break; }
+    }
+
+    let client = cell.connect("shop").await;
+    let pending = tokio::spawn(async move {
+        let reply = client.simple_query("UPDATE orders SET total = total + 1 WHERE _id = 1").await;
+        (client, reply)
+    });
+    tokio::time::timeout(Duration::from_secs(10), committed.notified()).await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &target, &common::control()).await.unwrap();
+    cut.cancel();
+    connection_proxy.await.unwrap();
+
+    let (client, reply) = tokio::time::timeout(Duration::from_secs(5), pending).await.unwrap().unwrap();
+    assert!(matches!(reply.unwrap().as_slice(), [tokio_postgres::SimpleQueryMessage::CommandComplete(_)]));
+    assert_eq!(cell.holder("shop").await, Some(1 - source));
+    assert_eq!(values(&client, "SELECT total FROM orders WHERE _id = 1").await, ["11"]);
+    drop(client);
+    stop.cancel();
+    control_proxy.await.unwrap().unwrap();
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transaction_retried_with_its_idempotency_key_commits_once() {
     let mut cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

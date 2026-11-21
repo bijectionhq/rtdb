@@ -209,7 +209,21 @@ TLC checks a single unexpired command, a bounded clock, and an atomic duplicate 
 The model finds duplicate mutations when SQL settings own the key or malformed application metadata suppresses the fallback, and finds deadline renewal when writer loss resets the cutoff.
 Verus checks the exact Rust cutoff selector and rejects a mutation that replaces an existing cutoff.
 The native Pgwire regression runs both duplicate cases against a real engine, and the gateway tests check repeated replacement and legacy refusal.
-Durable idempotency-table refinement, time and expiration assumptions, volatile client-supplied application keys, and general multi-statement replay remain separate obligations. [Lean proof](../../verification/multi/lean/GatewayReplay.lean) · [TLA+ model](../../verification/multi/tla/RTDBGatewayReplay.tla) · [Verus checks](../../verification/verus/replay_deadline/area.json) · [Pgwire tests](../../rust/crates/pgwire/src/protocol.rs) · [Gateway tests](../../rust/crates/multi/src/session.rs)
+This earlier model abstracts marker retention and command eligibility. [Lean proof](../../verification/multi/lean/GatewayReplay.lean) · [TLA+ model](../../verification/multi/tla/RTDBGatewayReplay.tla) · [Verus checks](../../verification/verus/replay_deadline/area.json) · [Pgwire tests](../../rust/crates/pgwire/src/protocol.rs) · [Gateway tests](../../rust/crates/multi/src/session.rs)
+
+### Replay permit and protected marker
+
+The protected permit assigns one stable marker key and one exclusive cutoff to both the original submission and every replacement.
+An admitted submission compares its own clock with the cutoff before append.
+The marker is retained at least until that cutoff and cannot be written or deleted by ordinary SQL.
+Lean proves at most one mutation for an arbitrary finite sequence of attempts and arbitrary clock samples, assuming ordered atomic guard and marker publication.
+TLC covers either writer reaching submission first and checks five counterexamples where a delayed original, older writer, changing application key, early expiry or marker deletion defeats the corresponding safeguard.
+The setup replay checker also exhibits an Execute arriving between an earlier eligibility decision and the end of the refusal drain.
+The gateway rechecks the final pending frames before resending them.
+Verus checks the production gateway's finite cutoff arithmetic, feature and age requirements, and the setup frame classification.
+The Rust wire fixture checks the exact nonce and cutoff encoding, while the Pgwire regression checks refusal before executing any replayed batch.
+The live-cell test withholds a committed reply, completes a holder move, and checks that the same client gets a reply and observes one mutation.
+The proof assumes the acknowledged journal prefix, single ordered resolver, and authentic writer capabilities. [Lean proof](../../verification/multi/lean/ReplayPermit.lean) · [TLA+ model](../../verification/multi/tla/RTDBReplayPermit.tla) · [Verus checks](../../verification/verus/replay_admission/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)
 
 ### Multi serving endpoint failure
 
