@@ -54,11 +54,11 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, storage_generation,
-        storage_namespaces, move_intent, placement_move, move_from, cell_move, moved_at_ms, deletion_record, version: _,
+        storage_namespaces, move_intent, placement_move, move_from, cell_move, moved_at_ms, source_cleanup, deletion_record, version: _,
     } = record;
     if holder.is_some() || !matches!(lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
         || move_intent.is_some() || placement_move.is_some() || move_from.is_some() || cell_move.is_some()
-        || moved_at_ms.is_some() || deletion_record.is_some()
+        || moved_at_ms.is_some() || source_cleanup.is_some() || deletion_record.is_some()
     {
         return None;
     }
@@ -141,6 +141,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         linearizable_reads: packed.linearizable_reads,
         checkpoint: packed.checkpoint.map(|PackedCheckpoint { block, boundary, source, system_time }| Checkpoint { block, boundary, source, system_time }),
         moved_at_ms: None,
+        source_cleanup: None,
         cell_move: None,
         storage_generation,
         storage_namespaces,

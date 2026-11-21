@@ -741,10 +741,37 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let deployments = east.directory.deployments().await.unwrap();
     let keys = east.keys();
     let hour = Duration::from_secs(3600);
-    assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms(), hour, Some(&keys)).await.unwrap(), 0, "and keeps them within the grace");
-    assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms() + hour.as_millis() as i64, hour, Some(&keys)).await.unwrap(), 1);
-    assert_eq!(left_behind().await, 0, "after the grace, the old cell erases what the move left");
+    let now = rtdb_directory::now_ms();
+    let due = now + hour.as_millis() as i64;
+    let source = east.directory.as_ref();
+    let destination_key = west_keys.existing(&tombstone.id).unwrap();
+    for (storage, keys) in [(&west_storage, &keys), (&east_storage, &west_keys)] {
+        let error = rtdb_multi::store::finish_moves(source, storage, &deployments, due, hour, Some(keys)).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/storage-binding-mismatch");
+        assert!(left_behind().await > 0);
+        assert_eq!(west_keys.existing(&tombstone.id).unwrap(), destination_key);
+    }
+    let mut legacy = tombstone.clone();
+    legacy.cell_move = None;
+    legacy.storage_namespaces = None;
+    let legacy = source.replace_deployment(legacy, tombstone.version).await.unwrap().applied().unwrap();
+    let error = rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, Some(&keys)).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.multi/storage-binding-missing");
+    assert!(left_behind().await > 0);
+    assert_eq!(keys.existing(&tombstone.id).unwrap(), destination_key);
+    source.replace_deployment(tombstone.clone(), legacy.version).await.unwrap().applied().unwrap();
+
+    assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, now, hour, Some(&keys)).await.unwrap(), 0, "and keeps them within the grace");
+    assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, None).await.unwrap(), 1);
+    assert_eq!(source.deployment(&tombstone.id).await.unwrap().unwrap().source_cleanup, Some(rtdb_directory::SourceCleanup::ObjectsErased));
+    assert_eq!(left_behind().await, 0, "after the grace the source erases what the move left");
+    assert_eq!(keys.existing(&tombstone.id).unwrap(), destination_key);
+    assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, None).await.unwrap(), 0);
+    assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, Some(&keys)).await.unwrap(), 1);
+    assert_eq!(source.deployment(&tombstone.id).await.unwrap().unwrap().source_cleanup, Some(rtdb_directory::SourceCleanup::ObjectsAndKeyErased));
     assert_eq!(keys.existing(&tombstone.id).unwrap_err().code, "rtdb.multi/key-destroyed");
+    assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, Some(&keys)).await.unwrap(), 0);
+    assert_eq!(west_keys.existing(&tombstone.id).unwrap(), destination_key);
     assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"], "while the deployment reads on in its new cell");
     drop((through_east, through_west));
     east.stop().await;

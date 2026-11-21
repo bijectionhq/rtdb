@@ -160,6 +160,13 @@ impl CellMovePhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCleanup {
+    ObjectsErased,
+    ObjectsAndKeyErased,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageNamespaces {
     pub objects: uuid::Uuid,
@@ -240,6 +247,8 @@ pub struct DeploymentRecord {
     #[serde(default)]
     pub moved_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cleanup: Option<SourceCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_move: Option<CellMove>,
     /// Each attempted copy uses a different prefix, so a superseded copier can never modify a live destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,7 +275,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {

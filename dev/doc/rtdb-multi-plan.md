@@ -600,6 +600,11 @@ Unbounded means adding cells (spec contract `CellMap`).
    A retry before preparation completes copies to a fresh destination prefix under the original writer fence.
    Once prepared, the source records the chosen prefix, the destination staged record waits for the placement switch, and retry finishes the same switch or source tombstone.
    The destination's holder imports the old log ensemble before log-fed replicas can serve it.
+   The source reaper verifies the recorded object namespace and any supplied key namespace before erasing the old copy.
+   Legacy tombstones without a recorded source binding require recovery of those historical namespace IDs before automatic cleanup.
+   With S3 it empties the source's version inventory before destroying the source key copy.
+   The tombstone records successful cleanup so future passes can skip it.
+   A later pass with `--keys` rechecks storage before finishing a previous objects-only cleanup.
 3. Format upgrades: readers for N-2 to N, rewrite on flush and compaction, a maintenance trickle for the rest.
 
 **Done when** a deployment moves between two simulated cells with one fenced write stall.

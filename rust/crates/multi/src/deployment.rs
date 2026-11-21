@@ -116,20 +116,27 @@ impl CellStorage {
 }
 
 pub(crate) async fn storage_namespace(bucket: &dyn ObjectStore) -> Result<uuid::Uuid> {
+    if let Some(id) = existing_storage_namespace(bucket).await? { return Ok(id); }
     let marker = ObjectKey::new(STORAGE_NAMESPACE_MARKER)?;
-    let bytes = match bucket.get(&marker).await {
-        Ok(bytes) => bytes,
-        Err(StoreError::MissingObject(_)) => {
-            let id = uuid::Uuid::new_v4();
-            match bucket.put(&marker, bytes::Bytes::copy_from_slice(id.as_bytes())).await {
-                Ok(()) => return Ok(id),
-                Err(StoreError::ConflictingObject(_)) => bucket.get(&marker).await?,
-                Err(error) => return Err(error.into()),
-            }
-        }
+    let id = uuid::Uuid::new_v4();
+    let bytes = match bucket.put(&marker, bytes::Bytes::copy_from_slice(id.as_bytes())).await {
+        Ok(()) => return Ok(id),
+        Err(StoreError::ConflictingObject(_)) => bucket.get(&marker).await?,
         Err(error) => return Err(error.into()),
     };
-    uuid::Uuid::from_slice(&bytes).map_err(|_| Anomaly::fault("rtdb.multi/storage-namespace", "The cell storage has an invalid namespace marker"))
+    namespace_id(&bytes)
+}
+
+pub(crate) async fn existing_storage_namespace(bucket: &dyn ObjectStore) -> Result<Option<uuid::Uuid>> {
+    match bucket.get(&ObjectKey::new(STORAGE_NAMESPACE_MARKER)?).await {
+        Ok(bytes) => namespace_id(&bytes).map(Some),
+        Err(StoreError::MissingObject(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn namespace_id(bytes: &[u8]) -> Result<uuid::Uuid> {
+    uuid::Uuid::from_slice(bytes).map_err(|_| Anomaly::fault("rtdb.multi/storage-namespace", "The cell storage has an invalid namespace marker"))
 }
 
 pub(crate) async fn storage_namespaces(bucket: &dyn ObjectStore, keys: &dyn crate::keys::KeyService) -> Result<rtdb_directory::StorageNamespaces> {

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
-use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, now_ms};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, SourceCleanup, StorageNamespaces, now_ms};
 use rtdb_node::RemoteStorageFactory;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, Result};
@@ -397,29 +397,59 @@ pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deploymen
                 if let Ok(deployments) = directory.deployments().await {
                     let now = wall_clock()();
                     let _ = reaper_pass(bucket.as_ref(), &deployments, now, grace).await;
-                    let _ = finish_moves(bucket.as_ref(), &deployments, now, grace, keys.as_deref()).await;
+                    let _ = finish_moves(directory.as_ref(), &storage, &deployments, now, grace, keys.as_deref()).await;
                 }
             }
         }
     }
 }
 
-/// Erases what deployments that moved to other cells left here, once the grace has passed since they moved: readers that were reading here at the cutover have finished by then.
-/// Their forks here keep what they share, copied into them first, and the key this cell held for each is destroyed, so its sealed log tail here is unreadable too.
-pub async fn finish_moves(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration, keys: Option<&dyn KeyService>) -> Result<usize> {
-    let mut finished = 0;
+/// Erases old copies after their move grace, preserving objects shared with local forks.
+/// Returns how many source tombstones advanced their cleanup state during the pass.
+pub async fn finish_moves(directory: &dyn Directory, storage: &crate::deployment::CellStorage, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration, keys: Option<&dyn KeyService>) -> Result<usize> {
+    let completion = if keys.is_some() { SourceCleanup::ObjectsAndKeyErased } else { SourceCleanup::ObjectsErased };
+    let grace = grace.as_millis().min(i64::MAX as u128) as i64;
+    let pending = |record: &DeploymentRecord| record.lifecycle == Lifecycle::Deleted
+        && record.moved_at_ms.is_some_and(|moved| now_ms.saturating_sub(moved) >= grace)
+        && record.source_cleanup.is_none_or(|done| done == SourceCleanup::ObjectsErased && keys.is_some());
+    let mut moved = deployments.iter().filter(|record| pending(record)).peekable();
+    if moved.peek().is_none() { return Ok(0); }
+    let bucket = storage.bucket(IoRegion::new()).await?;
+    let objects_namespace = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?;
+    let key_namespace = keys.map(KeyService::namespace_id).transpose()?;
     let others: Vec<DeploymentRecord> = deployments.iter().filter(|record| record.moved_at_ms.is_none()).cloned().collect();
-    for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Deleted && record.moved_at_ms.is_some_and(|moved| moved + grace.as_millis() as i64 <= now_ms)) {
-        let prefix = crate::reference::key(&record.storage_prefix())?;
-        if !bucket.list(Some(&prefix)).await?.is_empty() {
-            if !crate::reference::erase_deployment(bucket, &record.storage_prefix(), &others).await? {
+    let mut finished = 0;
+    let mut first_failure = None;
+    for candidate in moved {
+        let result = async {
+            let Some(mut record) = directory.deployment(&candidate.id).await?.filter(pending) else { return Ok(false); };
+            let expected = record.cell_move.as_ref().map(|intent| StorageNamespaces {
+                objects: intent.namespaces.source_objects, keys: intent.namespaces.source_keys,
+            }).or(record.storage_namespaces).ok_or_else(|| {
+                Anomaly::incorrect("rtdb.multi/storage-binding-missing", format!("The source of {} has no recorded storage binding", record.name))
+            })?;
+            if objects_namespace != Some(expected.objects) || key_namespace.is_some_and(|namespace| namespace != expected.keys) {
+                return Err(Anomaly::incorrect("rtdb.multi/storage-binding-mismatch", format!("The source of {} belongs to a different object or key namespace", record.name)));
+            }
+            let prefix = crate::reference::key(&record.storage_prefix())?;
+            if !bucket.list(Some(&prefix)).await?.is_empty() && !crate::reference::erase_deployment(bucket.as_ref(), prefix.as_str(), &others).await? {
                 return Err(Anomaly::fault("rtdb.multi/move-cleanup-incomplete", format!("The source still holds objects for {}", record.name)));
             }
-            finished += 1;
+            storage.purge_versions(&prefix).await?;
+            if let Some(keys) = keys { keys.destroy(&record.id)?; }
+            record.source_cleanup = Some(completion);
+            let version = record.version;
+            Ok(matches!(directory.replace_deployment(record, version).await?, Cas::Applied(_)))
+        }.await;
+        match result {
+            Ok(advanced) => finished += usize::from(advanced),
+            Err(error) => {
+                eprintln!("RTDB could not clean the moved source of {}: {error}", candidate.name);
+                first_failure.get_or_insert(error);
+            }
         }
-        if let Some(keys) = keys { keys.destroy(&record.id)?; }
     }
-    Ok(finished)
+    first_failure.map_or(Ok(finished), Err)
 }
 
 /// One pass of the reaper over a cell's `bucket`, whose deployments are `deployments`, as of `now_ms`: every deployment that is not deleted is reaped, in order, against the references of them all.

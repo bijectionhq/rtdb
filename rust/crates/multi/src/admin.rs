@@ -485,6 +485,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     incoming.storage_namespaces = Some(StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys });
     incoming.cell_move = None;
     incoming.moved_at_ms = None;
+    incoming.source_cleanup = None;
     incoming.move_intent = None;
     incoming.placement_move = None;
     incoming.activation_crashes = 0;

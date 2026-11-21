@@ -1861,7 +1861,6 @@ rule MoveCutover {
     -- The destination accepts placements only after the cell map switches to it.
     -- The destination's first holder imports the sealed source log before it can serve.
     -- A retry after the switch finishes publication and leaves the source tombstone.
-    -- After the grace period, the source removes the deployment's remaining objects and destroys its copy of the key once the source prefix is empty.
     -- Forks in the source cell retain access to every object they share.
     when: DestinationPrepared(record, target_cell)
 
@@ -1871,6 +1870,24 @@ rule MoveCutover {
         CellMapRowWritten(deployment: record.id, cell: target_cell)
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted })
         DestinationOpenedForPlacement(record, target_cell)
+}
+
+rule CleanUpMovedSource {
+    -- The source validates its object namespace and any supplied key namespace against the move's binding.
+    when: MoveGraceElapsed(record)
+
+    requires: record.lifecycle = deleted
+    requires: record.source_namespaces != null
+    requires: StorageNamespacesMatchSource(record)
+
+    ensures:
+        EraseSourceCopyAfterTransferringSharedObjects(record)
+        if SourceUsesS3(record):
+            EmptyVersionInventoryObserved(record.storage_root.prefix)
+        SourceCleanupRecorded(record, objects_erased)
+        if SourceKeyServiceConfigured(record):
+            SourceKeyCopyDestroyed(record.key_id)
+            SourceCleanupRecorded(record, objects_and_key_erased)
 }
 
 ------------------------------------------------------------
