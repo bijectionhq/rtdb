@@ -196,6 +196,9 @@ contract OutputSegmentLayout {
         -- Every finite signed 64-bit microsecond recency has a partition ceiling in the ISO proleptic Gregorian calendar.
         -- Weekly ceilings fall on Monday at 0000Z; a recency exactly on a ceiling belongs to that partition.
 
+    @invariant OutputPagesShareTheMergedSchema
+        -- Every page in an output data file uses the merged schema, including its field types and nullability.
+
     @invariant DecimalFieldsCarryTheirLogicalParameters
         -- Each decimal field in an output Arrow schema carries the merged field's signed 32-bit precision and scale, including decimal fields nested in containers.
         -- Its coefficient buffers represent values at that scale.

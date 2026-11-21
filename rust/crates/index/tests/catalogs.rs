@@ -167,7 +167,7 @@ fn removing_an_artefact_drops_its_record_whatever_its_stats_and_leaves_the_rest(
 #[test]
 fn artefact_records_survive_the_block_file_roundtrip() {
     let catalog = apply(&[("l01-rc-b00", 30), ("l01-rc-b01", 30)]).with_artefacts(&table(), [("l01-rc-b01".parse().unwrap(), artefact("body", 1, 9))]);
-    let block = TableBlock::from_parts(BTreeMap::new(), 0, catalog.partitions(&table()).unwrap()).unwrap();
+    let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, catalog.partitions(&table()).unwrap()).unwrap();
     let loaded = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(200)).unwrap();
     assert_eq!(catalog.all_tries(&table()), loaded.all_tries(&table()));
     assert!(loaded.all_tries(&table()).iter().any(|trie| trie.artefact("search", "body", 1).is_some()));

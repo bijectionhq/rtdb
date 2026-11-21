@@ -38,6 +38,7 @@ struct FinalWriter<'a> {
     data: ArrowFileWriter,
     metadata: MetadataBuilder,
     schema: OutputSchema,
+    arrow_schema: arrow_schema::SchemaRef,
     memory: &'a Arc<MemoryBudget>,
     metadata_charges: Vec<Arc<MemoryReservation>>,
     cancellation: &'a CancellationToken,
@@ -83,10 +84,10 @@ impl FinalWriter<'_> {
         if leaves.is_empty() { return self.metadata.write_nil(); }
         let total = leaves.iter().try_fold(0usize, |total, leaf| total.checked_add(leaf.rows).ok_or_else(|| crate::invalid("Page tree row count overflow")))?;
         if let [leaf] = leaves && leaf.rows > 0 && leaf.rows <= page_size {
-            // A spill page was built from its events with this output schema, so a leaf that is one whole page is written as it is.
+            // Decoding can mark a struct's union field nullable when one of its legs can be null.
             let page = read_page(reader, leaf.page, self.memory)?;
             if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
-            return self.page(page.batch());
+            if page.batch().schema() == self.arrow_schema { return self.page(page.batch()); }
         }
         if (leaves.len() == 1 && leaves[0].path.len() == depth) || total <= page_size {
             let mut rows = Vec::new();
@@ -233,7 +234,8 @@ pub(super) fn normalize(input: &MergeFile, put: &Option<StructFields<LogicalType
     let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
     let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency };
     let directory = data_path.parent().ok_or_else(|| crate::invalid("Output path has no parent"))?;
-    let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };
+    let arrow_schema = schema.schema()?;
+    let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, &arrow_schema, disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, arrow_schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };
     if !input.carries_recency {
         output.tree(&mut reader, &input.leaves, 0, config.page_size)?;
     } else if input.leaves.is_empty() { output.metadata.write_nil()?; }

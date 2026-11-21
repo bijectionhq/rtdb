@@ -240,7 +240,6 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Ids) 
                 columns.extend(aggregate.argument.iter().chain(&aggregate.filter).flat_map(Expr::referenced_columns));
                 columns.extend(aggregate.order_by.iter().flat_map(|order| order.expr.referenced_columns()));
             }
-            if columns.is_empty() { columns.extend(input.schema().fields().first().map(|field| field.id)); }
             let input = annotate_top_k(prune(Arc::clone(input), &columns, ids)?)?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Aggregate { input, groups: groups.clone(), aggregates: aggregates.clone() })?))
         }
@@ -677,6 +676,16 @@ mod tests {
             assert_eq!(scan.predicates, [Expr::unary(UnaryOp::Not, Expr::Column { id: evaluated.id, data_type: LogicalType::Scalar(ScalarType::Bool).maybe() })]);
             assert_eq!(scan.columns.iter().any(|field| field.id == body.id), reads_body, "{projected:?}");
         }
+    }
+
+    #[test]
+    fn counting_all_rows_needs_no_columns_from_the_scan() {
+        let count = rtdb_plan::AggregateExpr { field: field(5), function: rtdb_plan::AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![] };
+        let aggregate = Arc::new(Relation::new(Schema::new(vec![field(5)]).unwrap(), RelationNode::Aggregate { input: base_scan(vec![field(0), field(1)]), groups: vec![], aggregates: vec![count] }).unwrap());
+        let prepared = prepare(aggregate).unwrap();
+        let RelationNode::Aggregate { input, .. } = prepared.node() else { panic!("Expected the aggregate") };
+        let RelationNode::Scan(scan) = input.node() else { panic!("Expected the scan") };
+        assert!(scan.columns.is_empty());
     }
 
     #[test]
