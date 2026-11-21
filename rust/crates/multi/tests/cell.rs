@@ -1164,6 +1164,12 @@ async fn a_deployment_whose_activations_crash_is_quarantined_to_the_isolation_po
     let released = admin::unquarantine(cell.directory.as_ref(), "shop").await.unwrap();
     assert!(released.holder.is_none());
     assert_eq!(released.activation_crashes, 0);
+    let isolated_catalog = cell.node(1).server.node().catalog();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while isolated_catalog.database("shop").is_ok() || isolated_catalog.is_draining("shop") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the isolation node closed the released placement");
     assert_eq!(values(&isolated, "SELECT total FROM orders").await, ["10"]);
     assert_eq!(cell.holder("shop").await, Some(0));
     drop(isolated);
