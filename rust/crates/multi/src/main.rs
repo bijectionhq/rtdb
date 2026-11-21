@@ -48,7 +48,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN]\n\
        rtdb-multi stage-checkpoint --directory DIR --archive-root PATH --storage-root PATH --keys PATH --stage-request FILE [--ecs-cluster ARN]\n\
        rtdb-multi read-checkpoint-stage --directory DIR --storage-root PATH --keys PATH --id UUID --operation UUID --manifest-sha256 SHA256 --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--ecs-cluster ARN] [--parent-stdin]\n\
-       rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
+       rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN]\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for the deployments, deployment-names, members and stopped-tasks tables\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
 For `--keys` use a private local directory or dynamodb:TABLE with an independently installed key table.\n";
@@ -310,8 +310,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            // The archive owner re-observes exact captures in installed S3 custody.
-            hosted_protocol: 11,
+            // The archive owner can fence and retire individual captured checkpoints.
+            hosted_protocol: 12,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -633,7 +633,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let keys = key_service(arguments.required("keys")?).await?;
             let recovery = rtdb_multi::archive::restore(
                 directory.as_ref(), &storage, &archive, keys.as_ref(),
-                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, 4 << 20,
+                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, 4 << 20, hosted_task(&arguments)?.as_ref(),
             ).await?;
             println!("{}", serde_json::to_string_pretty(&recovery).expect("a restore receipt serializes"));
             Ok(())

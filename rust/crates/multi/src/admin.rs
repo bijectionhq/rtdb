@@ -666,6 +666,7 @@ async fn prepare_cell_move(
         staged.storage_regions.clear();
         staged.checkpoint_recovery = None;
         staged.checkpoint_captures.clear();
+        staged.checkpoint_capture_retirements.clear();
         staged.archive_retirement = None;
         staged.retired_residences.clear();
         staged.activation_crashes = 0;
@@ -678,6 +679,7 @@ async fn prepare_cell_move(
             });
             if prior.archive_retirement.is_none() {
                 staged.checkpoint_captures.clone_from(&prior.checkpoint_captures);
+                staged.checkpoint_capture_retirements.clone_from(&prior.checkpoint_capture_retirements);
             }
         }
         let result = if let Some(prior) = prior_residence {
@@ -742,7 +744,7 @@ async fn stage_cell_storage(
             return Err(cell_move_conflict(from, to, &staged.name));
         }
         record.storage_regions.insert(region, if local {
-            StorageRegion::Local
+            StorageRegion::Local { archive: None }
         } else {
             crate::store::remote_storage_region(None, hosted_task.clone())
         });

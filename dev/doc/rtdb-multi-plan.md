@@ -165,6 +165,15 @@ witness and exact manifest, and verifies every object under the capture's
 media key. The receipt binds the supplied observation ID to the original
 capture point and digest.
 
+`discard_checkpoint_capture` installs a permanent release for one capture
+ID in its original cell. It can close an unattempted ID and prevents a late
+capture from creating archive state. Physical retirement waits for the
+recorded capture and repair readers, withdraws only the archive key, and
+purges the capture's versions and unfinished uploads. The release receipt
+and authority witness remain available. The serving installation keeps
+its own key and placement. A capture used by the current repair still
+belongs to the serving closure and cannot be discarded independently.
+
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.
 The reaper settles each registered local archive after confirming its

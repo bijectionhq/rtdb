@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{
     ArchivedObject, CapturePoint, capture_receipt, checkpoint_storage_root, digest, encode,
-    inconsistent, read_object, unavailable, verified_archive,
+    inconsistent, read_object, require_capture_open, unavailable, verified_archive,
 };
 use crate::{
     admin::{begin_disposal, cell_media, installation_record, update_installation},
@@ -130,9 +130,7 @@ pub async fn stage_checkpoint(
     let (point, manifest) = capture_receipt(&source, archive, request.source, request.capture)?
         .filter(|(_, manifest)| manifest == &request.source_manifest_sha256)
         .ok_or_else(|| inconsistent("The source capture has another manifest"))?;
-    if source.archive_retirement.is_some() {
-        return Err(inconsistent("The source archive has been released"));
-    }
+    require_capture_open(&source, request.capture)?;
     let intent = CheckpointStage {
         intent: request,
         source_incarnation: point.incarnation,
@@ -171,9 +169,9 @@ pub async fn stage_checkpoint(
         Some(point.operation),
         None,
         |current| {
-            if current.archive_retirement.is_some()
-                || capture_receipt(current, archive, point.deployment, point.operation)?
-                    != Some((point.clone(), manifest.clone()))
+            require_capture_open(current, point.operation)?;
+            if capture_receipt(current, archive, point.deployment, point.operation)?
+                != Some((point.clone(), manifest.clone()))
             {
                 return Err(inconsistent(
                     "The capture lost its retained archive admission",
@@ -288,7 +286,7 @@ where
     let region = Uuid::new_v4();
     let (state, witness) = match media {
         CellStorage::Local { .. } => (
-            rtdb_directory::StorageRegion::Local,
+            rtdb_directory::StorageRegion::Local { archive: capture },
             keys.hold_local_storage_region(region)?,
         ),
         CellStorage::S3 { .. } => {

@@ -186,6 +186,8 @@ pub struct DeploymentRecord {
     pub checkpoint_repair_receipts: BTreeMap<uuid::Uuid, CheckpointRecovery>,
     /// Every independent archive admitted before a checkpoint copy started.
     pub checkpoint_captures: BTreeMap<uuid::Uuid, CheckpointCapture>,
+    /// Closed capture IDs cannot admit new copies, readers or archive keys.
+    pub checkpoint_capture_retirements: BTreeMap<uuid::Uuid, CheckpointCaptureRetirement>,
     pub archive_retirement: Option<ArchiveRetirement>,
     pub version: Version,
 }
@@ -223,9 +225,11 @@ impl HostedTask {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum StorageRegion {
-    Local,
+    Local { archive: Option<uuid::Uuid> },
     Remote {
         archive: Option<uuid::Uuid>,
+        /// Serving I/O can read its repair archive while writing its own prefix.
+        repair_archive: Option<uuid::Uuid>,
         owner: Option<HostedTask>,
         /// When closed, the region owner has joined its I/O and may issue
         /// no further requests. Uncertain publications still need evidence.
@@ -233,6 +237,16 @@ pub enum StorageRegion {
         /// Written before a conditional provider mutation is submitted.
         publications: BTreeMap<uuid::Uuid, StoragePublication>,
     },
+}
+
+/// The original archive's release fence, including IDs cancelled before copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointCaptureRetirement {
+    pub archive: String,
+    pub manifest_sha256: Option<String>,
+    pub authorized_at_ms: i64,
+    pub key_withdrawn_at_ms: Option<i64>,
+    pub observed_empty_at_ms: Option<i64>,
 }
 
 /// An exact provider upload, admitted before it received payload bytes.
@@ -393,7 +407,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn can_fork(&self) -> bool {

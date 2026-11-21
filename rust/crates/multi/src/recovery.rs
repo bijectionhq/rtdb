@@ -5,6 +5,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rtdb_directory::{
     CheckpointStageIntent, DeploymentRecord, Directory, DisposalReceipt, HostedTask,
+    ServingInventory,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,9 @@ enum Action {
         manifest_sha256: String,
         observation: Uuid,
     },
+    DiscardCheckpointCapture {
+        manifest_sha256: Option<String>,
+    },
     RecoverCheckpoint {
         manifest_sha256: String,
     },
@@ -81,6 +85,13 @@ enum Reply {
         manifest_sha256: String,
         observation: Uuid,
     },
+    CaptureDiscarded {
+        name: String,
+        authority: Uuid,
+        capture: Uuid,
+        manifest_sha256: Option<String>,
+        archive_disposal: CaptureDisposal,
+    },
     Recovered {
         name: String,
         authority: Uuid,
@@ -110,6 +121,14 @@ enum Reply {
     },
     Refused,
     Deferred,
+}
+
+#[derive(Serialize)]
+struct CaptureDisposal {
+    authorized_at_ms: i64,
+    key_withdrawn_at_ms: i64,
+    observed_empty_at_ms: i64,
+    inventory: ServingInventory,
 }
 
 pub struct RecoveryService {
@@ -229,6 +248,45 @@ impl RecoveryService {
                     observation,
                 })
             }
+            Action::DiscardCheckpointCapture { manifest_sha256 } => {
+                if manifest_sha256
+                    .as_deref()
+                    .is_some_and(|value| !valid_manifest(value))
+                    || installation.checkpoint_stage.is_some()
+                {
+                    return Ok(Reply::Refused);
+                }
+                let release = archive::retire_capture(
+                    directory.as_ref(),
+                    &installation,
+                    &self.storage,
+                    &self.archive,
+                    self.keys.as_ref(),
+                    request.capture,
+                    manifest_sha256.as_deref(),
+                )
+                .await?;
+                let (Some(withdrawn), Some(empty)) =
+                    (release.key_withdrawn_at_ms, release.observed_empty_at_ms)
+                else {
+                    return Ok(Reply::Deferred);
+                };
+                Ok(Reply::CaptureDiscarded {
+                    name: installation.name,
+                    authority: request.authority,
+                    capture: request.capture,
+                    manifest_sha256: release.manifest_sha256,
+                    archive_disposal: CaptureDisposal {
+                        authorized_at_ms: release.authorized_at_ms,
+                        key_withdrawn_at_ms: withdrawn,
+                        observed_empty_at_ms: empty,
+                        inventory: match &self.archive {
+                            CellStorage::Local { .. } => ServingInventory::LocalDirectory,
+                            CellStorage::S3 { .. } => ServingInventory::S3VersionsAndUploads,
+                        },
+                    },
+                })
+            }
             Action::RecoverCheckpoint { manifest_sha256 } => {
                 if !valid_manifest(&manifest_sha256) {
                     return Ok(Reply::Refused);
@@ -242,6 +300,7 @@ impl RecoveryService {
                     request.capture,
                     4 << 20,
                     Some(&manifest_sha256),
+                    self.hosted_task.as_ref(),
                 )
                 .await?;
                 let completed_at_ms = recovery.completed_at_ms.ok_or_else(|| {

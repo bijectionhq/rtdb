@@ -463,7 +463,7 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     let other_archive = CellStorage::Local { root: other_destination.path().to_owned() };
     assert!(rtdb_multi::archive::capture(cell.directory.clone(), &cell.storage(), &other_archive, &cell.keys(), id, operation, None).await.is_err());
     assert!(rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.is_err());
-    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation, 4 << 20, None).await.is_err());
     drop(client);
     admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &id.to_string(), 4 << 20).await.unwrap();
     let stage = rtdb_directory::CheckpointStageIntent {
@@ -540,7 +540,7 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     corrupt[0] ^= 1;
     std::fs::write(&path, corrupt).unwrap();
     assert!(rtdb_multi::archive::capture(cell.directory.clone(), &storage, &archive, &cell.keys(), id, operation, None).await.is_err());
-    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20, None).await.is_err());
     let still_live = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
     assert_eq!(still_live.lifecycle, Lifecycle::Live);
     assert_eq!(still_live.epoch, record.epoch);
@@ -551,19 +551,19 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let CellStorage::Local { root } = &storage else { panic!("a disposable local fixture") };
     std::fs::remove_dir_all(root.join(record.storage_prefix())).unwrap();
 
-    let restored = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.unwrap();
+    let restored = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20, None).await.unwrap();
     assert!(restored.completed_at_ms.is_some());
     assert_eq!(restored.epoch, record.epoch + 1);
-    let successor = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, successor_operation, 4 << 20).await.unwrap();
+    let successor = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, successor_operation, 4 << 20, None).await.unwrap();
     assert!(successor.epoch > restored.epoch);
     let reopened = connect_eventually(&cell, "shop").await;
     assert_eq!(values(&reopened, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
     assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
-    let retried = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.unwrap();
+    let retried = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20, None).await.unwrap();
     assert_eq!(retried, restored);
     let other_dir = tempfile::tempdir().unwrap();
     let other_archive = CellStorage::Local { root: other_dir.path().to_owned() };
-    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &other_archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &other_archive, &cell.keys(), id, operation, 4 << 20, None).await.is_err());
     drop(reopened);
 
     let destination = Cell::start(1, None).await;
@@ -628,7 +628,7 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     assert_eq!(active.retired_residences[&record.incarnation].serving, retired);
     assert_eq!(active.checkpoint_captures[&operation].incarnation, record.incarnation);
     let retried_after_return = rtdb_multi::archive::restore(
-        from.directory.as_ref(), from.storage, &archive, from.keys, id, operation, 4 << 20,
+        from.directory.as_ref(), from.storage, &archive, from.keys, id, operation, 4 << 20, None,
     ).await.unwrap();
     assert_eq!(retried_after_return, restored);
     assert!(from.directory.deployment(&id.to_string()).await.unwrap().unwrap().checkpoint_recovery.is_none());

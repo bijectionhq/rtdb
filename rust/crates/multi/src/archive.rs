@@ -73,6 +73,8 @@ mod stage;
 mod reader;
 pub use stage::stage_checkpoint;
 pub(crate) use stage::discard_checkpoint_stage;
+mod retirement;
+pub(crate) use retirement::{finish_capture_retirement, require_capture_open, retire_capture};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{StageSelector, tunnel_staged_checkpoint};
 
@@ -128,6 +130,7 @@ impl ArchivedCheckpoint {
             .map_err(|_| inconsistent("Invalid retained archive binding"))?;
         let deployment = record.id.parse::<Uuid>()
             .map_err(|_| inconsistent("Invalid retained archive owner"))?;
+        require_capture_open(record, recovery.operation)?;
         let expected = capture_point(record, deployment, recovery.operation, &recovery.archive)?;
         let bucket = archive.bucket(region).await?;
         let prefix = format!("checkpoint-captures/{}/{}", record.id, recovery.operation);
@@ -495,8 +498,8 @@ pub(crate) async fn verify_checkpoint_capture(
     stage::with_region(
         directory, keys, &source.id, archive, hosted_task, Some(operation), None,
         |record| {
-            if record.archive_retirement.is_some()
-                || capture_receipt(record, archive, deployment, operation)?.as_ref() != Some(&(point.clone(), manifest.clone()))
+            require_capture_open(record, operation)?;
+            if capture_receipt(record, archive, deployment, operation)?.as_ref() != Some(&(point.clone(), manifest.clone()))
             {
                 return Err(inconsistent("The capture no longer admits archive access"));
             }
@@ -639,8 +642,9 @@ pub async fn capture(
         crate::store::track_publications(&mut io, directory.clone(), id.clone(), region, None);
     }
     let admitted = update_installation(directory.as_ref(), &id, |record| {
+        require_capture_open(record, operation)?;
         if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
-            || record.move_from.is_some() || record.archive_retirement.is_some()
+            || record.move_from.is_some()
         {
             return Err(unavailable("The installation cannot be captured"));
         }
@@ -667,7 +671,7 @@ pub async fn capture(
             });
         }
         record.storage_regions.insert(region, if local {
-            rtdb_directory::StorageRegion::Local
+            rtdb_directory::StorageRegion::Local { archive: Some(operation) }
         } else {
             crate::store::remote_storage_region(Some(operation), hosted_task.clone())
         });
@@ -695,9 +699,9 @@ pub async fn capture(
         ).await?;
         let manifest = capture.manifest_sha256()?;
         update_installation(directory.as_ref(), &id, |current| {
+            require_capture_open(current, operation)?;
             if !same_incarnation(current, &capture.point)
                 || !current.storage_regions.contains_key(&region)
-                || current.archive_retirement.is_some()
                 || capture_point(current, deployment, operation, &binding)? != capture.point
             {
                 return Err(inconsistent("The capture lost its original storage admission"));
@@ -738,6 +742,7 @@ async fn capture_registered(
     let archive_bucket = destination.bucket(io.clone()).await?;
     archive_bucket.put(&archive_witness(deployment, operation)?, encode(&point)?).await?;
     update_installation(directory, &record.id, |current| {
+        require_capture_open(current, operation)?;
         if !same_lifetime(current, &point) {
             return Err(unavailable("The installation changed before binding archive media"));
         }
@@ -845,8 +850,9 @@ pub async fn restore(
     deployment: Uuid,
     operation: Uuid,
     maximum_message_bytes: usize,
+    hosted_task: Option<&rtdb_directory::HostedTask>,
 ) -> Result<CheckpointRecovery> {
-    restore_checkpoint(directory, storage, archive, keys, deployment, operation, maximum_message_bytes, None).await
+    restore_checkpoint(directory, storage, archive, keys, deployment, operation, maximum_message_bytes, None, hosted_task).await
 }
 
 pub(crate) async fn restore_checkpoint(
@@ -858,6 +864,7 @@ pub(crate) async fn restore_checkpoint(
     operation: Uuid,
     maximum_message_bytes: usize,
     expected_manifest: Option<&str>,
+    hosted_task: Option<&rtdb_directory::HostedTask>,
 ) -> Result<CheckpointRecovery> {
     let require_manifest = |actual: &str| {
         if expected_manifest.is_some_and(|expected| expected != actual) {
@@ -897,27 +904,17 @@ pub(crate) async fn restore_checkpoint(
     if !same_incarnation(&current, &point) || current.checkpoint != Some(point.checkpoint) {
         return Err(inconsistent("The archive is not the current durable checkpoint"));
     }
-    let region = IoRegion::new();
-    let archive_bucket = archive.bucket(region.clone()).await?;
-    let prefix = format!("checkpoint-captures/{deployment}/{operation}");
-    let metadata = PrefixedStore::new(archive_bucket.clone(), prefix.clone());
-    let capture = read::<Capture>(&metadata, &key("capture.json")?)
-        .await?
-        .ok_or_else(|| unavailable("The checkpoint capture is incomplete"))?;
-    let intent = read::<CapturePoint>(&metadata, &key("intent.json")?).await?;
-    if intent.as_ref() != Some(&point) || capture.point != point
-        || capture.manifest_sha256()? != manifest_sha256
-    {
-        return Err(inconsistent("The archive differs from its retained manifest receipt"));
-    }
     keys.existing_key(&current.key_id()).await?
         .ok_or_else(|| unavailable("The current installation key is unavailable"))?;
-    capture.verify(archive_bucket, &prefix, &archive_key(keys, &point).await?).await?;
+    verify_checkpoint_capture(
+        directory, &current, archive, keys, deployment, operation, &manifest_sha256, hosted_task,
+    ).await?;
 
     let fenced = update_installation(directory, &id, |record| {
         if read_receipt(record)?.is_some() {
             return Ok(());
         }
+        require_capture_open(record, operation)?;
         if !same_incarnation(record, &point)
             || record.checkpoint != Some(point.checkpoint)
             || record.move_from.is_some()
@@ -1019,6 +1016,9 @@ pub(crate) async fn begin_retirement_at(
         if record.lifecycle != Lifecycle::Deleted || record.disposal.is_none() {
             return Err(inconsistent("Recovery retirement requires a serving disposal receipt"));
         }
+        if record.checkpoint_capture_retirements.values().any(|release| release.observed_empty_at_ms.is_none()) {
+            return Err(unavailable("An individual checkpoint release is still pending"));
+        }
         if record.archive_retirement.is_none() {
             record.archive_retirement = Some(ArchiveRetirement {
                 deployment: record.id.clone(),
@@ -1117,6 +1117,9 @@ pub(crate) async fn next_remote_archive(
         .ok_or_else(|| unavailable("The selected installation is unavailable"))?;
     retirement_fence(&record)?;
     for (&operation, registration) in &record.checkpoint_captures {
+        if record.checkpoint_capture_retirements.get(&operation).is_some_and(|release| release.observed_empty_at_ms.is_some()) {
+            continue;
+        }
         if registration.remote_disposal.is_none()
             && let Some(work) = remote_archive(&record, deployment, operation, registration)?
         {
@@ -1179,7 +1182,8 @@ pub async fn finish_retirement(
     }
     let mut remote = false;
     for (&operation, registration) in &record.checkpoint_captures {
-        if !registration.media_bound {
+        if !registration.media_bound || record.checkpoint_capture_retirements.get(&operation)
+            .is_some_and(|release| release.observed_empty_at_ms.is_some()) {
             continue;
         }
         let archive: CellStorage = serde_json::from_str(&registration.archive)
@@ -1209,7 +1213,8 @@ pub async fn finish_retirement(
     }
 
     for (&operation, registration) in &record.checkpoint_captures {
-        if registration.media_bound {
+        if registration.media_bound && !record.checkpoint_capture_retirements.get(&operation)
+            .is_some_and(|release| release.observed_empty_at_ms.is_some()) {
             let point = capture_point(&record, deployment, operation, &registration.archive)?;
             keys.destroy(&archive_key_id(&point)).await?;
         }
