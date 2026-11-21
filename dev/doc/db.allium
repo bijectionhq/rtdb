@@ -634,6 +634,11 @@ config {
 -- If the root or a table block is missing while loading that checkpoint, recovery lists again.
 -- A newer reported block replaces the failed candidate. An unchanged, older or empty listing
 -- propagates the missing-object error. Every other read or decode error returns without refreshing.
+-- Before installing a recovered checkpoint, a provider that reports a retained replica prefix
+-- allows startup to check its first required offset. If the offset has already been trimmed,
+-- startup refreshes discovery and may use only a strictly newer reported checkpoint.
+-- A retained-prefix observation does not hold the suffix in place. The driver checks the log
+-- again as it opens the tail, and a later retention gap remains an error.
 --
 -- A new leader can always reconstruct correct state from the last persisted block and the follower's in-memory state, which has been built by processing replica messages.
 --

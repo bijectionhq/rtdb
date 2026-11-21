@@ -111,6 +111,8 @@ The optional native replay reads the same seeded 4,096-observation trace that th
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
 The same option runs the local checkpoint interruption, partial compaction, overlapping collection and manifest-recovery tests.
 The production controls publish the root too early and stop on a missing checkpoint without refreshing discovery.
+The startup replay test also covers a selected checkpoint whose first required replica offset is below the reported retained floor.
+The archived control skips the prefix check and must fail when the driver opens that suffix.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
 The catalog clock test commits a transaction at an explicit system time, issues an attach and a refused detach, and reopens the same local log.
@@ -148,6 +150,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   TLC explores its finite state space and Apalache independently checks the same safety conditions up to ten transitions.
 * `tla/RecoveryDiscovery.tla` models a separate fallback for missing checkpoint metadata during startup.
   The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
+* `tla/RecoveryReplay.tla` models a checkpoint selection check against the observed replica prefix, refresh, and subsequent tail opening.
+  It checks recovery with a newer checkpoint and reaches a separate loss between the probe and tail opening.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `hyperltl/CheckpointRecovery.hltl` compares every pair of modeled startup schedules with the same stable, readable replacement.
@@ -168,6 +172,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The catalog reclamation area checks the latest-block rule and the last-held-sibling predicate.
   The tiered publication area checks that all four serving siblings for the same block exist before the catalog retires the parent.
   The checkpoint discovery area checks the production retry decision and its decreasing distance from the maximum index.
+  The replay floor area checks the exact signed-offset rule for a required replica record below a provider's reported floor.
   The system time area checks the production assignment and admission decisions, including exhaustion and rejection of equal or earlier timestamps.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.
   The rank cutoff area checks the production decision given the two maximum frontier bounds.

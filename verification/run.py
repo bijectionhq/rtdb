@@ -602,6 +602,17 @@ TLA_CASES = (
      ("INVARIANTS TypeOK AttemptsAdvance NoEmptyAfterMissing UsesNewerListing CorruptionIsTerminal MissingFailureHasRefreshed",
       "INVARIANT NeverRecoveredAfterRefresh"),
      "NeverRecoveredAfterRefresh"),
+    ("RecoveryReplay", "checkpoint-replay-prefix", None, None),
+    ("RecoveryReplay", "checkpoint-replay-skip-probe", ('Mutation = "none"', 'Mutation = "skip_probe"'), "ObservedAdmission"),
+    ("RecoveryReplay", "checkpoint-replay-fail-fast", ('Mutation = "none"', 'Mutation = "fail_fast"'), "RefreshBeforeRefusing"),
+    ("RecoveryReplay", "checkpoint-replay-retry-same", ('Mutation = "none"', 'Mutation = "retry_same"'), "OnlyNewerCheckpointsRetried"),
+    ("RecoveryReplay", "checkpoint-replay-trust-probe", ('Mutation = "none"', 'Mutation = "trust_probe"'), "TailStartCovered"),
+    ("RecoveryReplay", "checkpoint-replay-replacement-witness",
+     ("INVARIANTS ObservedAdmission OnlyNewerCheckpointsRetried RefreshBeforeRefusing TailStartCovered",
+      "INVARIANT NeverOpenedReplacement"), "NeverOpenedReplacement"),
+    ("RecoveryReplay", "checkpoint-replay-post-probe-loss-witness",
+     ("INVARIANTS ObservedAdmission OnlyNewerCheckpointsRetried RefreshBeforeRefusing TailStartCovered",
+      "INVARIANT NeverLostAfterProbe"), "NeverLostAfterProbe"),
 )
 
 
@@ -695,6 +706,11 @@ def verify_apalache(args, scratch):
     check_apalache(
         args, scratch, "RecoveryDiscovery", "checkpoint-discovery-fail-fast", "MissingFailureHasRefreshed", 10,
         ('Mutation = "none"', 'Mutation = "fail_fast"'), "missing checkpoint without refreshed discovery",
+    )
+    check_apalache(args, scratch, "RecoveryReplay", "checkpoint-replay-prefix", "ReplaySafe", 10)
+    check_apalache(
+        args, scratch, "RecoveryReplay", "checkpoint-replay-trust-probe", "TailStartCovered", 10,
+        ('Mutation = "none"', 'Mutation = "trust_probe"'), "log no longer retained when the tail opens",
     )
 
 
@@ -919,6 +935,37 @@ def verify_checkpoint_replay(args, source):
     finally:
         blocks.write_bytes(original)
     print("rust-checkpoint-replay: seven tests passed, root-first and fail-fast mutations rejected")
+
+
+def verify_replay_prefix(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_trimmed"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-replay-prefix-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("native checkpoint selection after replica prefix trimming failed")
+
+    database = source / "rust/crates/node/src/database.rs"
+    original = database.read_bytes()
+    gate = "let recovered = if self.options.replication.enabled {"
+    try:
+        replace_once(database, gate, gate.replace("if self", "if false && self"))
+        checked = run_case(command, source / "rust", args.evidence, "rust-replay-prefix-skip-probe", env)
+        if (
+            checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or "startup must replay the retained replica suffix" not in checked.stdout
+            or 'code: "rtdb.storage/log-range-unavailable"' not in checked.stdout
+            or "0 passed; 1 failed" not in checked.stdout
+        ):
+            raise ValueError("skipping the observed replica prefix check did not fail during replay startup")
+    finally:
+        database.write_bytes(original)
+    print("rust-replay-prefix: checkpoint selection and suffix replay passed, skipping the probe failed")
 
 
 def verify_catalog_replay(args, source):
@@ -1192,6 +1239,8 @@ def main():
         "rust/crates/expr/src/evaluate.rs",
         "rust/crates/query/src/accelerate.rs",
         "rust/crates/replication/src/blocks.rs",
+        "rust/crates/replication/src/driver.rs",
+        "rust/crates/replication/src/logs.rs",
         "rust/crates/format/src/keys.rs",
         "rust/crates/index/src/trie_catalog.rs",
         "rust/crates/index/tests/catalogs.rs",
@@ -1204,11 +1253,15 @@ def main():
         "rust/crates/conformance/tests/node_faults.rs",
         "rust/crates/conformance/tests/recovery.rs",
         "rust/crates/node/tests/native.rs",
+        "rust/crates/node/src/database.rs",
         "rust/crates/tx/src/resolver.rs",
         "rust/crates/azure/src/copy.rs",
         "rust/crates/azure/src/lib.rs",
         "rust/crates/azure/tests/copy_completion.rs",
         "rust/crates/storage/src/remote.rs",
+        "rust/crates/storage/src/log/mod.rs",
+        "rust/crates/storage/src/log/memory.rs",
+        "rust/crates/kafka/src/lib.rs",
     ))
     for path in list(source_paths):
         if path.name == "proof.rs":
@@ -1242,6 +1295,7 @@ def main():
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
+            verify_replay_prefix(args, source)
             verify_catalog_replay(args, source)
             verify_system_time_replay(args, source)
             verify_merge_replay(args, source)

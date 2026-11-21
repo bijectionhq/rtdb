@@ -11,7 +11,7 @@ use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-use crate::{AppliedProgress, ReplicaRecord, TermFence};
+use crate::{AppliedProgress, PartitionLogs, ReplicaRecord, TermFence};
 
 pub struct RecoveredPartition {
     pub partition: Arc<PartitionState>,
@@ -25,6 +25,10 @@ impl RecoveredPartition {
     pub fn with_source_floor(mut self, source_floor: SourcePosition) -> Self {
         self.progress.source_position = self.progress.source_position.max(source_floor);
         self
+    }
+
+    pub(crate) fn replica_start(&self, logs: &PartitionLogs) -> Result<ReplicaPosition> {
+        Ok(self.block.as_ref().and_then(BlockCatalog::boundary_replica_position).unwrap_or(logs.replica_floor()?))
     }
 
     pub(crate) fn confirmation(&self, replica_epoch: StorageEpoch, storage_version: StorageVersion, storage_epoch: StorageEpoch, memory: &Arc<MemoryBudget>) -> Result<Option<RecoveredBlockConfirmation>> {
@@ -115,7 +119,34 @@ impl BlockStore {
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
     pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp) -> Result<RecoveredPartition> {
-        let (block, table_blocks) = match self.load_latest_checkpoint().await? {
+        self.restore(config, source_floor, now, self.load_latest_checkpoint_after(None).await?)
+    }
+
+    /// Reconsiders the checkpoint before a database installs it if an observed replica prefix
+    /// has already been trimmed. The driver still validates the suffix when it opens the tail.
+    pub async fn recover_for_replay(&self, mut recovered: RecoveredPartition, logs: &PartitionLogs,
+        config: TrieConfig, now: Timestamp, cancellation: &CancellationToken) -> Result<RecoveredPartition> {
+        let source_floor = logs.source_floor()?;
+        let work = async {
+            loop {
+                let after = recovered.replica_start(logs)?;
+                let Some(gap) = logs.observed_replica_gap(after).await? else {
+                    return Ok(recovered.with_source_floor(source_floor));
+                };
+                let previous = recovered.block.as_ref().map(BlockCatalog::block_index);
+                drop(recovered);
+                let Some(replacement) = self.load_latest_checkpoint_after(previous).await? else {
+                    return Err(gap.into());
+                };
+                recovered = self.restore(config, source_floor, now, Some(replacement))?;
+            }
+        };
+        cancellation.run_until_cancelled(work).await.ok_or_else(crate::progress::cancelled)?
+    }
+
+    fn restore(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp,
+        selected: Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>) -> Result<RecoveredPartition> {
+        let (block, table_blocks) = match selected {
             Some((catalog, tables)) => (Some(catalog), tables),
             None => (None, BTreeMap::new()),
         };
@@ -136,9 +167,14 @@ impl BlockStore {
             .max())
     }
 
-    async fn load_latest_checkpoint(&self) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
+    async fn load_latest_checkpoint_after(&self, previous: Option<BlockIndex>) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
         let directory = ObjectKey::new("blocks")?;
-        let Some(mut index) = self.latest_checkpoint(&directory).await? else { return Ok(None); };
+        let latest = self.latest_checkpoint(&directory).await?;
+        let selected = match previous {
+            Some(previous) => crate::checkpoint_discovery::newer_checkpoint(previous.0, latest.map(|index| index.0)).map(BlockIndex),
+            None => latest,
+        };
+        let Some(mut index) = selected else { return Ok(None); };
         loop {
             match self.load(index).await {
                 Err(error) if error.code == "rtdb.storage/missing-object" => {

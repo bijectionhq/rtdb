@@ -1,0 +1,87 @@
+{
+  "summary": "A reported prefix floor excludes exactly the still-required replica offsets below it.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 5,
+  "controls": {
+    "exclude_the_floor": {
+      "mutate": [{
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "find": "if requested < first_retained",
+        "replace": "if requested <= first_retained"
+      }],
+      "expect": [{
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "function": "missing_replay_offset",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 4
+    },
+    "exclude_the_floor_with_weakened_contract": {
+      "mutate": [{
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "find": "if requested < first_retained",
+        "replace": "if requested <= first_retained"
+      }, {
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "find": "(after as int) + 1 < first_retained as int",
+        "replace": "(after as int) + 1 <= first_retained as int"
+      }],
+      "expect": [{
+        "file": "verification/verus/replay_floor/laws.rs",
+        "function": "replay_can_start_at_the_first_retained_record",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/replay_floor/laws.rs",
+        "function": "empty_checkpoint_with_untrimmed_log_can_replay",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 3
+    },
+    "require_the_already_covered_record": {
+      "mutate": [{
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "find": "after.checked_add(1)",
+        "replace": "after.checked_add(0)"
+      }],
+      "expect": [{
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "function": "missing_replay_offset",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "function": "missing_replay_offset",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 4
+    },
+    "require_the_already_covered_record_with_weakened_contract": {
+      "mutate": [{
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "find": "after.checked_add(1)",
+        "replace": "after.checked_add(0)"
+      }, {
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "find": "(after as int) + 1 < first_retained as int",
+        "replace": "after < first_retained"
+      }, {
+        "file": "rust/crates/replication/src/replay_floor.rs",
+        "find": "out.unwrap() as int == (after as int) + 1",
+        "replace": "out.unwrap() == after"
+      }],
+      "expect": [{
+        "file": "verification/verus/replay_floor/laws.rs",
+        "function": "replay_can_start_at_the_first_retained_record",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/replay_floor/laws.rs",
+        "function": "a_trimmed_prefix_reports_its_first_required_record",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/replay_floor/laws.rs",
+        "function": "empty_checkpoint_with_untrimmed_log_can_replay",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 2
+    }
+  }
+}

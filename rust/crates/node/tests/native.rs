@@ -798,6 +798,91 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
 }
 
 #[tokio::test]
+async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_trimmed() {
+    use rtdb_storage::log::{LogOffset, MemoryLog};
+
+    struct SharedLogs {
+        source: Arc<MemoryLog>,
+        replica: Arc<MemoryLog>,
+        store: Arc<rtdb_storage::MemoryStore>,
+    }
+
+    struct LogOpening { reached: Semaphore, release: Semaphore }
+    struct Resources { shared: Arc<SharedLogs>, opening: Option<Arc<LogOpening>> }
+
+    #[async_trait]
+    impl ResourceFactory for Resources {
+        fn validate(&self, _: &str, _: &DatabaseConfig) -> Result<()> { Ok(()) }
+
+        async fn open_storage(&self, _: &str, _: &DatabaseConfig) -> Result<DatabaseStorage> {
+            Ok(DatabaseStorage {
+                store: self.shared.store.clone(),
+                storage_epoch: rtdb_types::StorageEpoch(0),
+                storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
+                io: rtdb_storage::IoRegion::new(),
+            })
+        }
+
+        async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
+            if let Some(opening) = &self.opening {
+                opening.reached.add_permits(1);
+                opening.release.acquire().await.unwrap().forget();
+            }
+            Ok(OpenedLogs {
+                source: self.shared.source.clone(), replica: self.shared.replica.clone(),
+                source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new(),
+            })
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let shared = Arc::new(SharedLogs {
+            source: Arc::new(MemoryLog::new(1 << 26)), replica: Arc::new(MemoryLog::new(1 << 26)),
+            store: Arc::new(rtdb_storage::MemoryStore::default()),
+        });
+        let runtime = services();
+        let writer_resources = Arc::new(Resources { shared: shared.clone(), opening: None });
+        let (writer, writer_driver) = running(options(), NodeServices { resources: writer_resources, ..runtime.clone() }).await;
+        let mut session = writer.session("xtdb", Arc::new(Authority)).unwrap();
+        let database = writer.catalog().database("xtdb").unwrap();
+        let token = CancellationToken::new();
+        session.state_mut().execute_operation(put(&writer, 1, 10)).await.unwrap();
+        database.flush().await.unwrap();
+        writer.sync_all(Duration::from_secs(10), &token).await.unwrap();
+        let initial = database.status().adopted_block.unwrap();
+
+        let opening = Arc::new(LogOpening { reached: Semaphore::new(0), release: Semaphore::new(0) });
+        let reader_resources = Arc::new(Resources { shared: shared.clone(), opening: Some(opening.clone()) });
+        let mut reader_options = options();
+        reader_options.read_only = true;
+        let starting = tokio::spawn(Node::open(reader_options, NodeServices { resources: reader_resources, ..runtime }));
+        opening.reached.acquire().await.unwrap().forget();
+
+        session.state_mut().execute_operation(put(&writer, 2, 20)).await.unwrap();
+        database.flush().await.unwrap();
+        writer.sync_all(Duration::from_secs(10), &token).await.unwrap();
+        let replacement = database.status().adopted_block.unwrap();
+        assert!(replacement.block_index() > initial.block_index());
+        let last_boundary = replacement.boundary_replica_position().unwrap().offset();
+        assert!(last_boundary > initial.boundary_replica_position().unwrap().offset() + 1);
+        shared.replica.truncate_before(LogOffset(last_boundary)).unwrap();
+        session.state_mut().execute_operation(put(&writer, 3, 30)).await.unwrap();
+        opening.release.add_permits(1);
+
+        let (reader, driver) = starting.await.unwrap().expect("startup must find a checkpoint with a retained replica suffix");
+        let reader_driver = tokio::spawn(driver.run());
+        reader.sync_all(Duration::from_secs(10), &token).await.expect("startup must replay the retained replica suffix");
+        let resumed = reader.catalog().database("xtdb").unwrap().status().adopted_block.unwrap();
+        assert_eq!(resumed.block_index(), replacement.block_index());
+        let mut session = reader.session("xtdb", Arc::new(Authority)).unwrap();
+        let cursor = session.query_sql("SELECT value FROM docs ORDER BY _id", vec![]).await.unwrap();
+        assert_eq!(rows(cursor).await, [[Value::I64(10)], [Value::I64(20)], [Value::I64(30)]]);
+        stop(&reader, reader_driver).await;
+        stop(&writer, writer_driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn catalog_transactions_advance_system_time_and_replay_in_order() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let directory = tempfile::tempdir().unwrap();
