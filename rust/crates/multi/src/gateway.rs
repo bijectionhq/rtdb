@@ -27,7 +27,7 @@ const PROTOCOL_3: i32 = 196608;
 const MAXIMUM_STARTUP_BYTES: usize = 10_000;
 const SNAPSHOT_PARAMETER: &str = "rtdb.read";
 
-fn database_selector(selector: &str) -> Result<(&str, Option<Uuid>)> {
+pub(crate) fn database_selector(selector: &str) -> Result<(&str, Option<Uuid>)> {
     let Some((name, authority)) = selector.split_once('@') else {
         return Ok((selector, None));
     };
@@ -65,18 +65,19 @@ impl Default for GatewayOptions {
     }
 }
 
-struct DeploymentConnections {
+pub(crate) struct DeploymentConnections {
     limit: usize,
     counts: Mutex<BTreeMap<String, usize>>,
 }
 
-struct DeploymentConnection {
+pub(crate) struct DeploymentConnection {
     registry: Arc<DeploymentConnections>,
     name: String,
 }
 
 impl DeploymentConnections {
-    fn admit(self: &Arc<Self>, name: &str) -> Option<DeploymentConnection> {
+    pub(crate) fn new(limit: usize) -> Self { Self { limit, counts: Mutex::default() } }
+    pub(crate) fn admit(self: &Arc<Self>, name: &str) -> Option<DeploymentConnection> {
         let mut active = self.counts.lock();
         let count = active.entry(name.to_owned()).or_default();
         if *count >= self.limit { return None; }
@@ -103,7 +104,7 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
     }
     let frame_memory = MemoryBudget::new(options.maximum_buffered_bytes);
     let connections = Arc::new(Semaphore::new(options.maximum_connections));
-    let deployments = Arc::new(DeploymentConnections { limit: options.maximum_connections_per_deployment, counts: Mutex::default() });
+    let deployments = Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment));
     let heartbeats = Arc::new(Heartbeats::default());
     let mut connection_index = 0usize;
     loop {
@@ -366,7 +367,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
                 last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
             }
             Ok(Response::Refused { code, message }) => refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
-            Ok(Response::Done | Response::Flushed { .. } | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. }) => {}
+            Ok(Response::Done | Response::Flushed { .. } | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. } | Response::FlightEndpoint { .. }) => {}
             Err(error) => last = Some(error),
         }
     }

@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
-use crate::{FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::{FORWARDED_PEER_HEADER, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 #[derive(Clone)]
@@ -89,10 +89,14 @@ impl Service {
         })?;
         let reservation = self.memory().reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
         let requested_database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose()?;
+        let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let credentials = Credentials::parse(request)?;
         let cookie = auth::cookie(request); let bearer = credentials.bearer();
         if let (Some(cookie), Some(bearer)) = (cookie, bearer) { if !auth::equal(cookie.as_bytes(), bearer.as_bytes()) { return Err(auth::unauthenticated("the session cookie and bearer token name different sessions")); } }
         let (session, minted, lease) = if let Some(id) = bearer.or(cookie) {
+            if forwarded_peer.is_some() {
+                return Err(auth::unauthenticated("Forwarded peer proof is for a new session"));
+            }
             let session = match self.0.sessions.lookup(&id.to_owned(), true) {
                 Lookup::Found(session) => session,
                 Lookup::Expired(after) => return Err(session_error(bearer.is_some(), format!("session expired after {} idle", crate::lease::duration(after)))),
@@ -106,14 +110,24 @@ impl Service {
             if let Err(error) = verified { if let Lookup::Found(removed) = self.0.sessions.take(&session.id) { removed.close(); } return Err(auth::auth_error(error)); }
             (session, false, lease)
         } else {
-            let peer = request.remote_addr().map(|address| address.ip().to_string());
-            let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
             let catalog = self.0.node.catalog();
+            let placed_name = || requested_database.filter(|name| !name.is_empty())
+                .ok_or_else(|| Status::invalid_argument("A placed Flight SQL session requires x-xtdb-database"));
+            let (peer, verified_attachment) = if let Some(proof) = forwarded_peer {
+                let verifier = self.0.config.forwarded_peer.as_ref()
+                    .ok_or_else(|| auth::unauthenticated("This listener does not accept forwarded peers"))?;
+                let proof = proof.to_str().map_err(|_| auth::unauthenticated("Invalid forwarded peer proof"))?;
+                let attachment = catalog.database(placed_name()?).map_err(status)?;
+                let peer = verifier.verify(proof, &attachment).map_err(auth::auth_error)?;
+                (Some(peer.to_string()), Some(attachment))
+            } else {
+                (request.remote_addr().map(|address| address.ip().to_string()), None)
+            };
+            let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
             let placement = if catalog.is_placed() {
-                let name = requested_database.filter(|name| !name.is_empty())
-                    .ok_or_else(|| Status::invalid_argument("A placed Flight SQL session requires x-xtdb-database"))?;
+                let name = placed_name()?;
                 caller.principal.authorize_database(name, DatabaseAccess::Read).map_err(status)?;
-                Some(catalog.database(name).map_err(status)?)
+                match verified_attachment { Some(attachment) => Some(attachment), None => Some(catalog.database(name).map_err(status)?) }
             } else { None };
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
             let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), self.memory().reserve(capacity).map_err(status)?));

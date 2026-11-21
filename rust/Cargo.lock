@@ -4357,6 +4357,7 @@ dependencies = [
 name = "rtdb-multi"
 version = "0.1.0"
 dependencies = [
+ "arrow-flight",
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
@@ -4364,6 +4365,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "http 1.5.0",
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
@@ -4374,6 +4376,7 @@ dependencies = [
  "rtdb-affinity",
  "rtdb-columnar",
  "rtdb-directory",
+ "rtdb-flight-sql",
  "rtdb-format",
  "rtdb-logkeeper",
  "rtdb-node",
@@ -4391,6 +4394,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-rustls 0.26.6",
  "tokio-util",
+ "tonic",
  "uuid",
 ]
 

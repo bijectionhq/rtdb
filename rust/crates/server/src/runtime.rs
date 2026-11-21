@@ -27,6 +27,7 @@ pub struct PlacedOptions {
     pub claim_wait: Duration,
     /// Accepts capabilities minted by the cell's gateways in place of a password.
     pub capabilities: Option<Arc<dyn rtdb_pgwire::CapabilityVerifier>>,
+    pub flight_peer: Option<Arc<dyn rtdb_flight_sql::FlightPeerVerifier>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -127,6 +128,7 @@ impl ServerDriver {
         let read_fence = placed.as_ref().and_then(|placed| placed.read_fence.clone());
         let scan_fragmenter = placed.as_ref().and_then(|placed| placed.scan_fragmenter.clone());
         let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());
+        let flight_peer = placed.as_ref().and_then(|placed| placed.flight_peer.clone());
         let gateway_session_state = placed.is_some();
         if let Some(placed) = placed {
             for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
@@ -159,7 +161,8 @@ impl ServerDriver {
             Some(settings) if settings.port >= 0 => {
                 let configuration = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
                     transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
-                    session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground, ..Default::default() };
+                    session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
+                    forwarded_peer: flight_peer, ..Default::default() };
                 let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
                 addresses.flight_sql = Some(handle.address());
                 Some((handle, driver))

@@ -11,6 +11,7 @@ pub mod cells;
 pub mod cipher;
 pub mod control;
 pub mod deployment;
+pub mod flight_gateway;
 pub mod fragments;
 pub mod gateway;
 pub mod install;

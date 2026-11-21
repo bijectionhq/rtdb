@@ -23,7 +23,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
-       rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
+       rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
@@ -426,6 +426,19 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 map.register_cell(cell, &advertised).await?;
                 options.cells = Some((map, cell.to_owned()));
             }
+            let flight = if arguments.present("flight-listen") {
+                let endpoint = arguments.required("flight-listen")?.parse::<SocketAddr>()
+                    .map_err(|_| usage("--flight-listen must be HOST:PORT".into()))?;
+                let flight = tokio::net::TcpListener::bind(endpoint).await.map_err(io)?;
+                eprintln!("Flight SQL gateway listening on {}", flight.local_addr().map_err(io)?);
+                Some(flight)
+            } else { None };
+            let flight = async {
+                match flight {
+                    Some(flight) => rtdb_multi::flight_gateway::serve(flight, Arc::clone(&directory), options.clone(), cancellation.clone()).await,
+                    None => std::future::pending().await,
+                }
+            };
             if arguments.present("install-listen") {
                 let tls = tls.ok_or_else(|| usage("The installation listener requires a TLS configuration".into()))?;
                 let installer = rtdb_multi::install::Installer::from_file(
@@ -436,11 +449,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 )?;
                 let installs = tokio::net::TcpListener::bind(arguments.address("install-listen", "127.0.0.1:0")?).await.map_err(io)?;
                 tokio::select! {
-                    gateway = gateway::serve(listener, directory.clone(), options, cancellation.clone()) => gateway,
-                    installation = rtdb_multi::install::serve(installs, tls, directory, Arc::new(installer), cancellation) => installation,
+                    gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
+                    flight = flight => flight,
+                    installation = rtdb_multi::install::serve(installs, tls, directory.clone(), Arc::new(installer), cancellation.clone()) => installation,
                 }
             } else {
-                gateway::serve(listener, directory, options, cancellation).await
+                tokio::select! {
+                    gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
+                    flight = flight => flight,
+                }
             }
         }
         "controller" => {

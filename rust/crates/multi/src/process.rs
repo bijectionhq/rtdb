@@ -113,6 +113,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
         claim_wait: settings.claim_wait,
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
+        flight_peer: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_flight_sql::FlightPeerVerifier>),
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
         scan_fragmenter: Some(fragmenter.clone() as Arc<dyn rtdb_query::ScanFragmenter>),
         compaction_relay: match (settings.pool == rtdb_directory::MemberPool::Compaction, &settings.capabilities) {
@@ -127,12 +128,13 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let control_address = control.local_addr().map_err(io)?;
     let pgwire_endpoint = advertised(pgwire_address, settings.advertise_host.as_deref())?;
     let control_endpoint = advertised(control_address, settings.advertise_host.as_deref())?;
+    let flight_endpoint = server.addresses().flight_sql.map(|address| advertised(address, settings.advertise_host.as_deref())).transpose()?;
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
         role: MemberRole::Node, address: pgwire_endpoint.clone(), control_address: Some(control_endpoint), availability_zone: settings.availability_zone, pool: settings.pool, engine_version, storage_namespaces: Some(storage_namespaces),
     }, settings.lease).await?;
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoint, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();

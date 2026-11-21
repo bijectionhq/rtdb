@@ -171,6 +171,7 @@ pub struct NodeAgent {
     node: Node,
     lease: Arc<MemberLease>,
     address: String,
+    flight_endpoint: Option<String>,
     options: AgentOptions,
     holdings: Mutex<BTreeMap<String, LocalHolding>>,
     /// Deployments a fragment was asked of before this node had them open, whose replicas its next pass opens.
@@ -188,8 +189,8 @@ pub struct NodeAgent {
 }
 
 impl NodeAgent {
-    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
+    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoint: Option<String>, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -914,6 +915,8 @@ impl Handler for NodeAgent {
             Request::ParkForMove { name, epoch, ticket } => self.park_holding(&name, Some((epoch, &ticket))).await,
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
             Request::Ping => Ok(Response::Done),
+            Request::FlightEndpoint => self.flight_endpoint.clone().map(|address| Response::FlightEndpoint { address })
+                .ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-flight-endpoint", "The holder does not have a Flight SQL endpoint")),
             Request::Subscribe { name } => self.subscribe(&name).await,
             Request::Snapshot { name } => self.snapshot(&name).await,
             Request::Flush { name } => self.flush(&name).await,
