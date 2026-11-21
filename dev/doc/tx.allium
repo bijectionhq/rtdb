@@ -869,6 +869,20 @@ rule FailedTransactionRejectsStatements {
 -- pgwire's SQL COMMIT / ROLLBACK act on the explicit transaction regardless of auto_commit.
 -- ADBC's programmatic commit() / rollback() are valid only when auto_commit is off.
 
+rule PgwireSingleAutocommitWriteCompletesAfterCommit {
+    when: SimpleQueryExecuted(frontend, connection, statement)
+
+    requires: frontend.protocol = pgwire
+    requires: SingleImplicitDml(statement, connection)
+
+    ensures:
+        let outcome = CommitOutcome(connection)
+        if outcome.committed:
+            CommandComplete(frontend, statement)
+        else:
+            StatementRejected(error_code: outcome.error_code)
+}
+
 rule TxControlAsSqlRejected {
     -- BEGIN, START TRANSACTION, COMMIT and ROLLBACK reach the connection as SQL text from ADBC and Flight SQL callers; the error names the transaction API those callers use.
     when: TxControlSubmittedAsSql(frontend, connection, statement)

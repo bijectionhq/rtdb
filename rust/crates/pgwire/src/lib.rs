@@ -4,6 +4,7 @@ mod error;
 mod protocol;
 mod server;
 mod wire;
+pub use wire::ANOMALY_CODE_FIELD;
 mod copy;
 
 pub use config::{CAPABILITY_PARAMETER, CapabilityVerifier, DELEGABLE_PARAMETER, ServerConfig, VerifiedCapability};

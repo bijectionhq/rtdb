@@ -164,7 +164,7 @@ impl ProtocolSession {
                 let name = input.string()?.to_owned(); let limit = input.integer()?; input.end()?; if limit < 0 { return Err(protocol("Execute row limit cannot be negative")); }
                 let generation = self.transaction_generation;
                 let mut portal = self.portals.remove(&name).ok_or_else(|| protocol("no such portal"))?;
-                let result = self.execute(&mut portal, limit as usize, writer).await;
+                let result = self.execute(&mut portal, limit as usize, false, writer).await;
                 if generation == self.transaction_generation { self.portals.insert(name, portal); }
                 result?;
             }
@@ -298,7 +298,7 @@ impl ProtocolSession {
     fn record_transaction_error(&self) { if let Some(observer) = self.node.execution_observer() { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
     async fn description<W: AsyncWrite + Unpin>(columns: Option<&[Column]>, fallback: PgType, writer: &mut Writer<W>) -> Result<()> { match columns { Some(columns) => writer.columns(columns, fallback).await, None => writer.empty(b'n').await } }
 
-    async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, writer: &mut Writer<W>) -> Result<()> {
+    async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, commit_dml_before_reply: bool, writer: &mut Writer<W>) -> Result<()> {
         let prepared = Arc::clone(&portal.prepared);
         let failed = self.session.state().status() == TransactionStatus::Failed;
         let control = prepared.control();
@@ -327,6 +327,7 @@ impl ProtocolSession {
                 let _arguments = self.node.memory().reserve(bound)?;
                 let args = if portal.arguments.is_empty() { None } else { Some(rtdb_tx::SqlArguments::from_rows(vec![portal.arguments.clone()], self.node.memory())?) };
                 self.session.state_mut().execute_operation(statement.dml_operation(args)?).await?;
+                if commit_dml_before_reply { self.commit().await?; }
                 writer.string(b'C', &dml_tag(source)).await
             }
             (PreparedKind::Control(control), _) => {
@@ -443,6 +444,7 @@ impl ProtocolSession {
             rtdb_sql::parse_statement_batch(&source, &memory)
         };
         let mut batch = parsed.map_err(|error| SimpleQueryFailure::from_batch(error, &source, original, &memory))?;
+        let single_autocommit = batch.len() == 1 && self.session.state().status() == TransactionStatus::Idle;
         while let Some(statement) = batch.next_for_execution() {
             let start_transaction = match &statement {
                 BatchExecution::Prepare(_) => true,
@@ -452,14 +454,14 @@ impl ProtocolSession {
                 },
             };
             if start_transaction { self.begin_implicit(None)?; }
-            let result = self.run_simple_statement(statement, writer).await;
+            let result = self.run_simple_statement(statement, single_autocommit, writer).await;
             self.simple_statement_result(result, writer).await?;
         }
         drop(batch);
         self.settle_simple_transaction().await.map_err(Into::into)
     }
 
-    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, writer: &mut Writer<W>) -> Result<()> {
+    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, commit_dml_before_reply: bool, writer: &mut Writer<W>) -> Result<()> {
         let (syntax, allocation) = match statement {
             BatchExecution::Command { syntax, allocation } => (syntax, allocation),
             BatchExecution::Prepare(statement) => {
@@ -478,7 +480,7 @@ impl ProtocolSession {
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
         let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
         if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
-        self.execute(&mut portal, 0, writer).await
+        self.execute(&mut portal, 0, commit_dml_before_reply, writer).await
     }
 
     async fn simple_statement_result<W: AsyncWrite + Unpin>(&mut self, result: Result<()>, writer: &mut Writer<W>) -> Result<()> {
@@ -838,6 +840,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_single_autocommit_write_reports_success_only_after_commit() {
+        let (mut frontend, driver) = test_frontend().await;
+        let node = frontend.node.clone();
+        let memory = Arc::clone(node.memory());
+        let driver = tokio::spawn(driver.run());
+        for (sql, expected) in [
+            ("INSERT INTO docs (_id, value) VALUES (NULL, 'invalid')", b'E'),
+            ("INSERT INTO docs (_id, value) VALUES (1, 'valid')", b'C'),
+        ] {
+            let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+            frontend.simple(sql, &mut writer).await.unwrap();
+            let bytes = writer.into_inner();
+            let mut reader = crate::wire::Reader::new(bytes.as_slice(), Arc::clone(&memory));
+            assert_eq!(reader.read(1 << 20).await.unwrap().unwrap().tag, expected);
+            assert_eq!(reader.read(1 << 20).await.unwrap().unwrap().tag, b'Z');
+            assert!(reader.read(1 << 20).await.unwrap().is_none());
+        }
+        drop(frontend);
+        node.shutdown();
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn initial_simple_query_error_is_written_once_on_partial_connection_failure() {
         use std::{io, pin::Pin, task::{Context, Poll}};
 
@@ -1160,7 +1185,7 @@ mod tests {
         let leaf_bytes = leaf.len() * 128 + 8192;
         let held = memory.reserve(memory.limit_bytes() - retained - arguments - leaf_bytes + 1).unwrap();
         let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
-        let error = frontend.execute(&mut portal, 0, &mut writer).await.unwrap_err();
+        let error = frontend.execute(&mut portal, 0, false, &mut writer).await.unwrap_err();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let request = format!("Cannot reserve {leaf_bytes} bytes");
         assert!(error.message.as_deref().unwrap().starts_with(request.as_str()));
@@ -1168,7 +1193,7 @@ mod tests {
         drop(held);
         assert_eq!(memory.used_bytes(), retained);
 
-        frontend.execute(&mut portal, 0, &mut writer).await.unwrap();
+        frontend.execute(&mut portal, 0, false, &mut writer).await.unwrap();
         assert!(old_statement.upgrade().is_none());
         frontend.portals.insert("portal".into(), portal);
         let mut body = vec![b'S'];

@@ -284,21 +284,24 @@ impl NodeAgent {
     }
 
     async fn await_leadership(&self, name: &str, database: &Arc<Database>) -> Result<()> {
-        let deadline = Instant::now() + self.options.activation_timeout;
+        let activation_deadline = tokio::time::sleep(self.options.activation_timeout);
+        tokio::pin!(activation_deadline);
+        let mut changes = database.watch_status();
+        let stopped = || database.progress().fault().unwrap_or_else(|| {
+            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/open-failed", "The deployment's driver stopped while it was being opened")
+        });
         loop {
-            let status = database.status();
+            let status = changes.borrow_and_update().clone();
             if matches!(status.role, DriverRole::Leading(_)) { return Ok(()); }
             if let Some(failure) = status.promotion_failure { return Err(failure); }
-            if matches!(status.role, DriverRole::Stopped) {
-                return Err(database.progress().fault().unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/open-failed", "The deployment's driver stopped while it was being opened")));
-            }
+            if matches!(status.role, DriverRole::Stopped) { return Err(stopped()); }
             if self.node.catalog().database(name).is_err() { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/open-failed", "The deployment stopped while it was being opened")); }
-            if Instant::now() > deadline {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/activation-timeout", format!(
+            tokio::select! {
+                _ = &mut activation_deadline => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/activation-timeout", format!(
                     "The holder did not confirm its leadership in time (role {:?}, highest term {:?}, replica position {:?}, open block {:?})",
-                    status.role, status.highest_term, status.replica_position, status.open_block)));
+                    status.role, status.highest_term, status.replica_position, status.open_block))),
+                changed = changes.changed() => if changed.is_err() { return Err(stopped()); },
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -333,12 +336,15 @@ impl NodeAgent {
             record.epoch > epoch || record.epoch == epoch && record.holder.as_ref() != Some(&member)
         }));
         let flush = async {
-            let open = database.status().open_block;
+            let mut changes = database.watch_status();
+            let open = changes.borrow().open_block;
             database.flush().await?;
-            while database.status().adopted_block.as_ref().is_none_or(|block| block.block_index() < open) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            let adopted = |status: &rtdb_replication::DriverStatus| status.adopted_block.as_ref().is_some_and(|block| block.block_index() >= open);
+            if changes.wait_for(|status| adopted(status) || matches!(status.role, DriverRole::Stopped)).await.is_ok_and(|status| adopted(&status)) {
+                Ok(())
+            } else {
+                Err(database.progress().fault().unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder stopped before adopting its flush")))
             }
-            Ok(())
         };
         tokio::select! {
             _ = deposed => Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder was deposed while waiting for its flush")),

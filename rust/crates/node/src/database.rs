@@ -10,7 +10,7 @@ use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDr
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
 use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +46,8 @@ impl Database {
     pub fn external_source(&self) -> bool { self.configuration.external_source.is_some() }
     pub fn progress(&self) -> &Arc<ProgressMonitor> { self.replication.progress() }
     pub fn status(&self) -> rtdb_replication::DriverStatus { self.replication.status() }
+    /// Observes the replication driver's current status and subsequent changes.
+    pub fn watch_status(&self) -> watch::Receiver<rtdb_replication::DriverStatus> { self.replication.watch_status() }
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
     /// Rows applied since the last block, held in the live index until the next flush.
     pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }

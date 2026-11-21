@@ -263,6 +263,13 @@ impl Session {
                             if frame.tag == b'Z' { self.swallowing -= 1; }
                             continue;
                         }
+                        if !self.pending.is_empty() && !self.discarding && frame.tag == b'E' && ingestion_stopped(&frame) {
+                            if self.answered || self.key.is_none() {
+                                break Err(lost("the holder's driver stopped during the command, whose outcome is unknown"));
+                            }
+                            self.lost_unanswered = true;
+                            self.discarding = true;
+                        }
                         if !self.answered && !self.discarding && frame.tag == b'E' && not_held(&frame) { self.discarding = true; }
                         if self.discarding {
                             if frame.tag == b'Z' {
@@ -272,9 +279,8 @@ impl Session {
                             }
                             continue;
                         }
-                        // A refusal part way through a resent command says nothing of the attempt that was lost, which may have committed.
-                        if self.answered && self.lost_unanswered && frame.tag == b'E' && not_held(&frame) {
-                            break Err(lost("the holder went away during a command, and its successor refused the command part way: its outcome is unknown"));
+                        if self.lost_unanswered && frame.tag == b'E' {
+                            break Err(lost("the command's outcome is unknown because its holder stopped and its successor could not confirm it"));
                         }
                         self.answered = true;
                         match frame.tag {
@@ -355,7 +361,24 @@ impl Session {
 }
 
 /// Whether an ErrorResponse is a placed node's refusal of a database it no longer holds, raised before the command ran.
-fn not_held(frame: &Frame) -> bool { frame.body.windows(rtdb_node::NOT_HELD.len()).any(|window| window == rtdb_node::NOT_HELD.as_bytes()) }
+fn not_held(frame: &Frame) -> bool {
+    backend_anomaly_code(frame).map_or_else(
+        || frame.body.windows(rtdb_node::NOT_HELD.len()).any(|window| window == rtdb_node::NOT_HELD.as_bytes()),
+        |code| code == rtdb_node::NOT_HELD.as_bytes(),
+    )
+}
+
+fn backend_anomaly_code(frame: &Frame) -> Option<&[u8]> {
+    frame.body.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(&[rtdb_pgwire::ANOMALY_CODE_FIELD]))
+}
+
+fn ingestion_stopped(frame: &Frame) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ErrorDetail<'a> { code: &'a str }
+    if let Some(code) = backend_anomaly_code(frame) { return code == b"xtdb/ingestion-stopped"; }
+    frame.body.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(b"D"))
+        .is_some_and(|detail| serde_json::from_slice::<ErrorDetail<'_>>(detail).is_ok_and(|anomaly| anomaly.code == "xtdb/ingestion-stopped"))
+}
 
 fn parse_name(frame: &Frame) -> String {
     frame.body.split(|byte| *byte == 0).next().map(|name| String::from_utf8_lossy(name).into_owned()).unwrap_or_default()
@@ -499,6 +522,46 @@ mod tests {
         assert_eq!(receive(&mut client).await.0, b'Z');
         drop(client);
         let _ = running.await;
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_keyed_command_is_replayed_when_the_driver_stops() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, mut source) = pair(&listener).await;
+        let (second, mut target) = pair(&listener).await;
+        let mut startup = 196608i32.to_be_bytes().to_vec();
+        startup.extend_from_slice(b"user\0xtdb\0database\0shop\0\0");
+        let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&startup);
+        let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id, None, true);
+        let running = tokio::spawn(session.run(gateway, first, 0));
+
+        greet(&mut source).await;
+        receive(&mut client).await;
+        receive(&mut client).await;
+        send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+        let key = query(&mut source).await;
+        send(&mut source, b'C', b"SET\0").await;
+        send(&mut source, b'Z', b"I").await;
+        assert_eq!(query(&mut source).await, "UPDATE counters SET n = n + 1");
+        let stopped = format!("SERROR\0C57014\0MThe replication driver has stopped\0{}xtdb/ingestion-stopped\0\0", char::from(rtdb_pgwire::ANOMALY_CODE_FIELD));
+        send(&mut source, b'E', stopped.as_bytes()).await;
+        send(&mut source, b'Z', b"I").await;
+
+        greet(&mut target).await;
+        assert_eq!(query(&mut target).await, key);
+        send(&mut target, b'C', b"SET\0").await;
+        send(&mut target, b'Z', b"I").await;
+        assert_eq!(query(&mut target).await, "UPDATE counters SET n = n + 1");
+        send(&mut target, b'C', b"UPDATE 1\0").await;
+        send(&mut target, b'Z', b"I").await;
+        assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()));
+        assert_eq!(receive(&mut client).await.0, b'Z');
+        drop(client);
+        running.await.unwrap().unwrap();
     }
 
     #[tokio::test]

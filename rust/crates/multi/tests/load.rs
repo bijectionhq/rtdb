@@ -127,6 +127,7 @@ async fn a_thousand_deployments_keep_their_history_through_handoff_and_failover(
         })).await);
     }
     let activation = start.elapsed();
+    println!("activated {deployments} deployments in {:.3} s", activation.as_secs_f64());
 
     let mut handoffs = Vec::with_capacity(deployments);
     for (batch_names, batch) in names.chunks(concurrency).zip(targets.chunks(concurrency)) {
@@ -189,5 +190,54 @@ async fn a_thousand_deployments_keep_their_history_through_handoff_and_failover(
     );
     let peaks: Vec<_> = cell.nodes.iter().flatten().map(|node| node.server.node().memory().peak_bytes()).collect();
     println!("survivor_peak_execution_bytes={peaks:?}");
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn writes_keep_progress_during_repeated_handoffs() {
+    let moves = setting("RTDB_CELL_ACTIVE_HANDOFFS", 48);
+    let cell = Cell::start_durable(3).await;
+    admin::create_deployment(cell.directory.as_ref(), "active", "bench", 3).await.unwrap();
+    let client = cell.connect("active").await;
+    client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
+    let first_write = Arc::new(tokio::sync::Notify::new());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let writer = {
+        let stop = stop.clone();
+        let first_write = first_write.clone();
+        tokio::spawn(async move {
+            let mut commits = Vec::new();
+            while !stop.is_cancelled() {
+                client.simple_query("UPDATE counters SET n = n + 1 WHERE _id = 1").await.unwrap();
+                commits.push(Instant::now());
+                if commits.len() == 1 { first_write.notify_one(); }
+            }
+            commits
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), first_write.notified()).await.unwrap();
+    let holder = cell.holder("active").await.unwrap();
+    let mut windows = Vec::with_capacity(moves);
+    for step in 1..=moves {
+        let target = cell.node((holder + step) % 3).lease.id();
+        let start = Instant::now();
+        admin::move_deployment(cell.directory.as_ref(), "active", &target, &common::control()).await.unwrap();
+        windows.push((start, Instant::now()));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    stop.cancel();
+    let commits = writer.await.unwrap();
+    let verifier = cell.connect("active").await;
+    assert_eq!(values(&verifier, "SELECT n FROM counters").await, [commits.len().to_string()]);
+
+    let mut gaps: Vec<_> = windows.into_iter().map(|(start, end)| {
+        commits.windows(2).filter(|pair| pair[0] <= end && pair[1] >= start)
+            .map(|pair| pair[1] - pair[0]).max().expect("commits bracket the handoff")
+    }).collect();
+    gaps.sort_unstable();
+    println!("moves={moves} acknowledged_updates={} peak_commit_gap_p50_ms={:.3} peak_commit_gap_p95_ms={:.3} peak_commit_gap_p99_ms={:.3}",
+        commits.len(), percentile(&gaps, 50), percentile(&gaps, 95), percentile(&gaps, 99));
+    drop(verifier);
     cell.stop().await;
 }

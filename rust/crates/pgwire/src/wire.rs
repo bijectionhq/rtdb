@@ -7,6 +7,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{network, protocol};
 
 pub(crate) const STARTUP_LIMIT: usize = 10_000;
+/// ErrorResponse field carrying a placement interruption code in every detail format.
+pub const ANOMALY_CODE_FIELD: u8 = b'y';
 
 pub(crate) struct Frame { pub tag: u8, pub body: Vec<u8>, pub charge: Arc<MemoryReservation> }
 pub(crate) struct Reader<R> { input: R, memory: Arc<MemoryBudget> }
@@ -64,6 +66,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         let severity = if fatal { "FATAL" } else { "ERROR" };
         let mut fields = vec![(b'S', severity), (b'V', severity), (b'C', crate::error::state(error)), (b'M', error.message.as_deref().unwrap_or(""))];
         if let Some(detail) = &detail { fields.push((b'D', detail)); }
+        if matches!(error.code.as_str(), rtdb_node::NOT_HELD | "xtdb/ingestion-stopped") { fields.push((ANOMALY_CODE_FIELD, &error.code)); }
         if matches!(error.code.as_str(), "xtdb/prepared-query-out-of-date" | "prepared-query-out-of-date") { fields.push((b'R', "RevalidateCachedQuery")); }
         self.fields(b'E', &fields).await
     }
@@ -111,9 +114,24 @@ mod tests {
                 loop { let tag = input.byte().unwrap(); if tag == 0 { break; } fields.insert(tag, input.string().unwrap()); }
                 input.end().unwrap();
                 assert_eq!(fields[&b'M'], message.as_deref().unwrap_or(""));
+                assert!(!fields.contains_key(&ANOMALY_CODE_FIELD));
                 assert_eq!(fields[&b'D'].as_bytes(), rtdb_pg_codec::encode_error(&error, fallback).unwrap());
                 assert_eq!(error.message, message);
                 assert_eq!(memory.used_bytes(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_error_codes_are_independent_of_the_detail_format() {
+        for code in [rtdb_node::NOT_HELD, "xtdb/ingestion-stopped"] {
+            let error = Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, code, "holder stopped");
+            for fallback in [PgType::Json, PgType::JsonLd, PgType::Transit] {
+                let mut writer = Writer::new(Vec::new(), MemoryBudget::new(1 << 20));
+                writer.error(&error, fallback, false).await.unwrap();
+                let bytes = writer.into_inner();
+                assert!(bytes[5..].split(|byte| *byte == 0)
+                    .any(|field| field.strip_prefix(&[ANOMALY_CODE_FIELD]) == Some(code.as_bytes())));
             }
         }
     }

@@ -460,6 +460,10 @@ Moves are invisible to clients only if the gateway owns connections and session 
    Terminates pgwire (reusing `pgwire/src/protocol.rs` and `wire.rs`) and Flight SQL, authenticates, mints capabilities and idempotency keys, and sends statements to nodes over an RPC carrying the capability, the session state and the basis.
 3. **Crate `affinity`**, ported from Bijection's `crates/affinity` with its score vectors, and routing by it (`RouteRead`), with per-key in-flight bounds and pressure.
 4. **Redirects**: `NotHolder`, `Moved`, `Behind`, followed by the gateway without the client noticing.
+   A driver that stops during execution can leave the outcome unknown.
+   The gateway replays the command under its original key when the client has received no answer.
+   A single pgwire autocommit write sends `CommandComplete` after the commit succeeds.
+   PGwire carries stable placement interruption codes independently of the configured error detail format. [PostgreSQL ErrorResponse format](https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ERRORRESPONSE)
 5. **Suspicion reports** to the controller on connection failure.
 
 **Tests.**
@@ -507,6 +511,8 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    When the source observes at most 64 live rows and 16 replica records since its last adopted boundary, with the intake processed through its latest position, it can park without uploading a block.
    The successor seals the quorum and recovers the durable tail before it confirms leadership.
    Larger or still-processing tails use the source's flush path.
+   A placed writer waits 2 ms at the committed log tip before its claim.
+   Control requests observe the replication driver's leadership and block-adoption updates directly.
 3. Autoscaling signals per pool, published as metrics through `metrics` and `server/src/metric_export`: nodes by the binding `LoadVector` dimension, logkeepers by ingest, workers by queue depth, gateways by connections.
 
 **Tests.**
@@ -531,7 +537,18 @@ Two release runs without a build running concurrently used the same 1,000-deploy
 
 The short-tail run measured the move alone at 33.5 ms p50 and 39.7 ms p99.
 It verified all 1,000 counters and checked the later epochs of the 346 deployments held by the node that was killed.
-The 30 ms stall gate still needs an isolated workload that measures admission during handoff.
+With the 2 ms wait and status notifications, three spaced runs measured move-to-first-write p50 of 15.4–15.7 ms and p99 of 17.3–18.3 ms.
+All counters matched after failover in the three runs, including the 341–351 deployments that changed epochs after their holder was killed.
+A third back-to-back run hit a local `EADDRNOTAVAIL` on connection setup, and the spaced repeat completed.
+With a connection issuing writes continuously, three release runs moved its deployment 48 times each.
+The final counter matched all 316–398 acknowledged updates per run.
+The largest inter-commit gap overlapping each move had a median of 18.6–22.1 ms, p95 of 25.8–27.3 ms, and p99 of 31.4–41.1 ms.
+The continuous-write tail latency remains above the 30 ms target.
+
+```sh
+cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
+  writes_keep_progress_during_repeated_handoffs -- --ignored --nocapture
+```
 
 ```sh
 RTDB_CELL_HANDOFF_DEPLOYMENTS=1000 \

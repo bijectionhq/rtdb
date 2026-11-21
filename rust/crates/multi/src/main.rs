@@ -107,7 +107,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             agent.park_after = arguments.optional("park-after").map(|seconds| seconds.parse().map(Duration::from_secs)).transpose().map_err(|_| usage("--park-after must be a number of seconds".into()))?;
             let node = process::start_node(directory, process::NodeSettings {
                 configuration, allocation_limit_bytes: arguments.number("memory-limit", 1usize << 30)?, control: arguments.address("control", "127.0.0.1:0")?,
-                availability_zone: arguments.optional("zone").unwrap_or("local").into(), agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(20),
+                availability_zone: arguments.optional("zone").unwrap_or("local").into(), agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(2),
                 pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
                 local_compaction: !arguments.present("no-local-compaction"), capabilities: cell_secret(&arguments)?,
                 keys: keys(&arguments)?, cache_dir: PathBuf::from(arguments.required("cache")?),

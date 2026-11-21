@@ -42,7 +42,10 @@ impl<'input> Iterator for StatementBatch<'input> {
     type Item = BatchStatement<'input>;
 
     fn next(&mut self) -> Option<Self::Item> { self.statements.next() }
+    fn size_hint(&self) -> (usize, Option<usize>) { self.statements.size_hint() }
 }
+
+impl ExactSizeIterator for StatementBatch<'_> {}
 
 #[derive(Debug)]
 pub struct BatchStatement<'input> {

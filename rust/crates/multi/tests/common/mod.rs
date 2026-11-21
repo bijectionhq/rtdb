@@ -15,9 +15,10 @@ async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, stor
     if let Some(watch) = watch { agent.watch_interval = watch; }
     agent.park_after = park_after;
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
+    let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
     process::start_node(Arc::clone(directory), process::NodeSettings {
         configuration: NodeConfiguration::from_yaml("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n").unwrap(), allocation_limit_bytes: 1 << 30,
-        control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), agent, lease: lease(), claim_wait: Duration::from_millis(20), pool,
+        control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), agent, lease: lease(), claim_wait: Duration::from_millis(claim_wait), pool,
         keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers, capabilities: Some(secret()),
     }).await.unwrap()
 }
