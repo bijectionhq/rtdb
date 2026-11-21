@@ -5,7 +5,7 @@ Track throughput, p50 and p95 latency, and peak memory under matched conditions.
 The results below describe specific builds and workloads.
 
 The packaged RTDB `55277dbf3` met or exceeded XTDB `c84f9334e` on all 110 evaluated throughput, latency and memory medians on Mac mini 2.
-The million-row pgwire ingest median uses four runs per engine, since the two full-run results differed by run order.
+The million-row pgwire ingest median uses four runs per engine after the first two pairs gave different winners.
 
 ## Baseline
 
