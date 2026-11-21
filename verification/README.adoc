@@ -202,6 +202,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   It checks the claim that an admitted snapshot can still read its dependencies when collection moves ahead.
 * `tla/RetirementPublication.tla` checks a certificate published after installation with a matching admission floor and an identity-scoped provider deletion.
   Its reachability check collects and reuses a physical key.
+* `tla/S3KeyCustody.tla` checks conditional provisioning, withdrawal, and confirmation for one S3 vault key.
+  It distinguishes a successful withdrawal from a conditional conflict and separately checks the provider's no-historical-version premise.
 * `verus/catalog_reader_admission` checks the Rust directory's serving-owner, residence and journal predicates.
   Each guard has a production-only and a jointly weakened contract control.
 * `tla/FragmentResidence.tla` checks routing and recipient admission when a database moves or opens a new replica journal.

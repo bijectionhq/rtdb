@@ -813,6 +813,22 @@ Changing the order alone would leave a crash window in which the catalog has adv
 The production protocol needs replayable retirement intent, proof of final exclusion including shared artefacts, a directory update binding the certificate to the admission floor, and an identity-preserving delete through the storage provider.
 Crash detection, provider copy and pack sharing remain separate implementation obligations. link:../../verification/tla/RetirementPublication.tla[Retirement publication model] · link:../../rust/crates/maintenance/src/gc.rs[Trie collection]
 
+=== Hosted key custody
+
+The vault installs one current key per deployment, checkpoint or stage identity.
+A conditional creation may succeed only while the object is absent.
+Withdrawal replaces the current value with a tombstone conditional on the observed state.
+The vault confirms withdrawal from the tombstone and requires the bucket to have never enabled versioning.
+Key creation and withdrawal may race, and a conditional conflict does not establish the outcome.
+
+The bounded S3 key model checks one provider object, two possible key values, and a withdrawal that can race with provisioning.
+Its invariants require an acknowledged withdrawal to leave a terminal tombstone and no historical key in the vault.
+TLC reaches an acknowledged withdrawal of an installed key.
+Its controls allow success on a conflict, allow provisioning after a tombstone, or allow historical versions.
+The provider supplies conditional writes and a fresh read of the current object.
+The bucket's administrative policy preserves the no-versioning and tombstone premises.
+Deployment-wide erasure also depends on drainage, inventory, and withdrawal of all independent key copies. link:../../verification/tla/S3KeyCustody.tla[Key custody model]
+
 === Delegated scans keep the coordinator's captured view
 
 A delegated prefix scan is an optimization of a query the coordinator already admitted.
