@@ -72,7 +72,7 @@ impl Service {
         let options = options(&native);
         let (basis, schema) = if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
             let Some(schema) = control_schema(control.statement()).map_err(status)? else {
-                let arguments = params.as_ref().map(|params| wire::arguments(params.batch(), self.memory())).transpose()?;
+                let arguments = params.as_ref().map(|params| params.arguments(self.memory())).transpose()?;
                 execute_control_update(&mut native, control.statement(), arguments.as_ref(), &token).await?;
                 drop(control);
                 return self.empty_update_info();
@@ -86,7 +86,7 @@ impl Service {
                     .map_err(status)?
             };
             if prepared.is_dml() {
-                let arguments = params.as_ref().map(|params| params.update_arguments(self.memory())).transpose()?;
+                let arguments = params.as_ref().map(|params| params.arguments(self.memory())).transpose()?;
                 native.prepare_context(&token).await.map_err(status)?;
                 execute_prepared_update(&mut native, &prepared, arguments).await?;
                 return self.empty_update_info();
@@ -114,7 +114,7 @@ impl Service {
             let token_guard = token.clone().drop_guard();
             let options = options(&native);
             let params = params.as_ref().map(|value| STANDARD.decode(value).map(Bytes::from).map_err(|_| invalid("invalid ticket parameters"))).transpose()?;
-            let arguments = params.as_ref().map(|bytes| wire::parameter_batch(bytes, self.memory()).and_then(|batch| wire::arguments(batch.batch(), self.memory()))).transpose()?;
+            let arguments = params.as_ref().map(|bytes| wire::parameter_batch(bytes, self.memory()).and_then(|batch| wire::arguments(&batch, self.memory()))).transpose()?;
             let cursor = if let Some(control) = rtdb_sql::parse_admitted_control_in(&sql, &options, self.memory()).map_err(status)? {
                 if control_schema(control.statement()).map_err(status)?.is_none() { return Err(invalid("ticket query cannot execute an update")); }
                 match native.execute_control_with(control.statement(), &[], &token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
