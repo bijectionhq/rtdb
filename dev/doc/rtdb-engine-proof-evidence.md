@@ -12,6 +12,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | Catalog targets | Checked evidence on main | Open implementation boundary |
 | --- | --- | --- |
 | TIME01, TIME02, TIME04–TIME11 | Lean relates the descending ceiling scan to the captured-history point query, including the exclusive query upper bound. Verus checks the production interval intersection, ceiling vector split and overwrite, cell selection, clipping, and per-fragment admission. Both native resolvers agreed with the reference for 4,096 observations. | SQL normalization, snapshot assembly, input coverage and operation order, the event and allocation shell, and the full assembly and projection of Rust fragments. |
+| VAL03, VAL04 · Type join and sparse fields | Lean proves associativity, commutativity and idempotence over arbitrary scalar families and flat struct fields. It distinguishes bottom, an explicit null, a field absent from both structs, and a field absent from one contributing struct. | Relate the model to the production type representations and prove nested collections, normalization, and the supported layout contracts. |
 | SCAN02, SCAN03, COMP02, COMP03, COMP08–COMP10 | Lean checks point reads through ordered compaction buckets, conservation of rows in the abstract mixed-trie traversal, and pointwise normalization of same-time cohorts. Native and Verus checks cover the production heap. Separate checks cover the bounded publish-and-adopt transition and exact tiered publication. | Compose actual scan and compaction producers, catalog adoption, and encoded and decoded coverage for all supported histories. |
 | TX01, TX03, TX06, TX11, LOG04, LOG05 | The bounded kernel and read-back models cover transaction publication, refusal, and the append, delivery, apply, and acknowledgment sequence. A Verus harness checks production replica admission. | Prove the production transaction and log traces refine those transitions under the provider and transaction assumptions. |
 | TX09 | Lean checks strictly ordered system times for arbitrary modeled mixed resolver histories and restart from the last completed time. Bounded TLC and a native catalog-clock replay check other portions of the same contract. | Refine the remaining ingress, time sources, resolve/apply paths, and provider-specific ordering. |
@@ -31,6 +32,9 @@ The signed order places that value below the observed epoch-32,767 position `922
 The checked epoch domain is 0 through 32,767, with nonnegative 48-bit positions and the before-first sentinel at offset `-1`.
 The model runner rejects weakening the upper limit to admit the sign bit or reducing the spacing between epochs. [Position theorems](../../verification/lean/MessagePosition.lean) · [Rust harnesses](../../rust/crates/types/tests/proofs.rs) · [JVM tests](../../core/src/test/kotlin/xtdb/util/MsgIdUtilTest.kt)
 
+The type join model represents normalized scalar families by kind membership and nullability and applies the field rule at each key of a flat struct.
+The runner rejects intersecting scalar legs and omitting the null contribution for a missing field. [Type join theorems](../../verification/lean/TypeJoin.lean)
+
 ## Multi evidence
 
 The multi models describe the separate `e86af7f12` branch baseline and its directory, Logkeeper, and object-store assumptions.
@@ -44,10 +48,14 @@ The [recovery study](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb983
 | SCAN01–SCAN05, COMP02, COMP05 | Lean proves pruning under the premise that dropped events cannot decide the point, ordered-segment replay, and recency early-exit agreement for disjoint ranges. Native SQL exercises pruning and compaction, and Kani checks Rust recency for three ranges. | Prove the pruning premise and range-order obligations at the actual producers. |
 | LOG08, FMT01 | Kani checks packed source and replica positions and resumption for epochs 0 through 32,767, nonnegative 48-bit offsets, and the `-1` start sentinel. It checks that all negative raw IDs resume from the start. The same harness is available on main. | Prove that each caller stays in the checked domain and that its persisted checkpoint supplies the correct boundary. |
 | CELL09, recovery S2, S5 | The multi PgWire fixture preserves a checkpoint row and acknowledged tail changes after the loss of one, two, and all workers, with the directory, keys and three durable local journals available. | Generalize from the MinIO fixture to every allowed recovery and prove readiness and retention with the declared services. |
-| Recovery S4 | Lean proves that the first divergence of epoch labels in the compared retained interval is detected at the start or a run boundary. A suffix overwrite reconstructs the winner when the run index is correct and matching epochs at each slot imply matching records. Kani checks multi Logkeeper's winner selection over three seal replies. | Establish durable journal identity, equal-epoch payload correspondence, and the Rust repair refinement. |
+| LOG11 and recovery S4 | Lean proves that the first divergence of epoch labels in the compared retained interval is detected at the start or a run boundary. A suffix overwrite reconstructs the winner in an abstract journal that preserves record identity by stream, generation, epoch and slot. Kani checks multi Logkeeper's winner selection over three seal replies. | Refine the production identity and copy transitions, durable admission and recovery, and the Rust repair plan. |
 
 The repair-prefix proof compares records at the same retained slot in one stream, generation, and retained coordinate system.
 Its counterexample shows that equal epoch labels alone permit distinct records when the same-slot identity premise is removed. [Repair-prefix proof](../../verification/multi/lean/RepairPrefix.lean)
+
+The journal model derives that premise over arbitrary traces from an empty journal.
+It assumes a slot is originated at most once for its complete identity, copies preserve the record, and discarding replica coverage leaves the mathematical history of originations available to the proof.
+The comparison assumes both run indexes describe their retained entries. [Retained-journal proof](../../verification/multi/lean/RetainedJournal.lean)
 
 Run the abstract multi lane with Lean 4.36.0 and TLC 1.7.4 from the repository root.
 It checks the ledger's catalog coverage, compiles the Lean source, and reruns all 14 bounded configurations, including the expected violations and reachability trace.

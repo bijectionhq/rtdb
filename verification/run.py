@@ -428,6 +428,24 @@ def verify_message_position(args, scratch):
     verify_lean_model(args, scratch, path, "message-position", controls, 5)
 
 
+def verify_type_join(args, scratch):
+    path = Path("verification/lean/TypeJoin.lean")
+    controls = {
+        "intersect-scalar-legs": (
+            "first.accepts kind ∨ second.accepts kind, first.allowsNull",
+            "first.accepts kind ∧ second.accepts kind, first.allowsNull",
+            ["bottom_contributes_no_scalar_legs", "field_join_assoc", "null_contributes_only_null",
+             "scalar_join_assoc", "scalar_join_comm", "scalar_join_preserves_membership"],
+        ),
+        "forget-missing-field": (
+            "some (joinScalars null value)",
+            "some value",
+            ["field_absence_contributes_null_if_the_key_exists"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "type-join", controls, 10)
+
+
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
     controls = {
@@ -536,6 +554,7 @@ def verify_lean(args, scratch):
             verify_ceiling(args, scratch, directory)
             verify_system_time(args, scratch)
             verify_message_position(args, scratch)
+            verify_type_join(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)

@@ -35,8 +35,8 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | --- | --- | --- |
 | VAL01 · Identity encoding | Open | — |
 | VAL02 · Name representation | Open | — |
-| VAL03 · Type join | Open | — |
-| VAL04 · Sparse schema | Open | — |
+| VAL03 · Type join | Partial | [Lean scalar and flat-struct join laws](rtdb-engine-proof-evidence.md#main-evidence) |
+| VAL04 · Sparse schema | Partial | [Lean missing-field and null rules](rtdb-engine-proof-evidence.md#main-evidence) |
 | VAL05 · Promotion and casts | Open | — |
 | VAL06 · Equality, hashing, and ordering | Open | — |
 | VAL07 · Extension types | Open | — |
@@ -125,7 +125,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | LOG08 · Publication and adoption | Partial | [Checkpoint selection and suffix replay](rtdb-engine-proof-evidence.md#main-evidence) · [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) |
 | LOG09 · Follower convergence | Partial | [Checkpoint selection and suffix replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | LOG10 · Failure reporting | Open | — |
-| LOG11 · Stream separation | Open | — |
+| LOG11 · Stream separation | Partial | [Lean model of retained journal slot identity](rtdb-engine-proof-evidence.md#multi-evidence) |
 | LOG12 · Retained-history audit | Open | — |
 | LOG13 · Terminal stream retirement | Open | — |
 
