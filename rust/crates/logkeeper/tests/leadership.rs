@@ -119,6 +119,26 @@ async fn a_writer_confirms_its_leadership_while_idle_and_while_appending() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_cannot_confirm_with_replacement_journals_that_lack_its_epoch() {
+    let mut ensemble = Ensemble::start(3).await;
+    let config = ensemble.config("journal-votes");
+    let log = open_writer(config, 1, CancellationToken::new()).await.unwrap();
+    append(log.as_ref(), "committed", 1).await;
+    log.confirm_leadership().await.unwrap();
+
+    for replica in [0, 1] {
+        ensemble.stop(replica).await;
+        ensemble.directories[replica] = tempfile::tempdir().unwrap();
+        ensemble.restart(replica).await;
+    }
+
+    let error = tokio::time::timeout(Duration::from_secs(5), log.confirm_leadership())
+        .await.unwrap().unwrap_err();
+    assert_eq!(error.code.as_str(), "rtdb.storage/remote");
+    assert!(error.message.as_deref().is_some_and(|message| message.contains("failed to confirm leadership")), "{error:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_writer_sealed_beyond_its_epoch_fails_to_confirm_without_appending() {
     let ensemble = Ensemble::start(3).await;
     let config = ensemble.config("sealed");

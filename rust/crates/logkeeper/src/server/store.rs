@@ -80,6 +80,7 @@ impl Store {
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
             RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
+            RequestBody::CheckSynced(check) => return self.check_synced(&check.stream, check.epoch, admission),
             RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) => return Outcome::Now(failed("not a direct mutation")),
         };
         let slot = self.slot(&stream);
@@ -151,6 +152,21 @@ impl Store {
 
     pub fn check(&self, stream: &str, epoch: u64) -> ResponseBody {
         match self.existing(stream) { Some(slot) => slot.state.lock().check(epoch), None => StreamState::<Stored>::default().check(epoch) }
+    }
+
+    fn check_synced(&self, stream: &str, epoch: u64, admission: tokio::sync::OwnedSemaphorePermit) -> Outcome {
+        let Some(slot) = self.existing(stream) else {
+            return Outcome::Now(StreamState::<Stored>::default().check_synced(epoch));
+        };
+        let state = slot.state.lock();
+        let reply = state.check_synced(epoch);
+        if !matches!(reply, ResponseBody::Accepted(_)) { return Outcome::Now(reply); }
+
+        // The stream can observe a complete overwrite before the journal has synced it.
+        let (done, durable) = oneshot::channel();
+        let barrier = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: Some(admission) };
+        if self.queue.send(barrier).is_err() { return Outcome::Now(failed("the journal has stopped")); }
+        Outcome::Durable(durable, reply)
     }
 
     /// Selects entries in `[from, to]` and where to find each payload, under the stream's lock.
@@ -274,7 +290,8 @@ pub(crate) fn failed(message: impl Into<String>) -> ResponseBody { ResponseBody:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{DropStream, Overwrite};
+    use crate::protocol::{Check, DropStream, Overwrite};
+    use crate::server::state::Event;
     use bytes::Bytes;
 
     #[tokio::test]
@@ -295,6 +312,36 @@ mod tests {
         drop(pending);
         assert!(matches!(second.await, Outcome::Durable(_, _)));
         assert!(store.existing("second").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_synced_check_waits_for_a_queued_epoch_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let (queue, mut work) = mpsc::unbounded_channel();
+        let store = Store::new(Arc::new(journal), recovered, queue);
+        let check = || RequestBody::CheckSynced(Check { stream: "pending-sync".into(), epoch: 2 });
+
+        assert!(matches!(store.mutate(check(), 32).await, Outcome::Now(ResponseBody::Refused(_))));
+        let incoming = RequestBody::Overwrite(Overwrite {
+            stream: "pending-sync".into(), epoch: 2, from_lsn: 0,
+            entries: Vec::new(), complete: true, commit_lsn: -1,
+        });
+        let Outcome::Durable(installed, ResponseBody::Accepted(_)) = store.mutate(incoming, 32).await else {
+            panic!("the complete overwrite must wait for the journal");
+        };
+        let Outcome::Durable(mut confirmed, ResponseBody::Accepted(_)) = store.mutate(check(), 32).await else {
+            panic!("the check must wait behind the overwrite");
+        };
+        assert!(futures::poll!(&mut confirmed).is_pending());
+        let install = work.recv().await.unwrap();
+        assert!(matches!(&install.write, Write::Events(_, events) if events.contains(&Event::Synced(Some(2)))));
+        install.done.send(Ok(())).unwrap();
+        installed.await.unwrap().unwrap();
+        let barrier = work.recv().await.unwrap();
+        assert!(matches!(&barrier.write, Write::Events(_, events) if events.is_empty()));
+        barrier.done.send(Ok(())).unwrap();
+        confirmed.await.unwrap().unwrap();
     }
 
     #[tokio::test]

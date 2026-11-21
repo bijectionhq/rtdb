@@ -82,7 +82,7 @@ impl Ensemble {
         self.ack(server, reply)
     }
 
-    pub fn check_request(&self, epoch: u64) -> RequestBody { RequestBody::Check(Check { stream: self.stream(), epoch }) }
+    pub fn check_synced_request(&self, epoch: u64) -> RequestBody { RequestBody::CheckSynced(Check { stream: self.stream(), epoch }) }
 
     pub fn overwrite_request(&self, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool, commit: i64) -> RequestBody {
         RequestBody::Overwrite(Overwrite { stream: self.stream(), epoch, from_lsn: from, entries, complete, commit_lsn: commit })

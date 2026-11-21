@@ -221,6 +221,10 @@ impl<P: Payload> StreamState<P> {
         else { self.accepted() }
     }
 
+    pub fn check_synced(&self, epoch: u64) -> ResponseBody {
+        self.check_writer(epoch).unwrap_or_else(|| self.accepted())
+    }
+
     pub fn drop_stream(&mut self, epoch: u64) -> Decision {
         if epoch == 0 { return invalid("epochs start at 1"); }
         if self.promised > epoch { return Decision { events: Vec::new(), reply: self.refused() }; }

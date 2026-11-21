@@ -336,12 +336,12 @@ impl Writer {
         let writer = Arc::downgrade(self);
         let ensemble = Arc::clone(&self.ensemble);
         let round = Arc::clone(round);
-        self.ensemble.links[server].send(self.ensemble.check_request(self.epoch), Box::new(move |reply| {
+        self.ensemble.links[server].send(self.ensemble.check_synced_request(self.epoch), Box::new(move |reply| {
             let Some(writer) = Weak::upgrade(&writer) else { return };
             let mut state = writer.state.lock();
             match ensemble.ack(server, reply) {
                 Ok(Ack::Refused(refused)) if refused.promised > writer.epoch => writer.depose(&mut state, refused.promised),
-                ack => if let State::Open(pipeline) = &mut *state { writer.mark(pipeline, &round, server, ack.is_ok()); },
+                ack => if let State::Open(pipeline) = &mut *state { writer.mark(pipeline, &round, server, matches!(ack, Ok(Ack::Accepted(_)))); },
             }
         }));
     }
@@ -350,7 +350,7 @@ impl Writer {
         let mut state = self.state.lock();
         if let Ok(Ack::Refused(refused)) = ack && refused.promised > self.epoch { return self.depose(&mut state, refused.promised); }
         let State::Open(pipeline) = &mut *state else { return };
-        if let Some(round) = &round { self.mark(pipeline, round, server, ack.is_ok()); }
+        if let Some(round) = &round { self.mark(pipeline, round, server, matches!(ack, Ok(Ack::Accepted(_)))); }
         match ack {
             Ok(Ack::Accepted(accepted)) => {
                 let replica = &mut pipeline.replicas[server];
@@ -478,7 +478,7 @@ impl Writer {
         }
     }
 
-    /// Succeeds once a write quorum of servers has answered, in a round that started after this call, that the stream is not sealed beyond this writer's epoch.
+    /// Succeeds once a write quorum has confirmed its stream is synced to this writer's promised epoch in a round that started after this call.
     /// So no successor had committed anything when the call began: a successor commits only after sealing a write quorum, which meets the confirming one.
     /// Concurrent callers share a round, at most one is in flight, and callers arriving during it wait for the next.
     /// A busy writer's round is answered by the replies to its appends and commits sent after it started; an idle writer's sends each server a check.

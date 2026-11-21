@@ -468,9 +468,10 @@ contract LogService {
         -- A deployment with no appends causes no log traffic: no heartbeat, no no-op, no timer.
 
     @invariant SealsAreAnnounced
-        -- Every acknowledgement of an append, a commit or a check for a deployment says whether that server's promised epoch for it was still at most the writer's epoch when the server decided the request, which is after the writer sent it.
-        -- A check changes nothing and needs no durable round; it is what an idle writer sends.
-        --   This is what a holder serving a linearizable read waits on (ServeLinearizableReadOnWriter).
+        -- A holder confirms its epoch from a quorum of positive replies to requests sent during the confirmation round.
+        -- A positive reply establishes that the server's promised and synced epochs were both equal to the holder's epoch when the server decided the request.
+        -- An idle holder sends an epoch check that waits behind preceding journal work and writes no event of its own.
+        -- A refusal reporting a higher epoch deposes the holder.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
@@ -1884,8 +1885,8 @@ rule ServeOnWriter {
 }
 
 rule ServeLinearizableReadOnWriter {
-    -- A holder serves a linearizable read only after acknowledgements from a write quorum, to requests sent after the query arrived, show its loglet unsealed beyond its epoch.
-    --   A busy holder takes them from its next appends and commits, an idle one from a check per server; that adds at most one round and involves no clock.
+    -- A holder serves a linearizable read only after a write quorum confirms its promised and synced epoch in a round that starts after the query arrives.
+    -- A busy holder can use positive replies to appends and commits sent during the round, and an idle holder sends one check per server.
     --   Concurrent queries share one confirmation round, at most one is in flight per holder, and a query arriving during one waits for the next.
     when: QueryArrived(holding, query, session)
 

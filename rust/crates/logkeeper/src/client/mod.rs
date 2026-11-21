@@ -258,7 +258,7 @@ impl QuorumLog {
             .collect()
     }
 
-    /// For the stream's writer: succeeds once a write quorum of servers has confirmed, in a round that started after this call, that the stream is not sealed beyond the writer's epoch.
+    /// For the stream's writer: succeeds once a write quorum has confirmed the writer's promised and synced epoch in a round that started after this call.
     /// A read served afterwards from what the writer had committed is linearizable, since no successor can have committed before the call began; this involves no clock.
     /// Concurrent callers share one round, so a burst costs at most two; a server reporting a higher promise deposes the writer, failing this and its appends with `Error::Deposed`.
     pub async fn confirm_leadership(&self) -> rtdb_types::Result<()> {

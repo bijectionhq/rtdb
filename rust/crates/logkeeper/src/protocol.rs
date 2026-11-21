@@ -180,13 +180,15 @@ pub(crate) enum RequestBody {
     Retire(Retire),
     #[prost(message, tag = "12")]
     DigestPage(DigestPage),
+    #[prost(message, tag = "13")]
+    CheckSynced(Check),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
     pub body: Option<RequestBody>,
 }
 

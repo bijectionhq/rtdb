@@ -2237,6 +2237,18 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-7f9-rust.log`
 This establishes the hosted recovery coordinate under the existing deployment-to-log configuration binding.
 The root's full dependency manifest, protection of that manifest across reaping and fork creation, and archive-specific refinement remain open.
 
+=== Logkeeper confirmation uses synced journal votes
+
+A positive holder confirmation now requires the server's promised and synced epochs to match the request.
+The explicit check waits behind already-queued journal writes and emits no journal event.
+The request has a distinct wire tag from the legacy seal-only check.
+
+The native logkeeper suite passed 61 cases and left one throughput benchmark ignored.
+The regression replaced two journals with blank journals at the same addresses and required the holder's check to fail.
+Switching the client back to the seal-only check let that blank quorum confirm and failed the regression.
+A journal-queue test checked that the confirmation waits behind the epoch installation.
+The separate requirements for subscriber read indexes remain in link:../redesign/authority-boundaries.md[Authority boundaries].
+
 === Table metadata bindings in checkpoint roots
 
 The Rust block producer now writes an OID-keyed SHA-256 manifest in each new checkpoint root.

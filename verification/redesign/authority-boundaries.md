@@ -60,6 +60,17 @@ The read index needs a quorum response from the exact loglet and history, includ
 A quorum of reachable servers that merely reports local tip values is insufficient unless the logkeeper protocol proves the reports intersect every completed write and identify a live loglet.
 An ongoing move fences the predecessor, closes its committed prefix and activates the successor with that prefix before it can answer.
 A read whose check overlaps a move can linearize on either side of that boundary.
+The active-loglet identity must distinguish an assembly being prepared from the one that can serve.
+Move recovery can sync the predecessor at the successor's epoch before installing the destination, so a matching epoch alone cannot establish that identity.
+The predecessor needs a quorum-durable closed state that fences read-index votes; the successor needs a quorum-durable active state before it issues votes.
+The states bind the deployment history and exact loglet configuration.
+
+The current writer returns an append receipt as soon as a quorum holds the entry, before every commit-watermark publication is acknowledged.
+Sampling only published commit watermarks can therefore miss a completed write.
+A quorum of exact active-loglet replies can conservatively bound completed writes by the largest held position among its replies, since that quorum intersects the write quorum.
+Such a bound can include unpublished entries.
+The subscriber waits until its committed prefix is applied through the bound and refuses freshness if it cannot reach it.
+The read path can keep the one-quorum append contract with this rule.
 Logkeepers' active journal identity must follow the exclusive journal and the fencing protocol.
 All trim requests require a grant bound to the history, loglet, epoch and protected recovery frontier.
 
@@ -71,6 +82,9 @@ Removing lease-based self-fencing is gated on native read-index admission for ev
 
 The fixed-ensemble recovery model already exercises server promises, complete and partial sync, suffix repair and checkpoint-authorized trim.
 The remaining proof has to compose that model with active-loglet transitions, committed-prefix read indexes, journal identity and the production trim grant.
+The holder's confirmation round now counts positive checks only after the journal confirms that its promised and synced epochs match.
+A blank or partially recovered journal refuses the check.
+The new check has its own wire tag, so an older server cannot return a weaker confirmation in its place.
 Check intersecting quorums and monotone acknowledged prefixes under crash, partial copies and ensemble movement.
 Keep the existing term fence as an independent replica-stream check while it serves classic logs.
 The new serving model assumes a commit prefix and an active-loglet check and therefore has no claim about the quorum implementation.
