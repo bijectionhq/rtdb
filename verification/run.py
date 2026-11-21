@@ -116,6 +116,58 @@ def verify_verus(args, scratch):
             print(f"{case}: {result['verified']} verified, {len(expected)} expected diagnostics")
 
 
+def verify_jvm_leaf_merge(args, scratch):
+    path = Path("core/src/main/java/xtdb/trie/LeafMerge.java")
+    cases = {
+        "baseline": None,
+        "larger-head": (
+            "order.compare(left[leftIndex], right[rightIndex]) < 0",
+            "order.compare(left[leftIndex], right[rightIndex]) > 0",
+        ),
+        "drop-suffix": (
+            "while (next < merged.length)",
+            "while (next < merged.length && leftIndex < left.length && rightIndex < right.length)",
+        ),
+        "change-right-value": (
+            "merged[next] = right[rightIndex];",
+            "merged[next] = 0;",
+        ),
+    }
+    version = run_case([args.openjml, "--version"], ROOT, args.evidence, "openjml-version")
+    if version.returncode or "openjml " not in version.stdout:
+        raise ValueError("OpenJML did not report its version")
+    for name, mutation in cases.items():
+        case = f"openjml-leaf-merge-{name}"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        if mutation:
+            replace_once(source, *mutation)
+        checked = run_case(
+            [args.openjml, "--esc", "--timeout=40", "--timeout-method=65",
+             "--esc-max-warnings=1", "--progress", str(path)],
+            directory, args.evidence, case,
+        )
+        output = checked.stdout + "\n" + checked.stderr
+        observed = {label: int(count) for label, count in re.findall(
+            r"(?m)^\s*(Valid|Invalid|Infeasible|Timeout|Error|Skipped):\s+(\d+)\s*$", output,
+        )}
+        expected = {
+            "Valid": 1 if mutation else 2,
+            "Invalid": 1 if mutation else 0,
+            "Infeasible": 0,
+            "Timeout": 0,
+            "Error": 0,
+            "Skipped": 2,
+        }
+        diagnostic = re.search(
+            r"LeafMerge\.java:\d+: verify:.*\((?:Assert|LoopInvariant|Postcondition)[^)]*\) in method merge",
+            output,
+        )
+        if checked.returncode != (6 if mutation else 0) or observed != expected or bool(diagnostic) != bool(mutation):
+            raise ValueError(f"{case}: expected {expected}, observed {observed}")
+        print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
+
+
 def verify_rank_bound(args, scratch):
     path = Path("verification/smt/rank-bound.smt2")
     baseline = {
@@ -1945,6 +1997,7 @@ def main():
     parser.add_argument("--apalache", required=True)
     parser.add_argument("--maude", required=True)
     parser.add_argument("--mcrl2-bin", type=Path)
+    parser.add_argument("--openjml")
     parser.add_argument("--autohyper")
     parser.add_argument("--rust-boundary", action="store_true")
     parser.add_argument("--native-replay", action="store_true")
@@ -1958,6 +2011,8 @@ def main():
                       ("lean", "verus", "z3", "java", "tlc", "alloy", "apalache", "maude")}
     if args.mcrl2_bin:
         supplied_tools.update({name: args.mcrl2_bin / name for name in ("mcrl22lps", "lps2lts", "ltscompare")})
+    if args.openjml:
+        supplied_tools["openjml"] = args.openjml
     if args.autohyper:
         app = Path(shutil.which(args.autohyper) or args.autohyper).resolve()
         paths = app.with_name("paths.json")
@@ -2032,6 +2087,12 @@ def main():
         "rust/crates/multi/src/agent.rs",
         "rust/crates/multi/tests/cell.rs",
     ))
+    if args.openjml:
+        source_paths.extend(ROOT / path for path in (
+            "core/src/main/java/xtdb/trie/LeafMerge.java",
+            "core/src/main/kotlin/xtdb/trie/MemoryHashTrie.kt",
+            "core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt",
+        ))
     for path in list(source_paths):
         if path.name == "proof.rs":
             for included in re.findall(r'#\[path\s*=\s*"([^"]+)"\]', path.read_text()):
@@ -2046,6 +2107,8 @@ def main():
         verify_lean(args, directory)
         verify_tla(args, directory)
         verify_verus(args, directory)
+        if args.openjml:
+            verify_jvm_leaf_merge(args, directory)
         verify_rank_bound(args, directory)
         verify_rank_cutoff_order(args, directory)
         verify_alloy(args, directory)

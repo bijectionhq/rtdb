@@ -2,13 +2,17 @@ package xtdb.trie
 
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.RootAllocator
+import org.apache.arrow.memory.util.ArrowBufPointer
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import xtdb.api.error.Incorrect
 import xtdb.arrow.FixedSizeBinaryVector
 import xtdb.arrow.IntVector
+import xtdb.arrow.VectorReader
 import xtdb.trie.proto.branch
 import xtdb.trie.proto.hashTrie
 import xtdb.trie.proto.hashTrieNode
@@ -161,6 +165,58 @@ class MemoryHashTrieTest {
                 if (order == 0) right.compareTo(left) else order
             }
             assertEquals(expected, trie.leaves.single().mergeSort(trie).toList())
+        }
+    }
+
+    @Test
+    fun `leaf cache fill and bulk overflow retain repeated ordinals in order`() {
+        FixedSizeBinaryVector(allocator, "_iid", false, 16).use { iids ->
+            for (value in listOf(2, 0, 2, 1, 3)) {
+                iids.writeBytes(ByteArray(16).also { it[0] = value.toByte() })
+            }
+
+            val stored = MemoryHashTrie.builder(iids).setLogLimit(5).setPageLimit(20).build()
+                .addAll(intArrayOf(3, 2, 2, 0, 4))
+            assertEquals(listOf(3, 2, 2, 0, 4), stored.leaves.single().data.toList())
+
+            val pending = stored.addAll(intArrayOf(1, 2, 1))
+            val leaf = pending.leaves.single()
+            val merged = leaf.mergeSort(pending)
+            assertEquals(listOf(1, 1, 3, 2, 2, 2, 0, 4), merged.toList())
+            assertSame(merged, leaf.mergeSort(pending))
+            assertEquals(listOf(3, 2, 2, 0, 4), stored.leaves.single().data.toList())
+
+            val overflowed = pending.addAll(intArrayOf(4, 0, 0))
+            assertEquals(listOf(1, 1, 3, 2, 2, 2, 0, 0, 0, 4, 4), overflowed.leaves.single().data.toList())
+        }
+    }
+
+    @Test
+    fun `a JVM leaf cache fill can retry an IID lookup failure`() {
+        FixedSizeBinaryVector(allocator, "_iid", false, 16).use { iids ->
+            for (value in listOf(1, 3, 2)) {
+                iids.writeBytes(ByteArray(16).also { it[0] = value.toByte() })
+            }
+
+            val pending = MemoryHashTrie.builder(iids).setLogLimit(2).build().addRange(0, 2) + 2
+            val failure = Incorrect("IID lookup failed", "test/iid-read")
+            var rejectRead = true
+            val visited = mutableListOf<Int>()
+            val trie = pending.withIidReader(object : VectorReader by iids {
+                override fun getPointer(idx: Int, reuse: ArrowBufPointer): ArrowBufPointer {
+                    visited.add(idx)
+                    if (rejectRead && idx == 0) throw failure
+                    return iids.getPointer(idx, reuse)
+                }
+            })
+            val leaf = trie.leaves.single()
+
+            assertSame(failure, assertThrows<Incorrect> { leaf.mergeSort(trie) })
+            assertEquals(listOf(0), visited)
+            rejectRead = false
+            val merged = leaf.mergeSort(trie)
+            assertEquals(listOf(0, 2, 1), merged.toList())
+            assertSame(merged, leaf.mergeSort(trie))
         }
     }
 

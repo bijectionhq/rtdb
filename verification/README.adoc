@@ -90,6 +90,7 @@ BIJECTION_LOCAL_EXECUTION=owner-authorized VERUS_Z3_PATH=/path/to/z3 \
   --apalache /path/to/apalache-mc --maude /path/to/maude \
   --mcrl2-bin /path/to/mCRL2.app/Contents/bin \
   --autohyper /path/to/AutoHyper \
+  --openjml /path/to/openjml \
   --rust-boundary --native-replay \
   --evidence /path/to/new-evidence-directory
 ----
@@ -106,6 +107,10 @@ Build the tool at that revision according to its upstream instructions and set i
 Pass the resulting executable as `--autohyper` and set `DOTNET_ROOT` for a separately installed .NET 8 runtime.
 The evidence includes the executable, assembly and tool configuration hashes.
 Omit the option to run the other studies without AutoHyper. https://github.com/AutoHyper/AutoHyper/tree/c94722d1f3c6d6f38a0967fcc580e26146c26109[AutoHyper build and setup]
+Pass `--openjml` to check the Java merge called by the production Kotlin trie.
+The recorded run used OpenJML 21.0.29 with its bundled Z3 5.1.0.
+The runner retains the baseline, tool version, and three negative controls.
+The controls select the larger head, drop an unread suffix, and replace a right-side value.
 The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.

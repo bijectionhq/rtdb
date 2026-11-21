@@ -271,41 +271,12 @@ class MemoryHashTrie(
             return childPath
         }
 
-        // Merges two sorted index arrays in IID order, ties broken by `compare`'s rightIdx-first rule.
         private fun merge(trie: MemoryHashTrie, left: IntArray, right: IntArray): IntArray {
             val leftPtr = ArrowBufPointer()
             val rightPtr = ArrowBufPointer()
-            val leftCount = left.size
-            val rightCount = right.size
-
-            val res = IntArrayList(leftCount + rightCount)
-            var leftIdx = 0
-            var rightIdx = 0
-
-            while (true) {
-                if (leftIdx == leftCount) {
-                    for (idx in rightIdx..<rightCount) res.add(right[idx])
-                    break
-                }
-
-                if (rightIdx == rightCount) {
-                    for (idx in leftIdx..<leftCount) res.add(left[idx])
-                    break
-                }
-
-                val l = left[leftIdx]
-                val r = right[rightIdx]
-
-                if (trie.compare(l, r, leftPtr, rightPtr) < 0) {
-                    res.add(l)
-                    leftIdx++
-                } else {
-                    res.add(r)
-                    rightIdx++
-                }
+            return LeafMerge.merge(left, right) { leftRow, rightRow ->
+                trie.compare(leftRow, rightRow, leftPtr, rightPtr)
             }
-
-            return res.toArray()
         }
 
         private fun HashTrieNode.decode(logLimit: Int, path: ByteArray): Node? =
