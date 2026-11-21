@@ -65,7 +65,10 @@ pub enum Role { Following, Leading(Term), Stopped }
 pub struct DriverStatus {
     pub role: Role,
     pub highest_term: Term,
+    /// Latest position consumed from the transport. Catalog effects at that position may be pending.
     pub replica_position: ReplicaPosition,
+    /// Last position through which every recognized effect was installed before this status was published.
+    pub installed_replica_position: Option<ReplicaPosition>,
     pub open_block: BlockIndex,
     pub adopted_block: Option<Arc<BlockCatalog>>,
     pub promotion_failure: Option<Anomaly>,
@@ -278,6 +281,8 @@ pub struct ReplicationDriver {
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
     compaction_replay_cutoff: Option<ReplicaPosition>,
     track_catalog_cut: bool,
+    recognized_prefix: bool,
+    installed_replica_position: Option<ReplicaPosition>,
     historical_confirmations: VecDeque<RecoveredBlockConfirmation>,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
@@ -307,7 +312,7 @@ impl ReplicationDriver {
         }
         let read_position = recovered.replica_start(&logs)?;
         let track_catalog_cut = config.enabled && recovered.can_track_catalog_cut(&logs);
-        let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
+        let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position, installed_replica_position: None,
             open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
         let (status, receiver) = watch::channel(initial);
         let (sender, commands) = mpsc::channel(128);
@@ -319,7 +324,7 @@ impl ReplicationDriver {
         } else { None };
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, historical_confirmations: VecDeque::new(), fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed_replica_position: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -351,9 +356,10 @@ impl ReplicationDriver {
         let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
         self.historical_confirmations = history.unwrap_or_default();
         if self.cancellation.is_cancelled() { return Ok(()); }
-        self.publish_catalog_cut()?;
+        self.update_installed_prefix()?;
         self.progress.driver_initialized(self.restart.take())?;
         self.replica_tail = Some(tail);
+        self.publish_status(self.role());
         if self.config.may_lead && self.fence.highest_term() == Term(0) { self.start_claim()?; }
         loop {
             if self.cancellation.is_cancelled() { return Ok(()); }
@@ -606,20 +612,24 @@ impl ReplicationDriver {
     fn publish_status(&self, role: Role) {
         let value = self.partition.value();
         let (promotion_failure, last_block_upload_epoch_seconds) = { let status = self.status.borrow(); (status.promotion_failure.clone(), status.last_block_upload_epoch_seconds) };
-        self.status.send_replace(DriverStatus { role, highest_term: self.fence.highest_term(), replica_position: self.read_position,
+        self.status.send_replace(DriverStatus { role, highest_term: self.fence.highest_term(), replica_position: self.read_position, installed_replica_position: self.installed_replica_position,
             open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds });
     }
-    fn publish_catalog_cut(&self) -> Result<()> {
+    fn update_installed_prefix(&mut self) -> Result<()> {
         let apply_deferred = self.leader.as_ref().is_some_and(|leader| !leader.held.is_empty());
         if let Some(through) = crate::catalog_cut::completed_prefix(
-            self.read_position.0, self.track_catalog_cut, self.pending_block.is_some(), apply_deferred,
+            self.read_position.0, self.recognized_prefix, self.pending_block.is_some(), apply_deferred,
         ) {
-            self.partition.publish_catalog_cut(CatalogCut {
-                storage_version: self.logs.storage_version,
-                storage_epoch: self.logs.storage_epoch,
-                replica_epoch: self.logs.replica_epoch,
-                through: ReplicaPosition(through),
-            })?;
+            let through = ReplicaPosition(through);
+            if self.track_catalog_cut {
+                self.partition.publish_catalog_cut(CatalogCut {
+                    storage_version: self.logs.storage_version,
+                    storage_epoch: self.logs.storage_epoch,
+                    replica_epoch: self.logs.replica_epoch,
+                    through,
+                })?;
+            }
+            self.installed_replica_position = Some(through);
         }
         Ok(())
     }
@@ -639,7 +649,7 @@ impl ReplicationDriver {
         };
         let Some(record) = decoded else {
             // The protobuf body can be omitted or too new for this reader to recognize.
-            self.track_catalog_cut = false;
+            self.recognized_prefix = false;
             self.read_position = position;
             return Ok(());
         };
@@ -662,7 +672,7 @@ impl ReplicationDriver {
             }
         }
         self.read_position = position;
-        self.publish_catalog_cut()?;
+        self.update_installed_prefix()?;
         self.publish_status(self.role());
         if admission.verdict == Verdict::Voided { self.start_claim()?; }
         Ok(())
@@ -986,7 +996,10 @@ impl ReplicationDriver {
             }
         }
         for record in held { self.apply_admitted(record).await?; }
-        self.publish_catalog_cut()
+        let previous = self.installed_replica_position;
+        self.update_installed_prefix()?;
+        if self.installed_replica_position != previous { self.publish_status(self.role()); }
+        Ok(())
     }
     async fn resolve_next_source(&mut self) -> Result<()> {
         let Some(leader) = &mut self.leader else { return Ok(()); };

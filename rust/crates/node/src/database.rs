@@ -79,13 +79,13 @@ impl Database {
             let logs = Arc::clone(&self.logs);
             if let Ok(Ok(tip)) = self.io.run_blocking(move || Ok(logs.latest_replica_position())).await { self.currency.observe(observed_at, tip); }
         }
-        let mut current = deadline(self.currency.anchor(self.replication.status().replica_position));
+        let mut current = deadline(self.currency.anchor(self.replication.status().installed_replica_position));
         if current.is_none_or(|deadline| !lease_admits(clock.monotonic_micros(), deadline)) {
             if let Some(tip) = self.currency.pending_tip() {
                 let mut status = self.replication.watch_status();
-                let caught_up = status.wait_for(|status| status.replica_position >= tip);
+                let caught_up = status.wait_for(|status| status.installed_replica_position.is_some_and(|installed| installed >= tip));
                 let _ = tokio::time::timeout(garbage.reader_lease_margin, self.cancellation.run_until_cancelled(caught_up)).await;
-                current = deadline(self.currency.anchor(self.replication.status().replica_position));
+                current = deadline(self.currency.anchor(self.replication.status().installed_replica_position));
             }
         }
         let clock = Arc::clone(clock);
@@ -460,7 +460,7 @@ impl MaintenanceSupervisor {
                         let logs = Arc::clone(&self.logs);
                         if let Ok(Ok(tip)) = tokio::task::spawn_blocking(move || logs.latest_replica_position()).await { self.currency.observe(observed_at, tip); }
                     }
-                    self.currency.anchor(current.replica_position);
+                    self.currency.anchor(current.installed_replica_position);
                 }
             }
             let term = match current.role { Role::Leading(term) => Some(term), _ => None };

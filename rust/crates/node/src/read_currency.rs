@@ -25,11 +25,11 @@ impl ReadCurrency {
         if currency.pending.is_none_or(|(_, pending)| tip > pending) { currency.pending = Some((observed_at, tip)); }
     }
     /// Confirms a pending observation once the catalog has applied its tip, and returns the anchor.
-    /// The caller reads `applied` after the catalog it will capture has published it.
-    pub fn anchor(&self, applied: ReplicaPosition) -> Option<i64> {
+    /// The caller observes installed progress before capturing its catalog.
+    pub fn anchor(&self, installed: Option<ReplicaPosition>) -> Option<i64> {
         let mut currency = self.0.lock();
         if let Some((observed_at, tip)) = currency.pending {
-            if applied >= tip {
+            if installed.is_some_and(|position| position >= tip) {
                 currency.pending = None;
                 currency.anchor = Some(currency.anchor.map_or(observed_at, |anchor| anchor.max(observed_at)));
             }
@@ -51,8 +51,9 @@ mod tests {
         assert!(currency.needs_observation(10, 5));
         currency.observe(10, position(4));
         assert!(!currency.needs_observation(100, 5));
-        assert_eq!(currency.anchor(position(3)), None);
-        assert_eq!(currency.anchor(position(4)), Some(10));
+        assert_eq!(currency.anchor(None), None);
+        assert_eq!(currency.anchor(Some(position(3))), None);
+        assert_eq!(currency.anchor(Some(position(4))), Some(10));
         assert!(!currency.needs_observation(14, 5));
         assert!(currency.needs_observation(15, 5));
     }
@@ -61,8 +62,8 @@ mod tests {
     fn the_anchor_never_moves_back() {
         let currency = ReadCurrency::default();
         currency.observe(20, position(2));
-        assert_eq!(currency.anchor(position(2)), Some(20));
+        assert_eq!(currency.anchor(Some(position(2))), Some(20));
         currency.observe(15, position(3));
-        assert_eq!(currency.anchor(position(3)), Some(20));
+        assert_eq!(currency.anchor(Some(position(3))), Some(20));
     }
 }

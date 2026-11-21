@@ -314,6 +314,7 @@ async fn catalog_cut_tracks_the_captured_catalog_after_a_pending_block_drains() 
     let partition = Arc::clone(&fixture.driver.partition);
     let table = TableRef::new("public", "docs");
     assert_eq!(partition.open_snapshot(None).catalog_cut(), None);
+    assert_eq!(fixture.handle.status().installed_replica_position, None);
     fixture.driver.consume(raw(0, 1, 0, resolved(0, 0))).await.unwrap();
     let before = partition.open_snapshot(None);
     assert_eq!(before.catalog_cut().unwrap().through, ReplicaPosition(0));
@@ -330,12 +331,14 @@ async fn catalog_cut_tracks_the_captured_catalog_after_a_pending_block_drains() 
     fixture.driver.consume(raw(2, 1, 2, added)).await.unwrap();
     let held = partition.open_snapshot(None);
     assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(2));
+    assert_eq!(fixture.handle.status().installed_replica_position, Some(ReplicaPosition(0)));
     assert_eq!(held.catalog_cut(), before.catalog_cut());
     assert!(held.trie_entries(&table).is_empty());
 
     fixture.driver.consume(raw(3, 1, 3, upload(0, 0))).await.unwrap();
     let installed = partition.open_snapshot(None);
     assert_eq!(installed.catalog_cut().unwrap().through, ReplicaPosition(3));
+    assert_eq!(fixture.handle.status().installed_replica_position, Some(ReplicaPosition(3)));
     assert_eq!(installed.trie_entries(&table).len(), 1);
     assert_eq!(held.catalog_cut().unwrap().through, ReplicaPosition(0));
     assert!(held.trie_entries(&table).is_empty());
@@ -352,6 +355,7 @@ async fn catalog_cut_cannot_cross_an_unrecognized_replica_body() {
     fixture.driver.consume(raw(2, 1, 1, resolved(2, 2))).await.unwrap();
 
     assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(2));
+    assert_eq!(fixture.handle.status().installed_replica_position, Some(ReplicaPosition(0)));
     assert_eq!(partition.snapshot().tx_basis().unwrap().tx_id, TxId(2));
     assert_eq!(partition.snapshot().catalog_cut().unwrap().through, ReplicaPosition(0));
 }
@@ -373,11 +377,13 @@ async fn catalog_cut_advances_when_resolution_releases_deferred_records() {
     fixture.driver.consume(raw(1, 1, 1, deleted)).await.unwrap();
     assert_eq!(fixture.driver.leader.as_ref().unwrap().held.len(), 1);
     assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(1));
+    assert_eq!(fixture.handle.status().installed_replica_position, Some(ReplicaPosition(0)));
     assert_eq!(partition.open_snapshot(None).catalog_cut().unwrap().through, ReplicaPosition(0));
 
     let resolution = &mut fixture.driver.leader.as_mut().unwrap().resolution;
     let (resolver, result) = super::pending_resolution(resolution).await;
     fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    assert_eq!(fixture.handle.status().installed_replica_position, Some(ReplicaPosition(1)));
     assert_eq!(partition.open_snapshot(None).catalog_cut().unwrap().through, ReplicaPosition(1));
     fixture.driver.demote().await.unwrap();
     drop(receipt);
