@@ -387,7 +387,7 @@ pub(crate) fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Res
     }
     let children = fields.iter().map(|(id, _)| {
         let children: Vec<&dyn Array> = unions.iter().map(|union| union.child(id).as_ref()).collect();
-        arrow_select::interleave::interleave(&children, &picks[id as usize]).map_err(|error| invalid("column-gather", error))
+        interleave(&children, &picks[id as usize])
     }).collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(UnionArray::try_new(fields.clone(), datafusion_common::arrow::buffer::ScalarBuffer::from(ids), Some(datafusion_common::arrow::buffer::ScalarBuffer::from(offsets)), children).map_err(|error| invalid("column-gather", error))?))
 }
@@ -477,6 +477,37 @@ fn result_projection_keeps_a_scalar_union_already_in_its_output_layout() {
 }
 
 #[test]
+fn stored_nested_union_projection_keeps_arrow_for_sparse_rows() {
+    use rtdb_index::{StoredEvent, StoredOperation};
+    use rtdb_types::{Iid, Interval, StructFields};
+
+    let memory = MemoryBudget::new(1 << 22);
+    let record = Value::Struct(StructFields::from([("a".into(), Value::I64(1))]));
+    let list = Value::List(vec![Value::I64(2)]);
+    let logical = LogicalType::from_legs([record.logical_type(), list.logical_type(), LogicalType::Null]);
+    let field = Field {
+        id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+        qualified_only: false, unnamed: false, data_type: logical.clone(),
+    };
+    let events = [record.clone(), Value::Null, list.clone()].into_iter().enumerate().map(|(row, value)| StoredEvent {
+        iid: Iid([row as u8; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([("v".into(), value)])),
+    }).collect::<Vec<_>>();
+    let put_types = StructFields::from([("v".into(), logical.clone())]);
+    let page = IndexBatch::copy_events_with_put_schema(&events, &put_types, &memory).unwrap();
+    let rows = [2, 0].map(|row| ResolvedRow { source: (0, row), valid_time: Interval::ALL, system_time: Interval::ALL });
+
+    let batch = gather(&rows, &[page], &[field], &memory, |_| Ok(None)).unwrap();
+
+    let Column::Arrow { array, .. } = &batch.columns[0] else { panic!("Expected a projected Arrow union"); };
+    let arrow_field = rtdb_columnar::to_field("v", &logical).unwrap();
+    let retained = conform(&batch.columns[0], &logical, &arrow_field).unwrap();
+    assert!(Arc::ptr_eq(array, &retained));
+    assert_eq!(rtdb_columnar::read_value(&arrow_field, retained.as_ref(), 0).unwrap(), list);
+    assert_eq!(rtdb_columnar::read_value(&arrow_field, retained.as_ref(), 1).unwrap(), record);
+}
+
+#[test]
 fn projections_keep_typed_arrays_when_a_page_lacks_the_column() {
     use rtdb_types::ScalarType;
 
@@ -512,6 +543,10 @@ fn a_projection_absent_from_every_page_is_an_arrow_null_array() {
 
 fn can_interleave_nested(array: &dyn Array) -> bool {
     if flat(array.data_type()) { return true; }
+    if let (DataType::Union(legs, arrow_schema::UnionMode::Dense), Some(union)) =
+        (array.data_type(), array.as_any().downcast_ref::<UnionArray>()) {
+        return legs.iter().all(|(id, _)| can_interleave_nested(union.child(id).as_ref()));
+    }
     if let Some(structs) = array.as_any().downcast_ref::<StructArray>() {
         return structs.columns().iter().all(|child| can_interleave_nested(child.as_ref()));
     }
@@ -553,6 +588,35 @@ pub(crate) fn conform(column: &Column, target: &LogicalType, field: &ArrowField)
     conform_array(array, logical, target, field)
 }
 
+pub(crate) fn relayout_output(column: &Column, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>)
+    -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
+    let Column::Arrow { array, field: source, logical: Some(logical) } = column else { return Ok(None) };
+    if !stable_read_layout(logical, source) || logical.join(target) != *target { return Ok(None); }
+    let bound = rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, field)?;
+    let Ok(scratch) = memory.reserve(bound) else { return Ok(None) };
+    let Ok((physical, array)) = rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, field) else { return Ok(None) };
+    if physical.data_type() != field.data_type() || (!target.nullable() && array.logical_null_count() != 0) {
+        return Ok(None);
+    }
+    Ok(Some((array, scratch)))
+}
+
+fn stable_read_layout(logical: &LogicalType, field: &ArrowField) -> bool {
+    stable_values(logical) && rtdb_columnar::execution_type(logical) == *logical && rtdb_columnar::from_field(field).is_ok_and(|ty| ty == *logical)
+}
+
+fn stable_values(logical: &LogicalType) -> bool {
+    match logical {
+        LogicalType::Null | LogicalType::Nothing => true,
+        LogicalType::Scalar(scalar) => copyable(scalar) || *scalar == rtdb_types::ScalarType::DateDay,
+        LogicalType::Maybe(ty) => stable_values(ty),
+        LogicalType::Struct(fields) => fields.values().all(stable_values),
+        LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => stable_values(element),
+        LogicalType::Union(legs) => legs.iter().all(stable_values),
+        _ => false,
+    }
+}
+
 fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, field: &ArrowField) -> Option<ArrayRef> {
     if !field.is_nullable() && array.null_count() != 0 { return None; }
     let strip = |logical: &LogicalType| match logical { LogicalType::Maybe(inner) => inner.as_ref().clone(), other => other.clone() };
@@ -567,7 +631,7 @@ fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, 
             let kept = legs.iter().all(|leg| match leg {
                 LogicalType::Scalar(scalar) => copyable(scalar) || *scalar == rtdb_types::ScalarType::DateDay,
                 LogicalType::Null => true,
-                _ => false,
+                _ => stable_values(leg) && rtdb_columnar::execution_type(leg) == *leg,
             });
             (kept && legs == expected && array.data_type() == field.data_type()).then(|| Arc::clone(array))
         }
