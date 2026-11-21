@@ -1269,12 +1269,19 @@ async fn an_unopened_root_can_be_deleted_and_a_legacy_fenced_deletion_can_resume
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     drop(client);
     cell.node(0).agent.park("legacy").await.unwrap();
-    let mut legacy = cell.directory.deployment_by_name("legacy").await.unwrap().unwrap();
-    let version = legacy.version;
-    legacy.epoch += 1;
-    legacy.lifecycle = Lifecycle::Deleting;
-    legacy.storage_namespaces = None;
-    let legacy = cell.directory.replace_deployment(legacy, version).await.unwrap().applied().unwrap();
+    let legacy = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut legacy = cell.directory.deployment_by_name("legacy").await.unwrap().unwrap();
+            let version = legacy.version;
+            legacy.epoch += 1;
+            legacy.lifecycle = Lifecycle::Deleting;
+            legacy.storage_namespaces = None;
+            if let Some(fenced) = cell.directory.replace_deployment(legacy, version).await.unwrap().applied() {
+                break fenced;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the legacy deletion fixture acquired the directory fence");
     let wrong_root = rtdb_multi::deployment::CellStorage::Local { root: cell.data.path().join("wrong-objects") };
     let error = admin::delete_deployment(cell.directory.as_ref(), &wrong_root, &keys, "legacy", 4 << 20).await.unwrap_err();
     assert_eq!(error.code, "rtdb.multi/storage-binding-mismatch");
