@@ -108,6 +108,14 @@ The follow-up runner records the first wrong result, subsequent counts and proto
 - `ff72d7394` skips the same-system-time compaction pass for ordered L0 pages with distinct IIDs and ordinary put or delete intervals.
   The maintenance suite passed all 38 tests.
   Both compaction changes need matched throughput and memory measurements.
+- `5d0b86b41` sets the measured jemalloc configuration in the native image and verifies that the runtime loads the library.
+  All 55 release tool tests passed.
+- `59e463386` reuses each input's current IID while merging sorted trie rows.
+  Trie lookups borrow the existing header and return its IID.
+- `786f26c5d` builds one inferred schema for rows with matching ordered fields and cell types.
+  It retains the existing type join for heterogeneous rows.
+- `075647865` reserves schema memory once per flat Flight parameter column and accounts for each decoded value.
+  The combined trie, index, Flight SQL and transaction suites passed all 166 tests for these three write-path changes.
 
 ## Current branch measurements
 
@@ -205,6 +213,15 @@ The same configuration improved the observed million-row memory and pgwire resul
 The glibc run with a 61.1 ms pgwire single-INSERT p95 was followed by 3.09 ms and 2.12 ms with jemalloc.
 The 100,000-row Flight ingest median still trails the reference, and the million-row Flight median difference is inside the measured XTDB spread.
 Verify the packaged allocator setting and repeat the remaining Flight comparisons with phase-specific profiles.
+
+### Flight and UPDATE CPU samples
+
+Phase-specific sampling on Mac mini 2 used RTDB `ff72d7394` with jemalloc and restricted each recording to the measured operation.
+With compaction disabled, fresh Flight ingest produced 1,043 samples, including 3.2% self time in `LiveTable::header` and 2.6% in trie merge.
+With compaction enabled, the 1,385 samples included 4.9% in an unstable quicksort specialization and 2.1% directly in the two Bloom insertion routines.
+The samples identify sorting and Bloom construction as active costs, while the quicksort symbol can include other callers.
+During the set-based UPDATE, 474 samples put 2.3% self time in the Arrow cell allocation estimator and another 2.3% in one of the hash writer specializations.
+Repeated document maps and live-trie lookups add work even without the compactor.
 
 ## Verification
 
