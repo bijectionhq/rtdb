@@ -3,7 +3,8 @@
 //! The agent never decides safety.
 //! The directory's version check decides who holds an epoch, and the logkeepers refuse every append from an earlier one; the agent only keeps what this node runs in step with what the directory says.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use rtdb_replication::Role as DriverRole;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch};
 use tokio_util::sync::CancellationToken;
 
-use crate::control::{CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
+use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, select_logkeepers};
 use crate::lease::MemberLease;
 
@@ -24,6 +25,8 @@ pub struct AgentOptions {
     pub storage: CellStorage,
     /// How long an activation may take to reach a confirmed leadership before it is abandoned.
     pub activation_timeout: Duration,
+    /// How many new deployment opens may start within one second.
+    pub activations_per_second: NonZeroUsize,
     /// How often held deployments are checked against the directory.
     pub watch_interval: Duration,
     /// Park a deployment nobody has touched for this long; never, if absent.
@@ -46,7 +49,8 @@ pub struct AgentOptions {
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { storage, activation_timeout: Duration::from_secs(30), watch_interval: Duration::from_millis(250), park_after: None,
+        Self { storage, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+            watch_interval: Duration::from_millis(250), park_after: None,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
     }
@@ -70,6 +74,20 @@ struct LocalHolding {
 }
 
 type Turns = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+#[derive(Default)]
+struct ActivationWindow { starts: VecDeque<Instant> }
+
+impl ActivationWindow {
+    fn admit(&mut self, now: Instant, limit: NonZeroUsize) -> bool {
+        while self.starts.front().is_some_and(|start| now.duration_since(*start) >= Duration::from_secs(1)) {
+            self.starts.pop_front();
+        }
+        if self.starts.len() >= limit.get() { return false; }
+        self.starts.push_back(now);
+        true
+    }
+}
 
 struct DeploymentTurn<'a> {
     turns: &'a Turns,
@@ -125,6 +143,7 @@ pub struct NodeAgent {
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
     /// One activation, subscription or park at a time per deployment name.
     turns: Turns,
+    activations: Mutex<ActivationWindow>,
     memory_relief: tokio::sync::Mutex<()>,
     /// How many fragments this node has read for other nodes' scans, by deployment, table and prefix.
     fragments_read: Mutex<BTreeMap<(String, String, String), u64>>,
@@ -132,7 +151,7 @@ pub struct NodeAgent {
 
 impl NodeAgent {
     pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
+        Arc::new(Self { directory, node, lease, address, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -161,6 +180,7 @@ impl NodeAgent {
         let turn = self.turn(name);
         let me = self.member();
         let mut attempted_relief = false;
+        let mut admitted = false;
         for _ in 0..4 {
             let active_turn = turn.lock().await;
             let record = self.record(name).await?;
@@ -199,6 +219,14 @@ impl NodeAgent {
                 self.relieve_execution_memory(Some(name)).await;
                 attempted_relief = true;
                 continue;
+            }
+            let reserved_here = record.active_move(now).is_some_and(|intent| intent.target == me);
+            if !admitted && !reserved_here {
+                let mut activations = self.activations.lock();
+                if !activations.admit(Instant::now(), self.options.activations_per_second) {
+                    return Err(Anomaly::new(AnomalyCategory::Busy, ACTIVATION_RATE_LIMITED, "The node has reached its deployment activation rate"));
+                }
+                admitted = true;
             }
             next.storage_namespaces = Some(self.storage_namespaces);
             match self.directory.replace_deployment(next, record.version).await? {
@@ -741,7 +769,20 @@ impl Handler for NodeAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeploymentTurn, Turns};
+    use super::{ActivationWindow, DeploymentTurn, Duration, Instant, NonZeroUsize, Turns};
+
+    #[test]
+    fn the_activation_window_counts_the_last_second_across_clock_boundaries() {
+        let mut window = ActivationWindow::default();
+        let limit = NonZeroUsize::new(2).unwrap();
+        let first = Instant::now();
+        assert!(window.admit(first, limit));
+        assert!(window.admit(first + Duration::from_millis(600), limit));
+        assert!(!window.admit(first + Duration::from_millis(999), limit));
+        assert!(window.admit(first + Duration::from_secs(1), limit));
+        assert!(!window.admit(first + Duration::from_millis(1599), limit));
+        assert!(window.admit(first + Duration::from_millis(1600), limit));
+    }
 
     #[tokio::test]
     async fn a_deployment_turn_survives_while_another_operation_uses_it() {

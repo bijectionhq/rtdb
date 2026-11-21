@@ -1424,6 +1424,8 @@ rule Park {
 rule ActivateOnDemand {
     -- A request for an unheld deployment claims it on the highest-ranked eligible, unpressured member.
     -- Activations are admitted at most activations_per_node_per_second per node; others queue at the gateway with a deadline, interactive before background.
+    -- The local window covers one rolling second and a rate refusal leaves the placement unchanged.
+    -- An existing reservation admits its handoff independently of the cold activation budget.
     when: ActivationRequested(deployment)
 
     requires: not deployment.is_held

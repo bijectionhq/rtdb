@@ -436,6 +436,9 @@ A parked deployment must cost nothing but its record and objects (`CostFollowsAc
    A planned handoff retains its reservation while retrying its target under pressure.
    A separate minimum-residency policy remains open.
 3. Activation on demand from the gateway or the intake (`ActivateOnDemand`), admitted per node at `activations_per_node_per_second`.
+   A placed node admits up to 200 cold claims in a rolling second by default, configurable with `--activations-per-second N`.
+   The gateway tries other eligible nodes and retries a rate refusal within its activation deadline.
+   Existing holdings and reserved handoffs can continue while the cold-activation budget is full.
 4. Everything per database that today lives for the database's lifetime (tasks, timers, log tails, pools) is made lazy, guided by the stage 0 measurements.
 
 **Tests.**

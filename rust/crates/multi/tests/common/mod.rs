@@ -1,6 +1,7 @@
 //! A whole cell in one process (a directory, three logkeepers, nodes and a gateway) for the cell and chaos tests.
 #![allow(dead_code)]
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,10 +11,7 @@ use rtdb_server::config::NodeConfiguration;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
-async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, storage: &CellStorage, index: usize, pool: MemberPool, park_after: Option<Duration>, compaction_workers: bool, watch: Option<Duration>) -> process::RunningNode {
-    let mut agent = AgentOptions::new(storage.clone());
-    if let Some(watch) = watch { agent.watch_interval = watch; }
-    agent.park_after = park_after;
+async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agent: AgentOptions, index: usize, pool: MemberPool, compaction_workers: bool) -> process::RunningNode {
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
     process::start_node(Arc::clone(directory), process::NodeSettings {
@@ -60,15 +58,19 @@ impl Cell {
 
     /// A cell keeping its objects in `objects`, or in a directory of its own.
     pub async fn start_on(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>) -> Self {
-        Self::start_configured(objects, pools, park_after, watch, cells, false).await
+        Self::start_configured(objects, pools, park_after, watch, cells, false, None).await
     }
 
     pub async fn start_durable(nodes: usize) -> Self {
-        Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, true).await
+        Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, true, None).await
+    }
+
+    pub async fn start_rate_limited(limit: NonZeroUsize) -> Self {
+        Self::start_configured(None, vec![MemberPool::General], None, None, None, false, Some(limit)).await
     }
 
     async fn start_configured(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>,
-        watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool) -> Self {
+        watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool, activations_per_second: Option<NonZeroUsize>) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
         let objects = objects.unwrap_or_else(|| CellStorage::Local { root: data.path().join("objects") });
@@ -80,8 +82,14 @@ impl Cell {
                 availability_zone: format!("zone-{index}"), lease: lease(),
             }).await.unwrap());
         }
+        let mut agent = AgentOptions::new(objects.clone());
+        if let Some(watch) = watch { agent.watch_interval = watch; }
+        if let Some(limit) = activations_per_second { agent.activations_per_second = limit; }
+        agent.park_after = park_after;
         let mut running = Vec::new();
-        for (index, pool) in pools.into_iter().enumerate() { running.push(Some(start_node(&directory, data.path(), &objects, index, pool, park_after, compaction_workers, watch).await)); }
+        for (index, pool) in pools.into_iter().enumerate() {
+            running.push(Some(start_node(&directory, data.path(), agent.clone(), index, pool, compaction_workers).await));
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = listener.local_addr().unwrap();
         let gateway_cancellation = CancellationToken::new();
@@ -102,7 +110,8 @@ impl Cell {
     /// Starts one more general node, as autoscaling or a replacement would.
     pub async fn add_node(&mut self) -> usize {
         let index = self.nodes.len();
-        self.nodes.push(Some(start_node(&self.directory, self.data.path(), &self.objects, index, MemberPool::General, None, false, None).await));
+        let agent = AgentOptions::new(self.objects.clone());
+        self.nodes.push(Some(start_node(&self.directory, self.data.path(), agent, index, MemberPool::General, false).await));
         index
     }
 

@@ -15,15 +15,18 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const NODE_UNDER_PRESSURE: &str = "rtdb.multi/node-under-pressure";
 pub(crate) const NOT_CLAIMABLE: &str = "rtdb.multi/not-claimable";
 pub(crate) const CLAIM_CONTENDED: &str = "rtdb.multi/claim-contended";
+pub(crate) const ACTIVATION_RATE_LIMITED: &str = "rtdb.multi/activation-rate-limited";
 
-pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED) }
+pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED | ACTIVATION_RATE_LIMITED) }
 
 pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: Duration, mut attempt: impl FnMut() -> F) -> Result<T> {
     let latest_start = tokio::time::Instant::now() + window;
     loop {
         let result = attempt().await;
-        if !matches!(&result, Err(error) if retryable_activation(&error.code)) { return result; }
-        let retry_at = tokio::time::Instant::now() + Duration::from_millis(25);
+        let Err(error) = &result else { return result; };
+        if !retryable_activation(&error.code) { return result; }
+        let delay = if error.code == ACTIVATION_RATE_LIMITED { Duration::from_millis(100) } else { Duration::from_millis(25) };
+        let retry_at = tokio::time::Instant::now() + delay;
         if retry_at >= latest_start { return result; }
         tokio::time::sleep_until(retry_at).await;
         if tokio::time::Instant::now() >= latest_start { return result; }
@@ -168,19 +171,20 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn activation_retries_pressure_and_contention_and_reports_a_terminal_failure() {
+    async fn activation_retries_temporary_refusals_and_reports_a_terminal_failure() {
         let mut calls = 0;
         let result = retry_activation(Duration::from_secs(1), || {
             calls += 1;
             let error = match calls {
                 1 => Anomaly::new(AnomalyCategory::Unavailable, NODE_UNDER_PRESSURE, "reclaiming memory"),
                 2 => Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, "another directory update won"),
+                3 => Anomaly::new(AnomalyCategory::Busy, ACTIVATION_RATE_LIMITED, "the activation window is full"),
                 _ => Anomaly::incorrect("test/deployment-gone", "the deployment was deleted"),
             };
             std::future::ready(Err::<(), _>(error))
         }).await;
         assert_eq!(result.unwrap_err().code, "test/deployment-gone");
-        assert_eq!(calls, 3);
+        assert_eq!(calls, 4);
     }
 
     #[tokio::test]

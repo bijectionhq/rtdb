@@ -7,6 +7,7 @@ use std::time::Duration;
 use common::*;
 use rtdb_directory::MemberPool;
 use rtdb_multi::admin;
+use rtdb_multi::control::Response;
 use rtdb_multi::keys::KeyService;
 use tokio_postgres::NoTls;
 
@@ -84,6 +85,28 @@ async fn an_activation_parks_a_cold_holding_under_execution_memory_pressure() {
     let cold = cell.connect("cold").await;
     assert_eq!(values(&cold, "SELECT total FROM orders").await, ["10"]);
     drop(cold);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_claims_share_a_node_activation_limit_while_warm_access_continues() {
+    let cell = Cell::start_rate_limited(std::num::NonZeroUsize::MIN).await;
+    for name in ["first", "second"] {
+        admin::create_deployment(cell.directory.as_ref(), name, "acme", 3).await.unwrap();
+    }
+    let agent = &cell.node(0).agent;
+    let (first, second) = tokio::join!(agent.activate("first"), agent.activate("second"));
+    let (warm, cold, refusal) = match (first, second) {
+        (Ok(_), Err(error)) => ("first", "second", error),
+        (Err(error), Ok(_)) => ("second", "first", error),
+        results => panic!("expected one admitted activation: {results:?}"),
+    };
+    assert_eq!(refusal.code, "rtdb.multi/activation-rate-limited");
+    assert!(matches!(agent.activate(warm).await.unwrap(), Response::Held { .. }));
+    assert_eq!(cell.holder(cold).await, None);
+    let client = tokio::time::timeout(Duration::from_secs(5), cell.connect(cold)).await.unwrap();
+    assert_eq!(cell.holder(cold).await, Some(0));
+    drop(client);
     cell.stop().await;
 }
 
