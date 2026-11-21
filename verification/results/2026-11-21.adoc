@@ -1256,3 +1256,16 @@ Lean ran with one worker and its default proof budgets.
 This invocation omitted both Rust options.
 The disposition of the later fork study is recorded separately above.
 Its input manifest SHA-256 is `d4bb2ef583c091d331b37828437534901076516771a6e024fa737567c425f0d4`.
+
+=== Multi follow-up integration
+
+The `rtdb-multi` tip `ef5a4ee14` adds load-aware placement, writer confirmation after route changes, read-width cleanup and independent checkpoint copies for cross-organisation forks.
+The merged Rust candidate first exposed a default-stack overflow during the native idempotent transaction retry.
+One crash report identified recursive column pruning.
+A second run after guarding pruning reached a separate stack limit during nested page-cursor construction.
+The fixes apply stack growth to recursive pruning and to polls that build nested page cursors.
+
+The selected Rust suites passed 330 tests at `4ffa2cf02` with the default stack and four test threads.
+The run included 78 local cell tests, including the idempotent retry, checkpoint retention, load-aware rebalancing and cross-organisation fork after source erasure.
+The DynamoDB feature and live S3 qualification were outside the selected tests.
+From `rust/`, run `BIJECTION_LOCAL_EXECUTION=owner-authorized RUST_TEST_THREADS=4 cargo test --offline --locked -p rtdb-multi -p rtdb-replication -p rtdb-node --lib --test cell --test resources --test native`.
