@@ -794,8 +794,8 @@ entity Holding {
     }
 
     transitions residency {
-        active -> resident_idle    -- no requests for clean_after_idle, and the tail flushed
-        resident_idle -> active    -- a request arrived
+        active -> resident_idle    -- idle deadline, admitted writes drained and checkpoint published
+        resident_idle -> active    -- a request claimed a new epoch
         resident_idle -> parked    -- memory pressure chose it, after min_residency
         active -> parked           -- the member drains or is told to park, after a final flush
         -- parked ends the holding: Parked is committed and the holder is cleared.
@@ -1455,14 +1455,20 @@ rule ScrubOrphans {
 ------------------------------------------------------------
 
 rule BecomeIdle {
-    when: holding: Holding.last_request_at + config.clean_after_idle <= now
+    -- A configured node keeps the placement while releasing the running database and its watch.
+    -- The directory retains the published checkpoint and the time of the last activity.
+    -- A move reservation takes precedence over the idle transition.
+    -- A Flight SQL call keeps the placement active until its stream closes or the caller cancels.
+    when: ResidentIdleDeadlineReached(holding)
 
     requires: holding.residency = active
-    requires: holding.tail_bytes = 0
 
     ensures:
+        AdmittedWritesApplied(holding)
+        CheckpointAdopted(holding)
+        WriterEpochAdvanced(holding.deployment)
         holding.residency = resident_idle
-        TailIndexReleased(holding)
+        HoldingResourcesReleased(holding)
 }
 
 rule WakeOnRequest {
@@ -1471,8 +1477,22 @@ rule WakeOnRequest {
     requires: holding.residency = resident_idle
 
     ensures:
+        NewEpochClaimed(holding.deployment, holding.member)
+        CheckpointRecovered(holding.deployment)
         holding.residency = active
         holding.last_request_at = now
+}
+
+rule ParkResidentIdle {
+    -- An idle deadline or drain can release a retained placement from the directory.
+    -- A parking attempt from an older scan must still match the deployment and idle epoch.
+    when: ResidentIdleParkRequested(holding)
+
+    requires: holding.residency = resident_idle
+
+    ensures:
+        HolderReleased(holding.deployment)
+        WriterEpochAdvanced(holding.deployment)
 }
 
 rule ParkUnderPressure {
@@ -1665,6 +1685,7 @@ rule ReportPlacementDemand {
     ensures:
         HeldDeploymentsReadByMember(cell)
         HolderCountsReportedByPool(cell)
+        ResidentIdleCountsReportedByPool(cell)
         PlacementNodeTargetsReportedByPool(cell)
 }
 

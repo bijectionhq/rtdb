@@ -156,11 +156,15 @@ async fn expect(address: &str, request: Request, control: &ControlKey) -> Result
 pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &ControlKey) -> Result<MemberId> {
     let current = record(directory, name).await?;
     let members = members(directory).await?;
-    if let Some(holder) = effective_holder(&current, &members, now_ms()) { return Ok(holder.clone()); }
     let now = now_ms();
+    let holder = effective_holder(&current, &members, now);
+    if let Some(holder) = holder && !current.is_resident_idle() { return Ok(holder.clone()); }
+    let resident = holder.and_then(|id| members.get(id));
+
     let nodes: Vec<&MemberRecord> = members.values().filter(|member| current.may_place_on(member, now)).collect();
     let mut last = None;
-    for node in rtdb_affinity::rank(&current.storage_identity(), &nodes, |member| member.id.as_str()) {
+    let ranked = rtdb_affinity::rank(&current.storage_identity(), &nodes, |member| member.id.as_str());
+    for node in resident.into_iter().chain(ranked.into_iter().copied().filter(|node| resident.is_none_or(|resident| node.id != resident.id))) {
         let Some(address) = &node.control_address else { continue };
         match expect(address, Request::Activate { name: name.to_owned() }, control).await {
             Ok(Response::Held { .. }) => return Ok(node.id.clone()),
@@ -278,7 +282,7 @@ pub async fn rebalance(directory: &dyn Directory, moves: usize, control: &Contro
         let mut load: BTreeMap<MemberId, Vec<&DeploymentRecord>> = members.values()
             .filter(|member| member.pool == pool && member.may_receive_placements(now) && member.control_address.is_some())
             .map(|member| (member.id.clone(), Vec::new())).collect();
-        for record in deployments.iter().filter(|record| record.writer_pool() == Some(pool)) {
+        for record in deployments.iter().filter(|record| record.writer_pool() == Some(pool) && !record.is_resident_idle()) {
             if let Some(held) = effective_holder(record, &members, now).and_then(|holder| load.get_mut(holder)) {
                 held.push(record);
             }
@@ -1738,6 +1742,8 @@ pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOp
 pub struct CellStatus {
     pub deployments: usize,
     pub active: usize,
+    #[serde(default)]
+    pub resident_idle: usize,
     pub parked: usize,
     pub quarantined: usize,
     pub nodes: BTreeMap<String, usize>,
@@ -1751,14 +1757,18 @@ pub async fn cell_status(directory: &dyn Directory, target_per_node: usize) -> R
     let mut nodes: BTreeMap<String, usize> = members.values().filter(|member| member.role == MemberRole::Node && member.is_live(now)).map(|member| (member.id.to_string(), 0)).collect();
     let deployments = directory.deployments().await?;
     let mut active = 0;
+    let mut resident_idle = 0;
     let mut quarantined = 0;
     for deployment in &deployments {
         if deployment.lifecycle == Lifecycle::Quarantined { quarantined += 1; }
-        if let Some(holder) = effective_holder(deployment, &members, now) { active += 1; *nodes.entry(holder.to_string()).or_default() += 1; }
+        if let Some(holder) = effective_holder(deployment, &members, now) {
+            if deployment.is_resident_idle() { resident_idle += 1; } else { active += 1; }
+            *nodes.entry(holder.to_string()).or_default() += 1;
+        }
     }
     let live = deployments.iter().filter(|deployment| matches!(deployment.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)).count();
     Ok(CellStatus {
-        deployments: live, active, parked: live - active, quarantined, nodes,
+        deployments: live, active, resident_idle, parked: live - active - resident_idle, quarantined, nodes,
         logkeepers: members.values().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).count(),
         recommended_nodes: active.div_ceil(target_per_node.max(1)).max(1),
     })
@@ -1769,6 +1779,8 @@ pub struct PlacementPoolStatus {
     pub eligible: usize,
     pub draining: usize,
     pub holdings: usize,
+    #[serde(default)]
+    pub resident_idle: usize,
     pub recommended_nodes: usize,
 }
 
@@ -1785,27 +1797,31 @@ pub struct PlacementStatus {
 pub async fn placement_status(directory: &dyn Directory, target_per_node: usize) -> Result<PlacementStatus> {
     let members = members(directory).await?;
     let now = now_ms();
-    let mut nodes: BTreeMap<_, usize> = members.values().filter(|member| member.may_hold(now) && member.pool != MemberPool::Compaction)
-        .map(|member| (&member.id, 0)).collect();
+    let mut nodes: BTreeMap<_, (usize, usize)> = members.values().filter(|member| member.may_hold(now) && member.pool != MemberPool::Compaction)
+        .map(|member| (&member.id, (0, 0))).collect();
     for record in live_holdings(directory, &members, now).await? {
-        if let Some(count) = effective_holder(&record, &members, now).and_then(|holder| nodes.get_mut(holder)) { *count += 1; }
+        if let Some((held, idle)) = effective_holder(&record, &members, now).and_then(|holder| nodes.get_mut(holder)) {
+            *held += 1;
+            *idle += usize::from(record.is_resident_idle());
+        }
     }
     let pool_status = |pool, minimum| {
-        let mut status = PlacementPoolStatus { eligible: 0, draining: 0, holdings: 0, recommended_nodes: 0 };
-        for (id, held) in &nodes {
+        let mut status = PlacementPoolStatus { eligible: 0, draining: 0, holdings: 0, resident_idle: 0, recommended_nodes: 0 };
+        for (id, (held, idle)) in &nodes {
             let member = &members[*id];
             if member.pool != pool { continue; }
             status.holdings += held;
+            status.resident_idle += idle;
             if member.may_receive_placements(now) { status.eligible += 1; }
             if member.state == MemberState::Draining { status.draining += 1; }
         }
-        status.recommended_nodes = status.holdings.div_ceil(target_per_node.max(1)).max(minimum);
+        status.recommended_nodes = (status.holdings - status.resident_idle).div_ceil(target_per_node.max(1)).max(minimum);
         status
     };
     Ok(PlacementStatus {
         general: pool_status(MemberPool::General, 1),
         isolation: pool_status(MemberPool::Isolation, 0),
-        nodes: nodes.into_iter().map(|(id, held)| (id.to_string(), held)).collect(),
+        nodes: nodes.into_iter().map(|(id, (held, _))| (id.to_string(), held)).collect(),
         logkeepers: members.values().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).count(),
         compaction_workers: members.values().filter(|member| member.role == MemberRole::Node && member.pool == MemberPool::Compaction && member.is_live(now)).count(),
     })

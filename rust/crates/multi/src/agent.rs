@@ -5,12 +5,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, Version, claim, effective_holder, now_ms, park};
+use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, Version, claim, effective_holder, now_ms, park, suspend_holding};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
@@ -35,6 +35,7 @@ pub struct AgentOptions {
     pub clean_after_idle: Duration,
     /// Park a deployment nobody has touched for this long; never, if absent.
     pub park_after: Option<Duration>,
+    pub resident_idle_after: Option<Duration>,
     pub min_residency: Duration,
     /// Drop a read replica nobody has touched for this long.
     pub unsubscribe_after: Duration,
@@ -58,7 +59,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
         Self { storage, s3_write_role: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
-            watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, min_residency: Duration::ZERO,
+            watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
     }
@@ -71,6 +72,7 @@ const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
 const PRESSURE_WAIT: Duration = Duration::from_millis(500);
 const PRESSURE_PARKS_PER_PASS: usize = 8;
 const IDLE_FLUSHES_PER_PASS: usize = 2;
+const RESIDENT_IDLE_PER_PASS: usize = 8;
 const HANDOFF_REPLAY_ROWS: u64 = 64;
 const HANDOFF_REPLAY_RECORDS: i64 = 16;
 const DRAIN_HANDOFFS_PER_PASS: usize = 8;
@@ -102,6 +104,7 @@ fn require_recovered_checkpoint(record: &DeploymentRecord, database: &Database) 
 struct LocalHolding {
     id: String,
     epoch: u64,
+    active_calls: usize,
     last_touch: Instant,
     opened: Instant,
     linearizable: bool,
@@ -109,6 +112,23 @@ struct LocalHolding {
     database: std::sync::Weak<Database>,
     claimed_version: Version,
     placement: tokio::sync::watch::Receiver<Option<DeploymentRecord>>,
+}
+
+struct HoldingCall {
+    agent: Weak<NodeAgent>,
+    name: String,
+    attachment: Weak<Database>,
+}
+
+impl Drop for HoldingCall {
+    fn drop(&mut self) {
+        let Some(agent) = self.agent.upgrade() else { return };
+        let mut holdings = agent.holdings.lock();
+        if let Some(holding) = holdings.get_mut(&self.name).filter(|holding| holding.database.ptr_eq(&self.attachment)) {
+            holding.active_calls -= 1;
+            holding.last_touch = Instant::now();
+        }
+    }
 }
 
 type Turns = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
@@ -183,6 +203,7 @@ pub struct NodeAgent {
     /// One activation, subscription or park at a time per deployment name.
     turns: Turns,
     activations: Mutex<ActivationWindow>,
+    last_resident_sweep: Mutex<Instant>,
     memory_relief: tokio::sync::Mutex<()>,
     /// How many fragments this node has read for other nodes' scans, by deployment, table and prefix.
     fragments_read: Mutex<BTreeMap<(String, String, String), u64>>,
@@ -190,7 +211,7 @@ pub struct NodeAgent {
 
 impl NodeAgent {
     pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoint: Option<String>, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
+        Arc::new(Self { directory, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), last_resident_sweep: Mutex::new(Instant::now()), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -293,7 +314,7 @@ impl NodeAgent {
                 let placement = rtdb_directory::watch_deployment(Arc::clone(&self.directory), record.id.clone(), self.options.watch_interval);
                 let opened = Instant::now();
                 self.holdings.lock().insert(record.name.clone(), LocalHolding {
-                    id: record.id.clone(), epoch: record.epoch, last_touch: opened, opened,
+                    id: record.id.clone(), epoch: record.epoch, active_calls: 0, last_touch: opened, opened,
                     linearizable: record.linearizable_reads, trimmed_through: None, database: Arc::downgrade(&database),
                     claimed_version: record.version, placement,
                 });
@@ -475,7 +496,8 @@ impl NodeAgent {
     }
 
     async fn park_with_turn(&self, name: &str, moving: Option<(u64, &MoveTicket)>, flush_wait: Duration) -> Result<Response> {
-        let Some((id, epoch)) = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch)) else { return Ok(Response::Done); };
+        let local = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch));
+        let Some((id, epoch)) = local else { return self.park_resident(name, moving, None).await; };
         let is_requested = |record: &DeploymentRecord| moving.is_none_or(|(epoch, ticket)| {
             record.id == ticket.deployment && record.epoch == epoch && record.holder.as_ref() == Some(&self.member())
                 && record.active_move(now_ms()).is_some_and(|intent| intent.request == ticket.request)
@@ -526,6 +548,76 @@ impl NodeAgent {
         }
         self.stop_running(name).await;
         Ok(Response::Done)
+    }
+
+    pub(crate) async fn park_resident_holdings(&self) {
+        if self.options.resident_idle_after.is_none() { return; }
+        if let Ok(records) = self.directory.deployments_held_by(&self.member()).await {
+            for record in records.into_iter().filter(DeploymentRecord::is_resident_idle) {
+                let _ = self.park_if_resident(&record).await;
+            }
+        }
+    }
+
+    async fn park_if_resident(&self, expected: &DeploymentRecord) -> Result<Response> {
+        let turn = self.turn(&expected.name);
+        let _turn = turn.lock().await;
+        self.park_resident(&expected.name, None, Some((&expected.id, expected.epoch))).await
+    }
+
+    async fn park_resident(&self, name: &str, moving: Option<(u64, &MoveTicket)>, expected: Option<(&str, u64)>) -> Result<Response> {
+        let member = self.member();
+        for _ in 0..8 {
+            let Some(record) = self.directory.deployment_by_name(name).await? else { return Ok(Response::Done) };
+            if !record.is_resident_idle() || record.holder.as_ref() != Some(&member) { return Ok(Response::Done); }
+            if expected.is_some_and(|(id, epoch)| record.id != id || record.epoch != epoch) { return Ok(Response::Done); }
+            if moving.is_some_and(|(epoch, ticket)| record.id != ticket.deployment || record.epoch != epoch
+                || !record.active_move(now_ms()).is_some_and(|intent| intent.request == ticket.request))
+            {
+                return Err(stale_handoff(name));
+            }
+            let parked = park(&record, &member, record.epoch).expect("the resident holder matches");
+            if let Cas::Applied(_) = self.directory.replace_deployment(parked, record.version).await? {
+                return Ok(Response::Done);
+            }
+        }
+        Err(Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, format!("{name} kept changing while it was parked")))
+    }
+
+    async fn suspend_if_idle(&self, name: &str, expected: &DeploymentRecord, last_touch: Instant) -> Result<()> {
+        let turn = self.turn(name);
+        let _turn = turn.lock().await;
+        let unchanged = || self.holdings.lock().get(name).is_some_and(|holding| {
+            holding.id == expected.id && holding.epoch == expected.epoch && holding.last_touch == last_touch && holding.active_calls == 0
+        });
+        if !unchanged() { return Ok(()); }
+        let member = self.member();
+        let database = self.node.catalog().database(name)?;
+        let deadline = tokio::time::Instant::now() + self.options.activation_timeout;
+        let pause = tokio::time::timeout_at(deadline, database.pause_transactions()).await
+            .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/suspend-drain-timeout", "The holder could not drain its admitted writes in time"))??;
+        let block = self.flush_and_adopt(&database, &expected.id, expected.epoch,
+            deadline.saturating_duration_since(tokio::time::Instant::now())).await?;
+        for _ in 0..8 {
+            if !unchanged() { return Ok(()); }
+            let Some(record) = self.directory.deployment(&expected.id).await? else { return Ok(()) };
+            let now = now_ms();
+            let last_activity = now.saturating_sub(last_touch.elapsed().as_millis().min(i64::MAX as u128) as i64);
+            let Some(mut suspended) = suspend_holding(&record, &member, expected.epoch, now, last_activity) else { return Ok(()) };
+            if let Some(checkpoint) = checkpoint_for_block(&block, StorageEpoch(record.log_epoch))
+                && record.checkpoint.is_none_or(|previous| previous.block < checkpoint.block)
+            {
+                suspended.checkpoint = Some(checkpoint);
+            }
+            if !unchanged() { return Ok(()); }
+            if let Cas::Applied(_) = self.directory.replace_deployment(suspended, record.version).await? {
+                self.stop_serving(name).await;
+                drop(pause);
+                self.wait_until_detached(name).await;
+                return Ok(());
+            }
+        }
+        Err(Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, format!("{name} kept changing while it became idle")))
     }
 
     fn execution_memory_pressured(&self) -> bool {
@@ -768,6 +860,14 @@ impl NodeAgent {
         }
     }
 
+    pub(crate) fn hold_active_call(self: &Arc<Self>, database: &Database) -> Option<Box<dyn Send + Sync>> {
+        let mut holdings = self.holdings.lock();
+        let holding = holdings.get_mut(database.name()).filter(|holding| std::ptr::eq(holding.database.as_ptr(), database))?;
+        holding.active_calls += 1;
+        holding.last_touch = Instant::now();
+        Some(Box::new(HoldingCall { agent: Arc::downgrade(self), name: database.name().into(), attachment: holding.database.clone() }))
+    }
+
     pub fn touch(&self, name: &str) {
         if let Some(holding) = self.holdings.lock().get_mut(name) { holding.last_touch = Instant::now(); }
         if let Some(subscription) = self.subscriptions.lock().get_mut(name) { subscription.last_touch = Instant::now(); }
@@ -784,13 +884,23 @@ impl NodeAgent {
         let me = self.member();
         let destinations = if draining { self.members().await.ok() } else { None };
         let active_within = self.options.park_after.map_or(ACTIVE_DRAIN_WINDOW, |after| after.min(ACTIVE_DRAIN_WINDOW));
+        let choose_drain_target = |record: &DeploymentRecord| {
+            let now = now_ms();
+            let candidates: Vec<_> = destinations.as_ref()?.values().filter(|member| member.id != me
+                && member.control_address.is_some() && record.may_place_on(member, now)
+                && target_engine.is_none_or(|target| member.engine_version == target)
+                && record.storage_namespaces.is_none_or(|namespaces| member.storage_namespaces == Some(namespaces))).collect();
+            rtdb_affinity::rank(&record.storage_identity(), &candidates, |member| member.id.as_str())
+                .first().map(|target| target.id.clone())
+        };
         let mut handoffs = Vec::new();
         let mut idle_flushes = 0;
+        let mut suspended = 0;
         let mut held: Vec<_> = self.holdings.lock().iter().map(|(name, holding)| {
-            (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch, holding.claimed_version, holding.placement.clone())
+            (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch, holding.claimed_version, holding.placement.clone(), holding.opened, holding.active_calls)
         }).collect();
-        held.sort_by_key(|(_, _, _, touched, _, _)| std::cmp::Reverse(*touched));
-        for (rank, (name, id, epoch, last_touch, claimed_version, placement)) in held.into_iter().enumerate() {
+        held.sort_by_key(|(_, _, _, touched, _, _, _, _)| std::cmp::Reverse(*touched));
+        for (rank, (name, id, epoch, last_touch, claimed_version, placement, opened, active_calls)) in held.into_iter().enumerate() {
             let current = placement.borrow().as_ref().filter(|record| record.version >= claimed_version).cloned();
             let placed_here = |record: &DeploymentRecord| record.epoch == epoch && record.holder.as_ref() == Some(&me);
             let deposed = current.as_ref().is_some_and(|record| !placed_here(record));
@@ -807,31 +917,52 @@ impl NodeAgent {
             }
             let Some(record) = current.as_ref() else { continue };
             if draining {
-                if target_engine.is_none() && record.engine_pin.is_none() && last_touch.elapsed() >= active_within {
+                if target_engine.is_none() && record.engine_pin.is_none() && active_calls == 0 && last_touch.elapsed() >= active_within {
                     let _ = self.park(&name).await;
-                } else if handoffs.len() < DRAIN_HANDOFFS_PER_PASS
-                    && let Some(members) = destinations.as_ref()
-                {
-                    let now = now_ms();
-                    let candidates: Vec<_> = members.values().filter(|member| member.id != me
-                        && member.control_address.is_some() && record.may_place_on(member, now)
-                        && target_engine.is_none_or(|target| member.engine_version == target)
-                        && record.storage_namespaces.is_none_or(|namespaces| member.storage_namespaces == Some(namespaces))).collect();
-                    if let Some(target) = rtdb_affinity::rank(&record.storage_identity(), &candidates, |member| member.id.as_str()).first() {
-                        handoffs.push((name, epoch, target.id.clone()));
-                    }
+                } else if handoffs.len() < DRAIN_HANDOFFS_PER_PASS && let Some(target) = choose_drain_target(record) {
+                    handoffs.push((name, epoch, target));
                 }
                 continue;
             }
             self.publish_and_trim(&name, record).await;
             let over = self.options.max_active.is_some_and(|limit| rank >= limit);
-            if over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) {
+            if over || active_calls == 0 && self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) {
                 let _ = self.park(&name).await;
-            } else if idle_flushes < IDLE_FLUSHES_PER_PASS && last_touch.elapsed() >= self.options.clean_after_idle
+            } else if active_calls == 0 && suspended < RESIDENT_IDLE_PER_PASS
+                && self.options.resident_idle_after.is_some_and(|after| last_touch.elapsed() >= after)
+                && opened.elapsed() >= self.options.min_residency
+            {
+                suspended += 1;
+                let _ = self.suspend_if_idle(&name, record, last_touch).await;
+            } else if active_calls == 0 && idle_flushes < IDLE_FLUSHES_PER_PASS && last_touch.elapsed() >= self.options.clean_after_idle
                 && self.node.catalog().database(&name).is_ok_and(|database| database.live_rows() > 0)
             {
                 idle_flushes += 1;
                 let _ = self.flush(&name).await;
+            }
+        }
+        let park_residents_after = self.options.park_after.filter(|_| self.options.resident_idle_after.is_some()).filter(|_| {
+            let mut last_sweep = self.last_resident_sweep.lock();
+            if last_sweep.elapsed() < Duration::from_secs(1) { return false; }
+            *last_sweep = Instant::now();
+            true
+        });
+        if self.options.resident_idle_after.is_some() && (draining || park_residents_after.is_some())
+            && handoffs.len() < DRAIN_HANDOFFS_PER_PASS
+            && let Ok(residents) = self.directory.deployments_held_by(&me).await
+        {
+            let now = now_ms();
+            let expired = |record: &DeploymentRecord| park_residents_after.is_some_and(|after| {
+                record.resident_idle.is_some_and(|idle| now.saturating_sub(idle.last_activity_at_ms) >= after.as_millis().min(i64::MAX as u128) as i64)
+            });
+            for record in residents.into_iter().filter(|record| record.is_resident_idle() && (draining || expired(record)))
+                .take(DRAIN_HANDOFFS_PER_PASS - handoffs.len())
+            {
+                if !draining || target_engine.is_none() && record.engine_pin.is_none() {
+                    let _ = self.park_if_resident(&record).await;
+                } else if let Some(target) = choose_drain_target(&record) {
+                    handoffs.push((record.name, record.epoch, target));
+                }
             }
         }
         if !handoffs.is_empty() {

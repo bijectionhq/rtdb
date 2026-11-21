@@ -43,6 +43,7 @@ pub struct NodeServices {
 #[async_trait::async_trait]
 pub trait ReadFence: Send + Sync {
     async fn confirm(&self, database: &str) -> Result<()>;
+    fn hold_active_call(&self, _database: &Database) -> Option<Box<dyn Send + Sync>> { None }
     async fn confirm_hosted(&self, _database: &Database) -> Result<String> {
         Err(hosted_source_unavailable())
     }
@@ -156,6 +157,9 @@ impl Node {
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> { &self.catalog }
     pub fn memory(&self) -> &Arc<MemoryBudget> { &self.factory.memory }
     pub fn cache_budget(&self) -> &Arc<CacheBudget> { &self.factory.cache }
+    pub fn hold_active_call(&self, database: &Database) -> Option<Box<dyn Send + Sync>> {
+        self.read_fence.as_ref()?.hold_active_call(database)
+    }
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.
     pub fn query_instant(&self) -> rtdb_types::Instant { self.factory.clock.query_instant() }

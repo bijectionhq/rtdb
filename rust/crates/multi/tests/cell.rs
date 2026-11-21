@@ -22,6 +22,90 @@ use rtdb_multi::keys::LocalKeyService;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_postgres::NoTls;
 
+async fn await_resident_idle(cell: &Cell, name: &str) -> rtdb_directory::DeploymentRecord {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let record = cell.directory.deployment_by_name(name).await.unwrap().unwrap();
+            if record.is_resident_idle() { return record; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the holding reached resident idle")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resident_idle_releases_the_writer_and_wakes_with_a_fresh_epoch() {
+    let cell = Cell::start_with_resident_idle(2, Duration::from_millis(300), None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO docs (_id, value) VALUES (1, 71)").await.unwrap();
+    let source = cell.holder("shop").await.unwrap();
+    let serving = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    drop(client);
+
+    let resident = await_resident_idle(&cell, "shop").await;
+    assert_eq!(resident.holder, serving.holder);
+    assert_eq!(resident.epoch, serving.epoch + 1);
+    assert!(resident.checkpoint.is_some());
+    let status = admin::cell_status(cell.directory.as_ref(), 1).await.unwrap();
+    assert_eq!((status.active, status.resident_idle, status.parked), (0, 1, 0));
+    let placement = admin::placement_status(cell.directory.as_ref(), 1).await.unwrap();
+    assert_eq!((placement.general.holdings, placement.general.resident_idle), (1, 1));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let node = cell.node(source);
+            if node.agent.held().is_empty() && node.server.node().catalog().database("shop").is_err()
+                && !node.server.node().catalog().is_draining("shop")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("resident idle closed the database driver");
+
+    let client = connect_eventually(&cell, "shop").await;
+    let woke = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert!(!woke.is_resident_idle());
+    assert_eq!(woke.holder, serving.holder);
+    assert_eq!(woke.epoch, resident.epoch + 1);
+    assert_eq!(values(&client, "SELECT value FROM docs").await, ["71"]);
+    drop(client);
+
+    let idle_again = await_resident_idle(&cell, "shop").await;
+    let target = 1 - source;
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id(), &control()).await.unwrap();
+    let moved = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert!(!moved.is_resident_idle());
+    assert_eq!(moved.epoch, idle_again.epoch + 2);
+    assert_eq!(moved.holder.as_ref(), Some(&cell.node(target).lease.id()));
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT value FROM docs").await, ["71"]);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resident_idle_holder_can_later_park_from_the_idle_deadline() {
+    let cell = Cell::start_with_resident_idle(1, Duration::from_millis(300), Some(Duration::from_secs(2))).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO docs (_id, value) VALUES (1, 35)").await.unwrap();
+    drop(client);
+    let resident = await_resident_idle(&cell, "shop").await;
+    let parked = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+            if record.holder.is_none() { break record; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the resident idled through its park deadline");
+    assert!(!parked.is_resident_idle());
+    assert_eq!(parked.epoch, resident.epoch + 1);
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT value FROM docs").await, ["35"]);
+    drop(client);
+    cell.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stopping_a_node_releases_its_agent_and_its_standby_storage_witness() {
     let mut cell = Cell::start(1, None).await;

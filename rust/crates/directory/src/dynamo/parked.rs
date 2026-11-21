@@ -74,7 +74,7 @@ struct PackedJournalAnchor {
 
 pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
-        id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, ensemble, created_at_ms, read_width,
+        id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, resident_idle: _, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, replica_anchor, storage_generation,
         storage_namespaces, s3_write_lease_until_ms, engine_pin, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
         source_cleanup, deletion_record, replica_journals, storage_regions, cell_transfer, disposal, checkpoint_recovery,
@@ -171,6 +171,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         lifecycle: if packed.quarantined { Lifecycle::Quarantined } else { Lifecycle::Live },
         epoch,
         holder: None,
+        resident_idle: None,
         ensemble: members.iter().map(|&member| MemberId(Uuid::from_bytes(member).to_string())).collect(),
         read_width: packed.read_width,
         activation_crashes: packed.activation_crashes,

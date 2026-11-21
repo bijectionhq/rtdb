@@ -78,6 +78,10 @@ impl Cell {
         Self::start_configured(None, vec![MemberPool::General], None, None, None, false, |agent| agent.activations_per_second = limit).await
     }
 
+    pub async fn start_with_resident_idle(nodes: usize, after: Duration, park_after: Option<Duration>) -> Self {
+        Self::start_configured(None, vec![MemberPool::General; nodes], park_after, None, None, true, |agent| agent.resident_idle_after = Some(after)).await
+    }
+
     pub async fn start_with_idle_flush(delay: Duration) -> Self {
         Self::start_configured(None, vec![MemberPool::General], None, None, None, true, |agent| agent.clean_after_idle = delay).await
     }

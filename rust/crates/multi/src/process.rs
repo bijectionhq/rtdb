@@ -150,6 +150,7 @@ impl RunningNode {
     /// Parks every deployment it holds, leaves the cell and stops.
     pub async fn shutdown(mut self) -> Result<()> {
         for name in self.agent.held().into_keys() { let _ = self.agent.park(&name).await; }
+        self.agent.park_resident_holdings().await;
         let _ = self.lease.retire().await;
         self.stop().await
     }
@@ -190,6 +191,10 @@ struct FenceSlot(std::sync::OnceLock<std::sync::Weak<NodeAgent>>);
 
 #[async_trait::async_trait]
 impl rtdb_node::ReadFence for FenceSlot {
+    fn hold_active_call(&self, database: &rtdb_node::Database) -> Option<Box<dyn Send + Sync>> {
+        self.0.get()?.upgrade()?.hold_active_call(database)
+    }
+
     async fn confirm(&self, database: &str) -> Result<()> {
         match self.0.get() {
             Some(agent) => agent.upgrade().ok_or_else(stopped_agent)?.confirm_read(database).await,

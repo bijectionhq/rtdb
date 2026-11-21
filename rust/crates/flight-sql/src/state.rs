@@ -60,22 +60,23 @@ impl Session {
     pub fn owns(&self, owner: &ResourceOwner) -> bool {
         owner.matches(self.caller.owner, self.placement.as_ref().map(|placement| &placement.attachment))
     }
-    fn require_database(&self, database: &str, node: &Node) -> Result<(), Status> {
+    fn require_database(&self, database: &str, node: &Node) -> Result<Option<Arc<Database>>, Status> {
         if let Some(placement) = &self.placement {
             if database != placement.name {
                 return Err(Status::permission_denied("This Flight SQL session belongs to another deployment"));
             }
             let current = node.catalog().database(database).map_err(|_| placement_changed())?;
             if !std::ptr::eq(placement.attachment.as_ptr(), Arc::as_ptr(&current)) { return Err(placement_changed()); }
+            return Ok(Some(current));
         }
-        Ok(())
+        Ok(None)
     }
-    pub fn database(&self, header: Option<&str>, node: &Node) -> Result<String, Status> {
+    pub fn resolve_database(&self, header: Option<&str>, node: &Node) -> Result<(String, Option<Arc<Database>>), Status> {
         let state = self.state.lock().expect("session lock");
         let SessionState::Open { catalog, .. } = &*state else { return Err(Status::not_found("session closed")); };
         let database = header.or_else(|| self.placed_database()).or_else(|| catalog.as_ref().map(|selection| selection.name.as_str())).unwrap_or("xtdb");
-        self.require_database(database, node)?;
-        Ok(database.into())
+        let attachment = self.require_database(database, node)?;
+        Ok((database.into(), attachment))
     }
     pub fn select_catalog(&self, name: Option<String>, node: &Node) -> Result<(), Status> {
         let selection = name.map(|name| Ok::<_, Status>(CatalogSelection { _reservation: node.memory().reserve(name.capacity() + 128).map_err(status)?, name })).transpose()?;

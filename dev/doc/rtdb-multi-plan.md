@@ -39,7 +39,7 @@ Update this section as work lands.
 | 5 | the store is fenced by the holder's epoch, cannot delete (a delete is a garbage record), and the reaper erases released objects and packs after a grace period. Managed S3 writes record their multipart identity before sending payload bytes and complete conditionally with a deployment-scoped grant. | Writer epochs in object paths and independently issued credentials remain open. The holder, conditional publication and checkpoint recovery checks protect the current storage layout. |
 | 6 | a block flush writes one object, its block's pack, which holds the catalog and is the boot object; placed nodes flush within 15 minutes and on park; the directory's checkpoint names the last published block, and a cold start finds its latest block by probing forward from it, and reads that block's pack, which names every other, listing nothing. Explicit flushes publish the adopted checkpoint before replying. | the boot object inlines the catalog and per-table block files but not the top trie levels, which are read from their own level-0 pack entries |
 | 7 | compaction workers compact the deployments that rank them first and relay the result to the holder, which publishes it; holders on such a cell run no compactor | |
-| 8 | parking after idleness, under `--max-active`, on drain, and waking on the next connection; operation locks are released with their last users and trim watermarks with their holdings. Ordinary parking drains admitted writes and publishes the adopted checkpoint when releasing the holder. | A distinct resident-idle mode and the resident-idle footprint target remain open. |
+| 8 | parking after idleness, under `--max-active`, on drain, and waking on the next connection; operation locks are released with their last users and trim watermarks with their holdings. Ordinary parking drains admitted writes and publishes the adopted checkpoint when releasing the holder. | Opt-in resident-idle retains the placement and checkpoint, closes local execution resources, and wakes through a new epoch. A local in-memory directory run measured 100,000 resident placements with zero additional node execution bytes or tasks. |
 | 9 | the gateway reads pgwire frames, survives a planned move or a holder's death while the session is idle, replays the startup and prepared statements, and resends a command a former holder refused as not held; once the first holder has authenticated the client, each reconnection carries a capability the gateway signs with the cell's secret, which a node accepts in place of the password for that deployment alone. The pgwire gateway can terminate TLS and bind a connection to a specific installation. | The first connection's authentication runs on its node. The Flight SQL gateway supports one cell and binds server-local sessions to the current writer. Transparent Flight SQL recovery and cross-cell routing remain open. |
 | 10 | read replicas fed by the log for read-only sessions within a deployment's read width; opt-in linearizable reads confirmed with the logkeepers before each query ; a snapshot session (`rtdb.read=snapshot`) reads the deployment as of its checkpoint on any node, the holder last, opened from object storage with frozen logs and no logkeeper, and closed before the reaper's grace runs out, serving any basis at or below the checkpoint ; a deployment whose persisted tries outgrow a node's disk cache (by default; `AgentOptions::fragments` sets the threshold and depth, and no command-line flag does yet) splits each whole-table scan into 16 trie-prefix fragments, each read at the coordinator's basis by the node that ranks first for `{storage identity}/{table}/{prefix}` among the nodes that may take placements, which opens a log-fed replica for it if it has none, and answered over the control protocol as Arrow IPC; a fragment whose reader fails or is not at the basis is read by the coordinator itself. Pgwire read-only sessions spread across the available replicas within the configured width. | scan fragments are split by the scan on the coordinating node, not by a cell-wide planner, and the size test is the deployment's persisted trie bytes against the node's disk-cache size rather than `PerMemberCacheShare`; a fragment carries the projection, the evaluated temporal bounds and the predicates any node evaluates alike, but not those on parameters, outer rows, the clock or chance, which the coordinator alone applies, and comes back whole in one response rather than streamed, a slice too large for one response being read by the coordinator instead; a reader at or past the coordinator's basis serves a fragment as of the basis, except that what was erased since is gone; `_id` lookups and multi-partition databases are never split |
 | 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal. Member probes have bounded concurrency, drains move one holding at a time, and `status --placements-only` reads indexed demand by pool. | Autoscaling acts on the reported signal outside RTDB. Load-vector rebalancing and automatic read-width adjustment remain open. |
@@ -664,7 +664,16 @@ A parked deployment must cost nothing but its record and objects (`CostFollowsAc
 **Changes.**
 
 1. `Holding.residency` with `active`, `resident_idle` and `parked`.
-   Resident-idle drops the tail live index and keeps catalogs; parked releases the holder in one CAS after a final flush and `Parked` record.
+   Set `--resident-idle-after SECONDS` to keep the placement after its writer has been idle for that interval.
+   The node drains admitted writes and publishes an adopted checkpoint while advancing the writer epoch.
+   The directory keeps the placement and last activity time, and the node closes its database, logs and placement watch.
+   A request wakes the deployment by claiming the next epoch and opening its checkpoint on the same eligible member.
+   A later park deadline, drain or planned move can release the idle placement directly.
+   The node skips a candidate from an earlier sweep once the deployment has awakened under another epoch.
+   An open Flight SQL call counts as activity through response streaming or cancellation.
+   The status command counts these placements separately as `resident_idle` and excludes them from the recommended active-node count.
+   Upgrade placement writers before enabling this option.
+   Ordinary parking releases the holder in the checkpoint publication CAS.
    Ordinary parking waits for admitted user transactions and pauses new submissions before flushing.
    It publishes the resulting checkpoint in the directory update that releases the holder.
    An explicit flush publishes its adopted checkpoint before it returns, while retaining the holder.
@@ -692,6 +701,20 @@ A node holding 100,000 resident-idle deployments stays within its memory target;
 `live-index.allium`: the tail index is released on idleness.
 
 **Done when** the resident-idle footprint meets the target measured in stage 0, or the target and the parking policy are revised.
+
+**Local resident-idle measurement**
+
+An in-process cell with one serving node, three fsync logkeepers and a memory directory stored 100,000 already-idle placements for the node.
+The placements were provisioned in the directory without opening each database.
+The process RSS increased by 168,378,368 bytes, including the directory, or 1,683 bytes per placement against the 65,536-byte target.
+The node execution budget and task count stayed flat.
+The benchmark then woke 32 deployments through the node agent under fresh epochs and measured 40.56 ms median and 105.30 ms maximum.
+The cell tests separately verify that an acknowledged write survives suspension, detachment, reactivation and movement.
+
+```sh
+cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --test footprint \
+  a_node_can_retain_one_hundred_thousand_idle_placements -- --ignored --nocapture
+```
 
 ### Stage 9: the gateway
 
