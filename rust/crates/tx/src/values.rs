@@ -158,7 +158,10 @@ pub struct ArrowDocuments {
 
 impl ArrowDocuments {
     pub fn from_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
-        let batch = batch.batch();
+        Self::from_record_batch(batch.batch(), memory)
+    }
+
+    pub(crate) fn from_record_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let schema = batch.schema();
         if batch.num_rows() == 0 || schema.fields().iter().any(|field| !Self::compatible(field, true)) {
             return Ok(None);
@@ -466,6 +469,14 @@ impl SqlArguments {
         self.chunks.iter().flat_map(move |(start, chunk)| {
             (0..chunk.len()).map(move |index| chunk.row(index, &self.memory).map(|row| (start + index, row)))
         })
+    }
+
+    pub(crate) fn single_arrow_batch(&self) -> Option<&RecordBatch> {
+        let [(_, chunk)] = self.chunks.as_slice() else { return None; };
+        match chunk.as_ref() {
+            ArgumentChunk::Arrow { batch, .. } => Some(batch.batch()),
+            ArgumentChunk::Rows { .. } => None,
+        }
     }
 
     pub(crate) fn uniform_arrow_pages(&self) -> Option<Vec<&RecordBatch>> {
