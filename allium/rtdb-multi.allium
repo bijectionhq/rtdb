@@ -323,6 +323,7 @@ config {
 
     -- Transactions.
     idempotency_window: Duration = 1.hours
+    command_replay_window: Duration = 30.seconds
     system_time_skew_bound: Duration = 500.milliseconds
 
     -- Reads.
@@ -2610,8 +2611,11 @@ surface ClientAccess {
         -- A dispatch failure preserves any complete command response the gateway has received.
         -- A writable pgwire pipeline waits for ReadyForQuery between command cycles so each autocommit cycle has its own retry key.
         -- A copy-in transfer can send its input frames before ReadyForQuery.
-        -- An unanswered keyed command can be retried under its original key, including an extended-protocol exchange flushed before Sync.
+        -- The gateway can resend an unanswered keyed command under its original key, including an extended-protocol exchange flushed before Sync.
+        -- Deduplication on resend requires each submitted transaction to use the same key within idempotency_window.
         -- A writer installs a key before executing the command it guards.
+        -- The writer preserves the gateway key through changes to SQL session state.
+        -- The gateway retries an unanswered write only when both writers support this protection.
         -- The gateway waits for the replacement writer to acknowledge the original key before replaying the command.
         -- Closed storage before the first command reply allows a keyed retry on a newer writer epoch.
         -- A holder's driver shutdown during a command leaves the outcome unknown until a keyed retry returns it.
@@ -2621,7 +2625,9 @@ surface ClientAccess {
         -- Acknowledged DISCARD ALL clears the prepared statements eligible for replay.
         -- An open pgwire session renews idle protection for its current backend and stops renewing it when that connection closes.
         -- A failed startup ends the client's authentication exchange.
-        -- A finite reconnect window bounds the time an established session waits for a replacement holder.
+        -- A finite reconnect window bounds the time an idle session waits for a replacement holder.
+        -- Recovery of a pending command uses one command_replay_window across replacement writers until the gateway takes a reply for forwarding to the client.
+        -- After the window elapses without a reply, the command's outcome is reported as unknown.
         -- A placement notification can start the next reconnect attempt before its fallback timer elapses.
         -- A replacement connection must resolve the original deployment identity.
         -- When startup specifies an installation, the backend verifies the identity of its attached database before the gateway confirms readiness.
@@ -2638,6 +2644,8 @@ surface ClientAccess {
 
     @guarantee OneOutcomePerKey
         -- A transaction retried with the same idempotency key within idempotency_window has exactly one outcome, whichever member answers.
+        -- A string application key takes precedence over the gateway key and must be stable across attempts for deduplication.
+        -- A transaction without a usable application key uses the gateway key and its transaction ordinal.
 }
 
 surface HolderToLog {

@@ -203,6 +203,7 @@ pub struct Session {
     settings_revision: u64,
     last_submitted: Option<LastSubmittedTx>,
     parameters: BTreeMap<String, Parameter>,
+    gateway_key: Option<(RetainedText, u64)>,
     /// The session key its transactions were last keyed under, and the sequence number of the next.
     idempotency_sequence: Option<(String, u64)>,
     cancellation: CancellationToken,
@@ -215,7 +216,7 @@ impl Session {
         let database = RetainedText::new(database.into(), service.memory())?;
         let timezone = RetainedText::new(timezone, service.memory())?;
         Ok(Self { service, database, lifecycle: Lifecycle::Open(None), auto_commit: true, default_access_mode: None,
-            initial_timezone: timezone.clone(), timezone, await_token: None, await_token_revision: 0, settings_revision: 0, last_submitted: None, parameters: BTreeMap::new(), idempotency_sequence: None, cancellation: parent.child_token() })
+            initial_timezone: timezone.clone(), timezone, await_token: None, await_token_revision: 0, settings_revision: 0, last_submitted: None, parameters: BTreeMap::new(), gateway_key: None, idempotency_sequence: None, cancellation: parent.child_token() })
     }
     fn ensure_open(&self) -> Result<()> {
         if matches!(self.lifecycle, Lifecycle::Closed) { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); }
@@ -284,6 +285,11 @@ impl Session {
             self.settings_revision = self.settings_revision.wrapping_add(1);
         }
         self.parameters.insert(name, Parameter { value, _entry: entry });
+        Ok(())
+    }
+    pub fn set_gateway_key(&mut self, key: String) -> Result<()> {
+        self.ensure_open()?;
+        self.gateway_key = Some((RetainedText::new(key, self.service.memory())?, 0));
         Ok(())
     }
     pub fn settings_revision(&self) -> u64 { self.settings_revision }
@@ -520,8 +526,10 @@ impl Session {
         self.ensure_open()?;
         options.user = self.service.user().map(str::to_owned);
         if options.default_tz.is_empty() { options.default_tz = self.timezone.to_string(); }
-        // Each transaction submitted under a session key takes the next key in its sequence, unless its metadata names its own: a command resent under the same key replays the same sequence.
-        if let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
+        if let Some((key, sequence)) = &mut self.gateway_key {
+            options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{}/{sequence}", &**key), self.service.memory())?);
+            *sequence += 1;
+        } else if let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
             let sequence = match &mut self.idempotency_sequence { Some((current, next)) if *current == key => { *next += 1; *next - 1 } sequence => { *sequence = Some((key.clone(), 1)); 0 } };
             options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{key}/{sequence}"), self.service.memory())?);
         }

@@ -200,7 +200,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | CELL05 · Watch consistency | Open | — |
 | CELL06 · Fault detection independence | Open | — |
 | CELL07 · Isolation and engine selection | Open | — |
-| CELL08 · Planned handoff | Open | — |
+| CELL08 · Planned handoff | Partial | [Protected write replay and mixed-version refusal](rtdb-engine-proof-evidence.md#gateway-write-replay) |
 | CELL09 · Cold activation | Partial | [Integrated Multi worker-loss and bitemporal replay regression](rtdb-engine-proof-evidence.md#main-evidence) |
 | CELL10 · Cross-cell cutover | Partial | [Bounded cross-cell transfer and fair activation model](rtdb-engine-proof-evidence.md#multi-evidence) |
 | CELL11 · Move retries | Open | — |
@@ -254,12 +254,13 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | API05 · Pgwire state machine | Open | — |
 | API06 · Parameters and results | Open | — |
 | API07 · Prepared handles and portals | Open | — |
-| API08 · Reply attribution | Open | — |
+| API08 · Reply attribution | Partial | [Acknowledged key and replay regression tests](rtdb-engine-proof-evidence.md#gateway-write-replay) |
 | API09 · Streaming ingestion | Open | — |
 | API10 · Handle lifetime | Open | — |
 | API11 · Cancellation isolation | Open | — |
 | API12 · Authentication refresh | Open | — |
 | API13 · Cross-deployment noninterference (Candidate) | Open | — |
+| API14 · Bounded gateway replay | Partial | [Lean, TLC, Verus and native replay tests](rtdb-engine-proof-evidence.md#gateway-write-replay) |
 
 ## Resource accounting and operational progress
 

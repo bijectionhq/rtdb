@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use rtdb_pgwire::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_SESSION_STATE_TAG};
 use rtdb_directory::{DeploymentRecord, Directory, MemoryDirectory};
 use rtdb_multi::session::{Frame, Router, Session};
-use rtdb_node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD};
+use rtdb_node::NOT_HELD;
 use rtdb_types::{Anomaly, AnomalyCategory};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -239,10 +240,11 @@ impl Backend {
             return self.die(&mut stream, "during its greeting").await;
         }
         self.note("greets".to_owned());
-        if !Self::send(&mut stream, &[frame(b'R', &[0, 0, 0, 0]), ready(b'I')]).await { return; }
+        if !Self::send(&mut stream, &[
+            frame(b'R', &[0, 0, 0, 0]), frame(GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_CONFIRM_KIND]), ready(b'I'),
+        ]).await { return; }
         self.world.lock().expect("unpoisoned").greeted += 1;
         reconnected.notify_one();
-        let keying = format!("SET {IDEMPOTENCY_KEY_PARAMETER} = '");
         let mut prepared = false;
         let mut prepared_now = false;
         let mut bound = None;
@@ -279,21 +281,22 @@ impl Backend {
                     if dies_idle { return self.die(&mut stream, "after preparing a statement").await; }
                     continue;
                 }
+                GATEWAY_SESSION_STATE_TAG if request.body.first() == Some(&GATEWAY_KEY_CONFIRM_KIND) => {
+                    let Ok(key) = std::str::from_utf8(&request.body[1..]) else { return };
+                    if self.rng.chance(4) { return self.die(&mut stream, "on being keyed").await; }
+                    {
+                        let mut shared = self.world.lock().expect("unpoisoned");
+                        let ordinal = shared.keys.len();
+                        shared.keys.entry(key.to_owned()).or_insert((ordinal, 0)).1 += 1;
+                    }
+                    if self.key.as_ref().is_none_or(|(current, _)| current != key) { self.key = Some((key.to_owned(), 0)); }
+                    if !Self::send(&mut stream, &[ready(self.status())]).await { return; }
+                    continue;
+                }
                 b'Q' => {}
                 _ => return,
             }
             let query = String::from_utf8_lossy(request.body.strip_suffix(b"\0").unwrap_or(&request.body)).into_owned();
-            if let Some(key) = query.strip_prefix(&keying).and_then(|rest| rest.strip_suffix('\'')) {
-                if self.rng.chance(4) { return self.die(&mut stream, "on being keyed").await; }
-                {
-                    let mut shared = self.world.lock().expect("unpoisoned");
-                    let ordinal = shared.keys.len();
-                    shared.keys.entry(key.to_owned()).or_insert((ordinal, 0)).1 += 1;
-                }
-                if self.key.as_ref().is_none_or(|(current, _)| current != key) { self.key = Some((key.to_owned(), 0)); }
-                if !Self::send(&mut stream, &[text("SET"), ready(self.status())]).await { return; }
-                continue;
-            }
             let statements: Vec<&str> = query.split("; ").collect();
             // A rollback ends the session's transaction on the node, whether it still holds the deployment or not.
             let fault = match self.draw(statements.len()) {

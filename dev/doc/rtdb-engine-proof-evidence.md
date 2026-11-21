@@ -304,3 +304,15 @@ cargo kani -p rtdb-logkeeper --features simulation --tests --output-format terse
 cargo kani -p rtdb-types --lib --output-format terse
 cargo kani -p rtdb-columnar --tests --output-format terse
 ```
+
+
+### Gateway write replay
+
+Lean checks that resetting SQL settings preserves the effective transaction key and that reinstalling the same private command key and ordinal reproduces it.
+The model takes any string application key as a fixed input.
+It also proves that an arbitrary finite sequence of replacements retains the first recovery cutoff.
+TLC checks a single unexpired command, a bounded clock, and an atomic duplicate guard.
+The model finds duplicate mutations when SQL settings own the key or malformed application metadata suppresses the fallback, and finds deadline renewal when writer loss resets the cutoff.
+Verus checks the exact Rust cutoff selector and rejects a mutation that replaces an existing cutoff.
+The native Pgwire regression runs both duplicate cases against a real engine, and the gateway tests check repeated replacement and legacy refusal.
+Durable idempotency-table refinement, time and expiration assumptions, volatile client-supplied application keys, and general multi-statement replay remain separate obligations. [Lean proof](../../verification/multi/lean/GatewayReplay.lean) · [TLA+ model](../../verification/multi/tla/RTDBGatewayReplay.tla) · [Verus checks](../../verification/verus/replay_deadline/area.json) · [Pgwire tests](../../rust/crates/pgwire/src/protocol.rs) · [Gateway tests](../../rust/crates/multi/src/session.rs)

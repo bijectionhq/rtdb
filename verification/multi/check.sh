@@ -33,7 +33,7 @@ while IFS='|' read -r module config expected_status expected_message; do
     (
         cd "$run/$config"
         java "-Djava.io.tmpdir=$run/$config/tmp" -XX:+UseParallelGC -Xmx1300m \
-            -jar "$TLA2TOOLS_JAR" -workers 2 -metadir states \
+            -jar "$TLA2TOOLS_JAR" -noGenerateSpecTE -workers 2 -metadir states \
             -config "$config.cfg" "$module.tla"
     ) > "$log" 2>&1 || status=$?
     if [[ "$status" != "$expected_status" ]] || ! rg -Fq "$expected_message" "$log"; then
@@ -56,6 +56,10 @@ RTDBRecovery|RTDBRecoveryWitness|12|Invariant NoPostRestartReadAndWrite is viola
 RTDBRecoveryIdentity|RTDBRecoveryIdentity|0|No error has been found
 RTDBRecoveryIdentity|RTDBRecoveryIdentityReuse|12|Invariant RecoveredHistoryPreservesAcknowledgedWrite is violated
 RTDBRecoveryIdentity|RTDBRecoveryIdentityStartup|12|Invariant FailedJournalsAreIneligible is violated
+RTDBGatewayReplay|RTDBGatewayReplay|0|No error has been found
+RTDBGatewayReplay|RTDBGatewayReplaySqlKey|12|Invariant OneEffect is violated
+RTDBGatewayReplay|RTDBGatewayReplayMalformedKey|12|Invariant OneEffect is violated
+RTDBGatewayReplay|RTDBGatewayReplayRenewedWindow|12|Invariant FixedCutoff is violated
 CONFIGURATIONS
 
 printf 'Proof logs: %s\n' "$run"

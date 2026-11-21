@@ -776,13 +776,12 @@ fn idempotency_key(metadata: &Value) -> Option<&str> {
     Some(key)
 }
 
-/// The session parameter a gateway sets at the start of each command: the command's transactions are keyed by it and their order within the command.
+/// The legacy SQL parameter for keying each transaction by its position within a command.
 pub const IDEMPOTENCY_KEY_PARAMETER: &str = "rtdb_idempotency_key";
 
-/// `metadata` with `key` as its idempotency key, unless it names one already.
 pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_tx::UserMetadata> {
     let mut fields = match metadata.as_ref().map(|metadata| metadata.value()) {
-        Some(Value::Struct(fields)) if fields.iter().any(|(name, _)| name.as_str() == "idempotency_key") => return Ok(metadata.expect("present")),
+        Some(value) if idempotency_key(value).is_some() => return Ok(metadata.expect("present")),
         Some(Value::Struct(fields)) => fields.clone(),
         _ => rtdb_types::StructFields::new(),
     };

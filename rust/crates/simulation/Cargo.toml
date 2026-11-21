@@ -13,6 +13,7 @@ rtdb-format.workspace = true
 rtdb-logkeeper = { workspace = true, features = ["simulation"] }
 rtdb-multi.workspace = true
 rtdb-node.workspace = true
+rtdb-pgwire.workspace = true
 rtdb-storage.workspace = true
 rtdb-types.workspace = true
 async-trait.workspace = true
