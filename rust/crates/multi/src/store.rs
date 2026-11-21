@@ -744,6 +744,7 @@ impl FencedStore {
 
 #[async_trait]
 impl ObjectStore for FencedStore {
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
@@ -769,6 +770,7 @@ fn plain(object: StoredObject) -> StoredObject { StoredObject { size: object.siz
 #[async_trait]
 impl ObjectStore for EncryptingStore {
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { self.inner.index_page_lifecycle() }
+    fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { false }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?) }
@@ -835,6 +837,7 @@ impl ObjectStore for GarbageStore {
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
         self.index_pages.as_ref().map(|pages| pages as &dyn IndexPageLifecycle)
     }
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }

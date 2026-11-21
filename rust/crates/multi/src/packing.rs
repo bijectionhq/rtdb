@@ -207,6 +207,7 @@ fn key(name: &str) -> rtdb_storage::Result<ObjectKey> { ObjectKey::new(name).map
 
 #[async_trait]
 impl ObjectStore for PackingStore {
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn head(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         if let Some(bytes) = self.held(object) { return Ok(StoredObject { key: object.clone(), size: bytes.len() as u64 }); }
         match self.inner.head(object).await {
