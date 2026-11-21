@@ -17,6 +17,15 @@ async fn committed(log: &dyn Log) -> Vec<String> {
     payloads(&log.read_range(LogOffset(0), LogOffset(i64::MAX)).await.unwrap())
 }
 
+async fn wait_for_logkeeper(config: StreamConfig) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if open_reader(config.clone(), CancellationToken::new()).await.is_ok() { return; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the restarted logkeeper serves reads");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deposed_writer_fails_its_next_append_and_its_successor_holds_everything_it_acknowledged() {
     let ensemble = Ensemble::start(3).await;
@@ -138,10 +147,12 @@ async fn a_drop_is_retryable_after_one_replica_misses_it_and_survives_restart() 
     assert!(matches!(refused, Err(Error::Deposed { epoch: 1, promised: 2 })), "{refused:?}");
     drop(writer);
     ensemble.restart(2).await;
+    wait_for_logkeeper(ensemble.config_of(&[2], "deleted")).await;
     drop_stream(&config, 2).await.unwrap();
     for server in 0..3 {
         ensemble.stop(server).await;
         ensemble.restart(server).await;
+        wait_for_logkeeper(ensemble.config_of(&[server], "other")).await;
         let dropped = ensemble.config_of(&[server], "deleted");
         assert!(open_reader(dropped.clone(), CancellationToken::new()).await.is_err());
         assert!(open_writer(dropped, 3, CancellationToken::new()).await.is_err());
