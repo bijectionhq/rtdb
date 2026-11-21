@@ -1,4 +1,6 @@
 mod credential;
+mod scoped;
+pub use scoped::{ScopedS3Writes, WriteAuthorization};
 #[cfg(feature = "versioning")]
 mod versions;
 
@@ -6,6 +8,7 @@ mod versions;
 pub use versions::VersionedInventory;
 
 use std::sync::Arc;
+use aws_credential_types::provider::SharedCredentialsProvider;
 use object_store::{StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
 use rtdb_format::generated::xtdb::aws::proto as pb;
 use rtdb_format::keys::StorageRoot;
@@ -42,6 +45,11 @@ pub struct S3Config {
     pub remote: Option<String>,
 }
 
+enum S3Authorization {
+    Static(S3Credentials),
+    Rotating { provider: SharedCredentialsProvider, region: Option<String> },
+}
+
 impl S3Config {
     pub fn new(bucket: impl Into<String>) -> Self {
         Self { bucket: bucket.into(), region: None, prefix: None, credentials: None, endpoint: None, path_style_access_enabled: false, remote: None }
@@ -66,24 +74,35 @@ impl S3Config {
     pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let prefix = self.object_prefix(storage_root)?;
-        let credentials = self.resolve_credentials(remotes)?;
+        let authorization = if let Some(credentials) = self.resolve_credentials(remotes)? {
+            S3Authorization::Static(credentials)
+        } else {
+            let mut configuration = aws_config::defaults(aws_config::BehaviorVersion::latest());
+            if let Some(region) = &self.region { configuration = configuration.region(aws_config::Region::new(region.clone())); }
+            let configuration = configuration.load().await;
+            let provider = configuration.credentials_provider().ok_or_else(|| Anomaly::incorrect("xtdb.aws/credentials", "AWS default credential provider is unavailable"))?;
+            S3Authorization::Rotating { provider, region: configuration.region().map(|region| region.as_ref().to_owned()) }
+        };
+        self.open_authorized(prefix, authorization, io)
+    }
+
+    fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let (endpoint, virtual_hosted) = self.endpoint_addressing()?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&self.bucket)
             .with_virtual_hosted_style_request(virtual_hosted)
             .with_skip_signature(false).with_conditional_put(S3ConditionalPut::ETagMatch).with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
         if let Some(region) = &self.region { builder = builder.with_region(region); }
         if let Some(endpoint) = endpoint { builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.as_str()).with_allow_http(endpoint.scheme() == "http"); }
-        if let Some(credentials) = credentials {
-            if credentials.access_key.is_empty() || credentials.secret_key.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 credentials require nonempty access and secret keys")); }
-            builder = builder.with_credentials(Arc::new(StaticCredentialProvider::new(AwsCredential { key_id: credentials.access_key, secret_key: credentials.secret_key, token: None })));
-        } else {
-            let mut configuration = aws_config::defaults(aws_config::BehaviorVersion::latest());
-            if let Some(region) = &self.region { configuration = configuration.region(aws_config::Region::new(region.clone())); }
-            let configuration = configuration.load().await;
-            if let Some(region) = configuration.region() { builder = builder.with_region(region.as_ref()); }
-            let provider = configuration.credentials_provider().ok_or_else(|| Anomaly::incorrect("xtdb.aws/credentials", "AWS default credential provider is unavailable"))?;
-            builder = builder.with_credentials(Arc::new(credential::CredentialBridge::new(provider)));
-        }
+        builder = match authorization {
+            S3Authorization::Static(credentials) => {
+                if credentials.access_key.is_empty() || credentials.secret_key.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 credentials require nonempty access and secret keys")); }
+                builder.with_credentials(Arc::new(StaticCredentialProvider::new(AwsCredential { key_id: credentials.access_key, secret_key: credentials.secret_key, token: None })))
+            }
+            S3Authorization::Rotating { provider, region } => {
+                if let Some(region) = region { builder = builder.with_region(region); }
+                builder.with_credentials(Arc::new(credential::CredentialBridge::new(provider)))
+            }
+        };
         let client = builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
         Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
     }

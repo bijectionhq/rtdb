@@ -47,7 +47,7 @@ pub enum CellStorage {
 }
 
 /// The key under an S3 configuration's prefix that a cell's objects are kept below.
-const S3_CELL_ROOT: &str = "cell";
+pub(crate) const S3_CELL_ROOT: &str = "cell";
 const STORAGE_NAMESPACE_MARKER: &str = "~cell-namespace";
 
 impl CellStorage {

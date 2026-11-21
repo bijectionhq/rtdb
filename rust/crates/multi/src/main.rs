@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--activations-per-second N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--cell NAME --cell-map MAP] [--cell-secret FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
        rtdb-multi move-cell --cell-map MAP --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
@@ -103,6 +104,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
+            if arguments.present("s3-write-role") {
+                let sts_endpoint = if arguments.present("sts-endpoint") { Some(arguments.required("sts-endpoint")?.to_owned()) } else { None };
+                agent.s3_write_role = Some(rtdb_multi::agent::S3WriteRole { arn: arguments.required("s3-write-role")?.to_owned(),
+                    sts_endpoint, require_conditional_put: !arguments.present("s3-compat-write-policy") });
+            } else if arguments.present("sts-endpoint") || arguments.present("s3-compat-write-policy") {
+                return Err(usage("STS endpoint and compatibility options require --s3-write-role".into()));
+            }
             agent.activations_per_second = arguments.number("activations-per-second", agent.activations_per_second)?;
             agent.max_tail_rows = arguments.optional("max-tail-rows").map(|count| count.parse()).transpose().map_err(|_| usage("--max-tail-rows must be a number".into()))?;
             agent.max_active = arguments.optional("max-active").map(|count| count.parse()).transpose().map_err(|_| usage("--max-active must be a number".into()))?;
@@ -117,6 +125,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
             cancellation.cancelled().await;
             node.shutdown().await
+        }
+        "init-storage" => {
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let namespaces = admin::initialize_storage(&storage, keys(&arguments)?.as_ref()).await?;
+            println!("{}", serde_json::to_string(&namespaces).expect("storage namespaces serialize"));
+            Ok(())
         }
         "gateway" => {
             let directory = directory(arguments.required("directory")?).await?;

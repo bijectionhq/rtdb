@@ -23,6 +23,7 @@ use crate::lease::MemberLease;
 #[derive(Clone, Debug)]
 pub struct AgentOptions {
     pub storage: CellStorage,
+    pub s3_write_role: Option<S3WriteRole>,
     /// How long an activation may take to reach a confirmed leadership before it is abandoned.
     pub activation_timeout: Duration,
     /// How many new deployment opens may start within one second.
@@ -47,9 +48,12 @@ pub struct AgentOptions {
     pub fragments: crate::fragments::FragmentOptions,
 }
 
+#[derive(Clone, Debug)]
+pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub require_conditional_put: bool }
+
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { storage, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+        Self { storage, s3_write_role: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), park_after: None,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }

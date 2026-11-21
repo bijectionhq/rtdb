@@ -70,11 +70,21 @@ async fn latest_manifest(bucket: &dyn ObjectStore, store: &str) -> Result<Option
 }
 
 /// One store within the cell's bucket: its keys, under `prefix`, seen without it.
-pub struct PrefixedStore { bucket: Bucket, prefix: String }
+pub struct PrefixedStore { bucket: Bucket, prefix: String, scoped_writer: Option<Bucket> }
 
 impl PrefixedStore {
-    pub fn new(bucket: Bucket, prefix: impl Into<String>) -> Self { Self { bucket, prefix: prefix.into() } }
+    pub fn new(bucket: Bucket, prefix: impl Into<String>) -> Self { Self { bucket, prefix: prefix.into(), scoped_writer: None } }
+    pub(crate) fn with_writer(mut self, writer: Option<Bucket>) -> Self {
+        self.scoped_writer = writer;
+        self
+    }
     fn full(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectKey> { self::key(&format!("{}/{}", self.prefix, key.as_str())) }
+    fn mutation(&self, key: &ObjectKey) -> rtdb_storage::Result<(&dyn ObjectStore, ObjectKey)> {
+        match &self.scoped_writer {
+            Some(writer) => Ok((writer.as_ref(), key.clone())),
+            None => Ok((self.bucket.as_ref(), self.full(key)?)),
+        }
+    }
 }
 
 #[async_trait]
@@ -83,8 +93,14 @@ impl ObjectStore for PrefixedStore {
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head_fresh(&self.full(key)?).await?.size }) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get(&self.full(key)?).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.bucket.get_range(&self.full(key)?, range).await }
-    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.bucket.put(&self.full(key)?, bytes).await }
-    async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.bucket.put_file(&self.full(key)?, source).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+        let (writer, key) = self.mutation(key)?;
+        writer.put(&key, bytes).await
+    }
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
+        let (writer, key) = self.mutation(key)?;
+        writer.put_file(&key, source).await
+    }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         let under = match directory { Some(directory) => self.full(directory)?, None => self::key(&self.prefix)? };
         let strip = format!("{}/", self.prefix);
@@ -93,7 +109,10 @@ impl ObjectStore for PrefixedStore {
             Some(self::key(&relative).map(|key| StoredObject { key, size: object.size }))
         }).collect()
     }
-    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.bucket.delete(&self.full(key)?).await }
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        let (writer, key) = self.mutation(key)?;
+        writer.delete(&key).await
+    }
 }
 
 /// A store's own objects and the objects its manifest references, read own-first.

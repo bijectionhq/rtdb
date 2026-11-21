@@ -78,6 +78,38 @@ async fn exercise_cell(storage: CellStorage) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cell_flushes_and_moves_with_deployment_scoped_s3_writes() {
+    use std::sync::atomic::Ordering;
+
+    let Ok(endpoint) = std::env::var("RTDB_S3_ENDPOINT") else { return };
+    if !endpoint.starts_with("http://127.0.0.1:") { return; }
+    let CellStorage::S3 { mut config } = storage().unwrap() else { unreachable!() };
+    let (address, writes, proxy) = pause_pack_upload(endpoint.parse().unwrap()).await;
+    config.endpoint = Some(format!("http://{address}"));
+    let cell = Cell::start_scoped(CellStorage::S3 { config }, rtdb_multi::agent::S3WriteRole {
+        arn: "arn:aws:iam::123456789012:role/rtdb-cell-writer".into(), sts_endpoint: Some(endpoint),
+        require_conditional_put: false,
+    }).await;
+    writes.observe_writes.store(true, Ordering::Relaxed);
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    let successor = 1 - holder;
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(successor).lease.id(), &control()).await.unwrap();
+    client.simple_query("UPDATE orders SET total = total + 5 WHERE _id = 1").await.unwrap();
+    cell.node(successor).agent.flush("shop").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["15"]);
+    assert!(writes.assumed_puts.load(Ordering::Relaxed) >= 3);
+    assert_eq!(writes.other_puts.load(Ordering::Relaxed), 0);
+    assert_eq!(writes.unconditional_puts.load(Ordering::Relaxed), 0);
+    drop(client);
+    cell.stop().await;
+    proxy.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cell_move_refuses_overlapping_s3_locations() {
     use rtdb_multi::cells::MemoryCellMap;
 
@@ -112,6 +144,10 @@ struct PackUpload {
     resume: tokio::sync::Notify,
     completed: tokio::sync::Notify,
     reply_status: std::sync::atomic::AtomicU16,
+    observe_writes: std::sync::atomic::AtomicBool,
+    assumed_puts: std::sync::atomic::AtomicUsize,
+    other_puts: std::sync::atomic::AtomicUsize,
+    unconditional_puts: std::sync::atomic::AtomicUsize,
 }
 
 async fn pause_pack_upload(upstream: hyper::Uri) -> (std::net::SocketAddr, std::sync::Arc<PackUpload>, tokio::task::JoinHandle<()>) {
@@ -141,6 +177,14 @@ async fn pause_pack_upload(upstream: hyper::Uri) -> (std::net::SocketAddr, std::
                         let block_pack = parts.uri.path().rsplit('/').next()
                             .is_some_and(|name| name.starts_with('b') && name.ends_with(".pack"));
                         let request = hyper::Request::from_parts(parts, Full::new(body.collect().await.map_err(std::io::Error::other)?.to_bytes()));
+                        if request.method() == hyper::Method::PUT && gate.observe_writes.load(Ordering::Relaxed) {
+                            let assumed = request.headers().contains_key("x-amz-security-token");
+                            let puts = if assumed { &gate.assumed_puts } else { &gate.other_puts };
+                            puts.fetch_add(1, Ordering::Relaxed);
+                            if request.headers().get("if-none-match").is_none_or(|value| value != "*") {
+                                gate.unconditional_puts.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         if request.method() == hyper::Method::PUT && block_pack && gate.armed.swap(false, Ordering::Relaxed) {
                             // The complete request remains deliverable even if the deposed holder closes its socket.
                             let delayed = tokio::spawn(async move {

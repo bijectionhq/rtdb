@@ -58,19 +58,23 @@ impl Cell {
 
     /// A cell keeping its objects in `objects`, or in a directory of its own.
     pub async fn start_on(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>) -> Self {
-        Self::start_configured(objects, pools, park_after, watch, cells, false, None).await
+        Self::start_configured(objects, pools, park_after, watch, cells, false, |_| {}).await
     }
 
     pub async fn start_durable(nodes: usize) -> Self {
-        Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, true, None).await
+        Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, true, |_| {}).await
     }
 
     pub async fn start_rate_limited(limit: NonZeroUsize) -> Self {
-        Self::start_configured(None, vec![MemberPool::General], None, None, None, false, Some(limit)).await
+        Self::start_configured(None, vec![MemberPool::General], None, None, None, false, |agent| agent.activations_per_second = limit).await
+    }
+
+    pub async fn start_scoped(objects: CellStorage, role: rtdb_multi::agent::S3WriteRole) -> Self {
+        Self::start_configured(Some(objects), vec![MemberPool::General; 2], None, None, None, true, |agent| agent.s3_write_role = Some(role)).await
     }
 
     async fn start_configured(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>,
-        watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool, activations_per_second: Option<NonZeroUsize>) -> Self {
+        watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool, configure: impl FnOnce(&mut AgentOptions)) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
         let objects = objects.unwrap_or_else(|| CellStorage::Local { root: data.path().join("objects") });
@@ -84,8 +88,12 @@ impl Cell {
         }
         let mut agent = AgentOptions::new(objects.clone());
         if let Some(watch) = watch { agent.watch_interval = watch; }
-        if let Some(limit) = activations_per_second { agent.activations_per_second = limit; }
         agent.park_after = park_after;
+        configure(&mut agent);
+        if agent.s3_write_role.is_some() {
+            let keys = rtdb_multi::keys::LocalKeyService::new(data.path().join("keys")).unwrap();
+            rtdb_multi::admin::initialize_storage(&objects, &keys).await.unwrap();
+        }
         let mut running = Vec::new();
         for (index, pool) in pools.into_iter().enumerate() {
             running.push(Some(start_node(&directory, data.path(), agent.clone(), index, pool, compaction_workers).await));

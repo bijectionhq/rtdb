@@ -15,12 +15,14 @@ rtdb-types.workspace = true
 rtdb-format.workspace = true
 object_store = { workspace = true, features = ["aws"] }
 serde.workspace = true
+serde_json.workspace = true
 url.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 aws-config = "=1.13.0"
 aws-credential-types = "=1.3.1"
 aws-sdk-s3 = { version = "=1.155.0", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "rustls"], optional = true }
+aws-sdk-sts = { version = "=1.126.0", default-features = false }
 
 [dev-dependencies]
 uuid.workspace = true

@@ -7,14 +7,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, SourceCleanup, StorageNamespaces, now_ms};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, SourceCleanup, StorageNamespaces, now_ms};
 use rtdb_node::RemoteStorageFactory;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, Result};
@@ -51,6 +51,42 @@ pub struct CellStoreFactory {
     pub keys: Arc<dyn KeyService>,
     pub storage_namespaces: rtdb_directory::StorageNamespaces,
     pub fence_interval: Duration,
+    pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
+}
+
+pub(crate) struct ScopedCellWrites {
+    issuer: rtdb_s3::ScopedS3Writes,
+    member: OnceLock<MemberId>,
+}
+
+impl ScopedCellWrites {
+    pub fn new(issuer: rtdb_s3::ScopedS3Writes) -> Self { Self { issuer, member: OnceLock::new() } }
+    pub fn set_member(&self, member: MemberId) { self.member.set(member).expect("a storage factory has one member"); }
+}
+
+struct ScopedWriter {
+    directory: Arc<dyn Directory>,
+    deployment: String,
+    prefix: String,
+    epoch: Option<u64>,
+    member: MemberId,
+}
+
+#[async_trait]
+impl rtdb_s3::WriteAuthorization for ScopedWriter {
+    async fn authorize(&self) -> Result<()> {
+        let (current, member) = tokio::try_join!(self.directory.deployment(&self.deployment), self.directory.member(&self.member))?;
+        let now = now_ms();
+        let admitted = current.zip(member).is_some_and(|(current, member)| current.storage_prefix() == self.prefix
+            && match self.epoch {
+                Some(epoch) => current.epoch == epoch && current.holder.as_ref() == Some(&self.member)
+                    && current.writer_pool() == Some(member.pool) && member.may_hold(now),
+                None => current.lifecycle == Lifecycle::Live && member.role == MemberRole::Node && member.pool == MemberPool::Compaction
+                    && member.state == MemberState::Eligible && member.is_live(now),
+            });
+        if admitted { return Ok(()); }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The deployment's write grant is fenced"))
+    }
 }
 
 #[async_trait]
@@ -65,10 +101,22 @@ impl RemoteStorageFactory for CellStoreFactory {
         if record.storage_namespaces.is_some() {
             crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
         }
-        let bucket = config.storage.bucket(io).await?;
+        let bucket = config.storage.bucket(Arc::clone(&io)).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        check_root(&crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()), &config.deployment, config.writer_epoch.is_some()).await?;
-        Ok(open_cell_store(bucket, &store, Some(&record), wall_clock()).await?)
+        let writer = match (&self.scoped_writes, &config.storage) {
+            (Some(scoped), crate::deployment::CellStorage::S3 { config: storage }) if config.writer_epoch.is_some() || config.compactor => {
+                let root = ObjectKey::new(format!("{}/{store}", crate::deployment::S3_CELL_ROOT))?;
+                let member = scoped.member.get().cloned()
+                    .ok_or_else(|| Anomaly::fault("rtdb.multi/write-member-missing", "The node has no registered identity for scoped writes"))?;
+                let authorization = Arc::new(ScopedWriter { directory: Arc::clone(&self.directory), deployment: config.deployment.clone(),
+                    prefix: config.prefix.clone(), epoch: config.writer_epoch, member });
+                Some(scoped.issuer.open(storage, &root, authorization, io)?)
+            }
+            _ => None,
+        };
+        let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()).with_writer(writer));
+        check_root(local.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
+        Ok(open_cell_store(bucket, &store, local, &record, wall_clock()).await?)
     }
 
     /// A deployment with a published checkpoint recovers from it without listing its store.
@@ -139,21 +187,22 @@ pub fn wall_clock() -> Clock {
 /// One store of a deployment in the cell's `bucket` (a prefix and a storage version), as a node opens it below its disk cache: its own objects and those its manifest references, packed, with deletes as releases.
 pub async fn open_deployment_store(bucket: crate::reference::Bucket, store: &str, discovery: crate::packing::PackDiscovery, clock: Clock) -> Result<Arc<GarbageStore>> {
     let base = crate::reference::Base::load(bucket.as_ref(), store).await?;
-    open_with_base(bucket, store, base, discovery, clock).await
+    let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store));
+    open_with_base(bucket, local, base, discovery, clock).await
 }
 
-async fn open_cell_store(bucket: crate::reference::Bucket, store: &str, record: Option<&DeploymentRecord>, clock: Clock) -> Result<Arc<GarbageStore>> {
-    let discovery = record.and_then(|record| record.checkpoint).map_or(crate::packing::PackDiscovery::List, |checkpoint| {
+async fn open_cell_store(bucket: crate::reference::Bucket, store: &str, local: Arc<crate::reference::PrefixedStore>,
+                         record: &DeploymentRecord, clock: Clock) -> Result<Arc<GarbageStore>> {
+    let discovery = record.checkpoint.map_or(crate::packing::PackDiscovery::List, |checkpoint| {
         crate::packing::PackDiscovery::From(checkpoint.block)
     });
-    if record.is_some_and(|record| record.parent.is_none() || record.storage_generation.is_some()) {
-        return open_with_base(bucket, store, crate::reference::Base::default(), discovery, clock).await;
-    }
-    open_deployment_store(bucket, store, discovery, clock).await
+    let base = if record.parent.is_none() || record.storage_generation.is_some() { crate::reference::Base::default() }
+        else { crate::reference::Base::load(bucket.as_ref(), store).await? };
+    open_with_base(bucket, local, base, discovery, clock).await
 }
 
-async fn open_with_base(bucket: crate::reference::Bucket, store: &str, base: crate::reference::Base, discovery: crate::packing::PackDiscovery, clock: Clock) -> Result<Arc<GarbageStore>> {
-    let local: Arc<dyn ObjectStore> = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.to_owned()));
+async fn open_with_base(bucket: crate::reference::Bucket, local: Arc<crate::reference::PrefixedStore>, base: crate::reference::Base,
+                        discovery: crate::packing::PackDiscovery, clock: Clock) -> Result<Arc<GarbageStore>> {
     let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { local } else { Arc::new(crate::reference::ReferencingStore::new(local, bucket, base)) };
     let packed = crate::packing::PackingStore::open_with_clock(own, discovery, Arc::clone(&clock)).await?;
     GarbageStore::open_with_clock(packed, clock).await
@@ -504,7 +553,7 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         let deleting = directory.create_deployment(deleting).await.unwrap();
         let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
-        let factory = CellStoreFactory { directory, keys, storage_namespaces, fence_interval: Duration::from_millis(100) };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, fence_interval: Duration::from_millis(100), scoped_writes: None };
         let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
@@ -753,7 +802,8 @@ mod tests {
         for name in ["tables/t/data/l00-rc-b01.arrow", "blocks/b01.binpb"] { writer.delete(&key(name)).await.unwrap(); }
         reap(bucket.as_ref(), &record, Duration::ZERO, &Default::default()).await.unwrap();
         raw.deny_list.store(true, std::sync::atomic::Ordering::Relaxed);
-        let cold = open_cell_store(bucket, &store, Some(&record), wall_clock()).await.unwrap();
+        let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), &store));
+        let cold = open_cell_store(bucket, &store, local, &record, wall_clock()).await.unwrap();
         assert_eq!(cold.get(&key("tables/t/data/l00-rc-b02.arrow")).await.unwrap().as_ref(), b"rows 2", "a block after a fully released one is found from the checkpoint");
     }
 
@@ -774,5 +824,42 @@ mod tests {
         check_root(&store, "two", true).await.unwrap();
         assert_eq!(check_root(&store, "one", false).await.unwrap_err().code, "rtdb.multi/foreign-root");
         check_root(&store, "two", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_grant_refresh_requires_the_current_writer_or_live_compactor() {
+        use rtdb_s3::WriteAuthorization;
+
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let register = |id: &str, pool| rtdb_directory::MemberRecord {
+            id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None,
+            availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: now_ms() + 60_000,
+            state: MemberState::Eligible, pool, storage_namespaces: None, version: 0,
+        };
+        let mut holder = directory.register_member(register("holder", MemberPool::General)).await.unwrap();
+        let worker = directory.register_member(register("compactor", MemberPool::Compaction)).await.unwrap();
+        let mut initial = DeploymentRecord::new("shop", "acme", vec![], 0);
+        initial.epoch = 1;
+        initial.holder = Some(holder.id.clone());
+        let mut record = directory.create_deployment(initial).await.unwrap();
+        let writer = ScopedWriter { directory: directory.clone(), deployment: record.id.clone(),
+            prefix: record.storage_prefix(), epoch: Some(record.epoch), member: holder.id.clone() };
+        let compactor = ScopedWriter { directory: directory.clone(), deployment: record.id.clone(),
+            prefix: record.storage_prefix(), epoch: None, member: worker.id };
+        writer.authorize().await.unwrap();
+        compactor.authorize().await.unwrap();
+
+        holder.lease_expires_at_ms = 0;
+        directory.replace_member(holder.clone(), holder.version).await.unwrap().applied().unwrap();
+        assert_eq!(writer.authorize().await.unwrap_err().code, rtdb_node::NOT_HELD);
+
+        record.epoch += 1;
+        record = directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        assert_eq!(writer.authorize().await.unwrap_err().code, rtdb_node::NOT_HELD);
+        compactor.authorize().await.unwrap();
+
+        record.lifecycle = Lifecycle::Deleting;
+        directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        assert_eq!(compactor.authorize().await.unwrap_err().code, rtdb_node::NOT_HELD);
     }
 }

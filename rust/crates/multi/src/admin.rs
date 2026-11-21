@@ -17,6 +17,12 @@ use crate::keys::KeyService;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
 
+/// Binds an object namespace for a cell before nodes using scoped writes start.
+pub async fn initialize_storage(storage: &CellStorage, keys: &dyn KeyService) -> Result<StorageNamespaces> {
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    storage_namespaces(bucket.as_ref(), keys).await
+}
+
 /// Creates a deployment, choosing its ensemble from the live logkeepers in its affinity order.
 /// Allocates identity and nothing else: no objects, no log state, no compute.
 pub async fn create_deployment(directory: &dyn Directory, name: &str, org: &str, replicas: usize) -> Result<DeploymentRecord> {

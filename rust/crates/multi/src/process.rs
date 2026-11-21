@@ -52,8 +52,23 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    let scoped_writes = match (&settings.agent.s3_write_role, &settings.agent.storage) {
+        (Some(role), crate::deployment::CellStorage::S3 { config }) => {
+            let issuer = rtdb_s3::ScopedS3Writes::new(&role.arn, config.region.as_deref(), role.sts_endpoint.as_deref(),
+                role.require_conditional_put).await?;
+            Some(Arc::new(crate::store::ScopedCellWrites::new(issuer)))
+        }
+        (Some(_), _) => return Err(Anomaly::incorrect("rtdb.multi/scoped-storage", "A scoped S3 write role requires S3 cell storage")),
+        (None, _) => None,
+    };
     let bucket = settings.agent.storage.bucket(rtdb_storage::IoRegion::new()).await?;
-    let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), settings.keys.as_ref()).await?;
+    let storage_namespaces = if scoped_writes.is_some() {
+        let objects = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?
+            .ok_or_else(|| Anomaly::incorrect("rtdb.multi/storage-namespace-missing", "Initialize the cell object namespace before starting a scoped writer"))?;
+        rtdb_directory::StorageNamespaces { objects, keys: settings.keys.namespace_id()? }
+    } else {
+        crate::deployment::storage_namespaces(bucket.as_ref(), settings.keys.as_ref()).await?
+    };
     if settings.configuration.disk_cache.is_none() {
         settings.configuration.disk_cache = Some(rtdb_server::config::DiskCacheSettings { path: settings.cache_dir.clone(), maximum_bytes: Some(1 << 30), maximum_ratio: 0.5 });
     }
@@ -66,7 +81,8 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let recorder = Arc::new(crate::logs::DirectoryRecorder { directory: Arc::clone(&directory) });
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
     let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
-    let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys), storage_namespaces, fence_interval: Duration::from_millis(100) });
+    let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys),
+        storage_namespaces, fence_interval: Duration::from_millis(100), scoped_writes: scoped_writes.clone() });
     let placed = PlacedOptions {
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
@@ -88,6 +104,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone, pool: settings.pool,
         storage_namespaces: Some(storage_namespaces),
     }, settings.lease).await?;
+    if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
     let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent, storage_namespaces, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::clone(&agent));

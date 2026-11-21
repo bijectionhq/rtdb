@@ -1850,6 +1850,20 @@ rule VerifyWriterDuringWatchStartup {
             WriteRefused(record)
 }
 
+rule RefreshScopedS3Session {
+    when: S3WriteCredentialsRequested(record, writer_epoch)
+
+    requires: DeploymentStillUsesStoragePrefix(record)
+    requires: WriterOrCompactorAuthorized(record, writer_epoch)
+
+    ensures:
+        let session = ProviderAssumedWriteRole(prefix: record.storage_root.prefix, max_age: config.credential_ttl)
+        if WriterOrCompactorAuthorized(record, writer_epoch):
+            ScopedWriteSessionIssued(session)
+        else:
+            WriteRefused(record)
+}
+
 rule TransferSharedObjects {
     -- Objects of the deleted deployment still referenced by another live deployment in its lineage move to that deployment's ownership by re-wrapping their data keys; no bytes are copied.
     when: DeletionDue(record)
