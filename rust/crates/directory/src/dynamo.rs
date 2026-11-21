@@ -500,7 +500,9 @@ mod tests {
         reopened.version = 65;
         reopened.checkpoint = Some(crate::Checkpoint { block: 87, boundary: 34_567, source: 31_234, system_time: 1_795_224_375_000_000 });
         reopened.storage_namespaces = Some(crate::StorageNamespaces { objects: uuid::Uuid::new_v4(), keys: [42; 32] });
-        for (name, record) in [("pristine", &pristine), ("previously active", &reopened)] {
+        let mut hosted = reopened.clone();
+        hosted.replica_journals.extend(["10.42.0.10:7654", "10.42.1.10:7654", "10.42.2.10:7654"].map(str::to_owned));
+        for (name, record) in [("pristine", &pristine), ("previously active", &reopened), ("with journal custody", &hosted)] {
             let compact = deployment_item(record, true).unwrap();
             assert!(matches!(compact[RECORD], AttributeValue::B(_)));
             assert_eq!(&decode_deployment(&compact).unwrap(), record);

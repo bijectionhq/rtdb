@@ -735,7 +735,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     let deletion = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(receipt) = cell.directory.deployment(&parent.id).await.unwrap().unwrap().disposal {
-                break receipt;
+                break *receipt;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -749,14 +749,14 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     assert!(rtdb_multi::keys::KeyService::key(&cell.keys(), &parent.key_id()).await.is_err(), "its key is withdrawn");
     let tombstone = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert_eq!(tombstone.lifecycle, rtdb_directory::Lifecycle::Deleted);
-    assert_eq!(tombstone.disposal, Some(deletion.clone()));
+    assert_eq!(tombstone.disposal.as_deref(), Some(&deletion));
     let recovered = admin::delete_installation(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &parent.id, 4 << 20).await.unwrap();
     assert_eq!(recovered, deletion);
     assert_eq!(cell.directory.deployment(&parent.id).await.unwrap().unwrap().version, tombstone.version);
     tokio::time::timeout(Duration::from_secs(5), async {
         while !shop.is_closed() { tokio::time::sleep(Duration::from_millis(10)).await; }
     }).await.expect("the gateway closes an existing session after observing disposal");
-    let signed = tombstone.deletion_record.as_ref().unwrap();
+    let signed = tombstone.deletion_record.as_deref().unwrap();
     assert_eq!(signed.facts.deployment, tombstone.id);
     assert_eq!(signed.facts.epoch, tombstone.epoch);
     assert_eq!(signed.facts.storage_prefix, parent.storage_prefix());
@@ -1597,7 +1597,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     assert_eq!(recovered.id, arrived.id);
     assert_eq!(recovered.cell_transfer, arrived.cell_transfer);
     let retired = east.directory.deployment(&tombstone.id).await.unwrap().unwrap();
-    assert_eq!(retired.disposal, Some(receipt));
+    assert_eq!(retired.disposal.as_deref(), Some(&receipt));
     assert!(!rtdb_multi::store::move_cleanup_due(&retired, moved + 3_600_000, hour));
     assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"], "while the deployment reads on in its new cell");
     drop((through_east, through_west));

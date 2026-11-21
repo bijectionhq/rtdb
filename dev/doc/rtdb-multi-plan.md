@@ -912,8 +912,10 @@ The run includes the directory's deployment and name indexes and uses process re
 | Before hosted recovery and custody | 1,000,000 | 152,846 | 1,544 | 516 | 0 |
 | Hosted recovery and custody | 1,000,000 | 118,297 | 3,495 | 606 | 0 |
 | Hosted recovery and custody with boxed index values | 1,000,000 | 133,613 | 2,450 | 606 | 0 |
+| Hosted recovery and custody with operation history allocated on demand | 1,000,000 | 136,052 | 1,406 | 606 | 0 |
 
 The in-memory directory stores one boxed value for each deployment, so unused index slots reserve space for pointers instead of full records.
+Transfer records, restore records and disposal receipts allocate their larger values only when an operation creates them.
 The durable local directory file retains the same JSON shape.
 
 ```sh
@@ -929,8 +931,9 @@ Both forms round-trip the same directory record.
 
 | Representative deployment | JSON item | Packed item |
 | --- | ---: | ---: |
-| Pristine root | 605 B | 146 B |
-| Previously active root with checkpoint and storage binding | 855 B | 218 B |
+| Pristine root | 695 B | 146 B |
+| Previously active root with checkpoint and storage binding | 945 B | 218 B |
+| Previously active root with three retained IPv4 journal endpoints | 1,020 B | 272 B |
 
 The estimates exclude DynamoDB's 100-byte per-item storage overhead and the separate deployment-name item.
 Numeric attributes use DynamoDB's approximate size formula. [DynamoDB item sizes and formats](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/CapacityUnitCalculations.html)

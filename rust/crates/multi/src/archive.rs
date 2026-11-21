@@ -758,7 +758,7 @@ pub(crate) async fn restore_checkpoint(
         .deployment(&id)
         .await?
         .ok_or_else(|| unavailable("The selected installation is unavailable"))?;
-    if let Some(recovery) = &current.checkpoint_recovery {
+    if let Some(recovery) = current.checkpoint_recovery.as_deref() {
         if recovery.operation == operation && recovery.completed_at_ms.is_some() {
             if recovery.archive != archive_binding {
                 return Err(inconsistent("The restore operation has another archive"));
@@ -823,7 +823,7 @@ pub(crate) async fn restore_checkpoint(
             .epoch
             .checked_add(1)
             .ok_or_else(|| inconsistent("No writer epochs remain"))?;
-        record.checkpoint_recovery = Some(CheckpointRecovery {
+        record.checkpoint_recovery = Some(Box::new(CheckpointRecovery {
             operation,
             checkpoint: point.checkpoint,
             epoch,
@@ -831,7 +831,7 @@ pub(crate) async fn restore_checkpoint(
             archive: archive_binding.clone(),
             manifest_sha256: manifest_sha256.clone(),
             completed_at_ms: None,
-        });
+        }));
         record.lifecycle = Lifecycle::Restoring;
         record.epoch = epoch;
         record.holder = None;
@@ -841,10 +841,10 @@ pub(crate) async fn restore_checkpoint(
     .await?;
     let pending = fenced
         .checkpoint_recovery
-        .clone()
+        .as_deref()
         .ok_or_else(|| inconsistent("Missing the accepted checkpoint restore"))?;
     if pending.completed_at_ms.is_some() {
-        return Ok(pending);
+        return Ok(pending.clone());
     }
     await_storage_drain(directory, storage, keys, &fenced).await?;
     let source = administration_stream(directory, &fenced, maximum_message_bytes).await?;
@@ -873,6 +873,7 @@ pub(crate) async fn restore_checkpoint(
     .await?;
     completed
         .checkpoint_recovery
+        .map(|recovery| *recovery)
         .ok_or_else(|| inconsistent("The completed restore has no receipt"))
 }
 
@@ -1115,7 +1116,7 @@ mod tests {
             CellStorage::parse("s3://archive-fixture/histories/example?region=us-east-1")?;
         record.epoch = 4;
         record.lifecycle = Lifecycle::Deleted;
-        record.disposal = Some(DisposalReceipt {
+        record.disposal = Some(Box::new(DisposalReceipt {
             deployment: record.id.clone(),
             incarnation: record.incarnation,
             epoch: record.epoch,
@@ -1124,7 +1125,7 @@ mod tests {
             key_withdrawn_at_ms: 1,
             serving_prefix_observed_empty_at_ms: 1,
             serving_inventory: rtdb_directory::ServingInventory::S3VersionsAndUploads,
-        });
+        }));
         record.checkpoint_captures.insert(
             operation,
             CheckpointCapture {

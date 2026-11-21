@@ -279,7 +279,7 @@ pub struct DeploymentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_cleanup: Option<SourceCleanup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cell_move: Option<CellMove>,
+    pub cell_move: Option<Box<CellMove>>,
     /// Each attempted copy uses a different prefix, so a superseded copier can never modify a live destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_generation: Option<uuid::Uuid>,
@@ -293,13 +293,13 @@ pub struct DeploymentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_pin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deletion_record: Option<DeletionRecord>,
-    pub cell_transfer: Option<CellTransfer>,
-    pub disposal: Option<DisposalReceipt>,
+    pub deletion_record: Option<Box<DeletionRecord>>,
+    pub cell_transfer: Option<Box<CellTransfer>>,
+    pub disposal: Option<Box<DisposalReceipt>>,
     /// Serving and archive receipts for earlier stays in this same cell.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub retired_residences: BTreeMap<u64, RetiredResidence>,
-    pub checkpoint_recovery: Option<CheckpointRecovery>,
+    pub checkpoint_recovery: Option<Box<CheckpointRecovery>>,
     /// Replay retains logical transactions through this position, but the restored checkpoint
     /// replaces the former serving storage and its compaction effects through the same position.
     #[serde(default, skip_serializing_if = "Option::is_none")]

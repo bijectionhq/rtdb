@@ -745,7 +745,7 @@ fn deletion_receipt(mut tombstone: DeploymentRecord) -> Result<DeletionRecord> {
     {
         return Err(Anomaly::fault("rtdb.multi/deletion-receipt-mismatch", format!("The stored receipt for {} does not match its tombstone", tombstone.name)));
     }
-    Ok(receipt)
+    Ok(*receipt)
 }
 
 fn cell_move_conflict(from: &CellHandle<'_>, to: &CellHandle<'_>, name: &str) -> Anomaly {
@@ -912,14 +912,14 @@ async fn prepare_cell_move(
         record.placement_move = None;
         record.storage_namespaces = bound_source.storage_namespaces;
         record.replica_journals.extend(source_stream.servers.iter().cloned());
-        record.cell_transfer = Some(CellTransfer {
+        record.cell_transfer = Some(Box::new(CellTransfer {
             intent: intent.clone(),
             source_incarnation: record.incarnation,
             destination_incarnation: arrival.incarnation,
             epoch: record.epoch,
             source_media: source_media.clone(),
             destination_media: destination_media.clone(),
-        });
+        }));
         Ok(())
     }).await?;
     let staged = if let Some(pending) = pending {
@@ -950,8 +950,8 @@ async fn prepare_cell_move(
         if let Some(prior) = &prior_residence {
             staged.retired_residences.clone_from(&prior.retired_residences);
             staged.retired_residences.insert(prior.incarnation, RetiredResidence {
-                transfer: prior.cell_transfer.clone().ok_or_else(&conflict)?,
-                serving: prior.disposal.clone().ok_or_else(&conflict)?,
+                transfer: prior.cell_transfer.as_deref().cloned().ok_or_else(&conflict)?,
+                serving: prior.disposal.as_deref().cloned().ok_or_else(&conflict)?,
                 archives: prior.archive_retirement.clone(),
             });
             if prior.archive_retirement.is_none() {
@@ -1201,7 +1201,7 @@ async fn finish_disposal_with_lock(
     if fenced.incarnation != expected {
         return earlier(&fenced);
     }
-    match (fenced.lifecycle, fenced.disposal.as_ref()) {
+    match (fenced.lifecycle, fenced.disposal.as_deref()) {
         (Lifecycle::Deleted, Some(receipt)) => return Ok(receipt.clone()),
         (Lifecycle::Deleting, None) => {},
         (Lifecycle::Deleted, None) if fenced.moved_at_ms.is_some() => {},
@@ -1304,19 +1304,19 @@ async fn finish_disposal_with_lock(
                 {
                     return Err(deletion_changed(id));
                 }
-                record.disposal = Some(receipt.clone());
-                record.deletion_record = Some(signed.clone());
+                record.disposal = Some(Box::new(receipt.clone()));
+                record.deletion_record = Some(Box::new(signed.clone()));
                 record.lifecycle = Lifecycle::Deleted;
                 Ok(())
             }
             Lifecycle::Deleted if record.moved_at_ms.is_some() => {
-                record.disposal = Some(receipt.clone());
+                record.disposal = Some(Box::new(receipt.clone()));
                 Ok(())
             }
             _ => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-fence", format!("Installation {id} left disposal"))),
         }
     }).await?;
-    deleted.disposal.ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
+    deleted.disposal.map(|receipt| *receipt).ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
 }
 
 async fn erase_and_sign_disposal(
