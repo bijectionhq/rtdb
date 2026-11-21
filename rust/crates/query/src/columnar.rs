@@ -31,9 +31,22 @@ pub(crate) struct SelectedColumn {
 }
 
 impl SelectedColumn {
+    pub(crate) fn new(sources: Vec<Option<StoredVector>>, cells: Arc<Vec<(usize, usize)>>) -> Self {
+        Self { sources: Arc::new(sources), cells }
+    }
+
     fn source(&self, row: usize) -> Result<Option<(&StoredVector, usize)>> {
         let &(source, offset) = self.cells.get(row).ok_or_else(|| invalid("column-row", "Column row is outside its page"))?;
         Ok(self.sources[source].as_ref().map(|source| (source, offset)))
+    }
+
+    pub(crate) fn source_layouts(&self) -> impl Iterator<Item = (&dyn Array, &ArrowField, Option<&LogicalType>)> {
+        self.sources.iter().flatten().map(|(array, field, logical, _)| (array.as_ref(), field.as_ref(), logical.as_ref()))
+    }
+
+    pub(crate) fn source_cell(&self, row: usize) -> Option<(&dyn Array, usize)> {
+        let (source, offset) = self.cells[row];
+        self.sources[source].as_ref().map(|(array, ..)| (array.as_ref(), offset))
     }
 
     fn select(self, mask: &[bool], selected: usize) -> Self {
@@ -345,7 +358,7 @@ fn take_arrow_rows<'a>(
     let has_missing_fixed_binary = sources.iter().any(Option::is_none) && sources.iter().flatten()
         .any(|(array, ..)| matches!(array.data_type(), DataType::FixedSizeBinary(_)));
     let column = if keep_selection || has_missing_fixed_binary {
-        Column::Selected(SelectedColumn { sources: Arc::new(sources), cells })
+        Column::Selected(SelectedColumn::new(sources, cells))
     } else {
         let base = cells.len().checked_mul(64).and_then(|bytes| lease.bytes().checked_add(bytes)).ok_or_else(size_error)?;
         let bound = cells.iter().try_fold(base, |bound, &(source, row)| {
@@ -481,7 +494,7 @@ fn gather_cells(children: Vec<Option<StoredVector>>, cells: &Arc<Vec<(usize, usi
         if let Some(column) = joined_nullable(&children, cells, &field, &logical)? { return Ok(column); }
         if let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
     }
-    Ok(Column::Selected(SelectedColumn { sources: Arc::new(children), cells: Arc::clone(cells) }))
+    Ok(Column::Selected(SelectedColumn::new(children, Arc::clone(cells))))
 }
 
 fn joined_nullable(children: &[Option<StoredVector>], cells: &[(usize, usize)],
