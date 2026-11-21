@@ -560,6 +560,9 @@ The worst client gap in those runs ranged from 34.3 to 100.9 ms, with the corres
 In the 100.9 ms case, the administration call finished in 39.0 ms.
 With the cold activation quota and the admission pause, one 1,000-deployment release run activated the deployments in 1.56 seconds.
 It measured a move-to-first-write p50 of 7.0 ms and p99 of 17.6 ms, then verified all counters and 342 new placements in 2.51 seconds after killing the busiest node.
+With placement-triggered reconnects and cancellation-aware block collection, a repeat measured 6.9 ms p50 and 8.7 ms p99 and verified the 342 replacement placements in 2.49 seconds.
+Five 48-move trials with continuous writes matched all 366–414 acknowledged updates per run.
+Their p95 inter-commit gaps were 19.4–30.0 ms and their p99 gaps were 30.9–60.9 ms.
 
 ```sh
 cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
@@ -745,6 +748,9 @@ Three release trials extended the workload to 32,768 durable updates apiece and 
 Each scale-out moved 10 deployments over 55–56 ms while 196–218 writes completed.
 Each scale-in drained 10–11 deployments over 275–385 ms while 751–1,328 writes completed.
 Every counter matched, with 1,488–2,965 updates/s and p99 of 27.7–97.7 ms across the trials.
+Three repeats with placement-triggered reconnects and cancellation-aware block collection matched all counters at 1,678–3,290 updates/s.
+The repeats measured p95 of 17.4–19.2 ms and p99 of 21.2–112.0 ms.
+The continuous workload still has inconsistent tail latency.
 
 ```sh
 RTDB_CELL_BENCH_SCALE=1 cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
