@@ -697,3 +697,41 @@ The full runner passed on `cbcfb34a5` with mCRL2, AutoHyper and both Rust option
 It checked 78 Verus obligations, matched 46 Verus diagnostic controls and completed 18 TLC baselines with 45 expected counterexamples or reachability witnesses.
 All other formal and native checks passed, including the five merge theorems and both model and native merge controls.
 The input manifest SHA-256 is `6f6a2387847a9dd3c3b171867ddc8de3321f74c92e4314b2b13913f4f625cf0e`.
+
+== System-time assignment for catalog transactions
+
+A native test on the baseline `a7b99a25c` committed an ordinary transaction with an explicit time ahead of the local log clock.
+The next attach failed at staging because its raw log time preceded the resolved head.
+The repaired resolver uses the same automatic clock decision for ordinary, external, skipped and catalog transactions.
+An explicit time that fails the same strict comparison still produces a refused outcome at its assigned automatic time.
+The private staging boundary checks that the write and result have the same transaction key and that the key's time is strictly later than the previous resolved time.
+
+The native test observes a successful attach at the next microsecond and a refused detach one microsecond later.
+It reopens the local node, observes the attached database in the catalog, verifies the recovered transaction key and reads the three ordered outcomes with SQL.
+The full selected node, replication and transaction suites passed 153 tests with the change on `main` and 158 tests with the corresponding change on `rtdb-multi` at `e86af7f12`.
+The scoped package command is
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-node --test native -p rtdb-tx --test resolution -p rtdb-replication --lib`.
+
+Link:../verus/system_time/proof.rs[Verus] checks two production functions and six laws over signed 64-bit input.
+It checks the first and advancing clock cases, the next-tick rule for a stalled clock, strict advancement, numeric exhaustion and refusal of a tied or older explicit time.
+Four controls pair production-only mutations with variants whose contracts were weakened as well.
+The common scalar module has identical contents on both branches.
+These proofs cover clock decisions before the transaction buffer validates intervals and before storage or replay.
+
+Link:../lean/SystemTime.lean[Lean] proves strict order for any finite mixed request list and proves that a completed prefix's final time suffices to resume its clock trace.
+The control that uses raw catalog time fails the local advancement lemma and a mixed sequence witness.
+Link:../tla/SystemClock.tla[TLC] explores all 129 states with four timestamps and at most two staged outcomes.
+It finds a tied time in two stages if catalog time is taken raw or if staging consults the durable head while earlier work is staged.
+With the restart seed removed, staging, publishing, crashing, restarting and staging again suffices to repeat the first timestamp.
+The baseline admits a later catalog transaction through that same restart sequence.
+Apalache checks strict ordering through eight transitions and independently finds the empty-restart counterexample.
+
+The models assume one resolver per ordered prefix and an intact recovered durable prefix.
+The native restart uses one local provider and one schedule.
+Existing persisted replica records retain their original decoding and replay rules.
+
+The full runner passed on `6c4ac85c1` with mCRL2, AutoHyper and both Rust options enabled.
+It checked 86 Verus obligations and 50 diagnostic controls, and completed 19 TLC baselines and 49 control or reachability cases.
+The archived native clock test passes and restoring the original raw assignment fails at the attach, with the predecessor-order error seen on the baseline.
+All other formal and native checks in the runner passed.
+The input manifest SHA-256 is `411931297c575c6a62cd4ffaee50a057c1b72661211bb239ade135cb437ff56c`.
