@@ -107,10 +107,14 @@ impl TrieCollector {
     pub async fn collect_as_of(&self, as_of: Timestamp, cancellation: &CancellationToken) -> Result<()> {
         let collection = Arc::new(self.partition.trie_collection());
         let cut = collection.current().snapshot().catalog_cut();
-        if let Some(cut) = cut {
-            IoRegion::retaining(collection.clone(), retirement_intent::resume(
+        if let Some(cut) = cut
+            && let Err(error) = IoRegion::retaining(collection.clone(), retirement_intent::resume(
                 self.store.as_ref(), self.publisher.as_ref(), collection.current(), cut, cancellation,
-            )).await?;
+            )).await
+        {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            self.observer.table_failed(None, &error);
+            return Ok(());
         }
         let tables: Vec<_> = collection.current().table_catalog().entries().cloned().collect();
         let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));

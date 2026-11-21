@@ -167,6 +167,15 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
         let observer = Arc::new(Observer::default());
         let first = collector(store.clone(), owner.clone(), observer.clone());
         let cancellation = CancellationToken::new();
+        if matches!(failed, Removal::StopBeforeInstall) {
+            let malformed = ObjectKey::new(format!("{pending}/malformed")).unwrap();
+            store.put(&malformed, Bytes::from_static(b"{")).await.unwrap();
+            first.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+            assert!(owner.requests.lock().unwrap().is_empty());
+            let error = observer.0.lock().unwrap().pop().unwrap();
+            assert_eq!(error.code, "rtdb.maintenance/invalid-state");
+            store.delete(&malformed).await.unwrap();
+        }
         first.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
         drop(first);
         assert_eq!(*owner.requests.lock().unwrap(), [vec![old.clone()]]);
