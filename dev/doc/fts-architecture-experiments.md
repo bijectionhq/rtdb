@@ -254,3 +254,82 @@ The focused release run passed all 49 cases, including the same-transaction BM25
 The full Gradle unit rerun passed all 3,187 cases.
 The first Gradle run hit a five-second JVM compaction sync timeout, and that case subsequently passed in isolation and in the full rerun.
 The benchmark harnesses also passed their independent result and score oracles on the release build.
+
+## Follow-up on the same trie files
+
+The follow-up compares the native ranked SQL plan with two verified-hit prototypes over a single running node.
+All three use the same immutable trie files, snapshot basis, and corpus registry implementation.
+The prototypes return exact index scores and fetch the projected fields from the primary table at the same valid and system instants.
+The harness captures the integer SQL IDs and their IIDs from that table and checks the correspondence before ranking.
+It times this capture separately.
+The harness runs an unlimited SQL ordering as the oracle and compares every projected value, including the row's system time.
+The experimental paths are enabled through the benchmark feature.
+
+The first prototype uses the existing score-only window bounds and applies the SQL tie-break after scoring.
+The second uses a window's lowest SQL ID and the maximum exact contribution from each scoring term's observed frequency and field length pairs.
+The resulting upper bound is for the same score and ascending ID order the SQL query uses.
+The observed pairs give an upper bound without the current summaries' upward rounding margin, so an equal score can be pruned when the window's lowest ID is too high.
+The experiment reports first-use preparation separately from steady-state ranking.
+The prototype covers a single MATCH and integer ID ordering at a valid-time and system-time point.
+Ambiguous visibility, live changes, incomplete index coverage, and uncovered IDs use the native SQL path.
+
+```sh
+cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node --features fts-experiments --example fts_architecture_bench -- same-files 90000 12
+```
+
+### Follow-up results
+
+Each variant used the same files within a dataset.
+The 90,000-, 110,000-, and 1,000,000-document datasets used 5, 6, and 50 primary tries, backed by 2, 3, and 14 search bundles.
+Each run interleaved 12 measurements per case and variant.
+The first two sizes each ran twice on freshly built datasets.
+All 900 timed queries matched their SQL reference, including fallbacks.
+
+| Documents | Query | Native SQL p50 / p95, ms | Direct, score bounds p50 / p95, ms | Direct, score and ID bounds p50 / p95, ms | Documents scored with ID bounds |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 90,000 | Uniform scores, top 20 | 244.98 / 258.24 | 20.12 / 20.43 | 1.96 / 2.14 | 3,584 |
+| 90,000 | Uniform scores, top 100 | 213.46 / 252.58 | 32.78 / 50.81 | 17.46 / 25.65 | 15,872 |
+| 90,000 | Dense, 12 score groups | 36.72 / 37.57 | 20.20 / 20.59 | 7.98 / 8.31 | 32,256 |
+| 90,000 | Selective conjunction | 1.86 / 2.06 | 1.44 / 1.68 | 1.42 / 1.52 | 793 |
+| 90,000 | Selective phrase | 0.94 / 1.14 | 1.27 / 1.40 | 1.37 / 1.56 | 179 |
+| 110,000 | Uniform scores, top 20 | 270.05 / 300.83 | 301.19 / 318.53 | 2.80 / 2.90 | 3,584 |
+| 110,000 | Uniform scores, top 100 | 265.82 / 269.10 | 296.55 / 301.94 | 20.22 / 20.97 | 15,872 |
+| 110,000 | Dense, 12 score groups | 266.83 / 268.42 | 297.84 / 299.32 | 11.75 / 12.06 | 32,256 |
+| 110,000 | Selective conjunction | 2.92 / 3.19 | 1.86 / 2.03 | 1.76 / 1.84 | 793 |
+| 110,000 | Selective phrase | 1.39 / 1.43 | 1.50 / 1.63 | 1.62 / 1.69 | 218 |
+| 1,000,000 | Uniform scores, top 20 | 2,695.99 / 2,752.45 | 2,790.78 / 2,833.41 | 9.50 / 9.93 | 3,072 |
+| 1,000,000 | Uniform scores, top 100 | 2,784.21 / 3,507.38 | 2,822.05 / 3,436.28 | 46.02 / 50.70 | 14,336 |
+| 1,000,000 | Dense, 12 score groups | 2,725.57 / 2,823.19 | 2,791.78 / 2,863.11 | 35.75 / 36.62 | 38,912 |
+| 1,000,000 | Selective conjunction | 113.68 / 115.93 | 30.88 / 31.78 | 14.11 / 17.60 | 3,169 |
+| 1,000,000 | Selective phrase | 19.31 / 32.12 | 11.54 / 11.90 | 6.30 / 7.37 | 634 |
+
+At 90,000 documents, the native SQL ranker handed all 90,000 tied candidates to the scan.
+The score-only prototype scored all 90,000 and fetched just the winners.
+The tie-aware path scored 3,584 in 28 windows for the same uniform top-20 result.
+At 110,000 and 1,000,000 documents, the native SQL ranker and the score-only prototype hit the candidate limit on both broad shapes.
+The score-only prototype then ran the native SQL plan, which accounts for the higher fallback latency in that column.
+It had already scored 105,024 documents in the million-document run when a window batch crossed its cap.
+With score and ID bounds, uniform top-20 at one million documents visited 24 windows and scored 3,072 documents.
+The row count and amount of candidate work still depend on the score distribution and the limit.
+
+The million-document run spent 667 ms once on SQL ID capture and verification.
+The first uniform tie-aware query took 61 ms, including 50 ms to build its window summaries from warm search files.
+The report and audit summaries retained about 1.25 MB in total across the 14 bundles, excluding the separate ID map.
+The exact score envelopes are derived from the postings once per file and term and reused across queries.
+These costs describe local execution with search files and corpus caches warmed by the reference query.
+
+The oracle checked IDs, exact scores, projected fields, and the row's system time.
+The additional temporal probes covered backdated corrections, nulls, deletes, erases, and reads at older system and valid instants after compaction.
+An unflushed update selected native SQL, and ambiguous persisted hits also took that fallback.
+
+### Follow-up decision
+
+Use the existing trie-owned search files for a production implementation of direct ranking.
+The score-only handoff explains a material part of the improvement below the cap.
+The exact score and SQL ID bound is what prevents the demonstrated cliff above it.
+The largest measured gains are for broad queries with large score ties.
+The native plan remained faster for the small phrase case at 90,000 and 110,000 documents.
+A production implementation should build tie metadata with the artifact, carry verified row identities into an in-engine batch fetch, and leave unsupported orders and visibility to the existing plan.
+Measure how often real queries qualify and whether the extra artifact metadata pays for itself on fresh terms.
+
+The focused release run passed all 50 search and node tests, including the exact score and ID bound regression.
