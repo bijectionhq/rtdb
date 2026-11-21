@@ -113,7 +113,7 @@ impl BatchSort {
         if runs.files.is_empty() {
             return Ok(Sorted::Memory(tail));
         }
-        if !tail.order.is_empty() {
+        if tail.order.len() != 0 {
             runs.push(Self::spill(&self.plan, &self.projection, tail).await?)?;
         }
         self.spilled = true;
