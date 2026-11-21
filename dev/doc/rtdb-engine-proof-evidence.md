@@ -159,6 +159,18 @@ The native contract test compares the public bucketer with an independent unsign
 Verus 0.2026.11.05.31e44e6 checked nine functions and rejected all five mutations, including one that accepts an IID with a smaller first differing digit. [Verus study](../../verification/verus/iid_partition/area.json)
 The native run passed 495 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Rust contract test](../../rust/crates/trie/tests/contracts.rs)
 
+### Submission clock and durable retry attribution
+
+Native submissions with an application idempotency key use a finite one-hour marker interval measured from submission.
+The resolver identifies the generated duplicate guard by its recorded position in the source transaction.
+An assertion failure elsewhere in the same operation sequence keeps its own aborted result.
+The outcome lookup uses the retry's historical system-time view of the key marker.
+The new reader still recognizes earlier source records and looks up their duplicate outcomes using the older guard convention.
+Verus checks the exact expiration boundary and operation-position helpers, with four mutation controls.
+Native regressions cover a system-time jump, a user assertion at the next position, concurrent submissions, and old and new outcome lookup after local restart.
+The application marker table remains writable through ordinary DML.
+This evidence covers the checked helpers and the tested recovery trace. [Native tests](../../rust/crates/node/tests/native.rs) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Source transaction contract](db.allium)
+
 ### Production live-trie bucket grouping
 
 Rust branch insertion and leaf splitting call the same checked grouping function.

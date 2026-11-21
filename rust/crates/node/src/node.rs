@@ -11,8 +11,8 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::CacheBudget;
-use rtdb_tx::{RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
+use rtdb_types::{Anomaly, AnomalyCategory, Instant, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -365,31 +365,38 @@ impl Node {
         let admission = if self.catalog.is_placed() {
             Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
         } else { None };
-        if let Some(key) = key {
+        let guard = if let Some(key) = key {
             if key == IDEMPOTENCY_SENTINEL { return Err(Anomaly::incorrect("rtdb.node/reserved-idempotency-key", format!("'{IDEMPOTENCY_SENTINEL}' is reserved and cannot be an idempotency key"))); }
+            let submitted_at = self.now();
+            let expires_at = crate::idempotency_window::expiration(submitted_at.0).map(Timestamp)
+                .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Idempotency key expiration exceeds the timestamp range"))?;
             // A transaction carrying a key that already committed within the window aborts on its assertion, and awaiting it answers with the original's outcome.
             let table = rtdb_types::TableRef::new("public", IDEMPOTENCY_TABLE);
-            let put = |id: &str, valid_to: Option<rtdb_types::Timestamp>| -> Result<TxOp> {
+            let put = |id: &str, valid_from, valid_to| -> Result<TxOp> {
                 let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([("_id".to_owned(), Value::Utf8(id.to_owned()))])], &self.factory.memory)?;
-                Ok(TxOp::PutDocs { table: table.clone(), documents, valid_from: None, valid_to })
+                Ok(TxOp::PutDocs { table: table.clone(), documents, valid_from, valid_to })
             };
-            let assertion = TxOp::Sql { sql: idempotency_guard(key), args: None };
+            let assertion = TxOp::Sql { sql: submission_clock_guard(key, submitted_at)?, args: None };
             let value = database.partition.value();
-            if value.table_catalog().metadata(&table).is_some() || value.live().tables().contains_key(&table) {
-                operations.insert(0, assertion);
-            } else {
+            let after_bootstrap = value.table_catalog().metadata(&table).is_none() && !value.live().tables().contains_key(&table);
+            if after_bootstrap {
                 // Until the keys table exists, a sentinel row creates it within the transaction, so the assertion can read it.
-                operations.splice(0..0, [put(IDEMPOTENCY_SENTINEL, None)?, assertion]);
+                operations.splice(0..0, [put(IDEMPOTENCY_SENTINEL, None, None)?, assertion]);
+            } else {
+                operations.insert(0, assertion);
             }
-            // A key expires after the window, so the table's current rows stay as few as the keys still in use.
-            operations.push(put(key, Some(rtdb_types::Timestamp(self.now().0 + IDEMPOTENCY_WINDOW.as_micros() as i64)))?);
-        }
+            operations.push(put(key, Some(submitted_at), Some(expires_at))?);
+            Some((submitted_at, after_bootstrap))
+        } else { None };
         database.require_writable()?;
         if database.external_source() { return Err(Anomaly::incorrect("xtdb/submit-tx-to-external-source-db", "Cannot submit transactions to an external-source database").with_context("db-name", database.name().into())); }
         options.user = identity.user().map(str::to_owned);
         options.default_tz = rtdb_expr::normalize_timezone(&options.default_tz)?;
         let sql_options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: self.factory.options.query.generate_series_end_exclusive, ..Default::default() };
-        let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
+        let mut source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
+        if let Some((submitted_at, after_bootstrap)) = guard {
+            source = source.with_idempotency_guard(submitted_at, after_bootstrap);
+        }
         let payload = source.encode()?.into_bytes();
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
         if let Some(admission) = &admission {
@@ -400,18 +407,22 @@ impl Node {
     }
 
     /// The committed outcome visible to the retry when its duplicate guard ran.
-    async fn keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
+    async fn keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, guard: DuplicateGuard, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
-        let time = Value::Timestamp { value: retry_time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
-        let arguments = vec![time.clone(), time, Value::Utf8(key.to_owned())];
+        let (valid_time, valid_filter) = match guard {
+            DuplicateGuard::Legacy => (retry_time, "AS OF ?"),
+            DuplicateGuard::SubmissionClock(time) => (time, "FROM ? TO NULL"),
+        };
+        let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let arguments = vec![timestamp(retry_time), timestamp(valid_time), Value::Utf8(key.to_owned())];
         let options = rtdb_sql::PrepareOptions {
             parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
             default_timezone: context.timezone.clone(),
             generate_series_end_exclusive: context.options.generate_series_end_exclusive,
             ..Default::default()
         };
-        let sql = format!("SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM {IDEMPOTENCY_TABLE} FOR SYSTEM_TIME AS OF ? FOR VALID_TIME AS OF ? AS k WHERE k._id = ?)");
+        let sql = format!("SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM public.{IDEMPOTENCY_TABLE} FOR SYSTEM_TIME AS OF ? FOR VALID_TIME {valid_filter} AS k WHERE k._id = ? ORDER BY k._system_from DESC LIMIT 1)");
         let prepared = match prepare_query(&sql, &context, &options) {
             Ok(prepared) => prepared,
             Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
@@ -469,10 +480,9 @@ impl Node {
                 };
                 if let Some(error) = &error
                     && error.code == "xtdb/assert-failed"
-                    && error.context.get("tx-op-idx").and_then(|value| value.as_u64()).is_some_and(|index| index <= 1)
                     && let Some(key) = idempotency_key(&cell("user_metadata")?)
-                    && error.context.get("sql").and_then(|value| value.as_str()).is_some_and(|sql| sql == idempotency_guard(key))
-                    && let Some(original) = self.keyed_transaction(database, key, system_time, identity, placement, cancellation).await?
+                    && let Some(guard) = DuplicateGuard::from_error(key, error)
+                    && let Some(original) = self.keyed_transaction(database, key, system_time, guard, identity, placement, cancellation).await?
                 {
                     return Ok(TransactionResult::Committed { tx_key: original });
                 }
@@ -738,11 +748,9 @@ impl SessionService for NativeSessionService {
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_in_placement(database, tx_id, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
 }
 
-/// Where a transaction's idempotency key is recorded, keyed by the key, so a retry finds it with one point lookup.
+/// The public marker table used by application idempotency keys.
 pub const IDEMPOTENCY_TABLE: &str = "rtdb_idempotency_keys";
 const IDEMPOTENCY_SENTINEL: &str = "~table";
-/// How long a committed transaction's key keeps a retry from running it again (`idempotency_window`).
-const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// The `idempotency_key` a transaction's metadata carries, set with `BEGIN READ WRITE WITH (METADATA = {idempotency_key: '...'})`.
 fn idempotency_key(metadata: &Value) -> Option<&str> {
@@ -765,9 +773,28 @@ pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key:
     rtdb_tx::UserMetadata::new(Value::Struct(fields), memory)
 }
 
-fn idempotency_guard(key: &str) -> String {
+enum DuplicateGuard {
+    Legacy,
+    SubmissionClock(Timestamp),
+}
+
+impl DuplicateGuard {
+    fn from_error(key: &str, error: &Anomaly) -> Option<Self> {
+        if let Some(marker) = error.context.get(IDEMPOTENCY_GUARD_RESULT) {
+            return marker.as_i64().map(|time| Self::SubmissionClock(Timestamp(time)));
+        }
+        let index = error.context.get("tx-op-idx")?.as_u64()?;
+        let sql = error.context.get("sql")?.as_str()?;
+        let literal = key.replace('\'', "''");
+        let legacy = format!("ASSERT NOT EXISTS (SELECT 1 FROM {IDEMPOTENCY_TABLE} WHERE _id = '{literal}')");
+        (index <= 1 && sql == legacy).then_some(Self::Legacy)
+    }
+}
+
+fn submission_clock_guard(key: &str, submitted_at: Timestamp) -> Result<String> {
     let literal = key.replace('\'', "''");
-    format!("ASSERT NOT EXISTS (SELECT 1 FROM {IDEMPOTENCY_TABLE} WHERE _id = '{literal}')")
+    let time = Instant::from(submitted_at).to_iso_string()?;
+    Ok(format!("ASSERT NOT EXISTS (SELECT 1 FROM public.{IDEMPOTENCY_TABLE} FOR VALID_TIME FROM TIMESTAMP '{time}' TO NULL WHERE _id = '{literal}')"))
 }
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.

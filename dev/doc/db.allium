@@ -367,6 +367,12 @@ entity SourceMessage {
 
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
+    -- A native keyed submission carries an optional guard envelope with a required submission clock sample and guard position.
+    -- Older and unkeyed records can omit the envelope.
+    -- The key marker is valid from its submission sample, inclusive, until one hour later, exclusive.
+    -- For a record carrying the envelope, the failed assertion must have the recorded position to identify a duplicate.
+    -- Typed outcome lookup selects the latest marker visible at the retry's system time whose validity extends past the retry's submission sample.
+    -- Outcome lookup for a record without that envelope uses the legacy guard convention and the retry's system time as its valid-time point.
     -- Source encoding admits and builds operation body columns one at a time.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
