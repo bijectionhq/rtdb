@@ -79,7 +79,16 @@ impl ScanAccelerator for SearchAccelerator {
         let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => found.files };
         let query = Query::parse(query);
         let mut answers = MatchAnswers::default();
-        for trie in files { answers.insert(&trie.data, Arc::new(self.runtime.match_set(request.database, &trie, column, &query)?.member(trie.member)?)); }
+        let mut sets = BTreeMap::new();
+        for trie in &files {
+            let set = match sets.entry(trie.identity.as_str()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                    self.runtime.match_set_for_scan(request.database, trie, column, &query, request.scan.iids.as_ref())?,
+                ),
+            };
+            answers.insert(&trie.data, Arc::new(set.member(trie.member)?));
+        }
         Ok((!answers.is_empty()).then_some(answers))
     }
 }

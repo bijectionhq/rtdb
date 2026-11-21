@@ -1,13 +1,13 @@
 //! A node's shared search state: what scans and the lane reuse across queries, jobs and databases.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::Snapshot;
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Instant, Result};
+use rtdb_types::{Iid, Instant, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::{SearchAccelerator, SearchArtefacts, SearchDefinition, SearchFile, definitions_in};
@@ -171,9 +171,16 @@ impl SearchRuntime {
 
     /// MATCH of a query on every document of a trie's file, kept for as long as the file is the one this node holds under its identity.
     pub fn match_set(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query) -> Result<Arc<crate::file::MatchSet>> {
+        self.match_set_for_scan(database, trie, column, query, None)
+    }
+
+    pub(crate) fn match_set_for_scan(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query, iids: Option<&BTreeSet<Iid>>) -> Result<Arc<crate::file::MatchSet>> {
         let cache_key = (database.to_string(), trie.identity.clone(), column.to_string(), query.clone());
         if let Some((opened, set)) = self.match_sets.lock().get(&cache_key) {
             if opened.upgrade().is_some_and(|opened| Arc::ptr_eq(&opened, &trie.file)) { return Ok(set); }
+        }
+        if let Some(iids) = iids.filter(|iids| iids.len() <= 128) {
+            return Ok(Arc::new(trie.file.match_selected_iids(column, query, iids)?));
         }
         let set = Arc::new(trie.file.match_set(column, query)?);
         self.match_sets.lock().insert(cache_key, (Arc::downgrade(&trie.file), Arc::clone(&set)), set.bytes());

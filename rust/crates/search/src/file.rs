@@ -2,7 +2,7 @@
 //! A document is a text run: every version of one entity whose indexed values are the same, with the rectangles of valid time × system time where one of them is visible.
 //! Tokens come from `rtdb-text`, so the index and the residual `MATCH` agree.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -748,7 +748,35 @@ impl SearchFile {
         let documents = self.sidecar.documents;
         let mut matching = vec![0u64; documents.div_ceil(64) as usize];
         for doc in self.matching_docs(column, query)? { matching[doc as usize / 64] |= 1 << (doc % 64); }
-        Ok(MatchSet { file: Arc::clone(self), column: self.column(column), matching })
+        Ok(MatchSet { file: Arc::clone(self), column: self.column(column), matching: MatchingDocuments::All(matching) })
+    }
+
+    pub(crate) fn match_selected_iids(self: &Arc<Self>, column: &str, query: &Query, iids: &BTreeSet<Iid>) -> Result<MatchSet> {
+        use tantivy::{DocSet, query::Query as _};
+
+        let mut selected = BTreeMap::new();
+        let column = self.column(column);
+        if let Some(column) = column {
+            for iid in iids {
+                for row in self.sidecar.rows_of(&iid.0) {
+                    if let RowDoc::Run(doc) = self.sidecar.row_doc(column, row) {
+                        selected.insert(doc, false);
+                        if selected.len() > 1024 { return self.match_set(&self.columns[column], query); }
+                    }
+                }
+            }
+            if !selected.is_empty() && !query.terms().is_empty() {
+                let segment = &self.searcher.segment_readers()[0];
+                let weight = Self::conjunction(Field::from_field_id(column as u32), query)
+                    .weight(tantivy::query::EnableScoring::disabled_from_searcher(&self.searcher)).map_err(fault)?;
+                let mut docs = weight.scorer(segment, 1.0).map_err(fault)?;
+                for (&doc, matched) in &mut selected {
+                    if docs.doc() < doc { docs.seek(doc); }
+                    *matched = docs.doc() == doc;
+                }
+            }
+        }
+        Ok(MatchSet { file: Arc::clone(self), column, matching: MatchingDocuments::Selected(selected) })
     }
 
     /// The column's corpus statistics for the query's terms: its runs, their tokens, and each term's document frequency.
@@ -766,8 +794,13 @@ impl SearchFile {
     }
 }
 
-/// MATCH of one query on every row of a search file, by page and row, through each row's run.
-pub struct MatchSet { file: Arc<SearchFile>, column: Option<usize>, matching: Vec<u64> }
+enum MatchingDocuments {
+    All(Vec<u64>),
+    Selected(BTreeMap<u32, bool>),
+}
+
+/// MATCH of one query on rows of a search file, by page and row, through each row's run.
+pub struct MatchSet { file: Arc<SearchFile>, column: Option<usize>, matching: MatchingDocuments }
 
 impl MatchSet {
     /// MATCH on the row at `row` of data page `page`: `None` where the column is null or absent; an error where the file has no such row, or the row is visible nowhere.
@@ -780,7 +813,11 @@ impl MatchSet {
         match sidecar.row_doc(column, row) {
             RowDoc::Invisible => Err(corrupt("Search file row is visible nowhere")),
             RowDoc::Null => Ok(None),
-            RowDoc::Run(doc) => Ok(Some(self.matching.get(doc as usize / 64).is_some_and(|word| word & (1 << (doc % 64)) != 0))),
+            RowDoc::Run(doc) => match &self.matching {
+                MatchingDocuments::All(bits) => Ok(Some(bits.get(doc as usize / 64).is_some_and(|word| word & (1 << (doc % 64)) != 0))),
+                MatchingDocuments::Selected(docs) => docs.get(&doc).copied().map(Some)
+                    .ok_or_else(|| corrupt("Search file MATCH was not requested for this row")),
+            },
         }
     }
     /// MATCH on one member's data file, by its own page and row.
@@ -790,7 +827,12 @@ impl MatchSet {
     }
 
     /// The bytes held, for a cache's weight.
-    pub fn bytes(&self) -> usize { self.matching.len() * 8 }
+    pub fn bytes(&self) -> usize {
+        match &self.matching {
+            MatchingDocuments::All(bits) => bits.len() * 8,
+            MatchingDocuments::Selected(docs) => docs.len() * std::mem::size_of::<(u32, bool)>(),
+        }
+    }
 }
 
 /// MATCH on the rows of one member of a search file.
@@ -1055,6 +1097,25 @@ mod tests {
         }
         assert!(set.value(pages.len(), 0).is_err());
         assert!(file.match_set("title", &query).unwrap().value(0, 0).unwrap().is_none(), "a column no row holds is null everywhere");
+    }
+
+    #[test]
+    fn selected_matches_check_phrases_and_leave_unselected_rows_unanswered() {
+        let mut rows = vec![
+            row(1, 0, "", "overdue invoice"),
+            row(2, 0, "", "invoice overdue"),
+            row(3, 0, "", "overdue invoice"),
+            row(4, 0, "", "missing"),
+        ];
+        rows[3].values[1] = None;
+        let file = open(&rows);
+        let query = Query::parse("\"overdue invoice\"");
+        let iids = BTreeSet::from([Iid(rows[0].iid), Iid(rows[1].iid), Iid(rows[3].iid)]);
+        let selected = file.match_selected_iids("body", &query, &iids).unwrap();
+        assert_eq!(selected.value(0, 0).unwrap(), Some(true));
+        assert_eq!(selected.value(0, 1).unwrap(), Some(false));
+        assert!(selected.value(0, 2).is_err());
+        assert_eq!(selected.value(0, 3).unwrap(), None);
     }
 
     #[test]
