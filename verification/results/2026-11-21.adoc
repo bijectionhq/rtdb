@@ -289,3 +289,26 @@ These are model results for the checked retention contracts.
 The lease result assumes completion or cancellation that is conclusive at the provider, not just a caller timeout.
 The pin result assumes atomic registration and retention across the authority's relevant lifecycle.
 The earlier native cursor attempt timed out and does not establish a production counterexample.
+
+== Native reader reclamation witness
+
+The fixture in link:../traces/reader_reclamation_diagnostic.rs[the native diagnostic] observed a reader availability failure on source revision `cb9a0c795`.
+A real local node compacts a table, opens a SQL cursor against the first serving trie without consuming its first page, and then compacts a replacement.
+The fixture passes the replacement's catalog to the production trie collector and explicitly invokes it with an eligible retention cutoff.
+The collector uses the same object store as the cursor.
+The fixture substitutes a recorder for the deletion notice publisher.
+An object check observes the selected old data and metadata missing, and the old cursor returns `rtdb.storage/missing-object` for that trie's metadata.
+A fresh query successfully returns both committed rows.
+
+This is a native witness for an explicitly invoked eligible collection cycle.
+It establishes that the cursor's old catalog does not keep its required object alive in this configuration.
+It leaves automatic scheduling, the default retention horizon, remote coordination, and durable deletion notice publication outside this run.
+The earlier scheduled diagnostic timed out and remains inconclusive for its own scenario.
+
+Reproduce the witness in an isolated checkout at `cb9a0c795` by appending the retained diagnostic to `rust/crates/conformance/tests/node_faults.rs`, then running the exact named case from `rust/`.
+
+[source,sh]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --locked -p rtdb-conformance \
+  --test node_faults eligible_trie_collection_strands_an_admitted_native_reader -- --exact --nocapture
+----

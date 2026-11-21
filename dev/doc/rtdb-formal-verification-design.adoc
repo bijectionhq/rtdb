@@ -19,7 +19,7 @@ The requirements below are proposed targets.
 The status and scope of completed results live in the evidence ledger.
 The unresolved product choice is the lifetime of a previously admitted read across compaction and collection.
 Both a bounded lease and a coordinated pin are candidates.
-The design keeps the existing native diagnostic outcome as inconclusive. link:rtdb-verification.adoc[Existing study brief] · link:../../verification/results/2026-11-21.adoc[Evidence ledger]
+A native diagnostic reproduces an open-cursor failure under explicit collection. link:rtdb-verification.adoc[Existing study brief] · link:../../verification/results/2026-11-21.adoc[Evidence ledger]
 
 === Key terms
 
@@ -657,9 +657,9 @@ An authority or identity constraint must also preserve the outcome across any de
 The collection study must cover trie data, trie metadata, shared artefacts, cached pathnames, checkpoint roots, table blocks, and log payloads with their own reachability rules.
 
 The retained bounded study compared a validated lease and coordinated pin and exhibited age-only and stale-follower counterexamples.
-The native cursor-and-collection diagnostic timed out waiting for a scheduled event.
-The evidence ledger can claim the bounded results and an attempted native exercise.
-Runtime behavior under the reader-retention scenario remains unresolved. link:../../verification/tla/LeaseAdmission.tla[Current bounded comparison] · link:gc.allium[Trie collection contract]
+The first native cursor-and-collection diagnostic timed out waiting for a scheduled event.
+A later native diagnostic with an explicitly invoked eligible collector reproduced a missing required object in an open cursor.
+The default automatic scheduling path and the production retention protocol remain open. link:../../verification/tla/LeaseAdmission.tla[Current bounded comparison] · link:gc.allium[Trie collection contract]
 
 == Production boundary and responsibilities
 
@@ -1052,8 +1052,8 @@ Establish supported remote configurations and any eventual retry and staging cle
 |Retention
 |The bounded lease and pin designs pass their recorded finite instances.
 The weakened alternatives yield model counterexamples.
-A native diagnostic has been attempted.
-|Choose the user-facing policy, establish its production storage boundary, and obtain a conclusive native replay.
+The native diagnostic reproduced the failure under explicit eligible collection.
+|Choose the user-facing policy, establish its production storage boundary, and replay the resulting protection and collection paths.
 |===
 
 The verification effort is active.
