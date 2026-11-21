@@ -350,6 +350,65 @@ fn persisted_trie_contains_pending_rows_and_reconstructs_paths() {
 }
 
 #[test]
+fn one_level_and_recursive_leaf_splits_keep_path_order_and_repeated_rows() {
+    let iids = [0, 1, 0, 3].map(|last| {
+        let mut bytes = [0; 16];
+        bytes[15] = last;
+        Iid(bytes)
+    });
+    let rows = [2, 0, 3, 1, 3, 0];
+    let path = Path::new(vec![0, 0], Bucketer::DEFAULT).unwrap();
+    let one_level = MemoryHashTrie::with_root_path(TrieConfig::new(8, 2).unwrap(), path.clone())
+        .unwrap().add_all(&iids[..], &rows).unwrap().compact_logs(&iids[..]).unwrap();
+    let recursive = MemoryHashTrie::with_root_path(TrieConfig::new(2, 2).unwrap(), path)
+        .unwrap().add_all(&iids[..], &rows).unwrap();
+
+    assert_eq!(one_level.leaves().len(), 1);
+    assert_eq!(one_level.leaves()[0].path().as_slice(), &[0, 0, 0]);
+    assert_eq!(recursive.leaves().iter().map(|leaf| leaf.path().len()).max(), Some(64));
+    assert_eq!(recursive.leaves().len(), 3);
+    for trie in [&one_level, &recursive] {
+        assert_eq!(trie.sorted_rows(&iids[..]).unwrap(), [2, 0, 0, 1, 3, 3]);
+        for leaf in trie.leaves() {
+            assert!(leaf.pending().is_empty());
+            for row in leaf.data() {
+                assert!(Bucketer::DEFAULT.contains(leaf.path(), iids[*row as usize]).unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_read_failure_inside_a_recursive_split_leaves_the_original_trie_unchanged() {
+    struct Reader {
+        visited: RefCell<Vec<u32>>,
+    }
+
+    impl IidReader for Reader {
+        fn iid(&self, row: u32) -> Result<Iid> {
+            let mut visited = self.visited.borrow_mut();
+            visited.push(row);
+            if visited.len() == 13 {
+                return Err(rtdb_types::Anomaly::incorrect("test/iid-read", "IID lookup failed"));
+            }
+            Ok(iid(row))
+        }
+    }
+
+    let trie = MemoryHashTrie::new(TrieConfig::new(1, 1).unwrap());
+    let reader = Reader { visited: RefCell::new(Vec::new()) };
+    let rows = [3, 2, 1, 0];
+    let error = trie.add_all(&reader, &rows).unwrap_err();
+    assert_eq!(error.code, "test/iid-read");
+    assert_eq!(reader.visited.into_inner(), [3, 2, 1, 0, 3, 2, 1, 0, 0, 1, 2, 3, 0]);
+
+    let iids = [0, 1, 2, 3].map(iid);
+    assert!(trie.sorted_rows(&iids[..]).unwrap().is_empty());
+    let retried = trie.add_all(&iids[..], &rows).unwrap();
+    assert_eq!(retried.sorted_rows(&iids[..]).unwrap(), [0, 1, 2, 3]);
+}
+
+#[test]
 fn persisted_rows_outside_their_path_or_order_are_rejected() {
     let iids = vec![iid(0), iid(u32::MAX)];
     let bad_order = PersistedTrie { log_limit: 2, page_limit: 2, root_path: vec![], root: PersistedNode::Leaf(vec![1, 0]) };
