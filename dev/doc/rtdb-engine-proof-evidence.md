@@ -13,6 +13,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | --- | --- | --- |
 | TIME01, TIME02, TIME04–TIME11 | Lean relates the descending ceiling scan to the captured-history point query, including the exclusive query upper bound. Verus checks the production interval intersection, ceiling vector split and overwrite, cell selection, clipping, and per-fragment admission. Both native resolvers agreed with the reference for 4,096 observations. | SQL normalization, snapshot assembly, input coverage and operation order, the event and allocation shell, and the full assembly and projection of Rust fragments. |
 | VAL03, VAL04 · Type join and sparse fields | Lean proves associativity, commutativity and idempotence over arbitrary scalar families and flat struct fields. It distinguishes bottom, an explicit null, a field absent from both structs, and a field absent from one contributing struct. | Relate the model to the production type representations and prove nested collections, normalization, and the supported layout contracts. |
+| VAL08 · Run-end layout | Lean proves round-trip expansion, strictly increasing exclusive ends, and equivalence of sliced reads to plain reads for arbitrary lists. Kani verifies Arrow's `RunEndBuffer::get_physical_index` for two runs and all admitted slices in each signed run-end width. | Relate the native encoders, representation equality, Arrow access over arbitrary run counts, and all selection, copy, and union paths to the logical model. |
 | SCAN02, SCAN03, COMP02, COMP03, COMP08–COMP10 | Lean checks point reads through ordered compaction buckets, conservation of rows in the abstract mixed-trie traversal, and pointwise normalization of same-time cohorts. Native and Verus checks cover the production heap. Separate checks cover the bounded publish-and-adopt transition and exact tiered publication. | Compose actual scan and compaction producers, catalog adoption, and encoded and decoded coverage for all supported histories. |
 | TX01, TX03, TX06, TX11, LOG04, LOG05 | The bounded kernel and read-back models cover transaction publication, refusal, and the append, delivery, apply, and acknowledgment sequence. A Verus harness checks production replica admission. | Prove the production transaction and log traces refine those transitions under the provider and transaction assumptions. |
 | TX09 | Lean checks strictly ordered system times for arbitrary modeled mixed resolver histories and restart from the last completed time. Bounded TLC and a native catalog-clock replay check other portions of the same contract. | Refine the remaining ingress, time sources, resolve/apply paths, and provider-specific ordering. |
@@ -34,6 +35,10 @@ The model runner rejects weakening the upper limit to admit the sign bit or redu
 
 The type join model represents normalized scalar families by kind membership and nullability and applies the field rule at each key of a flat struct.
 The runner rejects intersecting scalar legs and omitting the null contribution for a missing field. [Type join theorems](../../verification/lean/TypeJoin.lean)
+
+The run encoding model uses decidable value equality and mathematical offsets.
+The corresponding Rust check uses Arrow 58.4.1 on a 64-bit target, with positive increasing ends and a valid row in a covered slice.
+The model runner rejects a closed run end and a read that drops the slice origin. [Run encoding theorems](../../verification/lean/RunEncoding.lean) · [Arrow harnesses](../../rust/crates/columnar/tests/proofs.rs)
 
 ## Multi evidence
 
@@ -70,4 +75,5 @@ The supplementary Rust position and IID harnesses on main use Kani 0.68.0.
 cd rust
 cargo kani -p rtdb-types -p rtdb-trie --tests --output-format terse
 cargo kani -p rtdb-types --lib --output-format terse
+cargo kani -p rtdb-columnar --tests --output-format terse
 ```
