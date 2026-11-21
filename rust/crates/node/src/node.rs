@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, QueryBasis, ResourceFactory, Session, SessionIdentity, SessionService, SystemClock,
     catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory}, statement::prepare_query};
 
+
 #[derive(Clone)]
 pub struct NodeServices {
     pub resources: Arc<dyn ResourceFactory>,
@@ -38,6 +39,10 @@ pub struct NodeServices {
     pub read_fence: Option<Arc<dyn ReadFence>>,
     /// Splits a placed database's large scans into fragments other nodes read; absent, every scan reads its tries here.
     pub scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
+    /// The kinds of derived artefact this node builds; empty disables the artefact lane.
+    pub artefact_kinds: Vec<Arc<dyn rtdb_maintenance::ArtefactKind>>,
+    /// Consulted by every scan before it opens, unless `NodeOptions::scan_acceleration` is off.
+    pub scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>>,
 }
 
 #[async_trait::async_trait]
@@ -47,9 +52,20 @@ pub trait ReadFence: Send + Sync {
         Err(hosted_source_unavailable())
     }
 }
+fn default_search() -> SearchServices {
+    #[cfg(feature = "search")] {
+        let runtime = rtdb_search::SearchRuntime::new(256 << 20);
+        SearchServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()] }
+    }
+    #[cfg(not(feature = "search"))] { SearchServices { artefact_kinds: Vec::new(), scan_accelerators: Vec::new() } }
+}
+struct SearchServices { artefact_kinds: Vec<Arc<dyn rtdb_maintenance::ArtefactKind>>, scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>> }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None, compaction_relay: None, read_fence: None, scan_fragmenter: None }
+        let search = default_search();
+        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None,
+            compaction_relay: None, read_fence: None, scan_fragmenter: None,
+            artefact_kinds: search.artefact_kinds, scan_accelerators: search.scan_accelerators }
     }
 }
 
@@ -110,7 +126,7 @@ impl Node {
             Err(error) => match resources.close().await { Ok(()) => Err(error), Err(close) => Err(error.with_context("resource-close-error", close.to_string().into())) },
         }
     }
-    async fn open_region(mut options: NodeOptions, services: NodeServices, memory: Arc<MemoryBudget>) -> Result<(Self, NodeDriver)> {
+    async fn open_region(mut options: NodeOptions, mut services: NodeServices, memory: Arc<MemoryBudget>) -> Result<(Self, NodeDriver)> {
         if memory.limit_bytes() != options.execution_memory_bytes { return Err(Anomaly::incorrect("rtdb.node/invalid-memory-budget", "Node options and supplied execution budget have different limits")); }
         if options.command_capacity == 0 || options.execution_memory_bytes == 0 || options.cache_bytes == 0 {
             return Err(Anomaly::incorrect("rtdb.node/invalid-options", "Node capacities must be positive"));
@@ -120,9 +136,11 @@ impl Node {
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
         let read_fence = services.read_fence.clone();
         let scan_fragmenter = services.scan_fragmenter.clone();
+        services.scan_accelerators.insert(0, Arc::new(crate::ordered_index::OrderedIndexAccelerator));
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
-            external_sources: services.external_sources, compaction_relay: services.compaction_relay, clock: services.clock, options });
+            external_sources: services.external_sources, compaction_relay: services.compaction_relay, clock: services.clock, artefact_kinds: services.artefact_kinds,
+            accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, keyed: Arc::default() };
         let mut initial = Vec::new();
@@ -155,6 +173,8 @@ impl Node {
     }
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> { &self.catalog }
     pub fn memory(&self) -> &Arc<MemoryBudget> { &self.factory.memory }
+    /// The budget a query or a result stream reserves from, as the node's query options shape it.
+    pub fn query_memory(&self) -> Arc<MemoryBudget> { self.factory.options.query.query_memory(&self.factory.memory) }
     pub fn cache_budget(&self) -> &Arc<CacheBudget> { &self.factory.cache }
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.
@@ -293,7 +313,8 @@ impl Node {
         }
         let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
             .with_fragmenter(self.scan_fragmenter.clone());
-        QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+        QueryContext::with_owner(catalog, self.factory.options.query.query_memory(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+            .with_accelerators(Arc::clone(&self.factory.accelerators))
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
     }
 

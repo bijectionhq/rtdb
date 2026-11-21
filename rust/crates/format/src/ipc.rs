@@ -49,6 +49,47 @@ impl FileLayout {
     }
 }
 
+/// A file of `length` bytes of which only some ranges are at hand, added as a reader needs them; reading outside them fails.
+/// Clones share the ranges, so a caller can add a page's range to a reader it handed to an `ArrowFile`.
+#[derive(Clone)]
+pub struct SparseFile { length: u64, position: u64, ranges: Arc<std::sync::Mutex<Vec<(u64, Arc<dyn AsRef<[u8]> + Send + Sync>)>>> }
+impl SparseFile {
+    pub fn new(length: u64) -> Self { Self { length, position: 0, ranges: Default::default() } }
+    /// Makes `bytes` the file's contents from `start`; a later range shadows an earlier one where they overlap.
+    pub fn add(&self, start: u64, bytes: Arc<dyn AsRef<[u8]> + Send + Sync>) {
+        if let Ok(mut ranges) = self.ranges.lock() { ranges.push((start, bytes)); }
+    }
+    /// Keeps only the ranges at and after `keep`, so that pages read before it release their bytes.
+    pub fn retain_from(&self, keep: usize) {
+        if let Ok(mut ranges) = self.ranges.lock() { let drop = ranges.len().saturating_sub(keep); ranges.drain(..drop); }
+    }
+}
+impl Read for SparseFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.position >= self.length { return Ok(0); }
+        let ranges = self.ranges.lock().map_err(|_| std::io::Error::other("Sparse file ranges are poisoned"))?;
+        let found = ranges.iter().rev().find(|(start, bytes)| *start <= self.position && self.position < start + bytes.as_ref().as_ref().len() as u64);
+        let Some((start, bytes)) = found else { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Read outside the ranges fetched of a sparse file")) };
+        let bytes = bytes.as_ref().as_ref();
+        let offset = (self.position - start) as usize;
+        let count = buffer.len().min(bytes.len() - offset);
+        buffer[..count].copy_from_slice(&bytes[offset..offset + count]);
+        self.position += count as u64;
+        Ok(count)
+    }
+}
+impl Seek for SparseFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(offset) => self.length.checked_add_signed(offset),
+            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+        }.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Seek outside a sparse file"))?;
+        self.position = next;
+        Ok(next)
+    }
+}
+
 trait RetainedReader: Read + Seek + Send {}
 impl<T: Read + Seek + Send> RetainedReader for T {}
 
@@ -103,6 +144,14 @@ impl ArrowFile {
     }
 
     /// Returned batches retain their buffers independently of this reader.
+    /// The bytes of the file that hold `page`, which `read_page` reads and nothing else.
+    pub fn page_range(&self, page: usize) -> Result<std::ops::Range<u64>> {
+        let block = self.blocks.get(page).ok_or_else(|| invalid(format!("Page {page} is outside a {}-page file", self.page_count())))?;
+        let start = u64::try_from(block.offset()).map_err(invalid)?;
+        let length = u64::try_from(block.metaDataLength()).map_err(invalid)?.checked_add(u64::try_from(block.bodyLength()).map_err(invalid)?).ok_or_else(|| invalid("Arrow block length overflow"))?;
+        Ok(start..start.checked_add(length).ok_or_else(|| invalid("Arrow block end overflow"))?)
+    }
+
     pub fn read_page(&mut self, page: usize) -> Result<RecordBatch> {
         if page >= self.page_count() {
             return Err(invalid(format!("Page {page} is outside a {}-page file", self.page_count())));

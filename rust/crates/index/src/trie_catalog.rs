@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_types::CivilDate;
-use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::TrieKey, log::proto as log_pb};
+use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{PartGroup, TrieKey}, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,13 +13,15 @@ pub struct CatalogTrie {
     pub data_file_size: i64,
     pub metadata: Option<log_pb::TrieMetadata>,
     pub state: TrieState,
+    /// Files derived from this trie's data file, at most one per (kind, definition id, definition version).
+    pub artefacts: Vec<log_pb::ArtefactRecord>,
 }
 
 impl CatalogTrie {
     pub fn notification(key: TrieKey, data_file_size: i64, mut metadata: Option<log_pb::TrieMetadata>) -> Result<Self> {
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
         if let Some(metadata) = &mut metadata { metadata.iid_bloom = None; }
-        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent })
+        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent, artefacts: Vec::new() })
     }
 
     pub fn from_proto(value: &log_pb::TrieDetails) -> Result<Self> {
@@ -32,7 +34,7 @@ impl CatalogTrie {
         };
         let data_file_size = value.data_file_size.unwrap_or_default();
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
-        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state })
+        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state, artefacts: value.artefacts.clone() })
     }
 
     pub fn to_proto(&self, table: &TableRef) -> log_pb::TrieDetails {
@@ -43,8 +45,12 @@ impl CatalogTrie {
         log_pb::TrieDetails {
             table_name: Some(table.schema_and_table()), trie_key: Some(self.key.to_string()),
             data_file_size: Some(self.data_file_size), trie_metadata: self.metadata.clone(),
-            trie_state: Some(state), garbage_as_of,
+            trie_state: Some(state), garbage_as_of, artefacts: self.artefacts.clone(),
         }
+    }
+
+    pub fn artefact(&self, kind: &str, definition_id: &str, definition_version: i64) -> Option<&log_pb::ArtefactRecord> {
+        self.artefacts.iter().find(|record| same_artefact(record, kind, definition_id, definition_version))
     }
 
     fn garbage(&mut self, as_of: Timestamp) { self.state = TrieState::Garbage { as_of }; self.metadata = None; }
@@ -181,6 +187,14 @@ impl TrieCatalog {
     pub fn current_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         self.all_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).collect()
     }
+    /// The entry the catalog holds for `key`, live, nascent or garbage.
+    pub fn trie(&self, table: &TableRef, key: &TrieKey) -> Option<&CatalogTrie> {
+        self.tables.get(table)?.shards.get(&Shard::of(key))?.tries.get(&key.block_index()).filter(|trie| &trie.key == key)
+    }
+    /// The entries the catalog holds for a partition group's members, in bucket order; a member it does not hold is left out.
+    pub fn group_members(&self, table: &TableRef, group: &PartGroup) -> Vec<&CatalogTrie> {
+        group.members().iter().filter_map(|key| self.trie(table, key)).collect()
+    }
     pub(crate) fn has_current_tries(&self, table: &TableRef) -> bool {
         self.iter_tries(table).any(|trie| trie.state == TrieState::Live)
     }
@@ -205,6 +219,39 @@ impl TrieCatalog {
                         shard.tries.remove(&key.block_index());
                     }
                 }
+            }
+        }
+        next
+    }
+    /// Keeps the first record for each definition version, except when a live trie replaces its obsolete group's record with its own.
+    pub fn with_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
+        let mut next = self.clone();
+        if let Some(state) = next.tables.get_mut(table) {
+            for (key, record) in entries {
+                let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
+                let (kind, id, version) = (record.kind(), record.definition_id(), record.definition_version());
+                let held = trie.artefacts.iter_mut().find(|held| same_artefact(held, kind, id, version));
+                match held {
+                    None => trie.artefacts.push(record),
+                    Some(held) if held.scope() == log_pb::ArtefactScope::PartGroup
+                        && record.scope() == log_pb::ArtefactScope::Trie
+                        && trie.state == TrieState::Live
+                        && key.part_group().is_some_and(|group| group.members().iter().any(|member| {
+                            self.trie(table, member).is_none_or(|trie| matches!(trie.state, TrieState::Garbage { .. }))
+                        })) => *held = record,
+                    Some(_) => {}
+                }
+            }
+        }
+        next
+    }
+    /// A record matches an entry on kind, definition id and definition version alone.
+    pub fn without_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
+        let mut next = self.clone();
+        if let Some(state) = next.tables.get_mut(table) {
+            for (key, record) in entries {
+                let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
+                trie.artefacts.retain(|held| (held.kind(), held.definition_id(), held.definition_version()) != (record.kind(), record.definition_id(), record.definition_version()));
             }
         }
         next
@@ -285,6 +332,10 @@ impl TrieCatalog {
         }
         Ok(catalog)
     }
+}
+
+fn same_artefact(record: &log_pb::ArtefactRecord, kind: &str, definition_id: &str, definition_version: i64) -> bool {
+    record.kind() == kind && record.definition_id() == definition_id && record.definition_version() == definition_version
 }
 
 fn table_partitions(block: &TableBlock) -> Result<Vec<block_pb::Partition>> {

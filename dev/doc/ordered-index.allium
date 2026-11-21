@@ -1,0 +1,28 @@
+-- allium: 3
+-- Ordered secondary indexes over resolved table events.
+-- Table events and capture follow db.allium and allium/live-index.allium.
+-- See rust/crates/node/src/ordered_index.
+
+entity Definition {
+    identity: String
+    generation: Integer
+    columns: List<String>
+}
+
+entity Checkpoint {
+    definition: Definition
+    frontier: Integer
+    source_rows: Integer
+}
+
+-- Invariants
+--
+-- A checkpoint covers the table catalog's durable event count at its frontier.
+-- The checkpoint becomes usable after every referenced page is durable.
+-- A root contains each winning indexed row over disjoint valid-time spans at its system-time point.
+-- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
+-- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
+-- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
+-- A point read merges bucket prefixes in key order and fetches payload at the same basis.
+-- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
+-- Data compaction preserves input events and changes no ordered-index checkpoint.

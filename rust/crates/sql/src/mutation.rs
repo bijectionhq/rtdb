@@ -12,6 +12,10 @@ pub enum Mutation {
     Assert { input: Arc<Relation>, message: Option<String> },
     CreateTable { table: QualifiedTable, columns: Vec<String> },
     GrantRole { user: String, role: String, revoke: bool },
+    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool },
+    DropSearchIndex { name: String },
+    CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
+    DropOrderedIndex { name: String },
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +137,10 @@ fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
         }
         Dml::CreateTable { table, columns } => Mutation::CreateTable { table, columns },
         Dml::GrantRole { user, role, revoke } => Mutation::GrantRole { user, role, revoke },
+        Dml::CreateSearchIndex { name, table, columns, history } => Mutation::CreateSearchIndex { name, table, columns, history },
+        Dml::DropSearchIndex { name } => Mutation::DropSearchIndex { name },
+        Dml::CreateOrderedIndex { name, table, columns, if_not_exists } => Mutation::CreateOrderedIndex { name, table, columns, if_not_exists },
+        Dml::DropOrderedIndex { name } => Mutation::DropOrderedIndex { name },
     })
 }
 
@@ -160,7 +168,7 @@ pub fn prepare_patch(table: QualifiedTable, input: Arc<Relation>, valid_time: Te
     columns.insert("_valid_to".into(), instant_type().maybe());
     let fields = columns.into_iter().map(|(name, ty)| binder.field(name, None, ty)).collect::<Result<Vec<_>>>()?;
     let old = match binding {
-        Some(table) => Arc::new(Relation::scan(Scan { table, columns: fields, valid_time: TemporalFilter::FromTo { from: from.clone(), to: to.clone() }, system_time: TemporalFilter::Default, clamp_valid_time: true, iids: None, predicates: Vec::new() })?),
+        Some(table) => Arc::new(Relation::scan(Scan { table, columns: fields, valid_time: TemporalFilter::FromTo { from: from.clone(), to: to.clone() }, system_time: TemporalFilter::Default, clamp_valid_time: true, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new() })?),
         None => Arc::new(Relation::empty(Schema::new(fields)?)),
     };
     let find = |name: &str| old.schema().fields().iter().find(|field| field.name == name).map(Field::expression).ok_or_else(|| invalid("PATCH old column is absent"));

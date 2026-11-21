@@ -17,6 +17,11 @@ pub enum Dml {
     Assert { input: Arc<Relation>, message: Option<String> },
     CreateTable { table: QualifiedTable, columns: Vec<String> },
     GrantRole { user: String, role: String, revoke: bool },
+    /// `history` is false when the index covers only the current side (fts.allium: SearchIndexDefinition).
+    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool },
+    DropSearchIndex { name: String },
+    CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
+    DropOrderedIndex { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -176,7 +176,7 @@ fn bind_parsed<T>(
     let forms = parsed.forms;
     let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
     let scoped_catalog = TransactionCatalog(catalog);
-    let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
+    let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
@@ -302,6 +302,20 @@ impl Context<'_> {
                 Ok(Statement::Dml(Dml::CreateTable { table: self.target(table)?, columns }))
             }
             Syntax::GrantRole { user, role, revoke } => Ok(Statement::Dml(Dml::GrantRole { user: user.normalized(), role: role.normalized(), revoke: *revoke })),
+            Syntax::CreateSearchIndex { name, table, columns, history } => {
+                let columns: Vec<_> = columns.iter().map(Identifier::normalized).collect();
+                if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("CREATE SEARCH INDEX repeats a column")); }
+                if columns.iter().any(|name| name.starts_with('_')) { return Err(error("CREATE SEARCH INDEX cannot index internal columns")); }
+                Ok(Statement::Dml(Dml::CreateSearchIndex { name: name.normalized(), table: self.target(table)?, columns, history: *history }))
+            }
+            Syntax::DropSearchIndex { name } => Ok(Statement::Dml(Dml::DropSearchIndex { name: name.normalized() })),
+            Syntax::CreateOrderedIndex { name, table, columns, if_not_exists } => {
+                let columns: Vec<_> = columns.iter().map(Identifier::normalized).collect();
+                if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("CREATE INDEX repeats a column")); }
+                if columns.iter().any(|name| name.starts_with('_') && name != "_id") { return Err(error("CREATE INDEX cannot index internal columns")); }
+                Ok(Statement::Dml(Dml::CreateOrderedIndex { name: name.normalized(), table: self.target(table)?, columns, if_not_exists }))
+            }
+            Syntax::DropOrderedIndex { name } => Ok(Statement::Dml(Dml::DropOrderedIndex { name: name.normalized() })),
             Syntax::Records { patch, table, records } => {
                 use crate::{StaticMutation, StaticMutationKind};
                 let StaticMutation { table, input, kind } = self.record_rows(*patch, table, records)?;
@@ -774,6 +788,7 @@ impl Context<'_> {
             )?;
             (input, projected, names)
         };
+        let mut distinct = select.distinct;
         if let Some(order_by) = order_by {
             let ast::OrderByKind::Expressions(expressions) = &order_by.kind else { return Err(grammar_rejected("ORDER BY ALL")); };
             let fields = projected.iter().map(|projection| projection.field.clone()).collect::<Vec<_>>();
@@ -799,10 +814,22 @@ impl Context<'_> {
                 let descending = sort_descending(&expression.options)?;
                 order.push(SortExpr { expr, descending, nulls_first: expression.options.nulls_first.unwrap_or(descending) });
             }
-            input = Arc::new(input.sort(order)?);
-            input = Arc::new(input.project(fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect())?);
+            let order_uses_projection = order.iter().all(|sort| {
+                matches!(&sort.expr, Expr::Column { id, .. } if fields.iter().any(|field| field.id == *id))
+            });
+            let output = fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect();
+            if distinct && order_uses_projection {
+                // Sorting observes only the retained output, so equal rows share a sort key.
+                input = Arc::new(input.project(output)?);
+                input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Distinct { input })?);
+                input = Arc::new(input.sort(order)?);
+                distinct = false;
+            } else {
+                input = Arc::new(input.sort(order)?);
+                input = Arc::new(input.project(output)?);
+            }
         } else { input = Arc::new(input.project(projected)?); }
-        if select.distinct {
+        if distinct {
             input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Distinct { input })?);
         }
         // The reference parses `GROUP BY ()` but its plan never conforms, so the rest of the query is bound first for its errors to take precedence.
@@ -1067,7 +1094,7 @@ impl Context<'_> {
                     else { columns.push(field.clone()); }
                     output.push(field);
                 }
-                let relation = Arc::new(Relation::scan(Scan { table: binding, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates: Vec::new() })?);
+                let relation = Arc::new(Relation::scan(Scan { table: binding, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new() })?);
                 let relation = if purpose == TablePurpose::Query {
                     let prefix = self.symbol(&qualifier)?;
                     rename_source(relation, prefix)?

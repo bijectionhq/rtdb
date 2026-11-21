@@ -558,6 +558,9 @@ impl ObjectStore for EncryptingStore {
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?) }
+    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        self.open(key, self.inner.get_fresh(key).await?)
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         let plaintext = self.get(key).await?;
         let length = plaintext.len() as u64;
@@ -566,7 +569,7 @@ impl ObjectStore for EncryptingStore {
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         // An immutable put retried with identical content is a completed retry; sealing twice gives different bytes, so the retry is recognised before sealing.
-        if let Ok(existing) = self.get(key).await { return if existing == bytes { Ok(()) } else { Err(Error::Task(format!("{key} already exists with different content"))) }; }
+        if let Ok(existing) = self.get_fresh(key).await { return if existing == bytes { Ok(()) } else { Err(Error::Task(format!("{key} already exists with different content"))) }; }
         self.inner.put(key, self.seal(key, &bytes)?).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
@@ -577,6 +580,7 @@ impl ObjectStore for EncryptingStore {
         Ok(self.inner.list(directory).await?.into_iter().map(plain).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    async fn forget(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.forget(key).await }
 }
 
 /// A garbage record: an object released by its deployment, which the reaper may erase once `released_at_ms` is older than its grace period.

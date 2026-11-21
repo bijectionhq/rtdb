@@ -43,8 +43,8 @@ pub struct CompactionDriver {
     requests: mpsc::Receiver<Completion>,
 }
 
-struct Completion { reply: oneshot::Sender<Result<()>>, _permit: OwnedSemaphorePermit }
-impl Completion { fn send(self, result: Result<()>) { let _ = self.reply.send(result); } }
+pub(crate) struct Completion { pub(crate) reply: oneshot::Sender<Result<()>>, pub(crate) _permit: OwnedSemaphorePermit }
+impl Completion { pub(crate) fn send(self, result: Result<()>) { let _ = self.reply.send(result); } }
 
 type JobKey = (TableRef, TrieKey);
 
@@ -89,16 +89,21 @@ impl CompactionDriver {
                 let publisher = Arc::clone(&self.publisher);
                 let snapshots = Arc::clone(&self.snapshots);
                 let token = workers.clone();
+                let work = async move {
+                    if !available_jobs(snapshots.snapshot().trie_catalog())?.iter().any(|available| available == &job) { return Ok(()); }
+                    let notification = executor.execute(&job, &token).await?;
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => Err(crate::closed()),
+                        result = publisher.publish(notification) => result.map(|_| ()),
+                    }
+                };
+                // A merge is CPU-bound for as long as it runs, so each job drives its future on a blocking thread of its
+                // own: jobs run in parallel up to `parallelism`, and none holds a worker that queries and commits need.
+                let runtime = tokio::runtime::Handle::current();
+                let worker = tokio::task::spawn_blocking(move || runtime.block_on(work));
                 running.push(async move {
-                    let result = async {
-                        if !available_jobs(snapshots.snapshot().trie_catalog())?.iter().any(|available| available == &job) { return Ok(()); }
-                        let notification = executor.execute(&job, &token).await?;
-                        tokio::select! {
-                            biased;
-                            _ = token.cancelled() => Err(crate::closed()),
-                            result = publisher.publish(notification) => result.map(|_| ()),
-                        }
-                    }.await;
+                    let result = worker.await.unwrap_or_else(|error| Err(Anomaly::fault("rtdb.maintenance/compaction-worker", format!("Compaction worker failed: {error}"))));
                     (key, result)
                 }.boxed());
             }

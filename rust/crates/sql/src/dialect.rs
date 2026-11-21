@@ -203,7 +203,6 @@ impl Dialect for SqlDialect {
         supports_user_host_grantee,
         supports_string_escape_constant,
         supports_array_typedef_with_brackets,
-        supports_match_against,
         supports_set_names,
         supports_comma_separated_set_assignments,
         supports_filter_during_aggregation,

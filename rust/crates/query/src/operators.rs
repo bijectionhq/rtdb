@@ -8,7 +8,6 @@ use rtdb_types::{Result, Value};
 
 use crate::context::Execution;
 use crate::cursor::{BoxCursor, OwnedRow};
-use crate::spill::{SpillReader, SpillWriter};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
 use crate::{invalid, QueryContext};
 use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
@@ -73,17 +72,45 @@ pub(crate) fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution,
         RelationNode::Join { left,right,kind: rtdb_plan::JoinKind::Inner,condition: Some(condition) } if execution.analysis.is_none() && execution.context.tracer.is_none() => {
             let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?)?,batch_shape(&runtime.child(1)?)?) else { return Ok(None) };
             if build_projected != probe_projected || !crate::join::build_left(left,right,rtdb_plan::JoinKind::Inner,&execution)? { return Ok(None); }
-            let mut layout = crate::join_key::JoinLayout::new(left,right,Some(condition),&execution.context.memory)?;
-            layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
+            // The left input is built unless it would spill and the right one fits, in which case the right one is built
+            // and the output keeps its left-then-right columns: a spilled build orders its output differently anyway.
+            let threshold = execution.context.options.join_build_rows;
+            let swapped = crate::join::rows_at_most(left,&execution)? > threshold && crate::join::rows_at_most(right,&execution)? <= threshold;
+            let (build_side,probe_side,build_relation,probe_relation) = if swapped { (1,0,right,left) } else { (0,1,left,right) };
+            let mut layout = crate::join_key::JoinLayout::new(build_relation,probe_relation,Some(condition),&execution.context.memory)?;
+            layout.resolve_types(runtime.child(build_side)?.schema(),runtime.child(probe_side)?.schema(),&execution)?;
             let Some(order) = crate::batch_join::key_order(&layout) else { return Ok(None) };
-            let Some((build,projected)) = build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await? else { return Ok(None) };
+            let Some((build,projected)) = build_batches(runtime.child(build_side)?,execution.child(build_side),pushdowns.clone()).await? else { return Ok(None) };
             if projected != build_projected { return Ok(None); }
-            let probe = crate::batch_join::ProbeInput { runtime: runtime.child(1)?,execution: execution.child(1),pushdowns };
-            Ok(Some((Box::new(crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution)) as crate::columnar::BoxBatchCursor,projected)))
+            let probe = crate::batch_join::ProbeInput { runtime: runtime.child(probe_side)?,execution: execution.child(probe_side),pushdowns };
+            let unswapped = if swapped {
+                let mut layout = crate::join_key::JoinLayout::new(left,right,Some(condition),&execution.context.memory)?;
+                layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
+                Some(layout)
+            } else { None };
+            Ok(Some((Box::new(crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution).swapped(unswapped)) as crate::columnar::BoxBatchCursor,projected)))
         }
         _ => Ok(None),
     }
 }) }
+
+/// Opens a whole plan as a batch source where `build_batches` takes its shape, charging the root operator's state as
+/// `build_pages` does; `None` where the plan runs as pages.
+pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
+    execution.context.check_cancelled()?;
+    if execution.analysis.is_some() || execution.context.tracer.is_some() || batch_shape(&runtime)?.is_none() { return Ok(None); }
+    let reservation = state_reservation(&runtime, &execution)?;
+    let Some((batches, _)) = build_batches(runtime, execution, None).await? else { return Ok(None) };
+    Ok(Some(crate::columnar::retain_batch_state(batches, reservation)))
+}
+
+fn state_reservation(runtime: &Arc<EmittedRelation>, execution: &Execution) -> Result<Arc<rtdb_columnar::MemoryReservation>> {
+    let relation = runtime.relation();
+    let mut state_bound = crate::runtime_schema::local_allocation_bound(relation)?;
+    state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.schema())?).ok_or_else(||invalid("operator-size","Operator schema copies exceed addressable memory"))?;
+    for (index,_) in relation.children().iter().enumerate() { state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.child(index)?.schema())?).ok_or_else(|| invalid("operator-size", "Operator schema copies exceed addressable memory"))?; }
+    execution.context.memory.reserve(state_bound)
+}
 
 /// Whether `build_batches` opens this subtree as batches, and if so whether they pass through a projection.
 fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
@@ -107,10 +134,7 @@ fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
 fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<crate::pages::BoxPageCursor>> { Box::pin(async move {
     execution.context.check_cancelled()?;
     let relation = Arc::clone(runtime.relation());
-    let mut state_bound = crate::runtime_schema::local_allocation_bound(&relation)?;
-    state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.schema())?).ok_or_else(||invalid("operator-size","Operator schema copies exceed addressable memory"))?;
-    for (index,_) in relation.children().iter().enumerate() { state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.child(index)?.schema())?).ok_or_else(|| invalid("operator-size", "Operator schema copies exceed addressable memory"))?; }
-    let state_reservation = execution.context.memory.reserve(state_bound)?;
+    let state_reservation = state_reservation(&runtime, &execution)?;
     let traced_relation = Arc::clone(&relation);
     let traced_context = Arc::clone(&execution.context);
     let analysis = execution.analysis.clone();
@@ -238,6 +262,17 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         RelationNode::SortLimit { order_by,offset,fetch,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
+            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
+            let remaining = row_limit(fetch.as_ref(),&execution).await?;
+            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
+            if !order_by.is_empty() && fetch.is_some()
+                && let Ok(limit) = usize::try_from(row_limit)
+                && let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await?
+            {
+                let pages = Box::new(Limit { input: Some(input), offset: offset_value, remaining, execution });
+                let pages = crate::pages::retain_page_state(pages, state_reservation);
+                return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
+            }
             let schema = runtime.child(0)?.schema().clone();
             let batches = if !order_by.is_empty() && execution.analysis.is_none() && execution.context.tracer.is_none() && crate::sort::SortCursor::batch_eligible(&schema,order_by,0) {
                 build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await?
@@ -246,9 +281,6 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
                 Some(batches) => Ok(batches),
                 None => Err(build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?),
             };
-            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
-            let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
             let mut pages: BoxPageCursor = match input {
                 Ok((batches,projected)) if crate::sort::SortCursor::batch_eligible(&schema,order_by,row_limit) =>
                     Box::new(crate::sort::SortCursor::top_batches(batches,projected,schema,order_by.clone(),row_limit,execution.clone())),
@@ -398,6 +430,37 @@ impl PageCursor for LiteralPageCursor {
         Ok(Some(page))
     }
 }
+fn ordered_input(runtime: Arc<EmittedRelation>, execution: Execution, limit: usize)
+    -> futures::future::BoxFuture<'static, Result<Option<BoxPageCursor>>>
+{
+    Box::pin(async move {
+        let relation = runtime.relation();
+        let input: BoxPageCursor = match relation.node() {
+            RelationNode::Scan(scan) => {
+                let Some(input) = crate::scan::ordered_pages(scan, &execution, limit).await? else { return Ok(None); };
+                input
+            }
+            RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
+                let child = runtime.child(0)?;
+                let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit).await? else { return Ok(None); };
+                Box::new(PageProject { input, schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone() })
+            }
+            RelationNode::Extend { expressions, .. } => {
+                let child = runtime.child(0)?;
+                let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit).await? else { return Ok(None); };
+                Box::new(PageExtend { input, schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone() })
+            }
+            RelationNode::Filter { .. } | RelationNode::Distinct { .. } => {
+                let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await? else { return Ok(None); };
+                input
+            }
+            _ => return Ok(None),
+        };
+        let input = crate::pages::retain_page_state(input, state_reservation(&runtime, &execution)?);
+        Ok(Some(crate::trace::wrap(crate::analysis::wrap(input, execution.analysis.clone()), relation, &execution.context)))
+    })
+}
+
 struct PageProject { input: BoxPageCursor, schema: Schema, expressions: Vec<NamedExpr>, execution: Execution }
 #[async_trait]
 impl PageCursor for PageProject {
@@ -527,32 +590,56 @@ pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory
     }
     Ok(true)
 }
-pub(crate) struct SeenRows { writer: SpillWriter, runtime: Arc<RuntimeSchema>, context: Arc<QueryContext> }
-impl SeenRows {
-    pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeSchema>) -> Result<Self> { Ok(Self { writer: context.spill.create()?, runtime, context: Arc::clone(context) }) }
-    pub fn insert(&mut self, values: &[Value]) -> Result<bool> {
-        for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
-        let mut reader = self.writer.reader(Arc::clone(&self.context.memory))?;
-        while let Some(row) = reader.next()? {
-            self.context.check_cancelled()?;
-            if rows_equal(values, &row.values, &self.context.timezone, &self.context.memory)? { return Ok(false); }
+/// A hash that rows equal under `rows_equal` share.
+/// A date or timestamp equals one of another unit or zone once the session zone localizes it, so it hashes as the
+/// wall-clock time it reads as there; date-times nested in a container hash alike, and `rows_equal` tells them apart.
+fn equality_hash(values: &[Value], timezone: &str) -> u32 {
+    fn temporal(value: &Value) -> bool {
+        match value {
+            Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
+            Value::List(values) | Value::FixedSizeList(values) | Value::Set(values) => values.iter().any(temporal),
+            Value::Struct(fields) => fields.values().any(temporal),
+            Value::Map { entries, .. } => entries.iter().any(|(key, value)| temporal(key) || temporal(value)),
+            _ => false,
         }
-        self.writer.write(values, &self.context.memory)?;
+    }
+    values.iter().fold(0u32, |hash, value| {
+        let cell = match value {
+            Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) => rtdb_expr::local_micros(value, timezone)
+                .and_then(|micros| rtdb_columnar::hash_value(&Value::I64(micros), 0).ok()).map_or(0x7e3a_11c5, |cell| (cell as u32) ^ 0x7e3a_11c5),
+            value if temporal(value) => 0x7e3a_11c5,
+            value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
+        };
+        (hash ^ cell.wrapping_mul(0xcc9e_2d51).rotate_left(15)).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64)
+    })
+}
+/// The distinct rows seen so far, found through an index from their hash to the rows that share it.
+pub(crate) struct SeenRows { rows: Vec<OwnedRow>, index: std::collections::HashMap<u32, Vec<usize>>, validated: bool, runtime: Arc<RuntimeSchema>, context: Arc<QueryContext>, _reservation: Option<Arc<rtdb_columnar::MemoryReservation>> }
+impl SeenRows {
+    pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeSchema>) -> Result<Self> { Ok(Self { rows: Vec::new(), index: Default::default(), validated: false, runtime, context: Arc::clone(context), _reservation: None }) }
+    pub fn insert(&mut self, values: &[Value]) -> Result<bool> {
+        if !self.validated {
+            for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
+            self.validated = true;
+        }
+        let hash = equality_hash(values, &self.context.timezone);
+        if let Some(candidates) = self.index.get(&hash) {
+            for &candidate in candidates {
+                if rows_equal(values, &self.rows[candidate].values, &self.context.timezone, &self.context.memory)? { return Ok(false); }
+            }
+        }
+        let row = OwnedRow::copy_parts(&[values], 0, 0, &self.context.memory)?;
+        if self.rows.len() == self.rows.capacity() {
+            let capacity = self.rows.capacity().saturating_mul(2).max(16);
+            let bytes = capacity.checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>())
+                .ok_or_else(|| invalid("distinct-size", "Distinct rows exceed addressable memory"))?;
+            self._reservation = Some(self.context.memory.reserve(bytes)?);
+            self.rows.reserve_exact(capacity - self.rows.len());
+        }
+        self.index.entry(hash).or_default().push(self.rows.len());
+        self.rows.push(row);
         Ok(true)
     }
-}
-pub(crate) struct OrdinalSet { writer: SpillWriter, context: Arc<QueryContext> }
-impl OrdinalSet {
-    pub fn new(context: &Arc<QueryContext>) -> Result<Self> { Ok(Self { writer: context.spill.create()?, context: Arc::clone(context) }) }
-    pub fn contains(&mut self, ordinal: u64) -> Result<bool> {
-        let mut reader = self.writer.reader(Arc::clone(&self.context.memory))?;
-        while let Some(row) = reader.next()? {
-            self.context.check_cancelled()?;
-            if row.values.first() == Some(&Value::U64(ordinal)) { return Ok(true); }
-        }
-        Ok(false)
-    }
-    pub fn insert(&mut self, ordinal: u64) -> Result<()> { self.writer.write(&[Value::U64(ordinal)], &self.context.memory) }
 }
 struct Distinct { input: BoxPageCursor, seen: SeenRows, execution: Execution }
 #[async_trait]
@@ -571,19 +658,28 @@ impl PageCursor for Distinct {
     }
 }
 
-struct SetCursor { left: BoxPageCursor, right: Option<BoxPageCursor>, reader: Option<SpillReader>, operator: SetOperator, all: bool, consumed: OrdinalSet, seen: SeenRows, runtime: Arc<EmittedRelation>, execution: Execution }
+struct SetCursor { left: BoxPageCursor, right: Option<BoxPageCursor>, built: Option<RightRows>, operator: SetOperator, all: bool, seen: SeenRows, runtime: Arc<EmittedRelation>, execution: Execution }
+/// The right input, indexed by the hash rows equal under `rows_equal` share, and which of its rows an ALL operator consumed.
+struct RightRows { rows: Vec<OwnedRow>, index: std::collections::HashMap<u32, Vec<usize>>, consumed: Vec<bool>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl SetCursor {
     fn new(left: BoxPageCursor, right: BoxPageCursor, operator: SetOperator, all: bool, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
-        Ok(Self { left, right: Some(right), reader: None, operator, all, consumed: OrdinalSet::new(&execution.context)?, seen: SeenRows::new(&execution.context, runtime.child(0)?.output())?, runtime, execution })
+        Ok(Self { left, right: Some(right), built: None, operator, all, seen: SeenRows::new(&execution.context, runtime.child(0)?.output())?, runtime, execution })
     }
 }
 #[async_trait]
 impl PageCursor for SetCursor {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         if let Some(mut right) = self.right.take() {
-            let mut writer = self.execution.context.spill.create()?;
-            while let Some(mut page) = right.next_page().await? { while let Some(row) = page.next() { self.execution.context.check_cancelled()?;writer.write(&row.values,&self.execution.context.memory)?; } }
-            self.reader = Some(writer.finish()?.reader(Arc::clone(&self.execution.context.memory))?);
+            let memory = &self.execution.context.memory;
+            let mut rows = Vec::new();
+            while let Some(mut page) = right.next_page().await? { while let Some(row) = page.next() { self.execution.context.check_cancelled()?; rows.push(OwnedRow::copy_parts(&[&row.values], 0, 0, memory)?); } }
+            let bytes = rows.len().checked_mul(std::mem::size_of::<OwnedRow>() + std::mem::size_of::<(u32, Vec<usize>)>() + 2 * std::mem::size_of::<usize>() + 1)
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| invalid("set-size", "Set rows exceed addressable memory"))?;
+            let reservation = memory.reserve(bytes)?;
+            let mut index: std::collections::HashMap<u32, Vec<usize>> = Default::default();
+            for (ordinal, row) in rows.iter().enumerate() { index.entry(equality_hash(&row.values, &self.execution.context.timezone)).or_default().push(ordinal); }
+            let consumed = vec![false; rows.len()];
+            self.built = Some(RightRows { rows, index, consumed, _reservation: reservation });
         }
         while let Some(mut page) = self.left.next_page().await? {
           let mut output = PageBuilder::new(page.len(),&self.execution.context.memory)?;
@@ -592,18 +688,17 @@ impl PageCursor for SetCursor {
             let left_types = self.runtime.child(0)?;let right_types = self.runtime.child(1)?;
             for (left, right) in left_types.schema().fields().iter().zip(right_types.schema().fields()) { rtdb_plan::validate_equality_types(&left.data_type, &right.data_type)?; }
             if !self.all && !self.seen.insert(&left.values)? { continue; }
-            let reader = self.reader.as_mut().ok_or_else(|| invalid("set-state", "Set input was not spooled"))?;
-            reader.rewind()?;
-            let mut ordinal = 0u64;
+            let built = self.built.as_mut().ok_or_else(|| invalid("set-state", "Set input was not built"))?;
             let mut matched = false;
-            while let Some(right) = reader.next()? {
-                self.execution.context.check_cancelled()?;
-                if rows_equal(&left.values, &right.values, &self.execution.context.timezone, &self.execution.context.memory)? && (!self.all || !self.consumed.contains(ordinal)?) {
-                    if self.all { self.consumed.insert(ordinal)?; }
-                    matched = true;
-                    break;
+            if let Some(candidates) = built.index.get(&equality_hash(&left.values, &self.execution.context.timezone)) {
+                for &ordinal in candidates {
+                    if self.all && built.consumed[ordinal] { continue; }
+                    if rows_equal(&left.values, &built.rows[ordinal].values, &self.execution.context.timezone, &self.execution.context.memory)? {
+                        if self.all { built.consumed[ordinal] = true; }
+                        matched = true;
+                        break;
+                    }
                 }
-                ordinal = ordinal.checked_add(1).ok_or_else(|| invalid("row-count", "Set row count overflow"))?;
             }
             if matched == (self.operator == SetOperator::Intersect) { output.push(left)?; }
           }

@@ -326,3 +326,20 @@ async fn database_pools_share_one_ceiling_while_a_detached_pool_lease_remains_li
     assert_eq!(budget.retained_bytes(), 0);
     assert_eq!(second.get(&key).await.unwrap().as_slice(), b"other");
 }
+
+#[tokio::test]
+async fn a_local_objects_file_reads_its_bytes_even_after_a_delete() {
+    use std::io::Read;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalStore::open(directory.path()).unwrap());
+    let key = ObjectKey::new("tables/docs/artefacts/file.bin").unwrap();
+    store.put(&key, bytes::Bytes::from_static(b"search file")).await.unwrap();
+    let local = store.local_file(&key).await.unwrap().expect("a local store's objects are files");
+    store.delete(&key).await.unwrap();
+    let mut bytes = Vec::new();
+    local.file().try_clone().unwrap().read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"search file");
+    assert!(matches!(store.local_file(&key).await, Err(rtdb_storage::Error::MissingObject(_))));
+    assert!(rtdb_storage::MemoryStore::default().local_file(&key).await.unwrap().is_none(), "a memory store has no local file");
+    store.close_and_wait().await;
+}

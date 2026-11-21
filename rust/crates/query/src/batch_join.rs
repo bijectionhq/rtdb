@@ -13,7 +13,7 @@ use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch};
 use crate::context::Execution;
 use crate::invalid;
 use crate::join_key::JoinLayout;
-use crate::join_storage::{HashIndex, hash_values};
+use crate::join_storage::{HashIndex, combine_cell_hash, hash_values};
 use crate::operators::DeferredInput;
 use crate::pages::{BoxPageCursor, OwnedPage, PageCursor};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
@@ -42,19 +42,26 @@ enum State {
 }
 
 /// The build side: its batches, the key cells of every row in order, and the index over their hashes.
-struct Table { batches: Vec<ColumnBatch>, starts: Vec<usize>, keys: Vec<Value>, index: HashIndex, _keys: Arc<MemoryReservation> }
+struct Table { batches: Vec<ColumnBatch>, starts: Vec<usize>, keys: Vec<Value>, kind: Option<KeyKind>, index: HashIndex, _keys: Arc<MemoryReservation> }
 
 pub(crate) struct BatchJoin { state: State, spec: Spec }
 
 /// What the join compares and how it reads cells, fixed for its lifetime.
-struct Spec { order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, projected: bool, execution: Execution }
+/// `unswapped` is the join's own layout where the join builds its right input, which a spill hands to the row join.
+struct Spec { order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, projected: bool, swapped: bool, unswapped: Option<JoinLayout>, execution: Execution }
 
 impl BatchJoin {
     pub fn new(build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout, order: Vec<bool>, projected: bool, execution: Execution) -> Self {
         let build_keys = layout.left.key_positions().to_vec();
         let probe_keys = layout.right.key_positions().to_vec();
-        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, projected, execution } }
+        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, projected, swapped: false, unswapped: None, execution } }
     }
+}
+
+impl BatchJoin {
+    /// With the join's own layout, builds its right input and emits each match's left columns first, as the join's
+    /// schema orders them.
+    pub fn swapped(mut self, unswapped: Option<JoinLayout>) -> Self { self.spec.swapped = unswapped.is_some(); self.spec.unswapped = unswapped; self }
 }
 
 impl Spec {
@@ -108,60 +115,64 @@ impl Spec {
             return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's probe input did not open as batches"));
         };
         if probe_projected != self.projected { return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's inputs disagree on date admission")); }
-        Ok(State::Probe { table: Table { batches, starts, keys, index, _keys: reservation }, probe: probe_batches })
+        let kind = if width == 1 { KeyKind::of_build(&keys) } else { None };
+        Ok(State::Probe { table: Table { batches, starts, keys, kind, index, _keys: reservation }, probe: probe_batches })
     }
 
     /// Hands the input read so far, and the rest, to the row join, which spills a build side this large.
-    fn spill(&self, held: Vec<ColumnBatch>, rest: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
+    fn spill(&mut self, held: Vec<ColumnBatch>, rest: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
         let memory = &self.execution.context.memory;
         let pages = held.iter().map(|batch| batch.rows_admitting(memory, self.projected)).collect::<Result<VecDeque<_>>>()?;
         drop(held);
         let rest: BoxPageCursor = Box::new(crate::columnar::BatchRows::new(rest, Arc::clone(memory)).admitting_dates(self.projected));
         let build: BoxPageCursor = Box::new(HeldThen { pages, rest });
         let probe = DeferredInput::new(probe.runtime, probe.execution, crate::inspection::Constraints::default(), probe.pushdowns);
-        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, probe, layout, true, rtdb_plan::JoinKind::Inner, self.execution.clone())?)))
+        let (layout, build_left) = match self.unswapped.take() { Some(unswapped) => (unswapped, false), None => (layout, true) };
+        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, probe, layout, build_left, rtdb_plan::JoinKind::Inner, self.execution.clone())?)))
     }
 
     fn probe_batch(&self, table: &Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {
-        let equality = self.execution.scope()?;
         let width = self.build_keys.len();
-        let mut pairs: Vec<(usize, usize)> = Vec::new();
-        let mut probes: Vec<u32> = Vec::new();
-        let mut key = Vec::with_capacity(width);
-        let mut matches = self.execution.context.memory.reserve(4096)?;
-        for row in 0..probe.len {
-            self.execution.context.check_cancelled()?;
-            key.clear();
-            for &position in &self.probe_keys { key.push(self.cell(&probe.columns[position], row)?); }
-            'candidates: for build in table.index.candidates(hash_values(&key)?) {
-                let mut unknown = false;
-                for (index, build_first) in self.order.iter().enumerate() {
-                    let (build_cell, probe_cell) = (&table.keys[build * width + index], &key[index]);
-                    let (first, second) = if *build_first { (build_cell, probe_cell) } else { (probe_cell, build_cell) };
-                    let equal = rtdb_expr::sql_eq_in_timezone(first, second, &self.execution.context.timezone, &equality)?;
-                    equality.reset()?;
-                    match equal { None => unknown = true, Some(false) => continue 'candidates, Some(true) => {} }
+        let mut matched = Matches { pairs: Vec::new(), probes: Vec::new(), charge: self.execution.context.memory.reserve(4096)? };
+        let typed = table.kind.and_then(|kind| ProbeKey::of(&probe.columns[self.probe_keys[0]], kind));
+        if let Some(key) = typed {
+            for row in 0..probe.len {
+                self.execution.context.check_cancelled_at(row)?;
+                let Some(hash) = key.hash(row) else { continue };
+                for build in table.index.candidates(hash) {
+                    if key.equals(row, &table.keys[build]) { matched.push(table, build, row)?; }
                 }
-                if unknown { continue; }
-                if pairs.len() == pairs.capacity() {
-                    let capacity = pairs.capacity().saturating_mul(2).max(1024);
-                    let lease = Arc::get_mut(&mut matches).ok_or_else(|| invalid("join-size", "A join match charge is shared"))?;
-                    lease.grow_to(capacity.checked_mul(std::mem::size_of::<(usize, usize)>() + std::mem::size_of::<u32>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?)?;
-                    pairs.reserve_exact(capacity - pairs.len());
-                    probes.reserve_exact(capacity - probes.len());
+            }
+        } else {
+            let equality = self.execution.scope()?;
+            let mut key = Vec::with_capacity(width);
+            for row in 0..probe.len {
+                self.execution.context.check_cancelled()?;
+                key.clear();
+                for &position in &self.probe_keys { key.push(self.cell(&probe.columns[position], row)?); }
+                'candidates: for build in table.index.candidates(hash_values(&key)?) {
+                    let mut unknown = false;
+                    for (index, build_first) in self.order.iter().enumerate() {
+                        let (build_cell, probe_cell) = (&table.keys[build * width + index], &key[index]);
+                        let (first, second) = if *build_first { (build_cell, probe_cell) } else { (probe_cell, build_cell) };
+                        let equal = rtdb_expr::sql_eq_in_timezone(first, second, &self.execution.context.timezone, &equality)?;
+                        equality.reset()?;
+                        match equal { None => unknown = true, Some(false) => continue 'candidates, Some(true) => {} }
+                    }
+                    if unknown { continue; }
+                    matched.push(table, build, row)?;
                 }
-                let batch = table.starts.partition_point(|start| *start <= build) - 1;
-                pairs.push((batch, build - table.starts[batch]));
-                probes.push(u32::try_from(row).map_err(|_| size_error())?);
             }
         }
+        let Matches { pairs, probes, charge: matches } = matched;
         if pairs.is_empty() { return Ok(None); }
         let mut reservation = self.execution.context.memory.reserve(256)?;
         let mut columns = Vec::with_capacity(table.batches.first().map_or(0, |batch| batch.columns.len()) + probe.columns.len());
         let build_width = table.batches.first().map_or(0, |batch| batch.columns.len());
-        for position in 0..build_width { columns.push(gathered(&table.batches, position, &pairs)?); }
         let indices = UInt32Array::from(probes);
-        for column in &probe.columns { columns.push(taken(column, &indices)?); }
+        if self.swapped { for column in &probe.columns { columns.push(taken(column, &indices)?); } }
+        for position in 0..build_width { columns.push(gathered(&table.batches, position, &pairs)?); }
+        if !self.swapped { for column in &probe.columns { columns.push(taken(column, &indices)?); } }
         for column in &columns {
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("join-size", "A join output charge is shared"))?;
             lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
@@ -171,13 +182,102 @@ impl Spec {
     }
 }
 
+/// The build and probe rows a probe batch matched, in probe order, charged as they grow.
+struct Matches { pairs: Vec<(usize, usize)>, probes: Vec<u32>, charge: Arc<MemoryReservation> }
+impl Matches {
+    fn push(&mut self, table: &Table, build: usize, row: usize) -> Result<()> {
+        if self.pairs.len() == self.pairs.capacity() {
+            let capacity = self.pairs.capacity().saturating_mul(2).max(1024);
+            let lease = Arc::get_mut(&mut self.charge).ok_or_else(|| invalid("join-size", "A join match charge is shared"))?;
+            lease.grow_to(capacity.checked_mul(std::mem::size_of::<(usize, usize)>() + std::mem::size_of::<u32>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?)?;
+            self.pairs.reserve_exact(capacity - self.pairs.len());
+            self.probes.reserve_exact(capacity - self.probes.len());
+        }
+        let batch = table.starts.partition_point(|start| *start <= build) - 1;
+        self.pairs.push((batch, build - table.starts[batch]));
+        self.probes.push(u32::try_from(row).map_err(|_| size_error())?);
+        Ok(())
+    }
+}
+
+/// A single join key whose build cells are all integers of any width, or all strings: SQL equality of two such cells
+/// is equality of the integer or of the bytes, and a null matches nothing, so the probe reads its cells straight
+/// from its arrays rather than as values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyKind { Int, Utf8 }
+impl KeyKind {
+    fn of_build(keys: &[Value]) -> Option<Self> {
+        let int = |value: &Value| matches!(value, Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_));
+        if keys.iter().all(|key| int(key) || matches!(key, Value::Null)) { return Some(Self::Int); }
+        if keys.iter().all(|key| matches!(key, Value::Utf8(_) | Value::Null)) { return Some(Self::Utf8); }
+        None
+    }
+}
+fn int_value(value: &Value) -> Option<i64> {
+    match value { Value::I8(v) => Some(i64::from(*v)), Value::I16(v) => Some(i64::from(*v)), Value::I32(v) => Some(i64::from(*v)), Value::I64(v) => Some(*v), _ => None }
+}
+
+/// A probe batch's key cells, where its column holds only the build key's kind (an integer union's legs included).
+enum ProbeKey<'a> { Int(Vec<Option<i64>>), Utf8(&'a arrow_array::StringArray) }
+impl<'a> ProbeKey<'a> {
+    fn of(column: &'a Column, kind: KeyKind) -> Option<Self> {
+        match (column, kind) {
+            (Column::Arrow { array, field, .. }, KeyKind::Utf8) if field.metadata().is_empty() => array.as_any().downcast_ref::<arrow_array::StringArray>().map(Self::Utf8),
+            (Column::Arrow { array, field, .. }, KeyKind::Int) if field.metadata().is_empty() => int_cells(array.as_ref()).map(Self::Int),
+            (Column::Values(values), KeyKind::Int) => values.iter().map(|value| match value { Value::Null => Some(None), value => int_value(value).map(Some) }).collect::<Option<Vec<_>>>().map(Self::Int),
+            _ => None,
+        }
+    }
+    /// The row's hash as `hash_values` takes it of the cell's value; none for a null, which matches nothing.
+    fn hash(&self, row: usize) -> Option<u32> {
+        let cell = match self {
+            Self::Int(cells) => rtdb_columnar::hash_value(&Value::I64(cells[row]?), 0).ok()?,
+            Self::Utf8(array) => { if array.is_null(row) { return None; } rtdb_columnar::xxhash32(array.value(row).as_bytes(), 0) as i32 }
+        };
+        Some(combine_cell_hash(0, cell))
+    }
+    fn equals(&self, row: usize, build: &Value) -> bool {
+        match (self, build) {
+            (Self::Int(cells), build) => cells[row].is_some_and(|probe| int_value(build) == Some(probe)),
+            (Self::Utf8(array), Value::Utf8(build)) => !array.is_null(row) && array.value(row) == build.as_str(),
+            _ => false,
+        }
+    }
+}
+/// An integer column's cells widened to i64, through each leg of a dense union whose legs are integers or null.
+pub(crate) fn int_cells(array: &dyn Array) -> Option<Vec<Option<i64>>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
+    use arrow_schema::DataType;
+    let scalar = |array: &dyn Array, row: usize| -> Option<Option<i64>> {
+        if array.is_null(row) { return Some(None); }
+        Some(Some(match array.data_type() {
+            DataType::Int8 => i64::from(array.as_primitive::<Int8Type>().value(row)),
+            DataType::Int16 => i64::from(array.as_primitive::<Int16Type>().value(row)),
+            DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
+            DataType::Int64 => array.as_primitive::<Int64Type>().value(row),
+            DataType::Null => return Some(None),
+            _ => return None,
+        }))
+    };
+    match array.data_type() {
+        DataType::Union(legs, arrow_schema::UnionMode::Dense) => {
+            if !legs.iter().all(|(_, leg)| leg.metadata().is_empty() && matches!(leg.data_type(), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Null)) { return None; }
+            let union = array.as_any().downcast_ref::<arrow_array::UnionArray>()?;
+            (0..union.len()).map(|row| scalar(union.child(union.type_id(row)).as_ref(), union.value_offset(row))).collect()
+        }
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => (0..array.len()).map(|row| scalar(array, row)).collect(),
+        _ => None,
+    }
+}
+
 /// A build column across the batches the matches come from, as one array where every batch stores it alike.
 fn gathered(batches: &[ColumnBatch], position: usize, pairs: &[(usize, usize)]) -> Result<Column> {
     let arrow = batches.iter().map(|batch| match &batch.columns[position] { Column::Arrow { array, field, logical } => Some((array, field, logical)), Column::Values(_) => None }).collect::<Option<Vec<_>>>();
     if let Some(arrow) = arrow && let Some((_, field, logical)) = arrow.first()
         && crate::columnar::flat(field.data_type()) && arrow.iter().all(|(_, other, other_logical)| other == field && other_logical == logical) {
         let arrays: Vec<&dyn Array> = arrow.iter().map(|(array, ..)| array.as_ref()).collect();
-        let array = arrow_select::interleave::interleave(&arrays, pairs).map_err(|error| invalid("join-gather", error))?;
+        let array = crate::columnar::interleave(&arrays, pairs)?;
         return Ok(Column::Arrow { array, field: Arc::clone(field), logical: (*logical).clone() });
     }
     pairs.iter().map(|&(batch, row)| batches[batch].columns[position].value(row)).collect::<Result<Vec<_>>>().map(Column::Values)
