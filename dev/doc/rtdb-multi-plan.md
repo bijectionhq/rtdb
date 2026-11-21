@@ -1267,6 +1267,8 @@ The serial build hit the startup deadline during the combined burst.
 On the parallel build all 88 startups completed and all 24 recovered deployments accepted another write.
 Recovery p99 was 9.91 s, cold-start p99 was 3.09 s, and the full burst took 10.69 s.
 Warm update p99 in that forced-flush run was 2.23 s.
+With TCP_NODELAY enabled, the forced-flush trial again completed all 88 startups and verified 24 post-recovery writes.
+That trial recorded 10.12 s recovery p99, 3.30 s cold-start p99, 11.56 s to finish the burst, and 2.30 s warm update p99.
 
 
 **DynamoDB parked item size**
