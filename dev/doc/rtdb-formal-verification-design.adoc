@@ -779,9 +779,38 @@ After a record or a completed resolution, the driver advances the cut only when 
 An unrecognized replica body freezes the last cut.
 Exact and restored startup, or an ordinary checkpoint without a matching journal boundary, leave the cut unavailable.
 A direct compactor reset suspends cuts for the open partition.
-The snapshot prefix supplies one prerequisite for distributed reader admission.
-The directory still needs to bind it to the physical residence and serialize reader admission against certified object retirement.
-Recovery from a reset also needs a durable rule for retired object identities before a collector can use this cut. link:../../verification/tla/CatalogCutPublication.tla[Capture and publication model] · link:../../rust/crates/replication/src/driver.rs[Driver transitions]
+The hosted Rust store registers a held capture against the open storage owner, physical residence and journal epoch in one versioned directory update.
+A capture without a cut registers an opaque dependency.
+The capture and its admitted provider operations share the lifetime of the registration.
+Owner teardown can discard the registration once storage has drained or process death is established.
+The reaper still needs a certified retirement cut and a directory floor before it can use these reader records.
+
+The bounded-lease path observes installed replica progress before taking a new snapshot.
+It uses a separate status field that advances when deferred effects have applied.
+An unrecognized record freezes this progress even if the replica keeps receiving records.
+The cut embedded in a snapshot remains the authority for the exact captured catalog, including captures taken before the watch advanced. link:../../verification/tla/CatalogCutPublication.tla[Capture and publication model] · link:../../rust/crates/replication/src/driver.rs[Driver transitions] · link:../../rust/crates/multi/src/catalog_readers.rs[Hosted reader registration]
+
+=== Publication of retirement certificates
+
+A request to retire an object and an installed catalog that excludes it are distinct states.
+The certificate must follow installation of the final exclusion.
+Publishing the certificate advances the admission floor for that residence and journal in the same directory change.
+Readers already registered below that floor keep their holds until they drain.
+An opaque reader registered before the floor advances blocks generation-based authorization until it drains.
+After the floor advances, serving an opaque capture requires a separate retention authority.
+
+The bounded retirement-publication model checks one reader, three cuts and two physical incarnations of the same logical key.
+It separates the request, catalog installation, durable certificate, authorization and deletion.
+Its controls check premature certification, missing admission fencing and deletion by logical key.
+A successful sequence retires and erases the first incarnation and publishes a readable second incarnation.
+The model allows a provider to retry an already authorized deletion.
+Production must therefore either prevent key reuse in the certified namespace or support deletion conditional on the authorized physical identity.
+
+The production trie collector currently submits object releases before publishing the corresponding catalog removal.
+A time-stamped legacy garbage record cannot supply this certificate.
+Changing the order alone would leave a crash window in which the catalog has advanced but the reaper lacks a release.
+The production protocol needs replayable retirement intent, proof of final exclusion including shared artefacts, a directory update binding the certificate to the admission floor, and an identity-preserving delete through the storage provider.
+Crash detection, provider copy and pack sharing remain separate implementation obligations. link:../../verification/tla/RetirementPublication.tla[Retirement publication model] · link:../../rust/crates/maintenance/src/gc.rs[Trie collection]
 
 === Delegated scans keep the coordinator's captured view
 
