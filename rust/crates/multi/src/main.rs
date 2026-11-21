@@ -105,12 +105,13 @@ struct HostedTransferBinding {
     storage: String,
     keys: String,
     exchange: String,
+    attempt_gate: String,
 }
 
-fn check_hosted_transfer(command: &str, arguments: &Arguments) -> Result<()> {
+async fn admit_hosted_transfer(command: &str, arguments: &Arguments) -> Result<()> {
     let encoded = match std::env::var("RTDB_TRANSFER_BINDING") {
         Ok(encoded) => encoded,
-        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(std::env::VarError::NotPresent) if !arguments.present("transfer-attempt") => return Ok(()),
         Err(_) => return Err(usage("Invalid installed RTDB transfer binding".into())),
     };
     let binding: HostedTransferBinding = serde_json::from_str(&encoded)
@@ -130,7 +131,53 @@ fn check_hosted_transfer(command: &str, arguments: &Arguments) -> Result<()> {
     if command == "move-cell" || arguments.present("transfer") {
         return Err(usage("The hosted task requires a catalog-managed transfer exchange".into()));
     }
-    Ok(())
+    let expected_gate = arguments.required("to-directory")?.strip_prefix("dynamodb:")
+        .map(|prefix| format!("{prefix}-stopped-tasks"));
+    if expected_gate.as_deref() != Some(binding.attempt_gate.as_str()) {
+        return Err(usage("The hosted transfer attempt gate differs from its installed directory".into()));
+    }
+    let attempt = required_uuid(arguments, "transfer-attempt")?;
+    let task = hosted_task(arguments)?
+        .ok_or_else(|| usage("The hosted transfer requires its exact ECS task ARN".into()))?;
+    claim_transfer_attempt(&binding.attempt_gate, attempt, &task).await
+}
+
+#[cfg(feature = "dynamodb")]
+async fn claim_transfer_attempt(table: &str, attempt: uuid::Uuid, task: &rtdb_directory::HostedTask) -> Result<()> {
+    use aws_sdk_dynamodb::types::{AttributeValue, ReturnValuesOnConditionCheckFailure};
+
+    let client = aws_sdk_dynamodb::Client::new(&aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await);
+    let id = format!("transfer-attempt-{attempt}");
+    let result = client.put_item()
+        .table_name(table)
+        .item("id", AttributeValue::S(id))
+        .item("task_arn", AttributeValue::S(task.task_arn().to_owned()))
+        .condition_expression("attribute_not_exists(id)")
+        .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
+        .send().await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let Some(aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(occupied)) = error.as_service_error() else {
+                return Err(Anomaly::new(
+                    rtdb_types::AnomalyCategory::Unavailable,
+                    "rtdb.multi/transfer-attempt",
+                    format!("Could not admit the hosted transfer attempt: {error}"),
+                ));
+            };
+            // An SDK retry after a lost reply can recover its own claim.
+            let owner = occupied.item().and_then(|item| item.get("task_arn")).and_then(|value| value.as_s().ok());
+            if owner.is_some_and(|arn| arn == task.task_arn()) {
+                return Ok(());
+            }
+            Err(usage("The hosted transfer attempt is closed or claimed by another task".into()))
+        }
+    }
+}
+
+#[cfg(not(feature = "dynamodb"))]
+async fn claim_transfer_attempt(_: &str, _: uuid::Uuid, _: &rtdb_directory::HostedTask) -> Result<()> {
+    Err(Anomaly::unsupported("rtdb.multi/dynamodb", "Hosted transfers require the dynamodb feature"))
 }
 
 struct TransferExchange {
@@ -380,7 +427,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             rtdb_multi::cells::serve(listener, rtdb_multi::cells::MemoryCellMap::new(), cancellation).await
         }
         "move-cell" | "prepare-cell-transfer" | "activate-cell-transfer" => {
-            check_hosted_transfer(&command, &arguments)?;
+            admit_hosted_transfer(&command, &arguments).await?;
             let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
             let from_storage = CellStorage::parse(arguments.required("from-storage-root")?)?;
             let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
