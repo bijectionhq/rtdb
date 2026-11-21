@@ -1910,3 +1910,13 @@ It recorded 2,802 passes and 396 failures.
 Of those failures, 395 bindings tests had no `xtdb.native.library` configured and the single remaining root failure was an SSL connection setup error in `cross-db-refs-in-dml-5831`.
 A focused rerun supplies the installed local library and repeats the affected root namespace.
 The retained full Gradle logs are `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-before-docker.log` and `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-after-docker.log`.
+
+The exact runner selected the executable from Cargo's artifact report and ran it in the package directory.
+The archived naming-epoch replay passed.
+Re-enabling old-epoch publication and removing the physical identity check each failed at its declared assertion.
+The two controls and exact commands are in the replay evidence directory above.
+
+The focused Gradle retry exited zero with 415 passes using a previously built native library.
+It included all 398 binding tests and all 17 tests in the filtered multi-database namespace, including the earlier SSL setup failure.
+The focused log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-focused.log`.
+A new native-library build from the published source and a full Gradle run using that library are in progress.
