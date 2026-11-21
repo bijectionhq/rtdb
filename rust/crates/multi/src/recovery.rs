@@ -193,13 +193,19 @@ pub async fn serve(
     let operations = Arc::new(Semaphore::new(1));
     let mut requests = tokio::task::JoinSet::new();
     let acceptor = TlsAcceptor::from(tls);
-    loop {
-        let (socket, _) = tokio::select! {
-            _ = cancellation.cancelled() => break,
+    let result = loop {
+        let accepted = tokio::select! {
+            _ = cancellation.cancelled() => break Ok(()),
             _ = requests.join_next(), if !requests.is_empty() => continue,
-            accepted = listener.accept() => accepted.map_err(|_| {
-                Anomaly::incorrect("rtdb.multi/recovery-endpoint", "Cannot accept a recovery connection")
-            })?,
+            accepted = listener.accept() => accepted,
+        };
+        let (socket, _) = match accepted {
+            Ok(connection) => connection,
+            Err(_) => break Err(Anomaly::new(
+                AnomalyCategory::Unavailable,
+                "rtdb.multi/recovery-endpoint",
+                "Cannot accept a recovery connection",
+            )),
         };
         let Ok(connection) = connections.clone().try_acquire_owned() else {
             continue;
@@ -226,9 +232,12 @@ pub async fn serve(
             };
             let _ = tokio::time::timeout(SOCKET_DEADLINE, write_reply(&mut socket, &reply)).await;
         });
-    }
+    };
+    // Close the listener before joining. An accept failure must not abort
+    // a running capture or restore that holds a durable admission.
+    drop(listener);
     while requests.join_next().await.is_some() {}
-    Ok(())
+    result
 }
 
 async fn read_request(
