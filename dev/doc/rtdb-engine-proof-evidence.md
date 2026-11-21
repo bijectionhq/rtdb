@@ -20,6 +20,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | TX01, TX03, TX06, TX11, LOG04, LOG05 | The bounded kernel and read-back models cover transaction publication, refusal, and the append, delivery, apply, and acknowledgment sequence. A Verus harness checks production replica admission. | Prove the production transaction and log traces refine those transitions under the provider and transaction assumptions. |
 | TX09 | Lean checks strictly ordered system times for arbitrary modeled mixed resolver histories and restart from the last completed time. Bounded TLC and a native catalog-clock replay check other portions of the same contract. | Refine the remaining ingress, time sources, resolve/apply paths, and provider-specific ordering. |
 | LOG08, LOG09, GC05, STORE10, STORE11 | Bounded checkpoint discovery and replay models check a readable root and retained suffix, including the handoff at the observed log floor. A native test exercises the newer-checkpoint refresh and suffix replay. | Compose checkpoint publication, root and dependency discovery, trim authority and provider behavior over arbitrary executions. |
+| LOG03, LOG08, STORE10 · Classic Kafka and S3 recovery | The native process fixture checkpoints a prefix to MinIO, acknowledges an update and delete above it, kills all three RTDB processes, and verifies current rows, the fixture table's bitemporal history, and a new write from a fresh worker. | Prove the end-to-end runtime refinement across arbitrary histories, broker and provider failures, retention, and deployment configurations. |
 | LOG08, FMT01 · Packed log positions | Lean proves the exact signed epoch limit, lexicographic order, quotient and remainder extraction, and the start sentinel. Kani checks the Rust admission predicate and checks encoding and resumption on the admitted domain. JVM tests exercise the same boundary. | Compose the codec with admitted checkpoint metadata, all supported readers, and retained-log recovery. |
 | LOG05 and Multi recovery S3 · Logkeeper seal | Lean proves that replaying any finite sequence of later promise events preserves the seal's lower bound, and composes this with majority intersection for a fixed ensemble. Kani checks production promise replay and empty-stream commit admission across all epoch and sync inputs. | Refine durable journal settlement, message handling, directory-issued epochs and ensemble changes. |
 | LOG11 and Multi recovery S4 · Seal reply rank | Lean proves that the selected reply dominates all replies in an arbitrary nonempty list, and that it reaches a retained commit witness's slot in the same epoch or reports a later sync. Kani checks production ranking and its tie choice for one through three replies. | Establish which production replies witness the exact retained payloads and carry that through the repair and journal transitions. |
@@ -70,6 +71,19 @@ Replacement compute nodes get fresh cache directories.
 With a configured 1.5-second lease, the first integrated Multi run based on `e06764b1f` measured 1.58, 1.59, and 1.47 seconds from initiating worker loss to verifying the first recovered query results.
 The run after prepared replay landed at `773adfde9` measured 1.65, 1.73, and 1.56 seconds in the same fixture.
 These are local observations with a small checkpoint and suffix. [S3 fixture](../../rust/crates/multi/tests/s3.rs) · [Cell configuration](../../rust/crates/multi/tests/common/mod.rs)
+
+The classic fixture keeps one Kafka broker and MinIO available, uses one partition in each precreated topic, and leaves the topic data and S3 checkpoint in place.
+It verifies that all three RTDB processes exited after `SIGKILL` before starting a replacement with a fresh cache path.
+On the runtime based on `773adfde9`, two local runs verified the recovered queries 1.08 and 1.10 seconds after initiating worker termination.
+One earlier initialization attempt without precreated topics returned `xtdb.kafka/topic-metadata` with `RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART`. [Classic process fixture](../../verification/classic-kafka-s3.sh)
+
+Run the classic fixture with Docker, MinIO, the AWS CLI, and `psql` available.
+It starts disposable local services and records its logs under `build/proof-runs/classic-kafka-s3`.
+
+```sh
+cargo build --locked --manifest-path rust/Cargo.toml -p rtdb-server --features kafka,s3 --bin rtdb
+RTDB_CLASSIC_BIN="$PWD/rust/target/debug/rtdb" bash verification/classic-kafka-s3.sh
+```
 
 ## Multi evidence
 

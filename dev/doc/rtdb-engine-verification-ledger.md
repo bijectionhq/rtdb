@@ -117,7 +117,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | --- | --- | --- |
 | LOG01 · One durable order | Open | — |
 | LOG02 · Read progress | Open | — |
-| LOG03 · Retention and durability assumptions | Open | — |
+| LOG03 · Retention and durability assumptions | Partial | [Classic Kafka and S3 process recovery fixture](rtdb-engine-proof-evidence.md#main-evidence) |
 | LOG04 · Claim admission | Partial | [Kernel model and Rust term admission](rtdb-engine-proof-evidence.md#main-evidence) |
 | LOG05 · Term fencing | Partial | [Kernel and Rust term admission, and Multi Logkeeper seal proof](rtdb-engine-proof-evidence.md#main-evidence) |
 | LOG06 · Role transitions | Open | — |
