@@ -394,6 +394,18 @@ pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deploymen
                     let now = wall_clock()();
                     let _ = reaper_pass(bucket.as_ref(), &deployments, now, grace).await;
                     let _ = finish_moves(bucket.as_ref(), &deployments, now, grace, keys.as_deref()).await;
+                    if let Some(keys) = keys.as_deref() {
+                        for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Deleting) {
+                            let disposal = crate::admin::finish_disposal(
+                                directory.as_ref(), &storage, keys, &record.id, 4 << 20,
+                            );
+                            match cancellation.run_until_cancelled(disposal).await {
+                                None => return,
+                                Some(Err(error)) => eprintln!("Disposal of {} is pending: {}", record.id, error.code),
+                                Some(Ok(_)) => {}
+                            }
+                        }
+                    }
                 }
             }
         }

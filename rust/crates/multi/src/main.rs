@@ -34,6 +34,7 @@ Usage: rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --id UUID\n\
+       rtdb-multi schedule-disposal --directory DIR --id UUID\n\
        rtdb-multi disposal --directory DIR --id UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
@@ -243,6 +244,18 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let id = installation_id(&arguments)?;
             let receipt = directory.deployment(&id.to_string()).await?.and_then(|record| record.disposal);
             println!("{}", serde_json::to_string_pretty(&receipt).expect("a receipt serializes"));
+            Ok(())
+        }
+        "schedule-disposal" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let id = installation_id(&arguments)?;
+            let scheduled = admin::begin_disposal(directory.as_ref(), &id.to_string()).await?;
+            println!("{}", serde_json::json!({
+                "deployment": scheduled.id,
+                "incarnation": scheduled.incarnation,
+                "epoch": scheduled.epoch,
+                "lifecycle": scheduled.lifecycle,
+            }));
             Ok(())
         }
         "create" => {

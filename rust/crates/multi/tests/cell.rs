@@ -85,8 +85,13 @@ async fn failed_disposal_reuses_the_fence_on_retry() {
         DeploymentRecord::new("shop", "acme", vec![MemberId::fresh()], 0),
     ).await.unwrap();
 
+    let error = admin::finish_disposal(directory.as_ref(), &storage, &keys, &installation.id, 4 << 20).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.multi/disposal-unaccepted");
+    let accepted = admin::begin_disposal(directory.as_ref(), &installation.id).await.unwrap();
+    assert_eq!(accepted.epoch, installation.epoch + 1);
+
     for _ in 0..2 {
-        let error = admin::delete_deployment(directory.as_ref(), &storage, &keys, &installation.id, 4 << 20).await.unwrap_err();
+        let error = admin::finish_disposal(directory.as_ref(), &storage, &keys, &installation.id, 4 << 20).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/administration-ensemble");
         let pending = directory.deployment(&installation.id).await.unwrap().unwrap();
         assert_eq!(pending.lifecycle, Lifecycle::Deleting);
@@ -331,7 +336,24 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     cell.node(holder).agent.park("shop-preview").await.unwrap();
     let written = own(&child.storage_prefix());
 
-    let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &parent.id, 4 << 20).await.unwrap();
+    let pending = admin::begin_disposal(cell.directory.as_ref(), &parent.id).await.unwrap();
+    assert_eq!(pending.lifecycle, Lifecycle::Deleting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
+        cell.directory.clone(), cell.storage(), Some(Arc::new(cell.keys())),
+        Duration::from_secs(3600), Duration::from_millis(10), stop.clone(),
+    ));
+    let deletion = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(receipt) = cell.directory.deployment(&parent.id).await.unwrap().unwrap().disposal {
+                break receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the reaper recovers the scheduled disposal");
+    stop.cancel();
+    reaper.await.unwrap();
+    assert_eq!(deletion.epoch, pending.epoch);
     assert_eq!(deletion.deployment, parent.id);
     assert!(files_under(&root.join(parent.storage_prefix())).is_empty(), "the parent's objects are erased");
     assert!(own(&child.storage_prefix()) > written, "after the fork's shared objects were copied into it");
