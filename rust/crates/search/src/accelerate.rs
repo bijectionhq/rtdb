@@ -1,7 +1,7 @@
 #[cfg(feature = "experiments")]
 pub mod experiment;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -85,6 +85,7 @@ impl ScanAccelerator for SearchAccelerator {
 #[derive(Clone, Copy, Default)]
 struct Narrowing<'a> {
     is_oracle: bool,
+    baseline: bool,
     skip_retry: bool,
     estimate_first: bool,
     scope: Option<&'a BTreeSet<Iid>>,
@@ -93,6 +94,8 @@ struct Narrowing<'a> {
 #[derive(Default)]
 struct NarrowingWork {
     tried_ranking: bool,
+    filter_scope: Option<usize>,
+    retry_redundant: bool,
     ranked: bool,
     decline: Option<&'static str>,
     plain_decline: Option<&'static str>,
@@ -130,11 +133,20 @@ impl SearchAccelerator {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
             if ranked {
                 work.tried_ranking = true;
-                if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition, options, work).await? {
+                let existing = if options.baseline { None } else { scan.iids.as_ref() };
+                let scope = options.scope.or(existing);
+                work.filter_scope = scope.map(BTreeSet::len);
+                if scope.is_some_and(BTreeSet::is_empty) {
+                    work.ranked = true;
+                    return Ok(Some(BTreeSet::new()));
+                }
+                let ranking = Narrowing { scope, ..options };
+                if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition, ranking, work).await? {
                     work.ranked = true;
                     return Ok(Some(candidates));
                 }
-                if work.decline == Some("posting-estimate") || (options.skip_retry && work.budget_exceeded()) {
+                if work.retry_redundant || work.decline == Some("posting-estimate")
+                    || (options.skip_retry && work.budget_exceeded()) {
                     return Ok(None);
                 }
             }
@@ -388,6 +400,24 @@ impl Ord for Pending { fn cmp(&self, other: &Self) -> std::cmp::Ordering { desce
 /// Search files are expanded a batch of windows at a time, only while one may hold an event above every event already scored.
 struct Candidates<'a> { files: Vec<(BTreeMap<u32, usize>, crate::file::Ranked)>, cutter: Cutter<'a>, pending: std::collections::BinaryHeap<Pending>, seen: BTreeSet<Iid>, scored: usize }
 
+/// Counts only distinct IIDs already nominated by the ranker.
+fn exceeds_retry_limit(
+    seen: &BTreeSet<Iid>,
+    pending: &std::collections::BinaryHeap<Pending>,
+    limit: usize,
+    memory: &Arc<rtdb_columnar::MemoryBudget>,
+) -> bool {
+    let Some(remaining) = limit.checked_sub(seen.len()) else { return true };
+    if remaining >= pending.len() { return false; }
+    let needed = remaining + 1;
+    let Ok(_charge) = memory.reserve(needed.saturating_mul(size_of::<Iid>() + 32)) else { return false };
+    let mut distinct = HashSet::new();
+    if distinct.try_reserve(needed).is_err() { return false; }
+    pending.iter().any(|candidate| {
+        !seen.contains(&candidate.1) && distinct.insert(&candidate.1) && distinct.len() > remaining
+    })
+}
+
 impl Candidates<'_> {
     fn push(&mut self, iid: Iid, score: f64, exact: bool) { self.scored += 1; self.pending.push(Pending(score, iid, exact)); }
     fn drop_seen(&mut self) { while self.pending.peek().is_some_and(|top| self.seen.contains(&top.1)) { self.pending.pop(); } }
@@ -498,7 +528,14 @@ impl SearchAccelerator {
                 // An exactly visible event's row is in the scan's output with its score, so it needs no verifying.
                 if exact && trusted { verified.push((score, iid)); } else { iids.insert(iid); }
             }
-            if candidates.scored > self.max_candidates { work.decline = Some("candidate-budget"); return Ok(None); }
+            if candidates.scored > self.max_candidates {
+                work.decline = Some("candidate-budget");
+                if !options.baseline && options.scope.is_none() {
+                    // Each nominated IID would also be in the unranked MATCH candidate union.
+                    work.retry_redundant = exceeds_retry_limit(&candidates.seen, &candidates.pending, self.max_candidates, request.memory);
+                }
+                return Ok(None);
+            }
             if handed == 0 { break; }
             if iids.is_empty() { continue; }
             if work.verification_rounds == 16 { work.decline = Some("verification-budget"); return Ok(None); }
@@ -534,6 +571,22 @@ mod tests {
 
     fn at(valid: i64, system: i64) -> TemporalBounds {
         TemporalBounds { valid_time: Interval::new(Timestamp(valid), Timestamp(valid + 1)).unwrap(), system_time: Interval::new(Timestamp(system), Timestamp(system + 1)).unwrap() }
+    }
+
+    #[test]
+    fn retry_budget_requires_distinct_iids_and_available_scratch() {
+        let iid = |n| Iid([n; 16]);
+        let seen = BTreeSet::from([iid(1)]);
+        let mut pending = std::collections::BinaryHeap::from([
+            Pending(1.0, iid(1), true), Pending(0.5, iid(2), true), Pending(0.25, iid(2), true),
+        ]);
+        let memory = rtdb_columnar::MemoryBudget::new(1024);
+        assert!(!exceeds_retry_limit(&seen, &pending, 2, &memory));
+        pending.push(Pending(1.0, iid(3), true));
+        assert!(exceeds_retry_limit(&seen, &pending, 2, &memory));
+        assert!(!exceeds_retry_limit(&seen, &pending, 2, &rtdb_columnar::MemoryBudget::new(1)));
+        let seen = BTreeSet::from([iid(1), iid(2), iid(3)]);
+        assert!(exceeds_retry_limit(&seen, &pending, 2, &rtdb_columnar::MemoryBudget::new(1)));
     }
 
     #[test]

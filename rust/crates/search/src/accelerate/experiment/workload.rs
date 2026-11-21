@@ -9,6 +9,7 @@ use super::super::{Narrowing, NarrowingWork, SearchAccelerator};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy<'a> {
     Current,
+    Baseline,
     Exhaustive,
     FilterFirst(&'a BTreeSet<Iid>),
     SkipRetry,
@@ -23,13 +24,14 @@ impl SearchAccelerator {
     ) -> Result<(Option<BTreeSet<Iid>>, Json)> {
         let options = match policy {
             Policy::Current => Narrowing::default(),
+            Policy::Baseline => Narrowing { baseline: true, ..Default::default() },
             Policy::Exhaustive => Narrowing { is_oracle: true, ..Default::default() },
             Policy::FilterFirst(scope) if request.bounds.valid_time.is_point() && request.bounds.system_time.is_point() => {
                 Narrowing { scope: Some(scope), ..Default::default() }
             }
             Policy::FilterFirst(_) => Narrowing::default(),
-            Policy::SkipRetry => Narrowing { skip_retry: true, ..Default::default() },
-            Policy::Estimate => Narrowing { estimate_first: true, ..Default::default() },
+            Policy::SkipRetry => Narrowing { baseline: true, skip_retry: true, ..Default::default() },
+            Policy::Estimate => Narrowing { baseline: true, estimate_first: true, ..Default::default() },
         };
         let mut work = NarrowingWork::default();
         let picked = self.narrow(request, options, &mut work).await?;
@@ -43,7 +45,7 @@ impl SearchAccelerator {
             "postings_visited": work.postings_visited, "verification_rounds": work.verification_rounds,
             "verifier_iids": work.verifier_rows, "unranked_events": work.plain_events,
             "estimated_postings": work.estimated_postings, "candidate_iids": picked.as_ref().map(BTreeSet::len),
-            "filter_scope": options.scope.map(BTreeSet::len),
+            "filter_scope": work.filter_scope, "retry_redundant": work.retry_redundant,
         });
         Ok((picked, report))
     }

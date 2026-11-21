@@ -133,7 +133,7 @@ impl Fixture<'_> {
         Scan {
             table: TableBinding { name: QualifiedTable { database: "xtdb".into(), table: self.table.clone() },
                 columns: snapshot.column_types(&self.table), oid: None },
-            columns: Vec::new(), predicates: Vec::new(), matches: Vec::new(), iids: None, top_k: None,
+            columns: Vec::new(), predicates: Vec::new(), matches: Vec::new(), iids: None, top_k: None, ordered_top_k: None,
             valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default, clamp_valid_time: false,
         }
     }

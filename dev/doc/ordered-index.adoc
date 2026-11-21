@@ -13,6 +13,10 @@ Reuse both temporal points to continue the same read across SQL statements.
 The scan can reverse the index order and applies predicates before counting rows towards the limit.
 It fetches projected fields from a row's table at the same basis.
 
+For a ranked full-text query, a bounded seek on a structured predicate can supply an IID scope before MATCH candidates are scored.
+This uses the same captured snapshot and point instants as the text query.
+The primary scan applies the remaining predicates to the resolved row and SEARCH_SCORE uses the full snapshot corpus.
+
 `SELECT DISTINCT key ... ORDER BY key LIMIT n` can use an ordered index when the key is a stored text column and the preceding index columns are fixed by equality predicates.
 The ordered seek applies index-covered predicates before counting distinct keys.
 
