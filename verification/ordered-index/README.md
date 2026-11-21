@@ -252,6 +252,14 @@ union prefix and the effect of keeping the protected history and clear suffix
 through the newest clear reset. The proofs require authentic source prefixes,
 ancestry, and operation decoding.
 
+The newer paired runtime build used Bijection source `29cada504ef` with the
+mask projection alias fix published at `8585a3489207d430d443f54d9e8bb9746a5a3906`.
+The standalone RTDB binary was built from `d2d6945cf`. The local PgWire run
+observed `scan_ordered_seek` for both labelled directions before the drop,
+then the corresponding plain scans. Rows, continuation, and the authenticated
+read witness matched and both registrations revalidated. The alias fix keeps
+the positional mask decoder intact and gives each joined column a unique name.
+
 ## Execution
 
 Use Lean 4.35.0, Bijection's pinned Verus toolchain, and TLC from the authorized proof environment.
