@@ -1376,3 +1376,45 @@ The 270 source and model inputs apart from the runner are identical at `d21e9e19
 The intervening runner additions register the catalog-cut study, which was run separately as recorded above.
 The DynamoDB-enabled Multi binary also passed a local compile check against `d21e9e199`.
 The delegated scan and residence native controls were run as the focused cases above.
+
+=== Installed catalog cuts and consolidated branch evidence
+
+Commit `8be6d62f7` records a conservative installed replica prefix beside the immutable physical catalog.
+Each reader captures the two together, including when it reuses a cached live index.
+The driver waits for a pending block and deferred apply records to drain before it publishes the prefix.
+An unrecognized record freezes advancement, and a direct reset with no replica position suspends publication for the open partition.
+The current adapter derives its position from the admitted replay cursor and assumes the provider retains the correct journal suffix.
+Catalog cuts still need residence-qualified admission and a directory-backed retirement rule before a collector can use them.
+
+Verus checks `completed_prefix` byte for byte with the production source.
+The baseline has five obligations.
+The three direct controls remove the block, deferred-apply, or supported-history guard.
+The three joint controls weaken the function and its contract together and fail the corresponding law.
+Native tests exercise an actual block adoption with a held trie notification, a leader's deferred application, an unrecognized record, and a compactor reset.
+Re-run these tests with `cargo test --locked --manifest-path rust/Cargo.toml -p rtdb-replication --lib`.
+The Verus area runs in the combined runner. link:../verus/catalog_cut/area.json[Catalog-cut laws and controls]
+
+The consolidation includes the hosted ordered-index branch at `49bd0c804`, the core verification branch at `b1e41f938`, and the trie verification branch at `5d40ed129`.
+It includes the prior recovery properties, standalone authority, full-text-search and group-artefact tips.
+The earlier ordered-index branch had already been applied under a different commit identity.
+The ancestry merge records that branch with the same tree as its first parent.
+
+The JVM trie tests passed 12 cases under Temurin 25.0.5.1, including independent sibling versions and nonempty protobuf root paths.
+The separate temporal and recovery runner checked nine Lean files and 14 TLC configurations with their declared results.
+The independent SQL history oracle passed across live, flushed, compacted and reopened states, including the bypass of temporal pruning.
+The merged ordered-index query tests cover both seek directions, covered scans without the primary data object, offsets, and errors raised while opening sorted and unsorted limit inputs.
+The prior combined native run at `d070d54c4` passed 728 cases before the newer Arrow integration merge. link:../../dev/check-rtdb-proof-models.sh[Temporal and recovery reproduction]
+
+The combined formal runner finished at `e2b4f5d11`.
+It checked 34 Lean baselines, 160 baseline Verus obligations in 20 areas, 89 Verus negative controls and 33 bounded TLC baselines with their declared controls.
+The same run completed the Z3, Alloy, Apalache, Maude, mCRL2 and AutoHyper lanes. link:../README.adoc[Combined runner and toolchain]
+
+The expanded native run at `196f6d2b3` passed 1,154 cases and exposed one fixture that incorrectly required a particular delegated prefix to contain rows.
+Commit `5df92a93e` checks successful evaluation of that prefix and retains the required refusals for a different residence and a later captured head.
+All four delegation cases passed on the follow-up revision.
+
+The Multi update at `6082148e8` is included through `8527f7e00`.
+The conflict resolution keeps the checkpoint-refresh loop, opened fragment scope and per-handle session accounting together.
+The DynamoDB-enabled Rust run passed 106 library cases and 80 local cell cases.
+The provider-specific DynamoDB destruction case requires a local DynamoDB endpoint and was ignored.
+Re-run these suites with `cargo test --locked --manifest-path rust/Cargo.toml -p rtdb-multi --features dynamodb --lib --test cell`.
