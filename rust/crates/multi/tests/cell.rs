@@ -104,6 +104,28 @@ async fn failed_disposal_reuses_the_fence_on_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placement_status_counts_general_and_isolation_demand_separately() {
+    let cell = Cell::start_with(vec![MemberPool::General, MemberPool::Isolation], None).await;
+    let directory = cell.directory.as_ref();
+    for name in ["shop", "isolated", "parked"] { admin::create_deployment(directory, name, "acme", 3).await.unwrap(); }
+    let mut isolated = directory.deployment_by_name("isolated").await.unwrap().unwrap();
+    isolated.lifecycle = rtdb_directory::Lifecycle::Quarantined;
+    let version = isolated.version;
+    assert!(directory.replace_deployment(isolated, version).await.unwrap().applied().is_some());
+    cell.node(0).agent.activate("shop").await.unwrap();
+    cell.node(1).agent.activate("isolated").await.unwrap();
+
+    let report = admin::placement_status(directory, 1).await.unwrap();
+    assert_eq!((report.general.eligible, report.general.holdings, report.general.recommended_nodes), (1, 1, 1));
+    assert_eq!((report.isolation.eligible, report.isolation.holdings, report.isolation.recommended_nodes), (1, 1, 1));
+    assert_eq!(report.logkeepers, 3);
+    assert_eq!(report.compaction_workers, 0);
+    assert_eq!(report.nodes.values().sum::<usize>(), 2);
+    assert_eq!(cell.holder("parked").await, None);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auditing_a_pristine_deployment_does_not_allocate_its_encryption_key() {
     let cell = Cell::start(0, None).await;
     let deployment = admin::create_deployment(cell.directory.as_ref(), "pristine", "acme", 3).await.unwrap();

@@ -37,7 +37,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
        rtdb-multi roll-engine --directory DIR --version VERSION\n\
-       rtdb-multi status --directory DIR [--target-per-node N]\n\
+       rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
@@ -625,8 +625,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "status" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let status = admin::cell_status(directory.as_ref(), arguments.number("target-per-node", 1000usize)?).await?;
-            println!("{}", serde_json::to_string_pretty(&status).expect("a status serializes"));
+            let target = arguments.number("target-per-node", 1000usize)?;
+            let json = if arguments.present("placements-only") {
+                serde_json::to_string_pretty(&admin::placement_status(directory.as_ref(), target).await?)
+            } else {
+                serde_json::to_string_pretty(&admin::cell_status(directory.as_ref(), target).await?)
+            };
+            println!("{}", json.expect("a status serializes"));
             Ok(())
         }
         "audit" => {

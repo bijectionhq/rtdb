@@ -1627,6 +1627,15 @@ rule Rebalance {
             MoveChosen(holding.deployment, Affinity.next_rank(holding.deployment, excluding: member))
 }
 
+rule ReportPlacementDemand {
+    when: PlacementStatusRequested(cell)
+
+    ensures:
+        HeldDeploymentsReadByMember(cell)
+        HolderCountsReportedByPool(cell)
+        PlacementNodeTargetsReportedByPool(cell)
+}
+
 ------------------------------------------------------------
 -- Rules: reads
 ------------------------------------------------------------

@@ -1679,6 +1679,53 @@ pub async fn cell_status(directory: &dyn Directory, target_per_node: usize) -> R
     })
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PlacementPoolStatus {
+    pub eligible: usize,
+    pub draining: usize,
+    pub holdings: usize,
+    pub recommended_nodes: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PlacementStatus {
+    pub general: PlacementPoolStatus,
+    pub isolation: PlacementPoolStatus,
+    pub nodes: BTreeMap<String, usize>,
+    pub logkeepers: usize,
+    pub compaction_workers: usize,
+}
+
+/// Placement demand per pool, read through the holder index rather than the deployment inventory.
+pub async fn placement_status(directory: &dyn Directory, target_per_node: usize) -> Result<PlacementStatus> {
+    let members = members(directory).await?;
+    let now = now_ms();
+    let mut nodes: BTreeMap<_, usize> = members.values().filter(|member| member.may_hold(now) && member.pool != MemberPool::Compaction)
+        .map(|member| (&member.id, 0)).collect();
+    for record in live_holdings(directory, &members, now).await? {
+        if let Some(count) = effective_holder(&record, &members, now).and_then(|holder| nodes.get_mut(holder)) { *count += 1; }
+    }
+    let pool_status = |pool, minimum| {
+        let mut status = PlacementPoolStatus { eligible: 0, draining: 0, holdings: 0, recommended_nodes: 0 };
+        for (id, held) in &nodes {
+            let member = &members[*id];
+            if member.pool != pool { continue; }
+            status.holdings += held;
+            if member.may_receive_placements(now) { status.eligible += 1; }
+            if member.state == MemberState::Draining { status.draining += 1; }
+        }
+        status.recommended_nodes = status.holdings.div_ceil(target_per_node.max(1)).max(minimum);
+        status
+    };
+    Ok(PlacementStatus {
+        general: pool_status(MemberPool::General, 1),
+        isolation: pool_status(MemberPool::Isolation, 0),
+        nodes: nodes.into_iter().map(|(id, held)| (id.to_string(), held)).collect(),
+        logkeepers: members.values().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).count(),
+        compaction_workers: members.values().filter(|member| member.role == MemberRole::Node && member.pool == MemberPool::Compaction && member.is_live(now)).count(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Range;

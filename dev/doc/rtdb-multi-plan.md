@@ -703,6 +703,9 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    Upgrade all placement and directory writers before using pins or starting a version-targeted drain.
    Lazy format conversion and mixed engine storage-format validation remain open.
 3. Autoscaling signals per pool, published as metrics through `metrics` and `server/src/metric_export`: nodes by the binding `LoadVector` dimension, logkeepers by ingest, workers by queue depth, gateways by connections.
+   `rtdb-multi status --placements-only` reports eligible and draining nodes, indexed holdings, and the holder-count target for each placement pool.
+   This mode reads member holdings without scanning the parked deployment inventory.
+   DynamoDB verifies each returned indexed holding against its current record, and a newly placed deployment appears once the holder index has caught up.
 
 **Tests.**
 Simulation: scale-out moves only the keys that prefer the new member; scale-in retires members only when empty; a poisonous deployment is quarantined after `quarantine_crashes`; the balancer converges without oscillating.
