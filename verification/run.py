@@ -718,6 +718,36 @@ def verify_leaf_runs(args, scratch):
         raise ValueError("Lean leaf rank dependency did not compile")
     verify_lean_model(args, scratch, path, "leaf-runs", controls, 7,
                       os.environ | {"LEAN_PATH": str(dependency)})
+    return dependency
+
+
+def verify_trie_sibling_order(args, scratch, dependency):
+    path = Path("verification/lean/TrieSiblingOrder.lean")
+    controls = {
+        "wrong-byte-at-depth": (
+            "(bytes[depth / 4]?).bind",
+            "(bytes[depth / 2]?).bind",
+            ["bucket_at_depth_uses_the_corresponding_byte_lane"],
+        ),
+        "reverse-siblings": (
+            "(bucketOrder : buckets.Pairwise fun first second => first.val < second.val)",
+            "(bucketOrder : buckets.Pairwise fun first second => second.val < first.val)",
+            ["sibling_order_recovers_the_source_run"],
+        ),
+        "drop-first-visited-row": (
+            "    buckets.flatMap rows = source := by",
+            "    (buckets.flatMap rows).tail = source := by",
+            ["sibling_order_recovers_the_source_run"],
+        ),
+    }
+    leaf_runs = Path("verification/lean/LeafRuns.lean")
+    clone_file(leaf_runs, dependency)
+    env = os.environ | {"LEAN_PATH": str(dependency)}
+    built = run_case([args.lean, "-DwarningAsError=true", "-o", "LeafRuns.olean", str(leaf_runs)],
+                     dependency, args.evidence, "lean-trie-sibling-order-leaf-runs", env)
+    if built.returncode:
+        raise ValueError("Lean leaf-run dependency did not compile")
+    verify_lean_model(args, scratch, path, "trie-sibling-order", controls, 7, env)
 
 
 def verify_snapshot_ownership(args, scratch):
@@ -823,6 +853,103 @@ def verify_table_slugs(args, scratch):
         ),
     }
     verify_lean_model(args, scratch, path, "table-slugs", controls, 6)
+
+
+def verify_staged_prefix(args, scratch, history):
+    path = Path("verification/lean/StagedPrefix.lean")
+    controls = {
+        "ignore-block": (
+            "if stage.predecessor = snapshot.head ∧ stage.block = snapshot.block then",
+            "if stage.predecessor = snapshot.head then",
+            ["success_admits_exactly_the_linked_stage_chain"],
+        ),
+        "append-as-oldest": (
+            "stage.rows :: snapshot.history",
+            "snapshot.history ++ [stage.rows]",
+            ["empty_visible_batch_still_advances_the_head",
+             "resolver_reads_the_newest_queued_batches_then_durable"],
+        ),
+        "publish-on-stage": (
+            "| some _ => some ⟨pipeline.applied, pipeline.pending ++ [next]⟩",
+            "| some resolved => some ⟨resolved, pipeline.pending ++ [next]⟩",
+            ["staging_preserves_the_external_snapshot"],
+        ),
+        "discard-applied-rows": (
+            "⟨pipeline.applied, []⟩",
+            "⟨{ pipeline.applied with history := [] }, []⟩",
+            ["discarding_the_queue_preserves_the_applied_prefix"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "staged-prefix", controls, 8,
+                      os.environ | {"LEAN_PATH": str(history)})
+
+
+def verify_limit_open(args, scratch):
+    path = Path("verification/lean/LimitOpen.lean")
+    controls = {
+        "offset-before-input-failure": (
+            "| .error issue => ([.input], .error issue)",
+            "| .error issue => match bound .offset offset with\n"
+            "    | .error offsetIssue => ([.offset], .error offsetIssue)\n"
+            "    | .ok _ => ([.input], .error issue)",
+            ["input_failure_precedes_every_bound"],
+        ),
+        "fetch-before-offset": (
+            "match bound .offset offset with",
+            "match bound .fetch fetch with",
+            ["direct_bounds_can_skip_evaluating_the_counts", "fetch_refusal_follows_valid_offset",
+             "offset_refusal_precedes_fetch"],
+        ),
+        "coerce-direct-negative-to-zero": (
+            "if 0 ≤ integer ∧ integer ≤ 9223372036854775807 then some (some integer.toNat) else none",
+            "if integer ≤ 9223372036854775807 then some (some integer.toNat) else none",
+            ["direct_bound_has_the_same_success"],
+        ),
+        "overflow-positive-acceptance": (
+            "if 0 ≤ integer ∧ integer ≤ 9223372036854775807 then .ok (some integer.toNat)",
+            "if 0 ≤ integer ∧ integer ≤ 9223372036854775808 then .ok (some integer.toNat)",
+            ["direct_bound_has_the_same_success", "minus_one_and_overflow_are_refused",
+             "nonnegative_representable_integer_is_preserved"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "limit-open", controls, 10)
+
+
+def verify_private_replay(args, scratch):
+    path = Path("verification/lean/PrivateReplay.lean")
+    controls = {
+        "inclusive-cutoff": (
+            "decide (sample < cutoff)",
+            "decide (sample ≤ cutoff)",
+            ["admits_overlap_every_retained_marker", "exact_cutoff_refuses"],
+        ),
+        "shorten-marker": (
+            "max (sample + 3600000000) cutoff",
+            "sample + 3600000000",
+            ["installed_marker_covers_cutoff"],
+        ),
+        "point-lookup": (
+            "decide (sample < marker.expiresAt)",
+            "decide (marker.startsAt ≤ sample ∧ sample < marker.expiresAt)",
+            ["admits_overlap_every_retained_marker", "overlap_realizes_valid_time_range"],
+        ),
+        "duplicate-side-effect": (
+            "if overlaps marker attempt.submittedAt then\n            (state, .committed marker.original)",
+            "if overlaps marker attempt.submittedAt then\n            ({ state with effects := state.effects + 1 }, .committed marker.original)",
+            ["duplicates_preserve_the_original_for_any_admitted_sample"],
+        ),
+        "execute-after-lookup-failure": (
+            "if attempt.lookupFailed then (state, .aborted)",
+            "if attempt.lookupFailed then perform cutoff state attempt",
+            ["lookup_failure_preserves_marker_and_effects"],
+        ),
+        "install-aborted-marker": (
+            "else (state, .aborted)",
+            "else ({ state with marker := some ⟨attempt.submittedAt, markerEnd cutoff attempt.submittedAt, attempt.outcome⟩ }, .aborted)",
+            ["step_preserves_atomic_effect"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "private-replay", controls, 9)
 
 
 def verify_explicit_session(args, scratch):
@@ -1165,7 +1292,8 @@ def verify_lean(args, scratch):
             verify_memory_admission(args, scratch)
             verify_memory_trie(args, scratch)
             verify_iid_byte_order(args, scratch)
-            verify_leaf_runs(args, scratch)
+            leaf_models = verify_leaf_runs(args, scratch)
+            verify_trie_sibling_order(args, scratch, leaf_models)
             verify_live_row_address(args, scratch)
             verify_snapshot_ownership(args, scratch)
             verify_jvm_trie_pending_logs(args, scratch)
@@ -1173,6 +1301,9 @@ def verify_lean(args, scratch):
             verify_outer_join(args, scratch)
             verify_table_slugs(args, scratch)
             verify_explicit_session(args, scratch)
+            verify_private_replay(args, scratch)
+            verify_limit_open(args, scratch)
+            verify_staged_prefix(args, scratch, directory)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)

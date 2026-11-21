@@ -33,9 +33,9 @@ These results apply to the classic and full-text Rust paths at the particular re
 | LOG12 · Retained history audit | Lean proves chain equality for arbitrary page partitions, continuation from an adjacent digest, and the coverage and equality requirements for strict certification. Native contract tests compare online and stopped-journal digests across epochs and exercise quorum certification across multiple pages and trim. | Relate the accepted online and offline intervals and ordered records to the model under all journal and transport outcomes, including responder selection and physical validation. |
 | LOG13 · Journal retirement | Lean proves that replay and compaction preserve the retirement marker, and that completion requires every addressed replica. Kani checks replay of the production `Drop` event and subsequent commit refusal on an empty stream. Native replicas exercise retirement retry, restart, and direct checks for removed payloads. | Prove the runtime journal and fsync transitions, the inventory of all required replicas after copy or move, and the storage and deletion receipt contracts. |
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
-| IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, and stable partition of an insertion or split batch at every valid depth. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Compose grouping, leaf ordering, and recursive replacement at actual Rust and JVM call sites, then connect the resulting trees to traversal and replay. |
-| IDX02, IDX03, IDX07, IDX09 | Verus checks that the production Rust sort and merge return every input occurrence in IID order or report a reader error, and that native persisted leaf validation establishes run order. OpenJML checks order and multiplicity of the production JVM merge. An injective logical rank uniquely determines the successful output sequence. | Establish IID stability at each runtime reader, prove JVM pending-run sorting, and propagate stored-run order through the actual tree and leaf-state transitions. |
-| IDX01, IDX08 | Verus checks the production Rust search, append, and adjacent chunk replacement against one contiguous-layout invariant. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Prove the Arrow row-content obligation and refine snapshot ownership across block transitions in both engines. |
+| IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, partition, and recursive and one-level split. The Kani harness also checks all legal depths using independent bit extraction for widths 2, 4, and 8. | Check the native node construction and live insertion and traversal boundaries, then refine JVM splitting and connect both trees to replay. |
+| IDX02, IDX03, IDX07, IDX09 | Verus checks the production native sort, merge, persisted order validation and leaf split. OpenJML checks order and multiplicity of the production JVM merge. An injective logical rank uniquely determines an ordered leaf from its row occurrences. | Establish IID stability at each runtime reader, prove JVM pending-run sorting, and propagate stored-run order through insertion, caches and traversal. |
+| IDX01, IDX08 | Verus checks production Rust row addressing and proves that appending or joining adjacent chunks preserves the exact 16-byte IID at a retained ordinal under the ordered payload contract. Lean proves the corresponding arbitrary-history law. | Establish the Arrow and cached-header content contract and refine snapshot ownership across block transitions in both engines. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
 | STORE03 · Read entitlements | Lean proves a lease timing inequality and preservation of read entitlement across arbitrary abstract pin transitions, including close while a read remains active. | Prove clock, I/O completion, decoded page ownership, cache eviction, and provider lifetime assumptions at production call sites. |
@@ -159,6 +159,74 @@ The native contract test compares the public bucketer with an independent unsign
 Verus 0.2026.11.05.31e44e6 checked nine functions and rejected all five mutations, including one that accepts an IID with a smaller first differing digit. [Verus study](../../verification/verus/iid_partition/area.json)
 The native run passed 495 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Rust contract test](../../rust/crates/trie/tests/contracts.rs)
 
+### Same-block staged resolution prefix
+
+Lean checks that a queue can extend a captured snapshot exactly when each write names the current predecessor and block.
+The resolver view places staged batches in newest-first order ahead of the applied history.
+Moving the first stage into the applied prefix leaves the resolver's bitemporal answer unchanged if the published snapshot matches the overlay, including its block and transaction coordinates.
+Staging leaves the external snapshot in place, and discarding the remaining queue preserves the applied prefix.
+A batch with no rows in the table still advances the projected history's transaction coordinate.
+
+The native regressions reject reversed predecessors and a wrong block in `with_staged`.
+They check that moving an applied head out of the queue preserves the resolver basis and that captured readers cannot see staged data.
+A separate regression reads the predecessor's staged write and then the previous argument row's write within the current transaction.
+The proof takes one table's list of logical effects as input and assumes the segment and publication layers preserve that history.
+The concrete Arrow segment representation, block turnover, and read-back fencing still need composition with those premises. [Lean model](../../verification/lean/StagedPrefix.lean) · [Native overlay tests](../../rust/crates/tx/tests/resolution.rs) · [Snapshot construction](../../rust/crates/index/src/snapshot.rs)
+
+### Limit opening and count admission
+
+The ordinary native limit opens the input before evaluating OFFSET and then FETCH.
+An input that evaluates its rows eagerly can fail on open.
+An expression deferred by a projection remains deferred when the bound fails.
+A present FETCH and valid bounds that can be read directly from literals or captured parameters enable an ordered seek.
+An invalid count falls back to ordinary opening, where the earlier input error keeps its precedence.
+
+Lean proves the abstract open and bound order, the preservation of bound-expression errors, and equality of successfully decoded direct and ordinary counts.
+The direct-count law assumes the expression denotes the captured scalar that the endpoint reads.
+Verus checks the production count decoder and the capped offset-plus-fetch prefix, including the signed endpoint and overflowing unsigned sums.
+Native statement tests exercise eager and deferred evaluation, and the ordered-index tests require both literal and parameter counts to seek without an ordinary candidate scan.
+Full refinement still needs the async opener, the expression evaluator and optimizer's ordering and resource contracts. [Lean model](../../verification/lean/LimitOpen.lean) · [Verus study](../../verification/verus/limit_bounds/area.json) · [Production operators](../../rust/crates/query/src/operators.rs) · [Statement regression](../../rust/crates/node/tests/statement.rs)
+
+### Submission clock and durable retry attribution
+
+Native submissions with an application idempotency key use a finite one-hour marker interval measured from submission.
+The resolver identifies the generated duplicate guard by its recorded position in the source transaction.
+An assertion failure elsewhere in the same operation sequence keeps its own aborted result.
+The outcome lookup uses the retry's historical system-time view of the key marker.
+The new reader still recognizes earlier source records and looks up their duplicate outcomes using the older guard convention.
+Verus checks the exact expiration boundary and operation-position helpers, with four mutation controls.
+Native regressions cover a system-time jump, a user assertion at the next position, concurrent submissions, and old and new outcome lookup after local restart.
+The application marker table remains writable through ordinary DML.
+This evidence covers the checked helpers and the tested recovery trace. [Native tests](../../rust/crates/node/tests/native.rs) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Source transaction contract](db.allium)
+
+### Private replay admission and marker authority
+
+The Rust session accepts a trusted frontend's permit at synchronous commit of one buffered write operation.
+The node takes a single submission sample after admission and refuses a sample at or after the permit's exclusive cutoff before source append.
+A conflicting application key also refuses submission.
+The wire record contains the effective key, admitted sample and cutoff.
+Source recovery recomputes the validity interval and rejects incomplete or conflicting guard envelopes.
+
+The resolver reads markers against the ordered resolution prefix before user operations run.
+It writes the first successful command's marker together with the user's writes and the transaction receipt.
+The marker lives in the reserved `xt` schema, which rejects ordinary DML and direct external event writes.
+A duplicate records the original transaction key in its abort receipt and skips the user operations.
+The await path returns the original committed key from that receipt after live apply or recovery.
+A caller error during marker lookup aborts that attempt and leaves the resolver available for subsequent attempts.
+An external-source writer's abort with code `rtdb.tx/private-replay-duplicate` retains its original error.
+
+Verus checks the finite half-open interval and the strict cutoff in the production arithmetic.
+Lean proves at most one user effect for arbitrary resolution sequences for one key and cutoff, including aborted attempts and clock samples that arrive in either order.
+The installed marker overlaps every admitted submission's valid-time range, and later resolutions preserve its original outcome.
+In the model, a caller error during marker lookup aborts that attempt and preserves the stored marker and user-effect count.
+The model assumes one authoritative ordered prefix, atomic publication of user effects and the marker, and a common key and cutoff supplied by the trusted frontend.
+Native regressions cover cutoff equality, conflicting keys, parallel attempts, out-of-order clock samples, expiry beyond the ordinary window, rejected writes to the marker, and recovery both of a flushed marker and of the duplicate receipt.
+The format regression checks required field presence and distinguishes a zero timestamp from absence.
+The deployed contract still depends on frontend eligibility and matching resolver support across the log's eligible writers.
+Stable replay of aborted outcomes remains open. [Lean model](../../verification/lean/PrivateReplay.lean) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Node tests](../../rust/crates/node/tests/native.rs) · [Wire tests](../../rust/crates/tx/tests/submission.rs) · [Transaction contract](db.allium)
+
+The published Multi integration test withholds a committed UPDATE's reply, moves the deployment to another writer, and checks that the same client receives a completion and reads one increment. [Writer replacement regression](https://github.com/bijectionhq/rtdb/blob/7b4b6cd5427bbf04c841729eb532c18839b348e7/rust/crates/multi/tests/cell.rs#L2566)
+
 ### Production live-trie bucket grouping
 
 Rust branch insertion and leaf splitting call the same checked grouping function.
@@ -169,6 +237,30 @@ The child-path law composes the production comparator and digit selector to show
 The native tests exercise the last IID digit, repeated rows, and a read failure whose suffix remains unread.
 Verus 0.2026.11.05.31e44e6 checked thirteen functions and rejected all eight mutations, including wrong-child placement, reversed order, and admitting an unreadable row.
 The native run passed 497 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production grouping and tests](../../rust/crates/trie/src/partition_step.rs) · [Verus study](../../verification/verus/iid_partition/area.json)
+
+### Production leaf split
+
+Native overflow insertion and log compaction call the same checked subtree builder.
+Verus proves that a successful split preserves the input root, places every indexed occurrence in a matching leaf prefix, and preserves rank order within each resulting leaf.
+The sum of the occurrence counts in the result equals the count in the original run for each ordinal.
+Each constructed child uses the prefix given by its bucket slot, and the proof checks the depth bound on all recursive calls.
+A requested one-level split adds at most one level.
+A recursive split ends at a fitting page or at maximum depth.
+The proof assumes a valid ordered input run, a fixed IID lookup result per ordinal during the split, and a node constructor that reflects its path and leaf runs in bucket order.
+The native regressions compare one-level and maximum-depth recursive splits of a repeated-ordinal run and replay an IID failure during recursion through the public insertion API.
+Verus 0.2026.11.05.31e44e6 checked twenty-five functions and rejected thirteen controls, including dropping a child, swapping child slots, appending an incorrect path digit, splitting past maximum depth, and ignoring one-level mode.
+The native run passed 510 tests with `CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production split](../../rust/crates/trie/src/leaf_split_step.rs) · [Native node construction](../../rust/crates/trie/src/memory.rs) · [Verus study](../../verification/verus/iid_partition/area.json)
+
+### Trie sibling traversal order
+
+Lean proves that the base-four path orders IIDs by unsigned byte order and that depth `d` selects byte `d / 4` and lane `d % 4`.
+Verus separately checks that formula in the production Rust selector.
+Under a stable 16-byte IID for every ordinal, rows from an earlier child slot precede all rows from a later child slot in the leaf rank.
+For an ordered source run, if the visited child runs match their prefixes, are individually ordered and preserve each ordinal's count, concatenating them in slot order gives the exact original sequence.
+The count premise includes repeated ordinals.
+This composes at each branch given the ordered child runs, occurrence counts, and common IID interpretation.
+The production traversal and node adapter still need a refinement proof against those premises.
+Lean 4.35.0 audited seven theorems and rejected controls that select the wrong byte at depth, reverse sibling order, or drop the first visited row. [Sibling order proof](../../verification/lean/TrieSiblingOrder.lean) · [Checked Rust digit selector](../../rust/crates/trie/src/partition_step.rs) · [Checked subtree construction](#production-leaf-split)
 
 ### Production leaf merge
 
@@ -268,6 +360,15 @@ The native tests check chunk boundaries, repeated starts, retained reads after a
 Lean 4.35.0 audited five theorems and rejected both mutations.
 Verus 0.2026.11.05.31e44e6 checked nine functions and rejected five mutations.
 The native run passed 503 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Lean model](../../verification/lean/LiveRowAddress.lean) · [Verus study](../../verification/verus/live_row_address/area.json) · [Snapshot regression](../../rust/crates/index/tests/live_index.rs)
+
+### Retained IID contents in native chunks
+
+Verus checks the production row-address search, append, and tail replacement with chunks carrying sixteen-byte IID values.
+The checked reader returns the value at the unique owning cell of every in-range ordinal, even when empty chunks repeat a start address.
+Appending a chunk preserves that value for every retained ordinal, including when an overflowing append returns an error.
+Replacing the tail pair preserves the same value when the replacement's cells equal the earlier payload followed by the later payload.
+The study rejects reading the first cell instead of the located cell, ignoring the appended length, and reversing the two payloads while preserving their combined extent.
+The payload premise still needs to be established by Arrow concatenation and the live table's cached header reader. [Typed IID correspondence](../../verification/verus/live_iid_contents/contents.rs) · [Production row-address operations](../../rust/crates/index/src/row_address.rs) · [Live table and header reader](../../rust/crates/index/src/live.rs)
 
 ### JVM shared snapshot ownership
 

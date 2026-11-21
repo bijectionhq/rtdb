@@ -373,6 +373,14 @@ variant TxMessage : SourceMessage {
     -- Batches with compatible column types retain first-seen column order and represent missing columns as nulls without converting the documents to rows.
     -- Differently typed scalar columns can share a dense union in the source message and retain their Arrow representation on replay.
     -- Null and missing values use that union's null leg.
+    -- A historical native keyed submission can carry an optional guard envelope with a submission clock sample and guard position.
+    -- Older and unkeyed records can omit the envelope.
+    -- The key marker is valid from its submission sample, inclusive, until one hour later, exclusive.
+    -- For a record carrying the envelope, the failed assertion must have the recorded position to identify a duplicate.
+    -- Typed outcome lookup selects the latest marker visible at the retry's system time whose validity extends past the retry's submission sample.
+    -- A private replay submission instead carries its engine key, admission sample and exclusive cutoff.
+    -- These values are required together when the private replay envelope is present.
+    -- Submission refuses a sample at or after the cutoff before appending a source record.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
     default_tz: ZoneId               -- always present
@@ -880,6 +888,13 @@ rule LeaderProcessesTx {
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.
     -- For concrete document writes, forbidden columns abort with the table reference and offending column names in source schema order.
     -- SQL insert plans report each forbidden projection as a planning error.
+        -- The resolver looks up a private replay key against its ordered prefix before applying user operations.
+        -- A matching marker has a validity interval overlapping the submission sample or a later instant.
+        -- A successful first execution records its marker atomically with its user effects.
+        -- The marker expires at the later of the permit cutoff and one hour after the admission sample.
+        -- Private replay markers can be created by the resolver only and are protected from application writes and erases.
+        -- A duplicate records the original transaction key in its durable outcome and skips the user operations.
+        -- A caller error while looking up a private marker records a durable abort for that attempt and skips its user operations.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }

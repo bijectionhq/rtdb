@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::bucketer::invalid_bucket_depth;
 use crate::leaf_load_step::validate_persisted_order;
 use crate::leaf_sort_step::{merge_overflow_rows, merge_pending_rows};
+use crate::leaf_split_step::{split_subtree, SplitContents};
 use crate::partition_step::group_base4_rows;
 use crate::{Bucketer, Path};
 
@@ -226,20 +227,21 @@ fn compact<R: IidReader + ?Sized>(node: &Arc<TrieNode>, reader: &R, config: Trie
 }
 
 fn build_subtree<R: IidReader + ?Sized>(path: Path, rows: Vec<u32>, reader: &R, config: TrieConfig, recursive: bool) -> Result<Arc<TrieNode>> {
-    if rows.len() <= config.page_limit || path.len() == Bucketer::DEFAULT.max_depth() {
-        return Ok(Arc::new(TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([])))));
-    }
-    let buckets = group_base4_rows(
-        rows.into_iter(), path.len(), |row| reader.iid(row).map(|iid| iid.0), invalid_bucket_depth,
-    )?;
-    let mut children = std::array::from_fn(|_| None);
-    for (bucket, rows) in buckets.into_iter().enumerate() {
-        if rows.is_empty() { continue; }
-        let child_path = path.child(bucket as u8, Bucketer::DEFAULT)?;
-        children[bucket] = Some(if recursive { build_subtree(child_path, rows, reader, config, true)? }
-        else { Arc::new(TrieNode::Leaf(Leaf::new(child_path, rows.into(), Arc::from([])))) });
-    }
-    Ok(Arc::new(TrieNode::Branch { path, children }))
+    split_subtree(
+        path.into_buckets(),
+        rows,
+        |row| reader.iid(row).map(|iid| iid.0),
+        invalid_bucket_depth,
+        |buckets, contents| {
+            let path = Path::from_split_buckets(buckets);
+            Arc::new(match contents {
+                SplitContents::Leaf(rows) => TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([]))),
+                SplitContents::Branch(children) => TrieNode::Branch { path, children },
+            })
+        },
+        config.page_limit,
+        recursive,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

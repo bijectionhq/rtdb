@@ -191,6 +191,8 @@ It also proves that any number of replacements preserve the first recovery cutof
 The [gateway model](../../verification/multi/tla/RTDBGatewayReplay.tla) checks a bounded single-command schedule with three weakened configurations.
 [Verus checks the production cutoff-selection step](../../verification/verus/replay_deadline/proof.rs).
 The full composition with the asynchronous gateway, SQL execution, and the durable journal remains open.
+The private engine replay study checks the shared cutoff, protected marker creation and durable outcome lookup.
+The deployed claim still requires the gateway to send the same permit on each attempt and to enforce writer compatibility and command eligibility. [Engine replay evidence](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority)
 [CheckpointReplay.lean](../lean/CheckpointReplay.lean) proves that replaying exactly the suffix above a checkpoint gives the same result as folding the whole committed prefix through the requested basis.
 It also proves that the abstract snapshot response uses the requested basis within the checkpoint's coverage.
 The production refinement must connect the packed catalog and bitemporal query state to this complete logical prefix.

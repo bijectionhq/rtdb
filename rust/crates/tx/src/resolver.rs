@@ -14,7 +14,10 @@ use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, decode_arguments, is_reserved_write_schema, table_name}};
+use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
+use crate::{SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
+
+pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 
 pub trait TransactionAuthorization: Send + Sync {
     /// Rejects an absent principal or a principal without the reference superuser authority.
@@ -169,10 +172,10 @@ impl TxResolver {
         };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.trace_parent = span.as_ref().map(|span| span.context());
-        // A retry identity is scoped to the submitting principal; its receipt records what the original asked for.
-        let receipt = request.idempotency_key()
-            .map(|retry_key| Ok::<_, Anomaly>((format!("{}\u{1f}{retry_key}", request.options.user.as_deref().unwrap_or("")), request.body_digest()?)))
-            .transpose()?;
+        let replay = match &request.guard {
+            Some(SourceGuard::Replay(replay)) => Some(replay),
+            _ => None,
+        };
         let outcome = if let Some((requested, previous)) = invalid_time {
             Err(Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
@@ -185,8 +188,22 @@ impl TxResolver {
             Err(Anomaly::incorrect("rtdb/ordered-system-time", "specified system-time precedes the source-log timestamp")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
                 .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?))
+        } else if let Some(replay) = replay && let Err(error) = tx.check_replay_marker(replay).await {
+            Err(error)
         } else {
-            let mut outcome = match &receipt { Some((id, digest)) => tx.receipt_outcome(id, digest).await?, None => Ok(()) };
+            let (receipt, mut outcome) = if request.guard.is_none() {
+                match request.idempotency_key() {
+                    Some(key) => match request.body_digest() {
+                        Ok(digest) => {
+                            let id = format!("{}\u{1f}{key}", request.options.user.as_deref().unwrap_or(""));
+                            let outcome = tx.receipt_outcome(&id, &digest).await.and_then(|outcome| outcome);
+                            (Some((id, digest)), outcome)
+                        }
+                        Err(error) => (None, Err(error)),
+                    },
+                    None => (None, Ok(())),
+                }
+            } else { (None, Ok(())) };
             for (index, operation) in request.operations.iter().enumerate().take_while(|_| outcome.is_ok()) {
                 context.check_cancelled()?;
                 if let Err(error) = validate_document_operation(operation) {
@@ -198,12 +215,25 @@ impl TxResolver {
                         Some(table) if !error.context.contains_key("table") => error.with_transit_context("table", &T::table_ref(table))?,
                         _ => error,
                     };
+                    let error = if error.code == "xtdb/assert-failed" {
+                        match &request.guard {
+                            Some(SourceGuard::Application(guard)) => {
+                                let guard_time = crate::guard_attribution::guard_time_at(index, guard.after_bootstrap, guard.submitted_at.0);
+                                error.with_context(IDEMPOTENCY_GUARD_RESULT, guard_time.map_or(false.into(), Into::into))
+                            }
+                            Some(SourceGuard::Replay(_)) => error.with_context(IDEMPOTENCY_GUARD_RESULT, false.into()),
+                            None => error,
+                        }
+                    } else { error };
                     outcome = Err(error.with_context("tx-op-idx", index.into()).with_context("tx-key", tx_key_context(key)?));
                     break;
                 }
             }
-            if let (Ok(()), Some((id, digest))) = (&outcome, &receipt) { tx.put_receipt(id, digest)?; }
-            outcome
+            outcome.and_then(|()| match (replay, receipt) {
+                (Some(replay), _) => tx.write_replay_marker(replay),
+                (None, Some((id, digest))) => tx.put_receipt(&id, &digest),
+                (None, None) => Ok(()),
+            })
         };
         let result = match outcome {
             Ok(()) => TransactionResult::Committed { tx_key: key },
@@ -305,7 +335,11 @@ impl<'a> OpenTransaction<'a> {
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
-    pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.context.check_cancelled()?; self.buffer.append(table, event) }
+    pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> {
+        self.context.check_cancelled()?;
+        if is_replay_table(&table) || table == receipts_table() { check_table(&table)?; }
+        self.buffer.append(table, event)
+    }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
 
     pub async fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
@@ -599,6 +633,33 @@ impl<'a> OpenTransaction<'a> {
         let batch = rtdb_format::data::owned_put_batch(content, &headers, memory)?;
         self.buffer.append_batch(table, batch)
     }
+    async fn check_replay_marker(&self, replay: &ReplaySubmission) -> Result<()> {
+        if !self.snapshot()?.contains_table(&replay_table()) { return Ok(()); }
+        let mut cursor = self.open_query(
+            "SELECT original_tx_id, _system_from FROM xt.rtdb_replay_keys FOR VALID_TIME FROM ? TO NULL WHERE _id = ? ORDER BY _system_from DESC LIMIT 1",
+            vec![time_value(replay.submitted_at()), Value::Utf8(replay.key().to_owned())],
+        ).await?;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            if batch.num_rows() == 0 { continue; }
+            let id = rtdb_columnar::read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
+            let system = rtdb_columnar::read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
+            let (Value::I64(id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (id, system) else {
+                return Err(Anomaly::fault("rtdb.tx/private-replay-marker", "Replay marker has no original transaction key"));
+            };
+            return Err(duplicate_replay(TransactionKey { tx_id: TxId(id), system_time: Timestamp(value) }));
+        }
+        Ok(())
+    }
+
+    fn write_replay_marker(&mut self, replay: &ReplaySubmission) -> Result<()> {
+        let document = StructFields::from([
+            ("_id".into(), Value::Utf8(replay.key().to_owned())),
+            ("original_tx_id".into(), Value::I64(self.tx_key().tx_id.0)),
+        ]);
+        self.buffer.put(replay_table(), document, interval(replay.submitted_at(), replay.expires_at())?)
+    }
+
     fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>) -> Result<()> {
         let key = result.tx_key();
         let error = result.encoded_error()?;

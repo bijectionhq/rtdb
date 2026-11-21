@@ -58,7 +58,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | QRY08 · Join and set semantics | Open | — |
 | QRY09 · Aggregation | Partial | [Ordered-index distinct runs and bounded query prefixes](rtdb-engine-proof-evidence.md#main-evidence) |
 | QRY10 · Ordering and windows | Partial | [Ordered merge, filtering before limit and keyset continuation](rtdb-engine-proof-evidence.md#main-evidence) |
-| QRY11 · Evaluation context | Open | — |
+| QRY11 · Evaluation context | Partial | [Lean limit-opening order, checked production bounds, and native evaluation regressions](rtdb-engine-proof-evidence.md#limit-opening-and-count-admission) |
 | QRY12 · Streaming equivalence | Open | — |
 | QRY13 · Query framing | Open | — |
 | QRY14 · Rewrite termination (Candidate) | Open | — |
@@ -98,9 +98,9 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
-| TX01 · All-or-nothing effects | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) |
-| TX02 · Ordered resolution | Open | — |
-| TX03 · Staged isolation | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) |
+| TX01 · All-or-nothing effects | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Private replay admission and marker authority](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority) |
+| TX02 · Ordered resolution | Partial | [Lean same-block prefix and native overlay admission](rtdb-engine-proof-evidence.md#same-block-staged-resolution-prefix) |
+| TX03 · Staged isolation | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Lean staged views and native overlay observations](rtdb-engine-proof-evidence.md#same-block-staged-resolution-prefix) |
 | TX04 · Static DML equivalence | Open | — |
 | TX05 · Ordered apply | Open | — |
 | TX06 · Read-back agreement | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) |
@@ -108,7 +108,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | TX08 · Progress monitor | Open | — |
 | TX09 · Transaction clocks | Partial | [Mixed system-clock proof and replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | TX10 · Statement semantics at commit | Open | — |
-| TX11 · Known outcome | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) |
+| TX11 · Known outcome | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Native submission clock and durable retry attribution](rtdb-engine-proof-evidence.md#submission-clock-and-durable-retry-attribution) · [Private replay admission and marker authority](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority) |
 | TX12 · Strict serializability (Candidate) | Open | — |
 
 ## Logs, leadership, and block adoption
@@ -134,13 +134,13 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
 | IDX01 · Exact lookup | Partial | [Lean routed lookup and Rust comparison with flat history](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) · [Verified live row addressing](rtdb-engine-proof-evidence.md#live-row-addresses-across-chunk-layouts) |
-| IDX02 · Total coverage | Partial | [Lean row occurrence conservation and Rust traversal checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) · [Exact production bucket sequences](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) · [Multiplicity in the native leaf operations](rtdb-engine-proof-evidence.md#production-leaf-sort-and-composition) · [Multiplicity in the JVM merge](rtdb-engine-proof-evidence.md#production-jvm-leaf-merge) · [Leaf-run history and order](rtdb-engine-proof-evidence.md#leaf-runs-compaction-and-persisted-order) |
-| IDX03 · Leaf order | Partial | [Verified native sorting and merge composition](rtdb-engine-proof-evidence.md#production-leaf-sort-and-composition) · [Checked native persisted order](rtdb-engine-proof-evidence.md#native-persisted-leaf-order) · [Native comparator and JVM IID ordering](rtdb-engine-proof-evidence.md#production-leaf-comparison) · [Checked JVM merge](rtdb-engine-proof-evidence.md#production-jvm-leaf-merge) · [Leaf-run history and order](rtdb-engine-proof-evidence.md#leaf-runs-compaction-and-persisted-order) |
-| IDX04 · Bucket routing | Partial | [Verified production grouping and child-path membership](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) · [Rust IID bucket selection](rtdb-engine-proof-evidence.md#multi-evidence) |
+| IDX02 · Total coverage | Partial | [Lean row occurrence conservation and Rust traversal checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) · [Exact production bucket sequences](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) · [Multiplicity in the native leaf operations](rtdb-engine-proof-evidence.md#production-leaf-sort-and-composition) · [Multiplicity in the JVM merge](rtdb-engine-proof-evidence.md#production-jvm-leaf-merge) · [Leaf-run history and order](rtdb-engine-proof-evidence.md#leaf-runs-compaction-and-persisted-order) · [Checked native subtree construction](rtdb-engine-proof-evidence.md#production-leaf-split) |
+| IDX03 · Leaf order | Partial | [Verified native sorting and merge composition](rtdb-engine-proof-evidence.md#production-leaf-sort-and-composition) · [Checked native persisted order](rtdb-engine-proof-evidence.md#native-persisted-leaf-order) · [Native comparator and JVM IID ordering](rtdb-engine-proof-evidence.md#production-leaf-comparison) · [Checked JVM merge](rtdb-engine-proof-evidence.md#production-jvm-leaf-merge) · [Leaf-run history and order](rtdb-engine-proof-evidence.md#leaf-runs-compaction-and-persisted-order) · [Checked native subtree construction](rtdb-engine-proof-evidence.md#production-leaf-split) · [Exact sibling visitation sequence](rtdb-engine-proof-evidence.md#trie-sibling-traversal-order) |
+| IDX04 · Bucket routing | Partial | [Verified production grouping and child-path membership](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) · [Rust IID bucket selection](rtdb-engine-proof-evidence.md#multi-evidence) · [Checked native subtree construction](rtdb-engine-proof-evidence.md#production-leaf-split) |
 | IDX05 · Immutable ancestors | Partial | [JVM pending-log ownership proof and sibling-version regressions](rtdb-engine-proof-evidence.md#jvm-trie-pending-log-ownership) |
 | IDX06 · Bulk insertion equivalence | Partial | [Lean batch regrouping and Rust range, batch, and single insertion checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) · [Verified branch insertion grouping](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) |
-| IDX07 · Structural rewrite equivalence | Partial | [Verified stable row partition for a leaf split](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) · [Verified native compaction and overflow run order](rtdb-engine-proof-evidence.md#production-leaf-sort-and-composition) · [Checked JVM merge](rtdb-engine-proof-evidence.md#production-jvm-leaf-merge) · [Leaf-run history and order](rtdb-engine-proof-evidence.md#leaf-runs-compaction-and-persisted-order) |
-| IDX08 · Snapshot lifetime | Partial | [Verified row addressing, layout preservation, and native snapshot regression](rtdb-engine-proof-evidence.md#live-row-addresses-across-chunk-layouts) · [JVM ownership proof and retained-IID race regression](rtdb-engine-proof-evidence.md#jvm-shared-snapshot-ownership) |
+| IDX07 · Structural rewrite equivalence | Partial | [Checked native subtree construction](rtdb-engine-proof-evidence.md#production-leaf-split) · [Verified native compaction and overflow run order](rtdb-engine-proof-evidence.md#production-leaf-sort-and-composition) · [Checked JVM merge](rtdb-engine-proof-evidence.md#production-jvm-leaf-merge) · [Leaf-run history and order](rtdb-engine-proof-evidence.md#leaf-runs-compaction-and-persisted-order) · [Exact sibling visitation sequence](rtdb-engine-proof-evidence.md#trie-sibling-traversal-order) |
+| IDX08 · Snapshot lifetime | Partial | [Verified row addressing, layout preservation, and native snapshot regression](rtdb-engine-proof-evidence.md#live-row-addresses-across-chunk-layouts) · [Native retained IID correspondence](rtdb-engine-proof-evidence.md#retained-iid-contents-in-native-chunks) · [JVM ownership proof and retained-IID race regression](rtdb-engine-proof-evidence.md#jvm-shared-snapshot-ownership) |
 | IDX09 · Serialized correspondence | Partial | [Protobuf path round trip and ordered IID candidates](rtdb-engine-proof-evidence.md#protobuf-trie-paths-and-ordered-iid-candidates) · [Checked native persisted order](rtdb-engine-proof-evidence.md#native-persisted-leaf-order) |
 
 ## Persistent formats and compatibility
@@ -148,7 +148,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
 | FMT01 · Codec round trips | Partial | [Signed position bounds and production codec checks](rtdb-engine-proof-evidence.md#main-evidence) · [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) · [Protobuf trie paths](rtdb-engine-proof-evidence.md#protobuf-trie-paths-and-ordered-iid-candidates) |
-| FMT02 · Optional field presence | Open | — |
+| FMT02 · Optional field presence | Partial | [Native source guard presence and legacy replay regression](rtdb-engine-proof-evidence.md#submission-clock-and-durable-retry-attribution) · [Private replay admission and marker authority](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority) |
 | FMT03 · Arrow event fidelity | Open | — |
 | FMT04 · Version dispatch | Open | — |
 | FMT05 · Errors and referenced payloads | Open | — |
