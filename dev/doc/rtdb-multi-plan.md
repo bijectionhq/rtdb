@@ -454,6 +454,8 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    During recovery, the final overwrite acknowledgements also report the durable commit positions.
    An extra commit round is needed only when those acknowledgements leave fewer than a write quorum at the recovered commit position.
    A wire-level test drops the old writer's commit markers and checks that the successor confirms the recovered entry on a quorum before it is readable.
+   A serving log uses the existing deployment key after the storage open has made it durable.
+   A missing key stops the log open before it can reserve journal endpoints or change a quorum promise.
 3. **Ensemble assignment.**
    The directory records each loglet's ensemble; the controller balances writers across logkeepers.
    Assignment spreads an ensemble across distinct declared zones where possible and retains surviving members during repair.

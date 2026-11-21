@@ -93,8 +93,9 @@ impl LogFactory for LogkeeperLogFactory {
             return Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, drivers: Vec::new() });
         }
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
-        let quorum: Arc<dyn Log> = match access {
+        let (quorum, key): (Arc<dyn Log>, _) = match access {
             LogAccess::ReadWrite => {
+                let key = self.keys.existing(&config.key_id).await?;
                 // An interrupted copy can leave records even if the new
                 // ensemble never becomes the reported serving ensemble.
                 self.recorder.reserve_copy(&config.deployment, config.epoch, &stream.servers).await?;
@@ -109,15 +110,18 @@ impl LogFactory for LogkeeperLogFactory {
                     None => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
                 };
                 self.writers.lock().insert(config.deployment.clone(), Arc::downgrade(&writer));
-                writer
+                (writer, key)
             }
-            LogAccess::ReadOnly => rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?,
+            LogAccess::ReadOnly => {
+                let key = self.keys.existing(&config.key_id).await?;
+                (rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?, key)
+            }
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::new(
             quorum,
-            &self.keys.key(&config.key_id).await?,
+            &key,
             &config.replica_seal_scope,
         )?);
         let next = next_source_offset(replica.as_ref(), epoch).await?;
@@ -340,6 +344,39 @@ mod tests {
     use super::*;
     use rtdb_format::log::proto;
     use rtdb_types::Term;
+
+    #[tokio::test]
+    async fn a_log_open_without_a_serving_key_never_reserves_journal_endpoints() {
+        use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemoryDirectory};
+
+        let files = tempfile::tempdir().unwrap();
+        let keys = Arc::new(crate::keys::LocalKeyService::new(files.path()).unwrap());
+        let directory = MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.holder = Some(MemberId("holder".to_owned()));
+        record.epoch = 1;
+        let record = directory.create_deployment(record).await.unwrap();
+        let configuration = LogkeeperLogConfig {
+            servers: vec!["127.0.0.1:1".to_owned()],
+            deployment: record.id.clone(),
+            key_id: record.key_id(),
+            replica_stream: record.stream("replica"),
+            replica_seal_scope: record.replica_seal_scope(),
+            write_quorum: 1,
+            epoch: record.epoch,
+            log_epoch: record.log_epoch,
+            ensemble: vec![],
+            frozen_at: None,
+            previous_servers: None,
+        };
+        let configuration = Any { type_url: String::new(), value: serde_json::to_vec(&configuration).unwrap() };
+        let factory = LogkeeperLogFactory::new(1024, keys.clone(), Default::default(), Arc::new(DirectoryRecorder { directory: directory.clone() }));
+
+        let refused = factory.open(&configuration, LogAccess::ReadWrite, CancellationToken::new()).await.err().unwrap();
+        assert_eq!(refused.code, "rtdb.multi/key-missing");
+        assert!(directory.deployment(&record.id).await.unwrap().unwrap().replica_journals.is_empty());
+        assert!(keys.existing_key(&record.key_id()).await.unwrap().is_none());
+    }
 
     async fn append(log: &MemoryLog, message: ReplicaBody) {
         let envelope = ReplicaEnvelope { term: Term(1), term_sequence: None, message };
