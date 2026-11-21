@@ -1428,3 +1428,8 @@ Lean 4.36.0 checked seven theorems and rejected all three ownership mutations.
 The model covers local reference ownership and final release, with the locking and Arrow lifetime refinement listed in the engine ledger. link:../lean/SnapshotOwnership.lean[JVM snapshot ownership]
 All 25 JVM live-index cases passed, including reads through a retained snapshot after block adoption.
 The JVM pinning-cache fixture also passed after replacing its assumption about the identity of the evicted entry with checks of the retained pins and the weight limit.
+
+The JVM core suite passed 742 cases and the Gradle property-test tasks passed 3,348 cases.
+The JVM binding suite passed 398 cases with a separately built `rtdb-ffi` library supplied through `xtdb.native.library`.
+The 20-case compactor class passed when rerun after the workspace run hit the one-second recency case timeout.
+The final workspace `test` run succeeded with the native library configured and one Gradle worker, with 3,195 passing cases across the reported test suites.
