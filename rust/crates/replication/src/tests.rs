@@ -822,6 +822,14 @@ async fn a_recovered_checkpoint_does_not_replace_missing_required_replica_record
         fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(1)).await.unwrap().durable().await.unwrap();
     }
     fixture.replica.truncate_before(LogOffset(3)).unwrap();
+    let discovery = BlockDiscovery::List;
+    let config = TrieConfig::default();
+    let now = Timestamp(0);
+    let recovered = fixture.blocks.recover(config, SourcePosition(-1), now, discovery).await.unwrap();
+    let cancelled = CancellationToken::new();
+    let unavailable = fixture.blocks.recover_for_replay(recovered, discovery, &fixture.logs, config, now, &cancelled).await.err().unwrap();
+    assert_eq!(unavailable, Anomaly::from(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 3 }));
+
     let (handle, restarted) = reopen_memory_checkpoint(&fixture).await;
     let error = restarted.run().await.unwrap_err();
     assert_eq!(error, Anomaly::from(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 3 }));
@@ -846,6 +854,27 @@ async fn produce_newer_memory_checkpoint(fixture: &Fixture) -> ReplicationDriver
     let selected = prior.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
     assert_eq!(selected.catalog.boundary_replica_position(), Some(rtdb_types::ReplicaPosition(3)));
     prior
+}
+
+#[tokio::test]
+async fn a_trimmed_replay_anchor_can_advance_only_for_latest_checkpoint_recovery() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let config = TrieConfig::default();
+    let now = Timestamp(0);
+    let cancellation = CancellationToken::new();
+    let latest = BlockDiscovery::From(BlockIndex(0));
+    let exact = BlockDiscovery::At(BlockIndex(0));
+    let before_trim = fixture.blocks.recover(config, SourcePosition(-1), now, latest).await.unwrap();
+    let exact_anchor = fixture.blocks.recover(config, SourcePosition(-1), now, exact).await.unwrap();
+
+    produce_newer_memory_checkpoint(&fixture).await;
+    fixture.replica.truncate_before(LogOffset(3)).unwrap();
+
+    let refreshed = fixture.blocks.recover_for_replay(before_trim, latest, &fixture.logs, config, now, &cancellation).await.unwrap();
+    assert_eq!(refreshed.block.unwrap().block_index(), BlockIndex(1));
+
+    let fixed = fixture.blocks.recover_for_replay(exact_anchor, exact, &fixture.logs, config, now, &cancellation).await.unwrap();
+    assert_eq!(fixed.block.unwrap().block_index(), BlockIndex(0));
 }
 
 #[tokio::test]

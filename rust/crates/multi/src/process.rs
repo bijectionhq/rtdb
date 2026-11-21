@@ -103,7 +103,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         role: MemberRole::Node, address: pgwire_endpoint.clone(), control_address: Some(control_endpoint), availability_zone: settings.availability_zone, pool: settings.pool,
     }, settings.lease).await?;
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, settings.agent, writers, settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, settings.keys, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, settings.agent, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::clone(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();

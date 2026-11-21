@@ -302,7 +302,7 @@ impl ReplicationDriver {
         if let Some(boundary) = recovered.block.as_ref().and_then(BlockCatalog::latest_source_position) {
             logs.validate_source_boundary(&resolve.database, boundary)?;
         }
-        let read_position = recovered.block.as_ref().and_then(BlockCatalog::boundary_replica_position).unwrap_or(logs.replica_floor()?);
+        let read_position = recovered.replica_start(&logs)?;
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
             open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
         let (status, receiver) = watch::channel(initial);

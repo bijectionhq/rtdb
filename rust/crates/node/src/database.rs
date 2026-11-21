@@ -162,7 +162,7 @@ impl DatabaseFactory {
             let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
                 resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
-            let recovered = recovered.with_source_floor(logs.source_floor()?);
+            let recovered = blocks.recover_for_replay(recovered, resources.blocks, &logs, self.options.trie, self.clock.now(), &cancellation).await?;
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
@@ -214,10 +214,13 @@ impl DatabaseFactory {
             let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
             let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
-            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
+            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation: log_cancellation.clone() };
             Ok(OpenedDatabase { database, driver, secondaries })
         }.await;
-        if opened.is_err() { io.close_and_wait().await; }
+        if opened.is_err() {
+            log_cancellation.cancel();
+            io.close_and_wait().await;
+        }
         opened
     }
 }

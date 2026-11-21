@@ -1064,8 +1064,9 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     let members = members(directory).await?;
     let servers: Vec<String> = current.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
+    let key = keys.require_existing(&current.key_id()).await?;
     let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
-    let log = crate::logs::SealedLog::new(reader, &keys.key(&current.key_id()).await?, &current.replica_seal_scope())?;
+    let log = crate::logs::SealedLog::new(reader, &key, &current.replica_seal_scope())?;
     let latest = log.latest()?.0;
     let mut report = AuditReport::default();
     let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);

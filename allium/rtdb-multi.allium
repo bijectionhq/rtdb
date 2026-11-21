@@ -907,6 +907,9 @@ rule RetireDrainedMember {
 -- Rules: becoming the holder
 --
 -- First activation, failover, reactivation and the target side of a planned move are one protocol: claim, seal, recover, open.
+-- Only the current holder of a fresh root residence may enroll its serving key. First enrollment may be retried before any journal admission.
+-- All live journal opens require an existing serving key before reserving journal endpoints or contacting the ensemble.
+-- Journal admission survives interruption and makes future activation require the same key. Withdrawal always prevents enrollment.
 ------------------------------------------------------------
 
 rule Claim {

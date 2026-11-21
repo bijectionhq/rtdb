@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::control::{Handler, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config};
+use crate::keys::KeyService;
 use crate::lease::MemberLease;
 
 #[derive(Clone, Debug)]
@@ -79,6 +80,20 @@ fn require_recovered_checkpoint(record: &DeploymentRecord, database: &Database) 
     }
 }
 
+fn fresh_key_enrollment(record: &DeploymentRecord) -> bool {
+    matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+        && record.incarnation == 1
+        && record.log_epoch == 0
+        && record.lineage == record.id
+        && record.parent.is_none()
+        && record.move_from.is_none()
+        && record.cell_transfer.is_none()
+        && record.checkpoint.is_none()
+        && record.checkpoint_recovery.is_none()
+        && record.checkpoint_stage.is_none()
+        && record.replica_journals.is_empty()
+}
+
 struct LocalHolding {
     id: String,
     epoch: u64,
@@ -91,6 +106,7 @@ struct LocalSubscription { id: String, last_touch: Instant, opened: Instant, rol
 
 pub struct NodeAgent {
     directory: Arc<dyn Directory>,
+    keys: Arc<dyn KeyService>,
     node: Node,
     lease: Arc<MemberLease>,
     address: String,
@@ -111,8 +127,8 @@ pub struct NodeAgent {
 }
 
 impl NodeAgent {
-    pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
+    pub fn new(directory: Arc<dyn Directory>, keys: Arc<dyn KeyService>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, keys, node, lease, address, options, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -170,10 +186,24 @@ impl NodeAgent {
             .ok_or_else(|| Anomaly::fault("rtdb.multi/unknown-logkeeper", format!("Logkeeper {id} is not a member")))).collect()
     }
 
+    async fn enroll_fresh_serving_key(&self, held: &DeploymentRecord) -> Result<()> {
+        if !fresh_key_enrollment(held) { return Ok(()); }
+        // Journal admission is recorded before opening or copying a stream.
+        // Once admitted, a missing key cannot be replaced with a different key.
+        let current = self.directory.deployment(&held.id).await?
+            .filter(|current| current.epoch == held.epoch && current.holder.as_ref() == Some(&self.member()))
+            .ok_or_else(|| Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment ceased to authorize this writer"))?;
+        if fresh_key_enrollment(&current) {
+            self.keys.key(&current.key_id()).await?;
+        }
+        Ok(())
+    }
+
     async fn open(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Response> {
         self.stop_running(&record.name).await;
         let opened = async {
             let configuration = self.holder_config(&record, members)?;
+            self.enroll_fresh_serving_key(&record).await?;
             let database = self.node.database_or_attach(record.name.clone(), configuration).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the deployment"))?;
             self.await_leadership(&record.name, &database).await?;

@@ -11,7 +11,7 @@ use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-use crate::{AppliedProgress, ReplicaRecord, TermFence};
+use crate::{AppliedProgress, PartitionLogs, ReplicaRecord, TermFence};
 
 pub struct RecoveredPartition {
     pub partition: Arc<PartitionState>,
@@ -25,6 +25,13 @@ impl RecoveredPartition {
     pub fn with_source_floor(mut self, source_floor: SourcePosition) -> Self {
         self.progress.source_position = self.progress.source_position.max(source_floor);
         self
+    }
+
+    pub(crate) fn replica_start(&self, logs: &PartitionLogs) -> Result<ReplicaPosition> {
+        match self.block.as_ref().and_then(BlockCatalog::boundary_replica_position) {
+            Some(boundary) => Ok(boundary),
+            None => logs.replica_floor(),
+        }
     }
 
     pub(crate) fn confirmation(&self, replica_epoch: StorageEpoch, storage_version: StorageVersion, storage_epoch: StorageEpoch, memory: &Arc<MemoryBudget>) -> Result<Option<RecoveredBlockConfirmation>> {
@@ -127,7 +134,35 @@ impl BlockStore {
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
     pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery) -> Result<RecoveredPartition> {
-        let latest = self.latest_block(discovery).await?;
+        self.recover_selected(config, source_floor, now, self.latest_block(discovery).await?).await
+    }
+
+    /// If the replica prefix passed an ordinary startup anchor, use only a
+    /// newer published checkpoint. An exact anchor is never reconsidered.
+    pub async fn recover_for_replay(&self, mut recovered: RecoveredPartition, discovery: BlockDiscovery,
+        logs: &PartitionLogs, config: TrieConfig, now: Timestamp, cancellation: &CancellationToken) -> Result<RecoveredPartition> {
+        let source_floor = logs.source_floor()?;
+        if matches!(discovery, BlockDiscovery::At(_)) {
+            return Ok(recovered.with_source_floor(source_floor));
+        }
+        let work = async {
+            loop {
+                let Some(gap) = logs.observed_replica_gap(recovered.replica_start(logs)?).await? else {
+                    return Ok(recovered.with_source_floor(source_floor));
+                };
+                let previous = recovered.block.as_ref().map(BlockCatalog::block_index);
+                drop(recovered);
+                let Some(newer) = self.latest_block(BlockDiscovery::List).await?
+                    .filter(|newer| previous.is_none_or(|previous| newer.0 > previous.0)) else {
+                    return Err(gap.into());
+                };
+                recovered = self.recover_selected(config, source_floor, now, Some(newer)).await?;
+            }
+        };
+        cancellation.run_until_cancelled(work).await.ok_or_else(crate::progress::cancelled)?
+    }
+
+    async fn recover_selected(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, latest: Option<BlockIndex>) -> Result<RecoveredPartition> {
         let (block, table_blocks) = match latest {
             Some(index) => { let loaded = self.load(index).await?; (Some(loaded.0), loaded.1) }
             None => (None, BTreeMap::new()),

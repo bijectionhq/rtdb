@@ -107,6 +107,10 @@ impl Log for MemoryLog {
     }
 
     fn latest(&self) -> Result<LogOffset> { self.shared.progress.latest() }
+    async fn retained_floor(&self) -> Result<Option<LogOffset>> {
+        self.shared.progress.latest()?;
+        Ok(Some(self.first_retained()))
+    }
 
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         let next = after.0.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;

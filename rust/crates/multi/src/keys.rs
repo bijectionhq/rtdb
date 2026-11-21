@@ -17,6 +17,12 @@ pub trait KeyService: Send + Sync {
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
     /// Read current custody without creating a key.
     async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>>;
+    /// Opens a serving residence that must already have been provisioned.
+    async fn require_existing(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
+        self.existing_key(deployment).await?.ok_or_else(|| {
+            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/key-missing", "The serving key is unavailable")
+        })
+    }
     /// Gives `to` the key `from` has, for a fork whose objects are copies of its parent's.
     async fn copy(&self, from: &str, to: &str) -> Result<()>;
     /// Withdraws the key and permanently refuses provisioning for this deployment ID.

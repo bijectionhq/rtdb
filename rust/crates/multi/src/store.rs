@@ -104,7 +104,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         let record = self.directory.deployment(&config.deployment).await?
             .filter(|record| record.storage_prefix() == config.prefix)
             .ok_or_else(|| storage_region_error("The cached store belongs to another residence"))?;
-        Ok(Arc::new(EncryptingStore::new(cached, &self.keys.key(&record.key_id()).await?)?))
+        Ok(Arc::new(EncryptingStore::new(cached, &self.keys.require_existing(&record.key_id()).await?)?))
     }
 }
 
