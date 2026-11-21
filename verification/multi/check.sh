@@ -70,6 +70,8 @@ RTDBReplayPermit|RTDBReplayPermitDelayedOriginal|12|Invariant OneMutation is vio
 RTDBReplayPermit|RTDBReplayPermitEarlyExpiry|12|Invariant OneMutation is violated
 RTDBReplayPermit|RTDBReplayPermitErasedMarker|12|Invariant OneMutation is violated
 RTDBReplayPermit|RTDBReplayPermitLegacyWriter|12|Invariant OneMutation is violated
+RTDBReplayResolver|RTDBReplayResolver|0|No error has been found
+RTDBReplayResolver|RTDBReplayResolverWithoutAssertion|12|Invariant OneEffect is violated
 RTDBSetupReplay|RTDBSetupReplay|0|No error has been found
 RTDBSetupReplay|RTDBSetupReplayStaleCheck|12|Invariant SetupReplayHasNoExecute is violated
 CONFIGURATIONS

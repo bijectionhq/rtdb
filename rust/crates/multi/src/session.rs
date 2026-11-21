@@ -1339,7 +1339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_writer_with_confirmation_but_without_a_permit_cannot_originate_a_replay() {
+    async fn a_writer_advertising_the_old_permit_cannot_originate_a_replay() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1354,6 +1354,7 @@ mod tests {
             legacy.read_exact(&mut [0; 8]).await.unwrap();
             send(&mut legacy, b'R', &[0; 4]).await;
             send(&mut legacy, GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_CONFIRM_KIND]).await;
+            send(&mut legacy, GATEWAY_SESSION_STATE_TAG, &[7]).await;
             send(&mut legacy, b'Z', b"I").await;
             assert_eq!(receive(&mut client).await.0, b'R');
             assert_eq!(receive(&mut client).await.0, b'Z');
@@ -1384,13 +1385,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_replacement_advertising_the_old_permit_never_receives_the_write() {
+        assert_retry_after_backend_error(BackendFailure::StorageClosed { replacement: ReplacementKey::LegacyPermit }).await;
+    }
+
+    #[tokio::test]
     async fn a_not_held_reply_followed_by_an_expired_permit_has_an_unknown_outcome() {
         assert_retry_after_backend_error(BackendFailure::NotHeld { replacement: ReplacementKey::Expired }).await;
     }
 
     enum BackendFailure { NotHeld { replacement: ReplacementKey }, StorageClosed { replacement: ReplacementKey } }
     #[derive(Clone, Copy)]
-    enum ReplacementKey { Accept, Refuse, Unsupported, WithoutPermit, Expired }
+    enum ReplacementKey { Accept, Refuse, Unsupported, WithoutPermit, LegacyPermit, Expired }
 
     struct Routes(tokio::sync::Mutex<std::collections::VecDeque<(TcpStream, u64)>>);
 
@@ -1448,12 +1454,15 @@ mod tests {
         }
         drop(refusing);
 
-        if matches!(replacement, ReplacementKey::Unsupported | ReplacementKey::WithoutPermit) {
+        if matches!(replacement, ReplacementKey::Unsupported | ReplacementKey::WithoutPermit | ReplacementKey::LegacyPermit) {
             let mut startup = vec![0; successor.read_i32().await.unwrap() as usize - 4];
             successor.read_exact(&mut startup).await.unwrap();
             send(&mut successor, b'R', &[0; 4]).await;
-            if matches!(replacement, ReplacementKey::WithoutPermit) {
+            if matches!(replacement, ReplacementKey::WithoutPermit | ReplacementKey::LegacyPermit) {
                 send(&mut successor, GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_CONFIRM_KIND]).await;
+            }
+            if matches!(replacement, ReplacementKey::LegacyPermit) {
+                send(&mut successor, GATEWAY_SESSION_STATE_TAG, &[7]).await;
             }
             send(&mut successor, b'Z', b"I").await;
             let (tag, body) = receive(&mut client).await;

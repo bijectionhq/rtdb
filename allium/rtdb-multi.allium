@@ -2622,6 +2622,7 @@ surface ClientAccess {
         -- A writer installs a key before executing the command it guards.
         -- The writer preserves the gateway key through changes to SQL session state.
         -- An unanswered write can be replayed only when both writers support the same private permit contract.
+        -- The permit contract protects a command even if a legacy resolver inherits its admitted source record.
         -- The gateway waits for the replacement writer to acknowledge the original permit before replaying the command.
         -- The dispatch and replay share an exclusive submission cutoff issued when the command starts, within replay_permit_age.
         -- Both writers refuse a permitted submission at or after that cutoff before appending it.

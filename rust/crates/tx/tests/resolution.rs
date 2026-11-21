@@ -24,6 +24,49 @@ fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp:
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
 
 #[tokio::test]
+async fn old_resolvers_abort_a_fenced_source_record_before_a_replay_can_commit() {
+    use rtdb_format::envelope::{SourceBody, SourceMessage};
+
+    let context = context();
+    let key = "00112233445566778899aabbccddeeff/0";
+    let permit = ReplaySubmission::admit(key, Timestamp(100), Timestamp(400)).unwrap();
+    let encoded = request(vec![put(&context, 7, 0, i64::MAX)], &context)
+        .with_replay_submission(permit).encode().unwrap();
+    let Some(SourceMessage::Protobuf(SourceBody::Tx(command))) = SourceMessage::decode(encoded.as_slice()).unwrap() else {
+        panic!("expected structured source transaction");
+    };
+
+    for legacy_understands_permits in [false, true] {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+        let mut legacy_command = command.clone();
+        if legacy_understands_permits {
+            legacy_command.replay_submission.as_mut().unwrap().abort_on_legacy_resolver = None;
+        } else {
+            legacy_command.replay_submission = None;
+        }
+        let mut resolve = async |position, command| {
+            let request = SourceTransaction::decode(&SourceMessage::Protobuf(SourceBody::Tx(command)), &context.memory).unwrap();
+            let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(100 + position), request, &context).await.unwrap();
+            state.apply(resolver.take_head().unwrap().writes()).unwrap();
+            resolved
+        };
+        let old = resolve(0, legacy_command.clone()).await;
+        assert_eq!(old.result().error().unwrap().code, "xtdb/assert-failed");
+        assert_eq!(old.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+
+        let first = resolve(1, command.clone()).await;
+        assert!(first.result().committed());
+        assert!(first.writes().tables().contains_key(&table()));
+        let old_after_commit = resolve(2, legacy_command).await;
+        assert!(!old_after_commit.writes().tables().contains_key(&table()));
+        let duplicate = resolve(3, command.clone()).await;
+        assert_eq!(private_replay_original(duplicate.result().error().unwrap()).unwrap(), Some(first.result().tx_key()));
+        assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+    }
+}
+
+#[tokio::test]
 async fn external_writer_query_admits_sql_and_reads_its_own_staged_rows() {
     struct ReadBackWriter(Arc<MemoryBudget>);
 

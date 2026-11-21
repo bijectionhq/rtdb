@@ -13,6 +13,8 @@ use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, Result, Scalar
 use crate::{ArrowDocuments, Documents, EntityIds, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::values::{DecodedDocumentLayout, contains_fixed_size_list};
 
+const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
+
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
     Public(TxOp),
@@ -78,7 +80,7 @@ impl SourceTransaction {
             _ => 0,
         };
         let _option_scratch = memory.reserve(option_bytes)?;
-        let (pages, mut options, guard, legacy) = match message {
+        let (pages, mut options, guard, legacy, abort_on_legacy_resolver) = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
                 let bytes = tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
                 let options = SubmitOptions { default_tz: tx.default_tz.clone().ok_or_else(|| invalid("Transaction has no default timezone"))?, system_time: tx.system_time_micros.map(Timestamp), user: tx.user.clone(), user_metadata: tx.user_metadata.as_deref().filter(|bytes| !bytes.is_empty()).map(|bytes| decode_metadata(bytes, memory)).transpose()? };
@@ -99,9 +101,14 @@ impl SourceTransaction {
                     (None, None) => None,
                     (Some(_), Some(_)) => return Err(invalid("Source transaction contains two replay guards")),
                 };
-                (crate::ipc::decode(bytes, memory)?, options, guard, false)
+                let abort_on_legacy_resolver = match tx.replay_submission.as_ref().and_then(|replay| replay.abort_on_legacy_resolver) {
+                    Some(true) => true,
+                    Some(false) => return Err(invalid("Replay submission explicitly disables the legacy resolver assertion")),
+                    None => false,
+                };
+                (crate::ipc::decode(bytes, memory)?, options, guard, false, abort_on_legacy_resolver)
             }
-            SourceMessage::LegacyTransaction(bytes) => (crate::ipc::decode(bytes, memory)?, SubmitOptions::default(), None, true),
+            SourceMessage::LegacyTransaction(bytes) => (crate::ipc::decode(bytes, memory)?, SubmitOptions::default(), None, true, false),
             _ => return Err(invalid("Source message is not a transaction")),
         };
         if pages.is_empty() && !legacy {
@@ -138,6 +145,12 @@ impl SourceTransaction {
             let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Transaction operations are not a union"))?;
             for row in 0..union.len() { operations.push(reader.operation(union, row)?); }
         }
+        if abort_on_legacy_resolver {
+            if !matches!(operations.first(), Some(Operation::Public(TxOp::Sql { sql, args: None })) if sql == LEGACY_REPLAY_ABORT) {
+                return Err(invalid("Replay submission has no legacy resolver assertion"));
+            }
+            operations.remove(0);
+        }
         if let Some(SourceGuard::Application(guard)) = &guard {
             let operation = operations.get(usize::from(guard.after_bootstrap));
             if !matches!(operation, Some(Operation::Public(TxOp::Sql { args: None, .. }))) {
@@ -162,7 +175,7 @@ impl SourceTransaction {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         let mut field = |bytes: &[u8]| { hash.update((bytes.len() as u64).to_be_bytes()); hash.update(bytes); };
-        let batch = self.operation_batch()?;
+        let batch = self.operation_batch(None)?;
         field(crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?.as_slice());
         field(self.options.default_tz.as_bytes());
         field(&self.options.system_time.map_or([0; 9], |time| { let mut bytes = [1; 9]; bytes[1..].copy_from_slice(&time.0.to_be_bytes()); bytes }));
@@ -175,7 +188,10 @@ impl SourceTransaction {
     }
 
     pub fn encode(&self) -> Result<RetainedBytes> {
-        let batch = self.operation_batch()?;
+        let prefix = matches!(self.guard, Some(SourceGuard::Replay(_))).then(|| {
+            Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })
+        });
+        let batch = self.operation_batch(prefix.as_ref())?;
         let bytes = crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?;
         let metadata = self.options.user_metadata.as_ref().map(|metadata| encode_metadata(metadata, &self.memory)).transpose()?;
         let body_size = bytes.as_slice().len().checked_add(metadata.as_ref().map_or(0, |bytes| bytes.as_slice().len())).and_then(|bytes| bytes.checked_add(self.options.default_tz.capacity())).and_then(|bytes| bytes.checked_add(self.options.user.as_ref().map_or(0, String::capacity))).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
@@ -190,6 +206,7 @@ impl SourceTransaction {
                 key: Some(replay.key().to_owned()),
                 submitted_at_micros: Some(replay.submitted_at().0),
                 not_after_micros: Some(replay.not_after().0),
+                abort_on_legacy_resolver: Some(true),
             })),
             None => (None, None),
         };
@@ -206,8 +223,9 @@ impl SourceTransaction {
         RetainedBytes::with_reservation(encoded, reservation)
     }
 
-    fn operation_batch(&self) -> Result<OwnedBatch> {
-        let scratch = self.operations.iter().try_fold(65_536usize, |bytes, operation| {
+    fn operation_batch(&self, prefix: Option<&Operation>) -> Result<OwnedBatch> {
+        let operations = || prefix.into_iter().chain(&self.operations);
+        let scratch = operations().try_fold(65_536usize, |bytes, operation| {
             let extra = match operation {
                 Operation::Public(TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
                 Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } => {
@@ -226,7 +244,7 @@ impl SourceTransaction {
         })?;
         let _scratch_reservation = self.memory.reserve(scratch)?;
         let mut entries = Vec::new();
-        for operation in &self.operations {
+        for operation in operations() {
             check_writable_table(operation)?;
             if matches!(operation, Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) if ids.ids().is_empty()) { continue; }
             entries.push(operation_value(operation, &self.memory)?);

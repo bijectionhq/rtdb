@@ -69,6 +69,7 @@
 -- A trusted frontend may supply a private replay permit for the synchronous commit of exactly one buffered write operation.
 -- The permit names the command's effective key and exclusive submission cutoff.
 -- The initial attempt and every retry of that command carry the same permit.
+-- The guarded source record prevents a legacy resolver from applying the user's operations.
 -- A conflicting key in the transaction metadata is rejected before append.
 -- A retry that reaches marker lookup and finds the original outcome returns the original committed transaction key.
 

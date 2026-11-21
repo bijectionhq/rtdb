@@ -771,8 +771,11 @@ Moves are invisible to clients only if the gateway owns connections and session 
    An ambiguous batch, transaction-control command or extended Execute returns an unknown outcome.
    Extended-protocol setup can still be replayed before any execution frame is forwarded.
    Mixed-version cells continue to serve fresh commands.
-   Upgrade the gateways before deploying writers that advertise the permit.
-   Permit-backed replay relies on a compatible resolver on every writer eligible to resolve the deployment's source log.
+   Roll gateways first and drain sessions using the old permit before relying on the new contract.
+   The gateway authorizes replay only for writers advertising the current permit capability in both attempts.
+   The current permit capability records a leading assertion that aborts before user operations when executed by a legacy resolver.
+   A compatible resolver checks and removes that assertion before it runs the protected mutation.
+   Serve pre-existing records issued under the old permit with a compatible resolver until their source prefix has resolved.
    Place the writers' backend listeners on the private cell network and expose the gateway listener to clients.
    The gateway uses one 30-second window from the first replayable failure until it takes a replacement's first reply for forwarding to the client.
    All attempts to recover the pending command share that window.

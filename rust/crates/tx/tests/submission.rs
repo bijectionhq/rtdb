@@ -268,6 +268,7 @@ fn replay_submission_wire_checks_presence_before_resolving() {
     assert_eq!(metadata.key.as_deref(), Some(key));
     assert_eq!(metadata.submitted_at_micros, Some(0));
     assert_eq!(metadata.not_after_micros, Some(1));
+    assert_eq!(metadata.abort_on_legacy_resolver, Some(true));
     let decoded = SourceTransaction::decode(&SourceMessage::Protobuf(SourceBody::Tx(tx.clone())), &memory).unwrap();
     assert_eq!(decoded.encode().unwrap().as_slice(), encoded.as_slice());
 
@@ -275,9 +276,20 @@ fn replay_submission_wire_checks_presence_before_resolving() {
     missing_cutoff.replay_submission.as_mut().unwrap().not_after_micros = None;
     let mut expired = tx.clone();
     expired.replay_submission.as_mut().unwrap().not_after_micros = Some(0);
+    let mut missing_assertion = tx.clone();
+    let unguarded = SourceTransaction::new(
+        vec![TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (1)".into(), args: None }],
+        SubmitOptions::default(), &memory,
+    ).unwrap().encode().unwrap();
+    let Some(SourceMessage::Protobuf(SourceBody::Tx(unguarded))) = SourceMessage::decode(unguarded.as_slice()).unwrap() else {
+        panic!("expected structured source transaction");
+    };
+    missing_assertion.tx_ops = unguarded.tx_ops;
+    let mut disabled_assertion = tx.clone();
+    disabled_assertion.replay_submission.as_mut().unwrap().abort_on_legacy_resolver = Some(false);
     let mut ambiguous = tx;
     ambiguous.idempotency_guard = Some(IdempotencyGuard { submitted_at_micros: Some(0), after_bootstrap: Some(false) });
-    for invalid in [missing_cutoff, expired, ambiguous] {
+    for invalid in [missing_cutoff, expired, missing_assertion, disabled_assertion, ambiguous] {
         let message = SourceMessage::Protobuf(SourceBody::Tx(invalid));
         assert_eq!(SourceTransaction::decode(&message, &memory).err().unwrap().code, "rtdb.tx/invalid-source-transaction");
     }

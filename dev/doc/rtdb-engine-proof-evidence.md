@@ -546,6 +546,21 @@ The Rust wire fixture checks the exact nonce and cutoff encoding, while the Pgwi
 The live-cell test withholds a committed reply, completes a holder move, and checks that the same client gets a reply and observes one mutation.
 The proof assumes the acknowledged journal prefix, single ordered resolver, and authentic writer capabilities. [Lean proof](../../verification/multi/lean/ReplayPermit.lean) · [TLA+ model](../../verification/multi/tla/RTDBReplayPermit.tla) · [Verus checks](../../verification/verus/replay_admission/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)
 
+### Replay across a legacy resolver
+
+An older resolver can inherit an admitted source record independently of which Pgwire servers received the initial command and its retry.
+The current permit uses a distinct Pgwire capability and writes a leading failing assertion in the transaction body.
+The resolver consumes that assertion only when the transaction envelope identifies it and the operation matches exactly.
+Legacy decoding leaves the assertion in the operation sequence, where its execution aborts before any user writes.
+A resolver that recognizes the original permit can also return the existing marker before evaluating the assertion.
+The native replay test drops the entire permit and the new field separately to exercise both legacy decode behaviors on the same ordered prefix.
+It then resolves a compatible retry and verifies that the next compatible retry recovers the original committed transaction key.
+Lean extends the at-most-one invariant to arbitrary interleavings of protected resolution and legacy assertion aborts.
+TLC permits several already-appended attempts and a fresh choice of resolver for each record.
+Removing the legacy assertion produces two effects.
+The model assumes one ordered journal prefix and atomic guard and marker publication for a compatible resolution.
+Previously issued records retain the compatibility requirements of their original permit contract. [Lean proof](../../verification/multi/lean/ReplayPermit.lean) · [TLA+ model](../../verification/multi/tla/RTDBReplayResolver.tla) · [Native resolver regression](../../rust/crates/tx/tests/resolution.rs)
+
 ### Multi serving endpoint failure
 
 Lean proves that repeated pgwire failures reach any finite threshold when the address pair stays fixed, even while control answers.

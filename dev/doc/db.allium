@@ -388,6 +388,11 @@ variant TxMessage : SourceMessage {
     -- A private replay submission instead carries its engine key, admission sample and exclusive cutoff.
     -- These values are required together when the private replay envelope is present.
     -- Submission refuses a sample at or after the cutoff before appending a source record.
+    -- A new permit record identifies its legacy-resolver assertion in the envelope and places that assertion first in its operations.
+    -- A supporting resolver checks and consumes the assertion before resolving the user's operations.
+    -- A resolver that ignores the new field leaves the assertion in the operation sequence.
+    -- An existing marker can resolve the duplicate before operation execution.
+    -- Execution of the assertion aborts the transaction before any user operation.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
     default_tz: ZoneId               -- always present

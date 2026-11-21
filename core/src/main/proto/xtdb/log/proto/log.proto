@@ -43,6 +43,7 @@ message ReplaySubmission {
     string key = 1;
     int64 submitted_at_micros = 2;
     int64 not_after_micros = 3;
+    bool abort_on_legacy_resolver = 4;
 }
 
 message BlockUploaded {

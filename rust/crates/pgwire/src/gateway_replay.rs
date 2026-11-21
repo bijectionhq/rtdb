@@ -1,7 +1,8 @@
 use rtdb_types::Timestamp;
 use uuid::Uuid;
 
-pub const GATEWAY_REPLAY_PERMIT_KIND: u8 = 7;
+// Kind 7 can append a record an older resolver would apply without a marker.
+pub const GATEWAY_REPLAY_PERMIT_KIND: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -49,6 +50,9 @@ mod tests {
             let permit = GatewayReplayPermit { nonce: Uuid::from_u128(9), not_after: Timestamp(-123), mode };
             let encoded = permit.encode();
             assert_eq!(GatewayReplayPermit::decode(&encoded), Some(permit));
+            let mut legacy = encoded;
+            legacy[0] = 7;
+            assert_eq!(GatewayReplayPermit::decode(&legacy), None);
             assert_eq!(GatewayReplayPermit::decode(&encoded[..25]), None);
             let mut unknown_mode = encoded;
             unknown_mode[1] = 3;

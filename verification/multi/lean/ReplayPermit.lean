@@ -54,4 +54,26 @@ theorem at_most_one_mutation (cutoff : Nat) (clocks : List (Nat × Nat)) :
 #print axioms arbitrary_writer_clocks_preserve_safety
 #print axioms at_most_one_mutation
 
+inductive Resolver
+  | guarded (observed expiresAt : Nat)
+  | legacy
+
+def resolve (cutoff : Nat) (state : State) (resolver : Resolver) : State :=
+  match resolver with
+  | .guarded observed expiresAt => submit cutoff observed expiresAt state
+  | .legacy => state
+
+theorem mixed_resolvers_preserve_safety (cutoff : Nat) (state : State)
+    (safe : Safe cutoff state) (resolvers : List Resolver) :
+    Safe cutoff (resolvers.foldl (resolve cutoff) state) := by
+  induction resolvers generalizing state with
+  | nil => exact safe
+  | cons resolver resolvers ih =>
+    apply ih
+    cases resolver with
+    | guarded observed expiresAt => exact submission_preserves_safety cutoff observed expiresAt state safe
+    | legacy => exact safe
+
+#print axioms mixed_resolvers_preserve_safety
+
 end RTDB.Multi.ReplayPermit
