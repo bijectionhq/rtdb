@@ -664,6 +664,60 @@ The trie collector snapshots that registry with the current state and excludes d
 I/O regions keep those references through provider completion, and an in-progress collection prevents a compactor reset from reopening its key allocation.
 Runtime coordination for query snapshots and object reclamation across separate partition owners remains open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:gc.allium[Trie collection contract]
 
+=== Cross-node retention of serving snapshots
+
+The local partition can capture a query catalog consistently with its own collection decisions.
+A Multi deployment also has independent partition owners and a cell reaper that lists durable garbage records outside the directory transaction.
+The existing record carries an object key and a wall-clock release time.
+For this study its role is to submit an object for collection.
+The additional value needed by a reader-aware reaper is a certified retirement cut in the same order used for authoritative catalog admission.
+
+A catalog cut is distinct from the user's bitemporal query basis.
+Two equivalent physical catalogs can expose the same rows while carrying different object dependencies.
+Treat a cut as a residence-scoped catalog revision with a monotone order.
+Before choosing an encoding, demonstrate that every publication affecting a dependency changes the revision, including an accepted compaction result or artefact update that preserves the query basis.
+Checkpoint block numbers and wall-clock time alone do not provide that refinement.
+
+The common protocol has four decisions.
+
+. The directory admits and records a hold for the current catalog cut in one versioned update.
+  A reader with a different local cut must catch up or follow the product's refusal contract before opening storage.
+. Retirement certifies that the immutable object identity is absent from the named cut and from every later admissible cut.
+  The producer must distinguish the final retirement of the identity from the removal of one of several references.
+. A reaper captures a head and the outstanding reader obligations in one directory observation.
+  It compares release certificates against that captured observation, including releases discovered during a later listing.
+. The effect targets the exact physical identity authorized for removal.
+  Close or cancellation may stop new reads before already admitted provider operations are drained.
+
+Two candidates make the same safety decisions with different information.
+
+[cols="1,2,2",options="header"]
+|===
+|Policy |Delete admissibility from one sweep |Runtime cost to establish
+
+|Generation cutoff
+|The retirement cut is at or below the head and every outstanding reader cut.
+|Store one cut per hold and compute their minimum.
+An older reader can delay collection of objects it never referenced.
+
+|Exact dependencies
+|The retirement cut is at or below the captured head and no outstanding reader depends on the object.
+|Use immutable, complete dependency sets or a sound membership index.
+Inventory construction and retention must cover shared artefacts and all storage reads that outlive local cursor closure.
+|===
+
+The retirement cut in the exact policy still matters.
+An object may first become reachable after the captured sweep and be retired before the reaper lists its release.
+It is then absent from that sweep's inventory even though a reader subsequently admitted at the intermediate cut still needs it.
+The captured head must cover the certificate before that sweep can authorize deletion.
+
+TLC checks both policies with the same histories, two readers, three catalog cuts and four objects.
+Lean proves that either policy excludes every possible dependency at the time of the delete under the retained-catalog premise and the retirement certificate.
+It proves that exact tracking admits every deletion permitted by the generation cutoff, and gives an example where it permits more.
+These results concern candidate protocols in one residence.
+For production, identify the authoritative cut and receipt producers, connect storage admission and I/O draining for all query paths, and verify the garbage adapter and physical delete's identity.
+Exact historical admission, recovery dependencies, mixed-version deployments, and forks that share physical files require composition with their respective authorities. link:../../verification/tla/ResidenceReaderRetention.tla[Comparable model] · link:../../verification/lean/ResidenceReaderRetention.lean[General safety and comparison laws]
+
 === Multi replica recovery holds
 
 An ordinary recovery selects a checkpoint in one physical residence and opens a cursor on that residence's replica stream.

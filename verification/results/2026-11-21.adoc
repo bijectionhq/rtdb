@@ -1173,3 +1173,38 @@ Replay the positive proof with `lean verification/lean/CheckpointMetadataRetenti
 The standard local Lean run reached its wall-clock timeout during host contention.
 A focused rerun with `lean -j 1` and the default proof budgets verified the same baseline and rejected all three controls at `plans_survive_interleavings`.
 The registered runner cases specify the bounded witnesses, mutations, and expected failure sites. link:../lean/CheckpointMetadataRetention.lean[Lean laws] · link:../tla/CheckpointMetadataRetention.tla[TLA+ model]
+
+=== Cross-node serving snapshot retention
+
+The model compares a minimum held catalog cut and exact dependency tracking using the same provider and reader transitions.
+It models one physical residence, two readers, three successive catalog cuts and four immutable objects, including one shared across cuts and one created after startup.
+It allows time between the sweep's directory observation, discovery of a published release, authorization, and deletion.
+Closure and provider completion advance independently.
+
+TLC 2026.11.19 exhausted 7,622 reachable states with the cutoff and 8,278 with exact dependency tracking.
+Serving and open or draining reader dependencies remained present in both.
+Stale admission, omitted holds, ignored drain, and a release certified after the captured sweep each violated `ReaderReadable` in both variants.
+The late-release control for exact tracking has a seven-transition counterexample.
+A reaper captures cut 0, a later object enters at cut 1, a reader holds cut 1, and the object is retired at cut 2.
+The weakened reaper deletes it because its capture predates both the object and the reader.
+This model result requires a retirement certificate at or before the captured head even when the captured dependency inventory is exact.
+
+The common progress witness deletes both former dependencies while a current reader remains admitted.
+The exact policy also deletes an object introduced at cut 1 and retired at cut 2 while a reader still holds cut 0.
+The cutoff variant cannot take the second deletion in any reachable state of this configuration.
+These witnesses exercise possible reclamation under the two policies.
+
+Lean 4.36.0 checked four formal statements with an arbitrary dependency predicate over catalog cuts.
+The two safety laws require a retirement certificate and a premise that an active reader was either included in the capture or admitted at or above the captured head.
+The comparison laws prove that exact tracking permits all cutoff deletions under the certificate and exhibit strict inclusion.
+Three declarations use no axioms and the concrete witness uses `propext` and `Quot.sound`.
+The runner rejected five proof controls at their declared theorems, covering the hold premises, retirement order, certificate, and concrete witness.
+
+This is design evidence for one residence.
+The current Rust garbage record has an object key and a release time.
+A production connection needs an authoritative catalog-cut encoding, a certified release, cross-node reader admission with a drain boundary, and proof that the provider applies the authorization to the intended physical identity.
+The model takes final retirement as a premise and leaves reference transfers, exact historical admission, and capacity under long readers to separate studies.
+
+The focused run used `lean -j 1` and the registered TLC cases.
+The full runner can replay both configurations and their controls.
+The completed input SHA-256 values are `2c319c0f45ffaeb5655deb8fe1f8c266e2379042ca52e321be4bc64febcfa6a7` for the TLA+ model and `3b7275266258436aaff94d6a7d95dd05efe74e38358c17ffdf9b85130956243f` for the Lean model. link:../README.adoc#_run_the_studies[Runner and pinned tools] · link:../tla/ResidenceReaderRetention.tla[TLA+ model] · link:../lean/ResidenceReaderRetention.lean[Lean laws]

@@ -571,6 +571,38 @@ def verify_explicit_session(args, scratch):
     verify_lean_model(args, scratch, path, "explicit-session", controls, 9)
 
 
+def verify_residence_reader_retention(args, scratch):
+    path = Path("verification/lean/ResidenceReaderRetention.lean")
+    controls = {
+        "floor-omit-holds": (
+            "(mayDelete : FloorAllows retirement sweep)\n    (generation : Nat)",
+            "(mayDelete : retirement ≤ sweep.head ∧ True)\n    (generation : Nat)",
+            ["floor_preserves_dependencies"],
+        ),
+        "exact-omit-release-order": (
+            "(mayDelete : ExactAllows used retirement sweep)",
+            "(mayDelete : True ∧ ∀ cut, sweep.held cut → ¬ used cut)",
+            ["exact_preserves_dependencies"],
+        ),
+        "exact-omit-holds": (
+            "(mayDelete : ExactAllows used retirement sweep)",
+            "(mayDelete : retirement ≤ sweep.head ∧ True)",
+            ["exact_preserves_dependencies"],
+        ),
+        "compare-without-certificate": (
+            "theorem exact_allows_every_floor_deletion (certified : Certified used retirement)",
+            "theorem exact_allows_every_floor_deletion (_certified : True)",
+            ["exact_allows_every_floor_deletion"],
+        ),
+        "witness-overlaps-held-generation": (
+            "refine ⟨(· = 1), 2, ⟨2, (· = 0)⟩, ?_, ⟨1, rfl⟩, ?_, ?_⟩",
+            "refine ⟨(· = 0), 2, ⟨2, (· = 0)⟩, ?_, ⟨0, rfl⟩, ?_, ?_⟩",
+            ["exact_can_collect_with_an_unrelated_earlier_hold"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "residence-reader-retention", controls, 4)
+
+
 def verify_checkpoint_metadata_retention(args, scratch):
     path = Path("verification/lean/CheckpointMetadataRetention.lean")
     controls = {
@@ -807,6 +839,7 @@ def verify_lean(args, scratch):
             verify_replica_trim_admission(args, scratch)
             verify_replica_hold_close(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
+            verify_residence_reader_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
             verify_compaction_planner(args, scratch)
             verify_compaction_merge(args, scratch)
@@ -985,6 +1018,38 @@ TLA_CASES = (
     ("ReplicaHoldLifecycle", "replica-hold-trim-after-stop-witness",
      ("INVARIANTS ActiveHoldCovered ClosedNeverRegainsHold", "INVARIANT NeverTrimsAfterConfirmedDeath"),
      "NeverTrimsAfterConfirmedDeath"),
+    ("ResidenceReaderRetention", "residence-reader-floor-stale-admission",
+     ('Mutation = "none"', 'Mutation = "admit_stale"'), "ReaderReadable"),
+    ("ResidenceReaderRetention", "residence-reader-floor-ignore-holds",
+     ('Mutation = "none"', 'Mutation = "ignore_holds"'), "ReaderReadable"),
+    ("ResidenceReaderRetention", "residence-reader-floor-late-release",
+     ('Mutation = "none"', 'Mutation = "trust_late_release"'), "ReaderReadable"),
+    ("ResidenceReaderRetention", "residence-reader-floor-ignore-drain",
+     ('Mutation = "none"', 'Mutation = "ignore_drain"'), "ReaderReadable"),
+    ("ResidenceReaderRetention", "residence-reader-exact-ignore-drain",
+     ('Policy = "floor"\n    Mutation = "none"', 'Policy = "exact"\n    Mutation = "ignore_drain"'), "ReaderReadable"),
+    ("ResidenceReaderRetention", "residence-reader-exact-late-release",
+     ('Policy = "floor"\n    Mutation = "none"', 'Policy = "exact"\n    Mutation = "trust_late_release"'), "ReaderReadable"),
+    ("ResidenceReaderRetention", "residence-reader-floor", None, None),
+    ("ResidenceReaderRetention", "residence-reader-floor-conservative",
+     ("INVARIANTS TypeOK ServingReadable ReaderReadable", "INVARIANTS TypeOK ServingReadable ReaderReadable LaterObjectRetainedWithEarlierReader"), None),
+    ("ResidenceReaderRetention", "residence-reader-exact-selective-progress",
+     ('Policy = "floor"\n    Mutation = "none"\nINVARIANTS TypeOK ServingReadable ReaderReadable',
+      'Policy = "exact"\n    Mutation = "none"\nINVARIANT LaterObjectRetainedWithEarlierReader'),
+     "LaterObjectRetainedWithEarlierReader"),
+    ("ResidenceReaderRetention", "residence-reader-exact",
+     ('Policy = "floor"', 'Policy = "exact"'), None),
+    ("ResidenceReaderRetention", "residence-reader-exact-stale-admission",
+     ('Policy = "floor"\n    Mutation = "none"', 'Policy = "exact"\n    Mutation = "admit_stale"'), "ReaderReadable"),
+    ("ResidenceReaderRetention", "residence-reader-exact-ignore-holds",
+     ('Policy = "floor"\n    Mutation = "none"', 'Policy = "exact"\n    Mutation = "ignore_holds"'), "ReaderReadable"),
+    ("ResidenceReaderRetention", "residence-reader-floor-collection-witness",
+     ("INVARIANTS TypeOK ServingReadable ReaderReadable", "INVARIANT ReleasedWhileLatestReaderNeverObserved"),
+     "ReleasedWhileLatestReaderNeverObserved"),
+    ("ResidenceReaderRetention", "residence-reader-exact-collection-witness",
+     ('Policy = "floor"\n    Mutation = "none"\nINVARIANTS TypeOK ServingReadable ReaderReadable',
+      'Policy = "exact"\n    Mutation = "none"\nINVARIANT ReleasedWhileLatestReaderNeverObserved'),
+     "ReleasedWhileLatestReaderNeverObserved"),
     ("CheckpointMetadataRetention", "checkpoint-metadata-retention", None, None),
     ("CheckpointMetadataRetention", "checkpoint-metadata-stale-admission",
      ('Mutation = "none"', 'Mutation = "allow_stale"'), "AdmittedMetadataPresent"),
