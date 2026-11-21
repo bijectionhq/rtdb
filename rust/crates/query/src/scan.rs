@@ -1406,7 +1406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cold_point_scan_reads_just_its_page_unless_the_store_requires_a_whole_object() {
+    async fn a_cold_point_scan_returns_arrow_after_reading_the_selected_page() {
         use std::ops::Range;
         use rtdb_storage::{Result as StorageResult, StoredObject};
 
@@ -1444,10 +1444,14 @@ mod tests {
             let (mut scan, execution, _) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
             scan.iids = Some([events[1].iid].into());
             let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
-            let page = cursor.next_page().await.unwrap().unwrap();
-            assert_eq!(page.rows()[0].values, [Value::I64(2)]);
-            assert_eq!(page.rows().len(), 1);
-            assert!(cursor.next_page().await.unwrap().is_none());
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
+                panic!("Expected a projected Arrow column");
+            };
+            let values = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            assert_eq!(values.values().as_ref(), &[2]);
+            assert_eq!(page.len, 1);
+            assert!(cursor.next_batch().await.unwrap().is_none());
 
             let expected = if ranged {
                 vec![tail as u64..bytes.len() as u64, footer as u64..tail as u64, decoder.page_range(1).unwrap()]
