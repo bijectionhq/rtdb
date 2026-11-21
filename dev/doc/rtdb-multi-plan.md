@@ -875,6 +875,7 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    Before releasing the placement, the source pauses transaction admission and waits for all admitted writes to apply.
    When the drained source has at most 64 live rows and 16 replica records since its last adopted boundary, it can park without uploading a block.
    The successor seals the quorum and recovers the durable tail before it confirms leadership.
+   It checks the newest eight replica records for the source position before scanning older history.
    A node reuses encrypted disk-cache data for the same physical deployment across writer epochs, subscribers and snapshots.
    A new storage generation has a different cache identity.
    Once a write quorum acknowledges the recovered commit position, the successor can leave a delayed replica to background repair.

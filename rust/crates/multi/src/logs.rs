@@ -27,6 +27,7 @@ use crate::recovery_holds::{RecoveryAdmission, RecoveryHolds, ReplayHold};
 /// How many already-resolved intake records stay retained behind the holder's read position.
 const INTAKE_RETAINED_BEHIND: i64 = 1024;
 const SCAN_WINDOW: i64 = 256;
+const INTAKE_TIP_WINDOW: i64 = 8;
 
 /// The writers a node has opened, by deployment, for confirming leadership before a linearizable read.
 pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<rtdb_logkeeper::QuorumLog>>>>;
@@ -167,8 +168,9 @@ pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Resul
     let mut end = latest + 1;
     let mut after_newest = 0i64;
     let mut floor = 0;
+    let mut window = INTAKE_TIP_WINDOW;
     while end > floor {
-        let start = (end - SCAN_WINDOW).max(floor);
+        let start = (end - window).max(floor);
         let records = match replica.read_range(LogOffset(start), LogOffset(end)).await {
             Ok(records) => records,
             // Trimmed below here: the scan continues from the first retained record.
@@ -184,6 +186,7 @@ pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Resul
             }
         }
         end = start;
+        window = SCAN_WINDOW;
     }
     Ok(after_newest)
 }
@@ -514,8 +517,9 @@ mod tests {
         append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
         append(&replica, ReplicaBody::ResolvedTx(proto::ResolvedTx { src_msg_id: Some(41), ..Default::default() })).await;
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42);
-        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
-        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        for _ in 0..INTAKE_TIP_WINDOW {
+            append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        }
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42, "a claim consumes no source position");
         append(&replica, ReplicaBody::TriesAdded(Default::default())).await;
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 43, "a record that names no position may have consumed one");
