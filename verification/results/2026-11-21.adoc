@@ -1368,3 +1368,11 @@ The two source controls independently ignore the namespace-qualified storage rec
 They failed at the expected assertions.
 The clean `node.rs` SHA-256 is `8e94e7e29f59a8554ac4f6904b5e78e2759a11f6bc5b796cf769dfc48aa6fed0`.
 The new controls run with `--native-replay`. link:../tla/FragmentResidence.tla[Residence transition model]
+
+The combined local formal run completed at `65b86e478` across Lean, TLC, Verus, Z3, Apalache, Alloy, Maude, mCRL2 and AutoHyper.
+It checked 126 baseline Verus obligations in 17 areas, 70 source controls, and 32 TLC baselines with their registered controls and witnesses.
+Its input manifest SHA-256 is `151cabbfbf2f462ba907c45f4243bfeafedd1024bf734418ba1a5228d09bb76f`.
+The 270 source and model inputs apart from the runner are identical at `d21e9e199`.
+The intervening runner additions register the catalog-cut study, which was run separately as recorded above.
+The DynamoDB-enabled Multi binary also passed a local compile check against `d21e9e199`.
+The delegated scan and residence native controls were run as the focused cases above.
