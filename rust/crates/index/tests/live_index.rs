@@ -173,7 +173,8 @@ fn block_adoption_publishes_catalogs_and_rollover_together() {
             }
         }
     });
-    state.adopt_block(prepared, durable, &tries, Timestamp(101)).unwrap();
+    let table_blocks = prepared.table_blocks(&tries, Timestamp(101)).unwrap();
+    state.adopt_block(prepared, durable, &table_blocks, &tries, Timestamp(101)).unwrap();
     reader.join().unwrap();
     assert_eq!(rows(&held), 1);
     assert_eq!(rows(&state.open_snapshot(None)), 0);
@@ -193,7 +194,8 @@ fn failed_adoption_and_stale_apply_leave_one_unchanged_value() {
     state.apply(&stage(&state, &budget, 1)).unwrap();
     let before = state.value();
     assert!(state.apply(&first).is_err());
-    assert!(state.adopt_block(prepared, durable, &BTreeMap::new(), Timestamp(102)).is_err());
+    let table_blocks = prepared.table_blocks(&BTreeMap::new(), Timestamp(102)).unwrap();
+    assert!(state.adopt_block(prepared, durable, &table_blocks, &BTreeMap::new(), Timestamp(102)).is_err());
     assert!(Arc::ptr_eq(&before, &state.value()));
     assert_eq!(state.value().live().block_row_count(), 2);
 }

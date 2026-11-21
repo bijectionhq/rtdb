@@ -16,6 +16,9 @@
 --
 -- Native collection within one partition authority captures eligibility and reader references together.
 -- A trie that is live in any captured reader catalog stays out of the collection batch.
+-- At the same cut, the native collector excludes tries recorded as live or nascent in the latest installed checkpoint.
+-- Block adoption installs the replacement protection from the persisted table blocks together with the new block index.
+-- Pending tries remain required because a retained replica notice can complete their compaction cohort after recovery.
 -- Query and transaction snapshots register at the partition owner's state boundary.
 -- An admitted provider operation retains that registration through completion, including after caller cancellation.
 -- Compactor reset requires collection authorization to drain before it can reopen key allocation.

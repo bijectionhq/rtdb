@@ -1,7 +1,7 @@
 {
-  "summary": "Selection checks every captured reader generation before allowing collection of its dependencies.",
+  "summary": "Selection keeps dependencies of the installed checkpoint and every captured reader generation.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 3,
+  "min_verified_functions": 4,
   "controls": {
     "skip_last_generation": {
       "defect": "The last retained catalog is skipped during the dependency test.",
@@ -12,7 +12,7 @@
       }],
       "expect": [{
         "file": "rust/crates/index/src/reader_retention.rs",
-        "function": "any_reader_requires",
+        "function": "any_reference_requires",
         "category": "invariant not satisfied before loop"
       }],
       "min_verified_functions": 2
@@ -34,6 +34,52 @@
         "category": "assertion failed"
       }],
       "min_verified_functions": 2
+    },
+    "skip_checkpoint": {
+      "defect": "The collector ignores an installed checkpoint that still requires the trie.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/reader_retention.rs",
+          "find": "if checkpoint_requires { return true; }",
+          "replace": "if false { return true; }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/reader_retention.rs",
+          "function": "any_reference_requires",
+          "category": "invariant not satisfied before loop"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "skip_checkpoint_with_weakened_contract": {
+      "defect": "Both the runtime and its contract ignore the installed checkpoint.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/reader_retention.rs",
+          "find": "if checkpoint_requires { return true; }",
+          "replace": "if false { return true; }"
+        },
+        {
+          "file": "rust/crates/index/src/reader_retention.rs",
+          "find": "(checkpoint_requires || has_reference(observations@, observation_count(readers)))",
+          "replace": "has_reference(observations@, observation_count(readers))"
+        },
+        {
+          "file": "rust/crates/index/src/reader_retention.rs",
+          "find": "            !checkpoint_requires,\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reader_retention/laws.rs",
+          "function": "a_checkpoint_alone_keeps_its_dependencies",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
     }
   }
 }

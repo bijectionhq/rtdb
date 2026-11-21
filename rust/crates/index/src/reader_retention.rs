@@ -22,15 +22,17 @@ verus! {
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     requires observations@.len() == readers, observations_agree(observes, observations@),
-    ensures out == has_reference(observations@, observation_count(readers)),
+    ensures out == (checkpoint_requires || has_reference(observations@, observation_count(readers))),
 ))]
-pub(crate) fn any_reader_requires<F: Fn(usize) -> bool>(
-    readers: usize, observes: F, #[cfg(verus_keep_ghost)] observations: Ghost<Seq<bool>>,
+pub(crate) fn any_reference_requires<F: Fn(usize) -> bool>(
+    checkpoint_requires: bool, readers: usize, observes: F, #[cfg(verus_keep_ghost)] observations: Ghost<Seq<bool>>,
 ) -> bool {
+    if checkpoint_requires { return true; }
     let end = readers;
     let mut index = 0;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant
+            !checkpoint_requires,
             index <= end <= readers,
             end as int == observation_count(readers),
             observations@.len() == readers,

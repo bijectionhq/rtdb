@@ -249,7 +249,7 @@ async fn persist_with_blooms(state: &PartitionState, store: &MemoryStore, blooms
         store.put(&ObjectKey::new(catalog.entry(table).unwrap().slug.block_key(prepared.block_index()).unwrap()).unwrap(), table_block.encode().into()).await.unwrap();
     }
     store.put(&ObjectKey::new(block_key(prepared.block_index()).unwrap()).unwrap(), block.encode().into()).await.unwrap();
-    state.adopt_block(prepared, block.clone(), &additions, Timestamp(1000)).unwrap();
+    state.adopt_block(prepared, block.clone(), &tables, &additions, Timestamp(1000)).unwrap();
     (block, tables)
 }
 

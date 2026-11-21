@@ -90,6 +90,65 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
 }
 
 #[tokio::test]
+async fn collection_preserves_live_and_pending_tries_of_the_installed_checkpoint_until_replaced() {
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let trie = |key: &str| CatalogTrie::notification(key.parse().unwrap(), 16, None).unwrap();
+    let live = trie("l01-rc-b00");
+    let pending = trie("l02-rc-p0-b00");
+    let initial = TrieCatalog::new(16).unwrap()
+        .with_tries(table.clone(), [live.clone(), pending.clone()], Timestamp(100)).unwrap();
+    assert_eq!(initial.trie(&table, &live.key).unwrap().state, TrieState::Live);
+    assert_eq!(initial.trie(&table, &pending.key).unwrap().state, TrieState::Nascent);
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(initial, tables, TrieConfig::default()).unwrap()));
+    let checkpoint = |index: BlockIndex| BlockCatalog::from_proto(pb::Block {
+        block_index: Some(index.0), tables: vec![entry.to_proto()], ..Default::default()
+    }).unwrap();
+    let no_new_l0 = BTreeMap::new();
+    let prepared = state.prepare_block().unwrap();
+    let root = checkpoint(prepared.block_index());
+    let blocks = prepared.table_blocks(&no_new_l0, Timestamp(100)).unwrap();
+    state.adopt_block(prepared, root, &blocks, &no_new_l0, Timestamp(100)).unwrap();
+    state.add_tries(&BTreeMap::from([(table.clone(), [
+        "l02-rc-p1-b00", "l02-rc-p2-b00", "l02-rc-p3-b00",
+        "l03-rc-p00-b00", "l03-rc-p01-b00", "l03-rc-p02-b00", "l03-rc-p03-b00",
+    ].into_iter().map(trie).collect())]), Timestamp(200)).unwrap();
+    let current = state.value();
+    for dependency in [&live, &pending] {
+        assert!(matches!(current.trie_catalog().trie(&table, &dependency.key).unwrap().state, TrieState::Garbage { .. }));
+    }
+
+    let store = Arc::new(MemoryStore::default());
+    let mut objects = Vec::new();
+    for dependency in [&live, &pending] {
+        for path in [entry.slug.data_key(&dependency.key), entry.slug.metadata_key(&dependency.key)] {
+            let key = ObjectKey::new(path).unwrap();
+            store.put(&key, Bytes::from_static(b"checkpoint dependency")).await.unwrap();
+            objects.push(key);
+        }
+    }
+    let observer = Arc::new(Observer::default());
+    let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
+    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), observer.clone(), GarbageConfig::default()).unwrap();
+    let cancellation = CancellationToken::new();
+    collector.collect_as_of(Timestamp(200), &cancellation).await.unwrap();
+    assert!(publisher.commits.lock().unwrap().is_empty(), "an installed checkpoint still needs both tries");
+    for object in &objects { store.head(object).await.unwrap(); }
+
+    let prepared = state.prepare_block().unwrap();
+    let root = checkpoint(prepared.block_index());
+    let blocks = prepared.table_blocks(&no_new_l0, Timestamp(300)).unwrap();
+    state.adopt_block(prepared, root, &blocks, &no_new_l0, Timestamp(300)).unwrap();
+    collector.collect_as_of(Timestamp(200), &cancellation).await.unwrap();
+    assert_eq!(publisher.commits.lock().unwrap().as_slice(), &[vec![live.key, pending.key]]);
+    for object in &objects {
+        assert!(matches!(store.head(object).await, Err(rtdb_storage::Error::MissingObject(_))));
+    }
+    assert!(observer.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn collection_preserves_open_readers_and_their_inflight_io() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();

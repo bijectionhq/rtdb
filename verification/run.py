@@ -1016,6 +1016,37 @@ def verify_checkpoint_replay(args, source):
     print("rust-checkpoint-replay: seven tests passed, root-first and fail-fast mutations rejected")
 
 
+def verify_checkpoint_trie_retention(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "collection_preserves_live_and_pending_tries_of_the_installed_checkpoint_until_replaced"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--test", "gc", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-checkpoint-trie-retention-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("native retention of the installed checkpoint's tries failed")
+
+    partition = source / "rust/crates/index/src/partition.rs"
+    original = partition.read_bytes()
+    try:
+        replace_once(partition, "any_reference_requires(checkpoint_requires, self.readers.len(),",
+                     "any_reference_requires(false, self.readers.len(),")
+        checked = run_case(command, source / "rust", args.evidence, "rust-checkpoint-trie-retention-ignore-checkpoint", env)
+        if (
+            checked.returncode != 101
+            or f"{test} ... FAILED" not in checked.stdout
+            or "an installed checkpoint still needs both tries" not in checked.stdout
+            or "0 passed; 1 failed" not in checked.stdout
+        ):
+            raise ValueError("omitting the installed checkpoint did not fail the collection test")
+    finally:
+        partition.write_bytes(original)
+    print("rust-checkpoint-trie-retention: native dependency test passed, ignoring the checkpoint failed")
+
+
 def verify_replay_prefix(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -1475,6 +1506,7 @@ def main():
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
+            verify_checkpoint_trie_retention(args, source)
             verify_replay_prefix(args, source)
             verify_catalog_replay(args, source)
             verify_system_time_replay(args, source)

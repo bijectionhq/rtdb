@@ -1247,13 +1247,14 @@ mod tests {
             ..pb::Block::default()
         }).unwrap();
         let additions = BTreeMap::new();
-        for (table, table_block) in prepared.table_blocks(&additions, Timestamp(200)).unwrap() {
-            let key = catalog.entry(&table).unwrap().slug.block_key(prepared.block_index()).unwrap();
+        let table_blocks = prepared.table_blocks(&additions, Timestamp(200)).unwrap();
+        for (table, table_block) in &table_blocks {
+            let key = catalog.entry(table).unwrap().slug.block_key(prepared.block_index()).unwrap();
             store.put(&ObjectKey::new(key).unwrap(), table_block.encode().into()).await.unwrap();
         }
         let key = block_key(prepared.block_index()).unwrap();
         store.put(&ObjectKey::new(key).unwrap(), block.encode().into()).await.unwrap();
-        state.adopt_block(prepared, block, &additions, Timestamp(200)).unwrap();
+        state.adopt_block(prepared, block, &table_blocks, &additions, Timestamp(200)).unwrap();
 
         let memory = MemoryBudget::new(1 << 20);
         let key = TransactionKey { tx_id: TxId(1), system_time: basis.system_time };

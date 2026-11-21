@@ -713,10 +713,10 @@ impl ReplicationDriver {
                 }
                 let ReplicaBody::BlockUploaded(message) = &record.envelope.message else { return Err(invalid("Matching upload changed type")); };
                 let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Matching upload has no pending block"))?;
-                let (catalog, _) = self.blocks.load(pending.block_index()).await?;
+                let (catalog, table_blocks) = self.blocks.load(pending.block_index()).await?;
                 crate::blocks::validate_boundary(&catalog, &pending.prepared, &pending.boundary)?;
                 let tries = additions(&message.tries)?;
-                self.partition.adopt_block(pending.prepared.clone(), catalog, &tries, record.metadata.timestamp)?;
+                self.partition.adopt_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
                 self.progress.applied(message.latest_processed_msg_id.map(SourcePosition), None, message.external_source_token.clone())?;
                 let pending = self.pending_block.take().ok_or_else(|| invalid("Adopted block disappeared"))?;
                 let mut held = pending.into_records();

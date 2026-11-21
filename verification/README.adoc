@@ -111,6 +111,8 @@ The optional native replay reads the same seeded 4,096-observation trace that th
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
 The same option runs the local checkpoint interruption, partial compaction, overlapping collection and manifest-recovery tests.
 The production controls publish the root too early and stop on a missing checkpoint without refreshing discovery.
+The native collection replay checks that live and pending trie files remain protected until the installed checkpoint is replaced.
+Its control removes the checkpoint from collection eligibility.
 The startup replay test also covers a selected checkpoint whose first required replica offset is below the reported retained floor.
 The archived control skips the prefix check and must fail when the driver opens that suffix.
 It also tests catalog promotion after a binary checkpoint round trip.

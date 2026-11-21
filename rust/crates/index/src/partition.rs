@@ -7,11 +7,12 @@ use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
 use crate::{CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
-use crate::reader_retention::any_reader_requires;
+use crate::reader_retention::any_reference_requires;
 
 #[derive(Clone, Debug)]
 pub struct PartitionValue {
     trie_catalog: Arc<TrieCatalog>,
+    checkpoint_tries: Option<Arc<CheckpointTries>>,
     table_catalog: Arc<TableCatalog>,
     live: Arc<LiveIndex>,
     live_snapshot: Option<Arc<LiveIndex>>,
@@ -21,13 +22,32 @@ impl PartitionValue {
     pub fn loaded(trie_catalog: TrieCatalog, table_catalog: TableCatalog, config: TrieConfig) -> Result<Self> {
         let block_index = BlockIndex(table_catalog.block_index().map_or(-1, |index| index.0).checked_add(1).ok_or_else(|| invalid("Block index exhausted"))?);
         let latest_completed_tx = table_catalog.block().and_then(BlockCatalog::latest_completed_tx);
-        Ok(Self { trie_catalog: Arc::new(trie_catalog), table_catalog: Arc::new(table_catalog),
+        let checkpoint_tries = table_catalog.block_index().map(|_| Arc::new(CheckpointTries::capture(&trie_catalog)));
+        Ok(Self { trie_catalog: Arc::new(trie_catalog), checkpoint_tries, table_catalog: Arc::new(table_catalog),
             live: Arc::new(LiveIndex::new(block_index, latest_completed_tx, config)), live_snapshot: None })
     }
     pub fn trie_catalog(&self) -> &Arc<TrieCatalog> { &self.trie_catalog }
     pub fn table_catalog(&self) -> &Arc<TableCatalog> { &self.table_catalog }
     pub fn live(&self) -> &Arc<LiveIndex> { &self.live }
     pub fn snapshot(&self) -> Snapshot { Snapshot::new(Arc::clone(&self.trie_catalog), Arc::clone(&self.table_catalog), Arc::clone(&self.live)) }
+}
+
+#[derive(Debug)]
+struct CheckpointTries(BTreeMap<TableRef, BTreeSet<TrieKey>>);
+
+impl CheckpointTries {
+    fn capture(catalog: &TrieCatalog) -> Self {
+        Self(catalog.tables().map(|table| {
+            let keys = catalog.iter_tries(table)
+                .filter(|trie| matches!(trie.state, TrieState::Live | TrieState::Nascent))
+                .map(|trie| trie.key.clone()).collect();
+            (table.clone(), keys)
+        }).collect())
+    }
+
+    fn requires(&self, table: &TableRef, key: &TrieKey) -> bool {
+        self.0.get(table).is_some_and(|keys| keys.contains(key))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,9 +86,13 @@ impl TrieCollection {
 
     pub fn eligible(&self, table: &TableRef, as_of: Timestamp) -> Vec<TrieKey> {
         self.current.trie_catalog().garbage_tries(table, as_of).into_iter()
-            .filter(|candidate| !any_reader_requires(self.readers.len(), |index| {
-                self.readers[index].trie(table, &candidate.key).is_some_and(|trie| trie.state == TrieState::Live)
-            }))
+            .filter(|candidate| {
+                let checkpoint_requires = self.current.checkpoint_tries.as_ref()
+                    .is_some_and(|checkpoint| checkpoint.requires(table, &candidate.key));
+                !any_reference_requires(checkpoint_requires, self.readers.len(), |index| {
+                    self.readers[index].trie(table, &candidate.key).is_some_and(|trie| trie.state == TrieState::Live)
+                })
+            })
             .map(|trie| trie.key.clone()).collect()
     }
 }
@@ -202,8 +226,12 @@ impl PartitionState {
         Ok(BlockPreparation { captured, metadata })
     }
 
-    /// Storage must publish the block file before this atomic adoption.
-    pub fn adopt_block(&self, prepared: BlockPreparation, block: BlockCatalog, tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<()> {
+    /// Storage must publish the root and its table blocks before this atomic adoption.
+    /// Collection protects the tries used to restore the recorded checkpoint.
+    pub fn adopt_block(&self, prepared: BlockPreparation, block: BlockCatalog, table_blocks: &BTreeMap<TableRef, TableBlock>,
+        tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<()> {
+        let durable_tries = TrieCatalog::load(table_blocks, prepared.captured.trie_catalog.file_size_target(), as_of)?;
+        let checkpoint_tries = Some(Arc::new(CheckpointTries::capture(&durable_tries)));
         let mut value = self.value.write();
         if !Arc::ptr_eq(&value.live, &prepared.captured.live) { return Err(invalid("Live data moved while the block was being prepared")); }
         if block.block_index() != value.live.block_index() || block.latest_completed_tx() != value.live.latest_completed_tx() {
@@ -212,8 +240,12 @@ impl PartitionState {
         let mut trie_catalog = value.trie_catalog.as_ref().clone();
         for (table, tries) in tries { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
         let table_catalog = value.table_catalog.adopt(block, &prepared.metadata)?;
+        if !table_catalog.tables().keys().eq(table_blocks.keys()) {
+            return Err(invalid("Table blocks do not match the adopted checkpoint registry"));
+        }
         let live = value.live.next_block()?;
-        *value = Arc::new(PartitionValue { trie_catalog: Arc::new(trie_catalog), table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None });
+        *value = Arc::new(PartitionValue { trie_catalog: Arc::new(trie_catalog), checkpoint_tries,
+            table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None });
         Ok(())
     }
 }
