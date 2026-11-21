@@ -52,7 +52,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | QRY02 · Lowering | Open | — |
 | QRY03 · Plan reuse | Open | — |
 | QRY04 · Rewrite soundness | Open | — |
-| QRY05 · Predicate placement | Open | — |
+| QRY05 · Predicate placement | Partial | [Lean left join laws and nullable-side counterexample](rtdb-engine-proof-evidence.md#main-evidence) |
 | QRY06 · Correlation | Open | — |
 | QRY07 · Projection | Open | — |
 | QRY08 · Join and set semantics | Open | — |

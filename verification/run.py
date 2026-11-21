@@ -480,6 +480,23 @@ def verify_memory_admission(args, scratch):
     verify_lean_model(args, scratch, path, "memory-admission", controls, 6)
 
 
+def verify_outer_join(args, scratch):
+    path = Path("verification/lean/OuterJoin.lean")
+    controls = {
+        "lose-null-extension": (
+            "| [] => [none]",
+            "| [] => []",
+            ["moving_nullable_side_where_can_create_a_row"],
+        ),
+        "accept-unknown": (
+            "| .yes => true",
+            "| .yes | .unknown => true",
+            ["an_unknown_predicate_does_not_accept"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "outer-join", controls, 5)
+
+
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
     controls = {
@@ -591,6 +608,7 @@ def verify_lean(args, scratch):
             verify_type_join(args, scratch)
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
+            verify_outer_join(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
