@@ -6,7 +6,7 @@ use rtdb_node::{Database, NativeSession, Node};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use uuid::Uuid;
-use crate::{error::status, lease::Leased};
+use crate::{error::status, lease::Leased, wire::BoundParameters};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Owner { Anonymous, Authenticated(Uuid) }
@@ -111,6 +111,6 @@ impl Leased for Transaction { fn close(&self) { self.connection.close(); } }
 impl Drop for Transaction { fn drop(&mut self) { self.close(); } }
 #[derive(Clone)]
 pub(crate) enum PreparedScope { Session(String), Transaction(Bytes) }
-pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub scope: PreparedScope, pub params: Mutex<Option<Bytes>>, _reservation: Arc<MemoryReservation> }
+pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub scope: PreparedScope, pub params: Mutex<Option<Arc<BoundParameters>>>, _reservation: Arc<MemoryReservation> }
 impl Prepared { pub fn new(owner: ResourceOwner, sql: String, scope: PreparedScope, reservation: Arc<MemoryReservation>) -> Self { Self { owner, sql, scope, params: Mutex::new(None), _reservation: reservation } } }
 impl Leased for Prepared { fn close(&self) { *self.params.lock().expect("prepared parameters lock") = None; } }

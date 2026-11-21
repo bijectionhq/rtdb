@@ -419,6 +419,10 @@ pub fn read_stream(bytes: Arc<[u8]>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     Ok((schema, reader.collect::<Result<Vec<_>>>()?))
 }
 
+/// Applies IPC stream field nullability to an already decoded batch without copying its value buffers.
+/// Returns a replacement only when the stream reader would change the schema.
+pub fn adapt_stream_batch(batch: &RecordBatch) -> Result<Option<RecordBatch>> { decoded_schema::adapt_batch(batch) }
+
 /// Owns a complete IPC stream's schema and decoded Arrow buffers under one reservation.
 pub struct OwnedStream {
     schema: SchemaRef,

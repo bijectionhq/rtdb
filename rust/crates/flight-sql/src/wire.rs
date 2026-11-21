@@ -86,7 +86,7 @@ impl Decoder {
             arrow_ipc::MessageHeader::RecordBatch => {
                 let schema = self.schema.clone().ok_or_else(|| invalid("Record batch arrived before schema"))?;
                 let batch = arrow_flight::utils::flight_data_to_arrow_batch(&data, schema, &self.dictionaries).map_err(arrow)?;
-                let retained = self.memory.reserve(batch.get_array_memory_size()).map_err(status)?;
+                let retained = self.memory.reserve(rtdb_columnar::shared_allocation_size(&batch).map_err(status)?).map_err(status)?;
                 let owned = OwnedBatch::with_reservation(batch, retained).map_err(status)?;
                 drop(charge); Ok(Some(owned))
             }
@@ -128,6 +128,43 @@ pub(crate) fn parameter_batch(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Resu
     let batch = reader.next().transpose().map_err(status)?.unwrap_or_else(|| RecordBatch::new_empty(reader.schema()));
     OwnedBatch::with_reservation(batch, charge).map_err(status)
 }
+
+pub(crate) struct BoundParameters {
+    batch: OwnedBatch,
+    _schema: Arc<MemoryReservation>,
+}
+
+impl BoundParameters {
+    pub fn new(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>, Status> {
+        let schema = memory.reserve(schema_bound(batch.batch().schema_ref())?).map_err(status)?;
+        let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch()).map_err(status)? {
+            Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation())).map_err(status)?,
+            None => batch,
+        };
+        Ok(Arc::new(Self { batch, _schema: schema }))
+    }
+
+    pub fn empty(schema: &SchemaRef, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>, Status> {
+        let bound = schema_bound(schema)?;
+        let scratch = memory.reserve(mul(bound, 2)?).map_err(status)?;
+        let batch = RecordBatch::new_empty(Arc::clone(schema));
+        let batch = OwnedBatch::new(batch, memory).map_err(status)?;
+        let bound = Self::new(batch, memory)?;
+        drop(scratch);
+        Ok(bound)
+    }
+
+    pub fn batch(&self) -> &RecordBatch { self.batch.batch() }
+
+    pub fn update_arguments(&self, memory: &Arc<MemoryBudget>) -> Result<SqlArguments, Status> {
+        let arguments = SqlArguments::from_arrow(self.batch.clone(), memory).map_err(status)?;
+        let _check = memory.reserve(schema_bound(self.batch().schema_ref())?).map_err(status)?;
+        for ((field, array), logical) in self.batch().schema_ref().fields().iter().zip(self.batch().columns()).zip(arguments.types()) {
+            rtdb_columnar::validate_readable_column(field, array.as_ref(), logical, memory).map_err(status)?;
+        }
+        Ok(arguments)
+    }
+}
 fn ipc_bound(bytes: &[u8]) -> Result<usize, Status> {
     let mut position = 0usize; let mut bound = 8192;
     while position < bytes.len() {
@@ -154,18 +191,13 @@ pub(crate) struct ParameterTypes {
     _reservation: Arc<MemoryReservation>,
 }
 impl ParameterTypes {
-    fn from_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
+    pub fn from_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
         let schema = batch.schema_ref();
         let reservation = memory.reserve(schema_bound(schema)?).map_err(status)?;
         Ok(Self { types: logical_parameter_types(schema)?, _reservation: reservation })
     }
 
     pub fn as_slice(&self) -> &[LogicalType] { &self.types }
-}
-
-pub(crate) fn parameter_types(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<ParameterTypes, Status> {
-    let batch = parameter_batch(bytes, memory)?;
-    ParameterTypes::from_batch(batch.batch(), memory)
 }
 
 pub(crate) fn arguments(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<SqlArguments, Status> {
@@ -232,6 +264,23 @@ mod tests {
         let bytes = parameter_ipc(&RecordBatch::new_empty(schema), &memory).unwrap().unwrap(); let batch = parameter_batch(&bytes, &memory).unwrap(); let args = arguments(batch.batch(), &memory).unwrap();
         assert_eq!(args.row_count(), 0); assert_eq!(args.types().len(), 1);
     }
+
+    #[test]
+    fn schema_only_parameter_bindings_keep_the_typed_empty_batch_charged() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Arc::new(Schema::new(vec![Field::new("arg", DataType::Int64, false)]));
+
+        let bound = BoundParameters::empty(&schema, &memory).unwrap();
+        let args = bound.update_arguments(&memory).unwrap();
+        drop(bound);
+
+        assert!(memory.used_bytes() > 0);
+        assert_eq!(args.types(), &[LogicalType::Scalar(rtdb_types::ScalarType::I64)]);
+        assert_eq!(args.row_count(), 0);
+        drop(args);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
     #[test]
     fn parameter_type_projection_admits_and_releases_metadata_for_empty_batches() {
         let child_names = (0..16).map(|index| format!("field_{}_{index}", "x".repeat(512))).collect::<Vec<_>>();
@@ -265,9 +314,8 @@ mod tests {
         let decoded = MemoryBudget::new(1 << 24);
         let round_trip = parameter_batch(&bytes, &decoded).unwrap();
         let decoded_bound = schema_bound(round_trip.batch().schema_ref()).unwrap();
+        let types = ParameterTypes::from_batch(round_trip.batch(), &decoded).unwrap();
         drop(round_trip);
-        assert_eq!(decoded.used_bytes(), 0);
-        let types = parameter_types(&bytes, &decoded).unwrap();
         drop(bytes);
         assert_eq!(encoded.used_bytes(), 0);
         assert_eq!(types.as_slice(), std::slice::from_ref(&expected));
@@ -287,6 +335,76 @@ mod tests {
         drop(direct);
         drop(args);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn bound_update_arguments_retain_arrow_and_admit_rows_only_when_read() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Arc::new(Schema::new(vec![Field::new("client-name", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![None, Some(17)]))]).unwrap();
+        let bound = BoundParameters::new(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+        let restore = bound.update_arguments(&memory).unwrap();
+        drop(bound);
+        let obstruction = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
+
+        let error = restore.rows().next().unwrap().err().unwrap();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+
+        drop(obstruction);
+        assert_eq!(restore.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [vec![Value::Null], vec![Value::I64(17)]]);
+        drop(restore);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn decoded_parameter_buffers_charge_the_shared_ipc_body_once() {
+        let memory = MemoryBudget::new(1 << 28);
+        let fields = (0..32).map(|column| Field::new(format!("col_{column}"), DataType::Int64, false)).collect::<Vec<_>>();
+        let columns = (0..32).map(|_| {
+            Arc::new(Int64Array::from((0..128_i64).collect::<Vec<_>>())) as ArrayRef
+        }).collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let mut encoder = Encoder::new(&schema, &memory).unwrap();
+        let data = encoder.batch(&batch, &memory).unwrap().pop().unwrap();
+        let body = data.data_body.len();
+        let mut decoder = Decoder::new(Arc::clone(&memory));
+        decoder.decode(schema_data(&schema, &memory).unwrap()).unwrap();
+        let decoded = decoder.decode(data).unwrap().unwrap();
+
+        assert!(decoded.reservation().bytes() < body * 3);
+        assert_eq!(decoded.batch(), &batch);
+    }
+
+    #[test]
+    fn nested_union_parameter_metadata_matches_ticket_decoding_without_copying_cells() {
+        use arrow_array::{Array, NullArray, UnionArray, cast::AsArray, types::Int64Type};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::UnionFields;
+
+        let memory = MemoryBudget::new(1 << 22);
+        let legs = UnionFields::try_new([0, 1], [
+            Arc::new(Field::new("bottom", DataType::Null, false)),
+            Arc::new(Field::new("i64", DataType::Int64, false)),
+        ]).unwrap();
+        let union = UnionArray::try_new(legs, ScalarBuffer::from(vec![1_i8]), Some(ScalarBuffer::from(vec![0_i32])), vec![
+            Arc::new(NullArray::new(0)),
+            Arc::new(Int64Array::from(vec![100])),
+        ]).unwrap();
+        let child = Arc::new(Field::new("value", union.data_type().clone(), false));
+        let record = rtdb_columnar::build_struct_array(vec![child].into(), &[Arc::new(union)], 1, None).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("arg", record.data_type().clone(), false)]));
+        let batch = RecordBatch::try_new(schema, vec![record]).unwrap();
+        let pointer = |batch: &RecordBatch| batch.column(0).as_struct().column(0).as_union().child(1)
+            .as_primitive::<Int64Type>().values().as_ptr();
+        let address = pointer(&batch);
+        let bytes = parameter_ipc(&batch, &memory).unwrap().unwrap();
+        let decoded = parameter_batch(&bytes, &memory).unwrap();
+
+        let retained = BoundParameters::new(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+
+        assert_eq!(retained.batch().schema_ref(), decoded.batch().schema_ref());
+        assert_eq!(pointer(retained.batch()), address);
     }
 
     #[test]

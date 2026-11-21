@@ -219,11 +219,13 @@ async fn flight_redeems_ordered_distinct_from_index_batches_at_the_ticket_basis(
 async fn prepared_update_info_buffers_the_bound_operation_once() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
-    client.update("INSERT INTO docs (_id,n) VALUES (1,10)", None).await;
+    client.update("INSERT INTO docs (_id,n) VALUES (1,10), (2,20)", None).await;
     let transaction = client.begin().await;
-    let prepared = client.prepare("UPDATE docs SET n = n + ? WHERE _id = 1", Some(transaction.clone())).await;
+    let prepared = client.prepare("UPDATE docs SET n = n + ? WHERE _id = ?", Some(transaction.clone())).await;
     let command = CommandPreparedStatementQuery { prepared_statement_handle: prepared.prepared_statement_handle };
-    client.upload(command.clone(), vec![arguments(vec![2])]).await;
+    let schema = Arc::new(Schema::new(vec![Field::new("increment", DataType::Int64, false), Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![2, 4])), Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+    client.upload(command.clone(), vec![batch]).await;
     let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
     let request = client.request(descriptor);
     let info = client.client.get_flight_info(request).await.unwrap().into_inner();
@@ -231,7 +233,9 @@ async fn prepared_update_info_buffers_the_bound_operation_once() {
     assert!(client.redeem(&info).await.is_empty());
     assert!(client.redeem(&info).await.is_empty());
     client.end(transaction, true).await.unwrap();
-    assert_eq!(integer(&client.query("SELECT n FROM docs").await[0], 0, 0), 12);
+    let result = client.query("SELECT n FROM docs ORDER BY _id").await;
+    let actual = result.iter().flat_map(|batch| (0..batch.num_rows()).map(|row| integer(batch, 0, row))).collect::<Vec<_>>();
+    assert_eq!(actual, [12, 24]);
     running.stop().await;
 }
 

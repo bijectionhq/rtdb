@@ -56,7 +56,7 @@ impl Service {
                 "CreatePreparedStatement" => {
                     let request: ActionCreatePreparedStatementRequest = unpack(&action.body)?;
                     let connection = self.tx_or_session(&call, request.transaction_id.as_ref()).await?;
-                    let shape = self.prepare_shape(connection, &request.query, None).await?;
+                    let shape = self.prepare_shape(connection, &request.query).await?;
                     let scope = request.transaction_id.map_or_else(|| PreparedScope::Session(call.database.clone()), PreparedScope::Transaction);
                     let charge = self.memory().reserve(wire::add(request.query.capacity(), wire::add(call.database.len(), 1024)?)?).map_err(status)?;
                     let prepared = Arc::new(Prepared::new(call.session.owner(), request.query, scope, charge));

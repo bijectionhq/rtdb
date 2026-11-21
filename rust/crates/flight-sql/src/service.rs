@@ -215,8 +215,8 @@ impl FlightService for Service {
         let command = command(&request.into_inner().cmd).map_err(|error| call.error(error))?;
         let work = async {
             let schema = match command {
-                Command::CommandStatementQuery(command) => { let connection = self.connection(&call, &call.database).await?; self.describe(connection, &command.query, None).await?.0 }
-                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let connection = self.scoped(&call, &prepared.scope).await?; self.describe(connection, &prepared.sql, None).await?.0 }
+                Command::CommandStatementQuery(command) => { let connection = self.connection(&call, &call.database).await?; self.describe(connection, &command.query).await?.0 }
+                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let connection = self.scoped(&call, &prepared.scope).await?; self.describe(connection, &prepared.sql).await?.0 }
                 command => self.metadata_schema(&command)?,
             };
             Ok::<_, Status>(flight::SchemaResult { schema: wire::schema_message(&schema, self.memory())? })

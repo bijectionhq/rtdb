@@ -100,6 +100,8 @@ SQL BEGIN, COMMIT, and ROLLBACK use the shared Flight SQL control rejection; tra
 Prepared handles are re-prepared against the current execution context on each use.
 Their parameter metadata uses positional unnamed nullable fields, and the source's field-4 `is_update` extension is retained.
 Prepared query binding retains the first Arrow batch.
+Flight SQL derives the result schema from the bound Arrow fields and encodes the batch when issuing a query ticket.
+An update submitted through `GetFlightInfo` passes the bound batch to the transaction path as Arrow arguments.
 Prepared update binding accumulates all Arrow batches by column position.
 Zero columns mean an unbound execution; columns with zero rows preserve an empty execution batch.
 
