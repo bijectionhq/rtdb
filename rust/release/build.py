@@ -34,7 +34,7 @@ def selected_features(matrix, variant, platform):
     if matrix.get("schema_version") != 1 or platform not in matrix["platforms"]:
         raise ValueError("release selection is absent from the source matrix")
     if variant == "multi":
-        return ["rtdb-multi/dynamodb"]
+        return ["rtdb-multi/dynamodb", "rtdb-multi/s3-key-vault"]
     if variant not in matrix["variants"]:
         raise ValueError("release selection is absent from the source matrix")
     features = matrix["variants"][variant]

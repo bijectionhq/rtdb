@@ -59,7 +59,8 @@ Usage: rtdb-multi --build-info\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names, PREFIX-members and PREFIX-stopped-tasks\n\
 Use dynamodb+packed:PREFIX to write packed parked rows after all readers have upgraded.\n\
 MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
-DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n";
+DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n\
+For --keys, use a private directory, a dynamodb:TABLE locator, or s3://BUCKET?region=REGION for a never-versioned key vault.\n";
 
 fn main() {
     let runtime = match tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build() {
@@ -322,7 +323,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             // Hosted capture adopts a block through the holder's observed source.
-            hosted_protocol: 13,
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 14 } else { 13 },
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -874,11 +875,26 @@ fn cell_secret(arguments: &Arguments) -> Result<Option<Arc<rtdb_multi::capabilit
     arguments.optional("cell-secret").map(|path| rtdb_multi::capability::CellSecret::from_file(std::path::Path::new(path)).map(Arc::new)).transpose()
 }
 
-async fn key_service(specification: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
-    if let Some(table) = specification.strip_prefix("dynamodb:") {
-        return dynamo_keys(table).await;
-    }
-    Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(specification)?))
+fn key_service(specification: &str) -> futures::future::BoxFuture<'_, Result<Arc<dyn rtdb_multi::keys::KeyService>>> {
+    Box::pin(async move {
+        if let Some(table) = specification.strip_prefix("dynamodb:") {
+            return dynamo_keys(table).await;
+        }
+        if specification.starts_with("s3://") {
+            return s3_keys(specification).await;
+        }
+        Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(specification)?) as Arc<dyn rtdb_multi::keys::KeyService>)
+    })
+}
+
+#[cfg(feature = "s3-key-vault")]
+async fn s3_keys(specification: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    Ok(Arc::new(rtdb_multi::keys::s3::S3KeyService::open(specification).await?))
+}
+
+#[cfg(not(feature = "s3-key-vault"))]
+async fn s3_keys(_: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    Err(Anomaly::unsupported("rtdb.multi/s3-key-vault", "This binary was built without the s3-key-vault feature"))
 }
 
 #[cfg(feature = "dynamodb")]

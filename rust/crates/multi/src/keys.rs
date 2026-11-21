@@ -13,12 +13,14 @@ use rtdb_directory::{DeletionFacts, DeletionRecord};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 pub const KEY_BYTES: usize = 32;
+const NAMESPACE_KEY_ID: &str = ".rtdb-key-namespace";
+const DELETION_SIGNING_KEY_ID: &str = ".rtdb-deletion-signing-seed";
 const DESTROYED: &[u8] = b"RTDB-key-destroyed-v1";
 const DELETION_SIGNATURE_DOMAIN: &[u8] = b"rtdb.multi.deletion.v1\0";
 
 #[async_trait::async_trait]
 pub trait KeyService: Send + Sync {
-    async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.key(".rtdb-key-namespace").await }
+    async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.key(NAMESPACE_KEY_ID).await }
     async fn existing(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
         self.existing_key(deployment).await?.ok_or_else(|| {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb.multi/key-missing", "The deployment has no installed key")
@@ -31,10 +33,10 @@ pub trait KeyService: Send + Sync {
         Ok(())
     }
     async fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord> {
-        sign_deletion(self.key(".rtdb-deletion-signing-seed").await?, facts)
+        sign_deletion(self.key(DELETION_SIGNING_KEY_ID).await?, facts)
     }
     async fn deletion_verification_key(&self) -> Result<String> {
-        verification_key(self.key(".rtdb-deletion-signing-seed").await?)
+        verification_key(self.key(DELETION_SIGNING_KEY_ID).await?)
     }
 
     /// The deployment's key, created on first use.
@@ -278,6 +280,8 @@ fn malformed() -> Anomaly { Anomaly::fault("rtdb.multi/key-corrupt", "Malformed 
 
 #[cfg(feature = "dynamodb")]
 pub mod dynamo;
+#[cfg(feature = "s3-key-vault")]
+pub mod s3;
 
 fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/keys", error.to_string()) }
 

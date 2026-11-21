@@ -119,6 +119,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 aws-types = "=1.7.0"
 aws-sdk-dynamodb = "=1.132.0"
 aws-sdk-dynamodbstreams = "=1.126.0"
+aws-sdk-s3 = { version = "=1.155.0", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "rustls"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 url = "2"
 

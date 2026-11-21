@@ -1069,6 +1069,14 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    The full proof also requires a separately trusted, epoch-scoped storage credential issuer, provider KMS erasure and exclusion of concurrent administrative writers such as earlier reaper or lineage-transfer passes.
    A deployment moving between cells keeps ownership of its source tail until cutover.
 
+**Hosted key custody.**
+The hosted Multi binary can use a dedicated S3 key vault configured with `s3://BUCKET?region=REGION`.
+The bucket must have never enabled versioning, and vault objects use S3 server-side encryption.
+Creation uses conditional writes and verifies the installed value before returning.
+Withdrawal conditionally replaces the current key with a permanent tombstone and rechecks bucket versioning before acknowledging the withdrawal.
+The cell namespace and deletion signer are stored separately from per-deployment, stage and checkpoint keys.
+The directory records the selected storage and key namespaces before a residence opens.
+
 **Tests.**
 A same-organisation fork copies no payload.
 A cross-organisation fork copies the selected checkpoint and tail with an independent key and remains readable after the source is erased.
