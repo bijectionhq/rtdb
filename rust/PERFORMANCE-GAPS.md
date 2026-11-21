@@ -185,7 +185,26 @@ Flight ingest remained open (78.0k versus 96.1k rows/s), as did full-scan fetch 
 Flight single-row INSERT p95 was 3.4–12.2 ms versus 3.7–3.8 ms at 100,000 rows.
 At 1,000,000 rows pgwire single-row INSERT p95 was 2.6–61.1 ms versus 2.8–3.4 ms, and the median DELETE p95 trailed on both protocols with overlapping ranges.
 These write latency gaps need more repetitions, including heap and storage wait evidence during the slow runs.
-The allocator comparison and phase-specific CPU profiles are in progress.
+
+Two further runs per size preloaded jemalloc into the same RTDB image, with a background purge thread, one-second dirty-page decay and zero muzzy-page decay.
+They ran after the glibc comparison on the same host.
+The ranges below show both runs.
+
+| Rows | Metric | RTDB with jemalloc | XTDB |
+| ---: | --- | ---: | ---: |
+| 100k | Flight prepared INSERT | 86.6k [72.5k, 100.8k] rows/s | 96.1k [89.0k, 103.2k] rows/s |
+| 100k | Flight full-scan fetch p95 | 297 [282, 312] ms | 305 [288, 323] ms |
+| 1M | Flight prepared INSERT | 108.0k [106.3k, 109.7k] rows/s | 110.0k [88.9k, 131.2k] rows/s |
+| 1M | pgwire ingest | 47.1k [46.4k, 47.8k] rows/s | 40.0k [32.5k, 47.5k] rows/s |
+| 1M | pgwire concurrent INSERT | 1,595 [1,339, 1,852] tx/s | 1,195 [1,138, 1,252] tx/s |
+| 1M | pgwire UPDATE of 10% of orders | 675 [594, 756] ms | 800 [732, 868] ms |
+| 1M | Peak working set during pgwire | 641 [622, 659] MiB | 747 [723, 771] MiB |
+| 1M | Peak working set during Flight | 562 [539, 586] MiB | 787 [768, 806] MiB |
+
+The same configuration improved the observed million-row memory and pgwire results in both runs.
+The glibc run with a 61.1 ms pgwire single-INSERT p95 was followed by 3.09 ms and 2.12 ms with jemalloc.
+The 100,000-row Flight ingest median still trails the reference, and the million-row Flight median difference is inside the measured XTDB spread.
+Verify the packaged allocator setting and repeat the remaining Flight comparisons with phase-specific profiles.
 
 ## Verification
 

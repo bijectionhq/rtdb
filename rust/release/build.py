@@ -127,7 +127,15 @@ def extract_artifacts(commands, image, engine, output):
         return containers[0]
     with owned_cancellation() as owner:
         try:
-            entrypoint = ["--entrypoint", "/bin/sh", image["Id"], "-ec", "/usr/local/bin/rtdb --build-info\n/usr/local/bin/rtdb-config --build-info"] if engine == "rust" else ["--entrypoint", "/bin/true", image["Id"]]
+            if engine == "rust":
+                smoke = "\n".join([
+                    "grep -Fq libjemalloc.so.2 /proc/$$/maps",
+                    "/usr/local/bin/rtdb --build-info",
+                    "/usr/local/bin/rtdb-config --build-info",
+                ])
+                entrypoint = ["--entrypoint", "/bin/sh", image["Id"], "-ec", smoke]
+            else:
+                entrypoint = ["--entrypoint", "/bin/true", image["Id"]]
             commands.run("artifact-container", ["docker", "create", "--name", name, "--label", "io.rtdb.release=" + name, *entrypoint])
             capture_container()
             inspected = True
@@ -137,7 +145,7 @@ def extract_artifacts(commands, image, engine, output):
                 _, report = commands.run("artifact-build-info", ["docker", "start", "--attach", name])
                 state = capture_container().get("State", {})
                 if state.get("Running") is not False or state.get("Status") != "exited" or state.get("ExitCode") != 0:
-                    raise ValueError("packaged build-information commands did not complete successfully")
+                    raise ValueError("packaged allocator and build-information checks did not complete successfully")
                 lines = report.read_text().splitlines()
                 if len(lines) != 2:
                     raise ValueError("packaged executables must emit two build-information records")
