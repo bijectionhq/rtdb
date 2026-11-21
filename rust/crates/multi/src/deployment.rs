@@ -1,8 +1,9 @@
 //! What a node opens for a deployment: the `DatabaseConfig` derived from its directory record.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use rtdb_directory::DeploymentRecord;
+use rtdb_directory::{DeploymentRecord, MemberId, MemberRecord, MemberRole};
 use rtdb_format::database::proto::{DatabaseConfig, RemoteStorage, database_config};
 use rtdb_storage::{Error as StoreError, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, Result};
@@ -133,6 +134,13 @@ pub struct LogkeeperLogConfig {
 }
 
 pub fn write_quorum(ensemble: usize) -> usize { ensemble / 2 + 1 }
+
+pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<String>> {
+    record.ensemble.iter().map(|id| {
+        members.get(id).filter(|member| member.role == MemberRole::Logkeeper).map(|member| member.address.clone())
+            .ok_or_else(|| Anomaly::fault("rtdb.multi/unknown-logkeeper", format!("Logkeeper {id} is not a member")))
+    }).collect()
+}
 
 /// The configuration a node opens `record` with, given its ensemble's addresses.
 pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage: &CellStorage, role: Role) -> DatabaseConfig {

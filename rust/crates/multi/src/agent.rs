@@ -16,7 +16,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{Handler, Request, Response};
-use crate::deployment::{CellStorage, Role, database_config};
+use crate::deployment::{CellStorage, Role, database_config, ensemble_servers};
 use crate::lease::MemberLease;
 
 #[derive(Clone, Debug)]
@@ -137,11 +137,6 @@ impl NodeAgent {
         Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/claim-contended", format!("{name} kept changing while being claimed")))
     }
 
-    fn servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<String>> {
-        record.ensemble.iter().map(|id| members.get(id).map(|member| member.address.clone())
-            .ok_or_else(|| Anomaly::fault("rtdb.multi/unknown-logkeeper", format!("Logkeeper {id} is not a member")))).collect()
-    }
-
     async fn open(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Response> {
         self.stop_running(&record.name).await;
         let opened = async {
@@ -167,10 +162,30 @@ impl NodeAgent {
     fn holder_config(&self, record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<rtdb_format::database::proto::DatabaseConfig> {
         let now = now_ms();
         let live = |id: &MemberId| members.get(id).is_some_and(|member| member.is_live(now));
-        let servers = Self::servers(record, members)?;
         if let Some(previous) = &record.move_from {
-            return Ok(crate::deployment::moving_config(record, servers, Some((previous.clone(), record.ensemble.clone())), &self.options.storage, Role::Holder));
+            let logkeepers: Vec<_> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now)).collect();
+            let count = record.ensemble.len();
+            let mut addresses = BTreeSet::new();
+            let mut selected: Vec<&MemberRecord> = rtdb_affinity::rank(&record.storage_identity(), &logkeepers, |member| member.id.as_str())
+                .into_iter().copied().filter(|member| addresses.insert(member.address.as_str())).take(count).collect();
+            if selected.len() < crate::deployment::write_quorum(count) {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-log-quorum", "The destination cannot form a write quorum for the moved log"));
+            }
+            for id in &record.ensemble {
+                if selected.len() == count { break; }
+                if let Some(member) = members.get(id).filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper)
+                    && addresses.insert(member.address.as_str()) {
+                    selected.push(member);
+                }
+            }
+            if selected.len() != count {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-log-quorum", "The destination cannot resolve the moved log's full ensemble width"));
+            }
+            let servers = selected.iter().map(|member| member.address.clone()).collect();
+            let ensemble = selected.iter().map(|member| member.id.clone()).collect();
+            return Ok(crate::deployment::moving_config(record, servers, Some((previous.clone(), ensemble)), &self.options.storage, Role::Holder));
         }
+        let servers = ensemble_servers(record, members)?;
         let alive: Vec<MemberId> = record.ensemble.iter().filter(|id| live(id)).cloned().collect();
         if alive.len() == record.ensemble.len() || alive.len() < crate::deployment::write_quorum(record.ensemble.len()) {
             return Ok(database_config(record, servers, &self.options.storage, Role::Holder));
@@ -278,6 +293,9 @@ impl NodeAgent {
         let _turn = turn.lock().await;
         let record = self.record(name).await?;
         if record.lifecycle != Lifecycle::Live { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/not-live", format!("{name} is not live"))); }
+        if record.move_from.is_some() {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/log-move-pending", format!("{name}'s holder has yet to adopt its log")));
+        }
         if let Some(subscription) = self.subscriptions.lock().get_mut(name) {
             // A snapshot never advances, so it is replaced by a replica rather than served as one.
             if subscription.id == record.id && !matches!(subscription.role, Role::Snapshot(_)) && self.node.catalog().database(name).is_ok() {
@@ -288,7 +306,7 @@ impl NodeAgent {
         }
         if self.holdings.lock().contains_key(name) { return Ok(Response::Subscribed { address: self.address.clone() }); }
         let members = self.members().await?;
-        let configuration = database_config(&record, Self::servers(&record, &members)?, &self.options.storage, Role::Subscriber);
+        let configuration = database_config(&record, ensemble_servers(&record, &members)?, &self.options.storage, Role::Subscriber);
         self.stop_running(name).await;
         self.node.database_or_attach(name.to_owned(), configuration).await?
             .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the replica"))?;
@@ -376,7 +394,7 @@ impl NodeAgent {
 
         if boundary == 0 || self.trimmed.lock().get(id).is_some_and(|trimmed| *trimmed >= boundary - 1) { return; }
         let Ok(members) = self.members().await else { return };
-        let Ok(servers) = Self::servers(&record, &members) else { return };
+        let Ok(servers) = ensemble_servers(&record, &members) else { return };
         let stream = rtdb_logkeeper::StreamConfig { write_quorum: crate::deployment::write_quorum(servers.len()), servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 };
         if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(boundary - 1)).await.is_ok() { self.trimmed.lock().insert(id.to_owned(), boundary - 1); }
     }
@@ -403,7 +421,7 @@ impl NodeAgent {
         let workers: Vec<&MemberRecord> = members.values().filter(|member| member.pool == rtdb_directory::MemberPool::Compaction && member.is_live(now)).collect();
         let me = self.member();
         let mut wanted = BTreeMap::new();
-        for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Live && effective_holder(record, &members, now).is_some()) {
+        for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Live && record.move_from.is_none() && effective_holder(record, &members, now).is_some()) {
             let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &workers, |member| member.id.as_str());
             if ranked.first().is_some_and(|first| first.id == me) { wanted.insert(record.name.clone(), record.clone()); }
         }
@@ -419,7 +437,7 @@ impl NodeAgent {
             if self.subscriptions.lock().contains_key(&name) { continue; }
             let turn = self.turn(&name);
             let _turn = turn.lock().await;
-            let Ok(servers) = Self::servers(&record, &members) else { continue };
+            let Ok(servers) = ensemble_servers(&record, &members) else { continue };
             let configuration = database_config(&record, servers, &self.options.storage, Role::Compactor);
             if let Ok(Some(_)) = self.node.database_or_attach(name.clone(), configuration).await {
                 self.subscriptions.lock().insert(name, LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor, fragments: false });

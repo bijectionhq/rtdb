@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMove, CellMovePhase, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, Request, Response};
-use crate::deployment::{CellStorage, write_quorum};
+use crate::deployment::{CellStorage, ensemble_servers, write_quorum};
 use crate::keys::KeyService;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
@@ -27,11 +27,13 @@ pub async fn create_deployment(directory: &dyn Directory, name: &str, org: &str,
 async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
     let now = now_ms();
     let logkeepers: Vec<MemberRecord> = directory.members().await?.into_iter().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).collect();
-    if logkeepers.len() < replicas {
-        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/too-few-logkeepers", format!("{replicas} logkeepers are needed and {} are live", logkeepers.len())));
+    let mut addresses = std::collections::BTreeSet::new();
+    let selected: Vec<_> = rtdb_affinity::rank(&record.storage_identity(), &logkeepers, |member| member.id.as_str())
+        .into_iter().filter(|member| addresses.insert(member.address.as_str())).take(replicas).map(|member| member.id.clone()).collect();
+    if selected.len() < replicas {
+        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/too-few-logkeepers", format!("{replicas} logkeeper addresses are needed and {} are live", selected.len())));
     }
-    let ranked = rtdb_affinity::rank(&record.storage_identity(), &logkeepers, |member| member.id.as_str());
-    Ok(ranked.into_iter().take(replicas).map(|member| member.id.clone()).collect())
+    Ok(selected)
 }
 
 async fn members(directory: &dyn Directory) -> Result<BTreeMap<MemberId, MemberRecord>> {
@@ -51,6 +53,13 @@ async fn update(directory: &dyn Directory, name: &str, change: impl Fn(&mut Depl
         if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await? { return Ok(stored); }
     }
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{name} kept changing while being updated")))
+}
+
+async fn replica_servers(directory: &dyn Directory, record: &DeploymentRecord) -> Result<Vec<String>> {
+    match &record.move_from {
+        Some(previous) => Ok(previous.clone()),
+        None => ensemble_servers(record, &members(directory).await?),
+    }
 }
 
 fn control_address(members: &BTreeMap<MemberId, MemberRecord>, member: &MemberId) -> Result<String> {
@@ -171,8 +180,7 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
     if now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), checkpoint.block).await? >= grace.as_millis() as i64 {
         return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace")));
     }
-    let members = members(directory).await?;
-    let servers: Vec<String> = source.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+    let servers = replica_servers(directory, &source).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
     let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?, &keys.existing(&source.id)?, &stream.stream)?;
     let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
@@ -193,11 +201,7 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: 
         // The first holder claims the next epoch and seals the fork's tail.
         child.epoch = 1;
         crate::logs::renumber_into(&mut tail, rtdb_types::StorageEpoch(child.log_epoch))?;
-        let members = members(directory).await?;
-        let servers: Vec<String> = child.ensemble.iter().map(|id| {
-            members.get(id).map(|member| member.address.clone())
-                .ok_or_else(|| Anomaly::fault("rtdb.multi/unknown-logkeeper", format!("Logkeeper {id} is not a member")))
-        }).collect::<Result<_>>()?;
+        let servers = replica_servers(directory, &child).await?;
         Some(StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes })
     };
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
@@ -290,65 +294,177 @@ pub async fn create_in_cells(map: &dyn crate::cells::CellMap, cells: &[CellHandl
 
 fn crate_exists(name: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/exists", format!("A deployment named {name} exists in some cell")) }
 
-/// Moves a deployment to another cell (`BeginCellMove`, `MoveCutover`): the source fences it and seals its stream, its objects and key are copied, the target records it with the source's logkeepers to move from, the cell map flips, and the source keeps a tombstone that its gateway forwards.
-/// The target's first holder recovers the unflushed tail from the source's logkeepers and moves it onto its own.
+/// Moves a deployment to another cell (`BeginCellMove`, `MoveCutover`).
+/// Retrying with the same cells resumes after a durable cutover point or prepares a fresh copy at an isolated prefix.
 pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, to: &CellHandle<'_>, name: &str, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    if from.name == to.name || map.cell_of(name).await?.as_deref() != Some(from.name) {
+    let placement = map.cell_of(name).await?;
+    if from.name == to.name || placement.is_none() {
         return Err(Anomaly::incorrect("rtdb.multi/move-source", format!("{name} must be placed in {} before it can be moved to a different cell", from.name)));
     }
     let current = record(from.directory, name).await?;
-    if current.lifecycle != Lifecycle::Live {
-        return Err(Anomaly::incorrect("rtdb.multi/not-live", format!("{name} is not live")));
+    let existing = match (current.lifecycle, current.cell_move.as_ref()) {
+        (Lifecycle::Live, None) if placement.as_deref() == Some(from.name) => None,
+        (Lifecycle::Moving, Some(existing)) if existing.destination == to.name => Some(existing),
+        (Lifecycle::Deleted, Some(existing)) if existing.destination == to.name
+            && current.moved_at_ms.is_some() && matches!(existing.phase, CellMovePhase::Ready { .. }) => Some(existing),
+        _ => return Err(move_conflict(name, "the source cannot move to this destination")),
+    };
+    let ready = existing.filter(|existing| matches!(existing.phase, CellMovePhase::Ready { .. }));
+    let generation = ready.map_or_else(uuid::Uuid::new_v4, |ready| ready.phase.generation());
+    let mut destination = current.clone();
+    destination.storage_generation = Some(generation);
+
+    if ready.is_none() {
+        if placement.as_deref() != Some(from.name) { return Err(move_conflict(name, "the source has no prepared destination")); }
+        if to.directory.deployment_by_name(name).await?.is_some() || to.directory.deployment(&current.id).await?.is_some() {
+            return Err(crate_exists(name));
+        }
+        choose_ensemble(to.directory, &current, current.ensemble.len()).await?;
     }
-    if to.directory.deployment_by_name(name).await?.is_some() || to.directory.deployment(&current.id).await?.is_some() {
-        return Err(crate_exists(name));
-    }
-    choose_ensemble(to.directory, &current, current.ensemble.len()).await?;
     let (source, target) = tokio::try_join!(
         from.storage.bucket(rtdb_storage::IoRegion::new()),
         to.storage.bucket(rtdb_storage::IoRegion::new()),
     )?;
-    let prefix = rtdb_storage::ObjectKey::new(current.storage_prefix())?;
-    if from.storage.cleanup_contains(to.storage, &prefix)? || to.storage.cleanup_contains(from.storage, &prefix)? {
+    let source_prefix = rtdb_storage::ObjectKey::new(current.storage_prefix())?;
+    let destination_prefix = rtdb_storage::ObjectKey::new(destination.storage_prefix())?;
+    if from.storage.cleanup_contains(to.storage, &source_prefix)? || to.storage.cleanup_contains(from.storage, &destination_prefix)? {
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-storage", "Cell moves require object stores outside each other's deployment cleanup prefixes"));
     }
-    let (source_namespace, target_namespace) = tokio::try_join!(
-        crate::deployment::storage_namespace(source.as_ref()),
-        crate::deployment::storage_namespace(target.as_ref()),
-    )?;
-    if source_namespace == target_namespace {
-        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-storage", "Cell moves require distinct source and destination object stores"));
+    let namespaces = move_namespaces(from, to, source.as_ref(), target.as_ref()).await?;
+    if existing.is_some_and(|existing| existing.namespaces != namespaces) {
+        return Err(move_conflict(name, "the move is bound to different storage or key namespaces"));
     }
-    if from.keys.namespace_id()? == to.keys.namespace_id()? {
-        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-keys", "Cell moves require distinct source and destination key namespaces"));
+    if ready.is_some() {
+        return finish_cell_move(map, from, to, &current).await;
     }
-    let key = from.keys.key(&current.id)?;
+
+    let previous_ensemble = replica_servers(from.directory, &current).await?;
+    let key = if existing.is_some() { from.keys.existing(&current.id)? } else { from.keys.key(&current.id)? };
     to.keys.validate_install(&current.id, &key)?;
-    let fenced = update(from.directory, name, |record| {
-        if record.id != current.id || record.lifecycle != Lifecycle::Live {
-            return Err(Anomaly::incorrect("rtdb.multi/not-live", format!("{name} is no longer the live deployment selected for the move")));
+
+    let mut fencing = current.clone();
+    if fencing.lifecycle == Lifecycle::Live {
+        fencing.lifecycle = Lifecycle::Moving;
+        fencing.epoch += 1;
+        fencing.holder = None;
+        fencing.move_intent = None;
+    }
+    fencing.cell_move = Some(CellMove { destination: to.name.to_owned(), namespaces, phase: CellMovePhase::Preparing { generation } });
+    let fenced = from.directory.replace_deployment(fencing, current.version).await?.applied()
+        .ok_or_else(|| move_conflict(name, "the source changed before preparation started"))?;
+
+    let stream = StreamConfig { write_quorum: write_quorum(previous_ensemble.len()), servers: previous_ensemble.clone(), stream: fenced.stream("replica"), maximum_message_bytes };
+    rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
+    crate::reference::materialize(source.as_ref(), source_prefix.as_str(), target.as_ref(), destination_prefix.as_str()).await?;
+    if let Some(checkpoint) = fenced.checkpoint {
+        crate::reference::verify_block_pack(target.as_ref(), destination_prefix.as_str(), checkpoint.block).await?;
+    }
+    to.keys.install(&fenced.id, key)?;
+    let ensemble = choose_ensemble(to.directory, &fenced, fenced.ensemble.len()).await?;
+
+    let prepared = update(from.directory, name, |record| {
+        if record.id != fenced.id || record.lifecycle != Lifecycle::Moving || record.epoch != fenced.epoch || record.cell_move != fenced.cell_move {
+            return Err(move_conflict(name, "this copy no longer owns preparation"));
         }
-        record.lifecycle = Lifecycle::Moving;
-        record.epoch += 1;
-        record.holder = None;
+        record.cell_move.as_mut().expect("the preparation owns this intent").phase =
+            CellMovePhase::Ready { generation, previous_ensemble: previous_ensemble.clone(), ensemble: ensemble.clone() };
         Ok(())
     }).await?;
-    let members = members(from.directory).await?;
-    let servers: Vec<String> = fenced.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
-    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers: servers.clone(), stream: fenced.stream("replica"), maximum_message_bytes };
-    rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
-    crate::reference::materialize(source.as_ref(), &fenced.storage_prefix(), target.as_ref(), &fenced.storage_prefix()).await?;
-    to.keys.install(&fenced.id, key)?;
-    let mut arrived = fenced.clone();
-    arrived.lifecycle = Lifecycle::Live;
-    arrived.move_intent = None;
-    arrived.activation_crashes = 0;
-    arrived.move_from = Some(servers);
-    arrived.ensemble = choose_ensemble(to.directory, &arrived, fenced.ensemble.len()).await?;
-    let arrived = to.directory.create_deployment(arrived).await?;
-    if !map.assign(name, to.name, Some(from.name)).await? { return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-raced", format!("{name} was not in {} when the move completed", from.name))); }
-    update(from.directory, name, |record| { record.lifecycle = Lifecycle::Deleted; record.moved_at_ms = Some(now_ms()); Ok(()) }).await?;
-    Ok(arrived)
+    finish_cell_move(map, from, to, &prepared).await
+}
+
+async fn move_namespaces(from: &CellHandle<'_>, to: &CellHandle<'_>, source: &dyn rtdb_storage::ObjectStore, target: &dyn rtdb_storage::ObjectStore) -> Result<MoveNamespaces> {
+    let (source_objects, destination_objects) = tokio::try_join!(
+        crate::deployment::storage_namespace(source),
+        crate::deployment::storage_namespace(target),
+    )?;
+    if source_objects == destination_objects {
+        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-storage", "Cell moves require distinct source and destination object stores"));
+    }
+    let source_keys = from.keys.namespace_id()?;
+    let destination_keys = to.keys.namespace_id()?;
+    if source_keys == destination_keys {
+        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-keys", "Cell moves require distinct source and destination key namespaces"));
+    }
+    Ok(MoveNamespaces { source_objects, destination_objects, source_keys, destination_keys })
+}
+
+fn move_conflict(name: &str, reason: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-raced", format!("Cannot move {name}: {reason}"))
+}
+
+async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, to: &CellHandle<'_>, source: &DeploymentRecord) -> Result<DeploymentRecord> {
+    let name = &source.name;
+    let Some(CellMovePhase::Ready { generation, previous_ensemble, ensemble }) = source.cell_move.as_ref().map(|plan| &plan.phase) else {
+        return Err(move_conflict(name, "the destination copy has not been recorded"));
+    };
+    let mut incoming = source.clone();
+    incoming.lifecycle = Lifecycle::Moving;
+    incoming.storage_generation = Some(*generation);
+    incoming.cell_move = None;
+    incoming.moved_at_ms = None;
+    incoming.move_intent = None;
+    incoming.activation_crashes = 0;
+    incoming.move_from = Some(previous_ensemble.clone());
+    incoming.ensemble = ensemble.clone();
+    let incoming_prefix = incoming.storage_prefix();
+    let matches_destination = |record: &DeploymentRecord| {
+        record.id == incoming.id && record.log_epoch == incoming.log_epoch && record.storage_prefix() == incoming_prefix
+            && record.epoch >= incoming.epoch
+    };
+    let waiting_for_cutover = |record: &DeploymentRecord| record.lifecycle == Lifecycle::Moving && record.cell_move.is_none();
+    let valid_staged = |record: &DeploymentRecord| {
+        record.epoch == incoming.epoch && record.holder.is_none() && record.checkpoint == incoming.checkpoint
+            && record.ensemble == incoming.ensemble && record.move_from == incoming.move_from
+    };
+    let destination = match to.directory.deployment_by_name(name).await? {
+        Some(found) => found,
+        None if source.lifecycle == Lifecycle::Moving => {
+            match to.directory.create_deployment(incoming.clone()).await {
+                Ok(stored) => stored,
+                Err(error) => to.directory.deployment_by_name(name).await?.ok_or(error)?,
+            }
+        }
+        None => return Err(move_conflict(name, "the completed move has no destination record")),
+    };
+    if !matches_destination(&destination) || waiting_for_cutover(&destination) && !valid_staged(&destination) {
+        return Err(move_conflict(name, "the destination record disagrees with its prepared state"));
+    }
+
+    if map.cell_of(name).await?.as_deref() == Some(from.name) {
+        if !waiting_for_cutover(&destination) { return Err(move_conflict(name, "the destination is already serving")); }
+        map.assign(name, to.name, Some(from.name)).await?;
+    }
+    let placement = map.cell_of(name).await?;
+    if placement.as_deref() != Some(to.name)
+        && (waiting_for_cutover(&destination) || placement.is_none() || placement.as_deref() == Some(from.name))
+    {
+        return Err(move_conflict(name, "placement did not switch to the destination"));
+    }
+    if source.lifecycle == Lifecycle::Moving {
+        update(from.directory, name, |record| {
+            if record.id != source.id || record.cell_move != source.cell_move {
+                return Err(move_conflict(name, "the source lost its cutover record"));
+            }
+            if record.lifecycle == Lifecycle::Moving {
+                record.lifecycle = Lifecycle::Deleted;
+                record.moved_at_ms = Some(now_ms());
+            }
+            Ok(())
+        }).await?;
+    }
+    let destination = if waiting_for_cutover(&destination) {
+        update(to.directory, name, |record| {
+            if !matches_destination(record) { return Err(move_conflict(name, "the destination changed before publication")); }
+            if waiting_for_cutover(record) {
+                if !valid_staged(record) { return Err(move_conflict(name, "the destination lost its staged state")); }
+                record.lifecycle = Lifecycle::Live;
+            }
+            Ok(())
+        }).await?
+    } else { destination };
+
+    Ok(destination)
 }
 
 /// What a deletion did, kept as its record.
@@ -370,8 +486,7 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
             Lifecycle::Deleted => Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} is already deleted"))),
         }
     }).await?;
-    let members = members(directory).await?;
-    let servers: Vec<String> = fenced.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+    let servers = replica_servers(directory, &fenced).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
     let last = rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
     if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
@@ -411,8 +526,7 @@ pub struct AuditReport { pub records: usize, pub transactions: usize, pub highes
 pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<AuditReport> {
     use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
     let current = record(directory, name).await?;
-    let members = members(directory).await?;
-    let servers: Vec<String> = current.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+    let servers = replica_servers(directory, &current).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
     let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
     let log = crate::logs::SealedLog::new(reader, &keys.key(&current.id)?, &current.stream("replica"))?;

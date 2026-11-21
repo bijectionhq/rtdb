@@ -13,7 +13,7 @@ use rtdb_storage::log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRange, Lo
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_storage::{Error, Result};
 use rtdb_types::{Anomaly, Timestamp};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -82,6 +82,9 @@ struct Reader {
 fn validate(config: &StreamConfig) -> rtdb_types::Result<()> {
     if config.servers.is_empty() || config.stream.is_empty() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a stream needs a name and at least one server"));
+    }
+    if config.servers.iter().collect::<BTreeSet<_>>().len() != config.servers.len() {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a server address can occupy only one slot per ensemble"));
     }
     if config.write_quorum == 0 || config.write_quorum > config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", format!("write quorum {} must be between 1 and the {} servers", config.write_quorum, config.servers.len())));

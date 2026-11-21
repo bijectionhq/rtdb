@@ -120,6 +120,36 @@ pub enum Lifecycle {
     Deleted,
 }
 
+/// A cross-cell move owned by the source record until cutover is complete.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellMove {
+    pub destination: String,
+    pub namespaces: MoveNamespaces,
+    pub phase: CellMovePhase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveNamespaces {
+    pub source_objects: uuid::Uuid,
+    pub destination_objects: uuid::Uuid,
+    pub source_keys: [u8; 32],
+    pub destination_keys: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CellMovePhase {
+    Preparing { generation: uuid::Uuid },
+    Ready { generation: uuid::Uuid, previous_ensemble: Vec<String>, ensemble: Vec<MemberId> },
+}
+
+impl CellMovePhase {
+    pub fn generation(&self) -> uuid::Uuid {
+        match self {
+            Self::Preparing { generation } | Self::Ready { generation, .. } => *generation,
+        }
+    }
+}
+
 /// One deployment, as the directory records it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentRecord {
@@ -163,6 +193,11 @@ pub struct DeploymentRecord {
     /// When a deployment that moved to another cell left this one: the tombstone's objects here are erased once the reaper's grace has passed since.
     #[serde(default)]
     pub moved_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_move: Option<CellMove>,
+    /// Each attempted copy uses a different prefix, so a superseded copier can never modify a live destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_generation: Option<uuid::Uuid>,
     pub version: Version,
 }
 
@@ -181,7 +216,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_move: None, storage_generation: None, version: 0 }
     }
 
     pub fn can_fork(&self) -> bool {
@@ -194,7 +229,11 @@ impl DeploymentRecord {
     /// The only prefix this deployment's objects may live under.
     /// The leading hash spreads deployments over the object store's request partitions.
     pub fn storage_prefix(&self) -> String {
-        format!("{:04x}/{}/{}/{}/{}", fnv16(self.id.as_bytes()), self.org, self.lineage, self.id, self.incarnation)
+        let store = self.storage_generation.map_or_else(
+            || self.incarnation.to_string(),
+            |generation| format!("{}-{}", self.incarnation, generation.simple()),
+        );
+        format!("{:04x}/{}/{}/{}/{store}", fnv16(self.id.as_bytes()), self.org, self.lineage, self.id)
     }
 
     /// The name of one of this deployment's log streams on its ensemble.

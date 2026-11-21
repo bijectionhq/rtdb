@@ -133,3 +133,16 @@ async fn a_cancelled_log_refuses_appends_and_reads() {
     assert!(matches!(log.enqueue(Bytes::from_static(b"late"), Timestamp(2)).await, Err(Error::Closed(_))));
     assert!(matches!(log.latest(), Err(Error::Closed(_))));
 }
+
+#[tokio::test]
+async fn one_logkeeper_address_cannot_fill_multiple_quorum_slots() {
+    let config = rtdb_logkeeper::StreamConfig {
+        servers: vec!["127.0.0.1:9990".into(), "127.0.0.1:9990".into(), "127.0.0.1:9991".into()],
+        stream: "duplicate-replica-address".into(),
+        write_quorum: 2,
+        maximum_message_bytes: 1 << 20,
+    };
+    let error = rtdb_logkeeper::open_writer(config, 1, tokio_util::sync::CancellationToken::new())
+        .await.err().expect("a duplicate address is refused before opening the ensemble");
+    assert_eq!(error.code, "rtdb.logkeeper/invalid-stream-config");
+}

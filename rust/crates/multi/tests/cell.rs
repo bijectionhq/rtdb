@@ -405,6 +405,137 @@ async fn a_deposed_holder_refuses_a_linearizable_read_instead_of_serving_it_stal
     cell.stop().await;
 }
 
+#[derive(Default)]
+struct InterruptedCutover {
+    map: rtdb_multi::cells::MemoryCellMap,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl rtdb_multi::cells::CellMap for InterruptedCutover {
+    async fn register_cell(&self, cell: &str, gateway: &str) -> rtdb_types::Result<()> { self.map.register_cell(cell, gateway).await }
+    async fn gateway(&self, cell: &str) -> rtdb_types::Result<Option<String>> { self.map.gateway(cell).await }
+    async fn cells(&self) -> rtdb_types::Result<std::collections::BTreeMap<String, String>> { self.map.cells().await }
+    async fn cell_of(&self, deployment: &str) -> rtdb_types::Result<Option<String>> { self.map.cell_of(deployment).await }
+
+    async fn assign(&self, deployment: &str, cell: &str, expected: Option<&str>) -> rtdb_types::Result<bool> {
+        if expected.is_none() { return self.map.assign(deployment, cell, expected).await; }
+        let interrupted = || rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "test/cutover-interrupted", "The cell-map acknowledgement was lost");
+        match self.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+            0 => Err(interrupted()),
+            1 => {
+                assert!(self.map.assign(deployment, cell, expected).await?);
+                Err(interrupted())
+            }
+            _ => self.map.assign(deployment, cell, expected).await,
+        }
+    }
+}
+
+struct InterruptedInstall {
+    keys: rtdb_multi::keys::LocalKeyService,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl KeyService for InterruptedInstall {
+    fn namespace_id(&self) -> rtdb_types::Result<[u8; 32]> { self.keys.namespace_id() }
+    fn key(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.key(deployment) }
+    fn existing(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.existing(deployment) }
+    fn destroy(&self, deployment: &str) -> rtdb_types::Result<()> { self.keys.destroy(deployment) }
+    fn validate_install(&self, deployment: &str, key: &[u8; 32]) -> rtdb_types::Result<()> { self.keys.validate_install(deployment, key) }
+
+    fn install(&self, deployment: &str, key: [u8; 32]) -> rtdb_types::Result<()> {
+        if !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "test/key-install-interrupted", "The destination key service was unavailable"));
+        }
+        self.keys.install(deployment, key)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cell_move_resumes_when_preparation_or_the_placement_switch_is_interrupted() {
+    use rtdb_directory::{CellMovePhase, Lifecycle};
+    use rtdb_multi::cells::CellMap;
+
+    let map = std::sync::Arc::new(InterruptedCutover::default());
+    let east = Cell::start_in("east", map.clone(), 1).await;
+    let mut west = Cell::start_in("west", map.clone(), 2).await;
+    let (east_storage, west_storage) = (east.storage(), west.storage());
+    let east_keys = east.keys();
+    let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
+    let from = admin::CellHandle { name: "east", directory: east.directory.as_ref(), storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: west.directory.as_ref(), storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
+    let client = east.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    east.node(east.holder("shop").await.unwrap()).agent.flush("shop").await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    drop(client);
+
+    let move_shop = || admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20);
+    assert_eq!(move_shop().await.unwrap_err().code, "test/key-install-interrupted");
+    let incomplete = east.directory.deployment(&original.id).await.unwrap().unwrap();
+    assert_eq!(incomplete.lifecycle, Lifecycle::Moving);
+    assert!(west.directory.deployment(&original.id).await.unwrap().is_none());
+    let CellMovePhase::Preparing { generation: abandoned } = incomplete.cell_move.unwrap().phase else { panic!("the incomplete copy was published") };
+
+    assert_eq!(move_shop().await.unwrap_err().code, "test/cutover-interrupted");
+    assert_eq!(map.cell_of("shop").await.unwrap().as_deref(), Some("east"));
+    let source = east.directory.deployment(&original.id).await.unwrap().unwrap();
+    assert_eq!(source.lifecycle, Lifecycle::Moving);
+    let CellMovePhase::Ready { generation, .. } = source.cell_move.unwrap().phase else { panic!("the complete copy was not recorded") };
+    assert_ne!(generation, abandoned);
+    assert_eq!(source.epoch, incomplete.epoch);
+    let staged = west.directory.deployment(&original.id).await.unwrap().unwrap();
+    assert_eq!(staged.lifecycle, Lifecycle::Moving);
+    assert_eq!(staged.storage_generation, Some(generation));
+
+    assert_eq!(move_shop().await.unwrap_err().code, "test/cutover-interrupted");
+    assert_eq!(map.cell_of("shop").await.unwrap().as_deref(), Some("west"));
+    assert_eq!(west.directory.deployment(&original.id).await.unwrap().unwrap(), staged);
+
+    for logkeeper in std::mem::take(&mut west.logkeepers) { logkeeper.stop().await.unwrap(); }
+    for id in &staged.ensemble {
+        let mut old = west.directory.member(id).await.unwrap().unwrap();
+        old.state = rtdb_directory::MemberState::Dead;
+        let version = old.version;
+        west.directory.replace_member(old, version).await.unwrap().applied().unwrap();
+    }
+    let reused = west.directory.member(&staged.ensemble[0]).await.unwrap().unwrap().address.parse().unwrap();
+    for index in 0..2 {
+        west.logkeepers.push(rtdb_multi::process::start_logkeeper(west.directory.clone(), rtdb_multi::process::LogkeeperSettings {
+            listen: if index == 0 { reused } else { "127.0.0.1:0".parse().unwrap() },
+            data_dir: west.data.path().join(format!("replacement-{index}")),
+            fsync: false,
+            cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
+            availability_zone: format!("zone-{index}"),
+            lease: lease(),
+        }).await.unwrap());
+    }
+
+    let arrived = move_shop().await.unwrap();
+    assert_eq!(arrived.lifecycle, Lifecycle::Live);
+    assert_eq!(arrived.storage_generation, Some(generation));
+    let tombstone = east.directory.deployment(&original.id).await.unwrap().unwrap();
+    assert_eq!(tombstone.lifecycle, Lifecycle::Deleted);
+    move_shop().await.unwrap();
+    assert_eq!(east.directory.deployment(&original.id).await.unwrap().unwrap(), tombstone);
+
+    let reader = east.connect("shop").await;
+    assert_eq!(values(&reader, "SELECT total FROM orders").await, ["10", "20"]);
+    let adopted = west.directory.deployment(&original.id).await.unwrap().unwrap();
+    assert!(adopted.move_from.is_none());
+    assert_eq!(adopted.ensemble.len(), staged.ensemble.len());
+    assert_eq!(adopted.ensemble.iter().filter(|member| !staged.ensemble.contains(member)).count(), 2);
+    let mut addresses = std::collections::BTreeSet::new();
+    for member in &adopted.ensemble {
+        assert!(addresses.insert(west.directory.member(member).await.unwrap().unwrap().address));
+    }
+    drop(reader);
+    east.stop().await;
+    west.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_forwards() {
     let map: std::sync::Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::MemoryCellMap::new();

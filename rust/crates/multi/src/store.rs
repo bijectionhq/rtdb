@@ -294,6 +294,7 @@ pub async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Du
 pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
     use crate::reference::{Base, physical_objects};
     let mut reaped = Reaped::default();
+    if record.lifecycle == Lifecycle::Moving { return Ok(reaped); }
     let threshold = now_ms - grace.as_millis() as i64;
     for store in crate::reference::stores(bucket, &record.storage_prefix()).await? {
         let mut base = Base::load(bucket, &store).await?;

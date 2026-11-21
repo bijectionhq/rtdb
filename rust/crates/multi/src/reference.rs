@@ -204,6 +204,12 @@ async fn block_pack_location(bucket: &dyn ObjectStore, parent: &str, block: i64)
     Err(Anomaly::incorrect("rtdb.multi/no-such-block", format!("Block {block} has no pack in the deployment's store")))
 }
 
+pub(crate) async fn verify_block_pack(bucket: &dyn ObjectStore, prefix: &str, block: i64) -> Result<()> {
+    let location = block_pack_location(bucket, prefix, block).await?;
+    crate::packing::read_index(bucket, &key(&location)?).await?;
+    Ok(())
+}
+
 /// When `block`'s pack was written in `parent`'s stores, in milliseconds since the epoch, as its index records.
 pub async fn written_at_ms(bucket: &dyn ObjectStore, parent: &str, block: i64) -> Result<i64> {
     let location = block_pack_location(bucket, parent, block).await?;
@@ -263,10 +269,10 @@ pub async fn erase_deployment(bucket: &dyn ObjectStore, prefix: &str, others: &[
     Ok(bucket.list(Some(&key(prefix)?)).await.map_err(storage)?.is_empty())
 }
 
-async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
+async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> rtdb_storage::Result<()> {
     let target = key(to)?;
-    match to_bucket.head(&target).await { Ok(_) => return Ok(()), Err(Error::MissingObject(_)) => {}, Err(error) => return Err(error.into()) }
-    to_bucket.put(&target, from_bucket.get(&key(from)?).await.map_err(storage)?).await.map_err(storage)
+    match to_bucket.head(&target).await { Ok(_) => return Ok(()), Err(Error::MissingObject(_)) => {}, Err(error) => return Err(error) }
+    to_bucket.put(&target, from_bucket.get(&key(from)?).await?).await
 }
 
 /// Copies a deployment's stores from `from` in one cell's bucket to `to` in another's, resolving every reference into an object of its own.
@@ -276,7 +282,20 @@ pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &
         let target = format!("{to}/{version}");
         for name in physical_objects(from_bucket, &store).await? { copy_in(from_bucket, &format!("{store}/{name}"), to_bucket, &format!("{target}/{name}")).await?; }
         for (name, owner) in Base::load(from_bucket, &store).await?.objects {
-            if holds(from_bucket, &owner, &name).await? { copy_in(from_bucket, &format!("{owner}/{name}"), to_bucket, &format!("{target}/{name}")).await?; }
+            let own = format!("{store}/{name}");
+            let destination = format!("{target}/{name}");
+            match copy_in(from_bucket, &own, to_bucket, &destination).await {
+                Err(Error::MissingObject(_)) => match copy_in(from_bucket, &format!("{owner}/{name}"), to_bucket, &destination).await {
+                    // Erasure can transfer ownership between the two reads.
+                    Err(Error::MissingObject(_)) => match copy_in(from_bucket, &own, to_bucket, &destination).await {
+                        // A processed release record can already have been removed from both locations.
+                        Err(Error::MissingObject(_)) if crate::store::garbage_released_at(&name).is_some() => {}
+                        result => result?,
+                    },
+                    result => result?,
+                },
+                result => result?,
+            }
         }
     }
     Ok(())
@@ -288,6 +307,55 @@ mod tests {
 
     fn bucket() -> Bucket { Arc::new(rtdb_storage::MemoryStore::default()) }
     async fn put(bucket: &Bucket, name: &str, bytes: &[u8]) { bucket.put(&key(name).unwrap(), Bytes::copy_from_slice(bytes)).await.unwrap(); }
+
+    struct TransferringStore {
+        inner: Bucket,
+        original: ObjectKey,
+        copy: ObjectKey,
+        transferred: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ObjectStore for TransferringStore {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+            if key == &self.original && !self.transferred.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.inner.copy(&self.original, &self.copy).await?;
+                self.inner.delete(&self.original).await?;
+            }
+            self.inner.get(key).await
+        }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    #[tokio::test]
+    async fn a_cell_copy_recovers_a_reference_that_changes_owner_during_the_read() {
+        let (here, there) = (bucket(), bucket());
+        put(&here, "parent/v06/row", b"parent").await;
+        fork(here.as_ref(), "parent", "child", None).await.unwrap();
+        let transferring = TransferringStore {
+            inner: here.clone(),
+            original: key("parent/v06/row").unwrap(),
+            copy: key("child/v06/row").unwrap(),
+            transferred: Default::default(),
+        };
+        materialize(&transferring, "child", there.as_ref(), "arrived").await.unwrap();
+        assert_eq!(there.get(&key("arrived/v06/row").unwrap()).await.unwrap().as_ref(), b"parent");
+        assert!(!holds(here.as_ref(), "parent/v06", "row").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_cell_copy_fails_when_an_inherited_object_is_missing_at_both_owners() {
+        let (here, there) = (bucket(), bucket());
+        put(&here, "parent/v06/row", b"parent").await;
+        fork(here.as_ref(), "parent", "child", None).await.unwrap();
+        here.delete(&key("parent/v06/row").unwrap()).await.unwrap();
+        assert!(materialize(here.as_ref(), "child", there.as_ref(), "arrived").await.is_err());
+    }
 
     #[tokio::test]
     async fn a_fork_moved_to_another_cell_owns_everything_it_referenced() {

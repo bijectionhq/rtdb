@@ -371,6 +371,7 @@ contract LogService {
     -- What a cell's log servers supply, per deployment.
     -- The log servers are logkeepers, built for this contract; the loglet kind is recorded per loglet, so another kind can back a deployment from its next epoch.
     -- A deployment's log is a dense sequence of records addressed by Lsn, carried by a chain of loglets.
+    -- Each server address contributes at most one acknowledgement to a loglet's quorum.
     append: (deployment: DeploymentId, epoch: Epoch, lsn: Lsn, records: List<LogRecord>) -> Lsn
     seal: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> SealReply
     check: (deployment: DeploymentId, epoch: Epoch) -> Epoch
@@ -1733,26 +1734,35 @@ rule UpgradeFormatLazily {
 rule BeginCellMove {
     -- The source and target have distinct object and key namespaces.
     -- Each cell's object namespace lies outside the other's cleanup prefix for the deployment.
+    -- An incomplete copy can be retried at a fresh destination prefix.
+    -- Only the attempt recorded as prepared can be published.
     when: CellMoveRequested(record, target_cell)
 
     requires: record.lifecycle = live
 
     ensures:
-        Directory.cas(record.id, record.epoch, change: { lifecycle: moving })
+        Directory.cas(record.id, record.epoch, change: {
+            epoch: Epoch(value: record.epoch.value + 1),
+            holder: null,
+            lifecycle: moving
+        })
         ForkedInto(target_cell, from: record, basis: CurrentBasis(record))
 }
 
 rule MoveCutover {
-    -- The source fences the deployment, the target replays the remaining tail, the cell map flips, and the source keeps a forwarding tombstone.
+    -- The destination accepts placements only after the cell map switches to it.
+    -- The destination's first holder imports the sealed source log before it can serve.
+    -- A retry after the switch finishes publication and leaves the source tombstone.
     -- After the grace period, the source removes the deployment's remaining objects and destroys its copy of the key once the source prefix is empty.
     -- Forks in the source cell retain access to every object they share.
-    when: TargetCaughtUp(record, target_cell)
+    when: DestinationPrepared(record, target_cell)
+
+    requires: record.lifecycle = moving
 
     ensures:
-        Directory.cas(record.id, record.epoch, change: { epoch: Epoch(value: record.epoch.value + 1), holder: null })
-        RemainingTailCopied(record, to: target_cell)
         CellMapRowWritten(deployment: record.id, cell: target_cell)
-        Directory.cas(record.id, Epoch(value: record.epoch.value + 1), change: { lifecycle: deleted })
+        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted })
+        DestinationOpenedForPlacement(record, target_cell)
 }
 
 ------------------------------------------------------------
