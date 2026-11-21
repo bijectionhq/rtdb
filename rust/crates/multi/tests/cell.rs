@@ -531,6 +531,7 @@ async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
     fn position(cell: &Cell, id: &rtdb_directory::MemberId) -> Option<usize> { cell.logkeepers.iter().position(|logkeeper| logkeeper.lease.id() == *id) }
     let first_dead = position(&cell, &record.ensemble[0]).unwrap();
     let dead_id = record.ensemble[0].clone();
+    let retired = cell.logkeepers[first_dead].address.to_string();
     cell.logkeepers.remove(first_dead).stop().await.unwrap();
     tokio::time::sleep(Duration::from_millis(1700)).await;
     let holder = cell.holder("shop").await.unwrap();
@@ -541,6 +542,7 @@ async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
     let moved = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert!(!moved.ensemble.contains(&dead_id), "the dead logkeeper left the ensemble: {:?}", moved.ensemble);
     assert_eq!(moved.ensemble.len(), 3);
+    assert!(moved.log_copy_servers.contains(&retired));
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
 
     let second = record.ensemble.iter().skip(1).find_map(|id| position(&cell, id)).unwrap();
@@ -548,6 +550,32 @@ async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
     client.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20", "30"], "a second original logkeeper's death leaves a quorum of the new ensemble");
     drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deletion_drops_a_recorded_copy_outside_the_current_ensemble() {
+    use rtdb_multi::logs::{DirectoryRecorder, EnsembleRecorder};
+    use rtdb_storage::log::{Log, LogOffset};
+
+    let mut cell = Cell::start_durable(1).await;
+    cell.add_logkeeper().await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let held = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let extra = cell.logkeepers.iter().find(|keeper| !held.ensemble.contains(&keeper.lease.id())).unwrap().address.to_string();
+    let stream = rtdb_logkeeper::StreamConfig { servers: vec![extra], stream: held.stream("replica"), write_quorum: 1, maximum_message_bytes: 4 << 20 };
+    let recorder = DirectoryRecorder { directory: cell.directory.clone() };
+    recorder.reserve_copy(&held.id, held.epoch, &stream.servers).await.unwrap();
+    let speculative = rtdb_logkeeper::open_writer(stream.clone(), held.epoch, Default::default()).await.unwrap();
+    speculative.enqueue(bytes::Bytes::from_static(b"copied record"), rtdb_types::Timestamp(0)).await.unwrap().durable().await.unwrap();
+    assert_eq!(speculative.read_range(LogOffset(0), LogOffset(1)).await.unwrap().len(), 1);
+    drop(speculative);
+
+    let receipt = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
+    assert!(rtdb_logkeeper::open_writer(stream, receipt.facts.epoch + 1, Default::default()).await.is_err());
     cell.stop().await;
 }
 

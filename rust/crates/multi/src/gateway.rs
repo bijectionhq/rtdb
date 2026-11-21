@@ -126,7 +126,7 @@ struct GatewayRouter { directory: Arc<dyn Directory>, name: String, read_only: b
 
 impl GatewayRouter {
     async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
-        control::retry_pressure(self.options.control_timeout, || {
+        control::retry_activation(self.options.control_timeout, || {
             route(&self.directory, &self.name, self.read_only, self.snapshot, &self.options)
         }).await
     }
@@ -167,7 +167,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snap
         }
     }
     let mut last = None;
-    let mut pressure = None;
+    let mut retryable = None;
     let mut refused = None;
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
@@ -177,8 +177,8 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snap
                 let control = members.get(&MemberId(holder)).and_then(|member| member.control_address.clone());
                 return Ok((connect(&address).await?, control, record.epoch, record.id.clone()));
             }
-            Ok(Response::Refused { code, message }) if code == control::NODE_UNDER_PRESSURE => {
-                pressure = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
+            Ok(Response::Refused { code, message }) if control::retryable_activation(&code) => {
+                retryable = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
             }
             Ok(Response::Refused { code, message }) if code == control::NOT_CLAIMABLE => {
                 last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
@@ -188,7 +188,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, read_only: bool, snap
             Err(error) => last = Some(error),
         }
     }
-    Err(refused.or(pressure).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
+    Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
 }
 
 /// The nodes that may serve a snapshot read: every node that may take a placement, in the deployment's affinity order, the holder last, so snapshots spare the writer.

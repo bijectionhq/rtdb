@@ -14,12 +14,15 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) const NODE_UNDER_PRESSURE: &str = "rtdb.multi/node-under-pressure";
 pub(crate) const NOT_CLAIMABLE: &str = "rtdb.multi/not-claimable";
+pub(crate) const CLAIM_CONTENDED: &str = "rtdb.multi/claim-contended";
 
-pub(crate) async fn retry_pressure<T, F: Future<Output = Result<T>>>(window: Duration, mut attempt: impl FnMut() -> F) -> Result<T> {
+pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED) }
+
+pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: Duration, mut attempt: impl FnMut() -> F) -> Result<T> {
     let latest_start = tokio::time::Instant::now() + window;
     loop {
         let result = attempt().await;
-        if !matches!(&result, Err(error) if error.code == NODE_UNDER_PRESSURE) { return result; }
+        if !matches!(&result, Err(error) if retryable_activation(&error.code)) { return result; }
         let retry_at = tokio::time::Instant::now() + Duration::from_millis(25);
         if retry_at >= latest_start { return result; }
         tokio::time::sleep_until(retry_at).await;
@@ -165,14 +168,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn activation_retries_pressure_and_reports_any_other_failure() {
+    async fn activation_retries_pressure_and_contention_and_reports_a_terminal_failure() {
         let mut calls = 0;
-        let result = retry_pressure(Duration::from_secs(1), || {
+        let result = retry_activation(Duration::from_secs(1), || {
             calls += 1;
-            let error = if calls <= 2 {
-                Anomaly::new(AnomalyCategory::Unavailable, NODE_UNDER_PRESSURE, "reclaiming memory")
-            } else {
-                Anomaly::incorrect("test/deployment-gone", "the deployment was deleted")
+            let error = match calls {
+                1 => Anomaly::new(AnomalyCategory::Unavailable, NODE_UNDER_PRESSURE, "reclaiming memory"),
+                2 => Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, "another directory update won"),
+                _ => Anomaly::incorrect("test/deployment-gone", "the deployment was deleted"),
             };
             std::future::ready(Err::<(), _>(error))
         }).await;
@@ -188,7 +191,7 @@ mod tests {
             let (started, finish) = (started.clone(), finish.clone());
             tokio::spawn(async move {
                 let mut calls = 0;
-                retry_pressure(Duration::from_millis(500), || {
+                retry_activation(Duration::from_millis(500), || {
                     calls += 1;
                     let (calls, started, finish) = (calls, started.clone(), finish.clone());
                     async move {

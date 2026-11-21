@@ -237,6 +237,9 @@ pub struct DeploymentRecord {
     /// The logkeepers of the cell a deployment moved from, until its first holder here has moved the stream onto this cell's ensemble.
     #[serde(default)]
     pub move_from: Option<Vec<String>>,
+    /// Endpoints a stream copy may have reached, including incomplete transfers and retired ensembles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_copy_servers: Vec<String>,
     /// Whether its holder confirms its leadership with the logkeepers before serving each query.
     #[serde(default)]
     pub linearizable_reads: bool,
@@ -275,7 +278,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {

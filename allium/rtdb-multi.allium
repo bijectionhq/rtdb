@@ -443,6 +443,8 @@ contract LogService {
         -- Acknowledged and uncommitted entries are both released.
         -- A dropped stream remains closed after restart and journal compaction.
         -- An acknowledgement from every addressed replica is required before deletion advances.
+        -- A copy records its source and destination endpoints before transferring bytes.
+        -- Deletion addresses both the current ensemble and the recorded endpoints of earlier copy attempts.
 
     @invariant DurabilityIsConfiguredNotHoped
         -- Expected of the operator: each ensemble spans three availability zones, and a server acknowledges only after fsync.
@@ -1475,6 +1477,7 @@ rule CountActivationCrash {
 
 rule IntendMove {
     -- A reservation expires, and a refused activation releases its reservation.
+    -- Temporary memory pressure or directory contention can be retried while the reservation remains active.
     -- A handoff park names the deployment, holding epoch, and current reservation.
     when: MoveChosen(record, target)
 

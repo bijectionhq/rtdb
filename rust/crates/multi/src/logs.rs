@@ -34,6 +34,8 @@ pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std:
 /// Records a completed ensemble move, as the holder that made it at `epoch`, before anything is appended on the new ensemble.
 #[async_trait]
 pub trait EnsembleRecorder: Send + Sync {
+    /// Records every endpoint a copy can touch before any bytes move.
+    async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()>;
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
 }
 
@@ -47,6 +49,24 @@ pub struct DirectoryRecorder { pub directory: Arc<dyn rtdb_directory::Directory>
 
 #[async_trait]
 impl EnsembleRecorder for DirectoryRecorder {
+    async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()> {
+        for _ in 0..8 {
+            let mut record = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
+            if record.epoch != epoch || record.holder.is_none() {
+                return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its log copy was reserved"));
+            }
+            let mut endpoints = record.log_copy_servers.clone();
+            endpoints.extend_from_slice(servers);
+            endpoints.sort_unstable();
+            endpoints.dedup();
+            if endpoints == record.log_copy_servers { return Ok(()); }
+            record.log_copy_servers = endpoints;
+            let version = record.version;
+            if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(record, version).await? { return Ok(()); }
+        }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its log copy was reserved"))
+    }
+
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()> {
         for _ in 0..8 {
             let current = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
@@ -78,6 +98,8 @@ impl LogFactory for LogkeeperLogFactory {
             LogAccess::ReadWrite => {
                 let writer = match &config.previous_servers {
                     Some(previous) => {
+                        let endpoints = previous.iter().chain(&config.servers).cloned().collect::<Vec<_>>();
+                        self.recorder.reserve_copy(&config.deployment, config.epoch, &endpoints).await?;
                         let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0 }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
                         // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
                         self.recorder.record(&config.deployment, config.epoch, config.ensemble.iter().map(|id| rtdb_directory::MemberId(id.clone())).collect()).await?;

@@ -507,6 +507,7 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    The gateway, claim rule, and rebalancer use the same eligibility check for the general and isolation pools.
    Clearing quarantine fences the isolation holder so the next claim returns the deployment to the general pool.
    A planned move reserves a target for a bounded interval and releases the reservation if activation fails.
+   The target can retry temporary memory pressure or directory write contention under the same reservation.
    The source park verifies the holding epoch and reservation, and a delayed target activation requires the reservation at its claim.
    When the source observes at most 64 live rows and 16 replica records since its last adopted boundary, with the intake processed through its latest position, it can park without uploading a block.
    The successor seals the quorum and recovers the durable tail before it confirms leadership.
@@ -588,6 +589,10 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    Prefix erasure rejects overlap with another recorded deployment's prefix, including legacy records with older organisation identifiers.
    A holder binds its deployment to the node's configured namespaces in its first claim, and forks and cell moves carry the binding into their destination records.
    Deletion checks that binding before fencing, and a pristine root may take its first binding in the deletion CAS.
+   Ensemble transfer records the old and intended logkeeper addresses before it starts copying records.
+   Deletion waits for terminal drops from the current ensemble and every address recorded by an earlier transfer attempt.
+   A deployment's retained copy addresses remain in its JSON directory record.
+   Upgrade directory writers before relying on recorded copy history for new ensemble changes.
    An existing deployment without a binding acquires one from a configured holder before forking or moving.
    An older deletion already in progress can adopt the binding when all live nodes publish the same configuration.
    Credential expiry, provider KMS erasure and the second observation are still required for the full proof.

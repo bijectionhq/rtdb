@@ -15,7 +15,7 @@ use rtdb_replication::Role as DriverRole;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch};
 use tokio_util::sync::CancellationToken;
 
-use crate::control::{Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
+use crate::control::{CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, select_logkeepers};
 use crate::lease::MemberLease;
 
@@ -206,7 +206,7 @@ impl NodeAgent {
                 Cas::Conflict(_) => continue,
             }
         }
-        Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/claim-contended", format!("{name} kept changing while being claimed")))
+        Err(Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, format!("{name} kept changing while being claimed")))
     }
 
     async fn open(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Response> {

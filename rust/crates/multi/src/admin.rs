@@ -147,7 +147,7 @@ pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &Mem
         let activation = Request::ActivateForMove { name: name.to_owned(), ticket };
         let reserved_for = Duration::from_millis(reservation.expires_at_ms.saturating_sub(now_ms()).max(0) as u64);
         let retry_window = reserved_for.saturating_sub(CONTROL_TIMEOUT).min(CONTROL_TIMEOUT);
-        match control::retry_pressure(retry_window, || expect(&address, activation.clone(), control)).await? {
+        match control::retry_activation(retry_window, || expect(&address, activation.clone(), control)).await? {
             Response::Held { .. } => Ok(()),
             other => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-failed", format!("The target answered {other:?}"))),
         }
@@ -600,6 +600,9 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
             if !servers.contains(server) { servers.push(server.clone()); }
         }
     }
+    servers.extend(fenced.log_copy_servers.iter().cloned());
+    servers.sort_unstable();
+    servers.dedup();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
     rtdb_logkeeper::drop_stream(&stream, fenced.epoch).await?;
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
