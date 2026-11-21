@@ -1762,6 +1762,10 @@ surface QueryAccess {
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
         -- A projected dense union with compatible children retains its Arrow array when it already matches the result layout.
         -- A compatible projected array can be aligned to the result's nested fields and union legs in Arrow.
+        -- When selected cells need layout alignment before they can share one array, the scan retains their source vectors and positions.
+        -- Reading a selected struct during evaluation preserves which keys its source has.
+        -- Compatible fixed-size lists stay in Arrow through sparse selection and output.
+        -- A sparse selection of compatible in-memory maps also stays in Arrow.
 }
 
 ---- Deferred Specifications

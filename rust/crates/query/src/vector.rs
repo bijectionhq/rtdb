@@ -184,7 +184,7 @@ pub(crate) fn evaluate(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parame
     if !lowerable(expr) { return None; }
     let mut lowering = Lowering { inputs: Inputs { schema, batch, positions: Vec::new(), fields: Vec::new() }, parameters, divisors: Vec::new(), functions: Vec::new() };
     let (lowered, data_type) = lowering.lower(expr)?;
-    let columns: Vec<ArrayRef> = lowering.inputs.positions.iter().map(|position| match &batch.columns[*position] { Column::Arrow { array, .. } => Some(Arc::clone(array)), Column::Values(_) => None }).collect::<Option<_>>()?;
+    let columns: Vec<ArrayRef> = lowering.inputs.positions.iter().map(|position| match &batch.columns[*position] { Column::Arrow { array, .. } => Some(Arc::clone(array)), _ => None }).collect::<Option<_>>()?;
     let input = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(lowering.inputs.fields.clone())), columns,
         &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.len))).ok()?;
     for divisor in &lowering.divisors {

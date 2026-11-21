@@ -1245,18 +1245,21 @@ mod tests {
     }
 
     fn live_table() -> (PartitionState, TableRef, Vec<StoredEvent>) {
+        live_table_with_values((1..=3).map(Value::I64))
+    }
+
+    fn live_table_with_values(values: impl IntoIterator<Item = Value>) -> (PartitionState, TableRef, Vec<StoredEvent>) {
         let state = PartitionState::empty(TrieConfig::new(1, 1).unwrap()).unwrap();
         let table = TableRef::new("public", "docs");
         let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
         let memory = MemoryBudget::new(1 << 20);
         let mut write = TransactionBuffer::new(state.value().snapshot(), key, memory).unwrap();
-        let events = [0x00, 0x40, 0x80].into_iter().enumerate().map(|(index, prefix)| {
-            let value = Value::I64(index as i64 + 1);
+        let events = [0x00, 0x40, 0x80].into_iter().zip(values).enumerate().map(|(index, (prefix, value))| {
             StoredEvent {
                 iid: Iid([prefix; 16]),
                 system_from: key.system_time,
                 valid_time: Interval::ALL,
-                operation: StoredOperation::Put(StructFields::from([("_id".into(), value.clone()), ("v".into(), value)])),
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(index as i64 + 1)), ("v".into(), value)])),
                 recency: None,
             }
         }).collect::<Vec<_>>();
@@ -1487,6 +1490,51 @@ mod tests {
         store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
         (state, table, events, store, metadata_charge)
+    }
+
+    #[tokio::test]
+    async fn cold_sparse_projection_keeps_fixed_size_lists_in_arrow() {
+        let values = (1..=3).map(|n| Value::Struct(StructFields::from([
+            ("set".into(), Value::Set(vec![Value::I64(n)])),
+            ("pair".into(), Value::FixedSizeList(vec![Value::I64(n), Value::I64(-n)])),
+        ]))).collect::<Vec<_>>();
+        let (state, table, events) = live_table_with_values(values.clone());
+        let captured = state.value();
+        let table_entry = captured.table_catalog().entry(&table).unwrap();
+        let trie = TrieKey::l0(captured.live().block_index()).unwrap();
+        let put_fields = captured.live().tables()[&table].column_types().clone();
+        let page = build_event_batch(&events, Some(put_fields), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, false);
+        metadata.write_leaf(&page).unwrap();
+        let (metadata, statistics) = metadata.finish().unwrap();
+        let data = write_file(page.schema().as_ref(), &[page]).unwrap();
+        let addition = CatalogTrie::notification(trie.clone(), data.len() as i64, Some(statistics)).unwrap();
+        let store = Arc::new(MemoryStore::default());
+        store.put(&ObjectKey::new(table_entry.slug.metadata_key(&trie)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+        store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
+        let nascent = CatalogTrie::notification("l01-r20200101-b00".parse().unwrap(), 0, None).unwrap();
+        state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
+        let (mut scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, Arc::new(BufferPool::new(store, 1 << 20)));
+        scan.iids = Some([events[0].iid, events[2].iid].into());
+        let logical = scan.columns[0].data_type.clone();
+        let field = rtdb_columnar::to_field("v", &logical).unwrap();
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+
+        let batch = cursor.next_batch().await.unwrap().unwrap();
+        let selected = &batch.columns[0];
+        assert!(matches!(selected, crate::columnar::Column::Selected(_)));
+        let (result, _scratch) = crate::columnar::relayout_output(selected, &logical, &field, &memory).unwrap().unwrap();
+
+        assert_eq!(result.len(), 2);
+        let structs = result.as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+        assert!(structs.column(0).as_any().is::<arrow_array::ListArray>());
+        assert!(structs.column(1).as_any().is::<arrow_array::FixedSizeListArray>());
+        for (row, expected) in [&values[0], &values[2]].into_iter().enumerate() {
+            assert_eq!(rtdb_columnar::read_value(&field, result.as_ref(), row).unwrap(), *expected);
+        }
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        let counts = cursor.scan_counts().unwrap();
+        assert_eq!((counts.files_used, counts.pages_used, counts.rows_read), (1, 1, 3));
     }
 
     #[tokio::test]

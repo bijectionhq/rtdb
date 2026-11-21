@@ -93,6 +93,10 @@ Spill files are scoped temporary resources with a retained-byte quota.
   Projected columns use Arrow nulls for pages where the field is absent when the other pages share a layout or form a scalar union.
   A dense union with compatible children stays columnar through sparse projection and keeps its Arrow array when it matches the result layout.
   The query cursor also adapts compatible Arrow layouts to the declared result, including mixed unions and newly nullable struct fields.
+  Scan columns that need layout alignment keep source vectors and row positions through identity projection and filtering.
+  Evaluation reads each selected cell under its source layout, so earlier struct versions keep their original keys.
+  The cursor aligns compatible selected layouts and emits sparse fixed-size list selections using Arrow buffers.
+  The same selection works on maps from the live index.
   The buffer pool can retain decoded pages and parsed footers independently of the file's encoded payload.
 * The temporal resolver sees puts, deletes, and erases before a projected document reaches a value predicate.
 * Temporal file selection includes live candidates before dropping persisted files.

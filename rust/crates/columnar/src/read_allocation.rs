@@ -13,15 +13,24 @@ pub fn estimate_read_value_bytes(field: &Field, array: &dyn Array, row: usize) -
 
 /// Bounds the owned result of reading one cell through a `ColumnReader`, whose schema is derived once per column.
 pub fn estimate_read_cell_bytes(field: &Field, array: &dyn Array, row: usize) -> Result<usize> {
+    estimate_cell_bytes(field, array, row, false)
+}
+
+/// Bounds a cell copied by an Arrow selection, including child payloads masked by a parent's validity.
+pub fn estimate_copy_cell_bytes(field: &Field, array: &dyn Array, row: usize) -> Result<usize> {
+    estimate_cell_bytes(field, array, row, true)
+}
+
+fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: bool) -> Result<usize> {
     if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
     if field.data_type() != array.data_type() { return Err(layout()); }
     let base = add(mul(std::mem::size_of::<Value>(), 2)?, 256)?;
-    if field.data_type() == &DataType::Null && !field.is_nullable() { return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")); }
+    if field.data_type() == &DataType::Null && !field.is_nullable() && !copy { return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")); }
     if let DataType::RunEndEncoded(ends, values) = field.data_type() {
         let child = match ends.data_type() {
-            DataType::Int16 => { let runs = cast::<RunArray<Int16Type>>(array)?; estimate_read_cell_bytes(values, runs.values().as_ref(), runs.get_physical_index(row))? },
-            DataType::Int32 => { let runs = cast::<RunArray<Int32Type>>(array)?; estimate_read_cell_bytes(values, runs.values().as_ref(), runs.get_physical_index(row))? },
-            DataType::Int64 => { let runs = cast::<RunArray<Int64Type>>(array)?; estimate_read_cell_bytes(values, runs.values().as_ref(), runs.get_physical_index(row))? },
+            DataType::Int16 => { let runs = cast::<RunArray<Int16Type>>(array)?; estimate_cell_bytes(values, runs.values().as_ref(), runs.get_physical_index(row), copy)? },
+            DataType::Int32 => { let runs = cast::<RunArray<Int32Type>>(array)?; estimate_cell_bytes(values, runs.values().as_ref(), runs.get_physical_index(row), copy)? },
+            DataType::Int64 => { let runs = cast::<RunArray<Int64Type>>(array)?; estimate_cell_bytes(values, runs.values().as_ref(), runs.get_physical_index(row), copy)? },
             _ => return Err(layout()),
         };
         return add(base, child);
@@ -30,9 +39,9 @@ pub fn estimate_read_cell_bytes(field: &Field, array: &dyn Array, row: usize) ->
         let union = cast::<UnionArray>(array)?;
         let id = union.type_id(row);
         let field = fields.iter().find_map(|(candidate, field)| (candidate == id).then_some(field)).ok_or_else(layout)?;
-        return add(base, estimate_read_cell_bytes(field, union.child(id).as_ref(), union.value_offset(row))?);
+        return add(base, estimate_cell_bytes(field, union.child(id).as_ref(), union.value_offset(row), copy)?);
     }
-    if array.is_null(row) { return Ok(base); }
+    if array.is_null(row) && !copy { return Ok(base); }
     let value = match field.data_type() {
         DataType::Utf8 => mul(cast::<StringArray>(array)?.value(row).len(), 2)?,
         DataType::Binary => mul(cast::<BinaryArray>(array)?.value(row).len(), 2)?,
@@ -45,7 +54,8 @@ pub fn estimate_read_cell_bytes(field: &Field, array: &dyn Array, row: usize) ->
             for (index, child) in fields.iter().enumerate() {
                 bytes = add(bytes, map_node()?)?;
                 bytes = add(bytes, mul(child.name().len(), 2)?)?;
-                bytes = add(bytes, if child.data_type() == &DataType::Null && !child.is_nullable() { std::mem::size_of::<Value>() } else { estimate_read_cell_bytes(child, values.column(index).as_ref(), row)? })?;
+                bytes = add(bytes, if child.data_type() == &DataType::Null && !child.is_nullable() && !copy { std::mem::size_of::<Value>() }
+                    else { estimate_cell_bytes(child, values.column(index).as_ref(), row, copy)? })?;
             }
             bytes
         }
@@ -53,29 +63,29 @@ pub fn estimate_read_cell_bytes(field: &Field, array: &dyn Array, row: usize) ->
             let values = cast::<ListArray>(array)?;
             let start = usize::try_from(values.value_offsets()[row]).map_err(|_| layout())?;
             let end = usize::try_from(values.value_offsets()[row + 1]).map_err(|_| layout())?;
-            range(child, values.values().as_ref(), start, end)?
+            range(child, values.values().as_ref(), start, end, copy)?
         }
         DataType::FixedSizeList(child, length) => {
             let values = cast::<FixedSizeListArray>(array)?;
             let length = usize::try_from(*length).map_err(|_| layout())?;
             let start = mul(row, length)?;
-            range(child, values.values().as_ref(), start, add(start, length)?)?
+            range(child, values.values().as_ref(), start, add(start, length)?, copy)?
         }
         DataType::Map(child, _) => {
             let values = cast::<MapArray>(array)?;
             let start = usize::try_from(values.value_offsets()[row]).map_err(|_| layout())?;
             let end = usize::try_from(values.value_offsets()[row + 1]).map_err(|_| layout())?;
-            add(range(child, values.entries(), start, end)?, mul(end.checked_sub(start).ok_or_else(layout)?, mul(std::mem::size_of::<Value>(), 4)?)?)?
+            add(range(child, values.entries(), start, end, copy)?, mul(end.checked_sub(start).ok_or_else(layout)?, mul(std::mem::size_of::<Value>(), 4)?)?)?
         }
         _ => 0,
     };
     add(base, value)
 }
 
-fn range(field: &Field, values: &dyn Array, start: usize, end: usize) -> Result<usize> {
+fn range(field: &Field, values: &dyn Array, start: usize, end: usize, copy: bool) -> Result<usize> {
     if start > end || end > values.len() { return Err(layout()); }
     let mut bytes = add(256, mul(end - start, mul(std::mem::size_of::<Value>(), 2)?)?)?;
-    for row in start..end { bytes = add(bytes, estimate_read_cell_bytes(field, values, row)?)?; }
+    for row in start..end { bytes = add(bytes, estimate_cell_bytes(field, values, row, copy)?)?; }
     Ok(bytes)
 }
 
@@ -132,3 +142,17 @@ fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_
 fn mul(left: usize, right: usize) -> Result<usize> { left.checked_mul(right).ok_or_else(overflow) }
 fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Arrow cell allocation bound exceeds address space") }
 fn layout() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
+
+#[test]
+fn copying_a_null_fixed_list_admits_its_hidden_child_payload() {
+    use std::sync::Arc;
+
+    let item = Arc::new(Field::new("$data$", DataType::Utf8, false));
+    let text = "x".repeat(8192);
+    let values = Arc::new(StringArray::from(vec![text.as_str()]));
+    let array = FixedSizeListArray::try_new(item, 1, values, Some(arrow_buffer::NullBuffer::from(vec![false]))).unwrap();
+    let field = Field::new("list", array.data_type().clone(), true);
+
+    assert!(estimate_read_cell_bytes(&field, &array, 0).unwrap() < text.len());
+    assert!(estimate_copy_cell_bytes(&field, &array, 0).unwrap() >= text.len());
+}

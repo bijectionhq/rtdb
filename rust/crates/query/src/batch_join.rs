@@ -273,7 +273,7 @@ pub(crate) fn int_cells(array: &dyn Array) -> Option<Vec<Option<i64>>> {
 
 /// A build column across the batches the matches come from, as one array where every batch stores it alike.
 fn gathered(batches: &[ColumnBatch], position: usize, pairs: &[(usize, usize)]) -> Result<Column> {
-    let arrow = batches.iter().map(|batch| match &batch.columns[position] { Column::Arrow { array, field, logical } => Some((array, field, logical)), Column::Values(_) => None }).collect::<Option<Vec<_>>>();
+    let arrow = batches.iter().map(|batch| match &batch.columns[position] { Column::Arrow { array, field, logical } => Some((array, field, logical)), _ => None }).collect::<Option<Vec<_>>>();
     if let Some(arrow) = arrow && let Some((_, field, logical)) = arrow.first()
         && crate::columnar::flat(field.data_type()) && arrow.iter().all(|(_, other, other_logical)| other == field && other_logical == logical) {
         let arrays: Vec<&dyn Array> = arrow.iter().map(|(array, ..)| array.as_ref()).collect();
