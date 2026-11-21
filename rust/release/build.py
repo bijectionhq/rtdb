@@ -112,6 +112,13 @@ def native_executables(variant):
     return ("rtdb-multi",) if variant == "multi" else ("rtdb", "rtdb-config")
 
 
+def verify_hosted_protocol(image, compiled):
+    protocol = compiled.get("hosted_protocol")
+    label = image.get("Config", {}).get("Labels", {}).get("io.rtdb.hosted-protocol")
+    if type(protocol) is not int or protocol < 1 or label != str(protocol):
+        raise ValueError("packaged multi image hosted protocol differs from its executable")
+
+
 def extract_artifacts(commands, image, engine, output, variant=None):
     name = "rtdb-release-" + uuid.uuid4().hex
     destination = output / "artifacts"
@@ -300,6 +307,8 @@ def build(args):
                     metadata,
                     native_executables(args.variant),
                 )
+                if args.variant == "multi":
+                    verify_hosted_protocol(image, compiled)
             archive = output / f"rtdb-{args.engine}-{args.variant}-{expected_arch}.docker.tar"
             commands.run("save-server-image", ["docker", "image", "save", "--output", str(archive), image["Id"]])
             if git(repository, "rev-parse", "HEAD") != revision or git(repository, "status", "--porcelain", "--untracked-files=all"):
