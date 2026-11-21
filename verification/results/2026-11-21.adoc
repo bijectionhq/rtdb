@@ -1216,6 +1216,7 @@ The model has one source and one child, a two-object checkpoint, one captured re
 It separates preparation from publication and includes a refusal after source collection removes the remaining prerequisites.
 The reference policy explored 27 reachable states and the copy policy explored 38.
 Every published child remained readable.
+Apalache 0.63.0 independently checked both baselines through eight transitions and rejected the stale-inventory control.
 
 Four controls violated `PublishedChildReadable`.
 They omit validation of the captured referrers, allow a new shared dependency during a pending deletion, delete before transferring the shared objects, or publish a partial independent copy.
@@ -1230,4 +1231,4 @@ The independent checkpoint case abstracts physical copy completion, decryption, 
 This study establishes finite model properties only.
 
 The registered TLC runner executes both policies, all four controls, and four reachability witnesses.
-The checked model SHA-256 is `29a3d6d5f5d5160470418f4f577fb60df7be030c02ee9324639c9d8eb00f7bf6`. link:../tla/ForkPublication.tla[Fork model] · link:../README.adoc#_run_the_studies[Runner]
+The checked model SHA-256 is `d43053e0b4f22e095d3ae1d3c7a544d80077023a0ae950ae8e53d1925f6e4eb7`. link:../tla/ForkPublication.tla[Fork model] · link:../README.adoc#_run_the_studies[Runner]

@@ -1202,6 +1202,15 @@ def verify_apalache(args, scratch):
         args, scratch, "SystemClock", "system-clock-empty-restart", "StrictSystemTime", 8,
         ('Mutation = "none"', 'Mutation = "empty_restart"'), "regressing restart clock",
     )
+    check_apalache(
+        args, scratch, "ForkPublication", "fork-stale-inventory", "PublishedChildReadable", 8,
+        ('Mutation = "none"', 'Mutation = "ignore_new_fork"'), "stale reference inventory",
+    )
+    check_apalache(args, scratch, "ForkPublication", "fork-reference", "PublishedChildReadable", 8)
+    check_apalache(
+        args, scratch, "ForkPublication", "fork-copy", "PublishedChildReadable", 8,
+        ('Policy = "reference"', 'Policy = "copy"'),
+    )
     check_apalache(args, scratch, "RecoveryCollection", "recovery-collection", "RecoverySafe", 10)
     check_apalache(
         args, scratch, "RecoveryCollection", "recovery-collection-trim-for-head", "RecoverySuffixAvailable", 10,

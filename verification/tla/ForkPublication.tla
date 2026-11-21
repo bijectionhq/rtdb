@@ -1,8 +1,22 @@
 -------------------------- MODULE ForkPublication --------------------------
-CONSTANTS Policy, Mutation
+CONSTANTS
+    \* @type: Str;
+    Policy,
+    \* @type: Str;
+    Mutation
 Objects == {"root", "payload"}
 
-VARIABLES source, forkState, own, sweep, plan
+VARIABLES
+    \* @type: Bool;
+    source,
+    \* @type: Str;
+    forkState,
+    \* @type: Set(Str);
+    own,
+    \* @type: Str;
+    sweep,
+    \* @type: Str;
+    plan
 vars == <<source, forkState, own, sweep, plan>>
 
 Visible == forkState = "published"
