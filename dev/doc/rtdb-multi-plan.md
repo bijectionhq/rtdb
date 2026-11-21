@@ -123,6 +123,11 @@ clear after fencing. On a standalone local disk, each provider operation
 retains a lock in the independent key directory. After a node exits, the
 reaper can recover its recorded region only by acquiring that same persisted lock.
 Asynchronous local key opens use the blocking pool so a competing filesystem lock cannot stall the runtime thread.
+A local serving node prepares one locked, durable storage-region witness before it is needed.
+An admission consumes that witness once and starts replenishing the spare on the blocking pool.
+When a spare is unavailable, the admission creates its own witness before publishing the region.
+Normal shutdown removes an unused spare.
+A process exit before shutdown can leave one unreferenced standby witness file.
 A missing lock witness keeps the region pending. For remote
 storage, a producer that exits without acknowledging drain keeps cleanup
 pending until the provider's outstanding work can be accounted for.
@@ -788,12 +793,19 @@ After integrating hosted transfer and archive, four more alternating comparisons
 The checkpoint build measured scale-out p99 from 32.0 to 1,992.6 ms and scale-in p99 from 58.1 to 145.2 ms, at 2,275–4,608 writes/s overall.
 The variant that sent both key opens and storage-region witness I/O to the blocking pool measured scale-out p99 from 52.3 to 120.9 ms and scale-in p99 from 130.3 to 270.8 ms, at 2,140–3,211 writes/s overall.
 The comparisons leave the 30 ms acceptance gate open.
-The implementation offloads only the key opens, which have a regression test for holding a filesystem lock while the runtime services a timer.
+The key-open regression test holds a filesystem lock while the runtime services a timer.
 
 One instrumented run of the same workload traced 21 moves.
 Target database attach took 30.9 ms at the median and 197.1 ms at the slowest, while the source park RPC took 8.8 ms at the median and 16.7 ms at the slowest.
 A second instrumented run traced 21 moves and measured local storage-region admission at 13.3 ms median and 103.4 ms maximum, checkpoint recovery at 5.5 ms median, and log opening at 5.1 ms median.
 That run verified all 32,768 updates and measured end-to-end p99 of 50.0 ms during scale-out and 69.3 ms during scale-in.
+
+Three alternating pairs with the same instrumented build compared on-demand witnesses with one preallocated standby witness per local node.
+All six trials verified their 32,768 updates.
+Per-run median storage-region admission ranged from 37.3 to 122.1 ms on demand and from 0.041 to 0.071 ms with a standby witness.
+The trial ranges for scale-out p99 were 112.2–192.6 ms on demand and 38.1–165.4 ms with a standby witness.
+The trial ranges for scale-in p99 were 141.4–217.7 ms on demand and 108.8–208.5 ms with a standby witness.
+These trials shared the host with test builds and leave the 30 ms acceptance gate open.
 
 ### Stage 12: encryption, lineages, forks and deletion
 

@@ -1956,6 +1956,8 @@ rule BeginDeletion {
 }
 
 rule ClaimStoreRoot {
+    -- Local nodes can prepare a durable locked witness before admitting a storage region.
+    -- Each local region consumes its witness once and keeps the lock until its operations have drained.
     when: DeploymentStoreOpened(record, storage_prefix, writer_epoch)
 
     requires: record.lifecycle in {live, quarantined}

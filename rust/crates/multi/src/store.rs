@@ -5,6 +5,7 @@
 //! - `GarbageStore` turns a delete into a garbage record; only the reaper erases an object, once it has been garbage for the grace period (`OnlyTheReaperDeletes`, `ReapUnreachable`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -56,6 +57,59 @@ pub struct CellStoreFactory {
     pub(crate) hosted_task: Option<HostedTask>,
     pub(crate) storage_regions: TaskTracker,
     pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
+    pub(crate) local_witnesses: Option<Arc<LocalWitnessPool>>,
+}
+
+enum LocalWitnessSlot {
+    Empty,
+    Preparing,
+    Ready(Uuid, File),
+}
+
+pub(crate) struct LocalWitnessPool {
+    keys: Arc<dyn KeyService>,
+    slot: Mutex<LocalWitnessSlot>,
+}
+
+impl LocalWitnessPool {
+    pub(crate) fn new(keys: Arc<dyn KeyService>, tasks: &TaskTracker) -> Arc<Self> {
+        let pool = Arc::new(Self { keys, slot: Mutex::new(LocalWitnessSlot::Empty) });
+        let _ = pool.take(tasks);
+        pool
+    }
+
+    fn take(self: &Arc<Self>, tasks: &TaskTracker) -> Option<(Uuid, File)> {
+        let ready = match std::mem::replace(&mut *self.slot.lock(), LocalWitnessSlot::Preparing) {
+            LocalWitnessSlot::Preparing => return None,
+            LocalWitnessSlot::Empty => None,
+            LocalWitnessSlot::Ready(id, file) => Some((id, file)),
+        };
+        let pool = Arc::clone(self);
+        tasks.spawn_blocking(move || {
+            let id = Uuid::new_v4();
+            let prepared = match pool.keys.hold_local_storage_region(id) {
+                Ok(Some(file)) => LocalWitnessSlot::Ready(id, file),
+                Ok(None) => LocalWitnessSlot::Empty,
+                Err(error) => {
+                    eprintln!("Could not prepare a standby storage witness: {}", error.code);
+                    LocalWitnessSlot::Empty
+                }
+            };
+            *pool.slot.lock() = prepared;
+        });
+        ready
+    }
+}
+
+impl Drop for LocalWitnessPool {
+    fn drop(&mut self) {
+        if let LocalWitnessSlot::Ready(id, file) = std::mem::replace(self.slot.get_mut(), LocalWitnessSlot::Empty) {
+            drop(file);
+            if let Err(error) = self.keys.forget_local_storage_region(id) {
+                eprintln!("Could not remove standby storage witness {id}: {}", error.code);
+            }
+        }
+    }
 }
 
 pub(crate) struct ScopedCellWrites {
@@ -181,14 +235,17 @@ impl CellStoreFactory {
         let keys = self.keys.clone();
         let config = config.clone();
         let hosted_task = self.hosted_task.clone();
-        let id = Uuid::new_v4();
+        let local = matches!(config.storage, CellStorage::Local { .. });
+        let prepared = self.local_witnesses.as_ref().filter(|_| local).and_then(|pool| pool.take(&self.storage_regions));
+        let id = prepared.as_ref().map_or_else(Uuid::new_v4, |(id, _)| *id);
         let (release, dropped) = oneshot::channel();
         let (ready, admitted) = oneshot::channel();
         // The worker owns both the admission and its release. Dropping the
         // opening future cannot strand a request that has reached the directory.
         self.storage_regions.spawn(async move {
-            let local = matches!(config.storage, crate::deployment::CellStorage::Local { .. });
-            let witness = if local {
+            let witness = if let Some((_, file)) = prepared {
+                Some(file)
+            } else if local {
                 match keys.hold_local_storage_region(id) {
                     Ok(witness) => witness,
                     Err(error) => {
@@ -889,6 +946,34 @@ pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentReco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_prepared_local_witness_keeps_its_lock_through_admission_and_only_unused_witnesses_are_discarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = Arc::new(crate::keys::LocalKeyService::new(directory.path()).unwrap());
+        let tasks = TaskTracker::new();
+        let pool = LocalWitnessPool::new(keys.clone(), &tasks);
+        tasks.close();
+        tasks.wait().await;
+
+        let (id, file) = pool.take(&tasks).expect("the standby witness is ready");
+        assert!(!keys.local_storage_region_drained(id).unwrap());
+        tasks.wait().await;
+        let standby = match *pool.slot.lock() {
+            LocalWitnessSlot::Ready(id, _) => id,
+            _ => panic!("the standby witness was replenished"),
+        };
+        assert_ne!(id, standby);
+        assert!(directory.path().join(format!("{standby}.storage-region")).exists());
+        drop(pool);
+        assert!(!directory.path().join(format!("{standby}.storage-region")).exists());
+
+        assert!(!keys.local_storage_region_drained(id).unwrap());
+        drop(file);
+        assert!(keys.local_storage_region_drained(id).unwrap());
+        keys.forget_local_storage_region(id).unwrap();
+        assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none());
+    }
     use rtdb_storage::LocalStore;
     use rtdb_storage::MemoryStore;
 
@@ -906,7 +991,7 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         let deleting = directory.create_deployment(deleting).await.unwrap();
         let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
-        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None };
         let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
@@ -1134,6 +1219,7 @@ mod tests {
             directory: directory.clone(),
             keys: keys.clone(),
             storage_regions: TaskTracker::new(),
+            local_witnesses: None,
             storage_namespaces,
             scoped_writes: None,
             hosted_task: None,
