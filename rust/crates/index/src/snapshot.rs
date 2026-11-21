@@ -3,18 +3,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, LogicalType, ReplicaPosition, Result, StorageEpoch, StorageVersion, TableRef, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, LogicalType, Result, TableRef, Timestamp, TransactionKey};
 
 use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
 
-/// An installed replica prefix within the opened database's storage and journal.
-/// The journal epoch is explicit because its empty prefix is encoded as epoch base minus one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CatalogCut {
-    pub storage_version: StorageVersion,
-    pub storage_epoch: StorageEpoch,
-    pub replica_epoch: StorageEpoch,
-    pub through: ReplicaPosition,
+#[derive(Clone)]
+struct CatalogRead { _permit: Arc<dyn Send + Sync> }
+
+impl std::fmt::Debug for CatalogRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("CatalogRead").finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -26,11 +25,12 @@ pub struct Snapshot {
     basis: Option<TransactionKey>,
     system_time_cap: Option<Timestamp>,
     catalog_cut: Option<CatalogCut>,
+    catalog_read: Option<CatalogRead>,
 }
 
 impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
-        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None }
+        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None }
     }
     pub(crate) fn with_catalog_cut(mut self, catalog_cut: Option<CatalogCut>) -> Self {
         self.catalog_cut = catalog_cut;
@@ -39,6 +39,11 @@ impl Snapshot {
     /// Returns the conservative installed prefix captured with this physical catalog.
     /// Callers must also bind the opened database and residence before comparing cuts across nodes.
     pub fn catalog_cut(&self) -> Option<CatalogCut> { self.catalog_cut }
+    /// Transfers the store's captured catalog registration into this snapshot and its clones.
+    pub fn with_catalog_read(mut self, permit: Arc<dyn Send + Sync>) -> Self {
+        self.catalog_read = Some(CatalogRead { _permit: permit });
+        self
+    }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
     /// Whether a transaction's own uncommitted writes are layered over this snapshot.
     pub fn has_overlays(&self) -> bool { !self.layered.is_empty() }

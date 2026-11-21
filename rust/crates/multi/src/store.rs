@@ -25,6 +25,7 @@ use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::cipher::{Cipher, SEALED_OVERHEAD as OVERHEAD};
+use crate::catalog_readers::CatalogReaders;
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
 use crate::checkpoint_retention::checkpoint_metadata_collectable;
@@ -227,7 +228,11 @@ impl RemoteStorageFactory for CellStoreFactory {
                 self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
             );
             let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?;
-            Arc::get_mut(&mut opened).expect("the new store has one owner").index_pages = Some(pages);
+            let serving = Arc::get_mut(&mut opened).expect("the new store has one owner");
+            serving.index_pages = Some(pages);
+            serving.catalog_readers = Some(CatalogReaders::new(
+                self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner,
+            ));
             Ok::<_, Anomaly>(opened)
         }).await?;
         Ok(OpenedRecoveryStore { store: opened, blocks, checkpoint_metadata: Some(checkpoint_metadata), fragment_storage: Some(fragment_storage) })
@@ -507,10 +512,15 @@ fn publication_error(key: &ObjectKey, error: Anomaly) -> Error {
 pub(crate) async fn release_region(directory: &dyn Directory, deployment: &str, region: Uuid, uncertain: bool) -> Result<()> {
     for _ in 0..8 {
         let Some(mut record) = directory.deployment(deployment).await? else { return Ok(()); };
+        let readers = record.catalog_readers.len();
+        record.catalog_readers.retain(|_, reader| reader.owner != region);
+        let removed_readers = record.catalog_readers.len() != readers;
         match record.storage_regions.get_mut(&region) {
-            Some(StorageRegion::Remote { closed, .. }) if *closed => return Ok(()),
+            Some(StorageRegion::Remote { closed, .. }) if *closed => {
+                if !removed_readers { return Ok(()); }
+            }
             Some(StorageRegion::Remote { closed, publications, .. }) if !publications.is_empty() => *closed = true,
-            None if !uncertain => return Ok(()),
+            None if !uncertain && !removed_readers => return Ok(()),
             _ => { record.storage_regions.remove(&region); }
         }
         let version = record.version;
@@ -562,6 +572,7 @@ pub(crate) async fn reconcile_storage_regions(
                 crate::admin::update_installation(directory, &record.id, |current| {
                     if current.storage_regions.get(&region) == Some(state) {
                         current.storage_regions.remove(&region);
+                        current.catalog_readers.retain(|_, reader| reader.owner != region);
                     }
                     Ok(())
                 }).await?;
@@ -770,6 +781,9 @@ fn plain(object: StoredObject) -> StoredObject { StoredObject { size: object.siz
 #[async_trait]
 impl ObjectStore for EncryptingStore {
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { self.inner.index_page_lifecycle() }
+    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
+        self.inner.retain_catalog(cut).await
+    }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?) }
@@ -807,6 +821,7 @@ pub struct GarbageRecord { pub key: String, pub released_at_ms: i64 }
 pub struct GarbageStore {
     inner: Arc<dyn ObjectStore>,
     index_pages: Option<HostedIndexPages>,
+    catalog_readers: Option<CatalogReaders>,
     loaded_releases: tokio::sync::OnceCell<()>,
     released: Mutex<BTreeSet<ObjectKey>>,
     clock: Clock,
@@ -815,7 +830,7 @@ pub struct GarbageStore {
 impl GarbageStore {
     pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> { Self::open_with_clock(inner, wall_clock()).await }
 
-    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, index_pages: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeSet::new()), clock })) }
+    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, index_pages: None, catalog_readers: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeSet::new()), clock })) }
 
     async fn load_releases(&self) -> rtdb_storage::Result<()> {
         self.loaded_releases.get_or_try_init(|| async {
@@ -836,6 +851,10 @@ impl GarbageStore {
 impl ObjectStore for GarbageStore {
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
         self.index_pages.as_ref().map(|pages| pages as &dyn IndexPageLifecycle)
+    }
+    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
+        let Some(readers) = &self.catalog_readers else { return Ok(None); };
+        readers.retain(cut).await.map(Some)
     }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }

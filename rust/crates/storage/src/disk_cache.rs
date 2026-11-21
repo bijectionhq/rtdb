@@ -297,6 +297,9 @@ impl ObjectStore for DiskCachedStore {
     fn index_page_lifecycle(&self) -> Option<&dyn crate::object_store::IndexPageLifecycle> {
         self.remote.index_page_lifecycle()
     }
+    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        self.remote.retain_catalog(cut).await
+    }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let _scope = self.io.admit()?;

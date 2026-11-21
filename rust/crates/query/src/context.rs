@@ -14,6 +14,14 @@ use crate::{invalid, spill::SpillRegion};
 #[derive(Clone)]
 pub struct DatabaseSnapshot { pub partitions: Vec<Snapshot>, pub storage: Arc<BufferPool> }
 
+/// Binds the physical catalog in this snapshot to the store that will serve its reads.
+pub async fn retain_catalog_snapshot(snapshot: Snapshot, storage: &BufferPool) -> Result<Snapshot> {
+    match storage.object_store().retain_catalog(snapshot.catalog_cut()).await? {
+        Some(permit) => Ok(snapshot.with_catalog_read(permit)),
+        None => Ok(snapshot),
+    }
+}
+
 #[derive(Clone)]
 pub struct CatalogSnapshot {
     pub(crate) default_database: String,

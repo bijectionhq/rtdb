@@ -1,0 +1,177 @@
+{
+  "summary": "A catalog reader is admitted only by its open serving owner in the same residence and journal.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 6,
+  "controls": {
+    "ignore_serving": {
+      "defect": "The deployment no longer serves reads.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "serving && open_owner && same_residence && current_epoch == opened_epoch\n}",
+          "replace": "open_owner && same_residence && current_epoch == opened_epoch\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "function": "admits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "weaken_serving": {
+      "defect": "The function and contract both admit a reader in this case. The deployment no longer serves reads.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "serving && open_owner && same_residence && current_epoch == opened_epoch\n}",
+          "replace": "open_owner && same_residence && current_epoch == opened_epoch\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "out <==> serving && open_owner && same_residence && current_epoch == opened_epoch",
+          "replace": "out <==> open_owner && same_residence && current_epoch == opened_epoch"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/catalog_reader_admission/laws.rs",
+          "function": "a_nonserving_deployment_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "ignore_owner": {
+      "defect": "The storage owner is closed.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "serving && open_owner && same_residence && current_epoch == opened_epoch\n}",
+          "replace": "serving && same_residence && current_epoch == opened_epoch\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "function": "admits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "weaken_owner": {
+      "defect": "The function and contract both admit a reader in this case. The storage owner is closed.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "serving && open_owner && same_residence && current_epoch == opened_epoch\n}",
+          "replace": "serving && same_residence && current_epoch == opened_epoch\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "out <==> serving && open_owner && same_residence && current_epoch == opened_epoch",
+          "replace": "out <==> serving && same_residence && current_epoch == opened_epoch"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/catalog_reader_admission/laws.rs",
+          "function": "a_closed_owner_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "ignore_residence": {
+      "defect": "The deployment has changed residence.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "serving && open_owner && same_residence && current_epoch == opened_epoch\n}",
+          "replace": "serving && open_owner && current_epoch == opened_epoch\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "function": "admits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "weaken_residence": {
+      "defect": "The function and contract both admit a reader in this case. The deployment has changed residence.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "serving && open_owner && same_residence && current_epoch == opened_epoch\n}",
+          "replace": "serving && open_owner && current_epoch == opened_epoch\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "out <==> serving && open_owner && same_residence && current_epoch == opened_epoch",
+          "replace": "out <==> serving && open_owner && current_epoch == opened_epoch"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/catalog_reader_admission/laws.rs",
+          "function": "a_different_residence_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "ignore_journal": {
+      "defect": "The installation now uses a different journal epoch.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "serving && open_owner && same_residence && current_epoch == opened_epoch\n}",
+          "replace": "serving && open_owner && same_residence\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "function": "admits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "weaken_journal": {
+      "defect": "The function and contract both admit a reader in this case. The installation now uses a different journal epoch.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "serving && open_owner && same_residence && current_epoch == opened_epoch\n}",
+          "replace": "serving && open_owner && same_residence\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/catalog_reader_admission.rs",
+          "find": "out <==> serving && open_owner && same_residence && current_epoch == opened_epoch",
+          "replace": "out <==> serving && open_owner && same_residence"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/catalog_reader_admission/laws.rs",
+          "function": "a_different_journal_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    }
+  }
+}

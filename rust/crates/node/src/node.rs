@@ -332,7 +332,8 @@ impl Node {
             }
             let cap = requested.map(|time| time.as_micros()).transpose()?;
             let cap = match (cap, basis.snapshot_time) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
-            snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot.with_system_time_cap(cap)?], storage: Arc::clone(&database.storage) });
+            let snapshot = rtdb_query::retain_catalog_snapshot(snapshot.with_system_time_cap(cap)?, &database.storage).await?;
+            snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) });
         }
         let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
             .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
@@ -358,6 +359,7 @@ impl Node {
             cancellation.run_until_cancelled(tokio::time::sleep(Duration::from_millis(5))).await.ok_or_else(cancelled)?;
         }
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
+        let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
         let catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
         let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), fragment.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;

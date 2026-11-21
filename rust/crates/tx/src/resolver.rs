@@ -149,6 +149,7 @@ impl TxResolver {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
         let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
         context.check_cancelled()?;
+        let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let default_time = self.smooth(log_time)?;
         let invalid_time = request.options.system_time.zip(self.resolved_head)
@@ -210,6 +211,7 @@ impl TxResolver {
 
     pub async fn resolve_external(&mut self, durable: Snapshot, now: Timestamp, system_time: Option<Timestamp>, token: Option<Vec<u8>>, writer: &mut dyn TransactionWriter, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         context.check_cancelled()?;
+        let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let id = self.resolved_head.map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
         let key = TransactionKey { tx_id: TxId(id), system_time: self.smooth(system_time.unwrap_or(now))? };

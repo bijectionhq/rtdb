@@ -2654,6 +2654,59 @@ fn fragments_read(cell: &Cell) -> Vec<std::collections::BTreeMap<(String, String
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_reader_keeps_the_cut_of_its_captured_catalog() {
+    struct Reader;
+    #[async_trait::async_trait]
+    impl rtdb_node::SessionIdentity for Reader {
+        fn user(&self) -> Option<&str> { Some("reader") }
+        async fn revalidate(&self, _: rtdb_types::Timestamp) -> Result<()> { Ok(()) }
+        fn authorize_database(&self, _: &str, _: rtdb_node::DatabaseAccess) -> Result<()> { Ok(()) }
+    }
+
+    let cell = Cell::start(2, None).await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO docs (_id, v) VALUES (1, 17)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    let node = cell.node(holder).server.node();
+    let basis = rtdb_node::QueryBasis { snapshot: node.snapshot_basis().unwrap(), snapshot_time: None,
+        current_time: node.query_instant(), timezone: "UTC".into() };
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let capture = node.query_context("shop", &basis, &Reader, &cancellation).await.unwrap();
+    let cut = capture.catalog.database("shop").unwrap().partitions[0].catalog_cut().unwrap();
+    let record = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let (&reader, pin) = record.catalog_readers.iter().find(|(_, pin)| pin.cut == Some(cut)).unwrap();
+    assert!(record.storage_regions.contains_key(&pin.owner));
+    assert_eq!(pin.replica_epoch, record.log_epoch);
+    assert_eq!(pin.storage_root, rtdb_format::keys::StorageRoot::new(cut.storage_version, cut.storage_epoch).unwrap().key());
+
+    client.simple_query("UPDATE docs SET v = 25 WHERE _id = 1").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let database = node.catalog().database("shop").unwrap();
+        while !database.snapshot().catalog_cut().is_some_and(|current| current.through > cut.through) {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let next_basis = rtdb_node::QueryBasis { snapshot: node.snapshot_basis().unwrap(), ..basis };
+    let next = node.query_context("shop", &next_basis, &Reader, &cancellation).await.unwrap();
+    let next_cut = next.catalog.database("shop").unwrap().partitions[0].catalog_cut().unwrap();
+    assert!(cut.through < next_cut.through);
+    let record = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    assert_eq!(record.catalog_readers[&reader].cut, Some(cut));
+    assert!(record.catalog_readers.values().any(|pin| pin.cut == Some(next_cut)));
+    drop(next);
+    drop(capture);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cell.directory.deployment(&deployment.id).await.unwrap().unwrap().catalog_readers.contains_key(&reader) {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fragment_requires_the_opened_residence_and_replica_epoch() {
     use rtdb_plan::{ColumnId, Field, QualifiedTable, Scan, TableBinding, TemporalFilter};
     use rtdb_query::{ScanFragment, TriePrefix};

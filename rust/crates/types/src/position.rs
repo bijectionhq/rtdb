@@ -15,6 +15,16 @@ macro_rules! position {
 position!(SourcePosition: i64, ReplicaPosition: i64, TxId: i64, BlockIndex: i64,
     Term: i64, TermSequence: i64, StorageEpoch: i32, StorageVersion: i32);
 
+/// The installed replica prefix captured with a physical catalog.
+/// The journal epoch is explicit because its empty prefix is encoded as epoch base minus one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCut {
+    pub storage_version: StorageVersion,
+    pub storage_epoch: StorageEpoch,
+    pub replica_epoch: StorageEpoch,
+    pub through: ReplicaPosition,
+}
+
 const OFFSET_LIMIT: i64 = 1_i64 << 48;
 const EPOCH_LIMIT: i32 = 1_i32 << 15;
 

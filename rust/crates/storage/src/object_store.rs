@@ -100,6 +100,11 @@ pub trait IndexPageLifecycle: Send + Sync {
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
+    /// Registers a captured catalog in a shared serving store.
+    /// A missing cut represents an opaque capture. Standalone stores need no remote registration.
+    async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        Ok(None)
+    }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.
