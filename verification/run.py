@@ -571,6 +571,28 @@ def verify_explicit_session(args, scratch):
     verify_lean_model(args, scratch, path, "explicit-session", controls, 9)
 
 
+def verify_checkpoint_metadata_retention(args, scratch):
+    path = Path("verification/lean/CheckpointMetadataRetention.lean")
+    controls = {
+        "allow-stale-admission": (
+            "(floor : Nat) : Prop := state.published ≤ floor",
+            "(floor : Nat) : Prop := floor = floor",
+            ["plans_survive_interleavings"],
+        ),
+        "ignore-existing-holds": (
+            "(block : Nat) : MayAuthorize state block →",
+            "(block : Nat) : block < state.published →",
+            ["plans_survive_interleavings"],
+        ),
+        "publish-backwards": (
+            "state.published ≤ head → Step state { state with published := head }",
+            "True → Step state { state with published := head }",
+            ["plans_survive_interleavings"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "checkpoint-metadata-retention", controls, 3)
+
+
 def verify_replica_trim_admission(args, scratch):
     path = Path("verification/lean/ReplicaTrimAdmission.lean")
     controls = {
@@ -784,6 +806,7 @@ def verify_lean(args, scratch):
             verify_generation_retention(args, scratch)
             verify_replica_trim_admission(args, scratch)
             verify_replica_hold_close(args, scratch)
+            verify_checkpoint_metadata_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
             verify_compaction_planner(args, scratch)
             verify_compaction_merge(args, scratch)
@@ -962,6 +985,16 @@ TLA_CASES = (
     ("ReplicaHoldLifecycle", "replica-hold-trim-after-stop-witness",
      ("INVARIANTS ActiveHoldCovered ClosedNeverRegainsHold", "INVARIANT NeverTrimsAfterConfirmedDeath"),
      "NeverTrimsAfterConfirmedDeath"),
+    ("CheckpointMetadataRetention", "checkpoint-metadata-retention", None, None),
+    ("CheckpointMetadataRetention", "checkpoint-metadata-stale-admission",
+     ('Mutation = "none"', 'Mutation = "allow_stale"'), "AdmittedMetadataPresent"),
+    ("CheckpointMetadataRetention", "checkpoint-metadata-ignore-existing-holds",
+     ('Mutation = "none"', 'Mutation = "ignore_existing_holds"'), "AdmittedMetadataPresent"),
+    ("CheckpointMetadataRetention", "checkpoint-metadata-publish-backwards",
+     ('Mutation = "none"', 'Mutation = "publish_backwards"'), "PublishedMetadataPresent"),
+    ("CheckpointMetadataRetention", "checkpoint-metadata-collection-witness",
+     ("INVARIANTS PublishedMetadataPresent AdmittedMetadataPresent", "INVARIANT NeverCollectsSupersededMetadata"),
+     "NeverCollectsSupersededMetadata"),
     ("ReplicaTrimAdmission", "replica-trim-admission", None, None),
     ("ReplicaTrimAdmission", "replica-trim-trust-physical-floor",
      ('Mutation = "none"', 'Mutation = "trust_physical_floor"'), "ActiveRecoveryCovered"),

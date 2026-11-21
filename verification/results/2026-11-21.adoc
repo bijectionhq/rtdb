@@ -1154,3 +1154,21 @@ The combined formal runner passed at `a456fd6c5` with Lean, Verus, Z3, TLC, Apal
 It exercised 24 TLC baseline configurations and the registered controls and witnesses.
 The native replay and Rust boundary flags were omitted from the combined run, and the focused native results are recorded above.
 The input manifest SHA-256 is `1b8ebc14ef98cfa0ce628c009e7d3607635e40aec0364a702d410a788071bf21`. link:../README.adoc#_run_the_studies[Runner command and tool versions]
+
+=== Checkpoint metadata reaping across authorities
+
+At `ae0957678`, the metadata model covers publication, admission, release, preparation of a deletion, and the provider's later removal of the object.
+Its scope is one immutable physical residence and checkpoint metadata ordered by block.
+It assumes authoritative versioned admission, a forward published block, and no reuse of the released object's identity.
+The model abstracts the clock threshold, provider transport, and ancestry references.
+
+TLC explored 79 reachable states with two readers and three blocks.
+It rejected stale admissions, overlooking existing holds, and backward publication at the named safety properties.
+The reachability witness removes both old blocks and retains the latest one with a live startup reader.
+Use `java -cp tla2tools.jar tlc2.TLC -config verification/tla/CheckpointMetadataRetention.cfg verification/tla/CheckpointMetadataRetention.tla` from the repository root.
+
+Lean checked `plans_survive_interleavings`, `reachable_plans_are_safe`, and `admitted_metadata_cannot_be_deleted` for finite histories with arbitrary reader identities and block indices.
+The axiom audit reports `propext` and `Quot.sound` only.
+Replay the positive proof with `lean verification/lean/CheckpointMetadataRetention.lean` on Lean 4.36.0.
+The standard local Lean control run hit its wall-clock timeout under host contention, so this entry establishes the positive proof and the TLC controls.
+The registered combined-run cases specify the bounded witnesses and the three Lean controls. link:../lean/CheckpointMetadataRetention.lean[Lean laws] · link:../tla/CheckpointMetadataRetention.tla[TLA+ model]
