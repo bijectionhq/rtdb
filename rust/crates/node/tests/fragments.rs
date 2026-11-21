@@ -8,6 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rtdb_columnar::read_value;
+use rtdb_format::database::proto::DatabaseConfig;
 use rtdb_maintenance::CollectionObserver;
 use rtdb_node::*;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers};
@@ -34,6 +35,28 @@ impl CatalogUsers for CatalogFixtures {
 impl CatalogMetrics for CatalogFixtures { fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> { Ok(CatalogRows::new(Vec::new(), Arc::new(()))) } }
 struct TickClock(AtomicI64);
 impl Clock for TickClock { fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) } }
+
+struct LoopbackResources(NativeResources);
+
+#[async_trait]
+impl ResourceFactory for LoopbackResources {
+    fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
+        self.0.validate(name, configuration)
+    }
+
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> {
+        let mut storage = self.0.open_storage(name, configuration).await?;
+        storage.fragment_storage = Some(Arc::from("loopback-store"));
+        Ok(storage)
+    }
+
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess,
+        cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+        self.0.open_logs(name, configuration, access, cancellation, storage).await
+    }
+
+    async fn close(&self) -> Result<()> { self.0.close().await }
+}
 
 /// Reads every fragment through the node's own `scan_fragment`, as the node a fragment belongs to would, except those under `failing`.
 #[derive(Default)]
@@ -71,7 +94,8 @@ async fn start() -> (Node, tokio::task::JoinHandle<Result<()>>, Arc<Loopback>) {
     options.trie = rtdb_trie::TrieConfig::new(16, 32).unwrap();
     let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
     let fragmenter = Arc::new(Loopback::default());
-    let services = NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock, scan_fragmenter: Some(fragmenter.clone()),
+    let resources = LoopbackResources(NativeResources::default().with_local_log_clock(clock.clone(), false));
+    let services = NodeServices { resources: Arc::new(resources), clock, scan_fragmenter: Some(fragmenter.clone()),
         ..NodeServices::local(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures)) };
     let (node, driver) = Node::open(options, services).await.unwrap();
     let _ = fragmenter.node.set(node.clone());
@@ -178,7 +202,7 @@ async fn a_fragment_whose_node_fails_is_read_by_the_coordinator() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fragment_reads_as_of_its_basis_on_a_node_at_or_past_it() {
+async fn a_fragment_requires_the_captured_residence_and_exact_transaction_head() {
     let (node, driver, fragmenter) = start().await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     populate(&node, &mut session).await;
@@ -186,13 +210,11 @@ async fn a_fragment_reads_as_of_its_basis_on_a_node_at_or_past_it() {
     let _ = answers(&mut session).await;
     let fragment = fragmenter.last.lock().clone().unwrap();
     let at_basis = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
-    let slices: Vec<_> = (0..4u8).flat_map(|first| (0..4u8).map(move |second| rtdb_query::TriePrefix::new(vec![first, second]).unwrap())).map(|prefix| {
-        let mut slice = fragment.clone();
-        slice.prefix = prefix;
-        slice
-    }).collect();
-    let mut before = Vec::new();
-    for slice in &slices { before.push(node.scan_fragment(slice, Duration::ZERO, &CancellationToken::new()).await.unwrap()); }
+    assert!(!at_basis.is_empty());
+    let mut other_store = fragment.clone();
+    other_store.residence.as_mut().unwrap().storage = Arc::from("other-store");
+    let error = node.scan_fragment(&other_store, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.node/fragment-residence");
 
     let mut ahead = fragment.clone();
     ahead.basis.tx_id = rtdb_types::TxId(fragment.basis.tx_id.0 + 1);
@@ -207,10 +229,8 @@ async fn a_fragment_reads_as_of_its_basis_on_a_node_at_or_past_it() {
     execute(&mut session, TxOp::Sql { sql: "DELETE FROM users".into(), args: None }).await;
     execute(&mut session, put(&node, "users", vec![StructFields::from([("_id".to_owned(), Value::I64(1000)), ("name".to_owned(), Value::Utf8("later".into()))])])).await;
     let _ = rows(session.query_sql("SELECT name FROM users WHERE _id = 1000", vec![]).await.unwrap()).await;
-    assert_eq!(node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap(), at_basis, "a node past the basis reads the fragment as of the basis");
-    for (slice, before) in slices.iter().zip(&before) {
-        assert_eq!(&node.scan_fragment(slice, Duration::ZERO, &CancellationToken::new()).await.unwrap(), before, "slice {} reads as of the basis", slice.prefix);
-    }
+    let error = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.query/fragment-basis");
     stop(&node, driver).await;
 }
 
