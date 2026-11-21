@@ -223,7 +223,9 @@ The model assumes one authoritative ordered prefix, atomic publication of user e
 Native regressions cover cutoff equality, conflicting keys, parallel attempts, out-of-order clock samples, expiry beyond the ordinary window, rejected writes to the marker, and recovery both of a flushed marker and of the duplicate receipt.
 The format regression checks required field presence and distinguishes a zero timestamp from absence.
 The deployed contract still depends on frontend eligibility and matching resolver support across the log's eligible writers.
-Stable replay of aborted outcomes remains open in the Multi target. [Lean model](../../verification/lean/PrivateReplay.lean) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Node tests](../../rust/crates/node/tests/native.rs) · [Wire tests](../../rust/crates/tx/tests/submission.rs) · [Transaction contract](db.allium)
+Stable replay of aborted outcomes remains open. [Lean model](../../verification/lean/PrivateReplay.lean) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Node tests](../../rust/crates/node/tests/native.rs) · [Wire tests](../../rust/crates/tx/tests/submission.rs) · [Transaction contract](db.allium)
+
+The published Multi integration test withholds a committed UPDATE's reply, moves the deployment to another writer, and checks that the same client receives a completion and reads one increment. [Writer replacement regression](https://github.com/bijectionhq/rtdb/blob/7b4b6cd5427bbf04c841729eb532c18839b348e7/rust/crates/multi/tests/cell.rs#L2566)
 
 ### Production live-trie bucket grouping
 
