@@ -107,6 +107,35 @@ async fn a_placed_query_refuses_a_database_detached_or_replaced_while_checking_i
 }
 
 #[tokio::test]
+async fn a_placed_session_waits_for_its_own_await_basis() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, services()).await;
+    for name in ["shop", "other"] {
+        node.database_or_attach(name.into(), Default::default()).await.unwrap().unwrap();
+    }
+    let mut session = node.session("shop", Arc::new(Authority)).unwrap();
+    let other_basis = rtdb_format::basis::encode_tx_basis(&TxBasis {
+        databases: BTreeMap::from([("other".into(), vec![TxId(1_000_000)])]),
+    });
+    session.state_mut().set_await_token(Some(other_basis)).unwrap();
+    let query = tokio::time::timeout(Duration::from_secs(1), session.query_sql("SELECT 1", vec![])).await.unwrap().unwrap();
+    assert_eq!(rows(query).await, [vec![Value::I64(1)]]);
+    for sql in ["SHOW latest_completed_txs", "SHOW latest_submitted_msg_ids", "SHOW latest_processed_msg_ids"] {
+        let statement = rtdb_sql::parse_control(sql, &Default::default()).unwrap().unwrap();
+        let token = session.state().cancellation().child_token();
+        let ControlResult::Rows(result) = session.execute_control(&statement, &[], &token).await.unwrap() else {
+            panic!("expected transaction status for {sql}");
+        };
+        let reported = rows(result).await;
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0][0], Value::Utf8("shop".into()));
+    }
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn database_metric_provider_uses_current_catalog_without_retaining_node_lifetime() {
     let (node, driver) = Node::open(options(), services()).await.unwrap();
     let provider = node.metrics_provider().unwrap();

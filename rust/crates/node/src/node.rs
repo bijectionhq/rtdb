@@ -632,6 +632,18 @@ impl NativeSession {
 }
 
 pub(crate) struct NativeSessionService { pub(crate) node: Node, pub(crate) identity: Arc<dyn SessionIdentity>, pub(crate) database: String }
+
+impl NativeSessionService {
+    pub(crate) fn visible_databases(&self) -> Result<BTreeMap<String, Arc<Database>>> {
+        let catalog = self.node.catalog();
+        if catalog.is_placed() {
+            let database = catalog.database(&self.database).map_err(|_| lost_placement(&self.database))?;
+            Ok(BTreeMap::from([(self.database.clone(), database)]))
+        } else {
+            Ok(catalog.open_databases())
+        }
+    }
+}
 #[async_trait]
 impl SessionService for NativeSessionService {
     fn memory(&self) -> &Arc<MemoryBudget> { self.node.memory() }
@@ -642,12 +654,23 @@ impl SessionService for NativeSessionService {
     fn now(&self) -> Timestamp { self.node.now() }
     fn query_instant(&self) -> rtdb_types::Instant { self.node.query_instant() }
     fn snapshot_basis(&self) -> Result<TimeBasis> {
-        let mut basis = self.node.snapshot_basis()?;
-        // On a placed node the other databases are other tenants': a session's basis names only its own.
-        if self.node.catalog.is_placed() { basis.databases.retain(|name, _| *name == self.database); }
-        Ok(basis)
+        if !self.node.catalog.is_placed() { return self.node.snapshot_basis(); }
+        self.node.ensure_open()?;
+        let database = self.node.catalog.database(&self.database).map_err(|_| lost_placement(&self.database))?;
+        let time = database.partition.value().live().latest_completed_tx().map(|key| key.system_time.into());
+        Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
-    async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> { self.node.await_basis(basis, timeout, cancellation).await }
+    async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
+        if !self.node.catalog.is_placed() { return self.node.await_basis(basis, timeout, cancellation).await; }
+        self.node.ensure_open()?;
+        let Some(position) = basis.as_ref().and_then(|basis| basis.databases.get(&self.database)).and_then(|positions| positions.first()) else {
+            return Ok(());
+        };
+        self.node.ensure_indexing()?;
+        let database = self.node.catalog.database(&self.database).map_err(|_| lost_placement(&self.database))?;
+        tokio::time::timeout(timeout, database.replication.await_source(SourcePosition(position.0), cancellation)).await.map_err(|_| timeout_error())??;
+        Ok(())
+    }
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), cancellation).await }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction(database, tx_id, self.identity.as_ref(), cancellation).await }
 }

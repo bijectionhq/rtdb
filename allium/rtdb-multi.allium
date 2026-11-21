@@ -2352,6 +2352,8 @@ invariant ObjectsStayInTheirLineage {
 
 invariant OneDatabasePerSession {
     -- A session's catalog contains exactly its capability's deployment; the planner cannot name another.
+    -- Placed session transaction inspection reports only the deployment's progress.
+    -- A session waits for the positions in its own deployment when applying an await token.
     -- Cross-deployment reads exist only through an explicit grant, served on the snapshot tier.
     -- For a configured user grant list, an exact database rule takes precedence over the user's default rule, including during gateway reconnection.
     for session in Sessions:
