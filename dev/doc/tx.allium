@@ -21,6 +21,8 @@
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
 -- Compatible nested fields and union legs retain their value buffers when encoding changes their declared layout.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
+-- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
+-- EPOCH_NANOS_BE(CURRENT_TIMESTAMP) encodes that instant as eight unsigned big-endian bytes without rounding.
 --
 -- == Frontend parity (the point of this spec) ==
 --

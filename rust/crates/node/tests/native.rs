@@ -2474,6 +2474,20 @@ async fn index_flush(node: &Node, database: &Database) {
 }
 
 #[tokio::test]
+async fn an_ordered_sql_write_can_encode_its_own_revision_exactly() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let ordered = index_sql(&mut session,
+        "INSERT INTO revisions (_id, value) VALUES (1,
+            OVERLAY(X'6162' PLACING EPOCH_NANOS_BE(CURRENT_TIMESTAMP) FROM 2 FOR 0))").await;
+    let word = (u64::try_from(ordered.0).unwrap() * 1_000).to_be_bytes();
+    let expected = [b"a".as_slice(), &word, b"b"].concat();
+    assert_eq!(rows(session.query_sql("SELECT value FROM revisions", vec![]).await.unwrap()).await,
+        [vec![Value::Binary(expected)]]);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_index_declaration_if_not_exists_preserves_the_definition() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
@@ -2543,6 +2557,41 @@ async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_ba
     assert_eq!(rows(session.query_sql(old, vec![at]).await.unwrap()).await, [vec![Value::I64(1)], vec![Value::I64(2)]]);
     assert!(observer.take().is_empty());
 
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_index_gathers_projected_table_columns_at_the_original_basis() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (customer, priority, _id)").await;
+    index_sql(&mut session,
+        "INSERT INTO orders RECORDS {_id: 1, customer: 'a', priority: 3, payload: 'third'},
+         {_id: 2, customer: 'a', priority: 1, payload: 'first'}").await;
+    index_flush(&node, &database).await;
+    let past = index_sql(&mut session,
+        "INSERT INTO orders RECORDS {_id: 3, customer: 'a', priority: 2, payload: 'second'},
+         {_id: 4, customer: 'a', priority: 4}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    index_sql(&mut session, "UPDATE orders SET payload = 'changed' WHERE _id = 3").await;
+
+    observer.take();
+    let query = "SELECT payload, _id FROM orders FOR SYSTEM_TIME AS OF ? WHERE customer = 'a'
+                 ORDER BY priority, _id LIMIT 3 OFFSET 1";
+    let at = Value::Timestamp { value: past.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    assert_eq!(rows(session.query_sql(query, vec![at]).await.unwrap()).await, [
+        vec![Value::Utf8("second".into()), Value::I64(3)],
+        vec![Value::Utf8("third".into()), Value::I64(1)],
+        vec![Value::Null, Value::I64(4)],
+    ]);
+    assert!(observer.take().is_empty(), "the index selected IIDs before reading table payload");
     stop(&node, driver).await;
 }
 

@@ -313,6 +313,11 @@ impl Postings {
         )
     }
 
+    pub fn plain_column(&self, slot: usize) -> Option<&ArrayRef> {
+        self.0.layouts.get(slot)?.plain()?;
+        self.0.batch.columns().get(self.0.prefix + slot)
+    }
+
     pub fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
         self.0.encode(header, suffix)
     }

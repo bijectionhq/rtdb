@@ -200,7 +200,8 @@ struct RetainedAllocation {
     _reservation: Arc<MemoryReservation>,
 }
 
-fn attach_buffer(buffer: &Buffer, reservation: &Arc<MemoryReservation>) -> Buffer {
+/// Retains an existing allocation and its charge through this exact byte view.
+pub fn retain_buffer(buffer: &Buffer, reservation: &Arc<MemoryReservation>) -> Buffer {
     let start = std::ptr::NonNull::from(buffer.as_slice()).cast();
     let owner = Arc::new(RetainedAllocation { _buffer: buffer.clone(), _reservation: Arc::clone(reservation) });
     // SAFETY: the owner keeps the original immutable buffer alive for this slice's address and length.
@@ -208,10 +209,10 @@ fn attach_buffer(buffer: &Buffer, reservation: &Arc<MemoryReservation>) -> Buffe
 }
 
 fn attach_data(data: ArrayData, reservation: &Arc<MemoryReservation>) -> Result<ArrayData> {
-    let buffers = data.buffers().iter().map(|buffer| attach_buffer(buffer, reservation)).collect::<Vec<_>>();
+    let buffers = data.buffers().iter().map(|buffer| retain_buffer(buffer, reservation)).collect::<Vec<_>>();
     let children = data.child_data().iter().map(|child| attach_data(child.clone(), reservation)).collect::<Result<Vec<_>>>()?;
     let nulls = data.nulls().map(|nulls| {
-        let buffer = attach_buffer(nulls.buffer(), reservation);
+        let buffer = retain_buffer(nulls.buffer(), reservation);
         NullBuffer::new(BooleanBuffer::new(buffer, nulls.offset(), nulls.len()))
     });
     data.into_builder().buffers(buffers).child_data(children).nulls(nulls).build().map_err(super::arrow_error)

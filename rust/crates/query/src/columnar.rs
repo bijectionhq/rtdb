@@ -72,6 +72,49 @@ impl ColumnBatch {
         Ok(Self { columns, len: batch.batch().num_rows(), _reservation: Arc::clone(batch.reservation()) })
     }
 
+    /// Gathers nonempty positions in already resolved batches without building row objects.
+    pub fn take_rows(
+        sources: &[Self], rows: &[(usize, usize)], width: usize, memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        if rows.is_empty() || sources.iter().any(|source| source.columns.len() < width)
+            || rows.iter().any(|&(batch, row)| sources.get(batch).is_none_or(|source| row >= source.len))
+        {
+            return Err(invalid("column-gather", "Ordered row position is outside its batch"));
+        }
+        let mut reservation = memory.reserve(width.saturating_mul(256).saturating_add(256))?;
+        let mut columns = Vec::with_capacity(width);
+        for position in 0..width {
+            let scratch = rows.iter().try_fold(
+                sources.len().saturating_mul(256).saturating_add(4096),
+                |bound, &(batch, row)| {
+                    bound.checked_add(sources[batch].columns[position].bound(row)?.saturating_mul(4))
+                        .ok_or_else(size_error)
+                },
+            )?;
+            let _scratch = memory.reserve(scratch)?;
+            let mut name = "";
+            let arrow = sources.iter().map(|source| match &source.columns[position] {
+                Column::Arrow { array, field, logical } => {
+                    name = field.name();
+                    Some((array.data_type() != &DataType::Null)
+                        .then(|| (array.clone(), field.clone(), logical.clone())))
+                }
+                Column::Values(_) => None,
+            }).collect::<Option<Vec<_>>>();
+            let column = match arrow {
+                Some(arrow) => gather_cells(&arrow, rows, name)?,
+                None => Column::Values(rows.iter().map(|&(batch, row)| {
+                    sources[batch].columns[position].value(row)
+                }).collect::<Result<_>>()?),
+            };
+            let retained = column.retained_bytes()?;
+            let lease = Arc::get_mut(&mut reservation).expect("ordered gather owns its reservation");
+            lease.grow_to(lease.bytes().checked_add(retained).ok_or_else(size_error)?)?;
+            columns.push(column);
+        }
+        Self::settled(columns, rows.len(), reservation)
+    }
+
     /// A page of rows as columns of values, charged as each column is built.
     pub fn from_page(page: &OwnedPage, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = page.rows().first().map_or(0, |row| row.values.len());
@@ -188,6 +231,10 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
         let index = fields.iter().position(|field| field.name() == name)?;
         Some((Arc::clone(source.put.column(index)), Arc::clone(&fields[index]), source.batch.put_field_type(index).cloned()))
     }).collect();
+    gather_cells(&children, cells, name)
+}
+
+fn gather_cells(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalType>)>], cells: &[(usize, usize)], name: &str) -> Result<Column> {
     let Some((_, field, logical)) = children.iter().flatten().next().cloned() else {
         return Ok(Column::Arrow {
             array: Arc::new(arrow_array::NullArray::new(cells.len())),
@@ -208,8 +255,8 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
         }
     }
     if !uniform {
-        if let Some(column) = joined_nullable(&children, cells, &field, &logical)? { return Ok(column); }
-        if let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
+        if let Some(column) = joined_nullable(children, cells, &field, &logical)? { return Ok(column); }
+        if let Some(column) = joined_union(children, cells, name)? { return Ok(column); }
     }
     cells.iter().map(|&(source, offset)| match &children[source] {
         None => Ok(Value::Null),
@@ -890,6 +937,33 @@ mod tests {
     }
     fn arrow(array: ArrayRef, scalar: ScalarType) -> Column {
         Column::Arrow { field: Arc::new(ArrowField::new("c", array.data_type().clone(), true)), array, logical: Some(LogicalType::Scalar(scalar)) }
+    }
+
+    #[test]
+    fn ordered_gather_interleaves_arrow_batches_and_preserves_missing_cells() {
+        let memory = MemoryBudget::new(1 << 20);
+        let page = |columns| ColumnBatch::settled(columns, 2, memory.reserve(0).unwrap()).unwrap();
+        let sources = [
+            page(vec![
+                arrow(Arc::new(Int64Array::from(vec![10, 20])), ScalarType::I64),
+                Column::Arrow {
+                    array: Arc::new(arrow_array::NullArray::new(2)),
+                    field: Arc::new(ArrowField::new("c", DataType::Null, true)),
+                    logical: Some(LogicalType::Null),
+                },
+            ]),
+            page(vec![
+                arrow(Arc::new(Int64Array::from(vec![30, 40])), ScalarType::I64),
+                arrow(Arc::new(StringArray::from(vec!["first", "second"])), ScalarType::Utf8),
+            ]),
+        ];
+        let result = ColumnBatch::take_rows(&sources, &[(1, 1), (0, 0), (1, 0)], 2, &memory).unwrap();
+        assert!(result.columns.iter().all(|column| matches!(column, Column::Arrow { .. })));
+        assert_eq!(result.columns[0].value(0).unwrap(), Value::I64(40));
+        assert_eq!(result.columns[0].value(1).unwrap(), Value::I64(10));
+        assert_eq!(result.columns[1].value(0).unwrap(), Value::Utf8("second".into()));
+        assert_eq!(result.columns[1].value(1).unwrap(), Value::Null);
+        assert_eq!(result.columns[1].value(2).unwrap(), Value::Utf8("first".into()));
     }
 
     fn batch(random: &mut Random, rows: usize, memory: &Arc<MemoryBudget>) -> ColumnBatch {

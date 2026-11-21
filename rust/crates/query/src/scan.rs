@@ -432,7 +432,7 @@ impl Part {
     fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts } }
 }
 
-async fn ordered(scan: &Scan, execution: &Execution, limit: usize, projection: &[usize], covered_only: bool) -> Result<Option<crate::OrderedScan>> {
+async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usize>, projection: &[usize]) -> Result<Option<crate::OrderedScan>> {
     if scan.ordered_top_k.is_none() || scan.iids.is_some() || !scan.matches.is_empty() {
         return Ok(None);
     }
@@ -449,7 +449,7 @@ async fn ordered(scan: &Scan, execution: &Execution, limit: usize, projection: &
         verifier: &verifier, partitions: &database.partitions,
     };
     for accelerator in context.accelerators.iter() {
-        if let Some(output) = accelerator.ordered(&request, limit, projection, covered_only).await? {
+        if let Some(output) = accelerator.ordered(&request, window.clone(), projection).await? {
             return Ok(Some(output));
         }
     }
@@ -463,21 +463,27 @@ pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usi
         Some(positions) => positions,
         None => { full = (0..scan.columns.len()).collect::<Vec<_>>(); &full }
     };
-    let Some(output) = ordered(scan, execution, limit, positions, projection.is_some()).await? else { return Ok(None); };
+    let Some(output) = ordered(scan, execution, offset..limit, positions).await? else { return Ok(None); };
     Ok(Some(match output {
         crate::OrderedScan::Covered(batches) => {
-            OrderedInput::Batches(Box::new(CoveredBatches { batches, context: Arc::clone(&execution.context), offset }))
+            OrderedInput::Batches(Box::new(CoveredBatches { batches, context: Arc::clone(&execution.context) }))
         }
         crate::OrderedScan::Iids(iids) => {
-            if projection.is_some() { return Ok(None); }
-            let memory = execution.context.memory.reserve(iids.capacity().saturating_mul(size_of::<Iid>() + 32))?;
+            let memory = execution.context.memory.reserve(
+                iids.capacity().saturating_mul(size_of::<Iid>() + 32).saturating_add(positions.len().saturating_mul(256)),
+            )?;
             let mut scan = scan.clone();
+            scan.columns = positions.iter().map(|&position| scan.columns.get(position).cloned()
+                .ok_or_else(|| invalid("ordered-column", "Ordered projection is outside the scan schema")))
+                .collect::<Result<_>>()?;
             let width = scan.columns.len();
             let iid_at = include_iid(&mut scan)?;
             scan.ordered_top_k = None;
             scan.top_k = None;
             scan.predicates.clear();
-            OrderedInput::Rows(Box::new(OrderedRows { scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory }))
+            OrderedInput::Batches(Box::new(OrderedPayload {
+                scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory,
+            }))
         }
     }))
 }
@@ -485,29 +491,19 @@ pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usi
 struct CoveredBatches {
     batches: Box<dyn crate::OrderedBatches>,
     context: Arc<crate::QueryContext>,
-    offset: usize,
 }
 
 #[async_trait]
 impl crate::columnar::BatchCursor for CoveredBatches {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         self.context.check_cancelled()?;
-        while let Some(batch) = self.batches.next_batch().await? {
-            let rows = batch.batch().num_rows();
-            if self.offset >= rows {
-                self.offset -= rows;
-                continue;
-            }
-            let offset = std::mem::take(&mut self.offset);
-            let batch = if offset == 0 { batch } else { batch.slice(offset, rows - offset)? };
-            return crate::columnar::ColumnBatch::from_owned(batch).map(Some);
-        }
-        Ok(None)
+        self.batches.next_batch().await?.map(crate::columnar::ColumnBatch::from_owned).transpose()
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
         span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
         span.attribute("scan_ordered_covered", rtdb_plan::TraceValue::Unsigned(1));
+        self.batches.trace_attributes(span);
     }
 }
 
@@ -523,7 +519,7 @@ fn include_iid(scan: &mut Scan) -> Result<usize> {
     Ok(position)
 }
 
-struct OrderedRows {
+struct OrderedPayload {
     scan: Scan,
     execution: Execution,
     selected: std::vec::IntoIter<Iid>,
@@ -533,37 +529,41 @@ struct OrderedRows {
 }
 
 #[async_trait]
-impl PageCursor for OrderedRows {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+impl crate::columnar::BatchCursor for OrderedPayload {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        self.execution.context.check_cancelled()?;
         let ids: Vec<_> = self.selected.by_ref().take(128).collect();
         if ids.is_empty() { return Ok(None); }
         let memory = &self.execution.context.memory;
-        let _scratch = memory.reserve(ids.len() * 192)?;
+        let _scratch = memory.reserve(ids.len() * 256)?;
         let mut scan = self.scan.clone();
         scan.iids = Some(ids.iter().copied().collect());
         let mut source = ScanCursor::new(scan, self.execution.clone(), None).await?;
         let mut found = BTreeMap::new();
-        while let Some(mut page) = source.next_page().await? {
-            while let Some(mut row) = page.next() {
-                let Value::FixedSizeBinary(iid) = &row.values[self.iid_at] else {
-                    return Err(invalid("ordered-row-iid", "Ordered scan row has no IID"));
-                };
-                let iid = Iid::from_slice(iid)?;
-                row.values.truncate(self.width);
-                if found.insert(iid, row).is_some() {
+        let mut batches = Vec::new();
+        while let Some(batch) = source.next_batch().await? {
+            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[self.iid_at] else {
+                return Err(invalid("ordered-row-iid", "Ordered scan returned no IID array"));
+            };
+            let iids = rtdb_columnar::IidView::new(array.as_ref())?;
+            for row in 0..batch.len {
+                let iid = iids.get(row)?;
+                let position = (batches.len(), row);
+                if found.insert(iid, position).is_some() {
                     return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
                 }
             }
+            batches.push(batch);
         }
-        let mut output = crate::pages::PageBuilder::new(ids.len(), memory)?;
-        for iid in ids {
-            output.push(found.remove(&iid).ok_or_else(|| invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis"))?)?;
-        }
-        Ok(Some(output.finish()))
+        let order = ids.into_iter().map(|iid| found.remove(&iid)
+            .ok_or_else(|| invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis")))
+            .collect::<Result<Vec<_>>>()?;
+        crate::columnar::ColumnBatch::take_rows(&batches, &order, self.width, memory).map(Some)
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
         span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("scan_ordered_payload_batches", rtdb_plan::TraceValue::Unsigned(1));
     }
 }
 

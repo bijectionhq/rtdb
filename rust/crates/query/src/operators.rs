@@ -140,7 +140,7 @@ fn passthrough(expressions: &[NamedExpr], schema: &Schema, positions: &[usize]) 
     }).collect()
 }
 
-/// Opens a covered ordered result directly as Arrow when the outer projections only select columns.
+/// Opens an ordered result as batches when the outer projections only select columns.
 pub(crate) fn build_ordered_columns(
     runtime: Arc<EmittedRelation>,
     execution: Execution,

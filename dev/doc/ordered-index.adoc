@@ -14,7 +14,8 @@ The scan can reverse the index order and applies predicates before counting rows
 When all predicates and result columns are covered, the seek emits Arrow result batches from the index as the caller pulls them.
 The seek evaluates predicates against posting cells and gathers only the requested output columns through plain projections.
 Tracing and EXPLAIN ANALYZE observe the same batch cursor.
-When the query needs additional fields, the scan fetches them from the table at the same basis.
+When the query needs additional fields, the scan fetches those columns by IID from the table at the same basis.
+It maps the ordered IIDs to batch and row offsets and gathers the requested columns in index order.
 
 For a ranked full-text query, a bounded seek on a structured predicate can supply an IID scope before MATCH candidates are scored.
 This uses the same captured snapshot and point instants as the text query.
@@ -48,7 +49,10 @@ Correction spans refer to rows of index-owned Arrow key batches.
 A correction page persists only its own spans as Arrow columns for validity endpoints and keys, with an IID and span count for each row group.
 Branch fences and the revision directory carry the remaining tree metadata.
 Each read or maintenance cycle owns its page buffers and its live replay state.
-Covered results own their projected buffers independently of the page read.
+On standalone reads without an erase permit, a forward contiguous run from one leaf can share the selected text or binary value bytes.
+The output has rebased offsets and carries the backing allocation's memory reservation.
+Hosted reads and other covered selections gather their projected cells into independent buffers.
+The scan traces how many covered rows it slices and gathers.
 Ordered-index inputs bypass the persistent node cache, and replay reads its source bytes within the cycle's memory budget.
 Cold page reads carry the published size into a bounded provider fetch and validate the digest before opening Arrow buffers.
 The page admission and memory reservation stay with the provider operation through cancellation.

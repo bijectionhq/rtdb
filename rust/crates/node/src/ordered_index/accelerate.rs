@@ -1,16 +1,22 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, BinaryHeap},
+    ops::Range as RowRange,
 };
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, GenericByteArray, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
+    types::ByteArrayType,
 };
+use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, to_field};
+use rtdb_columnar::{
+    BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, retain_buffer, to_field,
+};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
 use rtdb_query::{OrderedBatches, OrderedScan, ScanAccelerator, ScanRequest};
 use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
@@ -33,7 +39,7 @@ pub(crate) struct OrderedIndexAccelerator;
 #[async_trait]
 impl ScanAccelerator for OrderedIndexAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        Ok(match exact(request, None, &[], false).await? {
+        Ok(match exact(request, None, &[]).await? {
             Some(OrderedScan::Iids(ids)) => Some(ids.into_iter().collect()),
             _ => None,
         })
@@ -42,22 +48,20 @@ impl ScanAccelerator for OrderedIndexAccelerator {
     async fn ordered(
         &self,
         request: &ScanRequest<'_>,
-        limit: usize,
+        window: RowRange<usize>,
         projection: &[usize],
-        covered_only: bool,
     ) -> Result<Option<OrderedScan>> {
-        if limit > MAX_CANDIDATES {
+        if window.end > MAX_CANDIDATES {
             return Ok(None);
         }
-        exact(request, Some(limit), projection, covered_only).await
+        exact(request, Some(window), projection).await
     }
 }
 
 async fn exact(
     request: &ScanRequest<'_>,
-    limit: Option<usize>,
+    window: Option<RowRange<usize>>,
     projection: &[usize],
-    covered_only: bool,
 ) -> Result<Option<OrderedScan>> {
     let table = &request.scan.table.name.table;
     if table.schema == super::CATALOG.0
@@ -68,7 +72,7 @@ async fn exact(
     {
         return Ok(None);
     }
-    match seek(request, limit, projection, covered_only).await {
+    match seek(request, window, projection).await {
         Err(error) if error.category == AnomalyCategory::Interrupted => Err(error),
         Err(_) => Ok(None),
         found => found,
@@ -77,9 +81,8 @@ async fn exact(
 
 async fn seek(
     request: &ScanRequest<'_>,
-    limit: Option<usize>,
+    window: Option<RowRange<usize>>,
     projection: &[usize],
-    covered_only: bool,
 ) -> Result<Option<OrderedScan>> {
     let definitions = definitions(
         request.database,
@@ -106,12 +109,13 @@ async fn seek(
             })
             .collect();
         let range = Range::bind(request, &fields).await?;
-        let top = if let Some(limit) = limit {
+        let top = if let Some(window) = &window {
             let Some((reverse, distinct_slot)) = order(request, &fields, &range) else {
                 continue;
             };
             Some(Top {
-                limit,
+                limit: window.end,
+                offset: window.start,
                 reverse,
                 distinct_slot,
             })
@@ -121,16 +125,7 @@ async fn seek(
             }
             None
         };
-        if let Some(found) = use_index(
-            request,
-            definition,
-            &fields,
-            range,
-            top,
-            projection,
-            covered_only,
-        )
-        .await?
+        if let Some(found) = use_index(request, definition, &fields, range, top, projection).await?
         {
             return Ok(Some(found));
         }
@@ -426,6 +421,7 @@ fn operands<'a>(
 #[derive(Clone, Copy)]
 struct Top {
     limit: usize,
+    offset: usize,
     reverse: bool,
     distinct_slot: Option<usize>,
 }
@@ -575,7 +571,6 @@ async fn use_index(
     range: Range,
     top: Option<Top>,
     projection: &[usize],
-    covered_only: bool,
 ) -> Result<Option<OrderedScan>> {
     let residuals = request
         .scan
@@ -602,10 +597,7 @@ async fn use_index(
     } else {
         None
     };
-    if covered_only && projection.is_none() {
-        return Ok(None);
-    }
-    if top.is_some_and(|top| top.limit == 0) {
+    if top.is_some_and(|top| top.offset >= top.limit) {
         return Ok(Some(if projection.is_some() {
             OrderedScan::Covered(Box::new(CoveredSeek::empty()))
         } else {
@@ -671,9 +663,12 @@ async fn use_index(
                 predicates,
                 distinct_slot,
                 last: None,
-                remaining: top.limit,
+                skip: top.offset,
+                remaining: top.limit - top.offset,
             }),
             first: None,
+            sliced_rows: 0,
+            gathered_rows: 0,
         };
         seek.first = seek.next_batch().await?;
         return Ok(Some(OrderedScan::Covered(Box::new(seek))));
@@ -718,6 +713,9 @@ async fn use_index(
         }
     }
     filter_payload(request, residuals, &mut pending, &mut selected).await?;
+    if let Some(top) = top {
+        drop(selected.drain(..top.offset.min(selected.len())));
+    }
     Ok(Some(OrderedScan::Iids(selected)))
 }
 
@@ -776,6 +774,7 @@ struct CoveredState {
     predicates: Vec<Predicate>,
     distinct_slot: Option<usize>,
     last: Option<Head>,
+    skip: usize,
     remaining: usize,
     scan: PostingScan,
 }
@@ -783,6 +782,8 @@ struct CoveredState {
 struct CoveredSeek {
     state: Option<CoveredState>,
     first: Option<OwnedBatch>,
+    sliced_rows: u64,
+    gathered_rows: u64,
 }
 
 impl CoveredSeek {
@@ -790,6 +791,8 @@ impl CoveredSeek {
         Self {
             state: None,
             first: None,
+            sliced_rows: 0,
+            gathered_rows: 0,
         }
     }
 }
@@ -826,11 +829,21 @@ impl OrderedBatches for CoveredSeek {
                 }
                 state.last = Some(head.clone());
             }
+            if state.skip != 0 {
+                state.skip -= 1;
+                continue;
+            }
             rows.push(head);
         }
         let batch = if rows.is_empty() {
             None
+        } else if state.scan.tree.shares_result_buffers()
+            && let Some(slice) = state.projection.slice(&state.scan.tree.memory, &rows)?
+        {
+            self.sliced_rows += rows.len() as u64;
+            Some(slice)
         } else {
+            self.gathered_rows += rows.len() as u64;
             Some(state.projection.batch(&state.scan.tree.memory, &rows)?)
         };
         state.remaining -= rows.len();
@@ -840,6 +853,17 @@ impl OrderedBatches for CoveredSeek {
             self.state = None;
         }
         Ok(batch)
+    }
+
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        span.attribute(
+            "scan_ordered_sliced_rows",
+            rtdb_plan::TraceValue::Unsigned(self.sliced_rows),
+        );
+        span.attribute(
+            "scan_ordered_gathered_rows",
+            rtdb_plan::TraceValue::Unsigned(self.gathered_rows),
+        );
     }
 }
 
@@ -938,6 +962,52 @@ impl Covered {
         }))
     }
 
+    fn slice(&self, memory: &Arc<MemoryBudget>, rows: &[Head]) -> Result<Option<OwnedBatch>> {
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        if self.columns.is_empty()
+            || rows
+                .iter()
+                .enumerate()
+                .any(|(offset, row)| !row.hit.follows(&first.hit, offset))
+        {
+            return Ok(None);
+        }
+        let columns = self
+            .columns
+            .iter()
+            .map(|(slot, scalar)| {
+                let (array, start, reservation) = first.hit.plain_column(*slot, rows.len())?;
+                match scalar {
+                    ScalarType::Utf8 if array.as_any().is::<StringArray>() => {
+                        Some((array, start, reservation))
+                    }
+                    ScalarType::Binary if array.as_any().is::<BinaryArray>() => {
+                        Some((array, start, reservation))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(columns) = columns else {
+            return Ok(None);
+        };
+        let mut builder = BatchBuilder::new(4096 + columns.len().saturating_mul(256), memory)?;
+        let mut arrays = Vec::with_capacity(columns.len());
+        for (array, start, reservation) in columns {
+            let range = start..start + rows.len();
+            if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+                arrays.push(slice_bytes(&mut builder, array, range, reservation)?);
+            } else if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
+                arrays.push(slice_bytes(&mut builder, array, range, reservation)?);
+            }
+        }
+        let batch =
+            RecordBatch::try_new(self.schema.clone(), arrays).map_err(super::format_error)?;
+        builder.finish(batch).map(Some)
+    }
+
     fn batch(&self, memory: &Arc<MemoryBudget>, rows: &[Head]) -> Result<OwnedBatch> {
         let mut builder = BatchBuilder::new(4096 + self.columns.len().saturating_mul(256), memory)?;
         let mut arrays = Vec::with_capacity(self.columns.len());
@@ -959,6 +1029,40 @@ impl Covered {
             .map_err(super::format_error)?;
         builder.finish(batch)
     }
+}
+
+fn slice_bytes<T: ByteArrayType<Offset = i32>>(
+    builder: &mut BatchBuilder,
+    array: &GenericByteArray<T>,
+    rows: std::ops::Range<usize>,
+    reservation: &Arc<MemoryReservation>,
+) -> Result<ArrayRef> {
+    // Expose only the selected byte window, including at the Arrow C data boundary.
+    let offsets = &array.value_offsets()[rows.start..=rows.end];
+    let base = offsets[0];
+    let length = (offsets[offsets.len() - 1] - base) as usize;
+    let bound = length
+        .saturating_add(offsets.len().saturating_mul(16))
+        .saturating_add(1024);
+    builder.column(bound, || {
+        let values = retain_buffer(
+            &array.values().slice_with_length(base as usize, length),
+            reservation,
+        );
+        let offsets = OffsetBuffer::new(
+            offsets
+                .iter()
+                .map(|offset| offset - base)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        let nulls = array
+            .nulls()
+            .map(|_| NullBuffer::from(rows.map(|row| !array.is_null(row)).collect::<Vec<_>>()));
+        let array =
+            GenericByteArray::<T>::try_new(offsets, values, nulls).map_err(super::format_error)?;
+        Ok(Arc::new(array))
+    })
 }
 
 fn covered_array<'a>(
@@ -1086,5 +1190,38 @@ impl Ord for Head {
 impl PartialOrd for Head {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_values_share_only_the_selected_byte_window() {
+        let memory = MemoryBudget::new(1 << 20);
+        let reservation = memory.reserve(64 * 1024).unwrap();
+        let source = StringArray::from(vec![
+            Some("before"),
+            Some("alpha"),
+            None,
+            Some("omega"),
+            Some("after"),
+        ]);
+        let start = source.values().as_ptr().wrapping_add("before".len());
+        let mut builder = BatchBuilder::new(4096, &memory).unwrap();
+        let result = slice_bytes(&mut builder, &source, 1..4, &reservation).unwrap();
+        let result_values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result_values.values().as_slice(), b"alphaomega");
+        assert_eq!(result_values.values().as_ptr(), start);
+        assert_eq!(result_values.value_offsets(), &[0, 5, 5, 10]);
+        assert!(result_values.is_null(1));
+
+        drop(source);
+        drop(reservation);
+        drop(builder);
+        assert_eq!(memory.used_bytes(), 64 * 1024);
+        drop(result);
+        assert_eq!(memory.used_bytes(), 0);
     }
 }

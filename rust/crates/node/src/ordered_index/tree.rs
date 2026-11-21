@@ -415,6 +415,10 @@ impl Tree {
         })
     }
 
+    pub fn shares_result_buffers(&self) -> bool {
+        self.permit.is_none()
+    }
+
     pub fn page_scope(&self) -> IndexPageScope<'_> {
         IndexPageScope {
             index: &self.directory,
@@ -929,6 +933,22 @@ impl Hit {
 
     pub fn key(&self) -> KeyRef<'_> {
         self.leaf().key(self.row)
+    }
+
+    pub fn follows(&self, first: &Self, distance: usize) -> bool {
+        Arc::ptr_eq(&self.node, &first.node) && first.row.checked_add(distance) == Some(self.row)
+    }
+
+    pub fn plain_column(
+        &self,
+        slot: usize,
+        length: usize,
+    ) -> Option<(&arrow_array::ArrayRef, usize, &Arc<MemoryReservation>)> {
+        let postings = self.leaf().postings.as_ref()?;
+        if self.row.checked_add(length)? > postings.len() {
+            return None;
+        }
+        Some((postings.plain_column(slot)?, self.row, &self.node._memory))
     }
 
     pub fn into_entry(self) -> Entry {
