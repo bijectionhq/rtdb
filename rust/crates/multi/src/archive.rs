@@ -248,6 +248,11 @@ impl ObjectStore for CheckpointStore {
         Ok(metadata)
     }
 
+    async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        if self.archive.objects.contains_key(key) { return Ok(None); }
+        self.serving.retirement_version(key).await
+    }
+
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         match self.archive.objects.get(key) {
             Some(object) => self.archive.seal_for_serving(key, object).await,

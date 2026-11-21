@@ -253,6 +253,7 @@ mod tests {
     use object_store::path::Path;
 
     use super::*;
+    use rtdb_storage::ObjectStore;
     use crate::{S3Config, S3Credentials};
 
     #[tokio::test]
@@ -274,6 +275,26 @@ mod tests {
         client.put_bucket_versioning().bucket(&bucket)
             .versioning_configuration(VersioningConfiguration::builder().status(BucketVersioningStatus::Enabled).build())
             .send().await.unwrap();
+
+        let cell = config.open_cell(&root, &remotes, rtdb_storage::IoRegion::new()).await.unwrap();
+        let observed_key = ObjectKey::new("observed/logical ~file").unwrap();
+        let physical_key = Path::from(format!("{}/{observed_key}", inventory.root)).to_string();
+        assert_eq!(cell.retirement_version(&observed_key).await.unwrap(), None);
+        let initial = client.put_object().bucket(&bucket).key(&physical_key)
+            .body(ByteStream::from_static(b"old version")).send().await.unwrap();
+        let observed = cell.retirement_version(&observed_key).await.unwrap().unwrap();
+        assert_eq!(observed.namespace.bucket, bucket);
+        assert_eq!(observed.namespace.endpoint, Some(endpoint_url.to_string()));
+        assert_eq!(observed.namespace.region.as_deref(), Some("us-east-1"));
+        assert_eq!(observed.key, physical_key);
+        assert_eq!(Some(observed.version.as_str()), initial.version_id());
+        let latest = client.put_object().bucket(&bucket).key(&physical_key)
+            .body(ByteStream::from_static(b"new version")).send().await.unwrap();
+        assert_ne!(initial.version_id(), latest.version_id());
+        client.delete_object().bucket(&bucket).key(&observed.key).version_id(&observed.version).send().await.unwrap();
+        assert_eq!(cell.get(&observed_key).await.unwrap().as_ref(), b"new version");
+        inventory.purge(&ObjectKey::new("observed").unwrap()).await.unwrap();
+        cell.close_and_wait().await;
 
         let upload_key = ObjectKey::new("managed/upload").unwrap();
         let upload_path = Path::from(format!("{}/{upload_key}", inventory.root));

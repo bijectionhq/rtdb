@@ -1,0 +1,95 @@
+{
+  "summary": "S3 retirement observations require a nonempty, non-null provider version.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "allow_empty": {
+      "defect": "An empty provider header is counted as evidence of an immutable version.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/remote_version_step.rs",
+          "find": "    !version.is_empty() && !(version.len() == 4 && version[0] == b'n' && version[1] == b'u' && version[2] == b'l' && version[3] == b'l')",
+          "replace": "    !(version.len() == 4 && version[0] == b'n' && version[1] == b'u' && version[2] == b'l' && version[3] == b'l')"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/remote_version_step.rs",
+          "function": "valid_object_version",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "allow_empty_and_contract": {
+      "defect": "An empty provider header is counted as evidence of an immutable version.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/remote_version_step.rs",
+          "find": "    !version.is_empty() && !(version.len() == 4 && version[0] == b'n' && version[1] == b'u' && version[2] == b'l' && version[3] == b'l')",
+          "replace": "    !(version.len() == 4 && version[0] == b'n' && version[1] == b'u' && version[2] == b'l' && version[3] == b'l')"
+        },
+        {
+          "file": "rust/crates/storage/src/remote_version_step.rs",
+          "find": "    ensures accepted <==> version@.len() > 0\n        && !(version@.len() == 4 && version@[0] == 110 && version@[1] == 117 && version@[2] == 108 && version@[3] == 108),",
+          "replace": "    ensures accepted <==> !(version@.len() == 4 && version@[0] == 110 && version@[1] == 117 && version@[2] == 108 && version@[3] == 108),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/s3_object_version/laws.rs",
+          "function": "an_empty_version_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "allow_null": {
+      "defect": "A replaceable null version is counted as evidence of an immutable version.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/remote_version_step.rs",
+          "find": "    !version.is_empty() && !(version.len() == 4 && version[0] == b'n' && version[1] == b'u' && version[2] == b'l' && version[3] == b'l')",
+          "replace": "    !version.is_empty()"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/remote_version_step.rs",
+          "function": "valid_object_version",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "allow_null_and_contract": {
+      "defect": "A replaceable null version is counted as evidence of an immutable version.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/remote_version_step.rs",
+          "find": "    !version.is_empty() && !(version.len() == 4 && version[0] == b'n' && version[1] == b'u' && version[2] == b'l' && version[3] == b'l')",
+          "replace": "    !version.is_empty()"
+        },
+        {
+          "file": "rust/crates/storage/src/remote_version_step.rs",
+          "find": "    ensures accepted <==> version@.len() > 0\n        && !(version@.len() == 4 && version@[0] == 110 && version@[1] == 117 && version@[2] == 108 && version@[3] == 108),",
+          "replace": "    ensures accepted <==> version@.len() > 0"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/s3_object_version/laws.rs",
+          "function": "a_null_version_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

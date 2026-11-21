@@ -2,7 +2,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_format::keys::{TRIE_RETIREMENT_DIRECTORY, TrieKey};
 use rtdb_index::PartitionValue;
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_types::{CatalogCut, ReplicaPosition, Result, TableRef};
+use rtdb_types::{CatalogCut, PhysicalObjectVersion, ReplicaPosition, Result, TableRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -12,10 +12,25 @@ use crate::TrieDeletionPublisher;
 const MAXIMUM_INTENT_BYTES: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize)]
+pub(crate) struct RetirementFile {
+    key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<PhysicalObjectVersion>,
+}
+
+impl RetirementFile {
+    pub(crate) async fn observe(store: &dyn ObjectStore, key: &ObjectKey) -> Result<Self> {
+        Ok(Self { key: key.to_string(), version: store.retirement_version(key).await? })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct Intent {
     selected: CatalogCut,
     table: TableRef,
     tries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files: Vec<RetirementFile>,
 }
 
 pub(crate) struct PendingRetirement {
@@ -41,8 +56,8 @@ impl PendingRetirement {
         })
     }
 
-    pub async fn stage(store: &dyn ObjectStore, selected: CatalogCut, table: &TableRef, keys: &[TrieKey]) -> Result<Self> {
-        let intent = Intent { selected, table: table.clone(), tries: keys.iter().map(TrieKey::to_string).collect() };
+    pub async fn stage(store: &dyn ObjectStore, selected: CatalogCut, table: &TableRef, keys: &[TrieKey], files: Vec<RetirementFile>) -> Result<Self> {
+        let intent = Intent { selected, table: table.clone(), tries: keys.iter().map(TrieKey::to_string).collect(), files };
         let bytes = Bytes::from(serde_json::to_vec(&intent).map_err(crate::invalid)?);
         if bytes.len() > MAXIMUM_INTENT_BYTES { return Err(crate::invalid("A trie retirement intent exceeds the metadata size limit")); }
         let pending = Self::for_bytes(selected, bytes)?;

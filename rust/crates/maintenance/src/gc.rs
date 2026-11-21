@@ -10,7 +10,7 @@ use rtdb_types::{Anomaly, BlockIndex, CatalogCut, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use crate::{CycleWorker, SnapshotSource, TrieDeletionPublisher};
-use crate::retirement_intent::{self, PendingRetirement};
+use crate::retirement_intent::{self, PendingRetirement, RetirementFile};
 
 #[derive(Clone, Debug)]
 pub struct GarbageConfig {
@@ -137,37 +137,58 @@ impl TrieCollector {
 
     async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
         if keys.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
+        let chunk_size = self.config.chunk_size;
+        // A shared file belongs in the receipt of the last batch removing members
+        // of its group. Keep group releases before releases of their data files.
+        let last_group_batch: BTreeMap<_, _> = keys.iter().enumerate()
+            .filter_map(|(index, key)| key.part_group().filter(|group| groups.contains(group)).map(|group| (group, index / chunk_size)))
+            .collect();
+        let mut group_files: BTreeMap<usize, Vec<ObjectKey>> = BTreeMap::new();
+        for (group, batch) in last_group_batch {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let prefix = ObjectKey::new(entry.slug.group_artefact_prefix(&group))?;
+            group_files.entry(batch).or_default().extend(self.store.list(Some(&prefix)).await?.into_iter().map(|file| file.key));
+        }
+
         let mut batches = Vec::new();
-        for chunk in keys.chunks(self.config.chunk_size) {
-            if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let intent = match cut {
-                Some(cut) => Some(PendingRetirement::stage(self.store.as_ref(), cut, &entry.table, chunk).await?),
-                None => None,
-            };
-            batches.push((chunk, intent));
-        }
-        // A group's artefacts are derived from every member's data file, so they go before any member's.
-        for group in groups {
-            if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let artefacts = ObjectKey::new(entry.slug.group_artefact_prefix(group)).map_err(crate::invalid)?;
-            for artefact in self.store.list(Some(&artefacts)).await.map_err(crate::invalid)? {
-                self.store.delete(&artefact.key).await.map_err(crate::invalid)?;
-            }
-        }
-        for (chunk, intent) in batches {
-            if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let results = stream::iter(0..chunk.len()).map(|index| async move {
+        for (index, chunk) in keys.chunks(chunk_size).enumerate() {
+            let trie_files = stream::iter(0..chunk.len()).map(|index| async move {
                 let key = &chunk[index];
                 let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                 if cancellation.is_cancelled() { return Err(crate::closed()); }
-                // Artefacts carry the data file's content, so they go first; listing catches any whose record has not reached this catalog.
-                let artefacts = ObjectKey::new(entry.slug.artefact_prefix(key)).map_err(crate::invalid)?;
-                for artefact in self.store.list(Some(&artefacts)).await.map_err(crate::invalid)? {
-                    self.store.delete(&artefact.key).await.map_err(crate::invalid)?;
-                }
-                self.store.delete(&ObjectKey::new(entry.slug.data_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)?;
-                self.store.delete(&ObjectKey::new(entry.slug.metadata_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)
-            }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<Result<()>>>().await;
+                // Listing also catches artefacts whose records have yet to reach this catalog.
+                let prefix = ObjectKey::new(entry.slug.artefact_prefix(key))?;
+                let mut files: Vec<_> = self.store.list(Some(&prefix)).await?.into_iter().map(|object| object.key).collect();
+                files.push(ObjectKey::new(entry.slug.data_key(key))?);
+                files.push(ObjectKey::new(entry.slug.metadata_key(key))?);
+                Ok::<_, Anomaly>(files)
+            }).buffered(self.config.delete_parallelism).collect::<Vec<_>>().await;
+            let trie_files = trie_files.into_iter().collect::<Result<Vec<_>>>()?;
+            let intent = if let Some(cut) = cut {
+                let keys: Vec<_> = group_files.get(&index).into_iter().flatten().chain(trie_files.iter().flatten()).cloned().collect();
+                let files = stream::iter(keys).map(|key| async move {
+                        let _permit = deletes.acquire().await.map_err(crate::invalid)?;
+                        if cancellation.is_cancelled() { return Err(crate::closed()); }
+                        RetirementFile::observe(self.store.as_ref(), &key).await
+                    }).buffered(self.config.delete_parallelism).collect::<Vec<_>>().await;
+                let files = files.into_iter().collect::<Result<Vec<_>>>()?;
+                Some(PendingRetirement::stage(self.store.as_ref(), cut, &entry.table, chunk, files).await?)
+            } else { None };
+            batches.push((chunk, trie_files, intent));
+        }
+
+        for key in group_files.values().flatten() {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            self.store.delete(key).await?;
+        }
+        for (chunk, trie_files, intent) in batches {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let results = stream::iter(trie_files).map(|files| async move {
+                let _permit = deletes.acquire().await.map_err(crate::invalid)?;
+                if cancellation.is_cancelled() { return Err(crate::closed()); }
+                for file in files { self.store.delete(&file).await?; }
+                Ok::<_, Anomaly>(())
+            }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<_>>().await;
             for result in results { result?; }
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let position = self.publisher.publish(entry.table.clone(), chunk.to_vec()).await?;

@@ -111,6 +111,11 @@ pub trait ObjectStore: Send + Sync {
     /// Store wrappers must forward this request to the wrapped store's `head_fresh`.
     /// A missing key returns `Error::MissingObject`.
     async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> { self.head(key).await }
+    /// Observes the current provider version of a loose object owned by this store.
+    /// Missing, inherited, packed or unversioned objects return no evidence.
+    async fn retirement_version(&self, _key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        Ok(None)
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes>;
     /// Reads without creating or trusting a node-local durable cache copy.
     /// Store wrappers must forward this request across any cache boundary.

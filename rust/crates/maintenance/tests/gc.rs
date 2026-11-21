@@ -8,7 +8,7 @@ use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, Trie
 use rtdb_maintenance::{BlockCollector, CollectionObserver, CycleWorker, GarbageConfig, TrieCollector, TrieDeletionPublisher, block_is_garbage};
 use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, StorageEpoch, StorageVersion, TableRef, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, PhysicalObjectVersion, S3ObjectNamespace, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -145,6 +145,7 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
     for failed in [Removal::StopBeforeInstall, Removal::StopAfterInstall] {
         let table = TableRef::new("public", "docs");
         let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+        let tables_for_footprint = tables.clone();
         let old: TrieKey = "l01-rc-b00".parse().unwrap();
         let newer: TrieKey = "l01-rc-b01".parse().unwrap();
         let catalog = TrieCatalog::new(16).unwrap().with_tries(table.clone(), [old.clone(), newer].into_iter().map(|key| {
@@ -183,6 +184,12 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
         let staged = store.list(Some(&pending)).await.unwrap();
         assert_eq!(staged.len(), 1);
         let staged_bytes = store.get(&staged[0].key).await.unwrap();
+        let encoded: serde_json::Value = serde_json::from_slice(&staged_bytes).unwrap();
+        let slug = &tables_for_footprint.entry(&table).unwrap().slug;
+        assert_eq!(encoded["files"], serde_json::json!([
+            {"key": slug.data_key(&old)},
+            {"key": slug.metadata_key(&old)},
+        ]), "the staged intent must include the file plan");
         assert!(store.list(Some(&installed)).await.unwrap().is_empty());
         drop(owner);
         drop(store);
@@ -335,6 +342,31 @@ async fn collection_preserves_open_readers_and_their_inflight_io() {
     state.reset_to_l0(BTreeMap::new()).unwrap();
 }
 
+struct ObservedGroupStore {
+    inner: Arc<MemoryStore>,
+    group_file: ObjectKey,
+}
+
+#[async_trait]
+impl ObjectStore for ObservedGroupStore {
+    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::object_store::StoredObject> { self.inner.head(key).await }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
+    async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+    async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, path).await }
+    async fn list(&self, prefix: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::object_store::StoredObject>> { self.inner.list(prefix).await }
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
+        if key != &self.group_file { return Ok(None); }
+        self.inner.head(key).await?;
+        Ok(Some(PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: "test-cell".into(), endpoint: None, region: Some("us-east-1".into()) },
+            key: format!("test-residence/{key}"),
+            version: "group-file-version".into(),
+        }))
+    }
+}
+
 #[tokio::test]
 async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let table = TableRef::new("public", "docs");
@@ -348,23 +380,48 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let object = ObjectKey::new(entry.slug.group_artefact_prefix(&group) + "/search/body-v1.bin").unwrap();
     let store = Arc::new(MemoryStore::default());
     store.put(&object, Bytes::from_static(b"artefact")).await.unwrap();
+    let observing = Arc::new(ObservedGroupStore { inner: store.clone(), group_file: object.clone() });
     let collect = |catalog: TrieCatalog| {
-        let (store, tables, entry) = (store.clone(), tables.clone(), entry.clone());
+        let (store, observing, tables, entry) = (store.clone(), observing.clone(), tables.clone(), entry.clone());
         async move {
-            let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
+            let publisher = Arc::new(DeletedPublisher { store, table: entry, commits: Mutex::new(Vec::new()) });
             let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-            let collector = TrieCollector::new(store, state, publisher.clone(), Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
+            let cut = CatalogCut { storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0), through: ReplicaPosition(0) };
+            state.publish_catalog_cut(cut).unwrap();
+            let config = GarbageConfig { chunk_size: 1, ..unleased() };
+            let observer = Arc::new(Observer::default());
+            let collector = TrieCollector::new(observing, state, publisher.clone(), observer.clone(), config, fixed_clock()).unwrap();
             collector.collect_as_of(Timestamp(200), &CancellationToken::new()).await.unwrap();
+            assert!(observer.0.lock().unwrap().is_empty());
             publisher.commits.lock().unwrap().concat()
         }
+    };
+    let receipts = async || {
+        let installed = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/installed")).unwrap();
+        let mut recorded = Vec::new();
+        for receipt in store.list(Some(&installed)).await.unwrap() {
+            let bytes = store.get(&receipt.key).await.unwrap();
+            let intent: serde_json::Value = serde_json::from_slice(&bytes[8..]).unwrap();
+            for file in intent["files"].as_array().unwrap() {
+                if file["key"] == object.as_str() { recorded.push((intent["tries"].clone(), file["version"].clone())); }
+            }
+        }
+        recorded
     };
     let one_superseded = supersede(catalog.clone(), 0);
     assert_eq!(collect(one_superseded.clone()).await, ["l02-rc-p0-b00".parse::<TrieKey>().unwrap()]);
     assert!(store.head(&object).await.is_ok(), "three members are still live");
+    assert!(receipts().await.is_empty());
     let collected = one_superseded.without_tries(&table, &["l02-rc-p0-b00".parse().unwrap()].into());
     let all_superseded = (1..4).fold(collected, supersede);
-    assert_eq!(collect(all_superseded).await.len(), 3);
+    let retired = collect(all_superseded).await;
+    assert_eq!(retired.len(), 3);
     assert!(store.head(&object).await.is_err(), "the last members take the group's artefacts with them");
+    let recorded = receipts().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, serde_json::json!([retired.last().unwrap().to_string()]));
+    assert_eq!(recorded[0].1["key"], format!("test-residence/{object}"));
+    assert_eq!(recorded[0].1["version"], "group-file-version");
 }
 
 #[tokio::test]

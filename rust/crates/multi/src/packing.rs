@@ -218,6 +218,10 @@ impl ObjectStore for PackingStore {
             other => other,
         }
     }
+    async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        if packed(key.as_str()) { return Ok(None); }
+        self.inner.retirement_version(key).await
+    }
     async fn get(&self, object: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         if let Some(bytes) = self.held(object) { return Ok(bytes); }
         if let Some((pack, entry)) = self.locate(object).await? { return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await; }

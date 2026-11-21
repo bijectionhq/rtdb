@@ -1938,6 +1938,9 @@ def verify_durable_trie_retirement(args, source):
         "skip-replay": ("if keys.iter().all(|key| !view.retains_trie(&intent.table, key)) {",
                         "if false && keys.iter().all(|key| !view.retains_trie(&intent.table, key)) {",
                         "the successor must confirm the staged removal"),
+        "omit-files": ("tries: keys.iter().map(TrieKey::to_string).collect(), files };",
+                       "tries: keys.iter().map(TrieKey::to_string).collect(), files: Vec::new() };",
+                       "the staged intent must include the file plan"),
     }
     for name, (before, after, failure) in controls.items():
         try:
@@ -1948,7 +1951,32 @@ def verify_durable_trie_retirement(args, source):
                 raise ValueError(f"trie retirement control {name} did not fail at its declared assertion")
         finally:
             journal.write_bytes(original)
-    print("rust-trie-retirement-intent: restart passed, omitting stage or replay failed")
+    print("rust-trie-retirement-intent: restart passed, omitting stage, replay or file plan failed")
+
+
+def verify_s3_object_version(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "tests::retirement_observation_accepts_only_exact_version_ids"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-s3", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-s3-object-version-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("the S3 adapter did not observe the expected version IDs")
+
+    adapter = source / "rust/crates/storage/src/remote.rs"
+    original = adapter.read_bytes()
+    try:
+        replace_once(adapter, ".filter(|version| valid_object_version(version.as_bytes()))", "")
+        checked = run_case(command, source / "rust", args.evidence, "rust-s3-object-version-bypass", env)
+        if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or "retirement observation returned an unusable provider version" not in checked.stdout
+            or "0 passed; 1 failed" not in checked.stdout):
+            raise ValueError("bypassing version validation did not fail at the expected assertion")
+    finally:
+        adapter.write_bytes(original)
+    print("rust-s3-object-version: loopback HEAD passed, bypassing validation failed")
 
 
 def verify_replay_prefix(args, source):
@@ -2572,6 +2600,13 @@ def main():
         "rust/crates/azure/src/lib.rs",
         "rust/crates/azure/tests/copy_completion.rs",
         "rust/crates/storage/src/remote.rs",
+        "rust/crates/storage/src/object_store.rs",
+        "rust/crates/storage/src/disk_cache.rs",
+        "rust/crates/s3/src/lib.rs",
+        "rust/crates/s3/src/versions.rs",
+        "rust/crates/multi/src/reference.rs",
+        "rust/crates/multi/src/archive.rs",
+        "rust/crates/types/src/position.rs",
         "rust/crates/storage/src/log/mod.rs",
         "rust/crates/storage/src/log/memory.rs",
         "rust/crates/kafka/src/lib.rs",
@@ -2633,6 +2668,7 @@ def main():
             verify_checkpoint_trie_retention(args, source)
             verify_trie_removal_readback(args, source)
             verify_durable_trie_retirement(args, source)
+            verify_s3_object_version(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
             verify_recovery_hold_replay(args, source)

@@ -828,13 +828,19 @@ If a key still appears, ordinary collection reevaluates its eligibility.
 An unreadable or invalid pending record stops that collection pass and is reported for retry on a later pass.
 The successor can release the intent marker after a durable receipt preserves its contents and records a later position in the same journal.
 Storage roots without a tracked catalog cut use the existing collection path.
-The intent digest binds the recorded selection and trie keys.
-Physical certification needs the identities observed for those keys when the intent was staged, including any shared artefact versions still held by another member.
+The intent digest binds the selection, trie keys, and recorded file plan.
+A shared artefact is recorded with the last batch retiring members of its group.
+For loose S3 objects owned by the serving residence, the collector observes the current provider version by issuing a HEAD through the store chain before recording the intent.
+Each observation carries the namespace, encoded physical key and exact version identifier.
+A missing object or header, an empty or `null` version, and an inherited, packed or archive-backed entry yield no version evidence.
+Historical intents remain readable with an empty file plan.
+A provider observation identifies one object version at observation time.
+Certification still needs evidence that the selected catalog named that publication and that every reference, including group membership, is excluded.
 The native driver now defers the trie-removal reply until the installed prefix covers its read-back position.
 It checks the requested trie keys against the current catalog and the installed checkpoint in one immutable partition value before returning a position.
 An unrecognized prefix or a removal skipped under the recovery cutoff cannot produce the reply.
 This reply is evidence of logical exclusion for the requested trie keys.
-The retirement protocol still needs identity evidence for the files and the atomic directory publication. link:../../verification/verus/trie_removal_receipt/area.json[Native receipt proof and mutation controls] · link:../../verification/verus/trie_retirement_intent/area.json[Intent receipt proof and controls]
+The retirement protocol still needs to connect publication identities to the catalog and install the certificate and admission floor together. link:../../verification/verus/trie_removal_receipt/area.json[Native receipt proof and mutation controls] · link:../../verification/verus/trie_retirement_intent/area.json[Intent receipt proof and controls]
 Publishing the certificate and its admission floor belongs in one directory CAS for that residence.
 The effect can be retried against the same certified identity after loss of a provider reply.
 A checkpoint can retain the intent or its completion through a journal trim only when the new recovery anchor supplies the same evidence.
@@ -1347,6 +1353,12 @@ A local node test observes a successful attach and a refused detach advance past
 Compiler controls reject forging and raw use of the replica admission witness.
 Each of the two new storage and compaction areas includes production-only and joint contract mutations.
 |Extend coverage from these functions to their effect paths, concurrent publication, reader protection, and ranked pipeline decisions.
+
+|Physical retirement identity
+|The trie retirement intent and installed receipt preserve the observed logical file plan and exact version metadata where the serving store can supply it.
+Verus checks the shipped S3 version classifier, with production-only and joint contract mutations.
+A loopback S3 HEAD fixture checks provider key encoding and refusal of missing, empty and replaceable version IDs.
+|Bind the observed version to catalog publication, test other storage representations, and require a directory-installed certificate before a provider erase.
 
 |Concurrent design models
 |TLC covers bounded writer admission, query capture, resolution, recovery, cache, reader I/O, and compaction publication variants.

@@ -25,6 +25,23 @@ pub struct CatalogCut {
     pub through: ReplicaPosition,
 }
 
+/// Identifies the provider namespace within which object versions are meaningful.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct S3ObjectNamespace {
+    pub bucket: String,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+}
+
+/// An observed version of a loose physical object. This carries no permission to erase it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalObjectVersion {
+    pub namespace: S3ObjectNamespace,
+    /// The exact object key as stored by S3, including provider path encoding.
+    pub key: String,
+    pub version: String,
+}
+
 const OFFSET_LIMIT: i64 = 1_i64 << 48;
 const EPOCH_LIMIT: i32 = 1_i32 << 15;
 

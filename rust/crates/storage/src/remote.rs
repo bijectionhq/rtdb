@@ -3,8 +3,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{Attribute, GetOptions, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
+use rtdb_types::{PhysicalObjectVersion, S3ObjectNamespace};
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+#[path = "remote_version_step.rs"]
+mod version_step;
+use version_step::valid_object_version;
 
 /// A provider may still be copying when its completion can no longer be established.
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +49,7 @@ pub struct RemoteStore {
     objects: Arc<RemoteObjects>,
     io: Arc<IoRegion>,
     single_put: bool,
+    version_namespace: Option<Arc<S3ObjectNamespace>>,
 }
 
 impl RemoteStore {
@@ -56,13 +62,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None }), io, single_put: false }
+        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None }), io, single_put: false, version_namespace: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None }), io, single_put: true }
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None }), io, single_put: true, version_namespace: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -73,7 +79,13 @@ impl RemoteStore {
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
         let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads) });
-        Self { objects, io, single_put: true }
+        Self { objects, io, single_put: true, version_namespace: None }
+    }
+
+    /// Enables version observations for a store backed by the specified S3 namespace.
+    pub fn with_s3_versioning(mut self, namespace: S3ObjectNamespace) -> Self {
+        self.version_namespace = Some(Arc::new(namespace));
+        self
     }
 
     /// Rejects new requests and waits for admitted operations, including requests whose callers were cancelled.
@@ -109,6 +121,24 @@ impl ObjectStore for RemoteStore {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.head(&key).await }).await
+    }
+    async fn retirement_version(&self, key: &ObjectKey) -> Result<Option<PhysicalObjectVersion>> {
+        let Some(namespace) = self.version_namespace.clone() else { return Ok(None); };
+        let objects = self.objects.clone();
+        let key = key.clone();
+        self.io.run_async(async move {
+            let path = objects.path(&key);
+            let metadata = match objects.client.head(&path).await {
+                Ok(metadata) => metadata,
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(error) => return Err(provider_error(&key, error)),
+            };
+            Ok(metadata.version.filter(|version| valid_object_version(version.as_bytes())).map(|version| PhysicalObjectVersion {
+                namespace: namespace.as_ref().clone(),
+                key: path.to_string(),
+                version,
+            }))
+        }).await
     }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());

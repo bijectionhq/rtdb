@@ -13,7 +13,7 @@ use object_store::{RetryConfig, StaticCredentialProvider, aws::{AmazonS3Builder,
 use rtdb_format::generated::xtdb::aws::proto as pb;
 use rtdb_format::keys::StorageRoot;
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, S3ObjectNamespace};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,7 +114,7 @@ impl S3Config {
             builder.with_copy_if_not_exists(S3CopyIfNotExists::Multipart)
         };
         if let Some(region) = &self.region { builder = builder.with_region(region); }
-        if let Some(endpoint) = endpoint { builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.as_str()).with_allow_http(endpoint.scheme() == "http"); }
+        if let Some(endpoint) = &endpoint { builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.as_str()).with_allow_http(endpoint.scheme() == "http"); }
         builder = match authorization {
             S3Authorization::Static(credentials) => {
                 if credentials.access_key.is_empty() || credentials.secret_key.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 credentials require nonempty access and secret keys")); }
@@ -125,16 +125,20 @@ impl S3Config {
                 builder.with_credentials(Arc::new(credential::CredentialBridge::new(provider)))
             }
         };
-        let client = builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
-        let client = Arc::new(client);
+        let namespace = S3ObjectNamespace {
+            bucket: self.bucket.clone(),
+            endpoint: endpoint.map(|endpoint| endpoint.to_string()),
+            region: builder.get_config_value(&AmazonS3ConfigKey::Region),
+        };
+        let client = Arc::new(builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?);
         if !cell {
             return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io)));
         }
         #[cfg(feature = "versioning")]
         if let Some(uploads) = uploads {
-            return Ok(Arc::new(RemoteStore::new_managed(client, prefix, io, Arc::new(uploads))));
+            return Ok(Arc::new(RemoteStore::new_managed(client, prefix, io, Arc::new(uploads)).with_s3_versioning(namespace)));
         }
-        Ok(Arc::new(RemoteStore::new_single_put(client, prefix, io)))
+        Ok(Arc::new(RemoteStore::new_single_put(client, prefix, io).with_s3_versioning(namespace)))
     }
 
     #[cfg(feature = "versioning")]
@@ -253,5 +257,60 @@ mod tests {
         config.path_style_access_enabled = false;
         config.endpoint = Some("http://127.0.0.1:9000".into());
         assert!(!config.endpoint_addressing().unwrap().1);
+    }
+    #[tokio::test]
+    async fn retirement_observation_accepts_only_exact_version_ids() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut config = S3Config::new("cell");
+        config.endpoint = Some(endpoint.clone());
+        config.region = Some("us-east-1".into());
+        config.credentials = Some(S3Credentials { access_key: "test".into(), secret_key: "test-secret".into() });
+        let root = ObjectKey::new("encoded root").unwrap();
+        let file = ObjectKey::new("data/loose file").unwrap();
+        let store = config.open_cell(&root, &std::collections::BTreeMap::new(), IoRegion::new()).await.unwrap();
+        let responses = [
+            ("200 OK", "x-amz-version-id: version+/=\r\n"),
+            ("200 OK", "x-amz-version-id: null\r\n"),
+            ("200 OK", "x-amz-version-id:\r\n"),
+            ("200 OK", ""),
+            ("404 Not Found", ""),
+        ];
+        let server = tokio::spawn(async move {
+            for (status, version_header) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "HEAD /cell/encoded%20root/data/loose%20file HTTP/1.1\r\n");
+                while line != "\r\n" {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                }
+                let reply = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n{version_header}\r\n");
+                reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let result = async {
+            let observed = store.retirement_version(&file).await.unwrap().unwrap();
+            assert_eq!(observed, rtdb_types::PhysicalObjectVersion {
+                namespace: S3ObjectNamespace {
+                    bucket: "cell".into(),
+                    endpoint: Some(format!("{endpoint}/")),
+                    region: Some("us-east-1".into()),
+                },
+                key: "encoded root/data/loose file".into(),
+                version: "version+/=".into(),
+            });
+            for _ in 0..4 {
+                assert_eq!(store.retirement_version(&file).await.unwrap(), None, "retirement observation returned an unusable provider version");
+            }
+            server.await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), result).await.unwrap();
+        store.close_and_wait().await;
     }
 }
