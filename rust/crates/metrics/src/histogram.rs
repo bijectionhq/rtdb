@@ -6,9 +6,12 @@ const MAX_ROTATION_MS: i64 = 60_000;
 const QUANTILES: [f64; 6] = [75.0, 85.0, 95.0, 98.0, 99.0, 99.9];
 
 // HdrHistogram's precision-one double layout: https://github.com/HdrHistogram/HdrHistogram/blob/HdrHistogram-2.2.2/src/main/java/org/HdrHistogram/DoubleHistogram.java
-struct DoubleHistogram<const BINS: usize, const MIN: i32> { bins: [i64; BINS], count: i64, low_exponent: i32, range_exponent: i32, minimum: Option<usize>, maximum: usize }
+struct DoubleHistogram<const BINS: usize, const MIN: i32> { bins: Box<[i64; BINS]>, count: i64, low_exponent: i32, range_exponent: i32, minimum: Option<usize>, maximum: usize }
 impl<const BINS: usize, const MIN: i32> DoubleHistogram<BINS, MIN> {
-    fn new() -> Self { Self { bins: [0; BINS], count: 0, low_exponent: 800, range_exponent: 3, minimum: None, maximum: 0 } }
+    fn new() -> Self {
+        let bins = vec![0; BINS].into_boxed_slice().try_into().expect("the allocation has exactly BINS counters");
+        Self { bins, count: 0, low_exponent: 800, range_exponent: 3, minimum: None, maximum: 0 }
+    }
     fn empty_like(&self) -> Self { Self { range_exponent: self.range_exponent, ..Self::new() } }
     fn reset(&mut self) { self.bins.fill(0); self.count = 0; self.low_exponent = 800; self.minimum = None; self.maximum = 0; }
     fn nonzero_bounds(&self) -> Option<(i32, i32)> {
@@ -90,6 +93,8 @@ struct Percentiles<const BINS: usize, const MIN: i32> {
     interval: DoubleHistogram<BINS, MIN>, accumulated: DoubleHistogram<BINS, MIN>, stale: bool,
 }
 impl<const BINS: usize, const MIN: i32> Percentiles<BINS, MIN> {
+    const BIN_BYTES: usize = (2 * WINDOWS + 2) * std::mem::size_of::<[i64; BINS]>();
+
     fn new(now_ms: i64) -> Self { Self { recorders: std::array::from_fn(|_| Recorder::new()), current: 0, last_rotation: now_ms,
         interval: DoubleHistogram::new(), accumulated: DoubleHistogram::new(), stale: false } }
     fn rotate(&mut self, now_ms: i64) {
@@ -143,6 +148,8 @@ impl Maximum {
 pub(crate) struct Timer { count: i64, total: i64, percentiles: Percentiles<1025, 0>, maximum: Maximum, step: crate::step::Pair<i64> }
 pub(crate) struct Snapshot { pub count: i64, pub total: f64, pub mean: i64, pub maximum: i64, pub percentiles: [f64; 6] }
 impl Timer {
+    pub const RETAINED_BYTES: usize = std::mem::size_of::<Self>() + Percentiles::<1025, 0>::BIN_BYTES;
+
     pub fn new(now_ms: i64) -> Self { Self { count: 0, total: 0, percentiles: Percentiles::new(now_ms), maximum: Maximum::new(now_ms), step: crate::step::Pair::new(now_ms) } }
     pub fn record(&mut self, elapsed: Duration, now_ms: i64) {
         let nanos = elapsed.as_nanos().min(i64::MAX as u128) as i64;
@@ -165,6 +172,8 @@ impl Timer {
 pub(crate) struct CommitLag { count: i64, total: f64, percentiles: Percentiles<1345, -20>, maximum: Maximum, step: crate::step::Pair<f64> }
 pub(crate) struct SummarySnapshot { pub count: i64, pub total: f64, pub maximum: f64, pub percentiles: [f64; 3] }
 impl CommitLag {
+    pub const RETAINED_BYTES: usize = std::mem::size_of::<Self>() + Percentiles::<1345, -20>::BIN_BYTES;
+
     pub fn new(now_ms: i64) -> Self { Self { count: 0, total: 0.0, percentiles: Percentiles::new(now_ms), maximum: Maximum::new(now_ms), step: crate::step::Pair::new(now_ms) } }
     pub fn record(&mut self, seconds: f64, now_ms: i64) {
         if !(seconds >= 0.0) { return; }
