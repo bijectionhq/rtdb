@@ -176,10 +176,11 @@ impl NodeAgent {
             return Ok(database_config(record, servers, &self.options.storage, Role::Holder));
         }
         let candidates: Vec<&MemberRecord> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now) && !record.ensemble.contains(&member.id)).collect();
+        let mut distinct: BTreeSet<_> = alive.iter().map(|id| members[id].address.as_str()).collect();
         let mut ensemble = alive;
         for member in rtdb_affinity::rank(&record.storage_identity(), &candidates, |member| member.id.as_str()) {
             if ensemble.len() == record.ensemble.len() { break; }
-            ensemble.push(member.id.clone());
+            if distinct.insert(member.address.as_str()) { ensemble.push(member.id.clone()); }
         }
         if ensemble.len() < record.ensemble.len() { return Ok(database_config(record, servers, &self.options.storage, Role::Holder)); }
         let next: Vec<String> = ensemble.iter().map(|id| members[id].address.clone()).collect();

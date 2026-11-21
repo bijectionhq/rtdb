@@ -1,6 +1,6 @@
 //! Cell administration: creating, moving, rebalancing, forking and deleting deployments, and confirming dead members (`CreateDeployment`, `IntendMove`, `Rebalance`, `Fork`, `BeginDeletion`, `EraseAndProve`, `ExpireLease`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,11 +71,16 @@ pub async fn install_deployment(
 async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
     let now = now_ms();
     let logkeepers: Vec<MemberRecord> = directory.members().await?.into_iter().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).collect();
-    if logkeepers.len() < replicas {
-        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/too-few-logkeepers", format!("{replicas} logkeepers are needed and {} are live", logkeepers.len())));
-    }
     let ranked = rtdb_affinity::rank(&record.storage_identity(), &logkeepers, |member| member.id.as_str());
-    Ok(ranked.into_iter().take(replicas).map(|member| member.id.clone()).collect())
+    let mut endpoints = BTreeSet::new();
+    let ensemble: Vec<_> = ranked.into_iter()
+        .filter(|member| endpoints.insert(member.address.as_str()))
+        .take(replicas).map(|member| member.id.clone()).collect();
+    if ensemble.len() != replicas {
+        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/too-few-logkeepers",
+            format!("{replicas} distinct logkeepers are needed and {} are live", ensemble.len())));
+    }
+    Ok(ensemble)
 }
 
 async fn members(directory: &dyn Directory) -> Result<BTreeMap<MemberId, MemberRecord>> {

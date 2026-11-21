@@ -55,6 +55,10 @@ Hosting can install its existing deployment authority with `rtdb-multi install -
 The directory allocates both name and authority conditionally, and an identical retry returns the same deployment.
 This entry point enables linearizable reads on the holder.
 
+Nodes and logkeepers bound to a wildcard address require `--advertise-host` with their reachable DNS name or IP.
+A durable logkeeper uses the same advertised address and data directory after restart.
+Ensemble selection counts each advertised log endpoint once.
+
 **Fixed on the way.**
 
 - A newly activated fork could publish its parent's boundary and trim its own log before its first flush completed.

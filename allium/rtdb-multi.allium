@@ -1880,6 +1880,8 @@ actor Node {
 
 actor LogServer {
     -- Holds loglets and enforces the epoch promise.
+    -- A durable log server's advertised endpoint identifies its log storage across process restarts.
+    -- An ensemble counts each storage endpoint once.
     identified_by: MemberRecord where role = log_server
 }
 

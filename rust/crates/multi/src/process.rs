@@ -24,6 +24,8 @@ pub struct NodeSettings {
     pub configuration: NodeConfiguration,
     pub allocation_limit_bytes: usize,
     pub control: SocketAddr,
+    /// The address peers use when the listeners bind on all interfaces.
+    pub advertise_host: Option<String>,
     pub availability_zone: String,
     pub agent: AgentOptions,
     pub lease: LeaseOptions,
@@ -82,11 +84,13 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let pgwire_address = server.addresses().pgwire.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;
     let control = TcpListener::bind(settings.control).await.map_err(io)?;
     let control_address = control.local_addr().map_err(io)?;
+    let pgwire_endpoint = advertised(pgwire_address, settings.advertise_host.as_deref())?;
+    let control_endpoint = advertised(control_address, settings.advertise_host.as_deref())?;
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
-        role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone, pool: settings.pool,
+        role: MemberRole::Node, address: pgwire_endpoint.clone(), control_address: Some(control_endpoint), availability_zone: settings.availability_zone, pool: settings.pool,
     }, settings.lease).await?;
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_address.to_string(), settings.agent, writers, settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, settings.agent, writers, settings.capabilities.clone());
     let _ = fence.0.set(Arc::clone(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();
@@ -136,7 +140,16 @@ impl rtdb_node::ReadFence for FenceSlot {
     }
 }
 
-pub struct LogkeeperSettings { pub listen: SocketAddr, pub data_dir: PathBuf, pub fsync: bool, pub cache_bytes: usize, pub availability_zone: String, pub lease: LeaseOptions }
+pub struct LogkeeperSettings {
+    pub listen: SocketAddr,
+    /// Stable DNS name of the disk, so ensembles can still reach it after a process restart.
+    pub advertise_host: Option<String>,
+    pub data_dir: PathBuf,
+    pub fsync: bool,
+    pub cache_bytes: usize,
+    pub availability_zone: String,
+    pub lease: LeaseOptions,
+}
 
 pub struct RunningLogkeeper {
     pub address: SocketAddr,
@@ -148,7 +161,8 @@ pub struct RunningLogkeeper {
 pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperSettings) -> Result<RunningLogkeeper> {
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
-    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: address.to_string(), control_address: None, availability_zone: settings.availability_zone, pool: Default::default() }, settings.lease).await?;
+    let endpoint = advertised(address, settings.advertise_host.as_deref())?;
+    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: endpoint, control_address: None, availability_zone: settings.availability_zone, pool: Default::default() }, settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
     tasks.spawn(rtdb_logkeeper::serve(listener, rtdb_logkeeper::ServerOptions { data_dir: settings.data_dir, fsync: settings.fsync, cache_bytes: settings.cache_bytes }, cancellation.clone()));
@@ -161,6 +175,41 @@ impl RunningLogkeeper {
         self.cancellation.cancel();
         while let Some(result) = self.tasks.join_next().await { if let Ok(Err(error)) = result { return Err(error); } }
         Ok(())
+    }
+}
+
+fn advertised(bound: SocketAddr, host: Option<&str>) -> Result<String> {
+    let invalid = || Anomaly::incorrect("rtdb.multi/advertise", "A wildcard listener needs a routable advertised IP or DNS name");
+    match host {
+        None if !bound.ip().is_unspecified() => Ok(bound.to_string()),
+        Some(host) => {
+            if let Ok(address) = host.parse::<std::net::IpAddr>() {
+                if address.is_unspecified() { return Err(invalid()); }
+                return Ok(SocketAddr::new(address, bound.port()).to_string());
+            }
+            if !host.is_empty() && host.len() <= 253 && host.split('.').all(|part| {
+                !part.is_empty() && part.len() <= 63 && !part.starts_with('-') && !part.ends_with('-')
+                    && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }) {
+                return Ok(format!("{}:{}", host.to_ascii_lowercase(), bound.port()));
+            }
+            Err(invalid())
+        }
+        None => Err(invalid()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_listeners_advertise_a_reachable_address_and_bound_port() {
+        let bound = "0.0.0.0:5432".parse().unwrap();
+        assert!(advertised(bound, None).is_err());
+        assert!(advertised(bound, Some("0.0.0.0")).is_err());
+        assert_eq!(advertised(bound, Some("keeper.cell.internal")).unwrap(), "keeper.cell.internal:5432");
+        assert_eq!(advertised(bound, Some("fd00::7")).unwrap(), "[fd00::7]:5432");
     }
 }
 
