@@ -1,7 +1,7 @@
 {
-  "summary": "Query and compaction share the base-four IID digit, and the memory trie compares paths by their first differing digit.",
+  "summary": "The production base-four IID digit determines path membership and the exact rows grouped for each child.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 9,
+  "min_verified_functions": 13,
   "controls": {
     "drop_last_digit": {
       "defect": "The final base-four digit cannot be selected.",
@@ -15,7 +15,7 @@
         "function": "base4_bucket",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 8
+      "min_verified_functions": 12
     },
     "drop_last_digit_with_weakened_contract": {
       "defect": "Both the function and the local contract promise only the first 63 digits.",
@@ -40,8 +40,24 @@
         "file": "rust/crates/trie/src/partition_step.rs",
         "function": "compare_base4_path",
         "category": "precondition not satisfied"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "Call to non-static function fails to satisfy `callee.requires(args)`"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "verification/verus/iid_partition/laws.rs",
+        "function": "child_membership_extends_parent_membership",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/iid_partition/laws.rs",
+        "function": "child_membership_extends_parent_membership",
+        "category": "precondition not satisfied"
       }],
-      "min_verified_functions": 7
+      "min_verified_functions": 9
     },
     "collapse_buckets": {
       "defect": "Only bucket zero is returned for every valid IID depth.",
@@ -55,7 +71,7 @@
         "function": "base4_bucket",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 8
+      "min_verified_functions": 12
     },
     "collapse_buckets_with_weakened_contract": {
       "defect": "Both the function and its local contract assign all valid inputs to bucket zero.",
@@ -76,8 +92,16 @@
         "file": "rust/crates/trie/src/partition_step.rs",
         "function": "compare_base4_path",
         "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/iid_partition/laws.rs",
+        "function": "child_membership_extends_parent_membership",
+        "category": "assertion failed"
       }],
-      "min_verified_functions": 7
+      "min_verified_functions": 9
     },
     "accept_smaller_iid_digit": {
       "defect": "An IID whose first differing digit is smaller is accepted under that path.",
@@ -91,7 +115,49 @@
         "function": "compare_base4_path",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 8
+      "min_verified_functions": 12
+    },
+    "send_row_to_next_bucket": {
+      "defect": "Every row goes to a different child.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "buckets[usize::from(bucket)].push(row);",
+        "replace": "buckets[(usize::from(bucket) + 1) % 4].push(row);"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 12
+    },
+    "prepend_row_to_bucket": {
+      "defect": "A child receives its rows in reverse input order.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "buckets[usize::from(bucket)].push(row);",
+        "replace": "buckets[usize::from(bucket)].insert(0, row);"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 12
+    },
+    "route_unreadable_iid_as_zero": {
+      "defect": "Grouping admits a row after its IID lookup fails.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "Err(error) => return Err(error),",
+        "replace": "Err(_) => [0; 16],"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "group_base4_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 12
     }
   }
 }

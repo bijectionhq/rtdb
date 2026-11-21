@@ -6,6 +6,8 @@ use rtdb_columnar::IidView;
 use rtdb_types::{Anomaly, Iid, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::bucketer::invalid_bucket_depth;
+use crate::partition_step::group_base4_rows;
 use crate::{Bucketer, Path};
 
 /// Indexed rows must keep the same IID for every operation on a retained trie.
@@ -198,8 +200,9 @@ fn insert_rows<R: IidReader + ?Sized>(
 ) -> Result<Arc<TrieNode>> {
     match node.as_ref() {
         TrieNode::Branch { path, children } => {
-            let mut buckets: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::new());
-            for row in rows { buckets[Bucketer::DEFAULT.bucket(reader.iid(row)?, path.len())? as usize].push(row); }
+            let buckets = group_base4_rows(
+                rows, path.len(), |row| reader.iid(row).map(|iid| iid.0), invalid_bucket_depth,
+            )?;
             let mut next = children.clone();
             for (bucket, rows) in buckets.iter().enumerate() {
                 if rows.is_empty() { continue; }
@@ -246,8 +249,9 @@ fn build_subtree<R: IidReader + ?Sized>(path: Path, rows: Vec<u32>, reader: &R, 
     if rows.len() <= config.page_limit || path.len() == Bucketer::DEFAULT.max_depth() {
         return Ok(Arc::new(TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([])))));
     }
-    let mut buckets: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::new());
-    for row in rows { buckets[Bucketer::DEFAULT.bucket(reader.iid(row)?, path.len())? as usize].push(row); }
+    let buckets = group_base4_rows(
+        rows.into_iter(), path.len(), |row| reader.iid(row).map(|iid| iid.0), invalid_bucket_depth,
+    )?;
     let mut children = std::array::from_fn(|_| None);
     for (bucket, rows) in buckets.into_iter().enumerate() {
         if rows.is_empty() { continue; }

@@ -134,12 +134,12 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
 | IDX01 · Exact lookup | Partial | [Lean routed lookup and Rust comparison with flat history](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) |
-| IDX02 · Total coverage | Partial | [Lean row occurrence conservation and Rust traversal checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) |
+| IDX02 · Total coverage | Partial | [Lean row occurrence conservation and Rust traversal checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) · [Exact production bucket sequences](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) |
 | IDX03 · Leaf order | Open | — |
-| IDX04 · Bucket routing | Partial | [Verified production base-four bucket and path comparison](rtdb-engine-proof-evidence.md#production-iid-path-comparison) · [Rust IID bucket selection](rtdb-engine-proof-evidence.md#multi-evidence) |
+| IDX04 · Bucket routing | Partial | [Verified production grouping and child-path membership](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) · [Rust IID bucket selection](rtdb-engine-proof-evidence.md#multi-evidence) |
 | IDX05 · Immutable ancestors | Open | — |
-| IDX06 · Bulk insertion equivalence | Partial | [Lean batch regrouping and Rust range, batch, and single insertion checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) |
-| IDX07 · Structural rewrite equivalence | Open | — |
+| IDX06 · Bulk insertion equivalence | Partial | [Lean batch regrouping and Rust range, batch, and single insertion checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) · [Verified branch insertion grouping](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) |
+| IDX07 · Structural rewrite equivalence | Partial | [Verified stable row partition for a leaf split](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) |
 | IDX08 · Snapshot lifetime | Open | — |
 | IDX09 · Serialized correspondence | Open | — |
 
