@@ -1,0 +1,24 @@
+[package]
+name = "rtdb-simulation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Deterministic simulations of an RTDB multi cell: the single-writer protocol under seeded faults, the storage lifecycle of forks, reaping, deletion and moves, and gateway sessions over failing backends"
+
+[dependencies]
+rtdb-directory.workspace = true
+rtdb-format.workspace = true
+rtdb-logkeeper = { workspace = true, features = ["simulation"] }
+rtdb-multi.workspace = true
+rtdb-node.workspace = true
+rtdb-storage.workspace = true
+rtdb-types.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

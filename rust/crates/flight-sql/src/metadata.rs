@@ -37,7 +37,9 @@ impl Service {
                     let databases = self.0.node.catalog().open_database_snapshot(self.memory()).map_err(status)?;
                     let bytes = databases.rows().iter().try_fold(8192, |bytes, database| wire::add(bytes, wire::add(wire::mul(database.name().len(), 8)?, 512)?))?;
                     charges.push(self.memory().reserve(bytes).map_err(status)?);
-                    let mut builder = command.into_builder(); for database in databases.rows() { builder.append(database.name()); } builder.build().map_err(arrow)?
+                    // A placed node's other databases are other tenants': the session sees only its own.
+                    let placed = self.0.node.catalog().is_placed();
+                    let mut builder = command.into_builder(); for database in databases.rows().iter().filter(|database| !placed || database.name() == call.database) { builder.append(database.name()); } builder.build().map_err(arrow)?
                 }
                 command => {
                     let connection = self.connection(&call, &call.database).await?;

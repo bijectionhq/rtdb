@@ -24,9 +24,10 @@ impl Clock for TickClock { fn now(&self) -> Timestamp { Timestamp(self.0.fetch_a
 
 struct Running { node: Node, node_task: JoinHandle<Result<()>>, server: ServerHandle, server_task: JoinHandle<Result<()>> }
 impl Running {
-    async fn start(config: ServerConfig, password: Option<&str>) -> Self {
+    async fn start(config: ServerConfig, password: Option<&str>) -> Self { Self::start_with(config, AuthConfig::SingleRootUser { password: password.map(Secret::new) }).await }
+    async fn start_with(config: ServerConfig, authentication: AuthConfig) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
-        let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), Arc::clone(&clock), Arc::new(NoHttp)).await.unwrap();
+        let auth = Authenticator::open(authentication, MemoryBudget::new(64 << 20), Arc::clone(&clock), Arc::new(NoHttp)).await.unwrap();
         let services = NodeServices { clock, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
         let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false;
         options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
@@ -1406,6 +1407,50 @@ async fn an_extended_execute_describes_the_rows_of_the_statement_it_names() {
     assert_eq!(tags(&described), b"1tTZ");
     assert!(described[2].1.windows(9).any(|name| name == b"forty_two"));
     drop(client);
+    running.stop().await;
+}
+
+/// A trusted startup as `user` on the primary database: the client, or the error the startup was refused with.
+async fn start_as(server: &ServerHandle, user: &str) -> std::result::Result<Client, String> {
+    let mut stream = TcpStream::connect(server.address()).await.unwrap();
+    let mut bytes = 196608i32.to_be_bytes().to_vec();
+    for field in ["user", user, "database", "xtdb"] { bytes.extend_from_slice(&cstring(field)); }
+    bytes.push(0);
+    stream.write_i32((bytes.len() + 4) as i32).await.unwrap(); stream.write_all(&bytes).await.unwrap();
+    let mut client = Client { stream, process: 0 };
+    loop {
+        match client.receive().await {
+            (b'Z', _) => return Ok(client),
+            (b'E', body) => return Err(String::from_utf8_lossy(&body).into_owned()),
+            _ => (),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_user_limited_by_grants_uses_only_the_databases_it_is_granted() {
+    use std::collections::BTreeMap;
+    use rtdb_auth::{GrantedAccess, Method, MethodRule};
+    let grants = BTreeMap::from([
+        ("reader".to_owned(), BTreeMap::from([("xtdb".to_owned(), GrantedAccess::Read)])),
+        ("outsider".to_owned(), BTreeMap::from([
+            ("*".to_owned(), GrantedAccess::Write),
+            ("xtdb".to_owned(), GrantedAccess::Deny),
+        ])),
+        ("ordinary".to_owned(), BTreeMap::from([("*".to_owned(), GrantedAccess::Read)])),
+    ]);
+    let running = Running::start_with(ServerConfig::default(), AuthConfig::UserList { users: BTreeMap::new(), rules: vec![MethodRule::any(Method::Trust)], grants }).await;
+    let mut writer = start_as(&running.server, "xtdb").await.unwrap();
+    assert!(!tags(&writer.query("INSERT INTO docs (_id) VALUES (1)").await).contains(&b'E'), "a user the grants do not name uses every database");
+    let mut reader = start_as(&running.server, "reader").await.unwrap();
+    assert_eq!(rows(&reader.query("SELECT _id FROM docs").await).len(), 1, "a read grant reads");
+    let refused = reader.query("INSERT INTO docs (_id) VALUES (2)").await;
+    assert!(refused.iter().any(|(tag, body)| *tag == b'E' && String::from_utf8_lossy(body).contains("read-only-grant")), "and does not write: {refused:?}");
+    let mut ordinary = start_as(&running.server, "ordinary").await.unwrap();
+    assert_eq!(rows(&ordinary.query("SELECT _id FROM docs").await).len(), 1);
+    let outsider = start_as(&running.server, "outsider").await.err().expect("explicit denial takes precedence over a default write grant");
+    assert!(outsider.contains("database-not-granted"), "{outsider}");
+    drop((writer, reader, ordinary));
     running.stop().await;
 }
 

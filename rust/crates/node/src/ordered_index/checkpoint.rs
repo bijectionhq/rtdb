@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     format_error,
-    maintenance::{cancelled, tip_key},
+    maintenance::cancelled,
     projection::RevisionRoots,
     tree::{Item, Key, Link, Pointer, Root, Tree},
 };
@@ -88,7 +88,6 @@ impl Checkpoint {
                 "An ordered index checkpoint references a missing page",
             ));
         }
-        tree.storage.invalidate(&tip_key(tree.directory)?).await?;
         self.retire_manifests(tree, cancellation).await?;
         for object in objects {
             if cancellation.is_cancelled() {
@@ -159,7 +158,7 @@ pub(super) async fn latest(tree: &Tree<'_>, through: i64) -> Result<Option<Check
     }
     let store = tree.storage.object_store();
     let head = key(tree, format_args!("manifests/{through:016x}"))?;
-    let object = match store.head(&head).await {
+    let object = match store.head_fresh(&head).await {
         Ok(object) => Some(object),
         Err(Error::MissingObject(_)) => store
             .list(Some(&key(tree, "manifests")?))
@@ -176,7 +175,7 @@ pub(super) async fn latest(tree: &Tree<'_>, through: i64) -> Result<Option<Check
     let allocation = tree
         .memory
         .reserve(size.saturating_mul(8).saturating_add(4096))?;
-    let bytes = store.get(&object.key).await?;
+    let bytes = store.get_fresh(&object.key).await?;
     if bytes.len() != size {
         return Err(format_error("Ordered index manifest length changed"));
     }
@@ -294,11 +293,7 @@ mod tests {
         let storage = BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20);
         let memory = MemoryBudget::new(1 << 20);
         let directory = ObjectKey::new("index").unwrap();
-        let tree = Tree {
-            storage: &storage,
-            directory: &directory,
-            memory: &memory,
-        };
+        let tree = Tree::new(&storage, &directory, &memory);
         let token = CancellationToken::new();
         let store = storage.object_store();
         let erased = key(&tree, "pages/0000000000000000/erased").unwrap();

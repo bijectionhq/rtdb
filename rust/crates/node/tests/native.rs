@@ -79,6 +79,50 @@ fn put(node: &Node, id: i64, value: i64) -> TxOp {
 }
 
 #[tokio::test]
+async fn source_barrier_waits_for_submitted_transactions_before_the_next_read() {
+    let (node, driver) = Node::open(options(), services()).await.unwrap();
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    writer.state_mut().submit_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(node.catalog().database("xtdb").unwrap().progress().current().tx_key.is_none());
+
+    let token = reader.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("SHOW rtdb_source_barrier", &Default::default()).unwrap().unwrap();
+    let mut barrier = Box::pin(reader.execute_control(&statement, &[], &token));
+    assert!(barrier.as_mut().now_or_never().is_none());
+    let driver = tokio::spawn(driver.run());
+    let ControlResult::Rows(show) = barrier.await.unwrap() else { panic!("expected a barrier acknowledgement"); };
+    assert_eq!(rows(show).await, [vec![Value::Utf8("1".into())]]);
+    assert_eq!(reader.state().status(), TransactionStatus::Idle);
+    assert_eq!(rows(reader.query_sql("SELECT value FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn source_barrier_refuses_a_node_without_an_indexer() {
+    let mut config = options();
+    config.replication.enabled = false;
+    let (node, driver) = Node::open(config, services()).await.unwrap();
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = reader.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("SHOW rtdb_source_barrier", &Default::default()).unwrap().unwrap();
+    let Err(error) = reader.execute_control(&statement, &[], &token).await else { panic!("barrier passed without an indexer"); };
+    assert_eq!(error.code, "xtdb/log-processor-not-initialised");
+    driver.close_without_run().await.unwrap();
+}
+
+#[tokio::test]
+async fn hosted_source_barrier_requires_an_authoritative_multi_holder() {
+    let (node, driver) = running(options(), services()).await;
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = reader.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("SHOW rtdb_hosted_source_barrier", &Default::default()).unwrap().unwrap();
+    let Err(error) = reader.execute_control(&statement, &[], &token).await else { panic!("standalone node certified a hosted history"); };
+    assert_eq!(error.code, "rtdb.node/hosted-source-unavailable");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn read_transaction_pinned_before_ingestion_retains_a_null_partition_time() {
     let (node, driver) = running(options(), services()).await;
     let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
@@ -761,7 +805,7 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
         fn validate(&self, _: &str, _: &DatabaseConfig) -> Result<()> { Ok(()) }
         async fn open_storage(&self, _: &str, _: &DatabaseConfig) -> Result<DatabaseStorage> {
             Ok(DatabaseStorage {
-                store: self.store.clone(), storage_epoch: rtdb_types::StorageEpoch(0), storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
+                store: self.store.clone(), blocks: Default::default(), storage_epoch: rtdb_types::StorageEpoch(0), storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
                 io: rtdb_storage::IoRegion::new(),
             })
         }
@@ -1803,6 +1847,98 @@ async fn a_stored_struct_reads_back_with_its_fields_in_written_order() {
     let equal = rows(session.query_sql("SELECT OBJECT(a: 1, b: 2) = OBJECT(b: 2, a: 1), OBJECT(a: 1) = OBJECT(a: 1, b: 2)", vec![]).await.unwrap()).await;
     assert_eq!(equal, [vec![Value::Bool(true), Value::Bool(false)]], "structs compare as maps whatever their field order");
     drop(session); stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn a_placed_catalog_starts_empty_and_holds_exactly_what_is_attached_and_detached_locally() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, services()).await;
+    assert!(node.catalog().database_names().is_empty(), "nothing starts open, not even a primary");
+    assert!(node.catalog().secondary_databases().is_empty());
+    assert_eq!(node.catalog().check_attach("shop", &DatabaseConfig::default()).unwrap_err().code, "xtdb/fixed-database-catalog", "log-borne instructions are refused");
+
+    node.database_or_attach("shop".into(), DatabaseConfig::default()).await.unwrap().expect("a placed catalog attaches locally");
+    let mut session = node.session("shop", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+    drop(session);
+
+    node.detach_local("shop".into()).await.unwrap();
+    assert!(node.catalog().database("shop").is_err(), "a detached database no longer resolves");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while node.catalog().is_draining("shop") { tokio::task::yield_now().await; }
+    }).await.expect("the detach drains");
+    node.database_or_attach("shop".into(), DatabaseConfig::default()).await.unwrap().expect("the name is free again once drained");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn a_session_on_a_placed_node_sees_its_own_database_and_no_other() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, services()).await;
+    for name in ["shop", "blog"] { node.database_or_attach(name.into(), DatabaseConfig::default()).await.unwrap().unwrap(); }
+    let mut blog = node.session("blog", Arc::new(Authority)).unwrap();
+    assert!(blog.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let mut shop = node.session("shop", Arc::new(Authority)).unwrap();
+    assert!(shop.state_mut().execute_tx(vec![put(&node, 1, 20)], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert_eq!(rows(shop.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
+    let reached = match shop.query_sql("SELECT value FROM blog.public.docs", vec![]).await { Ok(cursor) => Some(rows(cursor).await), Err(_) => None };
+    assert!(reached.as_ref().is_none_or(|rows| rows.is_empty()), "another tenant's table is not reachable by name: {reached:?}");
+    assert_eq!(rows(blog.query_sql("SELECT value FROM blog.public.docs", vec![]).await.unwrap()).await, [vec![Value::I64(10)]], "a session still names its own database");
+    shop.state_mut().set_auto_commit(false).await.unwrap();
+    let basis = shop.state_mut().read_basis().await.unwrap();
+    assert_eq!(basis.snapshot.databases.keys().cloned().collect::<Vec<_>>(), ["shop"], "a session's basis names no other tenant");
+    shop.state_mut().rollback_tx().unwrap();
+    drop((shop, blog));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn concurrent_transactions_with_one_idempotency_key_commit_once_and_both_report_it() {
+    let (node, driver) = running(options(), services()).await;
+    let metadata = || {
+        let mut options = AutonomousTxOptions::default();
+        options.user_metadata = Some(rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([("idempotency_key".into(), Value::Utf8("charge-7".into()))])), node.memory()).unwrap());
+        options
+    };
+    let mut first = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut second = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let (a, b) = tokio::join!(
+        first.state_mut().execute_tx(vec![put(&node, 1, 10)], metadata()),
+        second.state_mut().execute_tx(vec![put(&node, 2, 20)], metadata()),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(a.committed() && b.committed(), "both callers are told the keyed transaction committed");
+    assert_eq!(a.tx_key(), b.tx_key(), "and both are told it is the same transaction");
+    assert_eq!(rows(first.query_sql("SELECT COUNT(*) FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(1)]], "only one of them ran");
+    let mut reserved = AutonomousTxOptions::default();
+    reserved.user_metadata = Some(rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([("idempotency_key".into(), Value::Utf8("~table".into()))])), node.memory()).unwrap());
+    assert!(first.state_mut().execute_tx(vec![put(&node, 3, 30)], reserved).await.is_err(), "the key the keys table is created with is not a caller's to use");
+    drop((first, second));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn a_command_resent_under_its_session_key_on_a_new_session_writes_nothing_again() {
+    let (node, driver) = running(options(), services()).await;
+    let command = |key: &'static str, ids: [i64; 2]| {
+        let node = node.clone();
+        async move {
+            let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+            session.state_mut().set_parameter(rtdb_node::IDEMPOTENCY_KEY_PARAMETER, Some(key.into())).unwrap();
+            for id in ids { assert!(session.state_mut().execute_tx(vec![put(&node, id, id)], AutonomousTxOptions::default()).await.unwrap().committed()); }
+        }
+    };
+    command("first", [1, 2]).await;
+    command("first", [3, 4]).await;
+    command("second", [5, 6]).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert_eq!(rows(session.query_sql("SELECT _id FROM docs ORDER BY _id", vec![]).await.unwrap()).await, [[Value::I64(1)], [Value::I64(2)], [Value::I64(5)], [Value::I64(6)]].map(Vec::from),
+        "the resent command's transactions take the keys the first run's did, in order, and run no more");
+    drop(session);
+    stop(&node, driver).await;
 }
 
 #[tokio::test]

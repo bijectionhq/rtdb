@@ -79,14 +79,14 @@ def validate_package(record, manifest, revision, engine):
         raise ValueError("server image provenance lacks its build selection or source manifest digest")
 
 
-def verify_native_build_info(artifacts, metadata):
+def verify_native_build_info(artifacts, metadata, executables=("rtdb", "rtdb-config")):
     selected = metadata.get("tzdb")
     if not isinstance(selected, dict) or not isinstance(selected.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", selected["sha256"]) or type(selected.get("bytes")) is not int or not 1 <= selected["bytes"] <= 1024 * 1024:
         raise ValueError("native build metadata lacks its bounded TZDB input digest")
     if digest(artifacts["artifacts/tzdb.dat"]) != selected["sha256"] or artifacts["artifacts/tzdb.dat"].stat().st_size != selected["bytes"]:
         raise ValueError("packaged TZDB bytes differ from the selected build input")
     reports = []
-    for executable in ["rtdb", "rtdb-config"]:
+    for executable in executables:
         report = json.loads(artifacts["artifacts/" + executable + "-build-info.json"].read_bytes())
         expected = {"schema_version": 1, "engine": "rust", "revision": metadata["revision"], "version": metadata["version"], "tzdb_sha256": metadata["tzdb"]["sha256"]}
         if not isinstance(report, dict) or any(report.get(key) != value for key, value in expected.items()):
@@ -94,7 +94,7 @@ def verify_native_build_info(artifacts, metadata):
         if not isinstance(report.get("tzdb_version"), str) or not 1 <= len(report["tzdb_version"]) <= 128:
             raise ValueError(f"{executable} does not identify its compiled TZDB version")
         reports.append(report)
-    if reports[0] != reports[1]:
+    if any(report != reports[0] for report in reports[1:]):
         raise ValueError("packaged executable build information differs")
     return reports[0]
 

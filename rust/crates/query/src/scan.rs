@@ -15,7 +15,7 @@ use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
 use rtdb_types::{Anomaly, EventHeader, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
-use crate::{context::Execution, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
+use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
 /// A data file read whole from the buffer pool, or, where the pool no longer holds it but its layout is known, a page at a time.
 enum DataState { Unopened, Open { reader: ArrowFile, _reservation: Arc<MemoryReservation> }, Ranged { reader: ArrowFile, file: rtdb_format::ipc::SparseFile, _reservation: Arc<MemoryReservation> } }
@@ -130,7 +130,7 @@ impl Ord for Head {
 }
 impl PartialOrd for Head { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
 
-struct PartitionScan {
+pub(crate) struct PartitionScan {
     snapshot: Snapshot,
     storage: Arc<BufferPool>,
     scan: Scan,
@@ -146,6 +146,8 @@ struct PartitionScan {
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
+    /// The IIDs a fragment's scan is confined to; every IID, otherwise.
+    fragment: Option<(Iid, Iid)>,
     /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
     matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
@@ -179,7 +181,51 @@ fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::B
         clauses.into_iter().map(equality).collect::<Option<std::collections::BTreeSet<_>>>()
     })
 }
-pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, memory: Arc<MemoryBudget>, _reservation: Arc<MemoryReservation> }
+/// One source of a scan's rows: a partition this node reads, or a fragment of one that another node may read for it.
+enum Part { Local(PartitionScan), Fragment(Fragment) }
+
+/// A fragment dispatched to the node it belongs to, read here instead when that node is this one or does not answer.
+struct Fragment { request: Arc<ScanFragment>, fallback: PartitionScan, state: FragmentState }
+enum FragmentState { Pending, Dispatched(Dispatch), Remote(VecDeque<crate::columnar::ColumnBatch>), Local }
+
+/// A dispatch in flight, abandoned with the scan.
+struct Dispatch(tokio::task::JoinHandle<Result<Option<Vec<u8>>>>);
+impl Drop for Dispatch { fn drop(&mut self) { self.0.abort(); } }
+
+impl Fragment {
+    fn dispatch(&mut self, fragmenter: &Arc<dyn ScanFragmenter>) {
+        if !matches!(self.state, FragmentState::Pending) { return; }
+        let (fragmenter, request) = (Arc::clone(fragmenter), Arc::clone(&self.request));
+        self.state = FragmentState::Dispatched(Dispatch(tokio::spawn(async move { fragmenter.dispatch(&request).await })));
+    }
+    async fn next_batch(&mut self, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
+        if let FragmentState::Dispatched(dispatch) = &mut self.state {
+            let answer = (&mut dispatch.0).await;
+            self.state = match answer {
+                Ok(Ok(Some(bytes))) => match crate::fragment::decode_batches(&bytes, memory) {
+                    Ok(batches) => FragmentState::Remote(batches.into()),
+                    Err(_) => FragmentState::Local,
+                },
+                Ok(Ok(None) | Err(_)) | Err(_) => FragmentState::Local,
+            };
+        }
+        match &mut self.state {
+            FragmentState::Remote(batches) => Ok(batches.pop_front()),
+            FragmentState::Pending | FragmentState::Local => self.fallback.next_batch().await,
+            FragmentState::Dispatched(_) => Err(invalid("fragment-state", "A dispatched fragment was not awaited")),
+        }
+    }
+}
+
+/// The bytes of persisted tries the snapshot's database holds across its tables.
+fn persisted_bytes(snapshot: &Snapshot) -> u64 {
+    let catalog = snapshot.trie_catalog();
+    catalog.tables().flat_map(|table| catalog.iter_tries(table)).filter(|trie| trie.state == TrieState::Live)
+        .map(|trie| u64::try_from(trie.data_file_size).unwrap_or(0)).fold(0, u64::saturating_add)
+}
+
+/// `fragmenter` is held until the first pull dispatches the fragments.
+pub(crate) struct ScanCursor { parts: VecDeque<Part>, fragmenter: Option<Arc<dyn ScanFragmenter>>, completed: ScanCounts, database: String, source: String, memory: Arc<MemoryBudget>, _reservation: Arc<MemoryReservation> }
 impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
@@ -206,7 +252,8 @@ impl ScanCursor {
             queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(text), _ => None });
         }
         let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
-        let mut partitions = VecDeque::new();
+        let fragmenter = execution.context.catalog.fragmenter.clone();
+        let mut parts = VecDeque::new();
         for snapshot in database_partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             let mut narrowed = scan.clone();
@@ -235,23 +282,70 @@ impl ScanCursor {
                 }
                 matches.push((query.as_deref().map(rtdb_text::Query::parse), answers));
             }
-            partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, slots: slots.clone(), scan: narrowed, execution: execution.clone(), bounds,
-                initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
-                output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
+            let partition = |fragment, matches| PartitionScan {
+                snapshot: snapshot.clone(), storage: Arc::clone(storage), matches,
+                slots: slots.clone(), scan: narrowed.clone(), execution: execution.clone(), bounds,
+                initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
+                tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
+                output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
+                canonical_entity_iids, fragment,
+            };
+            // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
+            let split = match (&fragmenter, snapshot.tx_basis()) {
+                (Some(fragmenter), Some(basis)) if narrowed.iids.is_none() && narrowed.matches.is_empty() && database_partitions.len() == 1 =>
+                    fragmenter.depth(&name, &scan.table.name.table, persisted_bytes(snapshot)).map(|depth| (depth, basis)),
+                _ => None,
+            };
+            match split {
+                Some((depth, basis)) => for prefix in depth.prefixes() {
+                    let fallback = partition(Some(prefix.range()), Vec::new());
+                    parts.push_back(Part::Fragment(Fragment { request: Arc::new(ScanFragment::of(&narrowed, prefix, basis, bounds, &execution.context.timezone)), fallback, state: FragmentState::Pending }));
+                },
+                None => parts.push_back(Part::Local(partition(None, matches))),
+            }
         }
-        Ok(Self { partitions, completed: ScanCounts::default(), database: name, source, memory: Arc::clone(&execution.context.memory), _reservation: reservation })
+        let fragmenter = fragmenter.filter(|_| parts.iter().any(|part| matches!(part, Part::Fragment(_))));
+        Ok(Self { parts, fragmenter, completed: ScanCounts::default(), database: name, source, memory: Arc::clone(&execution.context.memory), _reservation: reservation })
+    }
+}
+
+impl PartitionScan {
+    #[allow(clippy::too_many_arguments)]
+    fn new(snapshot: Snapshot, storage: Arc<BufferPool>, scan: Scan, execution: Execution, bounds: TemporalBounds, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, canonical_entity_iids: bool, fragment: Option<(Iid, Iid)>) -> Self {
+        let slots = vec![None; scan.columns.len()];
+        Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
+            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, fragment }
+    }
+    /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
+    pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Self {
+        Self::new(snapshot, storage, fragment.scan.clone(), execution, fragment.bounds, None, false, Some(fragment.prefix.range()))
     }
 }
 
 impl ScanCursor {
     pub(crate) async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
-        while let Some(partition) = self.partitions.front_mut() {
-            if let Some(batch) = partition.next_batch().await? { return Ok(Some(batch)); }
-            self.completed.add(partition.counts);
-            self.partitions.pop_front();
+        // Every fragment is dispatched at the first pull, so the nodes they belong to read them side by side.
+        if let Some(fragmenter) = self.fragmenter.take() {
+            for part in &mut self.parts { if let Part::Fragment(fragment) = part { fragment.dispatch(&fragmenter); } }
+        }
+        while let Some(part) = self.parts.front_mut() {
+            let batch = match part { Part::Local(partition) => partition.next_batch().await?, Part::Fragment(fragment) => fragment.next_batch(&self.memory).await? };
+            if let Some(batch) = batch { return Ok(Some(batch)); }
+            self.completed.add(part.counts());
+            self.parts.pop_front();
         }
         Ok(None)
     }
+}
+
+#[cfg(test)]
+impl ScanCursor {
+    fn front_partition(&self) -> Option<&PartitionScan> { self.parts.front().map(|part| match part { Part::Local(partition) => partition, Part::Fragment(fragment) => &fragment.fallback }) }
+    fn front_partition_mut(&mut self) -> Option<&mut PartitionScan> { self.parts.front_mut().map(|part| match part { Part::Local(partition) => partition, Part::Fragment(fragment) => &mut fragment.fallback }) }
+}
+
+impl Part {
+    fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts } }
 }
 
 pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usize) -> Result<Option<crate::pages::BoxPageCursor>> {
@@ -455,13 +549,13 @@ impl PageCursor for ScanCursor {
         batch.rows(&self.memory).map(Some)
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
-        let mut counts = self.completed; for partition in &self.partitions { counts.add(partition.counts); }
+        let mut counts = self.completed; for part in &self.parts { counts.add(part.counts()); }
         span.attribute("scan_db", rtdb_plan::TraceValue::Text(&self.database));
         span.attribute("scan_source", rtdb_plan::TraceValue::Text(&self.source));
         for (name, value) in [("scan_files_pruned", counts.files_pruned), ("scan_files_used", counts.files_used), ("scan_pages_pruned", counts.pages_pruned), ("scan_pages_used", counts.pages_used), ("scan_rows_read", counts.rows_read)] { span.attribute(name, rtdb_plan::TraceValue::Unsigned(value)); }
     }
     fn scan_counts(&self) -> Option<ScanCounts> {
-        let mut counts = self.completed; for partition in &self.partitions { counts.add(partition.counts); }
+        let mut counts = self.completed; for part in &self.parts { counts.add(part.counts()); }
         Some(counts)
     }
 }
@@ -473,6 +567,7 @@ impl PartitionScan {
             iid: self.scan.iids.as_ref().filter(|iids| iids.len() == 1).and_then(|iids| iids.first().copied()) }
     }
     fn path_matches(&self, lower: Iid, upper: Iid) -> bool {
+        if self.fragment.is_some_and(|(first, last)| upper < first || last < lower) { return false; }
         match &self.scan.iids {
             Some(iids) => iids.range(lower..=upper).next().is_some(),
             None => self.pushdowns.as_ref().is_none_or(|filters| filters.path_matches(&self.scan.columns, lower, upper, self.canonical_entity_iids)),
@@ -729,7 +824,7 @@ impl PartitionScan {
         self.loaded.insert(index,LoadedPage { rows,_reservation: reservation,_charge: charge });
         Ok(())
     }
-    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         if !self.initialized { self.initialize().await?; }
         loop {
             self.execution.context.check_cancelled()?;
@@ -790,6 +885,7 @@ impl PartitionScan {
                 None => heads.pop(),
             };
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
+            if self.fragment.is_some_and(|(first, last)| head.header.iid < first || last < head.header.iid) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
             let (slot, batch, row) = rows.batch(head.ordinal)?;
             let page = &mut handles[head.active];
@@ -1077,7 +1173,7 @@ mod tests {
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             let expected = format!("Cannot reserve {candidate_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
             assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-            let partition = cursor.partitions.front().unwrap();
+            let partition = cursor.front_partition().unwrap();
             assert!(!partition.initialized);
             assert!(partition.files.entries.is_empty());
             assert!(partition.pages.entries.is_empty());
@@ -1102,7 +1198,7 @@ mod tests {
                 let expected = format!("Cannot reserve {requested} bytes from budget {} with {retained} retained", memory.limit_bytes());
                 assert_eq!(error.code, "rtdb/memory-budget-exceeded");
                 assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-                let partition = cursor.partitions.front().unwrap();
+                let partition = cursor.front_partition().unwrap();
                 assert!(!partition.initialized);
                 assert!(partition.files.entries.is_empty());
                 assert!(partition.pages.entries.is_empty());
@@ -1119,7 +1215,7 @@ mod tests {
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             let expected = format!("Cannot reserve {file_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
             assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-            let partition = cursor.partitions.front().unwrap();
+            let partition = cursor.front_partition().unwrap();
             assert!(partition.files.entries.is_empty());
             assert!(partition.files._reservation.is_none());
             assert!(partition.tasks.is_none());
@@ -1140,7 +1236,7 @@ mod tests {
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             let expected = format!("Cannot reserve {stack_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
             assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-            let partition = cursor.partitions.front().unwrap();
+            let partition = cursor.front_partition().unwrap();
             assert!(!partition.initialized);
             assert!(partition.files.entries.is_empty());
             assert!(partition.pages.entries.is_empty());
@@ -1161,7 +1257,7 @@ mod tests {
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let expected = format!("Cannot reserve {replacement_extent} bytes from budget {} with {retained_at_growth} retained", memory.limit_bytes());
         assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-        let partition = cursor.partitions.front().unwrap();
+        let partition = cursor.front_partition().unwrap();
         assert!(partition.pages.entries.is_empty());
         assert!(partition.pages._reservation.is_none());
         assert!(partition.tasks.is_none());
@@ -1175,7 +1271,7 @@ mod tests {
 
         if files_used != 0 {
             let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
-            let partition = cursor.partitions.front_mut().unwrap();
+            let partition = cursor.front_partition_mut().unwrap();
             partition.initialize().await.unwrap();
             let plan_memory = MemoryBudget::new(memory.limit_bytes());
             let plan = ScanTaskPlan::new(partition.pages.entries.iter().map(|page| PageRange { lower: page.lower, upper: page.upper }), &plan_memory).unwrap();
@@ -1191,7 +1287,7 @@ mod tests {
         assert_eq!(memory.used_bytes(), cursor_open);
         let mut rows = Vec::new();
         while let Some(page) = cursor.next_page().await.unwrap() {
-            let partition = cursor.partitions.front().unwrap();
+            let partition = cursor.front_partition().unwrap();
             assert_eq!(partition.files.entries.len(), files_used);
             assert_eq!(partition.files._reservation.as_ref().map_or(0, |lease| lease.bytes()), file_extent);
             let descriptors = &partition.pages;
@@ -1203,7 +1299,7 @@ mod tests {
         let counts = cursor.scan_counts().unwrap();
         assert_eq!(counts.files_used, files_used as u64);
         assert_eq!((counts.pages_used, counts.rows_read), (3, 3));
-        assert!(cursor.partitions.is_empty());
+        assert!(cursor.parts.is_empty());
         assert_eq!(memory.used_bytes(), cursor_open);
         drop(cursor);
         assert_eq!(memory.used_bytes(), before_cursor);
@@ -1373,7 +1469,7 @@ mod tests {
         let (mut scan, execution, _) = descriptor_scan(mixed, table, Arc::new(BufferPool::new(store, 1 << 20)));
         scan.iids = Some([events[1].iid].into_iter().collect());
         let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
-        let partition = cursor.partitions.front_mut().unwrap();
+        let partition = cursor.front_partition_mut().unwrap();
         partition.initialize().await.unwrap();
         let pages = &partition.pages.entries;
         assert_eq!(pages.iter().map(|page| page.priority).collect::<Vec<_>>(), [0, 1, 3]);
@@ -1417,7 +1513,7 @@ mod tests {
         let expected = format!("Cannot reserve {new_summary} bytes from budget {} with {retained} retained", memory.limit_bytes());
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-        let partition = cursor.partitions.front().unwrap();
+        let partition = cursor.front_partition().unwrap();
         assert!(!partition.initialized);
         assert!(partition.pages.entries.is_empty());
         assert!(partition.tasks.is_none());
@@ -1491,7 +1587,7 @@ mod tests {
             (history, scratch + previous_ceiling + replacement_ceiling),
         ] {
             let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
-            let partition = cursor.partitions.front_mut().unwrap();
+            let partition = cursor.front_partition_mut().unwrap();
             partition.initialize().await.unwrap();
             assert_eq!(partition.pages.entries.len(), 1);
             partition.load(0).await.unwrap();
@@ -1502,7 +1598,7 @@ mod tests {
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             let expected = format!("Cannot reserve {requested} bytes from budget {limit} with {retained} retained");
             assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-            assert!(cursor.partitions.front().unwrap().output.is_empty());
+            assert!(cursor.front_partition().unwrap().output.is_empty());
             drop((cursor, pressure));
             assert_eq!(root.used_bytes(), baseline);
             assert_eq!(memory.used_bytes(), baseline);
@@ -1520,7 +1616,7 @@ mod tests {
             vec![Value::I64(9), timestamp(10), timestamp(20), timestamp(100), timestamp(200)],
             vec![Value::I64(9), timestamp(20), timestamp(30), timestamp(100), Value::Null],
         ]);
-        assert!(cursor.partitions.is_empty());
+        assert!(cursor.parts.is_empty());
         assert_eq!(root.used_bytes(), cursor_open);
         drop((cursor, execution));
         assert_eq!(memory.used_bytes(), 0);

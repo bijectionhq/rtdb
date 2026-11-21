@@ -32,7 +32,7 @@ fn edn_authentication_retains_its_default_differences_from_yaml() {
     let AuthConfig::OpenIdConnect(config) = config.auth else { panic!("expected OIDC") };
     assert!(config.rules.is_empty());
     let (config, _) = NodeConfiguration::from_edn_with_environment(r#"{:authn [:user-list {:users {"alice" [:argon2id "encoded"]} :rules [{:method :password :user "alice" :remote-addr "127.0.0.1"}]}]}"#, &|_| None).unwrap();
-    let AuthConfig::UserList { users, rules } = config.auth else { panic!("expected user list") };
+    let AuthConfig::UserList { users, rules, .. } = config.auth else { panic!("expected user list") };
     assert_eq!(users["alice"].encoded(), "encoded");
     assert_eq!(rules[0].method, Method::Password);
     assert_eq!(rules[0].remote_address.as_deref(), Some("127.0.0.1"));

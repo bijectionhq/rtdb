@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use prost_types::Any;
-use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, storage_root}};
+use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, StorageRoot}};
 use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_storage::disk_cache::DiskCache;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
@@ -40,6 +40,8 @@ pub struct DatabaseResources {
 
 pub struct DatabaseStorage {
     pub store: Arc<dyn ObjectStore>,
+    /// How recovery finds the latest block: listing, unless the provider knows where to start.
+    pub blocks: rtdb_replication::BlockDiscovery,
     pub storage_epoch: StorageEpoch,
     pub storage_version: StorageVersion,
     /// The caller drains this region if later database assembly fails.
@@ -58,6 +60,13 @@ pub trait RemoteStorageFactory: Send + Sync {
     /// The returned store is scoped to `storage_root`, under the provider's configured prefix.
     /// Retained provider operations belong to the supplied database region, including after caller cancellation.
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>>;
+    /// A remote store normally uses a disk cache. An isolated read-only
+    /// factory may opt out to avoid retaining an extra physical copy.
+    fn use_disk_cache(&self) -> bool { true }
+    /// Wraps the store after the node's disk cache, so that whatever this adds (decryption, say) happens above the cache and the cache holds only what `open` returned.
+    async fn wrap_cached(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> { Ok(cached) }
+    /// How recovery should find the store's latest block; a provider that tracks it spares recovery a listing.
+    async fn block_discovery(&self, _configuration: &Any) -> Result<rtdb_replication::BlockDiscovery> { Ok(rtdb_replication::BlockDiscovery::List) }
 }
 
 #[async_trait]
@@ -212,7 +221,7 @@ impl ResourceFactory for NativeResources {
             }
             None => 0,
         };
-        storage_root(CURRENT_STORAGE_VERSION, StorageEpoch(epoch), 0, 1)?;
+        StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(epoch))?;
         Ok(())
     }
 
@@ -227,18 +236,26 @@ impl ResourceFactory for NativeResources {
                 None => None,
             }.unwrap_or(0);
             let storage_epoch = StorageEpoch(epoch);
-            let root = ObjectKey::new(storage_root(CURRENT_STORAGE_VERSION, storage_epoch, 0, 1)?)?;
+            let root = ObjectKey::new(StorageRoot::new(CURRENT_STORAGE_VERSION, storage_epoch)?.key())?;
+            let mut blocks = rtdb_replication::BlockDiscovery::List;
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
                 Some(database_config::Storage::LocalStorage(storage)) => Arc::new(LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?).join(root.as_str()), Arc::clone(&io))?),
                 Some(database_config::Storage::RemoteStorage(storage)) => {
                     let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
-                    let remote = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?.open(configuration, &root, Arc::clone(&io)).await?;
-                    let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
-                    cache.scope_in(cache_namespace(configuration, storage_epoch)?, remote, Arc::clone(&io))?
+                    let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
+                    let remote = factory.open(configuration, &root, Arc::clone(&io)).await?;
+                    blocks = factory.block_discovery(configuration).await?;
+                    let storage = if factory.use_disk_cache() {
+                        let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
+                        cache.scope_in(cache_namespace(configuration, storage_epoch)?, remote, Arc::clone(&io))?
+                    } else {
+                        remote
+                    };
+                    factory.wrap_cached(configuration, storage).await?
                 }
             };
-            Ok(DatabaseStorage { store, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
+            Ok(DatabaseStorage { store, blocks, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened

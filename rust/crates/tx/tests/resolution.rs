@@ -160,6 +160,32 @@ async fn ingestion_metrics_count_abort_and_invalid_time_but_exclude_skipped_tran
 }
 
 #[tokio::test]
+async fn guarded_system_time_cannot_precede_the_source_log() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let metadata = UserMetadata::new(
+        Value::Struct(StructFields::from([("rtdb_ordered_system_time".into(), Value::Bool(true))])),
+        &context.memory,
+    ).unwrap();
+    let guarded = |time| SourceTransaction::new(
+        vec![put(&context, 9, 0, i64::MAX)],
+        SubmitOptions { system_time: Some(Timestamp(time)), user_metadata: Some(metadata.clone()), ..Default::default() },
+        &context.memory,
+    ).unwrap();
+
+    let aborted = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), guarded(99), &context).await.unwrap();
+    assert_eq!(aborted.result().error().unwrap().code, "rtdb/ordered-system-time");
+    assert_eq!(aborted.result().tx_key().system_time, Timestamp(100));
+    assert_eq!(aborted.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+
+    let committed = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), guarded(101), &context).await.unwrap();
+    assert!(committed.result().committed());
+    assert_eq!(committed.result().tx_key().system_time, Timestamp(101));
+    assert_eq!(committed.writes().tables()[&table()].batch().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn skipped_transaction_stages_only_its_aborted_row_and_smooths_time() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();

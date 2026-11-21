@@ -19,6 +19,7 @@ class ExtractionCommands:
         self.fail_create_ack = fail_create_ack
         self.name = None
         self.exited = False
+        self.executable_count = 0
 
     def run(self, name, argv, required=True, timeout=None):
         self.calls.append((name, argv))
@@ -26,6 +27,7 @@ class ExtractionCommands:
         content = ""
         if name == "artifact-container":
             self.name = argv[argv.index("--name") + 1]
+            self.executable_count = argv[-1].count(" --build-info")
             self.container = True
             self.volumes.add("anonymous-volume")
             if self.fail_create_ack:
@@ -38,7 +40,7 @@ class ExtractionCommands:
                                   "Mounts": [{"Type": "volume", "Name": value} for value in self.volumes]}])
         elif name == "artifact-build-info":
             self.exited = True
-            content = json.dumps({"schema_version": 1}) + "\n" + json.dumps({"schema_version": 1}) + "\n"
+            content = (json.dumps({"schema_version": 1}) + "\n") * self.executable_count
         elif name.startswith("extract-"):
             if self.fail_copy:
                 raise RuntimeError("copy failed")
@@ -60,6 +62,15 @@ class ExtractionCommands:
 
 
 class ReleaseSelectionTests(unittest.TestCase):
+    def test_multi_image_hosted_protocol_matches_compiled_protocol(self):
+        image = {"Config": {"Labels": {"io.rtdb.hosted-protocol": "8"}}}
+        release.verify_hosted_protocol(image, {"hosted_protocol": 8})
+        for invalid in [{}, {"hosted_protocol": 7}, {"hosted_protocol": True}]:
+            with self.assertRaises(ValueError):
+                release.verify_hosted_protocol(image, invalid)
+        with self.assertRaises(ValueError):
+            release.verify_hosted_protocol({}, {"hosted_protocol": 8})
+
     def test_base_images_require_content_digests(self):
         pinned = "registry.example/runtime:bookworm@sha256:" + "a" * 64
         self.assertEqual(immutable_image(pinned), pinned)
@@ -71,6 +82,7 @@ class ReleaseSelectionTests(unittest.TestCase):
         matrix = json.loads((HERE / "matrix.json").read_bytes())
         self.assertEqual(selected_features(matrix, "local", "linux/amd64"), [])
         self.assertIn("rtdb-server/all-backends", selected_features(matrix, "all-backends", "linux/arm64"))
+        self.assertEqual(selected_features(matrix, "multi", "linux/arm64"), ["rtdb-multi/dynamodb"])
         for variant, platform in [("unknown", "linux/amd64"), ("local", "linux/mips")]:
             with self.assertRaises(ValueError):
                 selected_features(matrix, variant, platform)
@@ -107,6 +119,15 @@ class ReleaseSelectionTests(unittest.TestCase):
             self.assertIn("artifacts/tzdb.dat", {value["path"] for value in artifacts})
             self.assertIn("artifacts/rtdb-build-info.json", {value["path"] for value in artifacts})
             self.assertIn("artifacts/rtdb-config-build-info.json", {value["path"] for value in artifacts})
+
+    def test_multi_packaging_extracts_its_executable_and_compiled_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = extract_artifacts(ExtractionCommands(root), {"Id": "image"}, "rust", root, "multi")
+            self.assertEqual({value["path"] for value in artifacts}, {
+                "artifacts/build.json", "artifacts/rtdb-multi",
+                "artifacts/rtdb-multi-build-info.json", "artifacts/tzdb.dat",
+            })
 
     def test_tzdb_override_is_copied_and_bound_independently_of_later_source_changes(self):
         with tempfile.TemporaryDirectory() as directory:

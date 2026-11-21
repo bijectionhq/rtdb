@@ -66,7 +66,7 @@ fn stored_hashes_round_trip_reject_malformed_and_keep_the_algorithm_tag() {
 
 #[tokio::test]
 async fn configured_users_keep_trusted_embedded_and_unsupported_oauth_contracts() {
-    let auth = open(AuthConfig::UserList { users: BTreeMap::from([("alice".into(), PasswordHash::bcrypt("secret").unwrap())]), rules: vec![MethodRule::any(Method::Password)] }).await;
+    let auth = open(AuthConfig::UserList { users: BTreeMap::from([("alice".into(), PasswordHash::bcrypt("secret").unwrap())]), rules: vec![MethodRule::any(Method::Password)], grants: Default::default() }).await;
     assert_eq!(auth.known_users(), vec!["alice"]);
     assert_eq!(auth.verify_password("alice", "secret").await.unwrap().user_id(), Some("alice"));
     let wrong = auth.verify_password("alice", "wrong").await.err().unwrap();

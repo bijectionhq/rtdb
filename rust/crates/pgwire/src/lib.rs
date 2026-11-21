@@ -6,5 +6,6 @@ mod server;
 mod wire;
 mod copy;
 
-pub use config::ServerConfig;
-pub use server::{ServerDriver, ServerHandle, ServerStatus};
+pub use config::{CAPABILITY_PARAMETER, CapabilityVerifier, DELEGABLE_PARAMETER, ServerConfig, VerifiedCapability};
+pub use config::CHECKPOINT_STAGE_PARAMETER;
+pub use server::{ServerDriver, ServerHandle, ServerStatus, serve_read_only_tls};

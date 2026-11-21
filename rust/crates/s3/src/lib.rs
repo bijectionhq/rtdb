@@ -1,8 +1,14 @@
 mod credential;
+#[cfg(feature = "versioning")]
+mod versions;
+
+#[cfg(feature = "versioning")]
+pub use versions::VersionedInventory;
 
 use std::sync::Arc;
-use object_store::{StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
+use object_store::{RetryConfig, StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
 use rtdb_format::generated::xtdb::aws::proto as pb;
+use rtdb_format::keys::StorageRoot;
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -50,26 +56,36 @@ impl S3Config {
     }
 
     pub fn object_prefix(&self, storage_root: &ObjectKey) -> Result<ObjectKey> {
-        match &self.prefix {
-            Some(prefix) if !prefix.is_empty() => {
-                let prefix = ObjectKey::new(prefix.clone()).map_err(Anomaly::from)?;
-                ObjectKey::new(format!("{prefix}/{storage_root}")).map_err(Anomaly::from)
-            }
-            _ => Ok(storage_root.clone()),
-        }
+        if let Some(prefix) = self.prefix.as_deref().filter(|prefix| !prefix.is_empty()) { ObjectKey::new(prefix.to_owned()).map_err(Anomaly::from)?; }
+        ObjectKey::new(StorageRoot::under_prefix(self.prefix.as_deref(), storage_root.as_str())).map_err(Anomaly::from)
     }
 
     /// `storage_root` is appended to the configured prefix and must already contain the storage version and epoch.
     /// Credential aliases are resolved at opening; default credentials refresh during requests.
     /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
     pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        Ok(self.open_store(storage_root, remotes, io, false).await?)
+    }
+
+    /// Opens the cell's immutable namespace. Any result that leaves an
+    /// individual write uncertain belongs to the region's retirement owner.
+    pub async fn open_cell(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<RemoteStore>> {
+        self.open_store(storage_root, remotes, io, true).await
+    }
+
+    async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let prefix = self.object_prefix(storage_root)?;
         let credentials = self.resolve_credentials(remotes)?;
         let (endpoint, virtual_hosted) = self.endpoint_addressing()?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&self.bucket)
             .with_virtual_hosted_style_request(virtual_hosted)
-            .with_skip_signature(false).with_conditional_put(S3ConditionalPut::ETagMatch).with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
+            .with_skip_signature(false).with_conditional_put(S3ConditionalPut::ETagMatch);
+        builder = if cell {
+            builder.with_retry(RetryConfig { max_retries: 0, ..RetryConfig::default() })
+        } else {
+            builder.with_copy_if_not_exists(S3CopyIfNotExists::Multipart)
+        };
         if let Some(region) = &self.region { builder = builder.with_region(region); }
         if let Some(endpoint) = endpoint { builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.as_str()).with_allow_http(endpoint.scheme() == "http"); }
         if let Some(credentials) = credentials {
@@ -84,10 +100,50 @@ impl S3Config {
             builder = builder.with_credentials(Arc::new(credential::CredentialBridge::new(provider)));
         }
         let client = builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
-        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
+        let client = Arc::new(client);
+        if !cell {
+            return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io)));
+        }
+        if io.publication_journal().is_some() {
+            #[cfg(feature = "versioning")]
+            {
+                let uploads = self.versioned_inventory(storage_root, remotes).await?;
+                return Ok(Arc::new(RemoteStore::new_managed(client, prefix, io, Arc::new(uploads))));
+            }
+            #[cfg(not(feature = "versioning"))]
+            return Err(Anomaly::incorrect("xtdb.aws/managed-uploads", "Managed cell publications require S3 inventory support"));
+        }
+        Ok(Arc::new(RemoteStore::new_single_put(client, prefix, io)))
     }
 
-    fn endpoint_addressing(&self) -> Result<(Option<url::Url>, bool)> {
+    #[cfg(feature = "versioning")]
+    pub async fn versioned_inventory(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver) -> Result<VersionedInventory> {
+        if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
+        let root = self.object_prefix(storage_root)?;
+        let endpoint = self.configured_endpoint()?;
+        let environment = AmazonS3Builder::from_env();
+        let default_region = || environment.get_config_value(&AmazonS3ConfigKey::Region).unwrap_or_else(|| "us-east-1".into());
+        let requester_pays = environment.get_config_value(&AmazonS3ConfigKey::RequestPayer)
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes" | "y"));
+        let mut config = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(region) = &self.region { config = config.region(aws_config::Region::new(region.clone())); }
+        if let Some(credentials) = self.resolve_credentials(remotes)? {
+            if credentials.access_key.is_empty() || credentials.secret_key.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 credentials require nonempty access and secret keys")); }
+            if self.region.is_none() { config = config.region(aws_config::Region::new(default_region())); }
+            config = config.credentials_provider(aws_credential_types::Credentials::new(credentials.access_key, credentials.secret_key, None, None, "rtdb-s3"));
+        }
+        let config = config.load().await;
+        let region = config.region().cloned().unwrap_or_else(|| aws_config::Region::new(default_region()));
+        let mut builder = aws_sdk_s3::config::Builder::from(&config)
+            .region(region)
+            .force_path_style(!self.virtual_hosted(endpoint.as_ref()));
+        // MinIO's multipart prefix query only returns exact key matches.
+        let scope_multipart_listing = endpoint.is_none();
+        builder.set_endpoint_url(endpoint.map(|endpoint| endpoint.to_string()));
+        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root, requester_pays, scope_multipart_listing))
+    }
+
+    fn configured_endpoint(&self) -> Result<Option<url::Url>> {
         let environment = AmazonS3Builder::from_env();
         let endpoint = self.endpoint.clone().or_else(|| environment.get_config_value(&AmazonS3ConfigKey::S3Endpoint)).or_else(|| environment.get_config_value(&AmazonS3ConfigKey::Endpoint));
         let endpoint = endpoint.as_ref().map(|endpoint| url::Url::parse(endpoint)
@@ -95,12 +151,21 @@ impl S3Config {
         if endpoint.as_ref().is_some_and(|endpoint| !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() || !endpoint.username().is_empty() || endpoint.password().is_some() || endpoint.query().is_some() || endpoint.fragment().is_some()) {
             return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 endpoint must be an HTTP URL without embedded credentials, query, or fragment"));
         }
+        Ok(endpoint)
+    }
+
+    fn virtual_hosted(&self, endpoint: Option<&url::Url>) -> bool {
         let dns_bucket = (3..=63).contains(&self.bucket.len()) && self.bucket.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
             && self.bucket.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric) && self.bucket.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
             && !self.bucket.contains("..") && self.bucket.parse::<std::net::IpAddr>().is_err();
-        let https = endpoint.as_ref().is_none_or(|endpoint| endpoint.scheme() == "https");
-        let virtual_hosted = !self.path_style_access_enabled && dns_bucket && !(https && self.bucket.contains('.'))
-            && !endpoint.as_ref().is_some_and(|endpoint| matches!(endpoint.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))));
+        let https = endpoint.is_none_or(|endpoint| endpoint.scheme() == "https");
+        !self.path_style_access_enabled && dns_bucket && !(https && self.bucket.contains('.'))
+            && !endpoint.is_some_and(|endpoint| matches!(endpoint.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))))
+    }
+
+    fn endpoint_addressing(&self) -> Result<(Option<url::Url>, bool)> {
+        let endpoint = self.configured_endpoint()?;
+        let virtual_hosted = self.virtual_hosted(endpoint.as_ref());
         let endpoint = endpoint.map(|mut endpoint| {
             if virtual_hosted {
                 let host = format!("{}.{}", self.bucket, endpoint.host_str().unwrap_or_default());

@@ -1,3 +1,4 @@
+pub mod directory_io;
 mod error;
 mod calendar;
 mod zone;

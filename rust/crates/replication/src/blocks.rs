@@ -106,6 +106,18 @@ pub struct ProducedBlock {
     pub tries: BTreeMap<rtdb_types::TableRef, Vec<CatalogTrie>>,
 }
 
+/// How recovery finds a partition's latest block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockDiscovery {
+    /// Lists the block catalogs.
+    #[default]
+    List,
+    /// Probes forward from a block known to have been published, one head per block, never listing; a hint naming a block that is gone falls back to listing.
+    From(BlockIndex),
+    /// Recovers exactly this block, for a reader of the state as of it.
+    At(BlockIndex),
+}
+
 pub struct BlockStore {
     store: Arc<dyn ObjectStore>,
     cache: Arc<BufferPool>,
@@ -118,14 +130,15 @@ impl BlockStore {
         TrieCatalog::new(file_size_target)?;
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
-    pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp) -> Result<RecoveredPartition> {
-        self.restore(config, source_floor, now, self.load_latest_checkpoint_after(None).await?)
+    pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery) -> Result<RecoveredPartition> {
+        self.restore(config, source_floor, now, self.load_latest_checkpoint_after(None, discovery).await?)
     }
 
     /// Reconsiders the checkpoint before a database installs it if an observed replica prefix
-    /// has already been trimmed. The driver still validates the suffix when it opens the tail.
+    /// has already been trimmed. Exact recovery reports the gap without choosing another checkpoint.
+    /// The driver still validates the suffix when it opens the tail.
     pub async fn recover_for_replay(&self, mut recovered: RecoveredPartition, logs: &PartitionLogs,
-        config: TrieConfig, now: Timestamp, cancellation: &CancellationToken) -> Result<RecoveredPartition> {
+        config: TrieConfig, now: Timestamp, discovery: BlockDiscovery, cancellation: &CancellationToken) -> Result<RecoveredPartition> {
         let source_floor = logs.source_floor()?;
         let work = async {
             loop {
@@ -133,9 +146,10 @@ impl BlockStore {
                 let Some(gap) = logs.observed_replica_gap(after).await? else {
                     return Ok(recovered.with_source_floor(source_floor));
                 };
+                if matches!(discovery, BlockDiscovery::At(_)) { return Err(gap.into()); }
                 let previous = recovered.block.as_ref().map(BlockCatalog::block_index);
                 drop(recovered);
-                let Some(replacement) = self.load_latest_checkpoint_after(previous).await? else {
+                let Some(replacement) = self.load_latest_checkpoint_after(previous, BlockDiscovery::List).await? else {
                     return Err(gap.into());
                 };
                 recovered = self.restore(config, source_floor, now, Some(replacement))?;
@@ -161,15 +175,32 @@ impl BlockStore {
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         Ok(RecoveredPartition { partition, block, progress, fence, table_blocks }.with_source_floor(source_floor))
     }
-    async fn latest_checkpoint(&self, directory: &ObjectKey) -> Result<Option<BlockIndex>> {
-        Ok(self.store.list(Some(directory)).await?.into_iter()
-            .filter_map(|entry| block_index_from_key(entry.key.as_str()).ok())
-            .max())
+    async fn latest_block(&self, discovery: BlockDiscovery) -> Result<Option<BlockIndex>> {
+        let exists = |index: BlockIndex| async move {
+            match self.store.head_fresh(&ObjectKey::new(block_key(index)?)?).await {
+                Ok(_) => Ok(true),
+                Err(rtdb_storage::Error::MissingObject(_)) => Ok(false),
+                Err(error) => Err(rtdb_types::Anomaly::from(error)),
+            }
+        };
+        let mut latest = match discovery {
+            BlockDiscovery::At(block) if exists(block).await? => return Ok(Some(block)),
+            BlockDiscovery::At(block) => return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone", format!("Block {} is no longer stored", block.0))),
+            BlockDiscovery::From(hint) if exists(hint).await? => hint,
+            _ => {
+                let directory = ObjectKey::new("blocks")?;
+                return Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max());
+            }
+        };
+        while let Some(next) = latest.0.checked_add(1).map(BlockIndex) {
+            if !exists(next).await? { break; }
+            latest = next;
+        }
+        Ok(Some(latest))
     }
 
-    async fn load_latest_checkpoint_after(&self, previous: Option<BlockIndex>) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
-        let directory = ObjectKey::new("blocks")?;
-        let latest = self.latest_checkpoint(&directory).await?;
+    async fn load_latest_checkpoint_after(&self, previous: Option<BlockIndex>, discovery: BlockDiscovery) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
+        let latest = self.latest_block(discovery).await?;
         let selected = match previous {
             Some(previous) => crate::checkpoint_discovery::newer_checkpoint(previous.0, latest.map(|index| index.0)).map(BlockIndex),
             None => latest,
@@ -178,8 +209,9 @@ impl BlockStore {
         loop {
             match self.load(index).await {
                 Err(error) if error.code == "rtdb.storage/missing-object" => {
+                    if matches!(discovery, BlockDiscovery::At(_)) { return Err(error); }
                     // Collection can overtake a listing or a read of one of the table blocks.
-                    let listed = self.latest_checkpoint(&directory).await?.map(|index| index.0);
+                    let listed = self.latest_block(BlockDiscovery::List).await?.map(|index| index.0);
                     let Some(next) = crate::checkpoint_discovery::newer_checkpoint(index.0, listed) else {
                         return Err(error);
                     };
