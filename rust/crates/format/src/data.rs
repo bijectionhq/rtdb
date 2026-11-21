@@ -277,7 +277,7 @@ enum PutLeg { First, Last }
 
 /// Builds an owned index batch with scratch for one document column at a time, laid out as a live page.
 /// `copy` selects the stored-cell writer, which preserves existing decimal coefficients.
-pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+pub fn owned_event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let metadata = put_fields.as_ref().map_or(Ok(4096), |fields| {
         fields.iter().try_fold(4096usize, |bytes, (name, ty)| {
             ty.retained_bytes()?.checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
@@ -386,11 +386,22 @@ fn put_columns<E: EncodedEvent>(
     let mut columns = Vec::with_capacity(fields.len());
     for (name, ty) in fields {
         let field = to_field(&name, &ty)?;
-        if copy && builder.is_none() && let Some(column) = gather_column(documents, &field)? {
+        if copy && let Some(column) = gather_column(documents, &field, builder.as_deref_mut())? {
             schema.push(Arc::new(field));
             columns.push(column);
             continue;
         }
+        let _scratch = builder.as_deref().map(|builder| {
+            let bytes = documents.iter().try_fold(0usize, |bytes, doc| {
+                let cell = match doc.put_column(&name) {
+                    Some(PutColumn::Stored(field, array, row)) => rtdb_columnar::estimate_read_cell_bytes(field, array, row)?,
+                    Some(PutColumn::Absent) => std::mem::size_of::<Value>(),
+                    None => 0,
+                };
+                bytes.checked_add(cell).ok_or_else(event_size)
+            })?;
+            builder.reserve_scratch(bytes)
+        }).transpose()?;
         let cells = documents.iter().map(|doc| doc.put_cell(&name, &ty)).collect::<Result<Vec<_>>>()?;
         let build = || {
             let values = cells.iter().map(|cell| cell.as_ref().clone()).collect::<Vec<_>>();
@@ -408,7 +419,7 @@ fn put_columns<E: EncodedEvent>(
 
 /// The column `field` describes, copied from the arrays its documents' pages store it in, when every page stores it
 /// under that same flat layout (or lacks it, for a nullable column): the array `copy_array` builds from the cells read.
-fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field) -> Result<Option<ArrayRef>> {
+fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field, builder: Option<&mut BatchBuilder>) -> Result<Option<ArrayRef>> {
     use arrow_schema::TimeUnit as Unit;
     let flat = match field.data_type() {
         DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
@@ -431,7 +442,19 @@ fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field) -> Result<Opt
             _ => return Ok(None),
         }
     }
-    gather(field.data_type(), &sources).map(Some)
+    let build = || gather(field.data_type(), &sources);
+    let column = match builder {
+        Some(builder) => {
+            let base = sources.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
+            let bound = sources.iter().flatten().try_fold(base, |bytes, (array, row)| {
+                rtdb_columnar::estimate_read_cell_bytes(field, *array, *row)?.checked_mul(4)
+                    .and_then(|size| bytes.checked_add(size)).ok_or_else(event_size)
+            })?;
+            builder.column(bound, build)?
+        }
+        None => build()?,
+    };
+    Ok(Some(column))
 }
 
 fn gather(data_type: &DataType, sources: &[Option<(&dyn Array, usize)>]) -> Result<ArrayRef> {
@@ -542,7 +565,11 @@ mod tests {
     fn a_column_every_page_stores_under_its_output_layout_is_copied_from_the_pages() {
         let events = [page(Value::I64(1)), page(Value::I64(2))].concat();
         let field = to_field("v", &LogicalType::Scalar(ScalarType::I64)).unwrap();
-        assert!(gather_column(&events.iter().collect::<Vec<_>>(), &field).unwrap().is_some());
+        let memory = MemoryBudget::new(1 << 20);
+        let mut builder = BatchBuilder::new(4096, &memory).unwrap();
+        let selected = gather_column(&events.iter().collect::<Vec<_>>(), &field, Some(&mut builder)).unwrap().unwrap();
+        let values = selected.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[1, 2]);
     }
 
     #[test]
@@ -550,7 +577,7 @@ mod tests {
         let events = [page(Value::I64(1)), page(Value::Utf8("a".into()))].concat();
         let union = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8));
         for ty in [LogicalType::Scalar(ScalarType::I64), union] {
-            assert!(gather_column(&events.iter().collect::<Vec<_>>(), &to_field("v", &ty).unwrap()).unwrap().is_none());
+            assert!(gather_column(&events.iter().collect::<Vec<_>>(), &to_field("v", &ty).unwrap(), None).unwrap().is_none());
         }
     }
 }
