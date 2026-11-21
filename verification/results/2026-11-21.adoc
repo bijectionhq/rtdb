@@ -839,3 +839,21 @@ The row-placement premise connects the model to a logical metadata tree in which
 The Rust metadata decoder and task builder still need a source-level refinement argument.
 The finite native witness selects histories with disjoint valid intervals and checks their encoded rows.
 Full bitemporal preservation, including same-time conflicts and erasures, remains open.
+
+The combined runner passed on `8517dfc71` after the FTS experiment merge, with mCRL2, AutoHyper, and both Rust options enabled.
+It retained the 111 Verus obligations, 59 Verus mutation cases, 20 TLC baselines, and 55 TLC counterexample or reachability cases.
+It also passed the three audited planner theorems, their three mutants, and the native planner replay with its three mutants.
+The input manifest SHA-256 is `7957fd76d42e124a8fa8812cb0790f0a966f94e193b933c483ba987c6d8e7a67`.
+
+== Hosted authority branch integration
+
+The standalone-authority follow-ups through `f5a058624` are on `rtdb-multi` at `edcc54427`.
+The merged explicit flush waits for a block covering the accepted source position and publishes the checkpoint under the same holder epoch before returning its block number.
+Historical stages bind their storage and key namespaces so the existing disposal path can validate the exact installation.
+The first merged test run caught a duplicated S3 root segment.
+Cell access, inventory, and custody now use the prefix composed by the existing S3 configuration API.
+
+The local directory and multi suites ran 192 cases, including the held stage and repair lifecycle, with DynamoDB support compiled in.
+Six cases were marked ignored and five S3 cases exited at their endpoint gate.
+Run the selected suites with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-multi -p rtdb-directory --features rtdb-multi/dynamodb --lib --tests`.
+Live S3 and DynamoDB were outside the run.
