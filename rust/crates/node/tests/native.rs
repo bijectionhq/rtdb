@@ -2622,7 +2622,7 @@ async fn a_covered_ordered_scan_yields_a_batch_before_opening_later_leaves() {
     for page in objects.list(Some(&root)).await.unwrap() {
         if !page.key.as_str().contains("/pages/") { continue; }
         let bytes = objects.get(&page.key).await.unwrap();
-        if bytes.first() == Some(&1) && bytes.windows(b"key-0399".len()).any(|cell| cell == b"key-0399") {
+        if bytes.get(1..16) == Some([0; 15].as_slice()) && bytes.windows(b"key-0399".len()).any(|cell| cell == b"key-0399") {
             objects.delete(&page.key).await.unwrap();
             removed += 1;
         }

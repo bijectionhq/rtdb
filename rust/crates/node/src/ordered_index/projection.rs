@@ -12,8 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     format_error,
-    key::{Atom, AtomRef, Bucket},
+    key::{AtomRef, Bucket},
     maintenance::cancelled,
+    postings::{BatchKind, KeyBatch, KeyRow, ProjectedKeys, Tuple},
     tree::{Cursor, Hit, Item, Key, KeyRef, Link, Root, Span, Tree},
 };
 
@@ -149,7 +150,7 @@ fn resolve(
             if let Some(tuple) = &event.tuple {
                 after.push(Span {
                     valid,
-                    tuple: Arc::clone(tuple),
+                    tuple: tuple.clone(),
                 });
             }
             Ok(())
@@ -166,7 +167,7 @@ fn resolve(
         resolver.resolve_fragments(&header, |valid, _| {
             after.push(Span {
                 valid,
-                tuple: Arc::clone(&span.tuple),
+                tuple: span.tuple.clone(),
             });
             Ok(())
         })?;
@@ -193,7 +194,7 @@ fn project(edits: &mut BTreeMap<Key, Option<Item>>, iid: Iid, before: &[Span], a
             .flat_map(|span| {
                 Bucket::cover(span.valid).map(|bucket| Key::Posting {
                     bucket,
-                    tuple: Arc::clone(&span.tuple),
+                    tuple: span.tuple.clone(),
                     iid,
                 })
             })
@@ -218,7 +219,7 @@ pub(super) enum EventOrder {
 
 struct Event {
     header: EventHeader,
-    tuple: Option<Arc<[Atom]>>,
+    tuple: Option<KeyRow>,
     _allocation: Arc<MemoryReservation>,
 }
 
@@ -275,48 +276,82 @@ impl Changes {
         retain: impl Fn(EventHeader) -> bool,
     ) -> Result<()> {
         let _headers = memory.reserve(batch.len().saturating_mul(256))?;
-        for event in batch.page_events()?.into_iter().skip(skip) {
-            if cancellation.is_cancelled() {
-                return Err(cancelled());
+        let events = batch.page_events()?;
+        for events in events[skip.min(events.len())..].chunks(128) {
+            let _cells = memory.reserve(
+                events
+                    .len()
+                    .saturating_mul(columns.len())
+                    .saturating_mul(size_of::<AtomRef<'_>>())
+                    .saturating_add(8192),
+            )?;
+            let mut retained = Vec::new();
+            let mut rows = Vec::new();
+            let mut payload = 0usize;
+            for event in events {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                let header = event.header();
+                if !retain(header) {
+                    continue;
+                }
+                let row = if header.op == EventOp::Put {
+                    let cells = columns
+                        .iter()
+                        .map(|name| match event.put_column(name) {
+                            Some(PutColumn::Stored(field, array, row)) => {
+                                AtomRef::from_arrow(field, array, row)
+                            }
+                            Some(PutColumn::Absent) => Ok(AtomRef::Null),
+                            None => Err(format_error("An indexed put has no Arrow document")),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    payload = cells.iter().fold(payload, |bytes, cell| {
+                        bytes.saturating_add(cell.retained_bytes())
+                    });
+                    let row = rows.len();
+                    rows.push(cells);
+                    Some(row)
+                } else {
+                    None
+                };
+                retained.push((header, row));
             }
-            let header = event.header();
-            if !retain(header) {
-                continue;
-            }
-            let (tuple, allocation) = if header.op == EventOp::Put {
-                let _cells =
-                    memory.reserve(columns.len().saturating_mul(size_of::<AtomRef<'_>>()))?;
-                let cells = columns
-                    .iter()
-                    .map(|name| match event.put_column(name) {
-                        Some(PutColumn::Stored(field, array, row)) => {
-                            AtomRef::from_arrow(field, array, row)
-                        }
-                        Some(PutColumn::Absent) => Ok(AtomRef::Null),
-                        None => Err(format_error("An indexed put has no Arrow document")),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let bytes = cells.iter().fold(256usize, |bytes, cell| {
-                    bytes
-                        .saturating_add(size_of::<Atom>())
-                        .saturating_add(cell.retained_bytes())
-                });
-                let allocation = memory.reserve(bytes)?;
-                let values = cells.into_iter().map(AtomRef::owned).collect::<Arc<[_]>>();
-                (Some(values), allocation)
+            let keys = if rows.is_empty() {
+                None
             } else {
-                (None, memory.reserve(256)?)
+                let mut allocation = memory.reserve(
+                    payload
+                        .saturating_mul(3)
+                        .saturating_add(columns.len().saturating_mul(4096))
+                        .saturating_add(
+                            rows.len().saturating_mul(columns.len()).saturating_mul(64),
+                        ),
+                )?;
+                let views = rows
+                    .iter()
+                    .map(|cells| Tuple::Cells(cells))
+                    .collect::<Vec<_>>();
+                let keys = KeyBatch::build(&views, BatchKind::Keys, Vec::new())?;
+                Arc::get_mut(&mut allocation)
+                    .expect("key builder owns its reservation")
+                    .shrink_to(keys.retained_bytes())?;
+                Some(ProjectedKeys::new(keys, allocation))
             };
-            self.revisions
-                .entry(header.system_from)
-                .or_default()
-                .entry(header.iid)
-                .or_default()
-                .push(Event {
-                    header,
-                    tuple,
-                    _allocation: allocation,
-                });
+            for (header, row) in retained {
+                self.revisions
+                    .entry(header.system_from)
+                    .or_default()
+                    .entry(header.iid)
+                    .or_default()
+                    .push(Event {
+                        header,
+                        tuple: row
+                            .map(|row| keys.as_ref().expect("a put has projected keys").row(row)),
+                        _allocation: memory.reserve(256)?,
+                    });
+            }
         }
         Ok(())
     }
@@ -377,10 +412,10 @@ mod tests {
                 let Key::Posting { tuple, iid, .. } = entry.into_entry().key else {
                     panic!("Expected posting");
                 };
-                let [Atom::Integer(value)] = tuple.as_ref() else {
+                let AtomRef::Integer(value) = tuple.view().cell(0) else {
                     panic!("Expected integer");
                 };
-                keys.push((*value, iid));
+                keys.push((value, iid));
             }
         }
         keys.sort_unstable();

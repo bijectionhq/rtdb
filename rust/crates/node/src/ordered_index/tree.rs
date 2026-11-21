@@ -16,10 +16,10 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    format_error,
+    correction, format_error,
     key::{Atom, Bucket},
     maintenance::cancelled,
-    postings::{Postings, Tuple},
+    postings::{KeyRow, Postings, Tuple},
     seek,
 };
 
@@ -31,7 +31,7 @@ type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 pub(super) enum Key {
     Posting {
         bucket: Bucket,
-        tuple: Arc<[Atom]>,
+        tuple: KeyRow,
         iid: Iid,
     },
     Row(Iid),
@@ -41,9 +41,7 @@ pub(super) enum Key {
 impl Key {
     fn view(&self) -> KeyRef<'_> {
         match self {
-            Self::Posting { bucket, tuple, iid } => {
-                KeyRef::Posting(*bucket, Tuple::Owned(tuple), *iid)
-            }
+            Self::Posting { bucket, tuple, iid } => KeyRef::Posting(*bucket, tuple.view(), *iid),
             Self::Row(iid) => KeyRef::Row(*iid),
             Self::Revision(time) => KeyRef::Revision(*time),
         }
@@ -52,7 +50,7 @@ impl Key {
     fn bytes(&self) -> usize {
         size_of::<Self>()
             + match self {
-                Self::Posting { tuple, .. } => tuple_bytes(tuple),
+                Self::Posting { tuple, .. } => tuple.bytes(),
                 Self::Row(_) | Self::Revision(_) => 0,
             }
     }
@@ -85,7 +83,7 @@ impl KeyRef<'_> {
             Self::Posting(bucket, tuple, iid) => Key::Posting {
                 bucket,
                 iid,
-                tuple: tuple.iter().map(|atom| atom.owned()).collect(),
+                tuple: KeyRow::Fence(tuple.iter().map(|atom| atom.owned()).collect()),
             },
             Self::Row(iid) => Key::Row(iid),
             Self::Revision(time) => Key::Revision(time),
@@ -93,20 +91,13 @@ impl KeyRef<'_> {
     }
 }
 
-fn tuple_bytes(tuple: &[Atom]) -> usize {
-    tuple
-        .iter()
-        .map(|atom| size_of::<Atom>() + atom.retained_bytes())
-        .sum()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Span {
     pub valid: Interval,
-    pub tuple: Arc<[Atom]>,
+    pub tuple: KeyRow,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub(super) enum Item {
     Posting,
     Row(Arc<[Span]>),
@@ -115,7 +106,7 @@ pub(super) enum Item {
 
 static POSTING_ITEM: Item = Item::Posting;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub(super) struct Entry {
     pub key: Key,
     pub item: Item,
@@ -141,7 +132,7 @@ impl EntryView<'_> {
             Item::Posting | Item::Revision(None) => 0,
             Item::Row(spans) => spans
                 .iter()
-                .map(|span| size_of::<Span>() + tuple_bytes(&span.tuple))
+                .map(|span| size_of::<Span>() + span.tuple.bytes())
                 .sum(),
             Item::Revision(Some(pointer)) => pointer.first.bytes() + pointer.last.bytes() + 128,
         }
@@ -340,12 +331,29 @@ impl Leaf {
     }
 
     fn bytes(&self) -> usize {
+        let metadata = self
+            .metadata
+            .iter()
+            .map(|entry| match &entry.item {
+                Item::Row(spans) => {
+                    size_of::<Entry>() + spans.len().saturating_mul(size_of::<Span>())
+                }
+                _ => entry.view().bytes(),
+            })
+            .sum();
+        self.postings
+            .as_ref()
+            .map_or(0, Postings::bytes)
+            .saturating_add(metadata)
+            .saturating_add(self.first.bytes())
+            .saturating_add(self.last.bytes())
+    }
+
+    fn encoding_bytes(&self) -> usize {
         self.postings
             .as_ref()
             .map_or(0, Postings::bytes)
             .saturating_add(self.metadata.iter().map(|entry| entry.view().bytes()).sum())
-            .saturating_add(self.first.bytes())
-            .saturating_add(self.last.bytes())
     }
 }
 
@@ -357,7 +365,7 @@ const ARROW_LEAF_HEADER: [u8; 16] = {
 
 #[derive(Serialize, Deserialize)]
 enum StoredPage {
-    Leaf(Vec<Entry>),
+    Revisions(Vec<(Timestamp, Option<Arc<Pointer>>)>),
     Branch(Vec<Arc<Pointer>>),
 }
 
@@ -489,13 +497,14 @@ impl Tree {
         let bytes = IoRegion::retaining(
             memory.clone(),
             self.admitted(store.get_fresh_exact(&object, pointer.size)),
-        ).await?;
+        )
+        .await?;
         if bytes.len() != pointer.size
             || format!("{:x}", Sha256::digest(bytes.as_ref())) != pointer.digest
         {
             return Err(format_error("Ordered index page checksum mismatch"));
         }
-        let page = decode(bytes, pointer.generation)?;
+        let page = decode(bytes, pointer.generation, &memory)?;
         if page.first() != &pointer.first || page.last() != &pointer.last {
             return Err(format_error(
                 "Ordered index page fences differ from its reference",
@@ -507,9 +516,10 @@ impl Tree {
                 "Ordered index page exceeded its memory admission",
             ));
         }
-        Arc::get_mut(&mut memory)
-            .expect("page owns its admission")
-            .shrink_to(retained)?;
+        if let Some(memory) = Arc::get_mut(&mut memory) {
+            memory.shrink_to(retained)?;
+        }
+        let retained = memory.bytes();
         let node = Arc::new(Node {
             page,
             _memory: memory,
@@ -736,9 +746,13 @@ impl Tree {
             if let Some(pointer) = written.get(&identity) {
                 return Ok(Arc::clone(pointer));
             }
+            let bytes = match &node.page {
+                Page::Leaf(leaf) => leaf.encoding_bytes(),
+                Page::Branch(_) => node.page.bytes(),
+            };
             let _scratch = self
                 .memory
-                .reserve(node.page.bytes().saturating_mul(8).saturating_add(4096))?;
+                .reserve(bytes.saturating_mul(8).saturating_add(4096))?;
             let encoded = match &node.page {
                 Page::Leaf(leaf) => {
                     if !leaf
@@ -751,14 +765,23 @@ impl Tree {
                         ));
                     }
                     if let Some(postings) = &leaf.postings {
-                        let suffix = if leaf.metadata.is_empty() {
-                            Vec::new()
-                        } else {
-                            serde_json::to_vec(&leaf.metadata).map_err(format_error)?
-                        };
-                        postings.encode(&ARROW_LEAF_HEADER, &suffix)?
+                        postings.encode(&ARROW_LEAF_HEADER, &correction::encode(&leaf.metadata)?)?
+                    } else if matches!(leaf.metadata[0].key, Key::Row(_)) {
+                        correction::encode(&leaf.metadata)?
                     } else {
-                        serde_json::to_vec(&StoredPage::Leaf(leaf.metadata.clone()))
+                        let revisions = leaf
+                            .metadata
+                            .iter()
+                            .map(|entry| match (&entry.key, &entry.item) {
+                                (Key::Revision(time), Item::Revision(root)) => {
+                                    Ok((*time, root.clone()))
+                                }
+                                _ => Err(format_error(
+                                    "Ordered index revision leaf contains other entries",
+                                )),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        serde_json::to_vec(&StoredPage::Revisions(revisions))
                             .map_err(format_error)?
                     }
                 }
@@ -824,18 +847,29 @@ impl Tree {
     }
 }
 
-fn decode(bytes: Bytes, generation: i64) -> Result<Page> {
+fn decode(bytes: Bytes, generation: i64, memory: &Arc<MemoryReservation>) -> Result<Page> {
     let (postings, metadata) = if bytes.starts_with(&ARROW_LEAF_HEADER) {
         let (postings, suffix) = Postings::decode(bytes.slice(ARROW_LEAF_HEADER.len()..), FANOUT)?;
         let metadata = if suffix.is_empty() {
             Vec::new()
         } else {
-            serde_json::from_slice(&suffix).map_err(format_error)?
+            correction::decode(suffix, FANOUT - postings.len(), memory)?
         };
         (Some(postings), metadata)
+    } else if bytes.starts_with(&correction::HEADER) {
+        (None, correction::decode(bytes, FANOUT, memory)?)
     } else {
         match serde_json::from_slice(&bytes).map_err(format_error)? {
-            StoredPage::Leaf(metadata) => (None, metadata),
+            StoredPage::Revisions(revisions) => (
+                None,
+                revisions
+                    .into_iter()
+                    .map(|(time, root)| Entry {
+                        key: Key::Revision(time),
+                        item: Item::Revision(root),
+                    })
+                    .collect(),
+            ),
             StoredPage::Branch(children)
                 if !children.is_empty()
                     && children.len() <= FANOUT

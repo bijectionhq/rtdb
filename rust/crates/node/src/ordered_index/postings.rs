@@ -14,7 +14,9 @@ use arrow_ipc::{
 };
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use bytes::Bytes;
+use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Iid, Result};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
 
 use super::{
     format_error,
@@ -262,26 +264,10 @@ impl Layout {
 }
 
 #[derive(Debug)]
-pub(super) struct Postings {
-    layouts: Vec<Layout>,
-    batch: RecordBatch,
-    bytes: usize,
-}
+pub(super) struct Postings(KeyBatch);
 
 impl Postings {
     pub fn build(keys: &[(Bucket, Tuple<'_>, Iid)]) -> Result<Self> {
-        let width = keys.first().ok_or_else(invalid)?.1.len();
-        if width == 0 || keys.iter().any(|(_, tuple, _)| tuple.len() != width) {
-            return Err(invalid());
-        }
-        let layouts = (0..width)
-            .map(|slot| {
-                Layout(keys.iter().fold(0, |mask, (_, tuple, _)| {
-                    mask | Kind::of(tuple.cell(slot)).bit()
-                }))
-            })
-            .collect::<Vec<_>>();
-        let schema = schema(&layouts)?;
         let levels = UInt8Array::from(
             keys.iter()
                 .map(|(bucket, _, _)| bucket.level as u8)
@@ -296,9 +282,117 @@ impl Postings {
             &keys.iter().map(|(_, _, iid)| *iid).collect::<Vec<_>>(),
             None,
         )?;
-        let mut arrays: Vec<ArrayRef> = vec![Arc::new(levels), Arc::new(starts), iids];
+        let tuples = keys.iter().map(|(_, tuple, _)| *tuple).collect::<Vec<_>>();
+        KeyBatch::build(
+            &tuples,
+            BatchKind::Posting,
+            vec![Arc::new(levels), Arc::new(starts), iids],
+        )
+        .map(Self)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.batch.num_rows()
+    }
+    pub fn bytes(&self) -> usize {
+        self.0.bytes
+    }
+
+    pub fn at(&self, row: usize) -> (Bucket, Tuple<'_>, Iid) {
+        let level =
+            arrow::<UInt8Array>(self.0.batch.column(0).as_ref()).expect("validated bucket level");
+        let start =
+            arrow::<UInt64Array>(self.0.batch.column(1).as_ref()).expect("validated bucket start");
+        (
+            Bucket {
+                level: level.value(row).into(),
+                start: start.value(row),
+            },
+            Tuple::Arrow(&self.0, row),
+            Iid(fixed(self.0.batch.column(2).as_ref(), row)),
+        )
+    }
+
+    pub fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
+        self.0.encode(header, suffix)
+    }
+
+    pub fn decode(bytes: Bytes, max_rows: usize) -> Result<(Self, Bytes)> {
+        let (batch, suffix) = KeyBatch::decode(bytes, max_rows, BatchKind::Posting)?;
+        let postings = Self(batch);
+        for row in 0..postings.len() {
+            let (bucket, _, _) = postings.at(row);
+            if bucket.level > 64
+                || super::domain::bucket_start(bucket.start.into(), bucket.level) != bucket.start
+            {
+                return Err(invalid());
+            }
+        }
+        Ok((postings, suffix))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BatchKind {
+    Keys,
+    Posting,
+    Correction,
+}
+
+impl BatchKind {
+    fn fields(self) -> Vec<Field> {
+        match self {
+            Self::Keys => Vec::new(),
+            Self::Posting => vec![
+                Field::new("bucket_level", DataType::UInt8, false),
+                Field::new("bucket_start", DataType::UInt64, false),
+                Field::new("iid", DataType::FixedSizeBinary(16), false),
+            ],
+            Self::Correction => vec![
+                Field::new("valid_from", DataType::Int64, false),
+                Field::new("valid_to", DataType::Int64, false),
+            ],
+        }
+    }
+
+    fn prefix(self) -> usize {
+        match self {
+            Self::Keys => 0,
+            Self::Posting => 3,
+            Self::Correction => 2,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct KeyBatch {
+    layouts: Vec<Layout>,
+    batch: RecordBatch,
+    prefix: usize,
+    bytes: usize,
+}
+
+impl KeyBatch {
+    pub fn build(tuples: &[Tuple<'_>], kind: BatchKind, mut arrays: Vec<ArrayRef>) -> Result<Self> {
+        let width = tuples.first().ok_or_else(invalid)?.len();
+        if width == 0
+            || tuples.iter().any(|tuple| tuple.len() != width)
+            || arrays.len() != kind.prefix()
+        {
+            return Err(invalid());
+        }
+        let layouts = (0..width)
+            .map(|slot| {
+                Layout(
+                    tuples
+                        .iter()
+                        .fold(0, |mask, tuple| mask | Kind::of(tuple.cell(slot)).bit()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let schema = schema(kind, &layouts)?;
         for (slot, layout) in layouts.iter().enumerate() {
-            let cells: Vec<_> = keys.iter().map(|(_, tuple, _)| tuple.cell(slot)).collect();
+            let cells: Vec<_> = tuples.iter().map(|tuple| tuple.cell(slot)).collect();
             let bytes = cells
                 .iter()
                 .map(AtomRef::retained_bytes)
@@ -306,43 +400,28 @@ impl Postings {
             if bytes > i32::MAX as usize {
                 return Err(invalid());
             }
-            arrays.push(layout.build(schema.field(slot + 3), cells)?);
+            arrays.push(layout.build(schema.field(slot + kind.prefix()), cells)?);
         }
         let batch = RecordBatch::try_new(schema, arrays).map_err(format_error)?;
-        Self::new(layouts, batch)
+        Self::new(layouts, batch, kind.prefix())
     }
 
-    fn new(layouts: Vec<Layout>, batch: RecordBatch) -> Result<Self> {
+    fn new(layouts: Vec<Layout>, batch: RecordBatch, prefix: usize) -> Result<Self> {
         let bytes = rtdb_columnar::shared_allocation_size(&batch)?
             .saturating_add(layouts.len().saturating_mul(256));
         Ok(Self {
             layouts,
             batch,
+            prefix,
             bytes,
         })
     }
 
-    pub fn len(&self) -> usize {
-        self.batch.num_rows()
-    }
-
-    pub fn bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         self.bytes
     }
-
-    pub fn at(&self, row: usize) -> (Bucket, Tuple<'_>, Iid) {
-        let level =
-            arrow::<UInt8Array>(self.batch.column(0).as_ref()).expect("validated bucket level");
-        let start =
-            arrow::<UInt64Array>(self.batch.column(1).as_ref()).expect("validated bucket start");
-        (
-            Bucket {
-                level: level.value(row).into(),
-                start: start.value(row),
-            },
-            Tuple::Arrow(self, row),
-            Iid(fixed(self.batch.column(2).as_ref(), row)),
-        )
+    pub fn batch(&self) -> &RecordBatch {
+        &self.batch
     }
 
     // One schema-bound IPC record batch. The short layout prefix identifies its typed columns.
@@ -372,7 +451,7 @@ impl Postings {
         Ok(bytes)
     }
 
-    pub fn decode(bytes: Bytes, max_rows: usize) -> Result<(Self, Bytes)> {
+    pub fn decode(bytes: Bytes, max_rows: usize, kind: BatchKind) -> Result<(Self, Bytes)> {
         let length = |offset| -> Result<usize> {
             let raw = bytes.get(offset..offset + 4).ok_or_else(invalid)?;
             Ok(u32::from_le_bytes(raw.try_into().map_err(format_error)?) as usize)
@@ -428,9 +507,8 @@ impl Postings {
         }
         let mut nodes = nodes.iter();
         let mut buffers = buffers.iter();
-        for layout in [None; 3]
-            .into_iter()
-            .chain(layouts.iter().copied().map(Some))
+        for layout in
+            std::iter::repeat_n(None, kind.prefix()).chain(layouts.iter().copied().map(Some))
         {
             let node = nodes.next().ok_or_else(invalid)?;
             if node.length() != record.length() {
@@ -473,39 +551,27 @@ impl Postings {
         let batch = read_record_batch(
             &body,
             record,
-            schema(&layouts)?,
+            schema(kind, &layouts)?,
             &HashMap::new(),
             None,
             &MetadataVersion::V5,
         )
         .map_err(format_error)?;
         if batch.num_rows() != rows
-            || batch.columns()[..3]
+            || batch.columns()[..kind.prefix()]
                 .iter()
                 .any(|array| array.null_count() != 0)
         {
             return Err(invalid());
         }
-        let mut postings = Self::new(layouts, batch)?;
-        postings.bytes = postings.bytes.saturating_add(body_start);
-        for row in 0..rows {
-            let (bucket, _, _) = postings.at(row);
-            if bucket.level > 64
-                || super::domain::bucket_start(bucket.start.into(), bucket.level) != bucket.start
-            {
-                return Err(invalid());
-            }
-        }
-        Ok((postings, bytes.slice(body_end..)))
+        let mut keys = Self::new(layouts, batch, kind.prefix())?;
+        keys.bytes = keys.bytes.saturating_add(body_start);
+        Ok((keys, bytes.slice(body_end..)))
     }
 }
 
-fn schema(layouts: &[Layout]) -> Result<Arc<Schema>> {
-    let mut fields = vec![
-        Field::new("bucket_level", DataType::UInt8, false),
-        Field::new("bucket_start", DataType::UInt64, false),
-        Field::new("iid", DataType::FixedSizeBinary(16), false),
-    ];
+fn schema(kind: BatchKind, layouts: &[Layout]) -> Result<Arc<Schema>> {
+    let mut fields = kind.fields();
     for (slot, layout) in layouts.iter().enumerate() {
         fields.push(layout.field(slot)?);
     }
@@ -521,19 +587,21 @@ fn fixed(array: &dyn Array, row: usize) -> [u8; 16] {
 }
 
 fn invalid() -> rtdb_types::Anomaly {
-    format_error("Invalid ordered index posting leaf")
+    format_error("Invalid ordered index Arrow keys")
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Tuple<'a> {
     Owned(&'a [Atom]),
-    Arrow(&'a Postings, usize),
+    Cells(&'a [AtomRef<'a>]),
+    Arrow(&'a KeyBatch, usize),
 }
 
 impl<'a> Tuple<'a> {
     pub fn len(self) -> usize {
         match self {
             Self::Owned(atoms) => atoms.len(),
+            Self::Cells(cells) => cells.len(),
             Self::Arrow(postings, _) => postings.layouts.len(),
         }
     }
@@ -541,10 +609,10 @@ impl<'a> Tuple<'a> {
     pub fn get(self, slot: usize) -> Option<AtomRef<'a>> {
         match self {
             Self::Owned(atoms) => atoms.get(slot).map(Atom::borrowed),
-            Self::Arrow(postings, row) => postings
-                .layouts
-                .get(slot)
-                .map(|layout| layout.cell(postings.batch.column(slot + 3).as_ref(), row)),
+            Self::Cells(cells) => cells.get(slot).copied(),
+            Self::Arrow(postings, row) => postings.layouts.get(slot).map(|layout| {
+                layout.cell(postings.batch.column(slot + postings.prefix).as_ref(), row)
+            }),
         }
     }
 
@@ -564,6 +632,81 @@ impl<'a> Tuple<'a> {
                 (order != Ordering::Equal).then_some(order)
             })
             .unwrap_or_else(|| self.len().cmp(&other.len()))
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ProjectedKeys {
+    batch: KeyBatch,
+    _memory: Arc<MemoryReservation>,
+}
+
+impl ProjectedKeys {
+    pub fn new(batch: KeyBatch, memory: Arc<MemoryReservation>) -> Arc<Self> {
+        Arc::new(Self {
+            batch,
+            _memory: memory,
+        })
+    }
+
+    pub fn row(self: &Arc<Self>, row: usize) -> KeyRow {
+        debug_assert!(row < self.batch.batch.num_rows());
+        KeyRow::Arrow(self.clone(), row)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum KeyRow {
+    Fence(Arc<[Atom]>),
+    Arrow(Arc<ProjectedKeys>, usize),
+}
+
+impl KeyRow {
+    pub fn view(&self) -> Tuple<'_> {
+        match self {
+            Self::Fence(atoms) => Tuple::Owned(atoms),
+            Self::Arrow(keys, row) => Tuple::Arrow(&keys.batch, *row),
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.view()
+            .iter()
+            .map(|cell| size_of::<Atom>() + cell.retained_bytes())
+            .sum()
+    }
+}
+
+impl PartialEq for KeyRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for KeyRow {}
+impl PartialOrd for KeyRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for KeyRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.view().compare(other.view())
+    }
+}
+
+impl Serialize for KeyRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let tuple = self.view();
+        let mut sequence = serializer.serialize_seq(Some(tuple.len()))?;
+        for cell in tuple.iter() {
+            sequence.serialize_element(&cell)?;
+        }
+        sequence.end()
+    }
+}
+impl<'de> Deserialize<'de> for KeyRow {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Arc::deserialize(deserializer).map(Self::Fence)
     }
 }
 

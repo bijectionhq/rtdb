@@ -44,7 +44,9 @@ The point read applies later erasures to the selected root.
 The projector reads typed Arrow cells directly from table events.
 A posting leaf stores an uncompressed Arrow IPC record batch with a compact description of its column types.
 Seeks compare cells in the leaf's Arrow buffers, and a page rewrite copies surviving cells directly into the new buffers.
-Branch fences, correction spans, and the revision directory carry the tree metadata.
+Correction spans refer to rows of index-owned Arrow key batches.
+A correction page persists only its own spans as Arrow columns for validity endpoints and keys, with an IID and span count for each row group.
+Branch fences and the revision directory carry the remaining tree metadata.
 Each read or maintenance cycle owns its page buffers and its live replay state.
 Covered results own their projected buffers independently of the page read.
 Ordered-index inputs bypass the persistent node cache, and replay reads its source bytes within the cycle's memory budget.
