@@ -59,6 +59,10 @@ Nodes and logkeepers bound to a wildcard address require `--advertise-host` with
 A durable logkeeper uses the same advertised address and data directory after restart.
 Ensemble selection counts each advertised log endpoint once.
 
+In AWS, the cell installs its directory tables independently of the runtime roles.
+Use `--keys dynamodb:TABLE` for deployment keys in a dedicated table with string partition key `id`, separate from payload copies and without point-in-time recovery, streams or backup.
+Deleting a key clears its material and keeps a tombstone that prevents recreating that identity on a later open.
+
 **Fixed on the way.**
 
 - A newly activated fork could publish its parent's boundary and trim its own log before its first flush completed.

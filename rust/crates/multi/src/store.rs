@@ -76,7 +76,7 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn wrap_cached(&self, configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
-        let encrypted = EncryptingStore::new(cached, &self.keys.key(&config.deployment)?)?;
+        let encrypted = EncryptingStore::new(cached, &self.keys.key(&config.deployment).await?)?;
         let fence = match (config.writer_epoch, config.compactor) {
             (Some(epoch), _) => Fence::Writer { epoch, record: rtdb_directory::watch_deployment(Arc::clone(&self.directory), config.deployment.clone(), self.fence_interval) },
             (None, true) => Fence::Compactor,
@@ -397,7 +397,7 @@ pub async fn finish_moves(bucket: &dyn ObjectStore, deployments: &[DeploymentRec
             }
             finished += 1;
         }
-        if let Some(keys) = keys { keys.destroy(&record.id)?; }
+        if let Some(keys) = keys { keys.destroy(&record.id).await?; }
     }
     Ok(finished)
 }

@@ -33,7 +33,8 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --name NAME\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
-(RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n";
+(RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
+For `--keys` use a private local directory or dynamodb:TABLE with an independently installed key table.\n";
 
 #[tokio::main]
 async fn main() {
@@ -108,7 +109,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(), agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(20),
                 pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
                 local_compaction: !arguments.present("no-local-compaction"), capabilities: cell_secret(&arguments)?,
-                keys: keys(&arguments)?, cache_dir: PathBuf::from(arguments.required("cache")?),
+                keys: key_service(arguments.required("keys")?).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
             }).await?;
             eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
             cancellation.cancelled().await;
@@ -151,10 +152,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
             let from_storage = CellStorage::parse(arguments.required("from-storage-root")?)?;
             let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
-            let from_keys = rtdb_multi::keys::LocalKeyService::new(arguments.required("from-keys")?)?;
-            let to_keys = rtdb_multi::keys::LocalKeyService::new(arguments.required("to-keys")?)?;
-            let from = admin::CellHandle { name: arguments.required("from")?, directory: from_directory.as_ref(), storage: &from_storage, keys: &from_keys, maximum_deployments: usize::MAX };
-            let to = admin::CellHandle { name: arguments.required("to")?, directory: to_directory.as_ref(), storage: &to_storage, keys: &to_keys, maximum_deployments: usize::MAX };
+            let from_keys = key_service(arguments.required("from-keys")?).await?;
+            let to_keys = key_service(arguments.required("to-keys")?).await?;
+            let from = admin::CellHandle { name: arguments.required("from")?, directory: from_directory.as_ref(), storage: &from_storage, keys: from_keys.as_ref(), maximum_deployments: usize::MAX };
+            let to = admin::CellHandle { name: arguments.required("to")?, directory: to_directory.as_ref(), storage: &to_storage, keys: to_keys.as_ref(), maximum_deployments: usize::MAX };
             let record = admin::move_cell(map.as_ref(), &from, &to, arguments.required("name")?, 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
             Ok(())
@@ -164,7 +165,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let grace = Duration::from_secs(arguments.number("grace", 3600u64)?);
             // An open snapshot reads objects its deployment may have released since; the reaper's grace has to outlast it.
             if grace <= rtdb_multi::agent::SNAPSHOT_LIFETIME { return Err(usage("--grace must exceed a snapshot's lifetime of 30 minutes".into())); }
-            let keys = arguments.optional("keys").map(|path| rtdb_multi::keys::LocalKeyService::new(path).map(|keys| Arc::new(keys) as Arc<dyn rtdb_multi::keys::KeyService>)).transpose()?;
+            let keys = match arguments.optional("keys") {
+                Some(specification) => Some(key_service(specification).await?),
+                None => None,
+            };
             rtdb_multi::store::run_reaper(directory, CellStorage::parse(arguments.required("storage-root")?)?, keys, grace, Duration::from_secs(10), cancellation).await;
             Ok(())
         }
@@ -187,15 +191,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
                 (None, Some(time)) => {
                     let time = time.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| usage("--at-time must be an RFC 3339 timestamp".into()))?;
-                    admin::fork_at_time(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name, rtdb_types::Timestamp(time.timestamp_micros()),
+                    admin::fork_at_time(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, name, rtdb_types::Timestamp(time.timestamp_micros()),
                         Duration::from_secs(arguments.number("grace", 3600u64)?), 4 << 20).await?
                 }
                 (at_block, _) => match at_block {
                 Some(block) => {
                     let block = block.parse().map_err(|_| usage("--at-block must be a block index".into()))?;
-                    admin::fork_at_block(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
+                    admin::fork_at_block(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, name, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
                 }
-                None => admin::fork(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), from, name, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
+                None => admin::fork(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, name, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
                 },
             };
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
@@ -204,7 +208,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "delete" => {
             let directory = directory(arguments.required("directory")?).await?;
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
-            let deletion = admin::delete_deployment(directory.as_ref(), &storage, keys(&arguments)?.as_ref(), arguments.required("name")?, 4 << 20).await?;
+            let deletion = admin::delete_deployment(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), arguments.required("name")?, 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&deletion).expect("a record serializes"));
             Ok(())
         }
@@ -234,7 +238,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "audit" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let report = admin::audit(directory.as_ref(), keys(&arguments)?.as_ref(), arguments.required("name")?, 4 << 20).await?;
+            let report = admin::audit(directory.as_ref(), key_service(arguments.required("keys")?).await?.as_ref(), arguments.required("name")?, 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&report).expect("a report serializes"));
             if report.violations.is_empty() { Ok(()) } else { Err(Anomaly::fault("rtdb.multi/audit", format!("{} violations", report.violations.len()))) }
         }
@@ -258,8 +262,25 @@ fn cell_secret(arguments: &Arguments) -> Result<Option<Arc<rtdb_multi::capabilit
     arguments.optional("cell-secret").map(|path| rtdb_multi::capability::CellSecret::from_file(std::path::Path::new(path)).map(Arc::new)).transpose()
 }
 
-fn keys(arguments: &Arguments) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
-    Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(arguments.required("keys")?)?))
+async fn key_service(specification: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    if let Some(table) = specification.strip_prefix("dynamodb:") {
+        return dynamo_keys(table).await;
+    }
+    Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(specification)?))
+}
+
+#[cfg(feature = "dynamodb")]
+async fn dynamo_keys(table: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    let client = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
+        Ok(endpoint) => rtdb_directory::DynamoDirectory::local_client(&endpoint),
+        Err(_) => aws_sdk_dynamodb::Client::new(&aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await),
+    };
+    Ok(Arc::new(rtdb_multi::keys::dynamo::DynamoKeyService::new(client, table.to_owned())?))
+}
+
+#[cfg(not(feature = "dynamodb"))]
+async fn dynamo_keys(_: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
 }
 
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
@@ -278,10 +299,15 @@ async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
 async fn dynamodb(prefix: &str) -> Result<Arc<dyn Directory>> {
     let tables = rtdb_directory::DynamoTables::with_prefix(prefix);
     let directory = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
-        Ok(endpoint) => rtdb_directory::DynamoDirectory::local(&endpoint, tables),
-        Err(_) => rtdb_directory::DynamoDirectory::from_sdk_config(&aws_config::load_from_env().await, tables),
+        Ok(endpoint) => {
+            let directory = rtdb_directory::DynamoDirectory::local(&endpoint, tables);
+            directory.create_tables().await?;
+            directory
+        }
+        Err(_) => rtdb_directory::DynamoDirectory::from_sdk_config(
+            &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await, tables,
+        ),
     };
-    directory.create_tables().await?;
     Ok(Arc::new(directory))
 }
 

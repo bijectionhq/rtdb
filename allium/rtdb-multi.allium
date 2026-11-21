@@ -76,6 +76,7 @@ external entity ObjectStore {
 external entity KeyService {
     -- A key-management service (KMS).
     -- Wraps and unwraps data keys under a key bound to an encryption context, and destroys keys irreversibly.
+    -- The regional deployment key vault is outside the payload backup and tracks destroyed identities.
 }
 
 external entity Clock {

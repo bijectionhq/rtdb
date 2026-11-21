@@ -92,7 +92,7 @@ impl LogFactory for LogkeeperLogFactory {
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
-        let replica: Arc<dyn Log> = Arc::new(SealedLog { inner: quorum, cipher: Arc::new(Cipher::new(&self.keys.key(&config.deployment)?)?), stream: Arc::from(config.replica_stream.as_str()) });
+        let replica: Arc<dyn Log> = Arc::new(SealedLog { inner: quorum, cipher: Arc::new(Cipher::new(&self.keys.key(&config.deployment).await?)?), stream: Arc::from(config.replica_stream.as_str()) });
         let next = next_source_offset(replica.as_ref(), epoch).await?;
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
         let trimming = {

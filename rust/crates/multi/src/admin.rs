@@ -213,7 +213,7 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
     let members = members(directory).await?;
     let servers: Vec<String> = source.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
-    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), tokio_util::sync::CancellationToken::new()).await?, &keys.key(&source.id)?, &stream.stream)?;
+    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), tokio_util::sync::CancellationToken::new()).await?, &keys.key(&source.id).await?, &stream.stream)?;
     let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
     fork_with_tail(directory, storage, keys, parent, name, Some(checkpoint.block), tail, maximum_message_bytes).await
 }
@@ -231,7 +231,7 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: 
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
     child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
     crate::reference::fork(storage.bucket(rtdb_storage::IoRegion::new()).await?.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
-    keys.copy(&source.id, &child.id)?;
+    keys.copy(&source.id, &child.id).await?;
     if !tail.is_empty() {
         // The tail is written at the first writer epoch, so the fork's first holder claims the next and seals it.
         child.epoch = 1;
@@ -240,7 +240,7 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: 
         let members = members(directory).await?;
         let servers: Vec<String> = child.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
         let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes };
-        let writer = crate::logs::SealedLog::new(rtdb_logkeeper::open_writer(stream.clone(), child.epoch, tokio_util::sync::CancellationToken::new()).await?, &keys.key(&child.id)?, &stream.stream)?;
+        let writer = crate::logs::SealedLog::new(rtdb_logkeeper::open_writer(stream.clone(), child.epoch, tokio_util::sync::CancellationToken::new()).await?, &keys.key(&child.id).await?, &stream.stream)?;
         use rtdb_storage::log::Log;
         for envelope in tail { writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?; }
     }
@@ -282,7 +282,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
     let (source, target) = (from.storage.bucket(rtdb_storage::IoRegion::new()).await?, to.storage.bucket(rtdb_storage::IoRegion::new()).await?);
     crate::reference::materialize(source.as_ref(), &fenced.storage_prefix(), target.as_ref(), &fenced.storage_prefix()).await?;
-    to.keys.install(&fenced.id, from.keys.key(&fenced.id)?)?;
+    to.keys.install(&fenced.id, from.keys.key(&fenced.id).await?).await?;
     let mut arrived = fenced.clone();
     arrived.lifecycle = Lifecycle::Live;
     arrived.move_intent = None;
@@ -313,7 +313,7 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
     let last = rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
     if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
-    keys.destroy(&fenced.id)?;
+    keys.destroy(&fenced.id).await?;
     let key_destroyed_at_ms = now_ms();
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     // Its forks keep what they share with it: those objects are copied into them before it goes.
@@ -337,7 +337,7 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     let servers: Vec<String> = current.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
     let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
-    let log = crate::logs::SealedLog::new(reader, &keys.key(&current.id)?, &current.stream("replica"))?;
+    let log = crate::logs::SealedLog::new(reader, &keys.key(&current.id).await?, &current.stream("replica"))?;
     let latest = log.latest()?.0;
     let mut report = AuditReport::default();
     let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);
