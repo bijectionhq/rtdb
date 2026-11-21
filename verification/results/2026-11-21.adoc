@@ -1726,6 +1726,46 @@ Local command outputs are in `/private/tmp/rtdb-formal.QMjPSJsX/trie-removal-pre
 `/private/tmp/rtdb-formal.QMjPSJsX/trie-removal-prefix-a8e16de4f-native.log`,
 and `/private/tmp/rtdb-formal.QMjPSJsX/residence-retirement-composed-final/`.
 
+=== Durable native trie retirement intents
+
+At `ab9d86162` the collector stages an immutable intent in the opened storage root for each trie batch selected at an installed catalog cut.
+It stages the intents for the table before releasing its files or submitting any removal commands.
+Each receipt preserves the exact serialized intent with the replica position that confirms its removal.
+The collector releases the pending marker only after the installed receipt is durable.
+On reopen, ordinary collection reevaluates a still-present batch, and an already-absent batch can obtain a fresh installed receipt from the successor.
+The lookup validates the intent address and the receipt's embedded bytes.
+A read or validation error prevents effects in that cycle and allows another cycle to retry.
+The intent and its receipt stay in the source residence across forks and cell materialization.
+
+The disk-backed maintenance test reopens the store after stops on either side of installation, confirms that the receipt preserves the exact accepted intent, and replays an already-completed marker without issuing another removal.
+It also checks retry after a failed journal scan.
+The two native mutations fail at the declared assertions when staging is skipped and when replay is disabled.
+The focused Rust suite passed 396 tests across maintenance, replication, Multi and query, including the fork and transfer isolation case.
+Verus checked four functions and rejected four controls on the production receipt predicate, covering journal equality and strict progress past the selected cut. link:../verus/trie_retirement_intent/area.json[Receipt proof and mutations]
+
+The combined formal run at `a8e16de4f` separately completed 503 commands with the pinned toolchain, including the installed trie receipt area and the OpenJML checks.
+That run predates the durable intent area and the composed retirement model.
+The durable intent and composed model results are recorded in their focused runs.
+The default combined run excluded the optional native replay and compile-fail boundary suites.
+
+The retirement journal proves logical removal in storage roots with an installed catalog cut.
+The production reaper still needs certificates that bind exact physical identities and the atomically installed admission floor.
+The legacy timed release records do not supply that authority.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --offline --locked \
+  -p rtdb-maintenance -p rtdb-replication -p rtdb-multi -p rtdb-query \
+  --lib --test gc --no-fail-fast
+----
+
+The native mutation tests also run with `--native-replay` in link:../README.adoc#run-the-studies[the pinned verification runner].
+The local evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/durable-trie-intent-ab9d86162-native.log`,
+`/private/tmp/rtdb-formal.QMjPSJsX/durable-trie-intent-ab9d86162-controls/`,
+`/private/tmp/rtdb-formal.QMjPSJsX/durable-trie-intent-verus/`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/combined-a8e16de4f/`.
+
 
 == Client system time bounded by the source log
 
