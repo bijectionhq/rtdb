@@ -55,7 +55,14 @@ impl CellStorage {
     pub(crate) fn custody_namespace(&self) -> rtdb_types::Result<[u8; 32]> {
         let location = match self {
             Self::Local { root } => format!("local:{:?}", Self::local_root(root)?),
-            Self::S3 { config } => format!("s3:{:?}", (&config.bucket, &config.endpoint, Self::s3_root(config)?)),
+            // The placement owner verifies this fingerprint without reading
+            // credentials or opening the bucket.
+            Self::S3 { config } => format!(
+                "rtdb.cell.s3/v1\0{}\0{}\0{}",
+                config.bucket,
+                Self::s3_root(config)?,
+                config.endpoint.as_deref().unwrap_or_default(),
+            ),
         };
         let digest = ring::digest::digest(&ring::digest::SHA256, location.as_bytes());
         Ok(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
