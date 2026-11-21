@@ -1054,3 +1054,8 @@ The three audited theorems use only `propext` and `Quot.sound`.
 Both admission-control mutations fail the invariant-preservation theorem.
 This model assumes one stream with one durable authority, atomic registration and trim authorization, and a provider that completes only authorized trims.
 The proposed shared authority and recovery holds are still open production work.
+
+The combined formal runner passed on `17ad591d6` with 23 TLC baseline configurations and the new Lean and TLC controls.
+Its input manifest SHA-256 is `eb714e7df2ca08815f25ccd5c8c84491cb06e43486a56c36dae22498ea185a4a`.
+The Kafka adapter passed `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo check --offline --locked --manifest-path rust/Cargo.toml -p rtdb-kafka --lib` with the pinned CMake 4.5.1 on `PATH`.
+This adapter check did not connect to a broker.
