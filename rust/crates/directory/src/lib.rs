@@ -190,6 +190,8 @@ pub struct CheckpointCapture {
     pub checkpoint: Checkpoint,
     /// Payload copying starts only after the archive's witness becomes durable.
     pub media_bound: bool,
+    /// The bound archive provider confirmed no remaining versions or uploads.
+    pub remote_disposal: Option<[u8; 32]>,
 }
 
 /// The recovery owner releases its hold independently of serving disposal.

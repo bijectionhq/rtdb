@@ -57,25 +57,15 @@ use serde::{
 use uuid::Uuid;
 
 use crate::{
-    admin::{
-        administration_stream,
-        await_storage_drain,
-        update_installation,
-    },
+    admin::{administration_stream, await_storage_drain, update_installation},
     cipher::Cipher,
-    deployment::CellStorage,
+    deployment::{CellStorage, S3_CELL_ROOT},
     keys::KeyService,
     packing::PackDiscovery,
-    reference::{
-        key,
-        PrefixedStore,
-    },
+    reference::{PrefixedStore, key},
     store::{
-        open_deployment_store,
-        open_deployment_store_with_archive,
+        EncryptingStore, ROOT_MARKER, open_deployment_store, open_deployment_store_with_archive,
         wall_clock,
-        EncryptingStore,
-        ROOT_MARKER,
     },
 };
 
@@ -528,6 +518,7 @@ pub async fn capture(
                 log_epoch: record.log_epoch,
                 checkpoint,
                 media_bound: false,
+                remote_disposal: None,
             });
         }
         record.storage_regions.insert(region);
@@ -848,37 +839,166 @@ pub async fn begin_retirement(directory: &dyn Directory, deployment: Uuid) -> Re
     record.archive_retirement.ok_or_else(|| inconsistent("Missing the accepted recovery retirement"))
 }
 
-/// Remove registered local archives and settle their exact inventories.
-/// An S3 listing of current objects cannot establish versioned absence.
-pub async fn finish_local_retirement(directory: &dyn Directory, deployment: Uuid) -> Result<ArchiveRetirement> {
+/// One registered S3 namespace. The installed provider must verify the
+/// media witness and observe all versions and unfinished uploads absent.
+#[derive(Serialize)]
+pub(crate) struct RemoteArchive {
+    pub operation: Uuid,
+    pub bucket: String,
+    pub region: String,
+    pub root: String,
+    pub witness_size: u64,
+    pub witness_sha256: [u8; 32],
+    pub inventory: [u8; 32],
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 has 32 bytes")
+}
+
+fn retirement_fence(record: &DeploymentRecord) -> Result<&ArchiveRetirement> {
+    record
+        .archive_retirement
+        .as_ref()
+        .filter(|retirement| {
+            record.lifecycle == Lifecycle::Deleted
+                && record.disposal.is_some()
+                && record.storage_regions.is_empty()
+                && retirement.epoch == record.epoch
+        })
+        .ok_or_else(|| inconsistent("The installation is not fenced for archive retirement"))
+}
+
+fn remote_archive(
+    record: &DeploymentRecord,
+    deployment: Uuid,
+    operation: Uuid,
+    registration: &CheckpointCapture,
+) -> Result<Option<RemoteArchive>> {
+    if !registration.media_bound {
+        return Ok(None);
+    }
+    let archive: CellStorage = serde_json::from_str(&registration.archive)
+        .map_err(|_| inconsistent("Invalid retained archive binding"))?;
+    let CellStorage::S3 { config } = archive else {
+        return Ok(None);
+    };
+    let epoch = retirement_fence(record)?;
+    let point = capture_point(record, deployment, operation, &registration.archive)?;
+    let witness = encode(&point)?;
+    let inventory = encode(&(
+        epoch.epoch,
+        epoch.authorized_at_ms,
+        &registration.archive,
+        &point,
+    ))?;
+    let root = config.object_prefix(&key(S3_CELL_ROOT)?)?.to_string();
+    if config.endpoint.is_some() || config.credentials.is_some() || config.remote.is_some() {
+        return Err(unavailable(
+            "The archive requires its own provider's disposal authority",
+        ));
+    }
+    Ok(Some(RemoteArchive {
+        operation,
+        bucket: config.bucket,
+        region: config
+            .region
+            .ok_or_else(|| inconsistent("The archive registration has no AWS region"))?,
+        root,
+        witness_size: witness.len() as u64,
+        witness_sha256: sha256(&witness),
+        inventory: sha256(&inventory),
+    }))
+}
+
+pub(crate) async fn next_remote_archive(
+    directory: &dyn Directory,
+    deployment: Uuid,
+) -> Result<Option<RemoteArchive>> {
+    let record = directory
+        .deployment(&deployment.to_string())
+        .await?
+        .ok_or_else(|| unavailable("The selected installation is unavailable"))?;
+    retirement_fence(&record)?;
+    for (&operation, registration) in &record.checkpoint_captures {
+        if registration.remote_disposal.is_none()
+            && let Some(work) = remote_archive(&record, deployment, operation, registration)?
+        {
+            return Ok(Some(work));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn confirm_remote_archive(
+    directory: &dyn Directory,
+    deployment: Uuid,
+    epoch: u64,
+    operation: Uuid,
+    inventory: [u8; 32],
+) -> Result<()> {
+    update_installation(directory, &deployment.to_string(), |record| {
+        if retirement_fence(record)?.epoch != epoch {
+            return Err(inconsistent(
+                "The archive observation names another retirement fence",
+            ));
+        }
+        let registration = record
+            .checkpoint_captures
+            .get(&operation)
+            .ok_or_else(|| inconsistent("The archive observation names an unknown operation"))?;
+        let work = remote_archive(record, deployment, operation, registration)?
+            .filter(|work| work.inventory == inventory)
+            .ok_or_else(|| inconsistent("The archive observation names another inventory"))?;
+        let registration = record
+            .checkpoint_captures
+            .get_mut(&operation)
+            .expect("the archive registration exists");
+        if registration
+            .remote_disposal
+            .is_some_and(|accepted| accepted != work.inventory)
+        {
+            return Err(inconsistent("The archive observation changed"));
+        }
+        registration.remote_disposal = Some(work.inventory);
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+/// Remove registered local archives and require a provider observation for
+/// each registered remote one before recording the whole recovery receipt.
+pub async fn finish_retirement(
+    directory: &dyn Directory,
+    deployment: Uuid,
+) -> Result<ArchiveRetirement> {
     let id = deployment.to_string();
     let record = directory.deployment(&id).await?
         .ok_or_else(|| unavailable("The selected installation is unavailable"))?;
-    let accepted = record.archive_retirement.clone()
-        .ok_or_else(|| inconsistent("The recovery owner has not accepted archive retirement"))?;
+    let accepted = retirement_fence(&record)?.clone();
     if accepted.observed_empty_at_ms.is_some() {
         return Ok(accepted);
     }
-    if record.lifecycle != Lifecycle::Deleted || record.disposal.is_none()
-        || !record.storage_regions.is_empty() || accepted.epoch != record.epoch
-    {
-        return Err(inconsistent("The installation is not fenced for archive retirement"));
-    }
-
     let mut remote = false;
-    for (operation, registration) in &record.checkpoint_captures {
+    for (&operation, registration) in &record.checkpoint_captures {
         if !registration.media_bound {
             continue;
         }
         let archive: CellStorage = serde_json::from_str(&registration.archive)
             .map_err(|_| inconsistent("Invalid retained archive binding"))?;
         if !matches!(archive, CellStorage::Local { .. }) {
-            remote = true;
+            let work = remote_archive(&record, deployment, operation, registration)?
+                .ok_or_else(|| inconsistent("Missing remote archive inventory"))?;
+            remote |= registration.remote_disposal != Some(work.inventory);
             continue;
         }
         let bucket = archive.bucket(IoRegion::new()).await?;
-        let point = capture_point(&record, deployment, *operation, &registration.archive)?;
-        let witness = archive_witness(deployment, *operation)?;
+        let point = capture_point(&record, deployment, operation, &registration.archive)?;
+        let witness = archive_witness(deployment, operation)?;
         if read::<CapturePoint>(bucket.as_ref(), &witness).await?.as_ref() != Some(&point) {
             return Err(unavailable("Cannot identify the retained checkpoint archive media"));
         }
@@ -895,9 +1015,8 @@ pub async fn finish_local_retirement(directory: &dyn Directory, deployment: Uuid
     }
 
     let settled = update_installation(directory, &id, |current| {
-        if current.lifecycle != Lifecycle::Deleted || current.disposal.is_none()
-            || current.checkpoint_captures != record.checkpoint_captures
-        {
+        retirement_fence(current)?;
+        if current.checkpoint_captures != record.checkpoint_captures {
             return Err(inconsistent("The archive retirement inventory changed"));
         }
         let retirement = current.archive_retirement.as_mut()
@@ -910,4 +1029,108 @@ pub async fn finish_local_retirement(directory: &dyn Directory, deployment: Uuid
         Ok(())
     }).await?;
     settled.archive_retirement.ok_or_else(|| inconsistent("Missing the archive retirement receipt"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_directory::{DisposalReceipt, MemoryDirectory};
+
+    #[tokio::test]
+    async fn s3_archive_retirement_requires_the_observation_for_its_registered_inventory()
+    -> Result<()> {
+        let directory = MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("archive-fixture", "acme", Vec::new(), 0);
+        let deployment = Uuid::parse_str(&record.id).expect("deployment ID is a UUID");
+        let operation = Uuid::new_v4();
+        let archive =
+            CellStorage::parse("s3://archive-fixture/histories/example?region=us-east-1")?;
+        record.epoch = 4;
+        record.lifecycle = Lifecycle::Deleted;
+        record.disposal = Some(DisposalReceipt {
+            deployment: record.id.clone(),
+            incarnation: record.incarnation,
+            epoch: record.epoch,
+            journals: BTreeSet::new(),
+            journals_retired_at_ms: 1,
+            key_withdrawn_at_ms: 1,
+            serving_prefix_observed_empty_at_ms: 1,
+        });
+        record.checkpoint_captures.insert(
+            operation,
+            CheckpointCapture {
+                archive: archive_binding(&archive)?,
+                incarnation: record.incarnation,
+                log_epoch: record.log_epoch,
+                checkpoint: Checkpoint {
+                    block: 1,
+                    boundary: 3,
+                    source: 2,
+                    system_time: 100,
+                },
+                media_bound: true,
+                remote_disposal: None,
+            },
+        );
+        directory.create_deployment(record).await?;
+
+        let scheduled = begin_retirement(directory.as_ref(), deployment).await?;
+        assert!(
+            finish_retirement(directory.as_ref(), deployment)
+                .await
+                .is_err()
+        );
+        let work = next_remote_archive(directory.as_ref(), deployment)
+            .await?
+            .expect("provider work");
+        assert_eq!(work.operation, operation);
+        assert_eq!(work.bucket, "archive-fixture");
+        assert_eq!(work.region, "us-east-1");
+        assert_eq!(work.root, "histories/example/cell");
+        assert!(
+            confirm_remote_archive(
+                directory.as_ref(),
+                deployment,
+                scheduled.epoch + 1,
+                operation,
+                work.inventory
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            confirm_remote_archive(
+                directory.as_ref(),
+                deployment,
+                scheduled.epoch,
+                operation,
+                [0; 32]
+            )
+            .await
+            .is_err()
+        );
+        for _ in 0..2 {
+            confirm_remote_archive(
+                directory.as_ref(),
+                deployment,
+                scheduled.epoch,
+                operation,
+                work.inventory,
+            )
+            .await?;
+        }
+        assert!(
+            next_remote_archive(directory.as_ref(), deployment)
+                .await?
+                .is_none()
+        );
+        let settled = finish_retirement(directory.as_ref(), deployment).await?;
+        assert_eq!(settled.authorized_at_ms, scheduled.authorized_at_ms);
+        assert!(settled.observed_empty_at_ms.is_some());
+        assert_eq!(
+            finish_retirement(directory.as_ref(), deployment).await?,
+            settled
+        );
+        Ok(())
+    }
 }

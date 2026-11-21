@@ -468,7 +468,9 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &id.to_string(), 4 << 20).await.unwrap();
     let scheduled = rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.unwrap();
     assert!(scheduled.observed_empty_at_ms.is_none());
-    let retired = rtdb_multi::archive::finish_local_retirement(cell.directory.as_ref(), id).await.unwrap();
+    let retired = rtdb_multi::archive::finish_retirement(cell.directory.as_ref(), id)
+        .await
+        .unwrap();
     assert!(retired.observed_empty_at_ms.is_some());
     assert_eq!(retired.authorized_at_ms, scheduled.authorized_at_ms);
     assert!(files_under(&destination.path().join(format!("checkpoint-captures/{id}/{operation}"))).is_empty());

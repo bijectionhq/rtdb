@@ -50,6 +50,15 @@ struct Request {
     token: String,
     name: String,
     authority: Uuid,
+    observation: Option<ArchiveObservation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveObservation {
+    epoch: u64,
+    operation: Uuid,
+    inventory: [u8; 32],
 }
 
 #[derive(Deserialize)]
@@ -59,6 +68,7 @@ enum Operation {
     ScheduleDisposal,
     InspectDisposal,
     ScheduleRecoveryDisposal,
+    ConfirmRecoveryArchive,
 }
 
 #[derive(Serialize)]
@@ -83,6 +93,12 @@ enum Reply {
         name: String,
         authority: Uuid,
         epoch: u64,
+    },
+    RecoveryArchive {
+        name: String,
+        authority: Uuid,
+        epoch: u64,
+        archive: crate::archive::RemoteArchive,
     },
     RecoveryDisposed {
         name: String,
@@ -178,9 +194,15 @@ impl Installer {
     async fn dispatch(&self, directory: &dyn Directory, request: Request) -> Result<Reply> {
         let token = match request.operation {
             Operation::Install => Some(&self.install),
-            Operation::ScheduleDisposal | Operation::InspectDisposal | Operation::ScheduleRecoveryDisposal => self.disposal.as_ref(),
+            Operation::ScheduleDisposal | Operation::InspectDisposal
+            | Operation::ScheduleRecoveryDisposal | Operation::ConfirmRecoveryArchive => self.disposal.as_ref(),
         };
         if !token.is_some_and(|token| token.accepts(&request.token)) {
+            return Ok(Reply::Refused);
+        }
+        if request.observation.is_some()
+            != matches!(request.operation, Operation::ConfirmRecoveryArchive)
+        {
             return Ok(Reply::Refused);
         }
         match request.operation {
@@ -204,7 +226,7 @@ impl Installer {
                         .await?;
                 disposal_reply(installation, request.authority)
             }
-            Operation::InspectDisposal | Operation::ScheduleRecoveryDisposal => {
+            Operation::InspectDisposal | Operation::ScheduleRecoveryDisposal | Operation::ConfirmRecoveryArchive => {
                 let Some(installation) = directory.deployment_by_name(&request.name).await? else {
                     return Ok(Reply::Deferred);
                 };
@@ -214,6 +236,18 @@ impl Installer {
                 {
                     return Ok(Reply::Refused);
                 }
+                if let Some(observation) = request.observation {
+                    crate::archive::confirm_remote_archive(
+                        directory,
+                        request.authority,
+                        observation.epoch,
+                        observation.operation,
+                        observation.inventory,
+                    ).await?;
+                    return Ok(Reply::RecoveryScheduled {
+                        name: installation.name, authority: request.authority, epoch: observation.epoch,
+                    });
+                }
                 if matches!(request.operation, Operation::ScheduleRecoveryDisposal) {
                     let receipt = crate::archive::begin_retirement(directory, request.authority).await?;
                     if receipt.observed_empty_at_ms.is_some() {
@@ -222,6 +256,14 @@ impl Installer {
                             authority: request.authority,
                             epoch: receipt.epoch,
                             evidence: receipt_evidence(&receipt)?,
+                        });
+                    }
+                    if let Some(archive) = crate::archive::next_remote_archive(directory, request.authority).await? {
+                        return Ok(Reply::RecoveryArchive {
+                            name: installation.name,
+                            authority: request.authority,
+                            epoch: receipt.epoch,
+                            archive,
                         });
                     }
                     Ok(Reply::RecoveryScheduled {

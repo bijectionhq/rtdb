@@ -531,7 +531,14 @@ pub fn garbage_released_at(name: &str) -> Option<i64> {
     name.strip_prefix(&format!("{GARBAGE_DIRECTORY}/"))?.split('-').next()?.parse().ok()
 }
 
-pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deployment::CellStorage, keys: Option<Arc<dyn KeyService>>, grace: Duration, interval: Duration, cancellation: tokio_util::sync::CancellationToken) {
+pub async fn run_reaper(
+    directory: Arc<dyn Directory>,
+    storage: crate::deployment::CellStorage,
+    keys: Option<Arc<dyn KeyService>>,
+    grace: Duration,
+    interval: Duration,
+    cancellation: tokio_util::sync::CancellationToken,
+) {
     let Ok(bucket) = storage.bucket(IoRegion::new()).await else { return };
     loop {
         tokio::select! {
@@ -557,7 +564,7 @@ pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deploymen
                         .is_some_and(|retirement| retirement.observed_empty_at_ms.is_none()))
                     {
                         let Ok(id) = record.id.parse::<Uuid>() else { continue; };
-                        match cancellation.run_until_cancelled(crate::archive::finish_local_retirement(directory.as_ref(), id)).await {
+                        match cancellation.run_until_cancelled(crate::archive::finish_retirement(directory.as_ref(), id)).await {
                             None => return,
                             Some(Err(error)) => eprintln!("Archive retirement of {id} is pending: {}", error.code),
                             Some(Ok(_)) => {},
