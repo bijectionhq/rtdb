@@ -171,11 +171,11 @@ Each open refinement obligation must connect those transitions to the Rust code 
 | Property | Machine-checked evidence | Open implementation or modeling obligation |
 | --- | --- | --- |
 | S1 · One committed history | Fixed-ensemble TLC checks and the Lean quorum intersection and stale-append exclusion lemmas. | Prove persistent promises and ordered appends refine the voting premises, including overlapping accepts and ensemble changes. |
-| S2 · Durable commit survives allowed loss | Fixed-ensemble TLC checks retention of quorum-committed effects, including effects whose client reply was lost. | Prove the unbounded committed-prefix invariant and validate the checkpoint plus replay equivalence against the stored format. |
+| S2 · Durable commit survives allowed loss | Fixed-ensemble TLC checks retention of quorum-committed effects, and Lean proves checkpoint-plus-suffix replay equals full replay for a complete ordered history. | Prove the unbounded committed-prefix invariant and validate that the stored format supplies the complete prefix and suffix. |
 | S3 · Checkpoint publication authorizes trim | Lean proves for arbitrary trace length that trim retains the boundary of a durable same-stream checkpoint and an inherited checkpoint alone grants no trim permission. | Establish durable pack completeness, monotonic boundaries, storage generation checks, and the Rust publication and trim refinement. |
 | S4 · Repair preserves the committed prefix | Fixed-ensemble TLC checks recovery selection and incomplete copying. | Prove the repair boundary and old-ensemble to new-ensemble handoff, including stale overwrite and failure during the copy. |
-| S5 · Readiness implies correct recovery | TLC checks the abstract writable state and reaches a post-restart read and write. | Model checkpoint-only reads by basis and show the actual readiness and query paths refine those checks. |
-| S6 · A quorum represents real journals | TLC counterexamples for address reuse and registration before journal open. | Reproduce the failures against Rust and establish a durable identity and readiness contract for existing ensembles. |
+| S5 · Readiness implies correct recovery | TLC checks writable readiness and reaches a post-restart read and write, and Lean proves the exact basis and upper bound of successful abstract checkpoint-only reads. | Show the actual readiness and query paths establish checkpoint completeness, enforce the basis, and refine those checks. |
+| S6 · A quorum represents real journals | TLC counterexamples for address reuse and early registration, plus a loopback reproduction of early registration with the Rust binary. | Reproduce address reuse against Rust and establish a durable identity and readiness contract for existing ensembles. |
 | S7 · A keyed retry has one effect | Lean proves that an atomically recorded commit retains its original outcome and has one mutation in a single unexpired key window. | Verify the gateway and the durable idempotency transaction, including key derivation, replay eligibility, and expiration. |
 | Conditional recovery liveness | Weak-fairness TLC checks for one deployment and an intact fixed-ensemble quorum. | Prove progress across the fault boundary with admissible demand, replacement compute, and the actual readiness and retry protocol. |
 
@@ -186,10 +186,14 @@ Durable pack completeness is a premise at upload, and publication checks the wri
 Applying that theorem to Logkeepers requires distinct inventory entries tied to the correct journals and a durable promise that survives restart.
 [IdempotencyWindow.lean](../lean/IdempotencyWindow.lean) checks arbitrary commit, reply, and disconnect traces for a single eligible key before expiration.
 Its commit transition installs the outcome atomically with the only mutation, which is the contract the Rust resolver and idempotency table must establish.
+[CheckpointReplay.lean](../lean/CheckpointReplay.lean) proves that replaying exactly the suffix above a checkpoint gives the same result as folding the whole committed prefix through the requested basis.
+It also proves that the abstract snapshot response uses the requested basis within the checkpoint's coverage.
+The production refinement must connect the packed catalog and bitemporal query state to this complete logical prefix.
 Run the proofs with [Lean 4.24.0](https://github.com/leanprover/lean4/releases/tag/v4.24.0).
 
 ```sh
 lean dev/lean/CheckpointTrim.lean
+lean dev/lean/CheckpointReplay.lean
 lean dev/lean/Quorum.lean
 lean dev/lean/IdempotencyWindow.lean
 ```
@@ -199,4 +203,6 @@ With identity checks and eligibility after journal open enabled, TLC checks all 
 With `RTDBRecoveryIdentityReuse.cfg`, a write reaches two journals before a fresh journal takes over one of their addresses.
 A seal quorum made up of the fresh journal and the original journal that never held the write can then recover an empty history.
 With `RTDBRecoveryIdentityStartup.cfg`, registration followed by a failed journal open leaves the process eligible.
+In a loopback cell, pass a regular file as the Logkeeper's `--data` path to reproduce the startup failure with the Rust binary.
+After 3.5 seconds, `status` reported one live Logkeeper while its advertised socket refused connections, and the process reported `Not a directory` during shutdown.
 The pushed Rust revision resolves old ensemble members to network addresses and registers a new Logkeeper before the serving task opens its journal. [Address resolution](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/deployment.rs#L213-L217) · [Registration](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/process.rs#L168-L176) · [Journal open](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/logkeeper/src/server/mod.rs#L36-L47)
