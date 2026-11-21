@@ -71,6 +71,10 @@ In AWS, the cell installs its directory tables independently of the runtime role
 Use `--keys dynamodb:TABLE` for deployment keys in a dedicated table with string partition key `id`, separate from payload copies and without point-in-time recovery, streams or backup.
 Deleting a key clears its material and keeps a tombstone that prevents recreating that identity on a later open.
 
+The source directory records the fence epoch and destination before copying a cell transfer. Once the destination has its serving objects and key, it records the arrival and waits for routing to move and for the source to become a tombstone. Its first holder copies the sealed tail onto its logkeepers before accepting writes. Retrying a lost routing response continues that same transfer.
+
+`rtdb-multi delete --id UUID` fences an installation once. Its directory retains the serving disposal receipt once the key has been withdrawn and the serving prefix observed empty. `rtdb-multi disposal --id UUID` reads that receipt. Gateway sessions close when they observe retirement. Retained journals, versioned objects, backups and key copies in other cells require separate evidence for physical erasure.
+
 **Fixed on the way.**
 
 - A newly activated fork could publish its parent's boundary and trim its own log before its first flush completed.

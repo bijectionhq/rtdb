@@ -303,7 +303,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     assert_eq!(values(&shop, "SELECT total FROM orders").await, ["10", "20"], "the fork's writes stay in the fork");
     shop.simple_query("INSERT INTO orders (_id, total) VALUES (4, 40)").await.unwrap();
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20", "30"], "and the parent's in the parent");
-    drop((shop, preview));
+    drop(preview);
     let holder = cell.holder("shop-preview").await.unwrap();
     cell.node(holder).agent.park("shop-preview").await.unwrap();
     let written = own(&child.storage_prefix());
@@ -319,6 +319,9 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     let recovered = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &parent.id, 4 << 20).await.unwrap();
     assert_eq!(recovered, deletion);
     assert_eq!(cell.directory.deployment(&parent.id).await.unwrap().unwrap().version, tombstone.version);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !shop.is_closed() { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.expect("the gateway closes an existing session after observing disposal");
     assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await.is_err(), "a deleted deployment is refused");
     let preview = connect_eventually(&cell, "shop-preview").await;
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20", "30"], "a fork outlives its parent's deletion");
