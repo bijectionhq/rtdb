@@ -238,6 +238,10 @@ Run both the full sequence and fresh Flight ingest, check row counts, and accoun
 Report process RSS, anonymous memory, cgroup working set and total cgroup charge together with stage timings.
 Use compaction-disabled runs to identify causes and compaction-enabled runs to judge parity.
 Keep the existing correctness tests and run the relevant Rust, JVM and conformance suites for changes affecting shared behavior.
+The Gradle test and property suites passed all 6,535 tests after the watermark check changed, including 398 native binding tests.
+The Rust replication suite passed all 60 tests.
+All 59 tests in the Rust node's native integration suite passed.
+Two Rust search tests failed during compaction with an Arrow page schema mismatch on both the parity branch and its `c67d7a04f` baseline.
 
 ## Conformance follow-ups
 
