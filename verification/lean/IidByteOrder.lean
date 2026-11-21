@@ -194,10 +194,45 @@ theorem arrow_leaf_comparison_matches_iid_then_descending_row
     prefix_then_suffix leftHead rightHead leftTail rightTail (lh.trans rh.symm)]
   grind
 
+def iidRowRank (iid : List Byte) (row : Nat) : Nat :=
+  unsignedWord iid * 4294967296 + (4294967295 - row)
+
+theorem iid_row_rank_agrees_with_the_key (left right : List Byte) (leftRow rightRow : Nat)
+    (sameWidth : left.length = right.length)
+    (leftFits : leftRow < 4294967296) (rightFits : rightRow < 4294967296) :
+    iidRowRank left leftRow < iidRowRank right rightRow ↔
+      precedes left right ∨ (left = right ∧ rightRow < leftRow) := by
+  have sameWord : left = right ↔ unsignedWord left = unsignedWord right :=
+    ⟨congrArg unsignedWord, equal_width_words_are_injective left right sameWidth⟩
+  rw [← unsigned_word_order_matches_lexicographic_bytes left right sameWidth, sameWord]
+  unfold iidRowRank
+  omega
+
+theorem equal_iid_row_ranks_identify_the_row (left right : List Byte) (leftRow rightRow : Nat)
+    (leftFits : leftRow < 4294967296) (rightFits : rightRow < 4294967296)
+    (same : iidRowRank left leftRow = iidRowRank right rightRow) :
+    leftRow = rightRow := by
+  unfold iidRowRank at same
+  omega
+
+theorem arrow_leaf_comparison_realizes_the_leaf_rank
+    (leftHead rightHead leftTail rightTail : List Byte) (leftRow rightRow : Nat)
+    (lh : leftHead.length = 8) (rh : rightHead.length = 8)
+    (lt : leftTail.length = 8) (rt : rightTail.length = 8)
+    (leftFits : leftRow < 4294967296) (rightFits : rightRow < 4294967296) :
+    arrowRowBefore (word64 leftHead) (word64 rightHead) (word64 leftTail) (word64 rightTail)
+        leftRow rightRow ↔
+      iidRowRank (leftHead ++ leftTail) leftRow < iidRowRank (rightHead ++ rightTail) rightRow := by
+  have same : (leftHead ++ leftTail).length = (rightHead ++ rightTail).length := by simp [lh, rh, lt, rt]
+  rw [arrow_leaf_comparison_matches_iid_then_descending_row _ _ _ _ _ _ lh rh lt rt,
+    iid_row_rank_agrees_with_the_key _ _ _ _ same leftFits rightFits]
+
 #print axioms unsigned_word_fits_in_its_bytes
 #print axioms unsigned_word_order_matches_lexicographic_bytes
 #print axioms two_unsigned_words_match_iid_byte_order
 #print axioms flipped_sign_bit_refines_unsigned_long_order
 #print axioms arrow_leaf_comparison_matches_iid_then_descending_row
+#print axioms equal_iid_row_ranks_identify_the_row
+#print axioms arrow_leaf_comparison_realizes_the_leaf_rank
 
 end RTDB.IidByteOrder

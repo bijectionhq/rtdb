@@ -184,11 +184,24 @@ The JVM comparator uses Arrow's comparison of sixteen-byte IID views and compare
 Inspection of Arrow 19.0.0 bytecode found two word comparisons with byte-order normalization and a sign-bit flip before signed long comparison.
 Lean proves that the sign-bit flip realizes unsigned comparison and that comparing the two words and then the reverse ordinal agrees with the specified leaf order.
 The mapping assumes both readers deliver each row's stable sixteen IID bytes, the Arrow word loads represent those bytes in the documented order, and admitted row indices fit the JVM representation.
-Lean 4.35.0 audited five theorems and rejected signed-word comparison, reversed IID comparison and older-first row ties.
+Lean 4.35.0 audited seven theorems and rejected signed-word comparison, reversed IID comparison, older-first row ties and a reversed ordinal suffix in the rank.
 The Rust and JVM regressions each insert 4,096 rows and check the leaf against an independent order reference across single-byte values at every IID position, including duplicate IIDs.
 The native run passed 504 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`.
 Run the JVM case with `./gradlew :xtdb-core:test --tests 'xtdb.trie.MemoryHashTrieTest'`.
 The sorted-run and leaf-state refinement remains open. [Comparator study](../../verification/verus/trie_leaf_merge/area.json) · [JVM order proof](../../verification/lean/IidByteOrder.lean) · [Rust regression](../../rust/crates/trie/tests/contracts.rs) · [JVM regression](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
+
+### Leaf runs, compaction and persisted order
+
+The Lean leaf model starts with an ordered compacted run and arbitrary pending rows.
+It relates each edit to an independent row history that records appends and bucket filtering.
+Across arbitrary sequences of modeled inserts, cache fills, compactions, overflow merges and splits, a read returns the unique ordered sequence for that history, including repeated row occurrences.
+The general proof assumes a stable, injective rank and specializes it to the packed IID and descending ordinal rank for a stable IID reader.
+A child split uses the stable filtered run for its bucket, and the overflow case sorts both pending runs and merges them into the compacted run.
+The proof that checking each adjacent pair implies full order supplies the loader's starting invariant for the native persisted leaf.
+A JVM protobuf leaf starts with the order serialized by the producer and requires a valid ordered input.
+Lean 4.35.0 audited seven theorems and rejected four mutations covering stale cached rows, lost pending rows on overflow, missing bucket filtering and skipped adjacent comparison.
+The model uses Lean's proved list sort and merge.
+Connecting all production sort, merge, restore and reader paths to those model transitions remains an implementation refinement. [Leaf-run proof](../../verification/lean/LeafRuns.lean) · [Native leaf operations](../../rust/crates/trie/src/memory.rs) · [JVM leaf operations](../../core/src/main/kotlin/xtdb/trie/MemoryHashTrie.kt)
 
 ### Live row addresses across chunk layouts
 
