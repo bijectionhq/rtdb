@@ -121,6 +121,23 @@ and Bijection builds. Physical erasure of the remaining provider objects must
 bind garbage release, superseded publication settlement, and active read
 scopes to the provider's completion evidence.
 
+## Generation retirement model
+
+`ScopeRetirement.tla` models closing a generation to new uploads and reads, while already-admitted operations retain their original generation.
+It permits a provider upload admitted before closure to finish after closure.
+Erasure acknowledgement requires provider settlement and release of reader copies.
+A replacement generation carries replayed content only after the model's scrub condition is satisfied.
+
+With two publishers and two readers, TLC explored all 605 reachable states with the safety invariants holding.
+Setting `SettleUploads` to `FALSE` allowed a retired object to reappear after acknowledgement.
+Setting `DrainReaders` to `FALSE` allowed acknowledgement while an original reader still owned a copy.
+Setting `ScrubReplay` to `FALSE` allowed the replacement generation to carry erased content.
+
+The hosted implementation still needs a generation authority shared by read admission, the provider publication journal, and erasure completion.
+The authority must close the generation before inspecting the journal. It must settle each admitted upload by completion or confirmed abort, then verify deletion at the provider.
+Each replica must drain the old generation's operations and decoded pages before releasing its reader admission.
+Recovery must scrub erased history before producing any replacement page at the provider, including pages written before the replacement manifest is published.
+
 ## Execution
 
 Use Lean 4.35.0, Bijection's pinned Verus toolchain, and TLC from the authorized proof environment.

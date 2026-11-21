@@ -446,6 +446,23 @@ def verify_type_join(args, scratch):
     verify_lean_model(args, scratch, path, "type-join", controls, 10)
 
 
+def verify_run_encoding(args, scratch):
+    path = Path("verification/lean/RunEncoding.lean")
+    controls = {
+        "inclusive-end": (
+            "if logicalIndex < stop",
+            "if logicalIndex ≤ stop",
+            ["end_lookup_matches_expansion", "end_lookup_matches_expansion"],
+        ),
+        "lose-slice-origin": (
+            "firstEndAfter (start + row) runs",
+            "firstEndAfter (0 + row) runs",
+            ["encoded_slice_read_matches_plain"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "run-encoding", controls, 5)
+
+
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
     controls = {
@@ -555,6 +572,7 @@ def verify_lean(args, scratch):
             verify_system_time(args, scratch)
             verify_message_position(args, scratch)
             verify_type_join(args, scratch)
+            verify_run_encoding(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
