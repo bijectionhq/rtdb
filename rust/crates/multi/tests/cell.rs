@@ -514,6 +514,36 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let other_archive = CellStorage::Local { root: other_dir.path().to_owned() };
     assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &other_archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
     drop(reopened);
+
+    let destination = Cell::start(1, None).await;
+    let map = MemoryCellMap::new();
+    assert!(map.assign("shop", "source", None).await.unwrap());
+    let arrived = admin::move_cell(
+        map.as_ref(),
+        &admin::CellHandle {
+            name: "source",
+            directory: cell.directory.as_ref(),
+            storage: &storage,
+            keys: &cell.keys(),
+            maximum_deployments: 1,
+        },
+        &admin::CellHandle {
+            name: "destination",
+            directory: destination.directory.as_ref(),
+            storage: &destination.storage(),
+            keys: &destination.keys(),
+            maximum_deployments: 1,
+        },
+        "shop",
+        4 << 20,
+    ).await.unwrap();
+    assert!(arrived.checkpoint_recovery.is_none());
+    archive_dir.close().unwrap();
+    let moved = connect_eventually(&destination, "shop").await;
+    assert_eq!(values(&moved, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
+    assert_eq!(values(&moved, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    drop(moved);
+    destination.stop().await;
     cell.stop().await;
 }
 

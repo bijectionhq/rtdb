@@ -406,8 +406,12 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
             let target_bucket = to.storage.bucket(rtdb_storage::IoRegion::new()).await?;
             let prefix = fenced.storage_prefix();
             crate::reference::materialize(source_bucket.as_ref(), &prefix, target_bucket.as_ref(), &prefix).await?;
+            if let Some(archive) = crate::archive::ArchivedCheckpoint::load(&fenced, rtdb_storage::IoRegion::new()).await? {
+                archive.materialize(&fenced, target_bucket).await?;
+            }
             to.keys.install(id, from.keys.key(id).await?).await?;
             let mut arrived = fenced.clone();
+            arrived.checkpoint_recovery = None;
             arrived.storage_regions.clear();
             arrived.activation_crashes = 0;
             arrived.move_from = Some(stream.servers);

@@ -69,6 +69,7 @@ use crate::{
         PrefixedStore,
     },
     store::{
+        open_deployment_store,
         open_deployment_store_with_archive,
         wall_clock,
         EncryptingStore,
@@ -150,6 +151,38 @@ impl ArchivedCheckpoint {
             serving,
             archive: self,
         })
+    }
+
+    /// Resolve the archived part of a transferred store before its destination
+    /// accepts the history or the source can release its archive.
+    pub(crate) async fn materialize(
+        &self,
+        record: &DeploymentRecord,
+        destination: Arc<dyn ObjectStore>,
+    ) -> Result<()> {
+        let checkpoint = record
+            .checkpoint
+            .ok_or_else(|| inconsistent("Recovered installation lost its checkpoint"))?;
+        let version = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
+        let root = format!("{}/{version}", record.storage_prefix());
+        let physical = PrefixedStore::new(destination.clone(), root.clone());
+        let serving = open_deployment_store(
+            destination,
+            &root,
+            PackDiscovery::From(checkpoint.block),
+            wall_clock(),
+        )
+        .await?;
+        for (name, object) in &self.objects {
+            match serving.head(name).await {
+                Ok(_) => continue,
+                Err(Error::MissingObject(_)) => {},
+                Err(error) => return Err(error.into()),
+            }
+            let ciphertext = read_object(&self.files, name, object).await?;
+            physical.put(name, ciphertext).await?;
+        }
+        Ok(())
     }
 }
 
