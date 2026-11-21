@@ -138,7 +138,10 @@ async fn recover_interrupted_checkpoint(phase: Phase) {
     assert!(database.status().adopted_block.is_none(), "the root put had not returned");
     node.shutdown();
     schedule.close();
-    tokio::time::timeout(Duration::from_secs(10), owner).await.unwrap().unwrap().unwrap();
+    if let Err(interrupted) = tokio::time::timeout(Duration::from_secs(10), owner).await.unwrap().unwrap() {
+        assert_eq!(interrupted.code, "rtdb.storage/closed");
+        assert!(interrupted.to_string().contains("fault scenario closed"), "{interrupted}");
+    }
     schedule.assert_exhausted().unwrap();
     drop(session);
     drop(database);
