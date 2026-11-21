@@ -735,3 +735,48 @@ It checked 86 Verus obligations and 50 diagnostic controls, and completed 19 TLC
 The archived native clock test passes and restoring the original raw assignment fails at the attach, with the predecessor-order error seen on the baseline.
 All other formal and native checks in the runner passed.
 The input manifest SHA-256 is `411931297c575c6a62cd4ffaee50a057c1b72661211bb239ade135cb437ff56c`.
+
+== Checkpoint selection against the replica log floor
+
+On baseline `c765b039a`, a startup test with the native memory log and object store failed while opening the selected checkpoint's replica tail.
+A newer complete checkpoint was available.
+The repaired startup checks the first required offset against the reported prefix floor before installing the recovered state.
+If it observes a gap, it refreshes checkpoint discovery and requires a strictly newer candidate.
+The log check runs again for each replacement. An unchanged, older or empty listing preserves the log-range error.
+
+The native test selects the newer checkpoint and replays a transaction written after it.
+The follower returns all three expected rows in order.
+The selected node, replication, conformance and storage suites passed 193 tests.
+The scoped package command is
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-node -p rtdb-conformance -p rtdb-replication -p rtdb-storage --test native --test node_faults --test recovery --lib`.
+
+The memory provider reports its retained floor and the Kafka adapter uses the broker's low watermark.
+Providers without this observation continue through the driver's tail-opening check.
+The standalone Kafka adapter compiled and 831 library tests passed with CMake 4.5.1 from the pinned release archive.
+The SHA-256 of `cmake-4.5.1-macos-universal.tar.gz` is `e1fb288543e4eb2a410e385ecebc64323bda51f0205782f2b094ccd5d572ca2d`.
+The package command is `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-kafka --lib`, with CMake on `PATH`.
+These tests establish the crate's local behavior. A live Kafka broker was outside the run.
+https://github.com/Kitware/CMake/releases/tag/v4.5.1[CMake 4.5.1]
+
+Link:../verus/replay_floor/proof.rs[Verus] checks the exact signed-offset decision and four laws.
+Starting at the first retained record is allowed, a true gap identifies the first missing record, the origin is valid for an untrimmed log, and a maximum offset cannot be below a retained floor.
+Four controls catch using the covered boundary instead of its successor and excluding the exact first retained record, including variants with matching weakened contracts.
+The strictly newer checkpoint predicate is shared with the verified metadata-discovery fallback.
+
+Link:../tla/RecoveryReplay.tla[TLC] explored all 161 states with three checkpoints and possible staleness in listings.
+It rejected controls for skipping the probe, failing without refreshing, retrying the same block and trusting an earlier probe when opening the tail.
+Separate reachability cases select a usable replacement and reach a loss between the probe and tail opening.
+Apalache checked the admitted-offset properties through ten transitions and independently found the counterexample to trusting the probe.
+The observation grants no reservation. Production protection of the suffix through replay and full storage dependency closure are open obligations.
+
+The corresponding recovery change is on `rtdb-multi` at `6d2fa63b6`.
+Its sealed log forwards the floor obtained from logkeeper using the same bounds query as tail opening.
+The selected node, replica and logkeeper suites passed 156 tests on the original patch base, including the memory-provider restart and a local logkeeper trim contract for readers and writers.
+A separate 45-test replication run adds exact-block and restored-anchor coverage when the log prefix has been trimmed and a later checkpoint lies beyond the contiguous chain.
+The patch was rebased after the remote advanced. `git range-diff` confirmed the patch contents were identical, and the `rtdb-multi` binary compiled on the new head.
+
+The full runner passed on `46c0deca8` with mCRL2, AutoHyper and both Rust options enabled.
+It checked 91 Verus obligations and 54 diagnostic controls, and completed 20 TLC baselines and 55 control or reachability cases.
+The archived startup test passed. Skipping the prefix check failed at native replica startup with the same log-range error as the baseline.
+All other formal and native checks in the runner passed.
+The input manifest SHA-256 is `2ce24bf34cb8f4c64ac867d03350a300b784b071da96776dae0020c6fd3e3021`.
