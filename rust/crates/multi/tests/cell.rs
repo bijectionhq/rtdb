@@ -672,6 +672,41 @@ async fn a_planned_move_and_a_rebalance_hand_deployments_over_inside_their_pool(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_rebalances_leave_the_first_reservation_in_charge_of_the_move() {
+    let mut cell = Cell::start(1, None).await;
+    for name in ["one", "two"] {
+        admin::create_deployment(cell.directory.as_ref(), name, "acme", 3).await.unwrap();
+        assert!(matches!(cell.node(0).agent.activate(name).await.unwrap(), Response::Held { .. }));
+    }
+    cell.add_node().await;
+    let catalog = cell.node(0).server.node().catalog();
+    let one = catalog.database("one").unwrap();
+    let two = catalog.database("two").unwrap();
+    let pauses = (one.pause_transactions().await.unwrap(), two.pause_transactions().await.unwrap());
+    let directory = Arc::clone(&cell.directory);
+    let first = tokio::spawn(async move { admin::rebalance(directory.as_ref(), 10, &control()).await });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if cell.directory.deployment_by_name("one").await.unwrap().unwrap().placement_move.is_some()
+                || cell.directory.deployment_by_name("two").await.unwrap().unwrap().placement_move.is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("the first rebalancer reserved the move");
+
+    let competing = admin::rebalance(cell.directory.as_ref(), 10, &control()).await;
+    drop(pauses);
+    assert_eq!(first.await.unwrap().unwrap(), 1);
+    assert_eq!(competing.unwrap(), 0);
+    assert_eq!((cell.node(0).agent.held().len(), cell.node(1).agent.held().len()), (1, 1));
+    drop((one, two));
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unavailable_move_target_releases_the_reservation_and_late_parks_leave_the_new_holding() {
     use rtdb_multi::control::{self as rpc, MoveTicket, Request, Response};
 

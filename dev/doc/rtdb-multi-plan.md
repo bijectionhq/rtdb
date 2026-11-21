@@ -778,6 +778,7 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    A draining node hands off up to eight recently used deployments per pass and parks its idle deployments.
    It runs the handoffs one at a time.
    The source's identity and epoch must still match at reservation.
+   A rebalancer ends its current pass when another operation has reserved the deployment or changed the source holding.
    A recently used deployment keeps serving on a draining node while its pool has no eligible successor.
 2. Planned handoff (`IntendMove`, `HandOff`): subscription warm-up, hot-range prefetch from the source, admission pause, `Handoff` record, claim by move intent.
    The gateway, claim rule, and rebalancer use the same eligibility check for the general and isolation pools.

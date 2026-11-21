@@ -294,7 +294,11 @@ pub async fn rebalance(directory: &dyn Directory, moves: usize, control: &Contro
             });
             let Some((source, target, index)) = planned else { break };
             let deployment = load.get_mut(&source).expect("listed").swap_remove(index);
-            move_deployment(directory, &deployment.name, &target, control).await?;
+            match move_from_holding(directory, &deployment.name, &target, Some((&source, deployment.epoch)), control).await {
+                Ok(()) => {}
+                Err(error) if matches!(error.code.as_str(), "rtdb.multi/move-source-changed" | "rtdb.multi/move-in-progress") => return Ok(moved),
+                Err(error) => return Err(error),
+            }
             load.get_mut(&target).expect("listed").push(deployment);
             moved += 1;
         }

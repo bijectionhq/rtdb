@@ -1633,6 +1633,8 @@ rule DrainMember {
 rule Rebalance {
     -- The balancer moves deployments off a node over a watermark on any LoadVector dimension, each to its next eligible rank.
     -- Each eligible target belongs to the deployment's placement pool.
+    -- A reservation uses the source holding's identity and epoch from the plan.
+    -- A conflicting reservation or a changed source ends the current pass.
     when: NodeOverWatermark(member, dimension)
 
     ensures:
