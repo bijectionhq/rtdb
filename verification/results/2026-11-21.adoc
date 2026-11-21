@@ -190,3 +190,23 @@ The numeric proof depends on the IEEE round-to-nearest operations and the source
 The frontier proof assumes completeness of the qualifying row's matching event in a pending entry or unexpanded window.
 The production evidence exercises those paths, including shared-file members, without a general proof of index decoding, temporal candidate coverage or planner eligibility.
 The durable storage and cross-node reader-retention obligations remain open.
+
+== Checkpoint interruption on local durable storage
+
+The combined runner passed from `11131976a` with both Rust options enabled.
+TLC explored all 97 reachable states of the single-root model.
+The shortest early-root trace is three transitions.
+A second variant loses a child after its durable write in eight transitions.
+The log-retention variant removes the prefix, crashes, and then cannot find the root in eleven transitions.
+
+Four native conformance tests passed, including interruptions immediately before and after the root write, loss of a source acknowledgement, and recovery against a closed history manifest.
+The pre-write replay rebuilt from the retained log.
+The post-write replay opened the stored checkpoint and observed the same single system-time row.
+Moving the root write ahead of the table blocks in a disposable copy made the post-write replay fail at startup on the missing object `tables/public$docs/blocks/b00.binpb`.
+
+The first combined run exposed a race in the fault fixture.
+Injected closure can reach the shutting-down driver's log poll before cancellation is selected.
+The final test accepts that exact injected error as an interruption and still checks the durable checkpoint and recovered history on both sides of the write.
+
+These are local provider observations and a bounded model of checkpoint publication under the stated retention and durability assumptions.
+The referenced-trie closure across concurrent compaction and GC, and behavior on remote storage, remain separate obligations.

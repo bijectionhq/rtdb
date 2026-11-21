@@ -463,7 +463,7 @@ def verify_checkpoint_replay(args, source):
     if (
         checked.returncode != 101
         or f"{test} ... FAILED" not in checked.stdout
-        or "checkpoint could not open after After interruption" not in checked.stdout
+        or "checkpoint could not open after After interruption: rtdb.storage/missing-object" not in checked.stdout
         or "0 passed; 1 failed" not in checked.stdout
     ):
         raise ValueError("root-first mutation did not fail at checkpoint startup")
