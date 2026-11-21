@@ -289,8 +289,7 @@ config {
     -- Liveness.
     member_heartbeat: Duration = 500.milliseconds
     member_lease: Duration = 3.seconds
-    -- Independent gateway reports that corroborate a suspicion before the controller confirms it.
-    suspicion_reporters: Integer = 2
+    failed_serving_probe_rounds: Integer = 2
 
     -- The log.
     ensemble_size: Integer = 3
@@ -969,21 +968,20 @@ rule ExpireLease {
 }
 
 rule ConfirmSuspicion {
-    -- Gateways report connection failures to the controller.
-    -- Safety never depends on this verdict, so it can be quick: a wrong one costs one seal and a cache move.
-    when: SuspicionReported(member, reporters)
+    when: ServingProbeFailureObserved(member, endpoints, consecutive_failures)
 
-    requires: member.state in {eligible, draining}
-    requires: count(reporters) >= config.suspicion_reporters
-    requires: not LeaseRenewedSince(member, earliest(reporters.reported_at))
+    requires: member.state in {joining, eligible, draining}
+    requires: consecutive_failures >= config.failed_serving_probe_rounds
+    requires: endpoints = CurrentServingEndpoints(member)
 
     ensures:
         member.state = dead
 }
 
 rule ProbeMemberLiveness {
-    -- A controller pass issues up to sixteen member probes at a time.
-    -- Missing replies count against the endpoint that was probed.
+    -- A controller pass probes up to sixteen members at a time.
+    -- A round succeeds when the control endpoint answers and the pgwire TCP endpoint accepts a connection.
+    -- A successful round or a change to either endpoint clears preceding failures.
     when: ControllerProbeDue(cell)
 
     ensures:
@@ -2501,7 +2499,7 @@ invariant QuarantineIsolates {
 ------------------------------------------------------------
 
 actor Gateway {
-    -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, routes by affinity, reports suspicion.
+    -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, and routes by affinity.
     -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
     -- A configured gateway refuses plaintext startup before any holder receives credentials.
     -- A Flight SQL gateway forwards the authenticated transport peer using a proof for the deployment and writer epoch.
@@ -2600,6 +2598,10 @@ surface ClientAccess {
         -- Closing a session frees its reserved capacity.
         -- A gateway admits buffered frame bytes before reading the body and releases the charge when their last owner drops them.
 
+    @guarantee WriterDialRecovery
+        -- A failed dial to a confirmed writer is retryable within the enclosing startup or replay window.
+        -- A gateway attempt follows placement changes while that window remains open.
+
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.
 
@@ -2634,7 +2636,6 @@ surface ControlPlane {
     context cell: Cell
 
     provides:
-        SuspicionReported(controller, member, reporters)
         MoveChosen(controller, record, target)
         NodeOverWatermark(controller, member, dimension)
         EngineRolloutStarted(controller, cell, version)

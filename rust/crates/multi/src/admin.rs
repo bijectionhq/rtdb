@@ -1703,40 +1703,52 @@ impl Default for ControllerOptions {
     fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, load_limits: Default::default(), read_width: None, suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default() } }
 }
 
-pub struct FailedMemberProbe { endpoint: String, consecutive: u32 }
+pub struct FailedMemberProbe { control: String, pgwire: String, consecutive: u32 }
 
-/// Probes every live node's agent, and confirms dead those that failed `suspicion_probes` probes in a row (`ConfirmSuspicion`).
+impl FailedMemberProbe {
+    fn matches(&self, member: &MemberRecord) -> bool {
+        member.control_address.as_deref() == Some(self.control.as_str()) && member.address == self.pgwire
+    }
+}
+
+/// Probes every live node's control and pgwire endpoints and confirms consecutive failures for the same endpoint pair.
 /// Safety never depends on the verdict: a wrongly confirmed node's writes are already fenced by the epoch its successor claims.
 pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeMap<MemberId, FailedMemberProbe>, options: &ControllerOptions) -> Result<usize> {
     use futures::StreamExt;
 
+    if options.suspicion_probes == 0 { return Ok(0); }
     let now = now_ms();
     let mut members = directory.members().await?;
     members.retain(|member| {
         let probe = member.role == MemberRole::Node && member.is_live(now) && member.control_address.is_some();
-        if !probe || failures.get(&member.id).is_some_and(|failure| Some(&failure.endpoint) != member.control_address.as_ref()) {
+        if !probe || failures.get(&member.id).is_some_and(|failure| !failure.matches(member)) {
             failures.remove(&member.id);
         }
         probe
     });
     let mut probes = std::pin::pin!(futures::stream::iter(members).map(|member| async move {
         let address = member.control_address.as_deref().expect("members without control addresses were filtered");
-        let answered = matches!(control::call(address, &Request::Ping, options.probe_timeout, &options.control).await, Ok(Response::Done));
-        (member, answered)
+        let (control, pgwire_ok) = tokio::join!(
+            control::call(address, &Request::Ping, options.probe_timeout, &options.control),
+            crate::gateway::probe_pgwire(&member.address, options.probe_timeout),
+        );
+        (member, matches!(control, Ok(Response::Done)), pgwire_ok)
     }).buffer_unordered(CONCURRENT_SUSPICION_PROBES));
     let mut confirmed = 0;
-    while let Some((member, answered)) = probes.next().await {
-        if answered { failures.remove(&member.id); continue; }
-        let failure = failures.entry(member.id.clone()).or_insert_with(|| FailedMemberProbe {
-            endpoint: member.control_address.clone().expect("the member was probed at this address"),
-            consecutive: 0,
-        });
-        failure.consecutive = failure.consecutive.saturating_add(1);
-        if failure.consecutive >= options.suspicion_probes {
+    while let Some((member, control_ok, pgwire_ok)) = probes.next().await {
+        let previous = failures.get(&member.id);
+        let consecutive = crate::member_probe::failed_rounds(previous.map_or(0, |probe| probe.consecutive),
+            previous.is_some_and(|probe| probe.matches(&member)), control_ok, pgwire_ok);
+        if consecutive == 0 { failures.remove(&member.id); continue; }
+        let failure = FailedMemberProbe {
+            control: member.control_address.clone().expect("the member was probed at this address"),
+            pgwire: member.address.clone(), consecutive,
+        };
+        if consecutive >= options.suspicion_probes {
             // The suspect may still be renewing its lease, so the confirmation re-reads and retries rather than losing to a renewal.
             let mut current = member.clone();
             for _ in 0..8 {
-                if matches!(current.state, MemberState::Dead | MemberState::Retired) || current.control_address != member.control_address { break; }
+                if matches!(current.state, MemberState::Dead | MemberState::Retired) || !failure.matches(&current) { break; }
                 let mut dead = current.clone();
                 dead.state = MemberState::Dead;
                 match directory.replace_member(dead, current.version).await? {
@@ -1746,6 +1758,8 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
                 }
             }
             failures.remove(&member.id);
+        } else {
+            failures.insert(member.id, failure);
         }
     }
     Ok(confirmed)

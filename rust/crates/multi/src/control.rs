@@ -17,7 +17,9 @@ pub(crate) const NOT_CLAIMABLE: &str = "rtdb.multi/not-claimable";
 pub(crate) const CLAIM_CONTENDED: &str = "rtdb.multi/claim-contended";
 pub(crate) const ACTIVATION_RATE_LIMITED: &str = "rtdb.multi/activation-rate-limited";
 
-pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED | ACTIVATION_RATE_LIMITED) }
+pub(crate) const WRITER_PGWIRE_UNREACHABLE: &str = "rtdb.multi/writer-pgwire-unreachable";
+
+pub(crate) fn retryable_activation(code: &str) -> bool { matches!(code, NODE_UNDER_PRESSURE | CLAIM_CONTENDED | ACTIVATION_RATE_LIMITED | WRITER_PGWIRE_UNREACHABLE) }
 
 pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: Duration, mut attempt: impl FnMut() -> F) -> Result<T> {
     let latest_start = tokio::time::Instant::now() + window;
@@ -25,7 +27,7 @@ pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: D
         let result = attempt().await;
         let Err(error) = &result else { return result; };
         if !retryable_activation(&error.code) { return result; }
-        let delay = if error.code == ACTIVATION_RATE_LIMITED { Duration::from_millis(100) } else { Duration::from_millis(25) };
+        let delay = if matches!(error.code.as_ref(), ACTIVATION_RATE_LIMITED | WRITER_PGWIRE_UNREACHABLE) { Duration::from_millis(100) } else { Duration::from_millis(25) };
         let retry_at = tokio::time::Instant::now() + delay;
         if retry_at >= latest_start { return result; }
         tokio::time::sleep_until(retry_at).await;

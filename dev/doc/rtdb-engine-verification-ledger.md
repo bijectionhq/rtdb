@@ -271,7 +271,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | RES03 · Error and cancel cleanup | Open | — |
 | RES04 · Queue and frame admission | Open | — |
 | RES05 · Scoped shutdown | Open | — |
-| RES06 · Health and readiness | Open | — |
+| RES06 · Health and readiness | Partial | [Multi serving endpoint probes and recovery](rtdb-engine-proof-evidence.md#multi-serving-endpoint-failure) |
 | RES07 · Placement demand | Open | — |
 | RES08 · Physical memory envelope (Candidate) | Open | — |
 | RES09 · Cancellation work bound (Candidate) | Open | — |

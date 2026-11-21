@@ -176,3 +176,15 @@ The model finds duplicate mutations when SQL settings own the key or malformed a
 Verus checks the exact Rust cutoff selector and rejects a mutation that replaces an existing cutoff.
 The native Pgwire regression runs both duplicate cases against a real engine, and the gateway tests check repeated replacement and legacy refusal.
 Durable idempotency-table refinement, time and expiration assumptions, volatile client-supplied application keys, and general multi-statement replay remain separate obligations. [Lean proof](../../verification/multi/lean/GatewayReplay.lean) · [TLA+ model](../../verification/multi/tla/RTDBGatewayReplay.tla) · [Verus checks](../../verification/verus/replay_deadline/area.json) · [Pgwire tests](../../rust/crates/pgwire/src/protocol.rs) · [Gateway tests](../../rust/crates/multi/src/session.rs)
+
+### Multi serving endpoint failure
+
+Lean proves that repeated pgwire failures reach any finite threshold when the address pair stays fixed, even while control answers.
+Verus checks the production failure count, including reset after success or address replacement and saturation at the machine bound.
+TLC checks that failed observations can confirm only the corresponding address pair and that a waiting startup eventually connects under fair probe, placement, and retry steps.
+The model treats a reachable replacement and available directory and quorum as premises, with a startup budget sufficient for those steps.
+The weakened variants mask data endpoint failure with a healthy control response, confirm death from stale observations, or abandon the first failed dial.
+The native cell regression keeps the control endpoint responsive, breaks pgwire, and verifies the same client startup reaches the replacement and reads the committed data.
+A separate native test changes the pgwire address between the probe and publication.
+The TCP probe measures reachability without competing for a pgwire session slot.
+Post-connect stalls and gateway-only network splits invisible to the controller fall outside this recovery claim. [Lean proof](../../verification/multi/lean/ServingFailure.lean) · [TLA+ model](../../verification/multi/tla/RTDBServingFailure.tla) · [Verus checks](../../verification/verus/member_probe/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)

@@ -1736,9 +1736,11 @@ async fn controller_probes_can_progress_before_another_member_replies() {
     let directory = MemoryDirectory::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
+    let pgwire = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pgwire_address = pgwire.local_addr().unwrap().to_string();
     for id in ["first", "second"] {
         directory.register_member(MemberRecord {
-            id: MemberId(id.into()), role: MemberRole::Node, address: address.clone(), control_address: Some(address.clone()),
+            id: MemberId(id.into()), role: MemberRole::Node, address: pgwire_address.clone(), control_address: Some(address.clone()),
             availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
             state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
         }).await.unwrap();
@@ -1764,6 +1766,44 @@ async fn controller_probes_can_progress_before_another_member_replies() {
     }).await.unwrap();
     assert_eq!(confirmed.unwrap(), 0);
     assert!(failures.is_empty());
+}
+
+#[tokio::test]
+async fn the_controller_cannot_confirm_an_endpoint_changed_while_its_probe_is_pending() {
+    use rtdb_directory::{MemberRecord, MemberRole, MemberState};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let directory = MemoryDirectory::new();
+    let control = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unreachable = silent.local_addr().unwrap().to_string();
+    drop(silent);
+    let replacement = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let member = directory.register_member(MemberRecord {
+        id: MemberId("node".into()), role: MemberRole::Node, address: unreachable,
+        control_address: Some(control.local_addr().unwrap().to_string()), availability_zone: "local".into(),
+        engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
+    }).await.unwrap();
+    let id = member.id.clone();
+    let replace_during_probe = async {
+        let (peer, _) = control.accept().await.unwrap();
+        let mut peer = BufReader::new(peer);
+        let mut request = String::new();
+        peer.read_line(&mut request).await.unwrap();
+        let mut replacement_member = member.clone();
+        replacement_member.address = replacement.local_addr().unwrap().to_string();
+        assert!(directory.replace_member(replacement_member, member.version).await.unwrap().applied().is_some());
+        peer.get_mut().write_all(b"{\"outcome\":\"done\"}\n").await.unwrap();
+    };
+    let options = admin::ControllerOptions { suspicion_probes: 1, probe_timeout: Duration::from_millis(200), ..Default::default() };
+    let mut failures = BTreeMap::new();
+    let (confirmed, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(admin::confirm_suspicions(directory.as_ref(), &mut failures, &options), replace_during_probe)
+    }).await.unwrap();
+    assert_eq!(confirmed.unwrap(), 0);
+    assert_eq!(directory.member(&id).await.unwrap().unwrap().state, MemberState::Eligible);
 }
 
 #[tokio::test]
@@ -1821,6 +1861,81 @@ async fn the_controller_confirms_a_silent_node_dead_before_its_lease_runs_out() 
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
     assert_ne!(cell.holder("shop").await, Some(silent), "another node took over without waiting out the lease");
     drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pgwire_only_failure_promotes_a_writer_and_unblocks_gateway_startup() {
+    use rtdb_directory::{Cas, MemberState};
+    use rtdb_multi::control::{self, Handler, Request, Response};
+    use tokio::net::TcpListener;
+
+    struct UnreachableWriter {
+        address: String,
+        epoch: u64,
+        activated: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for UnreachableWriter {
+        async fn handle(&self, request: Request) -> Response {
+            match request {
+                Request::Ping => Response::Done,
+                Request::Activate { .. } => {
+                    self.activated.notify_one();
+                    Response::Held { address: self.address.clone(), epoch: self.epoch }
+                }
+                request => panic!("unexpected request: {request:?}"),
+            }
+        }
+    }
+
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let old = cell.holder("shop").await.unwrap();
+    let member = cell.node(old).lease.id();
+    let epoch = cell.directory.deployment_by_name("shop").await.unwrap().unwrap().epoch;
+
+    let data_endpoint = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unreachable = data_endpoint.local_addr().unwrap().to_string();
+    drop(data_endpoint);
+    let agent_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let agent_address = agent_listener.local_addr().unwrap().to_string();
+    let agent = Arc::new(UnreachableWriter { address: unreachable.clone(), epoch, activated: Default::default() });
+    let stop = tokio_util::sync::CancellationToken::new();
+    let running = tokio::spawn(control::serve(agent_listener, agent.clone(), common::control(), stop.clone()));
+    loop {
+        let mut record = cell.directory.member(&member).await.unwrap().unwrap();
+        record.address = unreachable.clone();
+        record.control_address = Some(agent_address.clone());
+        let version = record.version;
+        if let Cas::Applied(_) = cell.directory.replace_member(record, version).await.unwrap() { break; }
+    }
+
+    let gateway = cell.gateway;
+    let reconnect = tokio::spawn(async move {
+        tokio_postgres::Config::new().host(&gateway.ip().to_string()).port(gateway.port())
+            .user("xtdb").password("cell-test").dbname("shop").connect(NoTls).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), agent.activated.notified()).await.unwrap();
+
+    let options = admin::ControllerOptions { control: common::control(), ..Default::default() };
+    let mut failures = std::collections::BTreeMap::new();
+    assert_eq!(admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap(), 0);
+    assert_eq!(admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap(), 1);
+    assert_eq!(cell.directory.member(&member).await.unwrap().unwrap().state, MemberState::Dead);
+    assert!(matches!(control::call(&agent_address, &Request::Ping, Duration::from_secs(1), &common::control()).await.unwrap(), Response::Done));
+    let (client, driver) = tokio::time::timeout(Duration::from_secs(5), reconnect).await.unwrap().unwrap().unwrap();
+    let driver = tokio::spawn(driver);
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    assert_ne!(cell.holder("shop").await, Some(old));
+    drop(client);
+    driver.await.unwrap().unwrap();
+    stop.cancel();
+    running.await.unwrap().unwrap();
     cell.stop().await;
 }
 

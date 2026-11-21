@@ -1,0 +1,33 @@
+{
+  "summary": "A failed pgwire probe counts even when control answers, and changed endpoints do not inherit failures.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 3,
+  "controls": {
+    "ignore_pgwire": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/member_probe.rs",
+        "find": "    if control_ok && pgwire_ok {",
+        "replace": "    if control_ok {"
+      }],
+      "expect": [{
+        "file": "rust/crates/multi/src/member_probe.rs",
+        "function": "failed_rounds",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 2
+    },
+    "inherit_failures_at_new_address": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/member_probe.rs",
+        "find": "    } else if same_endpoints {",
+        "replace": "    } else if previous != 0 {"
+      }],
+      "expect": [{
+        "file": "rust/crates/multi/src/member_probe.rs",
+        "function": "failed_rounds",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 2
+    }
+  }
+}

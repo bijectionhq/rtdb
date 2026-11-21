@@ -858,10 +858,14 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 
 **Changes.**
 
-1. Crate `controller`: suspicion confirmation from corroborated gateway reports; admission of prewarmed members; drain (`DrainMember`); rebalancing on `LoadVector` watermarks (`Rebalance`); the drainer for orphaned tails (`DrainOrphanedTails`); quarantine (`CountActivationCrash`); engine rollouts (`RollEngine`).
+1. Crate `controller` covers serving endpoint health, admission of prewarmed members, drain, load-watermark rebalancing, orphaned tails, quarantine and engine rollouts.
    The controller probes at most 16 live node endpoints concurrently.
-   An unanswered probe contributes to confirmation only while the membership record still names the endpoint that was probed.
-   The running controller uses periodic probes and does not consume gateway reports.
+   Each round checks the control response and pgwire TCP reachability in parallel for each node.
+   The TCP probe needs no pgwire session slot.
+   Consecutive failures count only for one unchanged address pair.
+   A ready round resets the count, and a member with either address changed cannot be confirmed dead by the old observation.
+   The gateway retries a failed writer dial within its existing startup or replay budget so a successor can claim the deployment.
+   This recovery requires the controller to observe the serving failure and an eligible successor to reach storage and a write quorum.
    A draining node hands off up to eight recently used deployments per pass and parks its idle deployments.
    It runs the handoffs one at a time.
    The source's identity and epoch must still match at reservation.
