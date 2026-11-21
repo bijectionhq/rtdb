@@ -79,3 +79,25 @@ Use the same freshness and exactness semantics for every variant.
 Keep the smallest design that removes the measured bottlenecks.
 A direct operator and exact checkpoint can improve execution with the existing trie ownership.
 Independent search compaction earns its additional state and retention work if fan-out, cold I/O, or redundant rewriting remain material after those changes.
+
+## Experiment results
+
+### Corpus control on the warm baseline workload
+
+Compare baseline `1c8d111ef` with corpus control `356643715`.
+Both binaries used the locked Rust release profile on the same Apple M4 Max.
+Each build ran four fresh 100,000-document datasets with five indexed tries, 24 timed queries per case per dataset, and alternating build order.
+All 96 observations per case per build matched their expected results.
+
+| Query | Baseline p50 | Corpus control p50 | Paired p50 change |
+| --- | ---: | ---: | ---: |
+| Count all | 6.39 ms | 6.34 ms | −0.8% |
+| Count rare matches | 6.13 ms | 6.06 ms | −1.5% |
+| Count common matches | 17.43 ms | 17.32 ms | −1.0% |
+| Top 20, one MATCH | 43.98 ms | 43.33 ms | −1.6% |
+| Top 20, selective MATCH | 3.30 ms | 3.10 ms | −5.9% |
+| Top 20, two MATCH predicates | 52.15 ms | 51.11 ms | −2.0% |
+
+The selective case improved in all four pairs, with p50 changes from −8.9% to −4.8%.
+The broad cases showed smaller changes whose paired ranges included zero.
+The corpus regression exercises overlapping files and successive snapshot instants, including activation and expiry of a scheduled valid-time interval.
