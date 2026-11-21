@@ -1717,6 +1717,7 @@ rule EraseAndProve {
     when: SharedObjectsTransferred(record)
 
     requires: ServingStorageRegionsDrained(record)
+              and ServingPublicationsSettled(record)
 
     ensures:
         RetireReplicaJournals(record.id, record.epoch, AllRecordedJournals(record))

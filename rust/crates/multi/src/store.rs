@@ -140,6 +140,10 @@ impl CellStoreFactory {
                 let _ = dropped.await;
             }
             io.close_and_wait().await;
+            if io.has_unknown_publication() {
+                eprintln!("Storage region {id} in {} still has an unconfirmed provider publication", config.deployment);
+                return;
+            }
             drop(io);
             // A failed registration may already be committed. Compare and
             // replace even if absent to fence that attempt's old version.

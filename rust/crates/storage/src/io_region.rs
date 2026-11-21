@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 use crate::{Error, Result};
@@ -8,6 +9,7 @@ pub struct IoRegion {
     tasks: TaskTracker,
     parent: Option<Arc<IoRegion>>,
     lifetime: Option<Arc<dyn Send + Sync>>,
+    unknown_publication: AtomicBool,
 }
 pub(crate) struct IoAdmission {
     tokens: Vec<TaskTrackerToken>,
@@ -22,7 +24,7 @@ impl IoAdmission {
 }
 impl IoRegion {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { closed: Mutex::new(false), tasks: TaskTracker::new(), parent: None, lifetime: None })
+        Arc::new(Self { closed: Mutex::new(false), tasks: TaskTracker::new(), parent: None, lifetime: None, unknown_publication: AtomicBool::new(false) })
     }
     /// Operations admitted through this child also belong to every ancestor's drain.
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
@@ -33,7 +35,14 @@ impl IoRegion {
     /// Retain a provider lifetime in every admitted task. An unfinished task
     /// keeps its authority witness even if the async region owner is dropped.
     pub fn child_holding(self: &Arc<Self>, lifetime: Option<Arc<dyn Send + Sync>>) -> Arc<Self> {
-        Arc::new(Self { closed: Mutex::new(false), tasks: TaskTracker::new(), parent: Some(Arc::clone(self)), lifetime })
+        Arc::new(Self { closed: Mutex::new(false), tasks: TaskTracker::new(), parent: Some(Arc::clone(self)), lifetime, unknown_publication: AtomicBool::new(false) })
+    }
+    pub fn has_unknown_publication(&self) -> bool {
+        self.unknown_publication.load(Ordering::Acquire)
+    }
+    #[cfg(feature = "remote")]
+    pub(crate) fn publication(&self) -> Publication<'_> {
+        Publication { region: self, confirmed: false }
     }
     pub(crate) fn admit(&self) -> Result<IoAdmission> {
         let closed = self.closed.lock();
@@ -82,6 +91,26 @@ impl IoRegion {
             drop(operation);
         }).await.map_err(|error| Error::Task(error.to_string()))?;
         receiver.await.map_err(|error| Error::Task(error.to_string()))?
+    }
+}
+
+#[cfg(feature = "remote")]
+pub(crate) struct Publication<'a> {
+    region: &'a IoRegion,
+    confirmed: bool,
+}
+
+#[cfg(feature = "remote")]
+impl Publication<'_> {
+    pub(crate) fn confirm(mut self) { self.confirmed = true; }
+}
+
+#[cfg(feature = "remote")]
+impl Drop for Publication<'_> {
+    fn drop(&mut self) {
+        if !self.confirmed {
+            self.region.unknown_publication.store(true, Ordering::Release);
+        }
     }
 }
 

@@ -29,7 +29,7 @@ impl CellStorage {
             CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
             CellStorage::S3 { config } => {
                 let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT).map_err(rtdb_types::Anomaly::from)?;
-                config.open(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
+                config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
             }
         }
     }

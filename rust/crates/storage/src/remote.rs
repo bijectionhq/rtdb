@@ -7,7 +7,11 @@ use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 #[derive(Clone)]
-pub struct RemoteStore { objects: Arc<RemoteObjects>, io: Arc<IoRegion> }
+pub struct RemoteStore {
+    objects: Arc<RemoteObjects>,
+    io: Arc<IoRegion>,
+    single_put: bool,
+}
 
 impl RemoteStore {
     /// Opens an independent I/O region; the owner calls `close_and_wait` before runtime shutdown.
@@ -19,7 +23,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix }), io }
+        Self { objects: Arc::new(RemoteObjects { client, prefix }), io, single_put: false }
+    }
+
+    /// Cell storage publishes a final object with one conditional provider
+    /// write. The underlying client must not retry that request automatically.
+    pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix) }), io, single_put: true }
     }
 
     /// Rejects new requests and waits for admitted operations, including requests whose callers were cancelled.
@@ -39,6 +49,13 @@ impl RemoteStore {
         }
         let admission = self.io.admit()?.and(destination.io.admit()?);
         let (objects, destination_objects, source, key) = (Arc::clone(&self.objects), Arc::clone(&destination.objects), source.clone(), key.clone());
+        if destination.single_put {
+            let io = destination.io.clone();
+            return IoRegion::run_async_admitted(admission, async move {
+                let bytes = objects.get(&source).await?;
+                destination_objects.put(&key, bytes, Some(&io)).await
+            }).await;
+        }
         IoRegion::run_async_admitted(admission, async move { objects.copy_to(&source, &destination_objects, &key).await }).await
     }
 }
@@ -64,9 +81,14 @@ impl ObjectStore for RemoteStore {
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
-        self.io.run_async(async move { objects.put(&key, bytes).await }).await
+        let io = self.io.clone();
+        let single_put = self.single_put;
+        self.io.run_async(async move { objects.put(&key, bytes, single_put.then_some(io.as_ref())).await }).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
+        if self.single_put {
+            return Err(Error::Remote { key: key.to_string(), message: "Cell writes must supply the final sealed bytes".into() });
+        }
         let admission = self.io.admit()?;
         let input = std::fs::File::open(source).map_err(|error| Error::io(source, error))?;
         let (objects, key, source) = (Arc::clone(&self.objects), key.clone(), source.to_owned());
@@ -175,9 +197,17 @@ impl RemoteObjects {
         Ok(bytes)
     }
 
-    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+    async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<()> {
         let options = PutOptions { mode: PutMode::Create, ..Default::default() };
-        match self.client.put_opts(&self.path(key), bytes.clone().into(), options).await {
+        let publication = authority.map(IoRegion::publication);
+        let response = self.client.put_opts(&self.path(key), bytes.clone().into(), options).await;
+        if let Some(publication) = publication
+            && matches!(response, Ok(_) | Err(object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. } | object_store::Error::PermissionDenied { .. }))
+        {
+            publication.confirm();
+        }
+        match response {
             Ok(_) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                 if self.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) }
@@ -193,7 +223,7 @@ impl RemoteObjects {
             Err(Error::MissingObject(_)) => (),
             Err(error) => return Err(error),
         }
-        if length == 0 { return self.put(key, Bytes::new()).await; }
+        if length == 0 { return self.put(key, Bytes::new(), None).await; }
         let temporary = format!(".tmp/upload-{}", uuid::Uuid::new_v4());
         let temporary = Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{temporary}"), None => temporary });
         let mut upload = self.client.put_multipart(&temporary).await.map_err(|error| provider_error(key, error))?;
