@@ -3,9 +3,9 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_flight::FlightData;
 use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use bytes::Bytes;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value_as, from_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_cell_bytes, estimate_read_value_bytes, read_value_as, from_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{LogicalType, Value};
 use tonic::Status;
@@ -171,7 +171,19 @@ pub(crate) fn parameter_types(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Resu
 pub(crate) fn arguments(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<SqlArguments, Status> {
     let schema = batch.schema_ref();
     let mut bound = schema_bound(schema)?;
-    for row in 0..batch.num_rows() { for (column, field) in schema.fields().iter().enumerate() { bound = add(bound, estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?)?; } }
+    if batch.num_rows() > 0 {
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            let data_type = field.data_type();
+            let scalar = field.metadata().is_empty()
+                && (data_type.is_primitive()
+                    || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)));
+            bound = add(bound, estimate_read_value_bytes(field, column.as_ref(), 0).map_err(status)?)?;
+            let cell_bytes = if scalar { estimate_read_cell_bytes } else { estimate_read_value_bytes };
+            for row in 1..batch.num_rows() {
+                bound = add(bound, cell_bytes(field, column.as_ref(), row).map_err(status)?)?;
+            }
+        }
+    }
     let _scratch = memory.reserve(bound).map_err(status)?;
     let types = logical_parameter_types(schema)?;
     let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| read_value_as(ty, field, batch.column(column).as_ref(), row).map_err(status)).collect::<Result<Vec<Value>, _>>()).collect::<Result<Vec<_>, _>>()?;
@@ -183,7 +195,20 @@ mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use rtdb_columnar::read_value;
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::Field;
+    #[test]
+    fn scalar_argument_batches_charge_the_schema_once() {
+        let memory = MemoryBudget::new(512 << 10);
+        let schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(0..512))],
+        ).unwrap();
+        let arguments = arguments(&batch, &memory).unwrap();
+        assert_eq!(arguments.row_count(), 512);
+        assert_eq!(arguments.rows().last(), Some([Value::I64(511)].as_slice()));
+    }
+
     #[test]
     fn argument_rows_are_each_cell_read_under_its_columns_field() {
         let memory = MemoryBudget::new(1 << 22);

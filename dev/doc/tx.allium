@@ -306,6 +306,8 @@ variant Writing : Transaction {
     commit_opts: CommitOpts
 }
 
+-- A flat Flight SQL parameter column can reuse one inferred logical type for its cells.
+-- Memory admission accounts for that schema and for the individual values.
 entity DmlBuffer {
     -- Accumulates buffered ops for a Writing transaction. Consecutive same-SQL ops
     -- coalesce: their args are appended column-major into the last op, so a prepared
