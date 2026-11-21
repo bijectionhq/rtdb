@@ -406,8 +406,9 @@ impl NodeAgent {
         if self.node.catalog().database(name).is_ok() { let _ = self.node.detach_local(name.to_owned()).await; }
     }
 
-    /// Flushes `database` and waits until the block that was open is adopted.
-    async fn flush_and_adopt(&self, database: &Arc<Database>, id: &str, epoch: u64, wait: Duration) -> Result<()> {
+    /// Flushes through the source position observed when this request starts.
+    async fn flush_and_adopt(&self, database: &Arc<Database>, id: &str, epoch: u64, wait: Duration) -> Result<Arc<BlockCatalog>> {
+        let required = database.latest_submitted_position()?;
         let member = self.member();
         let mut watched = rtdb_directory::watch_deployment(self.directory.clone(), id.to_owned(), Duration::from_millis(100));
         let deposed = watched.wait_for(|snapshot| snapshot.as_ref().is_some_and(|record| {
@@ -415,13 +416,23 @@ impl NodeAgent {
         }));
         let flush = async {
             let mut changes = database.watch_status();
-            let open = changes.borrow().open_block;
-            database.flush().await?;
-            let adopted = |status: &rtdb_replication::DriverStatus| status.adopted_block.as_ref().is_some_and(|block| block.block_index() >= open);
-            if changes.wait_for(|status| adopted(status) || matches!(status.role, DriverRole::Stopped)).await.is_ok_and(|status| adopted(&status)) {
-                Ok(())
-            } else {
-                Err(database.progress().fault().unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder stopped before adopting its flush")))
+            loop {
+                let open = changes.borrow().open_block;
+                database.flush().await?;
+                let adopted = |status: &rtdb_replication::DriverStatus| {
+                    status.adopted_block.as_ref().is_some_and(|block| block.block_index() >= open)
+                };
+                if let Ok(status) = changes.wait_for(|status| adopted(status) || matches!(status.role, DriverRole::Stopped)).await {
+                    if let Some(block) = status.adopted_block.as_ref().filter(|_| adopted(&status))
+                        && (required.0 < 0 || block.latest_source_position().is_some_and(|position| position >= required))
+                    {
+                        return Ok(Arc::clone(block));
+                    }
+                    if !matches!(status.role, DriverRole::Stopped) { continue; }
+                }
+                return Err(database.progress().fault().unwrap_or_else(|| Anomaly::new(
+                    AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder stopped before adopting its flush",
+                )));
             }
         };
         tokio::select! {
@@ -439,13 +450,12 @@ impl NodeAgent {
             .ok_or_else(|| Anomaly::incorrect("rtdb.multi/not-held", format!("This node does not hold {name}")))?;
         let database = self.node.catalog().database(name)?;
         let deadline = tokio::time::Instant::now() + self.options.activation_timeout;
-        self.flush_and_adopt(&database, &id, epoch, self.options.activation_timeout).await?;
+        let block = self.flush_and_adopt(&database, &id, epoch, self.options.activation_timeout).await?;
         let missing = || Anomaly::fault("rtdb.multi/flush-checkpoint", format!("{name} did not adopt a block in its current log epoch"));
-        let block = database.status().adopted_block.ok_or_else(&missing)?;
         tokio::time::timeout_at(deadline, self.publish_checkpoint(&id, epoch, &block)).await.map_err(|_| {
             Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-timeout", format!("The checkpoint for {name} was not published in time"))
         })??.ok_or_else(missing)?;
-        Ok(Response::Done)
+        Ok(Response::Flushed { block: block.block_index().0 })
     }
 
     pub async fn park(&self, name: &str) -> Result<Response> { self.park_holding(name, None).await }

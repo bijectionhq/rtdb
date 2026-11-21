@@ -2050,11 +2050,15 @@ rule HostedCheckpointCapture {
 
     requires: ConfiguredOrganizationOwns(authority, name)
               and RootInstallation(authority)
-              and CaptureEligible(authority)
+              and CaptureEligibleOrCompleted(authority, capture_id)
 
     ensures:
-        RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
-        ReturnExactCheckpointAndManifestDigest(authority, capture_id)
+        if RetainedCaptureReceipt(authority, capture_id, ConfiguredArchive):
+            ReturnOriginalCaptureReceipt(authority, capture_id)
+        else:
+            RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
+            SealArchiveWithCaptureKey(authority, capture_id)
+            RetainAndReturnExactCheckpointAndManifestDigest(authority, capture_id)
 }
 
 rule HostedCheckpointRecovery {
@@ -2066,8 +2070,37 @@ rule HostedCheckpointRecovery {
               and ExactCheckpointOrCompletedRecovery(authority, capture_id)
 
     ensures:
-        RecoverUnderWriterFence(authority, capture_id)
-        ReturnRecoveryReceipt(authority, capture_id, manifest_digest)
+        if CompletedRecovery(authority, capture_id, manifest_digest):
+            ReturnOriginalRecoveryReceipt(authority, capture_id)
+        else:
+            RecoverUnderWriterFence(authority, capture_id)
+            RetainAndReturnRecoveryReceipt(authority, capture_id, manifest_digest)
+}
+
+rule StageHistoricalCheckpoint {
+    when: HistoricalCheckpointStageRequested(capture, target, operation)
+
+    requires: ExactRetainedCapture(capture)
+              and FreshHeldInstallation(target, operation)
+
+    ensures:
+        ReadArchiveUnderOriginalCustody(capture)
+        BindTargetStorageAndKeyNamespaces(target)
+        MaterializeVerifiedClosureWithFreshKey(capture, target)
+        RetainStageInventory(target, operation)
+        KeepPlacementAndLogsClosed(target)
+}
+
+rule ReadHeldCheckpoint {
+    when: HeldStageReadRequested(target, operation, inventory_digest)
+
+    requires: ExactHeldStage(target, operation, inventory_digest)
+
+    ensures:
+        AcquireHeldStageStorageRegion(target)
+        VerifyAndReadFrozenInventory(target, inventory_digest)
+        AuthenticateReaderAsOriginalCapture(target)
+        DrainReadersBeforeReleasingStageStorage(target)
 }
 
 rule RetireCheckpointArchives {
@@ -2078,6 +2111,7 @@ rule RetireCheckpointArchives {
 
     ensures:
         RetireRegisteredArchiveCopies(record)
+        WithdrawOnlyRegisteredCaptureKeys(record)
 }
 
 rule ObserveS3Inventory {

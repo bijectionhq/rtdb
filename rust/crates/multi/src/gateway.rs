@@ -366,7 +366,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
                 last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
             }
             Ok(Response::Refused { code, message }) => refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
-            Ok(Response::Done | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. }) => {}
+            Ok(Response::Done | Response::Flushed { .. } | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. }) => {}
             Err(error) => last = Some(error),
         }
     }

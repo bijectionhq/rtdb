@@ -1,7 +1,7 @@
 //! The RTDB multi cell processes.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
@@ -50,8 +50,10 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
        rtdb-multi schedule-recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi recovery-disposal --directory DIR --id UUID\n\
-       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
-       rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
+       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN --cell-secret FILE]\n\
+       rtdb-multi stage-checkpoint --directory DIR --archive-root PATH --storage-root PATH --keys PATH --stage-request FILE [--ecs-cluster ARN]\n\
+       rtdb-multi read-checkpoint-stage --directory DIR --storage-root PATH --keys PATH --id UUID --operation UUID --manifest-sha256 SHA256 --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--ecs-cluster ARN] [--parent-stdin]\n\
+       rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN]\n\n\
        rtdb-multi deletion-key --keys PATH\n\n\
        rtdb-multi verify-deletion --record PATH --public-key KEY\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names, PREFIX-members and PREFIX-stopped-tasks\n\
@@ -113,12 +115,13 @@ struct HostedTransferBinding {
     storage: String,
     keys: String,
     exchange: String,
+    attempt_gate: String,
 }
 
-fn check_hosted_transfer(command: &str, arguments: &Arguments) -> Result<()> {
+async fn admit_hosted_transfer(command: &str, arguments: &Arguments) -> Result<()> {
     let encoded = match std::env::var("RTDB_TRANSFER_BINDING") {
         Ok(encoded) => encoded,
-        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(std::env::VarError::NotPresent) if !arguments.present("transfer-attempt") => return Ok(()),
         Err(_) => return Err(usage("Invalid installed RTDB transfer binding".into())),
     };
     let binding: HostedTransferBinding = serde_json::from_str(&encoded)
@@ -138,7 +141,53 @@ fn check_hosted_transfer(command: &str, arguments: &Arguments) -> Result<()> {
     if command == "move-cell" || arguments.present("transfer") {
         return Err(usage("The hosted task requires a catalog-managed transfer exchange".into()));
     }
-    Ok(())
+    let expected_gate = arguments.required("to-directory")?.strip_prefix("dynamodb:")
+        .map(|prefix| format!("{prefix}-stopped-tasks"));
+    if expected_gate.as_deref() != Some(binding.attempt_gate.as_str()) {
+        return Err(usage("The hosted transfer attempt gate differs from its installed directory".into()));
+    }
+    let attempt = required_uuid(arguments, "transfer-attempt")?;
+    let task = hosted_task(arguments)?
+        .ok_or_else(|| usage("The hosted transfer requires its exact ECS task ARN".into()))?;
+    claim_transfer_attempt(&binding.attempt_gate, attempt, &task).await
+}
+
+#[cfg(feature = "dynamodb")]
+async fn claim_transfer_attempt(table: &str, attempt: uuid::Uuid, task: &rtdb_directory::HostedTask) -> Result<()> {
+    use aws_sdk_dynamodb::types::{AttributeValue, ReturnValuesOnConditionCheckFailure};
+
+    let client = aws_sdk_dynamodb::Client::new(&aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await);
+    let id = format!("transfer-attempt-{attempt}");
+    let result = client.put_item()
+        .table_name(table)
+        .item("id", AttributeValue::S(id))
+        .item("task_arn", AttributeValue::S(task.task_arn().to_owned()))
+        .condition_expression("attribute_not_exists(id)")
+        .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
+        .send().await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let Some(aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(occupied)) = error.as_service_error() else {
+                return Err(Anomaly::new(
+                    rtdb_types::AnomalyCategory::Unavailable,
+                    "rtdb.multi/transfer-attempt",
+                    format!("Could not admit the hosted transfer attempt: {error}"),
+                ));
+            };
+            // An SDK retry after a lost reply can recover its own claim.
+            let owner = occupied.item().and_then(|item| item.get("task_arn")).and_then(|value| value.as_s().ok());
+            if owner.is_some_and(|arn| arn == task.task_arn()) {
+                return Ok(());
+            }
+            Err(usage("The hosted transfer attempt is closed or claimed by another task".into()))
+        }
+    }
+}
+
+#[cfg(not(feature = "dynamodb"))]
+async fn claim_transfer_attempt(_: &str, _: uuid::Uuid, _: &rtdb_directory::HostedTask) -> Result<()> {
+    Err(Anomaly::unsupported("rtdb.multi/dynamodb", "Hosted transfers require the dynamodb feature"))
 }
 
 struct TransferExchange {
@@ -185,13 +234,6 @@ impl TransferExchange {
         }
         Ok(bytes.to_vec())
     }
-
-    async fn write_receipt(&self, receipt: &rtdb_directory::PreparedCellTransfer) -> Result<()> {
-        let key = rtdb_storage::ObjectKey::new("receipt.json")?;
-        let encoded = serde_json::to_vec(receipt).expect("a transfer receipt serializes");
-        self.store.put(&key, encoded.into()).await?;
-        Ok(())
-    }
 }
 
 async fn transfer_document<T: serde::de::DeserializeOwned>(
@@ -229,9 +271,7 @@ async fn execute_managed_transfer(
             admin::activate_managed_cell_transfer(from, to, &prepared).await?;
             prepared
         };
-        if let Some(exchange) = &exchange {
-            exchange.write_receipt(&receipt).await?;
-        } else {
+        if exchange.is_none() {
             println!("{}", serde_json::to_string(&receipt).expect("a transfer receipt serializes"));
         }
         Ok(())
@@ -252,6 +292,16 @@ fn required_uuid(arguments: &Arguments, name: &str) -> Result<uuid::Uuid> {
         .ok_or_else(|| usage(format!("--{name} must be a canonical, nonzero UUID")))
 }
 
+fn watch_parent(arguments: &Arguments, cancellation: &CancellationToken) {
+    if arguments.present("parent-stdin") {
+        let stop = cancellation.clone();
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            stop.cancel();
+        });
+    }
+}
+
 async fn run(arguments: Vec<String>) -> Result<()> {
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
     if command == "--build-info" {
@@ -263,10 +313,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             #[serde(flatten)]
             provenance: rtdb_types::BuildInfo,
             standalone_protocol: u32,
+            hosted_protocol: u32,
         }
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
+            // Hosted capture adopts a block through the holder's observed source.
+            hosted_protocol: 13,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -282,13 +335,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             process::initialize_standalone(std::path::Path::new(arguments.required("state")?), arguments.required("name")?, installation_id(&arguments)?).await
         }
         "standalone" => {
-            if arguments.present("parent-stdin") {
-                let stop = cancellation.clone();
-                std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-                    stop.cancel();
-                });
-            }
+            watch_parent(&arguments, &cancellation);
             process::serve_standalone(process::StandaloneSettings {
                 root: arguments.required("state")?.into(),
                 name: arguments.required("name")?.into(),
@@ -411,7 +458,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             rtdb_multi::cells::serve(listener, map, cancellation).await
         }
         "move-cell" | "prepare-cell-transfer" | "activate-cell-transfer" => {
-            check_hosted_transfer(&command, &arguments)?;
+            admit_hosted_transfer(&command, &arguments).await?;
             let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
             let from_storage = CellStorage::parse(arguments.required("from-storage-root")?)?;
             let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
@@ -449,13 +496,19 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 let tls_settings = configuration.server.and_then(|server| server.ssl)
                     .ok_or_else(|| usage("The recovery configuration must provide server.ssl".into()))?;
                 let tls = rtdb_server::tls::load(&tls_settings, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
+                let task = hosted_task(&arguments)?;
+                let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
+                if task.is_some() && control.0.is_none() {
+                    return Err(usage("Hosted recovery requires the installed --cell-secret".into()));
+                }
                 let service = rtdb_multi::recovery::RecoveryService::from_file(
                     std::path::Path::new(arguments.required("recovery-token-file")?),
                     arguments.required("recovery-org")?.to_owned(),
                     storage.clone(),
                     CellStorage::parse(arguments.required("archive-root")?)?,
                     keys.clone().ok_or_else(|| usage("The recovery endpoint requires --keys".into()))?,
-                    hosted_task(&arguments)?,
+                    task,
+                    control,
                 )?;
                 let listener = tokio::net::TcpListener::bind(
                     arguments.address("recovery-listen", "127.0.0.1:0")?,
@@ -591,12 +644,68 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
             let archive = CellStorage::parse(arguments.required("archive-root")?)?;
             let keys = key_service(arguments.required("keys")?).await?;
+            let id = installation_id(&arguments)?;
+            let operation = required_uuid(&arguments, "operation")?;
+            let task = hosted_task(&arguments)?;
+            let flushed = if task.is_some() {
+                let original = directory.deployment(&id.to_string()).await?
+                    .ok_or_else(|| usage("The capture's installation is unavailable".into()))?;
+                if original.checkpoint_captures.contains_key(&operation) {
+                    None
+                } else {
+                    Some(admin::flush_checkpoint(directory.as_ref(), &original,
+                        &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?)
+                }
+            } else { None };
             let capture = rtdb_multi::archive::capture(
                 directory, &storage, &archive, keys.as_ref(),
-                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, None,
+                id, operation, task, flushed.as_ref(),
             ).await?;
             println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));
             Ok(())
+        }
+        "stage-checkpoint" => {
+            if std::env::var_os("RTDB_TRANSFER_BINDING").is_some() {
+                return Err(usage("Checkpoint staging requires the original archive operator".into()));
+            }
+            let file = std::fs::File::open(arguments.required("stage-request")?).map_err(io)?;
+            let mut body = Vec::new();
+            file.take(TRANSFER_DOCUMENT_BYTES + 1).read_to_end(&mut body).map_err(io)?;
+            if body.len() as u64 > TRANSFER_DOCUMENT_BYTES {
+                return Err(usage("The checkpoint stage request exceeds its size limit".into()));
+            }
+            let intent = serde_json::from_slice(&body)
+                .map_err(|_| usage("Invalid checkpoint stage request".into()))?;
+            let directory = directory(arguments.required("directory")?).await?;
+            let archive = CellStorage::parse(arguments.required("archive-root")?)?;
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let receipt = rtdb_multi::archive::stage_checkpoint(
+                directory, &archive, &storage, keys.as_ref(), intent, hosted_task(&arguments)?,
+            ).await?;
+            println!("{}", serde_json::to_string(&receipt).expect("a stage receipt serializes"));
+            Ok(())
+        }
+        "read-checkpoint-stage" => {
+            if std::env::var_os("RTDB_TRANSFER_BINDING").is_some() {
+                return Err(usage("Checkpoint inspection requires a recovery operator".into()));
+            }
+            let directory = directory(arguments.required("directory")?).await?;
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let settings = rtdb_multi::archive::StagedReaderSettings {
+                destination: installation_id(&arguments)?,
+                operation: required_uuid(&arguments, "operation")?,
+                manifest_sha256: arguments.required("manifest-sha256")?.to_owned(),
+                certificate: arguments.required("certificate")?.into(),
+                private_key: arguments.required("private-key")?.into(),
+                password_file: arguments.required("password-file")?.into(),
+                ready_file: arguments.required("ready-file")?.into(),
+            };
+            watch_parent(&arguments, &cancellation);
+            rtdb_multi::archive::serve_staged_checkpoint(
+                directory, &storage, keys.as_ref(), settings, hosted_task(&arguments)?, cancellation,
+            ).await
         }
         "restore" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -605,7 +714,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let keys = key_service(arguments.required("keys")?).await?;
             let recovery = rtdb_multi::archive::restore(
                 directory.as_ref(), &storage, &archive, keys.as_ref(),
-                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, 4 << 20,
+                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, 4 << 20, hosted_task(&arguments)?.as_ref(),
             ).await?;
             println!("{}", serde_json::to_string_pretty(&recovery).expect("a restore receipt serializes"));
             Ok(())

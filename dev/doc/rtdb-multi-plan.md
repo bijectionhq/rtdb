@@ -154,22 +154,84 @@ tries as ciphertext to the independent archive. The receipt fixes the
 location, length and digest of each object. Retrying the operation recovers
 the same checkpoint and destination. The directory registers both and the
 capture's storage region before the first archive write. An archive binds
-its media witness before payload can be copied. The key vault stays outside
-the capture.
+its media witness before payload can be copied. The original directory
+accepts the verified manifest digest before the capture releases its region.
+A hosted retry recovers that receipt from the original cell. The archive's
+media key belongs to that capture and stays in the original cell's key vault.
+It survives serving-key withdrawal. Application-level ciphertext is copied
+as data and its keys are never part of the capture.
+
+The cell's S3 root is `cell` under the configured prefix. The archive
+namespace, S3 access and disposal inventory all derive from that root.
+A remote capture registers the ECS task that owns its provider I/O.
+Before a new hosted capture, the recovery owner asks the same residence's
+holder to flush through its observed source position. It admits capture
+after the directory publishes that block or a later cut in the same
+residence. An interrupted capture retains its original directory cut.
+`verify_checkpoint_capture` opens a fresh archive admission, reads the
+witness and exact manifest, and verifies every object under the capture's
+media key. The receipt binds the supplied observation ID to the original
+capture point and digest.
+
+`discard_checkpoint_capture` installs a permanent release for one capture
+ID in its original cell. It can close an unattempted ID and prevents a late
+capture from creating archive state. Physical retirement waits for the
+recorded capture and repair readers, withdraws only the archive key, and
+purges the capture's versions and unfinished uploads. The release receipt
+and authority witness remain available. The serving installation keeps
+its own key and placement. A capture used by the current repair still
+belongs to the serving closure and cannot be discarded independently.
 
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.
 The reaper settles each registered local archive after confirming its
 media witness. `rtdb-multi recovery-disposal --id UUID` returns the ordered
 retirement and observed absence. Remote archives stay pending until the
-provider proves that versions and unfinished uploads are absent.
+provider proves that versions and unfinished uploads are absent. Before
+issuing its retirement receipt, the reaper withdraws every registered
+capture's media key.
+
+`rtdb-multi stage-checkpoint` materializes exactly one retained capture under
+a fresh, held installation in the original cell. The authenticated reaper
+endpoint also accepts `stage_checkpoint`, using the original capture's
+authority and manifest and reserving `checkpoint-stage-<destination UUID>`.
+It verifies the selected manifest, re-encrypts the objects with a fresh
+stage media key, and retains the
+ordered destination manifest and its digest. The staged record has no
+placement, logkeeper ensemble or published checkpoint. The application
+restore owner must admit its historical state before the target can serve.
+Backing out uses ordinary exact-residence disposal.
+
+`rtdb-multi read-checkpoint-stage` holds the exact staged inventory open on a
+private loopback TLS reader. It authenticates the stage during PgWire startup,
+exposes only its frozen block, and joins the reader's I/O before releasing its
+storage admission. The reader has no disk cache or access to the source's
+application key vault. A consuming restore owner must apply current
+application custody and erasure authority before releasing protected data.
+For hosted recovery, the reaper accepts `open_checkpoint_stage` on its
+authenticated TLS connection. The request binds the original capture and
+the exact stage receipt. After opening the verified inventory it writes
+the acknowledgement and serves one read-only PgWire session on that same
+connection. It closes the session on loss of the directory fence or when
+the recovery action's lifetime expires.
+
+The hosted `discard_checkpoint_stage` action binds the original capture
+digest and stage operation. It reserves a disposal tombstone if a stage has
+yet to appear, so a late stage cannot reopen it. It returns the retained
+physical disposal receipt after the reaper has drained stage readers and
+uploads, withdrawn the stage key and confirmed empty serving inventory.
 
 `rtdb-multi restore` accepts the live directory's current checkpoint with
 the original archive manifest and current key. It records a restore intent,
 fences the old writer at the logkeepers, and verifies the objects. The
-directory then admits the checkpoint archive as a read-only source for
-missing objects. A successor recovers the same ordered tail before serving.
-The directory keeps the accepted manifest and completion for retries.
+directory then admits the checkpoint archive as the source of its exact
+manifest members. Reads verify their archived ciphertext and reseal each
+under the current serving key. Objects outside that manifest come from
+serving storage. A successor
+recovers the same ordered tail before serving.
+The directory keeps each accepted manifest and completion under its capture ID.
+A retry observes that exact receipt after a later repair or cell move. It
+does not open a new writer fence or access the archived objects.
 Retain the archive while an installation uses it.
 
 Hosted operators can give `rtdb-multi reaper` a private TLS recovery listener with its own credential, configured serving storage, independent archive, and current keys.

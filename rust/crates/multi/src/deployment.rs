@@ -62,13 +62,8 @@ impl CellStorage {
             .map_err(|error| rtdb_types::Anomaly::fault("rtdb.multi/storage-root", error.to_string()))
     }
 
-    fn s3_root(config: &rtdb_s3::S3Config) -> rtdb_storage::Result<rtdb_storage::ObjectKey> {
-        let prefix = config.prefix.as_deref().unwrap_or_default().trim_matches('/');
-        rtdb_storage::ObjectKey::new(if prefix.is_empty() {
-            S3_CELL_ROOT.to_owned()
-        } else {
-            format!("{prefix}/{S3_CELL_ROOT}")
-        })
+    pub(crate) fn s3_root(config: &rtdb_s3::S3Config) -> Result<ObjectKey> {
+        config.object_prefix(&ObjectKey::new(S3_CELL_ROOT)?)
     }
 
     pub(crate) fn overlaps(&self, other: &Self) -> rtdb_types::Result<bool> {
@@ -157,10 +152,7 @@ impl CellStorage {
         match self {
             Self::Local { .. } => Ok(rtdb_directory::DeletionInventory::CurrentObjects),
             Self::S3 { config } => {
-                let cell = ObjectKey::new(S3_CELL_ROOT)?;
-                let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
-                let inventory = config.versioned_inventory(&cell, &remotes).await?;
-                inventory.purge(deployment).await?;
+                Self::s3_inventory(config).await?.purge(deployment).await?;
                 Ok(rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads)
             }
         }
@@ -425,6 +417,20 @@ mod tests {
         let local = select_logkeepers("local", 3, Vec::new(), &[&a, &alternative, &reused]);
         assert_eq!(local.len(), 2);
         assert_ne!(local[0].address, local[1].address);
+    }
+
+    #[test]
+    fn prefixed_cell_access_and_disposal_open_the_same_root_as_custody() {
+        for (archive, expected) in [
+            ("s3://bucket?region=us-east-1", "cell"),
+            ("s3://bucket/histories/example?region=us-east-1", "histories/example/cell"),
+        ] {
+            let CellStorage::S3 { config } = CellStorage::parse(archive).unwrap() else {
+                panic!("S3 archive");
+            };
+            let root = CellStorage::s3_root(&config).unwrap();
+            assert_eq!(root.as_str(), expected);
+        }
     }
 
     #[test]

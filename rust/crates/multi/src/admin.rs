@@ -172,6 +172,35 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &Contro
     Err(last.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can hold this deployment")))
 }
 
+/// Ask the original installation's holder to publish through its source and
+/// retain the directory cut from that same residence.
+pub async fn flush_checkpoint(directory: &dyn Directory, original: &DeploymentRecord, control: &ControlKey) -> Result<DeploymentRecord> {
+    let holder = ensure_held(directory, &original.name, control).await?;
+    let before = record(directory, &original.name).await?;
+    let matches_original = |current: &DeploymentRecord| current.id == original.id && current.org == original.org
+        && current.incarnation == original.incarnation && current.log_epoch == original.log_epoch
+        && current.holder.as_ref() == Some(&holder);
+    if !matches_original(&before) {
+        return Err(fork_unavailable(&original.name));
+    }
+    let address = control_address(&members(directory).await?, &holder)?;
+    let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/capture-flush", "The holder did not publish an exact checkpoint in the original residence");
+    let Response::Flushed { block } = expect(
+        &address, Request::Flush { name: original.name.clone() }, control,
+    ).await? else { return Err(unavailable()); };
+    let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+    loop {
+        let after = record(directory, &original.name).await?;
+        if !matches_original(&after) || after.epoch != before.epoch || tokio::time::Instant::now() > deadline {
+            return Err(unavailable());
+        }
+        if after.checkpoint.is_some_and(|cut| cut.block >= block) {
+            return Ok(after);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Reserves the next claim for `target` during the handoff.
 pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
     move_from_holding(directory, name, target, None, control).await
@@ -760,7 +789,7 @@ fn same_cell_move(record: &DeploymentRecord, expected: &DeploymentRecord) -> boo
         && record.incarnation == expected.incarnation && record.cell_transfer == expected.cell_transfer
 }
 
-fn cell_media(storage: &CellStorage, keys: &dyn KeyService) -> Result<CellMedia> {
+pub(crate) fn cell_media(storage: &CellStorage, keys: &dyn KeyService) -> Result<CellMedia> {
     Ok(CellMedia {
         objects: storage.custody_namespace()?,
         keys: keys.custody_namespace()?,
@@ -944,6 +973,7 @@ async fn prepare_cell_move(
         staged.storage_regions.clear();
         staged.checkpoint_recovery = None;
         staged.checkpoint_captures.clear();
+        staged.checkpoint_capture_retirements.clear();
         staged.archive_retirement = None;
         staged.retired_residences.clear();
         staged.activation_crashes = 0;
@@ -956,6 +986,7 @@ async fn prepare_cell_move(
             });
             if prior.archive_retirement.is_none() {
                 staged.checkpoint_captures.clone_from(&prior.checkpoint_captures);
+                staged.checkpoint_capture_retirements.clone_from(&prior.checkpoint_capture_retirements);
             }
         }
         let result = if let Some(prior) = prior_residence {
@@ -1021,7 +1052,7 @@ async fn stage_cell_storage(
             return Err(cell_move_conflict(from, to, &staged.name));
         }
         record.storage_regions.insert(region, if local {
-            StorageRegion::Local
+            StorageRegion::Local { archive: None }
         } else {
             crate::store::remote_storage_region(None, hosted_task.clone())
         });
@@ -1039,7 +1070,7 @@ async fn stage_cell_storage(
         crate::reference::materialize(
             source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(),
         ).await?;
-        if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, IoRegion::new()).await? {
+        if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, from.keys, IoRegion::new()).await? {
             archive.materialize(staged, Arc::clone(&target_bucket)).await?;
         }
         if let Some(checkpoint) = staged.checkpoint {
@@ -1105,7 +1136,10 @@ async fn begin_disposal_at(directory: &dyn Directory, id: &str, incarnation: Opt
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => Ok(()),
-            Lifecycle::Live | Lifecycle::Quarantined if record.move_from.is_none() => {
+            Lifecycle::Live | Lifecycle::Quarantined | Lifecycle::Restoring
+                if record.move_from.is_none()
+                    && (record.lifecycle != Lifecycle::Restoring || record.checkpoint_stage.is_some()) =>
+            {
                 record.lifecycle = Lifecycle::Deleting;
                 record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
                     Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {id} has no remaining writer epochs"))
@@ -1191,6 +1225,11 @@ async fn finish_disposal_with_lock(
     };
     if fenced.incarnation != expected {
         return earlier(&fenced);
+    }
+    if let Some(stage) = &fenced.checkpoint_stage {
+        if cell_media(storage, keys)? != stage.media {
+            return Err(Anomaly::incorrect("rtdb.multi/stage-storage-custody", "The staged checkpoint belongs to different storage or keys"));
+        }
     }
     if (fenced.lifecycle == Lifecycle::Deleting || fenced.moved_at_ms.is_some()) && !fenced.storage_regions.is_empty() {
         crate::store::reconcile_storage_regions(directory, storage, keys, &fenced).await?;

@@ -326,27 +326,44 @@ async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn Obje
     to_bucket.put(&target, from_bucket.get(&key(from)?).await?).await
 }
 
+/// An earlier attempt can leave objects in the target. Only identical bytes
+/// satisfy a retry, and a concurrent create remains conditional in the store.
+async fn stage_object(bucket: &dyn ObjectStore, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+    match bucket.get(key).await {
+        Ok(existing) if existing == bytes => Ok(()),
+        Ok(_) => Err(Error::ConflictingObject(key.to_string()).into()),
+        Err(Error::MissingObject(_)) => bucket.put(key, bytes).await.map_err(storage),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Copies a deployment's stores from `from` in one cell's bucket to `to` in another's, resolving every reference into an object of its own.
 pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
     for store in stores(from_bucket, from).await? {
         let version = store.rsplit('/').next().expect("a store has a version").to_owned();
         let target = format!("{to}/{version}");
-        for name in physical_objects(from_bucket, &store).await? { copy_in(from_bucket, &format!("{store}/{name}"), to_bucket, &format!("{target}/{name}")).await?; }
-        for (name, owner) in Base::load(from_bucket, &store).await?.objects {
-            let own = format!("{store}/{name}");
-            let destination = format!("{target}/{name}");
-            match copy_in(from_bucket, &own, to_bucket, &destination).await {
-                Err(Error::MissingObject(_)) => match copy_in(from_bucket, &format!("{owner}/{name}"), to_bucket, &destination).await {
-                    // Erasure can transfer ownership between the two reads.
-                    Err(Error::MissingObject(_)) => match copy_in(from_bucket, &own, to_bucket, &destination).await {
-                        // A processed release record can already have been removed from both locations.
-                        Err(Error::MissingObject(_)) if crate::store::garbage_released_at(&name).is_some() => {}
-                        result => result?,
+        let base = Base::load(from_bucket, &store).await?;
+        for name in physical_objects(from_bucket, &store).await? {
+            let source = key(&format!("{store}/{name}"))?;
+            let destination = key(&format!("{target}/{name}"))?;
+            stage_object(to_bucket, &destination, from_bucket.get(&source).await?).await?;
+        }
+        for (name, owner) in base.objects {
+            let destination = key(&format!("{target}/{name}"))?;
+            let own = key(&format!("{store}/{name}"))?;
+            let bytes = match from_bucket.get(&own).await {
+                Err(Error::MissingObject(_)) => match from_bucket.get(&key(&format!("{owner}/{name}"))?).await {
+                    // Concurrent retirement materializes the reference before
+                    // removing the original, so look again in the fork.
+                    Err(Error::MissingObject(_)) => match from_bucket.get(&own).await {
+                        Err(Error::MissingObject(_)) if crate::store::garbage_released_at(&name).is_some() => continue,
+                        value => value?,
                     },
-                    result => result?,
+                    value => value?,
                 },
-                result => result?,
-            }
+                value => value?,
+            };
+            stage_object(to_bucket, &destination, bytes).await?;
         }
     }
     Ok(())
@@ -477,6 +494,17 @@ mod tests {
         fork(here.as_ref(), "parent", "child", None).await.unwrap();
         here.delete(&key("parent/v06/row").unwrap()).await.unwrap();
         assert!(materialize(here.as_ref(), "child", there.as_ref(), "arrived").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_transfer_retries_only_identical_staged_objects() {
+        let (here, there) = (bucket(), bucket());
+        put(&here, "source/v06/blocks/b00", b"accepted").await;
+        put(&there, "target/v06/blocks/b00", b"substitute").await;
+        assert!(materialize(here.as_ref(), "source", there.as_ref(), "target").await.is_err());
+        there.delete(&key("target/v06/blocks/b00").unwrap()).await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
     }
 
     #[tokio::test]

@@ -17,10 +17,14 @@ pub struct ServerConfig {
     pub read_only: bool,
     pub playground: bool,
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub require_tls: bool,
     pub parameters: BTreeMap<String, String>,
     /// Accepts a capability in the startup's `rtdb.capability` parameter in place of the configured authentication.
     pub capabilities: Option<Arc<dyn CapabilityVerifier>>,
 }
+
+/// The authenticated identity of an isolated checkpoint reader.
+pub const CHECKPOINT_STAGE_PARAMETER: &str = "rtdb.checkpoint_stage";
 
 /// The startup parameter a capability travels in.
 pub const CAPABILITY_PARAMETER: &str = "rtdb.capability";
@@ -41,7 +45,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self { address: (Ipv4Addr::LOCALHOST, 0).into(), maximum_connections: 42, pending_connections: 42,
             authentication_timeout: Duration::from_secs(60), drain_timeout: Duration::from_secs(5), maximum_message_bytes: 0x3fff_ffff, maximum_copy_bytes: 1024 * 1024 * 1024,
-            read_only: false, playground: false, tls: None, capabilities: None,
+            read_only: false, playground: false, tls: None, require_tls: false, capabilities: None,
             parameters: BTreeMap::from([("server_version".into(), "16".into()), ("server_encoding".into(), "UTF8".into()), ("client_encoding".into(), "UTF8".into()),
                 ("search_path".into(), "public".into()), ("datestyle".into(), "ISO".into()), ("intervalstyle".into(), "ISO_8601".into()),
                 ("timezone".into(), "UTC".into()), ("integer_datetimes".into(), "on".into()), ("standard_conforming_strings".into(), "on".into())]) }

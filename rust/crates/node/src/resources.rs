@@ -60,6 +60,9 @@ pub trait RemoteStorageFactory: Send + Sync {
     /// The returned store is scoped to `storage_root`, under the provider's configured prefix.
     /// Retained provider operations belong to the supplied database region, including after caller cancellation.
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>>;
+    /// A remote store normally uses a disk cache. An isolated read-only
+    /// factory may opt out to avoid retaining an extra physical copy.
+    fn use_disk_cache(&self) -> bool { true }
     /// Wraps the store after the node's disk cache, so that whatever this adds (decryption, say) happens above the cache and the cache holds only what `open` returned.
     async fn wrap_cached(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> { Ok(cached) }
     /// How recovery should find the store's latest block; a provider that tracks it spares recovery a listing.
@@ -243,8 +246,13 @@ impl ResourceFactory for NativeResources {
                     let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
                     let remote = factory.open(configuration, &root, Arc::clone(&io)).await?;
                     blocks = factory.block_discovery(configuration).await?;
-                    let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
-                    factory.wrap_cached(configuration, cache.scope_in(cache_namespace(configuration, storage_epoch)?, remote, Arc::clone(&io))?).await?
+                    let storage = if factory.use_disk_cache() {
+                        let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
+                        cache.scope_in(cache_namespace(configuration, storage_epoch)?, remote, Arc::clone(&io))?
+                    } else {
+                        remote
+                    };
+                    factory.wrap_cached(configuration, storage).await?
                 }
             };
             Ok(DatabaseStorage { store, blocks, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })

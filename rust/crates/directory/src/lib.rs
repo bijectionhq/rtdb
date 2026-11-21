@@ -304,9 +304,18 @@ pub struct DeploymentRecord {
     /// replaces the former serving storage and its compaction effects through the same position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_replay_cutoff: Option<i64>,
+    /// A historical checkpoint staged under this fresh, held installation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_stage: Option<Box<CheckpointStage>>,
+    /// Terminal same-history repair receipts survive later repairs and moves.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checkpoint_repair_receipts: BTreeMap<uuid::Uuid, CheckpointRecovery>,
     /// Every independent archive admitted before a checkpoint copy started.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkpoint_captures: BTreeMap<uuid::Uuid, CheckpointCapture>,
+    /// Closed capture IDs cannot admit new copies, readers or archive keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checkpoint_capture_retirements: BTreeMap<uuid::Uuid, CheckpointCaptureRetirement>,
     pub archive_retirement: Option<ArchiveRetirement>,
     pub version: Version,
 }
@@ -344,9 +353,11 @@ impl HostedTask {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum StorageRegion {
-    Local,
+    Local { archive: Option<uuid::Uuid> },
     Remote {
         archive: Option<uuid::Uuid>,
+        /// Serving I/O can read its repair archive while writing its own prefix.
+        repair_archive: Option<uuid::Uuid>,
         owner: Option<HostedTask>,
         /// When closed, the region owner has joined its I/O and may issue
         /// no further requests. Uncertain publications still need evidence.
@@ -354,6 +365,16 @@ pub enum StorageRegion {
         /// Written before a conditional provider mutation is submitted.
         publications: BTreeMap<uuid::Uuid, StoragePublication>,
     },
+}
+
+/// The original archive's release fence, including IDs cancelled before copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointCaptureRetirement {
+    pub archive: String,
+    pub manifest_sha256: Option<String>,
+    pub authorized_at_ms: i64,
+    pub key_withdrawn_at_ms: Option<i64>,
+    pub observed_empty_at_ms: Option<i64>,
 }
 
 /// An exact provider upload, admitted before it received payload bytes.
@@ -371,6 +392,8 @@ pub struct CheckpointCapture {
     pub checkpoint: Checkpoint,
     /// Payload copying starts only after the archive's witness becomes durable.
     pub media_bound: bool,
+    /// The immutable manifest accepted after verifying the complete archive.
+    pub manifest_sha256: Option<String>,
     /// The bound archive provider confirmed no remaining versions or uploads.
     pub remote_disposal: Option<[u8; 32]>,
 }
@@ -474,6 +497,30 @@ pub struct Checkpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointStageIntent {
+    pub operation: uuid::Uuid,
+    pub source: uuid::Uuid,
+    pub capture: uuid::Uuid,
+    pub source_manifest_sha256: String,
+    pub destination: uuid::Uuid,
+    pub name: String,
+    pub org: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointStage {
+    pub intent: CheckpointStageIntent,
+    pub source_incarnation: u64,
+    pub source_log_epoch: i32,
+    pub checkpoint: Checkpoint,
+    pub media: CellMedia,
+    /// Digest of the exact target object inventory under the destination key.
+    pub staged_manifest_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointRecovery {
     pub operation: uuid::Uuid,
     pub checkpoint: Checkpoint,
@@ -489,7 +536,8 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
-            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
+            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(),
+            checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {
@@ -540,7 +588,13 @@ impl DeploymentRecord {
     /// The key custody record for one residence. Withdrawing an old
     /// residence's key cannot withdraw the current residence's key record.
     pub fn key_id(&self) -> String {
-        if self.incarnation == 1 { self.id.clone() } else { format!("{}-{}", self.id, self.incarnation) }
+        if self.checkpoint_stage.is_some() {
+            format!("stage-{}-{}", self.id, self.incarnation)
+        } else if self.incarnation == 1 {
+            self.id.clone()
+        } else {
+            format!("{}-{}", self.id, self.incarnation)
+        }
     }
 
     /// The name of a physical log stream on this residence's ensemble.

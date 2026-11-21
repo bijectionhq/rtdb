@@ -54,11 +54,15 @@ case "${1:-}" in
             printf '%s' "$RTDB_RECOVERY_TOKEN" > recovery.token
             printf '%s' "${RTDB_CONFIGURATION:?Missing recovery configuration}" > config.yaml
             set -- --recovery-config config.yaml --recovery-token-file recovery.token "$@"
+            if [ -n "${RTDB_CELL_SECRET:-}" ]; then
+                printf '%s' "$RTDB_CELL_SECRET" > cell.secret
+                set -- --cell-secret cell.secret "$@"
+            fi
         fi
-        unset RTDB_CONFIGURATION RTDB_TLS_KEYSTORE RTDB_RECOVERY_TOKEN
+        unset RTDB_CONFIGURATION RTDB_TLS_KEYSTORE RTDB_RECOVERY_TOKEN RTDB_CELL_SECRET
         exec /usr/local/bin/rtdb-multi reaper "$@"
         ;;
-    prepare-cell-transfer | activate-cell-transfer)
+    prepare-cell-transfer | activate-cell-transfer | capture | restore | stage-checkpoint | read-checkpoint-stage)
         bind_hosted_task "$@"
         exec /usr/local/bin/rtdb-multi "$@"
         ;;

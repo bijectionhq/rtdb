@@ -166,7 +166,11 @@ impl RemoteStorageFactory for CellStoreFactory {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let (record, region, release) = self.admit_region(&config, io).await?;
-        let recovery = crate::archive::ArchivedCheckpoint::load(&record, Arc::clone(&region)).await?;
+        let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
+            crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
+        } else {
+            None
+        };
         if record.storage_namespaces.is_some() {
             crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
         }
@@ -268,10 +272,14 @@ impl CellStoreFactory {
                 {
                     return Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("Installation {} no longer authorizes this store", config.deployment)));
                 }
+                let repair = record.checkpoint_recovery.as_ref()
+                    .filter(|repair| repair.completed_at_ms.is_some())
+                    .map(|repair| repair.operation);
                 record.storage_regions.insert(id, if local {
-                    StorageRegion::Local
+                    StorageRegion::Local { archive: repair }
                 } else {
-                    remote_storage_region(None, hosted_task.clone())
+                    StorageRegion::Remote { archive: None, repair_archive: repair, owner: hosted_task.clone(),
+                        closed: false, publications: BTreeMap::new() }
                 });
                 Ok(())
             }).await;
@@ -311,7 +319,7 @@ impl CellStoreFactory {
 }
 
 pub(crate) fn remote_storage_region(archive: Option<Uuid>, owner: Option<HostedTask>) -> StorageRegion {
-    StorageRegion::Remote { archive, owner, closed: false, publications: BTreeMap::new() }
+    StorageRegion::Remote { archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
 }
 
 pub(crate) fn track_publications(
@@ -322,7 +330,7 @@ pub(crate) fn track_publications(
     writer_epoch: Option<u64>,
 ) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch, transfer: false },
+        DirectoryPublications { directory, deployment, region, writer_epoch, owner: PublicationOwner::Serving },
     ));
 }
 
@@ -334,8 +342,27 @@ pub(crate) fn track_transfer_publications(
     epoch: u64,
 ) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch: Some(epoch), transfer: true },
+        DirectoryPublications { directory, deployment, region, writer_epoch: Some(epoch), owner: PublicationOwner::Transfer },
     ));
+}
+
+pub(crate) fn track_checkpoint_stage_publications(
+    io: &mut Arc<IoRegion>,
+    directory: Arc<dyn Directory>,
+    deployment: String,
+    region: Uuid,
+    operation: Uuid,
+) {
+    Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
+        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointStage(operation) },
+    ));
+}
+
+#[derive(Clone, Copy)]
+enum PublicationOwner {
+    Serving,
+    Transfer,
+    CheckpointStage(Uuid),
 }
 
 struct DirectoryPublications {
@@ -343,7 +370,7 @@ struct DirectoryPublications {
     deployment: String,
     region: Uuid,
     writer_epoch: Option<u64>,
-    transfer: bool,
+    owner: PublicationOwner,
 }
 
 #[async_trait]
@@ -354,10 +381,13 @@ impl PublicationJournal for DirectoryPublications {
         }
         let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned() };
         crate::admin::update_installation(self.directory.as_ref(), &self.deployment, |record| {
-            let accepts_writes = if self.transfer {
-                record.lifecycle == Lifecycle::Moving && record.move_from.is_some()
-            } else {
-                matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+            let accepts_writes = match self.owner {
+                PublicationOwner::Serving => matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
+                PublicationOwner::Transfer => record.lifecycle == Lifecycle::Moving && record.move_from.is_some(),
+                PublicationOwner::CheckpointStage(operation) => record.lifecycle == Lifecycle::Restoring
+                    && record.checkpoint_stage.as_ref().is_some_and(|stage| {
+                        stage.intent.operation == operation && stage.staged_manifest_sha256.is_none()
+                    }),
             };
             if !accepts_writes || self.writer_epoch.is_some_and(|epoch| record.epoch != epoch)
             {
@@ -366,6 +396,9 @@ impl PublicationJournal for DirectoryPublications {
             let Some(StorageRegion::Remote { archive, closed: false, .. }) = record.storage_regions.get(&self.region) else {
                 return Err(storage_region_error("The remote storage region is closed or absent"));
             };
+            if let Some(capture) = archive {
+                crate::archive::require_capture_open(record, *capture)?;
+            }
             require_publication_key(record, *archive, key)?;
             let Some(StorageRegion::Remote { publications, .. }) = record.storage_regions.get_mut(&self.region) else {
                 unreachable!("the publication region was just checked");
@@ -441,13 +474,18 @@ pub(crate) async fn reconcile_storage_regions(
     keys: &dyn KeyService,
     record: &DeploymentRecord,
 ) -> Result<()> {
+    if let Some(stage) = &record.checkpoint_stage {
+        if crate::admin::cell_media(storage, keys)? != stage.media {
+            return Err(storage_region_error("Checkpoint staging uses different provider custody"));
+        }
+    }
     for (&region, state) in &record.storage_regions {
         match state {
-            StorageRegion::Local if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
+            StorageRegion::Local { .. } if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
                 release_region(directory, &record.id, region, false).await?;
                 keys.forget_local_storage_region(region)?;
             }
-            StorageRegion::Remote { archive, owner, publications, closed } => {
+            StorageRegion::Remote { archive, owner, publications, closed, .. } => {
                 if !*closed {
                     let Some(owner) = owner else { continue; };
                     if !directory.hosted_task_stopped(owner).await? {
@@ -750,7 +788,7 @@ impl ObjectStore for GarbageStore {
 pub const ROOT_MARKER: &str = "~root";
 
 /// Verifies the store's owner and lets a holder claim a new root.
-async fn check_root(store: &dyn ObjectStore, deployment: &str, claim: bool) -> Result<()> {
+pub(crate) async fn check_root(store: &dyn ObjectStore, deployment: &str, claim: bool) -> Result<()> {
     let marker = ObjectKey::new(ROOT_MARKER)?;
     let owner = match store.get(&marker).await {
         Ok(owner) => owner,
@@ -889,7 +927,21 @@ pub async fn run_reaper(
                     drop(maintenance);
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
-                            if record.lifecycle != Lifecycle::Deleting && !move_cleanup_due(record, now, grace) { continue; }
+                            for (&capture, release) in &record.checkpoint_capture_retirements {
+                                if release.observed_empty_at_ms.is_some() { continue; }
+                                let disposal = crate::archive::finish_capture_retirement(
+                                    directory.as_ref(), &storage, keys, &record.id, capture,
+                                );
+                                match cancellation.run_until_cancelled(disposal).await {
+                                    None => return,
+                                    Some(Err(error)) => eprintln!("Capture {capture} disposal is pending: {}", error.code),
+                                    Some(Ok(_)) => {},
+                                }
+                            }
+                        }
+                        for record in deployments.iter().filter(|record| {
+                            record.lifecycle == Lifecycle::Deleting || move_cleanup_due(record, now, grace)
+                        }) {
                             let disposal = crate::admin::finish_disposal_at(
                                 directory.as_ref(), &storage, keys, &record.id, Some(record.incarnation), 4 << 20,
                             );
@@ -899,16 +951,25 @@ pub async fn run_reaper(
                                 Some(Ok(_)) => {}
                             }
                         }
-                    }
-                    for record in &deployments {
-                        if !record.archive_retirement.as_ref().is_some_and(|retirement| retirement.observed_empty_at_ms.is_none()) {
-                            continue;
-                        }
-                        let Ok(id) = record.id.parse::<Uuid>() else { continue; };
-                        match cancellation.run_until_cancelled(crate::archive::finish_retirement(directory.as_ref(), id)).await {
-                            None => return,
-                            Some(Err(error)) => eprintln!("Archive retirement of {id} is pending: {}", error.code),
-                            Some(Ok(_)) => {},
+                        for record in deployments.iter().filter(|record| record.archive_retirement.as_ref()
+                            .is_some_and(|retirement| retirement.observed_empty_at_ms.is_none()))
+                        {
+                            let Ok(id) = record.id.parse::<Uuid>() else { continue; };
+                            if !record.storage_regions.is_empty() {
+                                match cancellation.run_until_cancelled(reconcile_storage_regions(directory.as_ref(), &storage, keys, record)).await {
+                                    None => return,
+                                    Some(Err(error)) => {
+                                        eprintln!("Archive readers for {id} are pending: {}", error.code);
+                                        continue;
+                                    }
+                                    Some(Ok(())) => {}
+                                }
+                            }
+                            match cancellation.run_until_cancelled(crate::archive::finish_retirement(directory.as_ref(), keys, id)).await {
+                                None => return,
+                                Some(Err(error)) => eprintln!("Archive retirement of {id} is pending: {}", error.code),
+                                Some(Ok(_)) => {},
+                            }
                         }
                     }
                 }
@@ -1274,20 +1335,20 @@ mod tests {
         let record = directory.create_deployment(record).await.unwrap();
         let object = key(&format!("{}/v06/data", record.storage_prefix()));
         let journal = DirectoryPublications {
-            directory: directory.clone(), deployment: record.id.clone(), region, writer_epoch: Some(record.epoch), transfer: false,
+            directory: directory.clone(), deployment: record.id.clone(), region, writer_epoch: Some(record.epoch), owner: PublicationOwner::Serving,
         };
         assert!(journal.admit(&key("another-installation/data"), attempt, "upload").await.is_err());
         journal.admit(&object, attempt, "upload").await.unwrap();
         let before = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(before.storage_regions[&region], StorageRegion::Remote {
-            archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
+            archive: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
         assert!(journal.admit(&object, Uuid::new_v4(), "upload").await.is_err());
         let retained = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(retained.storage_regions[&region], StorageRegion::Remote {
-            archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
+            archive: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
     }
 
@@ -1302,7 +1363,7 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
-        record.storage_regions.insert(region, StorageRegion::Local);
+        record.storage_regions.insert(region, StorageRegion::Local { archive: None });
         let record = directory.create_deployment(record).await.unwrap();
         crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
 
