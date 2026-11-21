@@ -1620,6 +1620,15 @@ rule BoundInitialGreeting {
         ConnectionClosed(connection)
 }
 
+rule TouchConnectedBackend {
+    when: BackendTouchDue(gateway, deployment, address)
+
+    requires: GatewayHasConnectedSession(gateway, deployment, address)
+
+    ensures:
+        TouchSent(gateway, deployment, address)
+}
+
 rule RouteRead {
     -- The gateway walks the deployment's affinity order within its read width.
     -- The holder is normally rank 1, so the first choice is usually the writer.

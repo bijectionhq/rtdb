@@ -3,15 +3,17 @@
 //! Routing never authorises: a node may refuse or redirect, and the gateway walks on.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, effective_holder, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::control::{self, Request, Response};
 
@@ -39,6 +41,7 @@ impl Default for GatewayOptions {
 }
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
+    let heartbeats = Arc::new(Heartbeats::default());
     loop {
         let (client, _) = tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
@@ -46,11 +49,12 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         };
         let directory = Arc::clone(&directory);
         let options = options.clone();
+        let heartbeats = Arc::clone(&heartbeats);
         let cancellation = cancellation.child_token();
         tokio::spawn(async move {
             tokio::select! {
                 _ = cancellation.cancelled() => {}
-                _ = connection(client, directory, options) => {}
+                _ = connection(client, directory, options, heartbeats) => {}
             }
         });
     }
@@ -77,7 +81,7 @@ impl Startup {
     }
 }
 
-async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions) -> Result<()> {
+async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, heartbeats: Arc<Heartbeats>) -> Result<()> {
     let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
     let Ok(startup) = tokio::time::timeout_at(startup_deadline, read_startup(&mut client)).await else { return Ok(()); };
     let Some(startup) = startup? else { return Ok(()); };
@@ -100,7 +104,7 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
         };
         return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
     }
-    let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), read_only: startup.read_only(), snapshot: startup.snapshot(), options: options.clone() });
+    let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), read_only: startup.read_only(), snapshot: startup.snapshot(), options: options.clone(), heartbeats });
     let (server, control, epoch, deployment) = match tokio::time::timeout_at(startup_deadline, router.route_with_record()).await {
         Ok(Ok(route)) => route,
         Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
@@ -122,7 +126,51 @@ async fn elsewhere(directory: &Arc<dyn Directory>, name: &str, options: &Gateway
     map.gateway(&living).await.ok().flatten()
 }
 
-struct GatewayRouter { directory: Arc<dyn Directory>, name: String, read_only: bool, snapshot: bool, options: GatewayOptions }
+struct GatewayRouter { directory: Arc<dyn Directory>, name: String, read_only: bool, snapshot: bool, options: GatewayOptions, heartbeats: Arc<Heartbeats> }
+
+type HeartbeatTarget = (String, String);
+
+#[derive(Default)]
+struct Heartbeats(Mutex<BTreeMap<HeartbeatTarget, Weak<Heartbeat>>>);
+
+struct Heartbeat {
+    registry: Weak<Heartbeats>,
+    target: HeartbeatTarget,
+    _task: AbortOnDropHandle<()>,
+}
+
+impl Heartbeats {
+    fn register(self: &Arc<Self>, deployment: &str, address: String, options: &GatewayOptions) -> Arc<Heartbeat> {
+        let target = (deployment.to_owned(), address);
+        let mut active = self.0.lock();
+        if let Some(heartbeat) = active.get(&target).and_then(Weak::upgrade) { return heartbeat; }
+        let (name, address) = target.clone();
+        let interval = options.touch_interval;
+        let timeout = options.control_timeout;
+        let key = control::ControlKey(options.capabilities.clone());
+        let request = Request::Touch { name };
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let _ = control::call(&address, &request, timeout, &key).await;
+            }
+        });
+        let heartbeat = Arc::new(Heartbeat { registry: Arc::downgrade(self), target: target.clone(), _task: AbortOnDropHandle::new(task) });
+        active.insert(target, Arc::downgrade(&heartbeat));
+        heartbeat
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            let mut active = registry.0.lock();
+            if active.get(&self.target).is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self)) {
+                active.remove(&self.target);
+            }
+        }
+    }
+}
 
 impl GatewayRouter {
     async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
@@ -139,17 +187,8 @@ impl crate::session::Router for GatewayRouter {
         Ok((stream, control, epoch))
     }
 
-    fn start_touching(&self, address: String) -> Option<tokio::task::JoinHandle<()>> {
-        let name = self.name.clone();
-        let interval = self.options.touch_interval;
-        let timeout = self.options.control_timeout;
-        let key = control::ControlKey(self.options.capabilities.clone());
-        Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let _ = control::call(&address, &Request::Touch { name: name.clone() }, timeout, &key).await;
-            }
-        }))
+    fn start_touching(&self, address: String) -> Option<Arc<dyn Send + Sync>> {
+        Some(self.heartbeats.register(&self.name, address, &self.options))
     }
 }
 
@@ -297,3 +336,32 @@ async fn refuse(client: &mut TcpStream, sqlstate: &str, message: &str) -> Result
 }
 
 fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/gateway-io", error.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use super::{Arc, GatewayOptions, Heartbeats};
+
+    #[tokio::test]
+    async fn simultaneous_sessions_share_backend_heartbeats_until_the_last_disconnect() {
+        let heartbeats = Arc::new(Heartbeats::default());
+        let options = GatewayOptions::default();
+        let first = heartbeats.register("shop", "old".to_owned(), &options);
+        let second = heartbeats.register("shop", "old".to_owned(), &options);
+        let moved = heartbeats.register("shop", "new".to_owned(), &options);
+        let other = heartbeats.register("other-shop", "old".to_owned(), &options);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &moved));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(heartbeats.0.lock().len(), 3);
+
+        drop(first);
+        assert_eq!(heartbeats.0.lock().len(), 3);
+        drop(second);
+        let active = heartbeats.0.lock();
+        assert!(!active.contains_key(&("shop".to_owned(), "old".to_owned())));
+        assert_eq!(active.len(), 2);
+        drop(active);
+        drop((moved, other));
+        assert!(heartbeats.0.lock().is_empty());
+    }
+}
