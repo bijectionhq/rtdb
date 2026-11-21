@@ -4,8 +4,8 @@ use std::{collections::BTreeSet, future::Future, sync::Arc};
 
 use bytes::Bytes;
 use rtdb_directory::{
-    CellMedia, CheckpointStage, CheckpointStageIntent, DeploymentRecord, Directory, HostedTask,
-    Lifecycle,
+    CellMedia, CheckpointStage, CheckpointStageIntent, DeploymentRecord, Directory,
+    DisposalReceipt, HostedTask, Lifecycle,
 };
 use rtdb_storage::{Error, IoRegion, ObjectStore};
 use rtdb_types::Result;
@@ -16,7 +16,7 @@ use super::{
     digest, encode, inconsistent, read, read_object, unavailable,
 };
 use crate::{
-    admin::{installation_record, update_installation},
+    admin::{begin_disposal, cell_media, installation_record, update_installation},
     cipher::Cipher,
     deployment::CellStorage,
     keys::KeyService,
@@ -28,6 +28,67 @@ use crate::{
 };
 
 pub(super) const STAGED_MANIFEST: &str = "~checkpoint-stage";
+
+/// Close the exact scratch identity, even when cancellation wins the race
+/// with staging. Physical disposal stays with the cell's ordinary reaper.
+pub(crate) async fn discard_checkpoint_stage(
+    directory: &dyn Directory,
+    source: &DeploymentRecord,
+    archive: &CellStorage,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    request: CheckpointStageIntent,
+) -> Result<Option<DisposalReceipt>> {
+    let id = request.destination.to_string();
+    let media = cell_media(storage, keys)?;
+    let record = match directory.deployment(&id).await? {
+        Some(record) => record,
+        None => {
+            let (point, _) = capture_receipt(source, archive, request.source, request.capture)?
+                .filter(|(_, digest)| digest == &request.source_manifest_sha256)
+                .ok_or_else(|| inconsistent("Discard requires the exact original capture"))?;
+            let mut tombstone =
+                installation_record(request.destination, &request.name, &request.org)?;
+            tombstone.lifecycle = Lifecycle::Deleting;
+            tombstone.epoch = 1;
+            tombstone.checkpoint_stage = Some(CheckpointStage {
+                intent: request.clone(),
+                source_incarnation: point.incarnation,
+                source_log_epoch: point.log_epoch,
+                checkpoint: point.checkpoint,
+                media: media.clone(),
+                staged_manifest_sha256: None,
+            });
+            match directory.create_deployment(tombstone).await {
+                Ok(accepted) => accepted,
+                Err(error) => directory.deployment(&id).await?.ok_or(error)?,
+            }
+        }
+    };
+    staged(&record, &request, &media)?;
+    if record.incarnation != 1
+        || record.holder.is_some()
+        || record.checkpoint.is_some()
+        || !record.ensemble.is_empty()
+        || !record.replica_journals.is_empty()
+        || record.move_from.is_some()
+        || record.moved_at_ms.is_some()
+    {
+        return Err(inconsistent("Discard requires a held checkpoint stage"));
+    }
+    match record.lifecycle {
+        Lifecycle::Restoring => {
+            begin_disposal(directory, &id).await?;
+            Ok(None)
+        }
+        Lifecycle::Deleting => Ok(None),
+        Lifecycle::Deleted => record
+            .disposal
+            .map(Some)
+            .ok_or_else(|| inconsistent("The stage tombstone has no physical disposal receipt")),
+        _ => Err(inconsistent("Discard requires a held checkpoint stage")),
+    }
+}
 
 /// Stage ciphertext in the capture's original cell. The source keeps its
 /// current authority. The target remains held with no placement or log;

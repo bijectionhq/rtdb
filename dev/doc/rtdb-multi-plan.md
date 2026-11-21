@@ -190,6 +190,12 @@ the acknowledgement and serves one read-only PgWire session on that same
 connection. It closes the session on loss of the directory fence or when
 the recovery action's lifetime expires.
 
+The hosted `discard_checkpoint_stage` action binds the original capture
+digest and stage operation. It reserves a disposal tombstone if a stage has
+yet to appear, so a late stage cannot reopen it. It returns the retained
+physical disposal receipt after the reaper has drained stage readers and
+uploads, withdrawn the stage key and confirmed empty serving inventory.
+
 `rtdb-multi restore` accepts the live directory's current checkpoint with
 the original archive manifest and current key. It records a restore intent,
 fences the old writer at the logkeepers, and verifies the objects. The

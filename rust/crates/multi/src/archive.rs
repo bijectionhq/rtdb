@@ -72,6 +72,7 @@ use crate::{
 mod stage;
 mod reader;
 pub use stage::stage_checkpoint;
+pub(crate) use stage::discard_checkpoint_stage;
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{StageSelector, tunnel_staged_checkpoint};
 

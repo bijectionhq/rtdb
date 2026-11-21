@@ -3,7 +3,9 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rtdb_directory::{CheckpointStageIntent, DeploymentRecord, Directory, HostedTask};
+use rtdb_directory::{
+    CheckpointStageIntent, DeploymentRecord, Directory, DisposalReceipt, HostedTask,
+};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -47,6 +49,11 @@ enum Action {
         destination: Uuid,
         stage_operation: Uuid,
     },
+    DiscardCheckpointStage {
+        source_manifest_sha256: String,
+        destination: Uuid,
+        stage_operation: Uuid,
+    },
     OpenCheckpointStage {
         destination: Uuid,
         stage_operation: Uuid,
@@ -80,6 +87,15 @@ enum Reply {
         destination: Uuid,
         stage_operation: Uuid,
         staged_manifest_sha256: String,
+    },
+    StageDiscarded {
+        name: String,
+        authority: Uuid,
+        capture: Uuid,
+        source_manifest_sha256: String,
+        destination: Uuid,
+        stage_operation: Uuid,
+        disposal: DisposalReceipt,
     },
     Refused,
     Deferred,
@@ -143,6 +159,7 @@ impl RecoveryService {
         let Some(installation) = self.authorize(directory.as_ref(), &request).await? else {
             return Ok(Reply::Refused);
         };
+        let discard = matches!(request.action, Action::DiscardCheckpointStage { .. });
         match request.action {
             Action::CaptureCheckpoint => {
                 let retained = archive::capture_receipt(
@@ -209,6 +226,11 @@ impl RecoveryService {
                 source_manifest_sha256,
                 destination,
                 stage_operation,
+            }
+            | Action::DiscardCheckpointStage {
+                source_manifest_sha256,
+                destination,
+                stage_operation,
             } => {
                 if !valid_manifest(&source_manifest_sha256)
                     || destination.is_nil()
@@ -219,20 +241,44 @@ impl RecoveryService {
                     return Ok(Reply::Refused);
                 }
                 let database = format!("checkpoint-stage-{destination}");
+                let intent = CheckpointStageIntent {
+                    operation: stage_operation,
+                    source: request.authority,
+                    capture: request.capture,
+                    source_manifest_sha256: source_manifest_sha256.clone(),
+                    destination,
+                    name: database.clone(),
+                    org: self.org.clone(),
+                };
+                if discard {
+                    let disposal = archive::discard_checkpoint_stage(
+                        directory.as_ref(),
+                        &installation,
+                        &self.archive,
+                        &self.storage,
+                        self.keys.as_ref(),
+                        intent,
+                    )
+                    .await?;
+                    return Ok(match disposal {
+                        Some(disposal) => Reply::StageDiscarded {
+                            name: installation.name,
+                            authority: request.authority,
+                            capture: request.capture,
+                            source_manifest_sha256,
+                            destination,
+                            stage_operation,
+                            disposal,
+                        },
+                        None => Reply::Deferred,
+                    });
+                }
                 let stage = archive::stage_checkpoint(
                     directory,
                     &self.archive,
                     &self.storage,
                     self.keys.as_ref(),
-                    CheckpointStageIntent {
-                        operation: stage_operation,
-                        source: request.authority,
-                        capture: request.capture,
-                        source_manifest_sha256: source_manifest_sha256.clone(),
-                        destination,
-                        name: database.clone(),
-                        org: self.org.clone(),
-                    },
+                    intent,
                     self.hosted_task.clone(),
                 )
                 .await?;
