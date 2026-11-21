@@ -190,10 +190,9 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         };
         return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
     }
-    if expected.is_some() {
-        startup.parameters.insert("database".into(), name.clone());
-        startup.bytes = encode_startup(&startup.parameters);
-    }
+    if expected.is_some() { startup.parameters.insert("database".into(), name.clone()); }
+    startup.parameters.insert(rtdb_pgwire::GATEWAY_AWAIT_TOKEN_PARAMETER.into(), "on".into());
+    startup.bytes = encode_startup(&startup.parameters);
     let read_only = startup.read_only();
     let mut router = GatewayRouter {
         directory: Arc::clone(&directory), name,

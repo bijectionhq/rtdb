@@ -127,6 +127,7 @@ impl ServerDriver {
         let read_fence = placed.as_ref().and_then(|placed| placed.read_fence.clone());
         let scan_fragmenter = placed.as_ref().and_then(|placed| placed.scan_fragmenter.clone());
         let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());
+        let gateway_await_tokens = placed.is_some();
         if let Some(placed) = placed {
             for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
@@ -144,7 +145,7 @@ impl ServerDriver {
             for (port, read_only) in [(settings.port, false), (settings.read_only_port, true)] {
                 if port < 0 { continue; }
                 let mut configuration = rtdb_pgwire::ServerConfig { address: address(&settings.host, port).await?, maximum_connections: settings.connections,
-                    pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), capabilities: capabilities.clone(), ..Default::default() };
+                    pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), capabilities: capabilities.clone(), gateway_await_tokens, ..Default::default() };
                 if let Some(zone) = &config.default_timezone {
                     configuration.parameters.insert("timezone".into(), zone.clone());
                 }

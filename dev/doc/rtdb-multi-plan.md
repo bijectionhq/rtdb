@@ -729,6 +729,9 @@ Moves are invisible to clients only if the gateway owns connections and session 
    Extended COPY ignores Sync while consuming input and reports readiness on the Sync that follows completion or cancellation.
    A read-only pgwire listener rejects COPY input before accepting payload bytes.
    A successful DISCARD ALL clears the gateway's prepared statements before a later reconnect.
+   At each idle command boundary, a placed node reports changes to the session’s await token over its private gateway connection.
+   The gateway restores the token, including its removal, before replaying named prepared statements on the new backend.
+   A replacement backend must support await-token restoration to resume a session with a saved token.
    A single pgwire autocommit write sends `CommandComplete` after the commit succeeds.
    PGwire carries stable placement interruption codes independently of the configured error detail format. [PostgreSQL ErrorResponse format](https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ERRORRESPONSE)
 5. **Suspicion reports** to the controller on connection failure.

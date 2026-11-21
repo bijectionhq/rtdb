@@ -9,7 +9,7 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_AWAIT_TOKEN_TAG, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
@@ -68,12 +68,13 @@ pub(crate) struct ProtocolSession {
     skip_until_sync: bool,
     implicit: bool,
     transaction_generation: u64,
+    reported_await_token: u64,
     statements: BTreeMap<String, RegisteredStatement>,
     portals: BTreeMap<String, Portal>,
     copy: Option<crate::copy::CopyInput>,
 }
 impl ProtocolSession {
-    pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self { Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None } }
+    pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self { Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0, reported_await_token: 0, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None } }
     pub fn extended(&self) -> bool { self.extended }
     pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.session.state_mut().close(); }
     fn environment(&self) -> Result<SessionEnvironment> { SessionEnvironment::new(self.session.state().parameter_entries(), self.session.state().effective_timezone(), self.node.memory()) }
@@ -85,6 +86,17 @@ impl ProtocolSession {
         Ok(())
     }
     fn ready(&self) -> u8 { match self.session.state().status() { TransactionStatus::Idle | TransactionStatus::Closed => b'I', TransactionStatus::Failed => b'E', _ => b'T' } }
+    async fn report_ready<W: AsyncWrite + Unpin>(&mut self, writer: &mut Writer<W>) -> Result<()> {
+        let status = self.ready();
+        if status == b'I' && self.startup.gateway_await_tokens {
+            let (revision, token) = self.session.state().connection_await_token();
+            if revision != self.reported_await_token {
+                writer.gateway_await_token(token).await?;
+                self.reported_await_token = revision;
+            }
+        }
+        writer.ready(status).await
+    }
     fn options(&self) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: self.session.state().parameter("search_path").unwrap_or("public").split(',').map(|name| name.trim().trim_matches('"').to_owned()).collect(), ..Default::default() } }
     fn begin_implicit(&mut self, read_only: Option<bool>) -> Result<()> { if self.session.state().status() != TransactionStatus::Idle { return Ok(()); } let mut settings = rtdb_node::TransactionSettings::default(); settings.access = read_only.map(|read_only| if read_only { rtdb_node::AccessSettings::ReadOnly(Default::default()) } else { rtdb_node::AccessSettings::ReadWrite(Default::default()) }); self.session.state_mut().begin_with(settings)?; self.implicit = true; Ok(()) }
     fn end_transaction(&mut self) { self.portals.clear(); self.implicit = false; self.transaction_generation = self.transaction_generation.wrapping_add(1); }
@@ -170,7 +182,7 @@ impl ProtocolSession {
                 result?;
             }
             b'C' => { let kind = input.byte()?; let name = input.string()?; input.end()?; match kind { b'P' => { self.portals.remove(name); }, b'S' => { if let Some(statement) = self.statements.remove(name) { self.portals.retain(|_, portal| !Arc::ptr_eq(&portal.prepared, &statement.prepared)); } }, _ => return Err(protocol("Invalid close target")) } writer.empty(b'3').await?; }
-            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit().await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; writer.ready(self.ready()).await?; }
+            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit().await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
             b'd' => { self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))?.append(input.remaining()).await?; }
             b'c' => {
@@ -184,12 +196,25 @@ impl ProtocolSession {
                     Err(error) if self.extended => return Err(error),
                     Err(error) => writer.error(&error, self.environment()?.fallback(), false).await?,
                 }
-                if !self.extended { writer.ready(self.ready()).await?; }
+                if !self.extended { self.report_ready(writer).await?; }
             }
             b'f' => {
                 self.copy = None;
                 if self.extended { return Err(protocol("COPY input was cancelled")); }
-                writer.ready(self.ready()).await?;
+                self.report_ready(writer).await?;
+            }
+            GATEWAY_AWAIT_TOKEN_TAG if self.startup.gateway_await_tokens => {
+                if self.extended || self.copy.is_some() || self.ready() != b'I' {
+                    return Err(protocol("A gateway can restore a token only on an idle session"));
+                }
+                self.extended = true;
+                let token = match input.byte()? {
+                    0 => { input.end()?; None },
+                    1 => Some(std::str::from_utf8(input.remaining()).map_err(|_| protocol("The gateway await token is not UTF-8"))?.to_owned()),
+                    _ => return Err(protocol("Invalid gateway await token")),
+                };
+                self.session.state_mut().set_await_token(token)?;
+                self.reported_await_token = self.session.state().connection_await_token().0;
             }
             b'p' => (),
             _ => return Err(Anomaly::unsupported("xtdb.pgwire/unknown-client-msg", format!("unknown client message: {}", frame.tag))),
@@ -422,7 +447,7 @@ impl ProtocolSession {
         self.extended = false; self.portals.remove("");
         let result = self.simple_statements(source, writer).await;
         if let Err(error) = result { writer.error(error.anomaly(), self.environment()?.fallback(), false).await?; }
-        if self.copy.is_none() { writer.ready(self.ready()).await?; }
+        if self.copy.is_none() { self.report_ready(writer).await?; }
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(
@@ -858,7 +883,7 @@ mod tests {
         let options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
         let (node, driver) = Node::open(options, services).await.unwrap();
         let session = node.session("xtdb", identity).unwrap();
-        let startup = Startup { parameters: BTreeMap::new(), _reservation: node.memory().reserve(0).unwrap() };
+        let startup = Startup { parameters: BTreeMap::new(), gateway_await_tokens: false, _reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
     }

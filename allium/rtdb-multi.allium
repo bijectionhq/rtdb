@@ -818,6 +818,8 @@ entity Session {
     -- Parameters, prepared statements, the transaction buffer up to commit.
     state: Bytes
     -- The highest basis this session has been acknowledged or has read at.
+    -- The pgwire gateway retains the backend's connection await token at idle command boundaries.
+    -- A new backend restores that token before preparing statements or running another command.
     basis: Basis?
     freshness: ReadFreshness
     -- Present while a cursor is open; pins the session's reads to that member until the cursor closes.

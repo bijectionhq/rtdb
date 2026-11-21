@@ -186,6 +186,7 @@ pub struct Session {
     timezone: RetainedText,
     initial_timezone: RetainedText,
     await_token: Option<RetainedText>,
+    await_token_revision: u64,
     last_submitted: Option<LastSubmittedTx>,
     parameters: BTreeMap<String, Parameter>,
     /// The session key its transactions were last keyed under, and the sequence number of the next.
@@ -200,7 +201,7 @@ impl Session {
         let database = RetainedText::new(database.into(), service.memory())?;
         let timezone = RetainedText::new(timezone, service.memory())?;
         Ok(Self { service, database, lifecycle: Lifecycle::Open(None), auto_commit: true, default_access_mode: None,
-            initial_timezone: timezone.clone(), timezone, await_token: None, last_submitted: None, parameters: BTreeMap::new(), idempotency_sequence: None, cancellation: parent.child_token() })
+            initial_timezone: timezone.clone(), timezone, await_token: None, await_token_revision: 0, last_submitted: None, parameters: BTreeMap::new(), idempotency_sequence: None, cancellation: parent.child_token() })
     }
     fn ensure_open(&self) -> Result<()> {
         if matches!(self.lifecycle, Lifecycle::Closed) { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); }
@@ -227,6 +228,7 @@ impl Session {
     pub fn effective_timezone(&self) -> &str { self.transaction().map_or(&self.timezone, |tx| &tx.timezone) }
     pub fn session_timezone(&self) -> &str { self.transaction().map_or(&self.timezone, |tx| &tx.session_timezone) }
     pub fn effective_await_token(&self) -> Option<&str> { self.transaction().and_then(Transaction::await_token).or(self.await_token.as_deref()) }
+    pub fn connection_await_token(&self) -> (u64, Option<&str>) { (self.await_token_revision, self.await_token.as_deref()) }
     pub fn last_submitted(&self) -> Option<&LastSubmittedTx> { self.last_submitted.as_ref() }
     pub fn cancellation(&self) -> &CancellationToken { &self.cancellation }
     pub fn status(&self) -> TransactionStatus {
@@ -239,7 +241,18 @@ impl Session {
     }
     pub fn is_read_only(&self) -> bool { matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Reading { .. } | Phase::Pending(Some(_)))) }
     pub fn is_read_write(&self) -> bool { matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Writing { .. })) }
-    pub fn set_await_token(&mut self, token: Option<String>) -> Result<()> { self.ensure_open()?; self.await_token = token.map(|token| RetainedText::new(token, self.service.memory())).transpose()?; Ok(()) }
+    pub fn set_await_token(&mut self, token: Option<String>) -> Result<()> {
+        self.ensure_open()?;
+        let token = token.map(|token| RetainedText::new(token, self.service.memory())).transpose()?;
+        self.replace_await_token(token);
+        Ok(())
+    }
+    fn replace_await_token(&mut self, token: Option<RetainedText>) {
+        if self.await_token.as_deref() != token.as_deref() {
+            self.await_token = token;
+            self.await_token_revision = self.await_token_revision.wrapping_add(1);
+        }
+    }
     pub fn set_session_characteristics(&mut self, access: Option<AccessMode>) -> Result<()> { self.ensure_open()?; self.default_access_mode = access; Ok(()) }
     pub fn set_parameter(&mut self, name: impl Into<String>, value: Option<String>) -> Result<()> {
         self.ensure_open()?;
@@ -329,7 +342,7 @@ impl Session {
     pub fn reset(&mut self) -> Result<()> {
         self.ensure_open()?;
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/discard-in-tx", "DISCARD ALL cannot run inside a transaction block")); }
-        self.parameters.clear(); self.timezone = self.initial_timezone.clone(); self.await_token = None; self.default_access_mode = None;
+        self.parameters.clear(); self.timezone = self.initial_timezone.clone(); self.replace_await_token(None); self.default_access_mode = None;
         Ok(())
     }
     pub async fn set_auto_commit(&mut self, enabled: bool) -> Result<()> {
@@ -439,14 +452,14 @@ impl Session {
         let token = match &self.await_token { Some(token) => decode_tx_basis(token)?.merge(&next)?, None => next };
         let token = RetainedText::new(encode_tx_basis(&token), self.service.memory())?;
         match mode {
-            CommitMode::Async => { self.await_token = Some(token); self.last_submitted = Some(LastSubmittedTx::Submitted(submitted)); Ok(CommitResult::Submitted(submitted)) }
+            CommitMode::Async => { self.replace_await_token(Some(token)); self.last_submitted = Some(LastSubmittedTx::Submitted(submitted)); Ok(CommitResult::Submitted(submitted)) }
             CommitMode::Sync => {
                 let result = {
                     let _await = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::TxAwait);
                     self.service.await_transaction(&database, submitted.tx_id, &self.cancellation).await?
                 };
                 if matches!(result, TransactionResult::Aborted { .. }) { if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
-                self.await_token = Some(token); self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
+                self.replace_await_token(Some(token)); self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
                 Ok(CommitResult::Executed(result))
             }
         }

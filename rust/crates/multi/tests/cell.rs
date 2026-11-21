@@ -450,7 +450,8 @@ async fn an_activation_parks_a_cold_holding_under_execution_memory_pressure() {
     let node = cell.node(0);
     let memory = node.server.node().memory();
     admin::create_deployment(cell.directory.as_ref(), "cold", "acme", 3).await.unwrap();
-    let cold = cell.connect("cold").await;
+    node.agent.activate("cold").await.unwrap();
+    let cold = common::connect(&node.pgwire_address.to_string(), "cold").await;
     cold.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     drop(cold);
     admin::create_deployment(cell.directory.as_ref(), "next", "acme", 3).await.unwrap();
@@ -1837,6 +1838,31 @@ async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers()
     assert!(report.replica_continued_digest.is_some());
     drop(client);
     cell.add_node().await;
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_session_keeps_its_await_token_across_moves_and_replays_a_clear() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let token = values(&client, "SHOW AWAIT_TOKEN").await;
+    assert_eq!(token.len(), 1);
+    assert!(!token[0].is_empty());
+
+    let source = cell.holder("shop").await.unwrap();
+    let target = 1 - source;
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).agent.member(), &control()).await.unwrap();
+    assert_eq!(values(&client, "SHOW AWAIT_TOKEN").await, token);
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+
+    client.simple_query("SET AWAIT_TOKEN = NULL").await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(source).agent.member(), &control()).await.unwrap();
+    let result = client.simple_query("SHOW AWAIT_TOKEN").await.unwrap();
+    let row = result.iter().find_map(|message| match message { tokio_postgres::SimpleQueryMessage::Row(row) => Some(row), _ => None }).unwrap();
+    assert_eq!(row.get(0), None);
+    drop(client);
     cell.stop().await;
 }
 

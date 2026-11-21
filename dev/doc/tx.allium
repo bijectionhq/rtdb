@@ -29,6 +29,8 @@
 --      pgwire parses them itself.
 --      BEGIN evaluates and validates its characteristics, then publishes the open transaction with those characteristics atomically.
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
+--      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
+--      The gateway sends the token to the successor before replaying prepared statements or resuming application work.
 --   2. ADBC and Flight SQL: a caller handing the connection SQL text has BEGIN, START TRANSACTION, COMMIT and ROLLBACK rejected with xtdb.adbc/tx-control-as-sql, which names the transaction API.
 --      These callers open and end transactions through their API: ADBC autocommit / commit / rollback, Flight SQL BeginTransaction / EndTransaction, and Xtdb.Connection.begin / commitSync / commitAsync / rollbackTx.
 --      They set characteristics with SET TRANSACTION, which is accepted as SQL, or with Xtdb.Connection.setTransactionReadOnly / setTransactionReadWrite / setTransactionTimeZone.
