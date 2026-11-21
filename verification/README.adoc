@@ -172,6 +172,12 @@ It also exercises the Azure adapter against a loopback provider and separately m
   Both models separate catalog publication, release certification, a captured sweep and later deletion, and keep closed readers' provider work protected until drain.
   `lean/ResidenceReaderRetention.lean` proves safety conditional on the retirement certificate and the captured-reader premise.
   It proves that exact tracking permits every cutoff deletion and exhibits a dependency-independent deletion that only exact tracking permits.
+* `tla/CatalogAdmissionFloor.tla` models independent reader and floor proposals over the same versioned record.
+  TLC covers one reader, three cuts and six directory version increments.
+  Apalache checks through eight transitions, including a stale floor write control.
+  `lean/CatalogAdmissionFloor.lean` proves that every finite history of guarded atomic steps preserves held readers for any finite reader list.
+  It separately proves floor monotonicity for each step.
+  It assumes each successful update sees the authoritative ledger at its linearization point.
 * `tla/RecoveryCollection.tla` checks overlapping checkpoint generations, an active recovery reference, the required log suffix, and delayed object deletion.
   TLC explores its finite state space and Apalache independently checks the same safety conditions up to ten transitions.
 * `tla/InstalledCheckpoint.tla` models the local trie collector while compaction, checkpoint publication, checkpoint adoption, readers, and physical deletion advance separately.

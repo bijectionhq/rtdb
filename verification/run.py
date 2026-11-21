@@ -527,6 +527,28 @@ def verify_type_join(args, scratch):
     verify_lean_model(args, scratch, path, "type-join", controls, 10)
 
 
+def verify_floor_preservation(args, scratch):
+    path = Path("verification/lean/CatalogAdmissionFloor.lean")
+    controls = {
+        "admit-without-floor-check": (
+            "(allowed : permits state.floor cut)",
+            "(allowed : True)",
+            ["a_step_preserves_held_readers"],
+        ),
+        "advance-across-a-reader": (
+            "(allAllow : ∀ cut ∈ state.readers, permits (some floor) cut)",
+            "(allAllow : True)",
+            ["a_step_preserves_held_readers"],
+        ),
+        "rewind-the-floor": (
+            "(covered : coversPreviousFloor state.floor (some floor))",
+            "(covered : True)",
+            ["a_step_never_lowers_the_floor"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "catalog-floor-preservation", controls, 4)
+
+
 def verify_retirement_identity(args, scratch):
     path = Path("verification/lean/RetirementIdentity.lean")
     controls = {
@@ -1159,6 +1181,7 @@ def verify_lean(args, scratch):
             verify_system_time(args, scratch)
             verify_message_position(args, scratch)
             verify_type_join(args, scratch)
+            verify_floor_preservation(args, scratch)
             verify_retirement_identity(args, scratch)
             verify_basis_tokens(args, scratch)
             verify_run_encoding(args, scratch)

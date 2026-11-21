@@ -1369,6 +1369,8 @@ Each of the two new storage and compaction areas includes production-only and jo
 |Hosted catalog admission
 |The same directory CAS coordinates reader registration and an installed retirement floor.
 TLC explores stale reads and writes, opaque captures and writer replacement.
+Apalache cross-checks the bounded safety property and the stale floor write control.
+Lean proves preservation for arbitrary lists of readers over serialized ledger transitions.
 Verus checks the exact cutoff decision.
 |Bind the floor and exact physical grant at one linearization point, bring recovery roots under the same authority and emit refinement traces.
 
