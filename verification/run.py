@@ -848,9 +848,14 @@ def verify_private_replay(args, scratch):
             ["admits_overlap_every_retained_marker", "overlap_realizes_valid_time_range"],
         ),
         "duplicate-side-effect": (
-            "if overlaps marker attempt.submittedAt then\n          (state, .committed marker.original)",
-            "if overlaps marker attempt.submittedAt then\n          ({ state with effects := state.effects + 1 }, .committed marker.original)",
+            "if overlaps marker attempt.submittedAt then\n            (state, .committed marker.original)",
+            "if overlaps marker attempt.submittedAt then\n            ({ state with effects := state.effects + 1 }, .committed marker.original)",
             ["duplicates_preserve_the_original_for_any_admitted_sample"],
+        ),
+        "execute-after-lookup-failure": (
+            "if attempt.lookupFailed then (state, .aborted)",
+            "if attempt.lookupFailed then perform cutoff state attempt",
+            ["lookup_failure_preserves_marker_and_effects"],
         ),
         "install-aborted-marker": (
             "else (state, .aborted)",
@@ -858,7 +863,7 @@ def verify_private_replay(args, scratch):
             ["step_preserves_atomic_effect"],
         ),
     }
-    verify_lean_model(args, scratch, path, "private-replay", controls, 8)
+    verify_lean_model(args, scratch, path, "private-replay", controls, 9)
 
 
 def verify_explicit_session(args, scratch):

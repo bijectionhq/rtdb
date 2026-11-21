@@ -204,6 +204,7 @@ An external-source writer's abort with code `rtdb.tx/private-replay-duplicate` r
 Verus checks the finite half-open interval and the strict cutoff in the production arithmetic.
 Lean proves at most one user effect for arbitrary resolution sequences for one key and cutoff, including aborted attempts and clock samples that arrive in either order.
 The installed marker overlaps every admitted submission's valid-time range, and later resolutions preserve its original outcome.
+In the model, a caller error during marker lookup aborts that attempt and preserves the stored marker and user-effect count.
 The model assumes one authoritative ordered prefix, atomic publication of user effects and the marker, and a common key and cutoff supplied by the trusted frontend.
 Native regressions cover cutoff equality, conflicting keys, parallel attempts, out-of-order clock samples, expiry beyond the ordinary window, rejected writes to the marker, and recovery both of a flushed marker and of the duplicate receipt.
 The format regression checks required field presence and distinguishes a zero timestamp from absence.

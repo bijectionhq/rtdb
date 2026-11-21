@@ -17,6 +17,7 @@ structure Attempt where
   submittedAt : Int
   outcome : Nat
   succeeds : Bool
+  lookupFailed : Bool
 
 inductive Reply where
   | refused
@@ -38,12 +39,14 @@ def perform (cutoff : Int) (state : State) (attempt : Attempt) : State × Reply 
 
 def step (cutoff : Int) (state : State) (attempt : Attempt) : State × Reply :=
   if admits cutoff attempt.submittedAt then
-    match state.marker with
-    | some marker =>
-        if overlaps marker attempt.submittedAt then
-          (state, .committed marker.original)
-        else perform cutoff state attempt
-    | none => perform cutoff state attempt
+    if attempt.lookupFailed then (state, .aborted)
+    else
+      match state.marker with
+      | some marker =>
+          if overlaps marker attempt.submittedAt then
+            (state, .committed marker.original)
+          else perform cutoff state attempt
+      | none => perform cutoff state attempt
   else (state, .refused)
 
 def Valid (cutoff : Int) (state : State) : Prop :=
@@ -80,25 +83,37 @@ theorem overlap_realizes_valid_time_range (marker : Marker) (sample : Int)
   · rintro ⟨valid, _, lower, upper⟩
     exact Int.lt_of_le_of_lt lower upper
 
+theorem lookup_failure_preserves_marker_and_effects
+    (cutoff : Int) (state : State) (attempt : Attempt)
+    (admitted : admits cutoff attempt.submittedAt = true) (failed : attempt.lookupFailed = true) :
+    step cutoff state attempt = (state, .aborted) := by
+  simp [step, admitted, failed]
+
 theorem duplicates_preserve_the_original_for_any_admitted_sample
     (cutoff : Int) (state : State) (attempt : Attempt) (marker : Marker)
     (valid : Valid cutoff state) (recorded : state.marker = some marker)
-    (admitted : admits cutoff attempt.submittedAt = true) :
+    (admitted : admits cutoff attempt.submittedAt = true) (lookedUp : attempt.lookupFailed = false) :
     step cutoff state attempt = (state, .committed marker.original) := by
   simp only [Valid, recorded] at valid
-  simp [step, recorded, admitted, admits_overlap_every_retained_marker cutoff _ _ admitted valid.2.2]
+  simp [step, recorded, admitted, lookedUp, admits_overlap_every_retained_marker cutoff _ _ admitted valid.2.2]
 
 theorem step_preserves_atomic_effect (cutoff : Int) (state : State) (attempt : Attempt)
     (valid : Valid cutoff state) : Valid cutoff (step cutoff state attempt).1 := by
   by_cases admitted : admits cutoff attempt.submittedAt = true
-  · cases recorded : state.marker with
-    | some marker =>
-        rw [duplicates_preserve_the_original_for_any_admitted_sample _ _ _ _ valid recorded admitted]
+  · cases lookup : attempt.lookupFailed with
+    | true =>
+        rw [lookup_failure_preserves_marker_and_effects _ _ _ admitted lookup]
         exact valid
-    | none =>
-        have effects : state.effects = 0 := by simpa [Valid, recorded] using valid
-        have endBounds := installed_marker_covers_cutoff cutoff attempt.submittedAt
-        cases success : attempt.succeeds <;> simp [step, perform, admitted, recorded, Valid, effects, success, endBounds]
+    | false =>
+        cases recorded : state.marker with
+        | some marker =>
+            rw [duplicates_preserve_the_original_for_any_admitted_sample _ _ _ _ valid recorded admitted lookup]
+            exact valid
+        | none =>
+            have effects : state.effects = 0 := by simpa [Valid, recorded] using valid
+            have endBounds := installed_marker_covers_cutoff cutoff attempt.submittedAt
+            cases success : attempt.succeeds <;>
+              simp [step, perform, admitted, lookup, recorded, Valid, effects, success, endBounds]
   · simpa [step, admitted] using valid
 
 def run (cutoff : Int) (state : State) (attempts : List Attempt) : State :=
@@ -124,10 +139,14 @@ theorem retained_outcome_survives_subsequent_resolutions
   | cons attempt rest tail =>
       have unchanged : (step cutoff state attempt).1 = state := by
         by_cases admitted : admits cutoff attempt.submittedAt = true
-        · rw [duplicates_preserve_the_original_for_any_admitted_sample _ _ _ _ valid recorded admitted]
+        · cases lookup : attempt.lookupFailed with
+          | true => rw [lookup_failure_preserves_marker_and_effects _ _ _ admitted lookup]
+          | false =>
+              rw [duplicates_preserve_the_original_for_any_admitted_sample _ _ _ _ valid recorded admitted lookup]
         · simp [step, admitted]
       simpa only [run, List.foldl_cons, unchanged] using tail
 
+#print axioms lookup_failure_preserves_marker_and_effects
 #print axioms exact_cutoff_refuses
 #print axioms installed_marker_covers_cutoff
 #print axioms admits_overlap_every_retained_marker
