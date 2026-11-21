@@ -100,6 +100,11 @@ also fences an empty identity if retirement arrives before installation.
 Inspection reads the directory without fencing. A settled response identifies
 the retired writer epoch and hashes the receipt retained by the directory.
 
+Holders and compactors consult the current directory record before accepting
+each object mutation. Failure to read the directory leaves the mutation
+unadmitted. A provider call admitted before the fence can still be in flight
+while the reaper runs.
+
 `rtdb-multi capture --id UUID --operation UUID` retains the selected
 published checkpoint and copies its catalog, table metadata and referenced
 tries as ciphertext to the independent archive. The receipt fixes the
