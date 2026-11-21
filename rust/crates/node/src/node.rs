@@ -106,7 +106,7 @@ impl Node {
             Err(error) => match resources.close().await { Ok(()) => Err(error), Err(close) => Err(error.with_context("resource-close-error", close.to_string().into())) },
         }
     }
-    async fn open_region(mut options: NodeOptions, services: NodeServices, memory: Arc<MemoryBudget>) -> Result<(Self, NodeDriver)> {
+    async fn open_region(mut options: NodeOptions, mut services: NodeServices, memory: Arc<MemoryBudget>) -> Result<(Self, NodeDriver)> {
         if memory.limit_bytes() != options.execution_memory_bytes { return Err(Anomaly::incorrect("rtdb.node/invalid-memory-budget", "Node options and supplied execution budget have different limits")); }
         if options.command_capacity == 0 || options.execution_memory_bytes == 0 || options.cache_bytes == 0 {
             return Err(Anomaly::incorrect("rtdb.node/invalid-options", "Node capacities must be positive"));
@@ -114,6 +114,7 @@ impl Node {
         options.default_timezone = rtdb_expr::normalize_timezone(&options.default_timezone)?;
         let catalog = DatabaseCatalog::new(options.membership.clone());
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
+        services.scan_accelerators.insert(0, Arc::new(crate::ordered_index::OrderedIndexAccelerator));
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
             external_sources: services.external_sources, clock: services.clock, artefact_kinds: services.artefact_kinds,

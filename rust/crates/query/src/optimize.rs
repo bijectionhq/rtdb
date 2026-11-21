@@ -108,9 +108,8 @@ fn annotate_top_k(relation: Arc<Relation>) -> Result<Arc<Relation>> {
         RelationNode::Project { input, expressions } => RelationNode::Project { input: annotate_top_k(Arc::clone(input))?, expressions: expressions.clone() },
         RelationNode::Rename { input, prefix, expressions } => RelationNode::Rename { input: annotate_top_k(Arc::clone(input))?, prefix: prefix.clone(), expressions: expressions.clone() },
         RelationNode::SortLimit { input, order_by, offset, fetch: Some(fetch) } => {
-            let Some(first) = order_by.first().filter(|order| order.descending) else { return Ok(relation) };
             let limit = match offset { Some(offset) => Expr::binary(BinaryOp::Add, offset.clone(), fetch.clone()), None => fetch.clone() };
-            let Some(input) = push_top_k(input, first.expr.clone(), &limit)? else { return Ok(relation) };
+            let Some(input) = push_top_k(input, order_by, &limit, &[])? else { return Ok(relation) };
             RelationNode::SortLimit { input, order_by: order_by.clone(), offset: offset.clone(), fetch: Some(fetch.clone()) }
         }
         _ => return Ok(relation),
@@ -118,40 +117,72 @@ fn annotate_top_k(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     Ok(Arc::new(Relation::new(relation.schema().clone(), rebuilt)?))
 }
 
-fn push_top_k(relation: &Arc<Relation>, order: Expr, limit: &Expr) -> Result<Option<Arc<Relation>>> {
+fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &Expr, residuals: &[Expr]) -> Result<Option<Arc<Relation>>> {
     let through = |expressions: &[NamedExpr]| {
         let defined: BTreeMap<ColumnId, Expr> = expressions.iter().map(|named| (named.field.id, named.expr.clone())).collect();
-        let mut order = order.clone();
-        order.rewrite(&mut |expression| if let Expr::Column { id, .. } = expression { if let Some(definition) = defined.get(id) { *expression = definition.clone(); } });
-        order
+        let rewrite = |expression: &mut Expr| if let Expr::Column { id, .. } = expression {
+            if let Some(definition) = defined.get(id) { *expression = definition.clone(); }
+        };
+        let mut order = order.to_vec();
+        let mut residuals = residuals.to_vec();
+        for key in &mut order { key.expr.rewrite(&mut |expression| rewrite(expression)); }
+        for predicate in &mut residuals { predicate.rewrite(&mut |expression| rewrite(expression)); }
+        (order, residuals)
     };
     let node = match relation.node() {
         RelationNode::Project { input, expressions } => {
-            let Some(input) = push_top_k(input, through(expressions), limit)? else { return Ok(None) };
+            let (order, residuals) = through(expressions);
+            let Some(input) = push_top_k(input, &order, limit, &residuals)? else { return Ok(None) };
             RelationNode::Project { input, expressions: expressions.clone() }
         }
         RelationNode::Rename { input, prefix, expressions } => {
-            let Some(input) = push_top_k(input, through(expressions), limit)? else { return Ok(None) };
+            let (order, residuals) = through(expressions);
+            let Some(input) = push_top_k(input, &order, limit, &residuals)? else { return Ok(None) };
             RelationNode::Rename { input, prefix: prefix.clone(), expressions: expressions.clone() }
         }
         RelationNode::Extend { input, expressions } => {
-            let Some(input) = push_top_k(input, through(expressions), limit)? else { return Ok(None) };
+            let (order, residuals) = through(expressions);
+            let Some(input) = push_top_k(input, &order, limit, &residuals)? else { return Ok(None) };
             return Ok(Some(Arc::new(input.extend(expressions.clone())?)));
         }
+        RelationNode::Filter { input, predicate } if ordered_index_filter(predicate) => {
+            let mut residuals = residuals.to_vec();
+            residuals.push(predicate.clone());
+            let Some(input) = push_top_k(input, order, limit, &residuals)? else { return Ok(None) };
+            RelationNode::Filter { input, predicate: predicate.clone() }
+        }
         RelationNode::Scan(scan) => {
-            let Expr::Call { name, args, .. } = &order else { return Ok(None) };
-            let ([Expr::Column { id, .. }, query], true) = (args.as_slice(), name.eq_ignore_ascii_case("search_score")) else { return Ok(None) };
-            if !matches!(query, Expr::Literal(_) | Expr::Parameter { .. }) || !scan.columns.iter().any(|field| field.id == *id) { return Ok(None); }
-            let name = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.as_str());
-            let evaluated: Vec<ColumnId> = scan.matches.iter().filter(|evaluated| Some(evaluated.column.as_str()) == name).map(|evaluated| evaluated.id).collect();
-            if !scan.predicates.iter().any(|predicate| has_match_on(predicate, *id, &evaluated)) { return Ok(None); }
             let mut scan = scan.clone();
-            scan.top_k = Some(rtdb_plan::ScanTopK { column: *id, query: query.clone(), limit: limit.clone() });
+            let Some(first) = order.first() else { return Ok(None) };
+            if residuals.iter().all(ordered_index_filter)
+                && order.iter().all(|key| matches!(&key.expr, Expr::Column { id, .. } if scan.columns.iter().any(|field| field.id == *id))) {
+                scan.ordered_top_k = Some(rtdb_plan::OrderedTopK { order: order.to_vec(), limit: limit.clone(), residuals: residuals.to_vec() });
+            } else {
+                if !residuals.is_empty() { return Ok(None); }
+                let Expr::Call { name, args, .. } = &first.expr else { return Ok(None) };
+                let [Expr::Column { id, .. }, query] = args.as_slice() else { return Ok(None) };
+                if !first.descending || !name.eq_ignore_ascii_case("search_score")
+                    || !matches!(query, Expr::Literal(_) | Expr::Parameter { .. })
+                    || !scan.columns.iter().any(|field| field.id == *id) { return Ok(None); }
+                let name = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.as_str());
+                let evaluated: Vec<ColumnId> = scan.matches.iter().filter(|evaluated| Some(evaluated.column.as_str()) == name).map(|evaluated| evaluated.id).collect();
+                if !scan.predicates.iter().any(|predicate| has_match_on(predicate, *id, &evaluated)) { return Ok(None); }
+                scan.top_k = Some(rtdb_plan::ScanTopK { column: *id, query: query.clone(), limit: limit.clone() });
+            }
             return Ok(Some(Arc::new(Relation::scan(scan)?)));
         }
         _ => return Ok(None),
     };
     Ok(Some(Arc::new(Relation::new(relation.schema().clone(), node)?)))
+}
+
+fn ordered_index_filter(expression: &Expr) -> bool {
+    let Expr::Binary { op, left, right } = expression else { return false; };
+    if matches!(op, BinaryOp::And | BinaryOp::Or) {
+        return ordered_index_filter(left) && ordered_index_filter(right);
+    }
+    let operand = |value: &Expr| matches!(value, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. });
+    matches!(op, BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) && operand(left) && operand(right)
 }
 
 /// Whether a conjunct of the predicate is a MATCH on `column`, or one of the scan's own columns evaluating such a MATCH.
@@ -563,7 +594,7 @@ mod tests {
         };
         Arc::new(Relation::scan(Scan {
             table, columns, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         }).unwrap())
     }
 

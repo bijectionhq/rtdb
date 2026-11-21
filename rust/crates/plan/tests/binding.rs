@@ -139,7 +139,7 @@ fn nonconstant_filter_remains_above_temporal_scan() {
     let price = binder.field("price", None, table.columns["price"].clone()).unwrap();
     let scan = Arc::new(Relation::scan(Scan {
         table, columns: vec![price.clone()], valid_time: TemporalFilter::All,
-        system_time: TemporalFilter::All, clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
+        system_time: TemporalFilter::All, clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
     }).unwrap());
     let filtered = Arc::new(scan.clone().filter(Expr::binary(BinaryOp::Gt, price.expression(), Expr::Literal(Value::I64(100)))).unwrap());
     let simplified = simplify(filtered.clone()).unwrap();
