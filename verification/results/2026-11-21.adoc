@@ -472,3 +472,20 @@ The model and verified functions leave several premises at the call sites.
 Tantivy must enumerate sorted postings of the queried term and preserve document identity.
 The persisted sidecar must represent the same postings and extrema as a computation on demand.
 The remaining native loop, intersection, visibility, and frontier-coverage steps need refinement evidence that these premises hold at the ranker's cutoff.
+
+== Global top K and offset after partition pruning
+
+Lean checked five theorems in link:../lean/PartitionedTopK.lean[the partitioned ranking model].
+For any result list ordered by descending primary score, a row in its first k positions has fewer than k strictly higher-scoring rows in its partition.
+Keeping every such row in every partition therefore preserves the entire ordered prefix, including ties in the original reference order.
+Using the sum of offset and fetch as the local bound preserves the requested SQL page.
+The proofs cover empty inputs, zero limits, and limits longer than the result.
+
+The model rejected breaking ties locally by a different row identifier order, which changes what a query could select with its own tie-break.
+It separately rejected applying a local bound of fetch alone when the offset is nonzero.
+Each mutation failed a general theorem and a concrete two-row case.
+The native SQL search suite exercises ranked reads across multiple partitions and checks offset results against full sorting.
+
+The theorem starts with the resolved, qualifying reference rows and their scores.
+It assumes the implementation retains every row admitted by the modeled predicate and reproduces the reference tie order in the final sort.
+The Rust candidate verification and scan planner still need this refinement proof.

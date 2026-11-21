@@ -106,6 +106,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/Minimality.lean` exhibits requirements that need a distinct admission horizon, a private resolution prefix, a whole batch boundary, or intra-batch order.
   `lean/Ceiling.lean` proves that the system-time ceiling at a valid coordinate emits the reference answer exactly once, including after ordinary out-of-range events are dropped.
   `lean/SearchWindows.lean` checks coverage of conjunctive matches by complete window summaries, the extrema of each summary, and the assignment to half-open window ranges.
+  `lean/PartitionedTopK.lean` proves that conservative partition pruning preserves the ordered global prefix and the SQL page for any offset and fetch.
 * `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
   It assumes durable append is atomic and does not implement a consensus provider.
 * `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.

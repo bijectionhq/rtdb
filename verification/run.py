@@ -245,10 +245,32 @@ def verify_compaction_projection(args, scratch, history):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 
+def verify_lean_model(args, scratch, path, study, controls, theorems):
+    allowed = {"propext", "Classical.choice", "Quot.sound"}
+    for name, mutation in {"baseline": None, **controls}.items():
+        case = f"lean-{study}-{name}"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        if mutation:
+            replace_once(source, mutation[0], mutation[1])
+        checked = run_case([args.lean, str(path)], directory, args.evidence, case)
+        if mutation:
+            observed = lean_error_theorems(source, path, checked.stdout)
+            expected = sorted(mutation[2])
+            if not checked.returncode or observed != expected:
+                raise ValueError(f"{case}: expected {expected}, observed {observed}")
+        else:
+            audited = re.findall(r"depends on axioms: \[([^\]]*)\]|does not depend on any axioms", checked.stdout)
+            if checked.returncode or len(audited) != theorems or any(
+                set(re.findall(r"[\w.]+", axioms)) - allowed for axioms in audited
+            ):
+                raise ValueError(f"{case}: proof or axiom audit failed")
+        print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
+
+
 def verify_search_windows(args, scratch):
     path = Path("verification/lean/SearchWindows.lean")
     controls = {
-        "baseline": None,
         "longest-document": (
             "min posting.length impact.length", "max posting.length impact.length",
             ["summary_bounds_every_posting", "summary_bounds_every_posting",
@@ -264,26 +286,23 @@ def verify_search_windows(args, scratch):
              "scanning_interval_matches_assignment"],
         ),
     }
-    allowed = {"propext", "Classical.choice", "Quot.sound"}
-    for name, mutation in controls.items():
-        case = f"lean-search-windows-{name}"
-        directory = scratch / case
-        source = clone_file(path, directory)
-        if mutation:
-            replace_once(source, mutation[0], mutation[1])
-        checked = run_case([args.lean, str(path)], directory, args.evidence, case)
-        if mutation:
-            observed = lean_error_theorems(source, path, checked.stdout)
-            expected = sorted(mutation[2])
-            if not checked.returncode or observed != expected:
-                raise ValueError(f"{case}: expected {expected}, observed {observed}")
-        else:
-            audited = re.findall(r"depends on axioms: \[([^\]]*)\]|does not depend on any axioms", checked.stdout)
-            if checked.returncode or len(audited) != 7 or any(
-                set(re.findall(r"[\w.]+", axioms)) - allowed for axioms in audited
-            ):
-                raise ValueError("Lean search window proof or axiom audit failed")
-        print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
+    verify_lean_model(args, scratch, path, "search-windows", controls, 7)
+
+
+def verify_partitioned_top_k(args, scratch):
+    path = Path("verification/lean/PartitionedTopK.lean")
+    controls = {
+        "drop-ties": (
+            "row.score < candidate.score",
+            "(row.score < candidate.score ∨ row.score = candidate.score ∧ candidate.id < row.id)",
+            ["prefix_row_survives_partition_pruning", "tied_rows_remain_eligible"],
+        ),
+        "ignore-offset": (
+            "rows.filter (keeps rows (offset + fetch))", "rows.filter (keeps rows fetch)",
+            ["an_offset_keeps_the_following_row", "ordered_page_survives_partition_pruning"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "partitioned-top-k", controls, 5)
 
 
 def verify_reader_retention(args, scratch):
@@ -369,6 +388,7 @@ def verify_lean(args, scratch):
             verify_reader_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
             verify_search_windows(args, scratch)
+            verify_partitioned_top_k(args, scratch)
             independence = Path("verification/lean/Minimality.lean")
             clone_file(independence, directory)
             checked = run_case(
