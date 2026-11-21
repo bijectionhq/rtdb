@@ -102,7 +102,8 @@ Their parameter metadata uses positional unnamed nullable fields, and the source
 Prepared query binding retains the first Arrow batch.
 Flight SQL derives the result schema from the bound Arrow fields and encodes the batch when issuing a query ticket.
 Ticket redemption validates the argument batch and reads the first parameter row when opening the query.
-A pure projection of a compatible single-row parameter batch returns its Arrow buffers directly.
+A pure projection of a compatible single-row parameter batch stays in Arrow.
+It reuses compatible buffers and normalizes Boolean padding and masked cells when copying is needed.
 An update submitted through `GetFlightInfo` passes the bound batch to the transaction path as Arrow arguments.
 Prepared update binding accumulates all Arrow batches by column position.
 Zero columns mean an unbound execution; columns with zero rows preserve an empty execution batch.
