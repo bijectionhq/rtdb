@@ -17,7 +17,7 @@ use tantivy::query::{BooleanQuery, Occur, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
 use tantivy::store::Compressor;
 use tantivy::tokenizer::{PreTokenizedString, Token};
-use tantivy::{Directory, Index, IndexSettings, TantivyDocument, Term};
+use tantivy::{Directory, HasLen, Index, IndexSettings, TantivyDocument, Term};
 
 use crate::rectangle::merge_adjacent_valid_time;
 
@@ -422,20 +422,27 @@ impl Source {
 // SAFETY: every owner keeps its bytes at a fixed address for as long as it lives, wherever it moves: behind a reference count, or in a mapping.
 unsafe impl stable_deref_trait::StableDeref for Source {}
 
-/// A read-only directory over a bundle held in memory.
+/// A read-only directory over an immutable search bundle.
 #[derive(Clone)]
-struct BundleDirectory { bytes: OwnedBytes, files: Arc<BTreeMap<PathBuf, Range<usize>>> }
+struct BundleDirectory { bytes: FileSlice, files: Arc<BTreeMap<PathBuf, Range<usize>>> }
 
 impl std::fmt::Debug for BundleDirectory {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.debug_struct("BundleDirectory").field("files", &self.files.keys()).finish() }
 }
 
 impl BundleDirectory {
-    fn open(bytes: Source) -> Result<Self> {
-        let data: &[u8] = &bytes;
-        if data.len() < 2 * MAGIC.len() + 8 || &data[..8] != MAGIC || &data[data.len() - 8..] != MAGIC { return Err(corrupt("Search file has no bundle magic")); }
-        let footer = usize::try_from(u64::from_le_bytes(data[data.len() - 16..data.len() - 8].try_into().map_err(fault)?)).map_err(fault)?;
-        let mut cursor = data.get(footer..data.len() - 16).ok_or_else(|| corrupt("Search file footer is out of range"))?;
+    fn open(bytes: FileSlice) -> Result<Self> {
+        let len = bytes.len();
+        if len < 2 * MAGIC.len() + 8 { return Err(corrupt("Search file has no bundle magic")); }
+        let trailer = bytes.slice(len - 16..).read_bytes().map_err(fault)?;
+        let head = bytes.slice(..8).read_bytes().map_err(fault)?;
+        if head.as_slice() != MAGIC || trailer.len() != 16 || &trailer.as_slice()[8..] != MAGIC {
+            return Err(corrupt("Search file has no bundle magic"));
+        }
+        let footer = usize::try_from(u64::from_le_bytes(trailer.as_slice()[..8].try_into().map_err(fault)?)).map_err(fault)?;
+        if !(8..=len - 16).contains(&footer) { return Err(corrupt("Search file footer is out of range")); }
+        let footer_bytes = bytes.slice(footer..len - 16).read_bytes().map_err(fault)?;
+        let mut cursor = footer_bytes.as_slice();
         let mut take = |count: usize| -> Result<&[u8]> {
             if cursor.len() < count { return Err(corrupt("Search file footer is truncated")); }
             let (head, tail) = cursor.split_at(count);
@@ -452,7 +459,7 @@ impl BundleDirectory {
             let end = offset.checked_add(size).filter(|end| *end <= footer).ok_or_else(|| corrupt("Search file entry is out of range"))?;
             files.insert(PathBuf::from(name), offset..end);
         }
-        Ok(Self { bytes: OwnedBytes::new(bytes), files: Arc::new(files) })
+        Ok(Self { bytes, files: Arc::new(files) })
     }
     fn read_only(path: &Path) -> std::io::Error { std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("Search file is read-only: {}", path.display())) }
 }
@@ -460,7 +467,7 @@ impl BundleDirectory {
 impl Directory for BundleDirectory {
     fn get_file_handle(&self, path: &Path) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         let range = self.files.get(path).ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))?;
-        Ok(Arc::new(FileSlice::new(Arc::new(self.bytes.slice(range.clone())))))
+        Ok(Arc::new(self.bytes.slice(range.clone())))
     }
     fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> { Err(DeleteError::IoError { io_error: Arc::new(Self::read_only(path)), filepath: path.to_path_buf() }) }
     fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> { Ok(self.files.contains_key(path)) }
@@ -599,7 +606,16 @@ pub struct SearchFile { searcher: tantivy::Searcher, columns: Vec<String>, sidec
 
 impl SearchFile {
     pub fn open(bytes: impl Into<Source>, columns: &[String]) -> Result<Self> {
-        let directory = BundleDirectory::open(bytes.into())?;
+        Self::open_slice(FileSlice::from(bytes.into()), columns)
+    }
+
+    /// Opens a bundle through an immutable range reader.
+    pub fn open_with_ranges(reader: Arc<dyn FileHandle>, columns: &[String]) -> Result<Self> {
+        Self::open_slice(FileSlice::new(reader), columns)
+    }
+
+    fn open_slice(bytes: FileSlice, columns: &[String]) -> Result<Self> {
+        let directory = BundleDirectory::open(bytes)?;
         let sidecar = directory.get_file_handle(Path::new(SIDECAR)).map_err(|_| corrupt("Search file has no sidecar"))?;
         let sidecar = sidecar.read_bytes(0..sidecar.len()).map_err(fault)?;
         let index = Index::open(directory).map_err(fault)?;
@@ -933,6 +949,39 @@ mod tests {
     fn run(file: &SearchFile, row: u32) -> Option<u32> { match file.sidecar.row_doc(1, row) { RowDoc::Run(doc) => Some(doc), _ => None } }
 
     #[test]
+    fn range_reads_preserve_ranked_results_without_requesting_the_entire_bundle() {
+        #[derive(Debug)]
+        struct Tracked {
+            data: OwnedBytes,
+            reads: std::sync::Mutex<Vec<Range<usize>>>,
+        }
+
+        impl HasLen for Tracked {
+            fn len(&self) -> usize { self.data.len() }
+        }
+
+        #[async_trait::async_trait]
+        impl FileHandle for Tracked {
+            fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+                self.reads.lock().unwrap().push(range.clone());
+                Ok(self.data.slice(range))
+            }
+        }
+
+        let data = build_search_file(&columns(), &rows(), "ranges").unwrap();
+        let full = SearchFile::open(data.clone(), &columns()).unwrap();
+        let tracked = Arc::new(Tracked { data: OwnedBytes::new(data), reads: Default::default() });
+        let ranged = SearchFile::open_with_ranges(tracked.clone(), &columns()).unwrap();
+        let query = Query::parse("invoice");
+        let score = |file: &SearchFile| file.scored("body", &query, &query, None, all())
+            .unwrap().into_iter().map(|(hit, score)| (hit.iid, hit.doc, score)).collect::<Vec<_>>();
+        assert_eq!(score(&ranged), score(&full));
+        let reads = tracked.reads.lock().unwrap();
+        assert!(reads.contains(&(tracked.len() - 16..tracked.len())));
+        assert!(reads.iter().all(|range| range.len() < tracked.len()));
+    }
+
+    #[test]
     fn a_job_builds_the_same_bytes_every_time() {
         let first = build_search_file(&columns(), &rows(), "public$docs/l01-rc-b00/docs_text").unwrap();
         assert_eq!(first, build_search_file(&columns(), &rows(), "public$docs/l01-rc-b00/docs_text").unwrap());
@@ -1171,7 +1220,7 @@ mod tests {
     #[test]
     fn a_sidecar_whose_bytes_changed_is_unreadable() {
         let bytes = build_search_file(&columns(), &corpus_rows(2000, 1), "job").unwrap();
-        let directory = BundleDirectory::open(Source::from(bytes.clone())).unwrap();
+        let directory = BundleDirectory::open(FileSlice::from(Source::from(bytes.clone()))).unwrap();
         let range = directory.files[Path::new(SIDECAR)].clone();
         for offset in [range.start, range.start + range.len() / 2, range.end - 1] {
             let mut corrupted = bytes.clone();
