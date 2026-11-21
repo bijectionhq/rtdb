@@ -173,12 +173,15 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     let mut samples = Vec::new();
     for (number, query) in data.queries.chunks_exact(data.dimensions).take(query_count).enumerate() {
         for &filter in filters {
-            let start = Instant::now();
-            let expected = search(&exhaustive, query, VALID_AT, filter, None).await;
-            let exact_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let start = Instant::now();
-            let ordered = search(&active, query, VALID_AT, filter, None).await;
-            let ordered_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let contexts = [&exhaustive, &active];
+            let mut measured = [(Rows::new(), 0.0), (Rows::new(), 0.0)];
+            for order in 0..contexts.len() {
+                let position = (number + order) % contexts.len();
+                let start = Instant::now();
+                let rows = search(contexts[position], query, VALID_AT, filter, None).await;
+                measured[position] = (rows, start.elapsed().as_secs_f64() * 1000.0);
+            }
+            let [(expected, exact_ms), (ordered, ordered_ms)] = measured;
             assert_eq!(ordered, expected, "query {number}, filter {filter:?}");
             for &probe in probes {
                 let cold = BufferPool::new(index.store.clone(), 256 << 20);

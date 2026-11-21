@@ -41,10 +41,15 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     let bytes = args.iter().try_fold(256usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
     context.reserve(bytes.checked_mul(16).ok_or_else(overflow)?)?;
     let name = name.to_lowercase().replace('-', "_");
+    if name == "cosine_distance" {
+        let [left, right] = args else {
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "cosine_distance requires two arguments"));
+        };
+        return crate::vector::cosine_distance(left, right);
+    }
     function_type(&name, &args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
     if let Some(result) = crate::period::predicate(&name, args, context) { return result; }
     if let Some(result) = crate::search::call(&name, args, context) { return result; }
-    if name == "cosine_distance" { return crate::vector::cosine_distance(&args[0], &args[1]); }
     if let Some(result) = crate::string::call(&name, args, context) { return result; }
     if let Some(result) = crate::session_info::call(&name, args, context) { return result; }
     if let Some(result) = crate::collection::call(&name, args, context) { return result; }
