@@ -1928,6 +1928,8 @@ surface ClientAccess {
     @guarantee MovesAreInvisible
         -- A planned handoff stalls writes for one log round plus a redirect, and touches no client connection.
         -- A failover stalls writes until detection and claim complete, and a retried commit returns the outcome the first attempt had.
+        -- A dispatch failure preserves any complete command response the gateway has received.
+        -- An unanswered keyed command can be retried under its original key, including an extended-protocol exchange flushed before Sync.
         -- An authenticated idle session retains its acknowledged named prepared statements across holder changes.
         -- A failed startup ends the client's authentication exchange.
         -- A finite reconnect window bounds the time an established session waits for a replacement holder.

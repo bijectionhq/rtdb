@@ -72,7 +72,13 @@ pub trait Router: Send + Sync {
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)>;
 }
 
-struct Backend { writer: OwnedWriteHalf, frames: mpsc::Receiver<std::io::Result<Frame>>, reader: tokio::task::JoinHandle<()>, epoch: u64 }
+struct Backend {
+    writer: OwnedWriteHalf,
+    frames: mpsc::Receiver<std::io::Result<Frame>>,
+    reader: tokio::task::JoinHandle<()>,
+    epoch: u64,
+    drain_deadline: Option<tokio::time::Instant>,
+}
 
 impl Drop for Backend { fn drop(&mut self) { self.reader.abort(); } }
 
@@ -80,7 +86,16 @@ impl Backend {
     fn new(stream: TcpStream, epoch: u64) -> Self {
         let (read, writer) = stream.into_split();
         let (frames, reader) = pump(read);
-        Self { writer, frames, reader, epoch }
+        Self { writer, frames, reader, epoch, drain_deadline: None }
+    }
+
+    async fn dispatch(&mut self, frame: &Frame) -> bool {
+        if self.drain_deadline.is_some() { return false; }
+        if self.writer.write_all(&frame.encode()).await.is_ok() { return true; }
+        // The reader may still hold replies that decide whether the command can be retried.
+        self.drain_deadline = Some(tokio::time::Instant::now() + RECONNECT_WITHIN);
+        let _ = self.writer.shutdown().await;
+        false
     }
 }
 
@@ -194,9 +209,15 @@ impl Session {
             loop {
                 let event = {
                     let Some(current) = backend.as_mut() else { break Ok(()) };
-                    tokio::select! {
-                        request = requests.recv() => Event::Request(request),
-                        reply = current.frames.recv() => Event::Reply(reply),
+                    if let Some(deadline) = current.drain_deadline {
+                        let reply = tokio::time::timeout_at(deadline, current.frames.recv()).await
+                            .map_err(|_| lost("timed out draining the failed connection; the command's outcome is unknown"))?;
+                        Event::Reply(reply)
+                    } else {
+                        tokio::select! {
+                            request = requests.recv() => Event::Request(request),
+                            reply = current.frames.recv() => Event::Reply(reply),
+                        }
                     }
                 };
                 match event {
@@ -212,20 +233,21 @@ impl Session {
                             continue;
                         }
                         if request.tag == b'H' {
-                            backend.as_mut().expect("connected").writer.write_all(&request.encode()).await.map_err(io)?;
+                            backend.as_mut().expect("connected").dispatch(&request).await;
+                            if self.pending.last().is_some_and(|frame| !matches!(frame.tag, b'Q' | b'S' | b'H')) {
+                                self.pending.push(request);
+                            }
                             continue;
                         }
                         let starts = self.status == Status::Idle;
                         if starts { self.answered = false; self.lost_unanswered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
                         if starts && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
                         if backend.is_none() { backend = Some(self.connect().await?); }
-                        if starts { if let Some(key) = self.key.clone() { self.send_key(backend.as_mut().expect("connected"), &key).await?; } }
-                        self.pending.push(request.clone());
-                        self.status = Status::Busy;
                         let current = backend.as_mut().expect("connected");
-                        if current.writer.write_all(&request.encode()).await.is_err() {
-                            break Err(lost("the holder went away while a command was being sent"));
-                        }
+                        if starts { if let Some(key) = self.key.clone() { self.send_key(current, &key).await; } }
+                        current.dispatch(&request).await;
+                        self.pending.push(request);
+                        self.status = Status::Busy;
                     }
                     Event::Reply(Some(Ok(frame))) => {
                         if !self.greeting.done {
@@ -246,7 +268,7 @@ impl Session {
                             if frame.tag == b'Z' {
                                 self.discarding = false;
                                 backend = Some(self.connect().await?);
-                                self.resend(backend.as_mut().expect("connected")).await?;
+                                self.resend(backend.as_mut().expect("connected")).await;
                             }
                             continue;
                         }
@@ -283,7 +305,7 @@ impl Session {
                             self.lost_unanswered = true;
                             self.swallowing = 0;
                             backend = Some(self.connect().await?);
-                            self.resend(backend.as_mut().expect("connected")).await?;
+                            self.resend(backend.as_mut().expect("connected")).await;
                             continue;
                         }
                         backend = Some(self.connect().await?);
@@ -299,19 +321,18 @@ impl Session {
     }
 
     /// Keys the transactions of the command that follows on `backend` by `key`, swallowing the statement's replies.
-    async fn send_key(&mut self, backend: &mut Backend, key: &str) -> Result<()> {
+    async fn send_key(&mut self, backend: &mut Backend, key: &str) {
         let mut body = format!("SET {} = '{key}'", rtdb_node::IDEMPOTENCY_KEY_PARAMETER).into_bytes();
         body.push(0);
-        backend.writer.write_all(&Frame { tag: b'Q', body: Bytes::from(body) }.encode()).await.map_err(io)?;
-        self.swallowing += 1;
-        Ok(())
+        if backend.dispatch(&Frame { tag: b'Q', body: Bytes::from(body) }).await { self.swallowing += 1; }
     }
 
     /// Sends the pending command again on a new backend, under its key if it has one.
-    async fn resend(&mut self, backend: &mut Backend) -> Result<()> {
-        if let Some(key) = self.key.clone() { self.send_key(backend, &key).await?; }
-        for request in &self.pending { backend.writer.write_all(&request.encode()).await.map_err(io)?; }
-        Ok(())
+    async fn resend(&mut self, backend: &mut Backend) {
+        if let Some(key) = self.key.clone() { self.send_key(backend, &key).await; }
+        for request in &self.pending {
+            if !backend.dispatch(request).await { break; }
+        }
     }
 
     fn confirm_prepared_change(&mut self, response: u8) {
@@ -478,6 +499,93 @@ mod tests {
         assert_eq!(receive(&mut client).await.0, b'Z');
         drop(client);
         let _ = running.await;
+    }
+
+    #[tokio::test]
+    async fn a_reset_during_dispatch_retries_the_whole_command_under_the_same_key() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway_side) = pair(&listener).await;
+        let (first, mut dying) = pair(&listener).await;
+        let (second, mut successor) = pair(&listener).await;
+        let startup = crate::gateway::encode_startup(&BTreeMap::from([("user".into(), "xtdb".into())]));
+        let session = Session::new(Bytes::from(startup), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id, None, true);
+        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        greet(&mut dying).await;
+        assert_eq!(receive(&mut client).await.0, b'R');
+        assert_eq!(receive(&mut client).await.0, b'Z');
+
+        let mut command = b"UPDATE counters SET n = n + 1".to_vec();
+        command.resize(8 << 20, b' ');
+        command.push(0);
+        send(&mut client, b'Q', &command).await;
+        let key = query(&mut dying).await;
+        send(&mut dying, b'C', b"SET\0").await;
+        send(&mut dying, b'Z', b"I").await;
+        assert_eq!(dying.read_u8().await.unwrap(), b'Q');
+        dying.set_zero_linger().unwrap();
+        drop(dying);
+
+        tokio::select! {
+            () = greet(&mut successor) => {}
+            (tag, body) = receive(&mut client) => panic!("client received {tag}: {}", String::from_utf8_lossy(&body)),
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("gateway did not reconnect"),
+        }
+        assert_eq!(query(&mut successor).await, key);
+        send(&mut successor, b'C', b"SET\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        let (tag, retried) = receive(&mut successor).await;
+        assert_eq!(tag, b'Q');
+        assert!(retried == command);
+        send(&mut successor, b'C', b"UPDATE 1\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()));
+        assert_eq!(receive(&mut client).await.0, b'Z');
+        drop(client);
+        running.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_replayed_extended_exchange_flushes_before_the_client_sends_sync() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway_side) = pair(&listener).await;
+        let (first, mut dying) = pair(&listener).await;
+        let (second, mut successor) = pair(&listener).await;
+        let startup = crate::gateway::encode_startup(&BTreeMap::from([("user".into(), "xtdb".into())]));
+        let session = Session::new(Bytes::from(startup), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id, None, true);
+        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        greet(&mut dying).await;
+        assert_eq!(receive(&mut client).await.0, b'R');
+        assert_eq!(receive(&mut client).await.0, b'Z');
+
+        let parse = b"stmt\0SELECT 1\0\0\0";
+        send(&mut client, b'P', parse).await;
+        send(&mut client, b'H', b"").await;
+        let key = query(&mut dying).await;
+        send(&mut dying, b'C', b"SET\0").await;
+        send(&mut dying, b'Z', b"I").await;
+        assert_eq!(receive(&mut dying).await, (b'P', parse.to_vec()));
+        assert_eq!(receive(&mut dying).await, (b'H', Vec::new()));
+        drop(dying);
+
+        greet(&mut successor).await;
+        assert_eq!(query(&mut successor).await, key);
+        send(&mut successor, b'C', b"SET\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(receive(&mut successor).await, (b'P', parse.to_vec()));
+        let flushed = tokio::time::timeout(std::time::Duration::from_secs(5), receive(&mut successor)).await.unwrap();
+        assert_eq!(flushed, (b'H', Vec::new()));
+        send(&mut successor, b'1', b"").await;
+        assert_eq!(receive(&mut client).await, (b'1', Vec::new()));
+        send(&mut client, b'S', b"").await;
+        assert_eq!(receive(&mut successor).await, (b'S', Vec::new()));
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(receive(&mut client).await.0, b'Z');
+        drop(client);
+        running.await.unwrap().unwrap();
     }
 
     #[tokio::test]

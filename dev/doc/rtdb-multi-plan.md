@@ -53,6 +53,7 @@ Update this section as work lands.
 - A failed object-store write leaves the release visible and retryable, and a failed pack read defers the erasure pass for that store.
 - A failed startup tells the client that authentication ended, and the reconnect window covers the replacement holder's greeting and replay.
 - The gateway restores the named statements acknowledged by the holder when idle failover follows an extended-protocol exchange.
+- The gateway recovers a keyed command when its holder's TCP connection resets part way through dispatch.
 
 - A promotion that inherited a flushed block reopened its source tail behind the flush and stopped with "Source reader did not advance" (`ReplicationDriver::promote`); it affected classic failover too.
 - A planned move whose target died afterwards left a move intent no node could ever satisfy.
