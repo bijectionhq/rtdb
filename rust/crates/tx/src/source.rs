@@ -557,6 +557,11 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
         } else {
             field.with_nullable(nullable)
         };
+        if pages.iter().any(|page| document_column(page, field.name()).is_some_and(|(source, _)| {
+            source.data_type() != field.data_type() && !canonical_union_layouts(source)
+        })) {
+            return Ok(None);
+        }
         output_layout.push(field);
     }
     let mut fields = Vec::with_capacity(output_layout.len());
@@ -1267,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_documents_accept_noncanonical_arrow_union_children() {
+    fn mixed_documents_normalize_arrow_union_aliases_before_replay() {
         let memory = budget();
         let table = TableRef::new("public", "docs");
         let ints = || Arc::new(arrow_array::Int64Array::from(vec![7])) as ArrayRef;
@@ -1277,6 +1282,9 @@ mod tests {
                 vec![ints(), Arc::new(arrow_array::NullArray::new(1)) as ArrayRef], vec![3, 8], vec![Value::I64(7), Value::Null]),
             (vec![3, 8, 9], vec![int.clone(), int.with_name("second_i64"), Field::new("utf8", DataType::Utf8, false)],
                 vec![ints(), ints(), Arc::new(arrow_array::StringArray::from(vec!["s"]))], vec![8, 9], vec![Value::I64(7), Value::Utf8("s".into())]),
+            (vec![3, 8, 9], vec![Field::new("a", DataType::UInt64, false), Field::new("b", DataType::Int64, false), Field::new("s", DataType::Utf8, false)],
+                vec![Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX])), ints(), Arc::new(arrow_array::StringArray::from(vec!["s"]))],
+                vec![3, 9], vec![Value::I64(-1), Value::Utf8("s".into())]),
         ];
         for (tags, fields, children, selected, expected) in cases {
             let legs = UnionFields::try_new(tags, fields).unwrap();
@@ -1285,6 +1293,16 @@ mod tests {
             let batch = RecordBatch::try_new(schema, vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])), Arc::new(column)]).unwrap();
             let batch = OwnedBatch::new(batch, &memory).unwrap();
             let arrow = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            drop(batch);
+            let (_, column) = document_column(arrow.array(), "v").unwrap();
+            match column.data_type() {
+                DataType::Int64 => assert_eq!(expected[1], Value::Null),
+                DataType::Union(legs, UnionMode::Dense) => {
+                    assert_ne!(expected[1], Value::Null);
+                    assert_eq!(legs.iter().map(|(tag, field)| (tag, field.name().as_str())).collect::<Vec<_>>(), [(0, "i64"), (1, "utf8")]);
+                }
+                other => panic!("Unexpected normalized layout {other:?}"),
+            }
             let row = StructFields::from([("_id".into(), Value::I64(3)), ("v".into(), Value::I64(9))]);
             let rows = Documents::new(vec![row], &memory).unwrap();
             let source = SourceTransaction::new(vec![
@@ -1303,6 +1321,92 @@ mod tests {
                 assert_eq!(actual, expected);
             }
         }
+    }
+
+    #[test]
+    fn nullable_one_kind_union_inside_a_list_keeps_its_declared_nullability() {
+        for (tags, expected) in [
+            (vec![3i8, 8, 3], [Some(7), None, Some(7)]),
+            (vec![3i8, 3, 3], [Some(7), Some(7), Some(7)]),
+        ] {
+            let memory = budget();
+            let nullable = tags.contains(&8);
+            let legs = UnionFields::try_new([3, 8], [Field::new("i64", DataType::Int64, false), Field::new("null", DataType::Null, true)]).unwrap();
+            let items = UnionArray::try_new(legs, tags.into(), Some(vec![0i32, 0, 0].into()),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![7])), Arc::new(arrow_array::NullArray::new(usize::from(nullable)))]).unwrap();
+            let item = Arc::new(Field::new("$data$", items.data_type().clone(), nullable));
+            let list = ListArray::try_new(item, OffsetBuffer::new(vec![0i32, 3].into()), Arc::new(items), None).unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new("v", list.data_type().clone(), false)]));
+            let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![Arc::new(list)]).unwrap(), &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            drop(batch);
+
+            let (field, list) = document_column(documents.array(), "v").unwrap();
+            let list = list.as_any().downcast_ref::<ListArray>().unwrap();
+            let DataType::List(item) = field.data_type() else { panic!("Expected normalized Arrow list"); };
+            assert!(item.is_nullable());
+            assert_eq!(list.values().as_primitive::<arrow_array::types::Int64Type>().iter().collect::<Vec<_>>(), expected);
+            drop(documents);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn duplicate_union_tags_keep_input_owned_when_normalization_cannot_reserve() {
+        let memory = MemoryBudget::new(384 * 1024);
+        let legs = UnionFields::try_new([3, 8], [Field::new("left", DataType::Binary, false), Field::new("right", DataType::Binary, false)]).unwrap();
+        let left = vec![1; 64 * 1024];
+        let right = vec![2; 64 * 1024];
+        let array = UnionArray::try_new(legs, vec![3i8, 8].into(), Some(vec![0i32, 0].into()), vec![
+            Arc::new(arrow_array::BinaryArray::from(vec![left.as_slice()])),
+            Arc::new(arrow_array::BinaryArray::from(vec![right.as_slice()])),
+        ]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", array.data_type().clone(), false)]));
+        let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap(), &memory).unwrap();
+
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(documents.array().column(0), batch.batch().column(0)));
+    }
+
+    #[test]
+    fn optional_union_copy_does_not_displace_document_schema_admission() {
+        let mut fields = (0..96).map(|index| Field::new(format!("v{index}"), DataType::Int64, false)).collect::<Vec<_>>();
+        let mut columns = vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])) as ArrayRef; fields.len()];
+        let legs = UnionFields::try_new([3, 8], [Field::new("a", DataType::Binary, false), Field::new("b", DataType::Binary, false)]).unwrap();
+        let payload = vec![0u8; 8 * 1024];
+        let child = || Arc::new(arrow_array::BinaryArray::from(vec![payload.as_slice()])) as ArrayRef;
+        let union = UnionArray::try_new(legs, vec![3i8, 8].into(), Some(vec![0i32, 0].into()), vec![child(), child()]).unwrap();
+        fields.push(Field::new("payload", union.data_type().clone(), false));
+        columns.push(Arc::new(union));
+        let schema = Arc::new(Schema::new(fields));
+        let bound = rtdb_format::ipc::schema_translation_bound(&schema).unwrap();
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        let memory = MemoryBudget::new(batch.get_array_memory_size() + 2 * bound);
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(documents.array().column(96), batch.batch().column(96)));
+    }
+
+    #[test]
+    fn an_arrow_document_keeps_distinct_shapes_in_same_kind_union_children() {
+        let memory = budget();
+        let a = Value::Struct(StructFields::from([("a".into(), Value::I64(7))]));
+        let b = Value::Struct(StructFields::from([("b".into(), Value::I64(9))]));
+        let children = [&a, &b].map(|value| build_array(&value.logical_type(), std::slice::from_ref(value)).unwrap());
+        let legs = UnionFields::try_new([3, 8], children.iter().zip(["a", "b"]).map(|(child, name)| Field::new(name, child.data_type().clone(), false))).unwrap();
+        let array = UnionArray::try_new(legs, vec![3i8, 8].into(), Some(vec![0i32, 0].into()), Vec::from(children)).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", array.data_type().clone(), false)]));
+        let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap(), &memory).unwrap();
+
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+
+        let (field, array) = document_column(documents.array(), "v").unwrap();
+        assert!(Arc::ptr_eq(array, batch.batch().column(0)));
+        assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), a);
+        assert_eq!(read_value(field, array.as_ref(), 1).unwrap(), b);
     }
 
     #[test]

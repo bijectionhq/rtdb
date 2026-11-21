@@ -331,7 +331,8 @@ async fn bulk_ingest_preserves_nested_arrow_lists_with_signed_execution_values()
 
 #[tokio::test]
 async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
-    use arrow_array::UnionArray;
+    use arrow_array::{Array, UInt64Array, UnionArray};
+    use arrow_schema::UnionFields;
     use rtdb_types::{LogicalType, StructFields, Value};
 
     let running = Running::start(None, FlightConfig::default()).await;
@@ -351,7 +352,13 @@ async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
     let tx = client.begin().await;
     let command = CommandStatementIngest { table: "docs".into(), transaction_id: Some(tx.clone()), ..Default::default() };
     client.upload(command.clone(), vec![upload(vec![1, 2], record.logical_type().maybe(), &[record.clone(), Value::Null])]).await;
-    client.upload(command, vec![upload(vec![3], list.logical_type(), std::slice::from_ref(&list))]).await;
+    client.upload(command.clone(), vec![upload(vec![3], list.logical_type(), std::slice::from_ref(&list))]).await;
+    let aliases = UnionFields::try_new([3, 8], [Field::new("u", DataType::UInt64, false), Field::new("s", DataType::Int64, false)]).unwrap();
+    let aliases = UnionArray::try_new(aliases, vec![3i8, 8].into(), Some(vec![0i32, 0].into()),
+        vec![Arc::new(UInt64Array::from(vec![u64::MAX])), Arc::new(Int64Array::from(vec![9]))]).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("v", aliases.data_type().clone(), false)]));
+    let aliases = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![4, 5])), Arc::new(aliases)]).unwrap();
+    client.upload(command, vec![aliases]).await;
     client.end(tx, true).await.unwrap();
 
     let database = running.node.catalog().database("xtdb").unwrap();
@@ -374,7 +381,7 @@ async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
         (0..batch.num_rows()).map(|row| (integer(batch, 0, row), rtdb_columnar::read_value(field, array, row).unwrap())).collect::<Vec<_>>()
     }).collect();
     rows.sort_by_key(|(id, _)| *id);
-    assert_eq!(rows, [(1, record), (2, Value::Null), (3, list)]);
+    assert_eq!(rows, [(1, record), (2, Value::Null), (3, list), (4, Value::I64(-1)), (5, Value::I64(9))]);
     running.stop().await;
 }
 
