@@ -270,6 +270,12 @@ async fn a_limit_over_uuid_ids_in_id_order_stops_reading_once_it_has_its_rows() 
     let expected: Vec<u128> = of_series.iter().copied().filter(|id| at(*id) % 600 == 0 && at(*id) > 0).take(3).collect();
     assert_eq!(in_order(fixture.rows("SELECT _id FROM (SELECT _id, at FROM pts WHERE _id >= ? AND _id <= ?) AS p WHERE p.at = 600 OR p.at = 1200 OR p.at = 1800 ORDER BY _id LIMIT 3", range.clone()).await), expected);
 
+    // A predicate that no page's statistics admit: each leaf is tested when the read reaches it, and none is read.
+    let unmatched = "SELECT _id FROM pts WHERE _id >= ? AND _id <= ? AND at > 1000000 ORDER BY _id DESC LIMIT 1";
+    assert!(fixture.rows(unmatched, range.clone()).await.is_empty());
+    let counters = fixture.counters(unmatched, range.clone()).await;
+    assert!(counters["scan_pages_used"] == 0 && counters["scan_pages_pruned"] > 0, "{counters:?}");
+
     // The whole table, whose newest rows are live and whose oldest are persisted.
     assert_eq!(in_order(fixture.rows("SELECT _id FROM pts ORDER BY _id DESC LIMIT 7", vec![]).await), all.iter().rev().copied().take(7).collect::<Vec<_>>());
     assert_eq!(in_order(fixture.rows("SELECT _id FROM pts ORDER BY _id LIMIT 7", vec![]).await), all[..7]);

@@ -22,6 +22,8 @@ use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages:
 struct DataFile {
     storage: Arc<BufferPool>,
     key: ObjectKey,
+    /// The trie's metadata file, where an ordered scan finds the statistics of the leaves it comes to.
+    metadata: ObjectKey,
     opened: Option<OpenedLayout>,
 }
 
@@ -122,7 +124,8 @@ impl FileDescriptors {
 }
 
 enum PageSource { Live { table: Arc<LiveTable>, rows: Arc<LocatedRows> }, File { file: usize, page: usize } }
-struct Page { lower: Iid, upper: Iid, priority: usize, source: PageSource, summary: PageSummary, content_matches: bool }
+/// `unread` names the metadata node whose statistics have not been tested yet: until they are, the page counts as matching and has no temporal bounds.
+struct Page { lower: Iid, upper: Iid, priority: usize, source: PageSource, summary: PageSummary, content_matches: bool, unread: Option<usize> }
 
 #[derive(Default)]
 struct PageDescriptors {
@@ -232,6 +235,8 @@ pub(crate) struct PartitionScan {
     confined: Option<(Iid, Iid)>,
     /// Set where the scan's rows must leave it in the order of their IIDs; they leave page by page, otherwise.
     order: Option<IidOrder>,
+    /// The scan's predicates as tests of a page's statistics, kept by an ordered scan for the leaves it has yet to reach.
+    page_test: Option<crate::page_metadata::PageTest>,
     /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
     matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
@@ -462,7 +467,7 @@ impl ScanCursor {
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                 tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
                 output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
-                canonical_entity_iids, confined, order,
+                canonical_entity_iids, confined, order, page_test: None,
             };
             // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
             let split = match (&fragmenter, snapshot.tx_basis()) {
@@ -497,7 +502,7 @@ impl PartitionScan {
             fragment
         });
         Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
-            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None }
+            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None, page_test: None }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
     pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Self {
@@ -945,7 +950,7 @@ impl PartitionScan {
                 if !self.path_matches(lower, upper) { return Ok(()); }
                 let rows = segment.located_rows(leaf)?;
                 let temporal = summarize_headers(rows.headers.iter().copied());
-                pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true,
+                pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true, unread: None,
                     summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)
             })?;
         }
@@ -1021,7 +1026,7 @@ impl PartitionScan {
             };
             files.admit(file_count, &self.execution.context.memory)?;
             let file = files.entries.len();
-            files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, opened: None });
+            files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, metadata: key.clone(), opened: None });
             let trie_recency = recency(trie.key.recency())?;
             let memory = &self.execution.context.memory;
             let mut pending = MetadataStack::default();
@@ -1045,11 +1050,16 @@ impl PartitionScan {
                     MetadataNode::RecencyBranch(children) => for (upper, node) in children.iter().rev() {
                         pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
                     },
-                    MetadataNode::Leaf { data_page_index, columns } => { let columns = &*columns.values()?; pages.push(Page { lower, upper, priority: live_segment_count + index,
-                        content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
-                            && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?,
-                        source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
-                            recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)? }
+                    MetadataNode::Leaf { data_page_index, columns } => {
+                        // An ordered scan may stop after its first tasks, so it reads a leaf's statistics when it reaches the leaf's task.
+                        let (content_matches, temporal, unread) = if self.order.is_some() { (true, None, Some(visit.node)) } else {
+                            let columns = &*columns.values()?;
+                            (self.leaf_matches(columns, &page_test)?, page_temporal(columns), None)
+                        };
+                        pages.push(Page { lower, upper, priority: live_segment_count + index, content_matches, unread,
+                            source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal,
+                                recency: Some(visit.recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?
+                    }
                 }
             }
         }
@@ -1060,7 +1070,37 @@ impl PartitionScan {
         self.tasks = Some(ScanTaskPlan::new(pages.entries.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),self.order == Some(IidOrder::Descending),&self.execution.context.memory)?);
         self.files = files;
         self.pages = pages;
+        self.page_test = self.order.map(|_| page_test);
         self.initialized = true;
+        Ok(())
+    }
+    /// Whether a leaf's statistics leave it possible that a put of its page satisfies the scan's pushdowns and predicates.
+    fn leaf_matches(&self, columns: &[Value], page_test: &crate::page_metadata::PageTest) -> Result<bool> {
+        Ok(self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
+            && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?)
+    }
+    /// Tests the statistics an ordered scan left unread for the pages of the task it has reached.
+    /// The metadata is read from the pool that `initialize` decoded it into; where the pool no longer holds a file, its
+    /// pages stay as they are, read and resolved without pruning.
+    fn read_statistics(&mut self, pages: &[usize]) -> Result<()> {
+        let Some(page_test) = &self.page_test else { return Ok(()) };
+        for index in pages {
+            let page = &self.pages.entries[*index];
+            let (Some(node), PageSource::File { file, .. }) = (page.unread, &page.source) else { continue };
+            let data = &self.files.entries[*file];
+            let read = match data.storage.view::<CachedMetadata>(&data.metadata, View::File) {
+                Some(cached) => {
+                    let _charge = self.execution.context.memory.reserve(cached.bound)?;
+                    let Some(MetadataNode::Leaf { columns, .. }) = cached.metadata.nodes().get(node) else { return Err(invalid("metadata-node", "A page's metadata node is not a leaf")) };
+                    let columns = &*columns.values()?;
+                    Some((self.leaf_matches(columns, page_test)?, page_temporal(columns)))
+                }
+                None => None,
+            };
+            let page = &mut self.pages.entries[*index];
+            page.unread = None;
+            if let Some((content_matches, temporal)) = read { page.content_matches = content_matches; page.summary.temporal = temporal; }
+        }
         Ok(())
     }
     async fn load(&mut self, index: usize) -> Result<()> {
@@ -1132,6 +1172,7 @@ impl PartitionScan {
     async fn buffer_task(&mut self,task: ScanTask) -> Result<()> {
         let bound = task.pages.len().checked_mul(std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>() + std::mem::size_of::<OwnedPage>() + 256).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(||invalid("scan-task-size","Scan task scratch exceeds addressable memory"))?;
         let reservation = self.execution.context.memory.reserve(bound)?;
+        self.read_statistics(&task.pages)?;
         let summaries: Vec<_> = task.pages.iter().map(|index|self.pages.entries[*index].summary.clone()).collect();
         let mut selected: Vec<_> = select_pages(&summaries,self.pruning(),|summary|self.pages.entries[summary.page_index as usize].content_matches).into_iter().map(|summary|summary.page_index as usize).collect();
         self.counts.pages_pruned = self.counts.pages_pruned.saturating_add((task.pages.len() - selected.len()) as u64);

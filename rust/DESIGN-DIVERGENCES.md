@@ -183,6 +183,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 9. `ORDER BY _id ... LIMIT n` over such a table reads in IID order and stops (`iid_ordered_input`), which XTDB also has no counterpart for.
    - The scan hands its tasks out in ascending or descending IID order, and keeps each task's merged rows in one batch in that order.
    - The scan's predicates run on those batches, and the limit above stops pulling once it has its rows, so the remaining tasks load no page.
+   - `initialize` walks the interval's metadata paths but leaves each leaf's statistics undecoded; `read_statistics` tests them when the scan reaches the leaf's task, from the metadata the pool holds.
    - It serves one `_id` sort key over a single partition, where no ordered index answers first. Any other sort is sorted as before.
 
 ### Divergence and impact
