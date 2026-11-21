@@ -412,10 +412,9 @@ pub(crate) async fn administration_stream(directory: &dyn Directory, record: &De
     Ok(StreamConfig { write_quorum: write_quorum(record.ensemble.len()), servers, stream: record.stream("replica"), maximum_message_bytes })
 }
 
-/// Fences and removes an installation's serving storage. The installation's tombstone
-/// retains the receipt so a lost response can be recovered without opening that storage.
-pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
-    let fenced = update_installation(directory, id, |record| {
+/// Accepts serving disposal by fencing this installation in the directory.
+pub async fn begin_disposal(directory: &dyn Directory, id: &str) -> Result<DeploymentRecord> {
+    update_installation(directory, id, |record| {
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => Ok(()),
@@ -430,9 +429,24 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
             }
             _ => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/not-disposable", format!("Installation {id} cannot be disposed in this cell"))),
         }
-    }).await?;
-    if let Some(receipt) = fenced.disposal {
-        return Ok(receipt);
+    }).await
+}
+
+/// Fences and removes an installation's serving storage. The tombstone retains its receipt.
+pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
+    begin_disposal(directory, id).await?;
+    finish_disposal(directory, storage, keys, id, maximum_message_bytes).await
+}
+
+/// Settles a disposal previously accepted by the directory.
+pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
+    let fenced = directory.deployment(id).await?.ok_or_else(|| {
+        Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
+    })?;
+    match (fenced.lifecycle, fenced.disposal.as_ref()) {
+        (Lifecycle::Deleted, Some(receipt)) => return Ok(receipt.clone()),
+        (Lifecycle::Deleting, None) => {},
+        _ => return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-unaccepted", format!("The directory has not accepted disposal of {id}"))),
     }
     let mut stream = administration_stream(directory, &fenced, maximum_message_bytes).await?;
     stream.servers.extend(fenced.replica_journals.iter().cloned());

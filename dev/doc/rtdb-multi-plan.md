@@ -80,7 +80,10 @@ listener belongs on the trusted cell network.
 
 The source directory records the fence epoch and destination before copying a cell transfer. Once the destination has its serving objects and key, it records the arrival and waits for routing to move and for the source to become a tombstone. Its first holder copies the sealed tail onto its logkeepers before accepting writes. Retrying a lost routing response continues that same transfer.
 
-`rtdb-multi delete --id UUID` fences an installation once. A holder records
+`rtdb-multi schedule-disposal --id UUID` fences an installation once in the
+directory. A reaper configured with the cell's key service completes that
+accepted request after the caller exits. `rtdb-multi delete --id UUID` can
+also settle it synchronously. A holder records
 its journal endpoints before it can copy or append a replica record.
 Disposal retires the stream on each recorded journal and waits for its
 obsolete segments to be replaced and removed. An unavailable journal keeps
