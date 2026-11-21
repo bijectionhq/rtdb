@@ -125,6 +125,13 @@ async fn share_compact_and_replay(cache_bytes: usize) {
     let before = segments(directory.path()).1;
     trim(&config(&server, 0), LogOffset(40)).await.unwrap();
     append(writers[0].as_ref(), "after the trim", 43).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let reader = open_reader(config(&server, 0), CancellationToken::new()).await.unwrap();
+            if reader.latest().unwrap() == LogOffset(43) { break; }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("the reader can see the appended entry before the journal stops");
     let mut compacted = segments(directory.path());
     for _ in 0..100 {
         if compacted.1 < before / 2 { break; }
@@ -143,7 +150,8 @@ async fn share_compact_and_replay(cache_bytes: usize) {
     let reader = open_reader(config(&server, 0), CancellationToken::new()).await.unwrap();
     assert!(matches!(reader.read_range(LogOffset(0), LogOffset(44)).await, Err(Error::UnavailableLogRange { requested: 0, first_retained: 41 })));
     let tail = payloads(reader.as_ref(), 41).await;
-    assert_eq!((tail.len(), tail[2].as_str()), (3, "after the trim"));
+    assert_eq!(tail.len(), 3);
+    assert_eq!(tail[2], "after the trim");
     assert_eq!(seal(&config(&server, 7), 1).await.unwrap_err().category, AnomalyCategory::Conflict, "promises survive the restart");
     let writer = open_writer(config(&server, 0), 3, CancellationToken::new()).await.unwrap();
     assert_eq!(append(writer.as_ref(), "next", 44).await.offset, LogOffset(44));
