@@ -311,7 +311,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             // Hosted capture adopts a block through the holder's observed source.
-            hosted_protocol: 14,
+            hosted_protocol: 15,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
