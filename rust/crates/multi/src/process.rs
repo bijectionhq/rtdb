@@ -32,6 +32,7 @@ pub struct NodeSettings {
     pub control: SocketAddr,
     /// The address peers use when the listeners bind on all interfaces.
     pub advertise_host: Option<String>,
+    pub hosted_task: Option<rtdb_directory::HostedTask>,
     pub availability_zone: String,
     pub engine_version: Option<String>,
     pub agent: AgentOptions,
@@ -94,8 +95,14 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
     let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
     let storage_regions = TaskTracker::new();
-    let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys),
-        storage_namespaces, scoped_writes: scoped_writes.clone(), storage_regions: storage_regions.clone() });
+    let storage = Arc::new(crate::store::CellStoreFactory {
+        directory: Arc::clone(&directory),
+        keys: Arc::clone(&settings.keys),
+        storage_namespaces,
+        scoped_writes: scoped_writes.clone(),
+        hosted_task: settings.hosted_task,
+        storage_regions: storage_regions.clone(),
+    });
     let placed = PlacedOptions {
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],

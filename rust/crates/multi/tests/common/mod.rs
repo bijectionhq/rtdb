@@ -18,6 +18,7 @@ async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agen
     let connections = std::env::var("RTDB_TEST_PGWIRE_CONNECTIONS").ok().map_or(42, |count| count.parse::<usize>().unwrap());
     let configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\n")).unwrap();
     process::start_node(Arc::clone(directory), process::NodeSettings {
+        hosted_task: None,
         advertise_host: None,
         configuration, allocation_limit_bytes: 1 << 30,
         control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), engine_version, agent, lease: lease(), claim_wait: Duration::from_millis(claim_wait), pool,

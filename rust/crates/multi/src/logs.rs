@@ -73,7 +73,6 @@ impl EnsembleRecorder for DirectoryRecorder {
             if current.epoch != epoch { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its new ensemble was recorded")); }
             let mut next = current.clone();
             next.ensemble = ensemble.clone();
-            next.move_from = None;
             if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
         }
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its new ensemble was recorded"))

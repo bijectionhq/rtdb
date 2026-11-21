@@ -299,28 +299,6 @@ impl NodeAgent {
     fn holder_config(&self, record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<rtdb_format::database::proto::DatabaseConfig> {
         let now = now_ms();
         let live = |id: &MemberId| members.get(id).is_some_and(|member| member.is_live(now));
-        if let Some(previous) = &record.move_from {
-            let logkeepers: Vec<_> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now)).collect();
-            let count = record.ensemble.len();
-            let mut selected = select_logkeepers(&record.storage_identity(), count, Vec::new(), &logkeepers);
-            let mut addresses: BTreeSet<_> = selected.iter().map(|member| member.address.as_str()).collect();
-            if selected.len() < crate::deployment::write_quorum(count) {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-log-quorum", "The destination cannot form a write quorum for the moved log"));
-            }
-            for id in &record.ensemble {
-                if selected.len() == count { break; }
-                if let Some(member) = members.get(id).filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper)
-                    && addresses.insert(member.address.as_str()) {
-                    selected.push(member);
-                }
-            }
-            if selected.len() != count {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-log-quorum", "The destination cannot resolve the moved log's full ensemble width"));
-            }
-            let servers = selected.iter().map(|member| member.address.clone()).collect();
-            let ensemble = selected.iter().map(|member| member.id.clone()).collect();
-            return Ok(crate::deployment::moving_config(record, servers, Some((previous.clone(), ensemble)), &self.options.storage, Role::Holder));
-        }
         let servers = ensemble_servers(record, members)?;
         let alive: Vec<MemberId> = record.ensemble.iter().filter(|id| live(id)).cloned().collect();
         if alive.len() == record.ensemble.len() || alive.len() < crate::deployment::write_quorum(record.ensemble.len()) {

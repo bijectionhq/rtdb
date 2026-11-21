@@ -33,3 +33,52 @@ theorem snapshot_reply_is_at_the_requested_basis
 #print axioms snapshot_reply_is_at_the_requested_basis
 
 end RTDB.Recovery
+
+namespace RTDB.Recovery
+
+inductive ReplayEvent (Tx Notice : Type) where
+  | transaction (tx : Tx)
+  | compaction (notice : Notice)
+
+def replayRestored (cutoff : Nat) :
+    List (Nat × ReplayEvent Tx Notice) → List (Nat × ReplayEvent Tx Notice)
+  | [] => []
+  | (position, event) :: rest =>
+    let later := replayRestored cutoff rest
+    match event with
+    | .transaction _ => (position, event) :: later
+    | .compaction _ => if position > cutoff then (position, event) :: later else later
+
+def logicalApply (applyTx : State → Tx → State) (state : State)
+    (entry : Nat × ReplayEvent Tx Notice) : State :=
+  match entry.2 with
+  | .transaction tx => applyTx state tx
+  | .compaction _ => state
+
+theorem restored_replay_preserves_transaction_history
+    (applyTx : State → Tx → State) (initial : State)
+    (cutoff : Nat) (suffix : List (Nat × ReplayEvent Tx Notice)) :
+    (replayRestored cutoff suffix).foldl (logicalApply applyTx) initial =
+      suffix.foldl (logicalApply applyTx) initial := by
+  induction suffix generalizing initial with
+  | nil => rfl
+  | cons entry rest ih =>
+    rcases entry with ⟨position, event⟩
+    cases event with
+    | transaction tx =>
+      simp [replayRestored, logicalApply, ih]
+    | compaction notice =>
+      by_cases permitted : position > cutoff
+      · simp [replayRestored, logicalApply, permitted, ih]
+      · simp [replayRestored, logicalApply, permitted, ih]
+
+theorem replay_keeps_a_new_compaction (cutoff position : Nat) (notice : Notice)
+    (newer : cutoff < position) :
+    replayRestored cutoff [(position, ReplayEvent.compaction (Tx := Tx) notice)] =
+      [(position, ReplayEvent.compaction (Tx := Tx) notice)] := by
+  simp [replayRestored, newer]
+
+#print axioms restored_replay_preserves_transaction_history
+#print axioms replay_keeps_a_new_compaction
+
+end RTDB.Recovery

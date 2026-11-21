@@ -83,15 +83,20 @@ fn write_policy(storage: &S3Config, root: &ObjectKey, partition: &str, condition
     }
     let objects = format!("arn:{partition}:s3:::{}/{prefix}/*", storage.bucket);
     let mut statements = vec![
-        json!({"Effect": "Allow", "Action": "s3:GetObject", "Resource": objects}),
+        json!({"Effect": "Allow", "Action": ["s3:GetObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"], "Resource": objects}),
         json!({"Effect": "Deny", "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"], "Resource": "*"}),
         json!({"Effect": "Deny", "Action": "s3:PutObject", "NotResource": objects}),
     ];
     if conditional {
         statements.push(json!({"Effect": "Allow", "Action": "s3:PutObject", "Resource": objects,
             "Condition": {"StringEquals": {"s3:if-none-match": "*"}}}));
+        // S3 reserves and uploads parts without object-creation headers.
+        // The conditional header still applies when a complete object can become visible.
+        statements.push(json!({"Effect": "Allow", "Action": "s3:PutObject", "Resource": objects,
+            "Condition": {"Bool": {"s3:ObjectCreationOperation": "false"}}}));
         statements.push(json!({"Effect": "Deny", "Action": "s3:PutObject", "Resource": objects,
-            "Condition": {"StringNotEqualsIfExists": {"s3:if-none-match": "*"}}}));
+            "Condition": {"Bool": {"s3:ObjectCreationOperation": "true"},
+                          "StringNotEqualsIfExists": {"s3:if-none-match": "*"}}}));
     } else {
         // MinIO supports a session prefix but rejects the S3 conditional-write policy key.
         statements.push(json!({"Effect": "Allow", "Action": "s3:PutObject", "Resource": objects}));

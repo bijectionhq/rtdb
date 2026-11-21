@@ -97,6 +97,13 @@ impl S3Config {
     }
 
     fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
+        #[cfg(feature = "versioning")]
+        let uploads = (cell && io.publication_journal().is_some())
+            .then(|| self.authorized_inventory(prefix.clone(), &authorization)).transpose()?;
+        #[cfg(not(feature = "versioning"))]
+        if cell && io.publication_journal().is_some() {
+            return Err(Anomaly::incorrect("xtdb.aws/managed-uploads", "Managed cell publications require S3 inventory support"));
+        }
         let (endpoint, virtual_hosted) = self.endpoint_addressing()?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&self.bucket)
             .with_virtual_hosted_style_request(virtual_hosted)
@@ -120,11 +127,39 @@ impl S3Config {
         };
         let client = builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
         let client = Arc::new(client);
-        Ok(Arc::new(if cell {
-            RemoteStore::new_single_put(client, prefix, io)
-        } else {
-            RemoteStore::new_in(client, Some(prefix), io)
-        }))
+        if !cell {
+            return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io)));
+        }
+        #[cfg(feature = "versioning")]
+        if let Some(uploads) = uploads {
+            return Ok(Arc::new(RemoteStore::new_managed(client, prefix, io, Arc::new(uploads))));
+        }
+        Ok(Arc::new(RemoteStore::new_single_put(client, prefix, io)))
+    }
+
+    #[cfg(feature = "versioning")]
+    fn authorized_inventory(&self, root: ObjectKey, authorization: &S3Authorization) -> Result<VersionedInventory> {
+        let endpoint = self.configured_endpoint()?;
+        let environment = AmazonS3Builder::from_env();
+        let (provider, provider_region) = match authorization {
+            S3Authorization::Static(credentials) => (SharedCredentialsProvider::new(
+                aws_credential_types::Credentials::new(&credentials.access_key, &credentials.secret_key, None, None, "rtdb-s3"),
+            ), None),
+            S3Authorization::Rotating { provider, region } => (provider.clone(), region.clone()),
+        };
+        let region = self.region.clone().or(provider_region)
+            .or_else(|| environment.get_config_value(&AmazonS3ConfigKey::Region))
+            .unwrap_or_else(|| "us-east-1".into());
+        let requester_pays = environment.get_config_value(&AmazonS3ConfigKey::RequestPayer)
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes" | "y"));
+        let mut builder = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region))
+            .credentials_provider(provider)
+            .force_path_style(!self.virtual_hosted(endpoint.as_ref()));
+        let scope_multipart_listing = endpoint.is_none();
+        builder.set_endpoint_url(endpoint.map(|endpoint| endpoint.to_string()));
+        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root, requester_pays, scope_multipart_listing))
     }
 
     #[cfg(feature = "versioning")]

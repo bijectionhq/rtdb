@@ -125,17 +125,22 @@ reaper can recover its recorded region only by acquiring that same
 persisted lock. A missing lock witness keeps the region pending. For remote
 storage, a producer that exits without acknowledging drain keeps cleanup
 pending until the provider's outstanding work can be accounted for.
-Each remote serving object is published with one conditional PUT of its
-sealed bytes directly to its final key. The PUT carries a unique publication
-identity in its metadata. An ambiguous response settles only if a fresh
-HEAD returns that identity. Missing or unrelated metadata keeps the region's
-admission pending. When I/O joins, its owner records the closed admission
-and exact unresolved publication identities in the directory. A later
-reaper can release it after confirming those objects in the original
-serving or checkpoint namespace. The reaper holds ordinary serving
-collection while the directory retains those publication identities.
-An owner that exits before recording its close still leaves an open
-admission.
+Remote serving and checkpoint writers reserve an empty S3 multipart upload
+and record its exact ID and object key in the directory before uploading
+payload bytes. They complete the upload with `If-None-Match: *`. On
+failure, the writer aborts the exact upload and confirms its ID is gone
+before clearing the admission. The retained publication marker recovers
+the success reply if S3 completed the object before a lost response.
+A reservation interrupted before admission carries no payload, and the
+bucket's incomplete-upload lifecycle rule collects it if it was created.
+
+When the owner closes its I/O, a reaper can retire the region's remaining
+upload IDs. On ECS, the region records the exact task ARN. An independent
+ECS event delivery retains terminal STOPPED observations in the cell
+directory. The observation authorizes the reaper to retire an open
+region's upload IDs. Disposal continues only once the provider rejects
+part inspection for every retained ID and the cell's object inventory can
+be checked after cleanup.
 
 `rtdb-multi capture --id UUID --operation UUID` retains the selected
 published checkpoint and copies its catalog, table metadata and referenced

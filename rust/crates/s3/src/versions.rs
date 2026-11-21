@@ -1,7 +1,10 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier, RequestPayer};
-use rtdb_storage::ObjectKey;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
+use bytes::Bytes;
+use object_store::path::Path;
+use rtdb_storage::{Error, ObjectKey, remote::PublicationUploads};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 pub struct VersionedInventory {
@@ -15,6 +18,13 @@ pub struct VersionedInventory {
 impl VersionedInventory {
     pub(crate) fn new(client: Client, bucket: String, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
         Self { client, bucket, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing }
+    }
+
+    /// Retires one exact journaled upload rather than looking for a current
+    /// object. A successful result proves that its upload ID no longer exists.
+    pub async fn abort_publication(&self, key: &ObjectKey, upload: &str) -> Result<()> {
+        let path = Path::from(format!("{}/{key}", self.root));
+        self.abort_upload(path.as_ref(), upload).await
     }
 
     /// Empties multipart uploads, object versions and delete markers under a deployment prefix.
@@ -89,13 +99,12 @@ impl VersionedInventory {
             match self.client.list_parts().bucket(&self.bucket).key(key).upload_id(id).max_parts(1)
                 .set_request_payer(self.request_payer.clone()).send().await
             {
-                Ok(parts) if parts.parts().is_empty() && parts.is_truncated() != Some(true) => return Ok(()),
                 Ok(_) => {}
                 Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("NoSuchUpload") => return Ok(()),
                 Err(error) => return Err(unavailable(format!("Checking an aborted multipart upload failed: {error}"))),
             }
         }
-        Err(unavailable("Parts remain after aborting a multipart upload"))
+        Err(unavailable("The aborted multipart upload is still addressable"))
     }
 
     async fn purge_versions(&self, prefix: &str) -> Result<()> {
@@ -136,6 +145,48 @@ impl VersionedInventory {
     }
 }
 
+#[async_trait::async_trait]
+impl PublicationUploads for VersionedInventory {
+    async fn reserve(&self, path: &Path, attempt: uuid::Uuid) -> rtdb_storage::Result<String> {
+        let key = path.as_ref();
+        let reserved = self.client.create_multipart_upload().bucket(&self.bucket).key(key)
+            .metadata("rtdb-publication", attempt.to_string()).checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .set_request_payer(self.request_payer.clone()).send().await
+            .map_err(|error| publication_failure(path, error.to_string()))?;
+        reserved.upload_id().filter(|id| !id.is_empty()).map(str::to_owned)
+            .ok_or_else(|| publication_failure(path, "S3 did not identify the reserved upload"))
+    }
+
+    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<bool> {
+        let key = path.as_ref();
+        let part = self.client.upload_part().bucket(&self.bucket).key(key).upload_id(upload)
+            .part_number(1).checksum_algorithm(ChecksumAlgorithm::Sha256).body(ByteStream::from(bytes))
+            .set_request_payer(self.request_payer.clone()).send().await
+            .map_err(|error| publication_failure(path, error.to_string()))?;
+        let tag = part.e_tag().ok_or_else(|| publication_failure(path, "S3 returned an uploaded part without an ETag"))?;
+        let checksum = part.checksum_sha256().ok_or_else(|| publication_failure(path, "S3 returned an uploaded part without its checksum"))?;
+        let parts = CompletedMultipartUpload::builder()
+            .parts(CompletedPart::builder().part_number(1).e_tag(tag).checksum_sha256(checksum).build())
+            .build();
+        match self.client.complete_multipart_upload().bucket(&self.bucket).key(key).upload_id(upload)
+            .if_none_match("*").multipart_upload(parts).set_request_payer(self.request_payer.clone()).send().await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("PreconditionFailed") => Ok(false),
+            Err(error) => Err(publication_failure(path, error.to_string())),
+        }
+    }
+
+    async fn abort(&self, path: &Path, upload: &str) -> rtdb_storage::Result<()> {
+        self.abort_upload(path.as_ref(), upload).await
+            .map_err(|error| publication_failure(path, error.code))
+    }
+}
+
+fn publication_failure(path: &Path, message: impl Into<String>) -> Error {
+    Error::Remote { key: path.to_string(), message: message.into() }
+}
+
 fn unavailable(message: impl Into<String>) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.s3/version-inventory", message)
 }
@@ -170,6 +221,20 @@ mod tests {
         client.put_bucket_versioning().bucket(&bucket)
             .versioning_configuration(VersioningConfiguration::builder().status(BucketVersioningStatus::Enabled).build())
             .send().await.unwrap();
+
+        let upload_key = ObjectKey::new("managed/upload").unwrap();
+        let upload_path = Path::from(format!("{}/{upload_key}", inventory.root));
+        let attempt = uuid::Uuid::new_v4();
+        let winner = inventory.reserve(&upload_path, attempt).await.unwrap();
+        assert!(inventory.complete(&upload_path, &winner, Bytes::from_static(b"sealed")).await.unwrap());
+        let loser = inventory.reserve(&upload_path, uuid::Uuid::new_v4()).await.unwrap();
+        assert!(!inventory.complete(&upload_path, &loser, Bytes::from_static(b"other")).await.unwrap());
+        inventory.abort_publication(&upload_key, &loser).await.unwrap();
+        inventory.abort_publication(&upload_key, &winner).await.unwrap();
+        let retained = client.get_object().bucket(&bucket).key(upload_path.as_ref()).send().await.unwrap();
+        assert_eq!(retained.metadata().unwrap()["rtdb-publication"], attempt.to_string());
+        assert_eq!(retained.body.collect().await.unwrap().into_bytes().as_ref(), b"sealed");
+        inventory.purge(&ObjectKey::new("managed").unwrap()).await.unwrap();
 
         let deployment = ObjectKey::new("deployment").unwrap();
         let neighbor = ObjectKey::new("deployment-neighbor").unwrap();

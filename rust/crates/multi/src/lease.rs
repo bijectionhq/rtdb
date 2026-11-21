@@ -38,7 +38,7 @@ impl Registration {
     fn record(self, id: MemberId) -> MemberRecord {
         MemberRecord {
             id, role: self.role, address: self.address, control_address: self.control_address,
-            availability_zone: self.availability_zone, engine_version: self.engine_version, engine_version: env!("CARGO_PKG_VERSION").into(),
+            availability_zone: self.availability_zone, engine_version: self.engine_version,
             lease_expires_at_ms: 0, state: MemberState::Eligible, drain_target_engine: None, pool: self.pool, storage_namespaces: self.storage_namespaces, version: 0,
         }
     }

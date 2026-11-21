@@ -2,6 +2,18 @@
 set -eu
 umask 077
 
+bind_hosted_task() {
+    unset RTDB_ECS_TASK_ARN
+    for option in "$@"; do
+        if [ "$option" = "--ecs-cluster" ]; then
+            hosted_metadata=$(curl --fail --silent --max-time 5 "${ECS_CONTAINER_METADATA_URI_V4:?Missing ECS task metadata}/task")
+            RTDB_ECS_TASK_ARN=$(printf '%s' "$hosted_metadata" | jq -er '.TaskARN | select(type == "string" and length > 0)')
+            export RTDB_ECS_TASK_ARN
+            return
+        fi
+    done
+}
+
 case "${1:-}" in
     gateway | node | controller)
         role=$1
@@ -20,6 +32,7 @@ case "${1:-}" in
                 fi
                 ;;
             node)
+                bind_hosted_task "$@"
                 printf '%s' "${RTDB_CONFIGURATION:?Missing node configuration}" > config.yaml
                 set -- --config config.yaml "$@"
                 if [ -n "${ECS_CONTAINER_METADATA_URI_V4:-}" ]; then
@@ -34,6 +47,7 @@ case "${1:-}" in
         ;;
     reaper)
         shift
+        bind_hosted_task "$@"
         if [ -n "${RTDB_RECOVERY_TOKEN:-}" ]; then
             cd "$(mktemp -d /tmp/rtdb-recovery.XXXXXXXX)"
             printf '%s' "${RTDB_TLS_KEYSTORE:?Missing recovery TLS keystore}" | base64 --decode > recovery.p12

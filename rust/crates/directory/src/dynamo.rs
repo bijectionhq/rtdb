@@ -23,7 +23,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{check_fork_parent, exists, fork_conflict, fork_parent_id, Cas, ChangeFeed, DeploymentRecord, Directory, MemberId, MemberRecord, Version};
+use crate::{check_fork_parent, exists, fork_conflict, fork_parent_id, Cas, ChangeFeed, DeploymentRecord, Directory, HostedTask, MemberId, MemberRecord, Version};
 
 mod parked;
 mod streams;
@@ -47,12 +47,17 @@ pub struct DynamoTables {
     /// One item per deployment name, written in the same transaction as the deployment it names.
     pub deployment_names: String,
     pub members: String,
+    /// Written by the ECS stop-event owner, never by serving nodes.
+    pub stopped_tasks: String,
 }
 
 impl DynamoTables {
-    /// `{prefix}-deployments`, `{prefix}-deployment-names` and `{prefix}-members`.
+    /// The deployment, name, member and stopped-task tables for this cell.
     pub fn with_prefix(prefix: &str) -> Self {
-        Self { deployments: format!("{prefix}-deployments"), deployment_names: format!("{prefix}-deployment-names"), members: format!("{prefix}-members") }
+        Self {
+            deployments: format!("{prefix}-deployments"), deployment_names: format!("{prefix}-deployment-names"),
+            members: format!("{prefix}-members"), stopped_tasks: format!("{prefix}-stopped-tasks"),
+        }
     }
 }
 
@@ -116,7 +121,8 @@ impl DynamoDirectory {
         self.create_table(&self.tables.deployments, ID).await?;
         self.create_table(&self.tables.deployment_names, NAME).await?;
         self.create_table(&self.tables.members, ID).await?;
-        for table in [&self.tables.deployments, &self.tables.deployment_names, &self.tables.members] { self.await_active(table).await?; }
+        self.create_table(&self.tables.stopped_tasks, ID).await?;
+        for table in [&self.tables.deployments, &self.tables.deployment_names, &self.tables.members, &self.tables.stopped_tasks] { self.await_active(table).await?; }
         Ok(())
     }
 
@@ -349,6 +355,16 @@ impl Directory for DynamoDirectory {
         self.insert_deployment(child, Some(condition)).await
     }
 
+    async fn hosted_task_stopped(&self, task: &HostedTask) -> Result<bool> {
+        HostedTask::new(task.cluster_arn(), task.task_arn())?;
+        let Some(item) = self.get(&self.tables.stopped_tasks, ID, task.task_arn()).await? else {
+            return Ok(false);
+        };
+        Ok(string_attribute(&item, ID)? == task.task_arn()
+            && string_attribute(&item, "cluster_arn")? == task.cluster_arn()
+            && string_attribute(&item, "status")? == "STOPPED")
+    }
+
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         self.get(&self.tables.deployments, ID, id).await?.as_ref().map(decode_deployment).transpose()
     }
@@ -533,6 +549,27 @@ mod tests {
         await_versions(&mut feed, std::slice::from_ref(&parked)).await;
         assert_eq!(reader.deployment(&parked.id).await.unwrap().as_ref(), Some(&parked));
         assert!(matches!(writer.replace_deployment(packed, held.version).await.unwrap(), Cas::Conflict(Some(current)) if current == parked));
+    }
+
+    #[tokio::test]
+    async fn hosted_stop_evidence_matches_the_exact_task_and_terminal_state() {
+        let Some(directory) = local().await else { return };
+        let cluster = "arn:aws:ecs:us-east-1:111122223333:cluster/fixture";
+        let task = HostedTask::new(cluster, "arn:aws:ecs:us-east-1:111122223333:task/fixture/84d0704dd3e548d496883a065ccc01c7").unwrap();
+        assert!(!directory.hosted_task_stopped(&task).await.unwrap());
+
+        for (observed_cluster, status, accepted) in [
+            ("another-cluster", "STOPPED", false),
+            (cluster, "STOPPING", false),
+            (cluster, "STOPPED", true),
+        ] {
+            directory.client.put_item().table_name(&directory.tables().stopped_tasks)
+                .item(ID, AttributeValue::S(task.task_arn().into()))
+                .item("cluster_arn", AttributeValue::S(observed_cluster.into()))
+                .item("status", AttributeValue::S(status.into()))
+                .send().await.unwrap();
+            assert_eq!(directory.hosted_task_stopped(&task).await.unwrap(), accepted);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

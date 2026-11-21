@@ -64,7 +64,7 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         tokio::spawn(async move {
             tokio::select! {
                 _ = cancellation.cancelled() => {}
-                _ = connection(client, directory, options) => {}
+                _ = connection(client, directory, options, cancellation.clone()) => {}
             }
         });
     }

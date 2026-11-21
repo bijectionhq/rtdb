@@ -3,7 +3,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rtdb_directory::Directory;
+use rtdb_directory::{Directory, HostedTask};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -69,6 +69,7 @@ pub struct RecoveryService {
     storage: CellStorage,
     archive: CellStorage,
     keys: Arc<dyn KeyService>,
+    hosted_task: Option<HostedTask>,
 }
 
 impl RecoveryService {
@@ -78,6 +79,7 @@ impl RecoveryService {
         storage: CellStorage,
         archive: CellStorage,
         keys: Arc<dyn KeyService>,
+        hosted_task: Option<HostedTask>,
     ) -> Result<Self> {
         Ok(Self {
             token: Token::new(&Token::read(token)?)?,
@@ -85,10 +87,11 @@ impl RecoveryService {
             storage,
             archive,
             keys,
+            hosted_task,
         })
     }
 
-    async fn dispatch(&self, directory: &dyn Directory, request: Request) -> Result<Reply> {
+    async fn dispatch(&self, directory: Arc<dyn Directory>, request: Request) -> Result<Reply> {
         if !self.token.accepts(&request.token)
             || request.capture.is_nil()
             || request.authority.is_nil()
@@ -113,6 +116,7 @@ impl RecoveryService {
                     self.keys.as_ref(),
                     request.authority,
                     request.capture,
+                    self.hosted_task.clone(),
                 )
                 .await?;
                 let manifest_sha256 = capture.manifest_sha256()?;
@@ -132,7 +136,7 @@ impl RecoveryService {
                     return Ok(Reply::Refused);
                 }
                 let recovery = archive::restore_checkpoint(
-                    directory,
+                    directory.as_ref(),
                     &self.storage,
                     &self.archive,
                     self.keys.as_ref(),
@@ -160,7 +164,7 @@ impl RecoveryService {
         }
     }
 
-    async fn handle(&self, directory: &dyn Directory, line: &str) -> Reply {
+    async fn handle(&self, directory: Arc<dyn Directory>, line: &str) -> Reply {
         let Ok(request) = serde_json::from_str::<Request>(line) else {
             return Reply::Refused;
         };
@@ -226,7 +230,7 @@ pub async fn serve(
             let reply = if let Ok(_operation) = operations.try_acquire() {
                 // Finishing the operation releases its durable storage registration
                 // even when the client disconnects before receiving the receipt.
-                service.handle(directory.as_ref(), &line).await
+                service.handle(directory, &line).await
             } else {
                 Reply::Deferred
             };
@@ -284,6 +288,7 @@ mod tests {
         directory.create_deployment(installation).await.unwrap();
         let token = "a".repeat(64);
         let service = RecoveryService {
+            hosted_task: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local {
@@ -309,19 +314,19 @@ mod tests {
         };
         assert!(matches!(
             service
-                .handle(directory.as_ref(), &request("invalid", authority))
+                .handle(directory.clone(), &request("invalid", authority))
                 .await,
             Reply::Refused
         ));
         assert!(matches!(
             service
-                .handle(directory.as_ref(), &request(&token, Uuid::new_v4()))
+                .handle(directory.clone(), &request(&token, Uuid::new_v4()))
                 .await,
             Reply::Refused
         ));
         assert!(matches!(
             service
-                .handle(directory.as_ref(), &request(&token, authority))
+                .handle(directory.clone(), &request(&token, authority))
                 .await,
             Reply::Deferred
         ));

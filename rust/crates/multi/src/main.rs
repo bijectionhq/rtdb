@@ -1,7 +1,7 @@
 //! The RTDB multi cell processes.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,15 +21,17 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--park-after SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
-       rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
+       rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
+       rtdb-multi prepare-cell-transfer --transfer FILE --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
+       rtdb-multi activate-cell-transfer --transfer FILE --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
@@ -52,7 +54,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
        rtdb-multi deletion-key --keys PATH\n\n\
        rtdb-multi verify-deletion --record PATH --public-key KEY\n\n\
-DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
+DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names, PREFIX-members and PREFIX-stopped-tasks\n\
 Use dynamodb+packed:PREFIX to write packed parked rows after all readers have upgraded.\n\
 MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
 DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n";
@@ -88,6 +90,27 @@ impl Arguments {
     fn number<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
         self.optional(name).map(|value| value.parse().map_err(|_| usage(format!("--{name} must be a number")))).transpose().map(|value| value.unwrap_or(default))
     }
+}
+
+fn hosted_task(arguments: &Arguments) -> Result<Option<rtdb_directory::HostedTask>> {
+    let Some(cluster) = arguments.optional("ecs-cluster") else {
+        if arguments.present("ecs-cluster") { return Err(usage("--ecs-cluster needs the installed cluster ARN".into())); }
+        return Ok(None);
+    };
+    let task = std::env::var("RTDB_ECS_TASK_ARN")
+        .map_err(|_| usage("The hosted entrypoint must supply the current ECS task ARN".into()))?;
+    Ok(Some(rtdb_directory::HostedTask::new(cluster, &task)?))
+}
+
+fn read_transfer<T: serde::de::DeserializeOwned>(arguments: &Arguments) -> Result<T> {
+    const MAXIMUM_BYTES: u64 = 8192;
+    let mut encoded = Vec::new();
+    let file = std::fs::File::open(arguments.required("transfer")?).map_err(io)?;
+    file.take(MAXIMUM_BYTES + 1).read_to_end(&mut encoded).map_err(io)?;
+    if encoded.len() > MAXIMUM_BYTES as usize {
+        return Err(usage("The cell transfer document exceeds its size limit".into()));
+    }
+    serde_json::from_slice(&encoded).map_err(|_| usage("Invalid cell transfer document".into()))
 }
 
 fn installation_id(arguments: &Arguments) -> Result<uuid::Uuid> {
@@ -185,6 +208,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             agent.park_after = arguments.optional("park-after").map(|seconds| seconds.parse().map(Duration::from_secs)).transpose().map_err(|_| usage("--park-after must be a number of seconds".into()))?;
             let node = process::start_node(directory, process::NodeSettings {
                 advertise_host: arguments.optional("advertise-host").map(str::to_owned),
+                hosted_task: hosted_task(&arguments)?,
                 configuration, allocation_limit_bytes: arguments.number("memory-limit", 1usize << 30)?, control: arguments.address("control", "127.0.0.1:0")?,
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(),
                 engine_version: if arguments.present("engine-version") { Some(arguments.required("engine-version")?.to_owned()) } else { None },
@@ -254,17 +278,32 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             eprintln!("cell map listening on {}", listener.local_addr().map_err(io)?);
             rtdb_multi::cells::serve(listener, map, cancellation).await
         }
-        "move-cell" => {
-            let map = cell_map(arguments.required("cell-map")?).await?;
+        "move-cell" | "prepare-cell-transfer" | "activate-cell-transfer" => {
             let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
             let from_storage = CellStorage::parse(arguments.required("from-storage-root")?)?;
             let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
             let from_keys = key_service(arguments.required("from-keys")?).await?;
             let to_keys = key_service(arguments.required("to-keys")?).await?;
-            let from = admin::CellHandle { name: arguments.required("from")?, directory: from_directory.as_ref(), storage: &from_storage, keys: from_keys.as_ref(), maximum_deployments: usize::MAX };
-            let to = admin::CellHandle { name: arguments.required("to")?, directory: to_directory.as_ref(), storage: &to_storage, keys: to_keys.as_ref(), maximum_deployments: usize::MAX };
-            let record = admin::move_cell(map.as_ref(), &from, &to, arguments.required("name")?, 4 << 20).await?;
-            println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
+            let from = admin::CellHandle { name: arguments.required("from")?, directory: &from_directory, storage: &from_storage, keys: from_keys.as_ref(), maximum_deployments: usize::MAX };
+            let to = admin::CellHandle { name: arguments.required("to")?, directory: &to_directory, storage: &to_storage, keys: to_keys.as_ref(), maximum_deployments: usize::MAX };
+            match command.as_str() {
+                "move-cell" => {
+                    let map = rtdb_multi::cells::RemoteCellMap::new(arguments.required("cell-map")?);
+                    let record = admin::move_cell(map.as_ref(), &from, &to, arguments.required("name")?, 4 << 20, hosted_task(&arguments)?).await?;
+                    println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
+                },
+                "prepare-cell-transfer" => {
+                    let intent = read_transfer(&arguments)?;
+                    let prepared = admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, hosted_task(&arguments)?).await?;
+                    println!("{}", serde_json::to_string(&prepared).expect("a transfer receipt serializes"));
+                },
+                "activate-cell-transfer" => {
+                    let prepared = read_transfer(&arguments)?;
+                    admin::activate_managed_cell_transfer(&from, &to, &prepared).await?;
+                    println!("{}", serde_json::to_string(&prepared).expect("a transfer receipt serializes"));
+                },
+                _ => unreachable!(),
+            }
             Ok(())
         }
         "reaper" => {
@@ -290,6 +329,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     storage.clone(),
                     CellStorage::parse(arguments.required("archive-root")?)?,
                     keys.clone().ok_or_else(|| usage("The recovery endpoint requires --keys".into()))?,
+                    hosted_task(&arguments)?,
                 )?;
                 let listener = tokio::net::TcpListener::bind(
                     arguments.address("recovery-listen", "127.0.0.1:0")?,
@@ -426,8 +466,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let archive = CellStorage::parse(arguments.required("archive-root")?)?;
             let keys = key_service(arguments.required("keys")?).await?;
             let capture = rtdb_multi::archive::capture(
-                directory.as_ref(), &storage, &archive, keys.as_ref(),
-                installation_id(&arguments)?, required_uuid(&arguments, "operation")?,
+                directory, &storage, &archive, keys.as_ref(),
+                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, None,
             ).await?;
             println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));
             Ok(())

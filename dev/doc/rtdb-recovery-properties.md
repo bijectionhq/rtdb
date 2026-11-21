@@ -206,3 +206,21 @@ With `RTDBRecoveryIdentityStartup.cfg`, registration followed by a failed journa
 In a loopback cell, pass a regular file as the Logkeeper's `--data` path to reproduce the startup failure with the Rust binary.
 After 3.5 seconds, `status` reported one live Logkeeper while its advertised socket refused connections, and the process reported `Not a directory` during shutdown.
 The pushed Rust revision resolves old ensemble members to network addresses and registers a new Logkeeper before the serving task opens its journal. [Address resolution](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/deployment.rs#L213-L217) · [Registration](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/process.rs#L168-L176) · [Journal open](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/logkeeper/src/server/mod.rs#L36-L47)
+
+## Archive restore and physical replay
+
+A verified archive checkpoint is a representation of the captured transaction prefix.
+Restore seals the serving journal and durably retains the last sealed replica position as the cutoff for compaction notices.
+Replay still applies all transactions after the checkpoint and advances ordered replica progress.
+A compaction notice in the sealed prefix describes the old serving objects and does not change the restored catalog.
+Compaction after the cutoff remains eligible.
+Moving a restored installation preserves the cutoff and copies the required archived objects before materializing the destination root.
+
+The local cell regression opens the restored installation and reads both the checkpoint row and the later transaction.
+It then moves the installation, removes the source archive, and reads the same logical result from the destination.
+
+Lean 4.36.0 checks two additional laws in [CheckpointReplay.lean](../lean/CheckpointReplay.lean).
+Filtering physical notices through the cutoff preserves the logical fold for every replay suffix, assuming a compaction notice leaves logical history invariant.
+The model keeps a compaction strictly after the cutoff.
+Dropping old transactions fails the first theorem, and suppressing every compaction fails the second.
+These theorems depend on the abstract event classification. The cell test exercises the implementation with local storage and durable loopback journals.
