@@ -274,6 +274,19 @@ impl Writer {
     async fn establish(ensemble: Arc<Ensemble>, epoch: u64, replies: &[(usize, Sealed)], recovered: Recovered<'_>) -> Result<Arc<Self>> {
         let last = recovered.history.last;
         let synced = sync_quorum(&ensemble, epoch, replies, &recovered, last).await?;
+        // Predecessor recovery also syncs replicas at this epoch. Only the writer's own ensemble activates.
+        let mut activating: FuturesUnordered<_> = synced.iter().map(|&server| ensemble.activate(server, epoch)).collect();
+        let mut activated = 0;
+        while let Some(reply) = activating.next().await {
+            match reply {
+                Ok(Ack::Accepted(_)) => activated += 1,
+                Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
+                // Older journals may still participate in writes. They cannot answer read index requests.
+                _ => (),
+            }
+            if activated >= ensemble.config.write_quorum { break; }
+        }
+        drop(activating);
         let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
         let replicas = (0..ensemble.len()).map(|server| if synced.contains(&server) {
             Replica { acked: last, link: Link::Live }
@@ -450,7 +463,7 @@ impl Writer {
                 let pipeline = match &mut *state { State::Open(pipeline) => pipeline, State::Deposed { promised } => return Err(Error::Deposed { epoch, promised: *promised }) };
                 if from >= pipeline.buffer_first {
                     let entries = pipeline.buffer.iter().skip((from - pipeline.buffer_first) as usize).map(|buffered| buffered.entry.clone()).collect();
-                    let body = ensemble.overwrite_request(epoch, from, entries, true, pipeline.commit);
+                    let body = ensemble.repair_request(epoch, from, entries, pipeline.commit);
                     pipeline.replicas[server].link = Link::Live;
                     self.send(pipeline, server, body);
                     return Ok(());

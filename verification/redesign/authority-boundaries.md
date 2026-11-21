@@ -74,7 +74,13 @@ The read path can keep the one-quorum append contract with this rule.
 [ActiveLogletReadIndex.tla](../tla/ActiveLogletReadIndex.tla) checks this rule with overlapping three-journal ensembles, two available positions and a single read.
 It separates a synced predecessor from an active successor and allows publication to lag acknowledgement.
 The move and activation are atomic in the model.
-The runtime still needs durable activation, a per-read bound and the apply wait.
+The native logkeeper persists activation only on the writer's target ensemble after recovery and installs the same activation on repaired replicas.
+A read-index round requires matching stream, epoch, ensemble and write quorum and accepts a journal's held position only after its preceding journal work is durable.
+Journals without read-index support can still carry writes during rollout.
+A writer opened by an older binary establishes its activation when a supporting writer opens the stream.
+The query path still needs to invoke the round on the subscriber's attached log and wait for its committed apply position.
+An implicit query or read transaction must capture its system-time basis after that wait.
+An explicit or already pinned basis keeps the history and time selected by the caller or transaction.
 Logkeepers' active journal identity must follow the exclusive journal and the fencing protocol.
 All trim requests require a grant bound to the history, loglet, epoch and protected recovery frontier.
 

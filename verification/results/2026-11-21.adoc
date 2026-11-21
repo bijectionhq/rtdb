@@ -2256,7 +2256,22 @@ TLC explored 74,981 reachable states with two overlapping three-journal ensemble
 Replacing exact activation with predecessor sync, or using only the published commit watermark, each admitted a read bound below an already acknowledged write.
 Reachability checks found a read served after the move and a speculative bound that must wait for progress.
 The model treats sealing and activation as atomic stages.
-Native subscriber integration and the production refinement for those stages remain open. link:../tla/ActiveLogletReadIndex.tla[Active loglet model]
+Native subscriber integration and the production refinement for those stages were tracked separately. link:../tla/ActiveLogletReadIndex.tla[Active loglet model]
+
+=== Native active loglet read indexes
+
+The writer activates its exact ensemble after recovery and installs the same activation on repaired journals.
+An activation survives journal replay and compaction and is revoked by a higher epoch promise.
+A read index uses an intersecting quorum of matching durable activations and returns the largest held position.
+The native logkeeper suite passed 63 tests with one throughput benchmark ignored.
+The tests cover two overlapping ensembles, a completed append with unpublished commit watermarks and activation replay across compaction.
+The predecessor test fails when a synced replica can vote without matching the activated ensemble.
+The unpublished append test fails when a vote reports the published commit watermark as its bound.
+The default native simulation suite passed 13 tests with four longer sweeps ignored.
+The logkeeper suite passed again after the rebase and all 85 native Multi cell tests passed.
+The serial Gradle run executed nine test tasks and passed all 3,198 tests without failures or skips.
+Gradle property testing passed all 3,348 cases without failures or skips.
+The placed query still needs to use the index and wait for the bound to apply.
 
 === Table metadata bindings in checkpoint roots
 

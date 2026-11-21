@@ -15,6 +15,7 @@ const RETAINED_ENTRY_OVERHEAD: usize = 32;
 pub enum Event {
     Promise(u64),
     Synced(Option<u64>),
+    Activate { epoch: u64, ensemble: [u8; 32] },
     /// Drops every entry at or above the lsn.
     Truncate(i64),
     Append(Entry),
@@ -56,6 +57,7 @@ pub struct StreamState<P = Bytes> {
     pub dropped: bool,
     /// The epoch whose writer last brought this server up to that writer's whole history.
     pub synced: Option<u64>,
+    pub(super) active_ensemble: Option<[u8; 32]>,
     /// Entries at or below this lsn are dropped.
     pub trim: i64,
     pub commit: i64,
@@ -80,7 +82,7 @@ fn dense(first: i64, entries: &[Entry]) -> bool {
 
 impl<P> Default for StreamState<P> {
     fn default() -> Self {
-        Self { promised: 0, dropped: false, synced: None, trim: -1, commit: -1, entries: VecDeque::new(), epoch_runs: VecDeque::new(), retained_bytes: 0 }
+        Self { promised: 0, dropped: false, synced: None, active_ensemble: None, trim: -1, commit: -1, entries: VecDeque::new(), epoch_runs: VecDeque::new(), retained_bytes: 0 }
     }
 }
 
@@ -105,8 +107,17 @@ impl<P: Payload> StreamState<P> {
 
     pub fn apply(&mut self, event: &Event) {
         match event {
-            Event::Promise(epoch) => self.promised = self.promised.max(*epoch),
+            Event::Promise(epoch) => {
+                if *epoch > self.promised {
+                    self.promised = *epoch;
+                    self.active_ensemble = None;
+                }
+            }
             Event::Synced(epoch) => self.synced = *epoch,
+            Event::Activate { epoch, ensemble } => {
+                debug_assert_eq!(*epoch, self.promised);
+                self.active_ensemble = Some(*ensemble);
+            }
             Event::Truncate(from) => {
                 let keep = (from - self.trim - 1).clamp(0, self.entries.len() as i64);
                 self.retained_bytes -= self.entries.drain(keep as usize..).map(|held| held.payload.bytes() + RETAINED_ENTRY_OVERHEAD).sum::<usize>();
@@ -202,6 +213,17 @@ impl<P: Payload> StreamState<P> {
         self.persist(events, Self::accepted)
     }
 
+    pub fn repair(&mut self, epoch: u64, from: i64, entries: Vec<Entry>, commit: i64, ensemble: [u8; 32]) -> Decision {
+        if self.promised == epoch && self.active_ensemble.is_some_and(|active| active != ensemble) {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        let mut overwrite = self.overwrite(epoch, from, entries, true, commit);
+        if matches!(overwrite.reply, ResponseBody::Accepted(_)) {
+            overwrite.events.extend(self.activate(epoch, ensemble).events);
+        }
+        overwrite
+    }
+
     pub fn seal(&mut self, epoch: u64) -> Decision {
         if epoch == 0 { return invalid("epochs start at 1"); }
         if self.dropped { return invalid("the stream was dropped"); }
@@ -223,6 +245,18 @@ impl<P: Payload> StreamState<P> {
 
     pub fn check_synced(&self, epoch: u64) -> ResponseBody {
         self.check_writer(epoch).unwrap_or_else(|| self.accepted())
+    }
+
+    pub fn activate(&mut self, epoch: u64, ensemble: [u8; 32]) -> Decision {
+        if self.active_ensemble.is_some_and(|active| active != ensemble) || self.check_writer(epoch).is_some() {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        let events = self.active_ensemble.is_none().then_some(Event::Activate { epoch, ensemble }).into_iter().collect();
+        self.persist(events, Self::accepted)
+    }
+
+    pub fn read_index(&self, epoch: u64, ensemble: [u8; 32]) -> ResponseBody {
+        if self.active_ensemble == Some(ensemble) { self.check_synced(epoch) } else { self.refused() }
     }
 
     pub fn drop_stream(&mut self, epoch: u64) -> Decision {

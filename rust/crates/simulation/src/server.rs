@@ -112,7 +112,7 @@ impl Server {
             Event::Truncate(from) => Some(*from),
             Event::Append(entry) => Some(entry.lsn),
             Event::Promise(_) | Event::Commit(_) => Some(i64::MAX),
-            Event::Synced(_) | Event::Trim(_) | Event::Drop(_) => None,
+            Event::Synced(_) | Event::Activate { .. } | Event::Trim(_) | Event::Drop(_) => None,
         }).try_fold(i64::MAX, |low, from| from.map(|from| low.min(from)));
         let snapshot = sealing.then(|| held(&self.accepted));
         self.pending.push(Pending { events: decision.events, reply, body: decision.reply, snapshot, writer });

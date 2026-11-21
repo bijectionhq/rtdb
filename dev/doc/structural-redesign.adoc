@@ -132,6 +132,8 @@ Renewal, recovery-root integration, identity-bound certification and timer remov
 
 link:../../verification/redesign/authority-boundaries.md[Authority boundaries] specifies placed attempt receipts, read indexes, logkeeper safety and CDC acknowledgement.
 The placed serving model checks receipt and freshness transitions on an abstract committed replica prefix.
+Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
+The placed subscriber still needs to use the index and wait for the resulting prefix before capturing a snapshot.
 The native scoring contract is specified in link:fts.allium[Full-text search].
 
 === Ranked cutoff at ties

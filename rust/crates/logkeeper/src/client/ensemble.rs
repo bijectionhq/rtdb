@@ -2,9 +2,10 @@
 
 use super::connection::{Connection, connection, remote};
 use super::StreamConfig;
-use crate::protocol::{Accepted, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, Overwrite, PageDigest, Read, Refused, RequestBody, ResponseBody, Retire, Seal, Sealed, Trim};
+use crate::protocol::{Accepted, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, Refused, RequestBody, ResponseBody, Retire, Seal, Sealed, Trim};
 use bytes::Bytes;
 use rtdb_storage::{Error, Result};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,12 +21,22 @@ pub(crate) enum Ack {
 pub(crate) struct Ensemble {
     pub config: StreamConfig,
     pub links: Vec<Arc<Connection>>,
+    identity: Bytes,
 }
 
 impl Ensemble {
     pub fn new(config: StreamConfig) -> Self {
         let links = config.servers.iter().map(|address| connection(address)).collect();
-        Self { config, links }
+        let mut servers: Vec<_> = config.servers.iter().collect();
+        servers.sort_unstable();
+        let mut identity = Sha256::new();
+        identity.update(b"rtdb.logkeeper/ensemble/v1");
+        identity.update((config.write_quorum as u64).to_be_bytes());
+        for server in servers {
+            identity.update((server.len() as u64).to_be_bytes());
+            identity.update(server.as_bytes());
+        }
+        Self { config, links, identity: Bytes::copy_from_slice(&identity.finalize()) }
     }
 
     pub fn len(&self) -> usize { self.links.len() }
@@ -84,12 +95,31 @@ impl Ensemble {
 
     pub fn check_synced_request(&self, epoch: u64) -> RequestBody { RequestBody::CheckSynced(Check { stream: self.stream(), epoch }) }
 
-    pub fn overwrite_request(&self, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool, commit: i64) -> RequestBody {
-        RequestBody::Overwrite(Overwrite { stream: self.stream(), epoch, from_lsn: from, entries, complete, commit_lsn: commit })
+    fn loglet_check(&self, epoch: u64) -> LogletCheck {
+        LogletCheck { stream: self.stream(), epoch, ensemble: self.identity.clone() }
+    }
+
+    pub async fn activate(&self, server: usize, epoch: u64) -> Result<Ack> {
+        let reply = self.links[server].call(RequestBody::ActivateLoglet(self.loglet_check(epoch))).await;
+        self.ack(server, reply)
+    }
+
+    pub async fn read_index(&self, server: usize, epoch: u64) -> Result<Ack> {
+        let reply = self.links[server].call(RequestBody::ReadIndex(self.loglet_check(epoch))).await;
+        self.ack(server, reply)
+    }
+
+    pub fn repair_request(&self, epoch: u64, from: i64, entries: Vec<Entry>, commit: i64) -> RequestBody {
+        RequestBody::Overwrite(Overwrite {
+            stream: self.stream(), epoch, from_lsn: from, entries, complete: true, commit_lsn: commit, activate_ensemble: self.identity.clone(),
+        })
     }
 
     pub async fn overwrite(&self, server: usize, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool) -> Result<Ack> {
-        let reply = self.links[server].call(self.overwrite_request(epoch, from, entries, complete, -1)).await;
+        let body = RequestBody::Overwrite(Overwrite {
+            stream: self.stream(), epoch, from_lsn: from, entries, complete, commit_lsn: -1, activate_ensemble: Bytes::new(),
+        });
+        let reply = self.links[server].call(body).await;
         self.ack(server, reply)
     }
 

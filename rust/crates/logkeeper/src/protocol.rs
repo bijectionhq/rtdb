@@ -97,6 +97,8 @@ pub(crate) struct Overwrite {
     pub complete: bool,
     #[prost(sint64, tag = "6")]
     pub commit_lsn: i64,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub activate_ensemble: Bytes,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -134,6 +136,16 @@ pub(crate) struct Check {
     pub stream: String,
     #[prost(uint64, tag = "2")]
     pub epoch: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct LogletCheck {
+    #[prost(string, tag = "1")]
+    pub stream: String,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub ensemble: Bytes,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -182,13 +194,17 @@ pub(crate) enum RequestBody {
     DigestPage(DigestPage),
     #[prost(message, tag = "13")]
     CheckSynced(Check),
+    #[prost(message, tag = "14")]
+    ActivateLoglet(LogletCheck),
+    #[prost(message, tag = "15")]
+    ReadIndex(LogletCheck),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15")]
     pub body: Option<RequestBody>,
 }
 

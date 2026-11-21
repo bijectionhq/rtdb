@@ -250,6 +250,36 @@ pub async fn retire(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()>
 }
 
 impl QuorumLog {
+    /// Bounds writes completed before this call on the exact active ensemble.
+    /// The caller must wait for committed application through the returned position.
+    pub async fn read_index(&self, epoch: u64) -> Result<LogOffset> {
+        let ensemble = &self.shared.ensemble;
+        let quorum = ensemble.config.write_quorum;
+        let unavailable = |message: &str| Error::Remote { key: ensemble.config.stream.clone(), message: message.into() };
+        if quorum <= ensemble.len() / 2 { return Err(unavailable("read indexes require intersecting write quorums")); }
+        let mut replies: FuturesUnordered<_> = (0..ensemble.len()).map(|server| ensemble.read_index(server, epoch)).collect();
+        let mut confirmed = 0;
+        let mut last = -1;
+        loop {
+            let reply = tokio::select! {
+                _ = self.shared.cancellation.cancelled() => return Err(Error::Closed("quorum log closed".into())),
+                reply = replies.next() => reply,
+            };
+            let Some(reply) = reply else { break };
+            match reply {
+                Ok(Ack::Accepted(held)) => {
+                    confirmed += 1;
+                    last = last.max(held.last_lsn);
+                    if confirmed == quorum { return Ok(LogOffset(last)); }
+                }
+                Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
+                _ => (),
+            }
+            if confirmed + replies.len() < quorum { break; }
+        }
+        Err(unavailable("a write quorum did not confirm the active loglet"))
+    }
+
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
     pub fn loglets(&self) -> Vec<Loglet> {
         let shared = &self.shared;

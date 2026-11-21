@@ -40,6 +40,8 @@ struct Snapshot {
     commit: i64,
     #[prost(bool, tag = "5")]
     retired: bool,
+    #[prost(bytes = "bytes", tag = "6")]
+    active_ensemble: Bytes,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
@@ -74,12 +76,16 @@ struct Record {
     stream: u64,
     #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11")]
     kind: Option<Kind>,
+    // An activation is an optional refinement of an existing synced record.
+    #[prost(bytes = "bytes", tag = "12")]
+    active_ensemble: Bytes,
 }
 
 fn record(event: &Event) -> Kind {
     match event {
         Event::Promise(epoch) => Kind::Promise(*epoch),
         Event::Synced(epoch) => Kind::Synced(epoch.unwrap_or(0)),
+        Event::Activate { epoch, .. } => Kind::Synced(*epoch),
         Event::Truncate(from) => Kind::Truncate(*from),
         Event::Append(entry) => Kind::Append(entry.clone()),
         Event::Commit(lsn) => Kind::Commit(*lsn),
@@ -89,7 +95,11 @@ fn record(event: &Event) -> Kind {
 }
 
 fn frame(stream: u64, kind: Kind, buffer: &mut BytesMut) {
-    let body = Record { stream, kind: Some(kind) }.encode_to_vec();
+    frame_record(Record { stream, kind: Some(kind), active_ensemble: Bytes::new() }, buffer)
+}
+
+fn frame_record(record: Record, buffer: &mut BytesMut) {
+    let body = record.encode_to_vec();
     buffer.put_u32(body.len() as u32);
     buffer.put_u32(crc32fast::hash(&body));
     buffer.put_slice(&body);
@@ -416,7 +426,11 @@ impl Journal {
                     if current.declared.insert(slot.id) { frame(slot.id, Kind::Declare(slot.name.clone()), &mut buffer); }
                     for event in events {
                         let start = buffer.len();
-                        frame(slot.id, record(event), &mut buffer);
+                        let active_ensemble = match event {
+                            Event::Activate { ensemble, .. } => Bytes::copy_from_slice(ensemble),
+                            _ => Bytes::new(),
+                        };
+                        frame_record(Record { stream: slot.id, kind: Some(record(event)), active_ensemble }, &mut buffer);
                         if let Event::Append(entry) = event { placed.push(Placed { slot, entry, start, length: buffer.len() - start }); }
                     }
                     sync = true;
@@ -486,6 +500,7 @@ impl Journal {
             frame(id, Kind::Declare(stream.slot.name.clone()), &mut buffer);
             frame(id, Kind::Snapshot(Snapshot {
                 promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit, retired: state.dropped,
+                active_ensemble: state.active_ensemble.as_ref().map_or_else(Bytes::new, |ensemble| Bytes::copy_from_slice(ensemble)),
             }), &mut buffer);
             let mut locations = Vec::with_capacity(state.entries.len());
             for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
@@ -601,7 +616,7 @@ impl Replay {
         let length = file.metadata().map_err(|error| io_error(path, error))?.len();
         let mut reader = BufReader::with_capacity(1 << 20, file);
         let mut position = 0u64;
-        while let Some((Record { stream, kind }, framed)) = read_record(&mut reader, length - position).map_err(|error| io_error(path, error))? {
+        while let Some((Record { stream, kind, active_ensemble }, framed)) = read_record(&mut reader, length - position).map_err(|error| io_error(path, error))? {
             let at = position;
             position += framed;
             let kind = kind.ok_or_else(|| corrupt(path, "a record without a kind"))?;
@@ -623,11 +638,20 @@ impl Replay {
                     if snapshot.retired { self.compacted.insert(stream, snapshot.promised); }
                     *state = StreamState {
                         promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced),
+                        active_ensemble: decode_ensemble(path, &snapshot.active_ensemble)?,
                         trim: snapshot.trim, commit: snapshot.commit, dropped: snapshot.retired, ..StreamState::default()
                     };
                 }
                 Kind::Promise(epoch) => state.apply(&Event::Promise(epoch)),
-                Kind::Synced(epoch) => state.apply(&Event::Synced((epoch != 0).then_some(epoch))),
+                Kind::Synced(epoch) => {
+                    state.apply(&Event::Synced((epoch != 0).then_some(epoch)));
+                    if let Some(ensemble) = decode_ensemble(path, &active_ensemble)? {
+                        if epoch == 0 || epoch != state.promised || state.active_ensemble.is_some_and(|active| active != ensemble) {
+                            return Err(corrupt(path, "activation does not match the stream's promised epoch or ensemble"));
+                        }
+                        state.apply(&Event::Activate { epoch, ensemble });
+                    }
+                }
                 Kind::Truncate(from) => state.apply(&Event::Truncate(from)),
                 Kind::Append(entry) => {
                     if entry.lsn != state.last() + 1 { return Err(corrupt(path, format!("stream {stream}'s entry {} follows {}", entry.lsn, state.last()))); }
@@ -641,6 +665,11 @@ impl Replay {
         }
         Ok((position, length))
     }
+}
+
+fn decode_ensemble(path: &Path, encoded: &[u8]) -> Result<Option<[u8; 32]>> {
+    if encoded.is_empty() { return Ok(None); }
+    encoded.try_into().map(Some).map_err(|_| corrupt(path, "invalid active ensemble digest"))
 }
 
 /// Stops at the first incomplete or damaged record.
@@ -835,6 +864,30 @@ mod tests {
         drop(journal);
         fs::remove_dir_all(directory.path().join("segments")).unwrap();
         assert!(Journal::open(directory.path(), true, 0, Some(MemberIdentity::Reopen(first))).is_err());
+    }
+
+    #[test]
+    fn activation_survives_replay_and_compaction_until_a_higher_promise() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, _, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let stream = slot(&journal, "active-loglet");
+        let ensemble = [4; 32];
+        synced(&journal, &stream, 1);
+        decide(&journal, &stream, |state| state.activate(1, ensemble));
+        drop(journal);
+
+        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let stream = recovered_slots(recovered).remove("active-loglet").unwrap();
+        assert!(matches!(stream.state.lock().read_index(1, ensemble), crate::protocol::ResponseBody::Accepted(_)));
+        assert!(matches!(stream.state.lock().activate(1, [5; 32]).reply, crate::protocol::ResponseBody::Refused(_)));
+        compact(&journal, &[&stream]);
+        drop(journal);
+
+        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
+        let stream = recovered_slots(recovered).remove("active-loglet").unwrap();
+        assert!(matches!(stream.state.lock().read_index(1, ensemble), crate::protocol::ResponseBody::Accepted(_)));
+        synced(&journal, &stream, 2);
+        assert!(matches!(stream.state.lock().read_index(2, ensemble), crate::protocol::ResponseBody::Refused(_)));
     }
 
     #[test]

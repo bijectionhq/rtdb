@@ -419,6 +419,8 @@ contract LogService {
     append: (deployment: DeploymentId, epoch: Epoch, lsn: Lsn, records: List<LogRecord>) -> Lsn
     seal: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> SealReply
     check: (deployment: DeploymentId, epoch: Epoch) -> Epoch
+    activate: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> ()
+    read_index: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> Lsn
     read: (deployment: DeploymentId, from: Lsn) -> List<LogRecord>
     subscribe: (deployment: DeploymentId, from: Lsn) -> Stream<LogRecord>
     trim: (deployment: DeploymentId, through: Lsn) -> Lsn
@@ -472,6 +474,14 @@ contract LogService {
         -- A positive reply establishes that the server's promised and synced epochs were both equal to the holder's epoch when the server decided the request.
         -- An idle holder sends an epoch check that waits behind preceding journal work and writes no event of its own.
         -- A refusal reporting a higher epoch deposes the holder.
+
+    @invariant ReadIndexUsesTheActiveLoglet
+        -- After recovering a durable write quorum, the writer installs an activation for its exact ensemble and write quorum in the new epoch.
+        -- A journal acknowledges activation only at its promised and synced epoch and records at most one ensemble for that epoch.
+        -- A higher promise revokes the activation.
+        -- A positive read-index reply requires that activation and reports the last held position after preceding journal work is durable.
+        -- A read index takes the maximum last held position from an intersecting write quorum of positive replies.
+        -- A subscriber waits for committed application through the result before taking its query snapshot.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
@@ -1928,10 +1938,9 @@ rule ServeOnSubscriber {
 
     ensures:
         if session.freshness = linearizable:
-            let committed = ConfirmActiveLogletReadIndex(subscription.deployment)
-            if committed != null:
-                AwaitApplied(subscription, committed)
-                Served(query, tier: subscriber, at: committed)
+            let bound = ConfirmActiveLogletReadIndex(subscription.deployment)
+            if bound != null and AwaitApplied(subscription, bound, within: config.subscriber_basis_wait):
+                Served(query, tier: subscriber, at: subscription.applied_lsn)
             else:
                 Replied(query, behind: true)
         else if subscription.applied_lsn >= session.basis.lsn:

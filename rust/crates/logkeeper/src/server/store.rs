@@ -75,12 +75,28 @@ impl Store {
         if self.queue.is_closed() { return Outcome::Now(failed("the journal has stopped")); }
         let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision>) = match body {
             RequestBody::Append(append) => (append.stream, Box::new(move |state| state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn))),
-            RequestBody::Overwrite(overwrite) => (overwrite.stream, Box::new(move |state| state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn))),
+            RequestBody::Overwrite(overwrite) if overwrite.activate_ensemble.is_empty() => (overwrite.stream, Box::new(move |state| {
+                state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn)
+            })),
+            RequestBody::Overwrite(overwrite) => {
+                let Ok(ensemble) = overwrite.activate_ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
+                if !overwrite.complete { return Outcome::Now(failed("activation requires a complete overwrite")); }
+                (overwrite.stream, Box::new(move |state| state.repair(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.commit_lsn, ensemble)))
+            }
             RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
             RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
-            RequestBody::CheckSynced(check) => return self.check_synced(&check.stream, check.epoch, admission),
+            RequestBody::CheckSynced(check) => return self.check_after_durability(&check.stream, admission, |state| state.check_synced(check.epoch)),
+            RequestBody::ActivateLoglet(check) => {
+                let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
+                (check.stream, Box::new(move |state| state.activate(check.epoch, ensemble)))
+            }
+            RequestBody::ReadIndex(check) => {
+                if !self.journal.is_durable() { return Outcome::Now(failed("read indexes require a durable journal")); }
+                let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
+                return self.check_after_durability(&check.stream, admission, |state| state.read_index(check.epoch, ensemble));
+            }
             RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) => return Outcome::Now(failed("not a direct mutation")),
         };
         let slot = self.slot(&stream);
@@ -154,15 +170,17 @@ impl Store {
         match self.existing(stream) { Some(slot) => slot.state.lock().check(epoch), None => StreamState::<Stored>::default().check(epoch) }
     }
 
-    fn check_synced(&self, stream: &str, epoch: u64, admission: tokio::sync::OwnedSemaphorePermit) -> Outcome {
+    fn check_after_durability(
+        &self, stream: &str, admission: tokio::sync::OwnedSemaphorePermit, check: impl FnOnce(&StreamState<Stored>) -> ResponseBody,
+    ) -> Outcome {
         let Some(slot) = self.existing(stream) else {
-            return Outcome::Now(StreamState::<Stored>::default().check_synced(epoch));
+            return Outcome::Now(check(&StreamState::default()));
         };
         let state = slot.state.lock();
-        let reply = state.check_synced(epoch);
+        let reply = check(&state);
         if !matches!(reply, ResponseBody::Accepted(_)) { return Outcome::Now(reply); }
 
-        // The stream can observe a complete overwrite before the journal has synced it.
+        // The reply's position includes accepted mutations that the journal may still be syncing.
         let (done, durable) = oneshot::channel();
         let barrier = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: Some(admission) };
         if self.queue.send(barrier).is_err() { return Outcome::Now(failed("the journal has stopped")); }
@@ -301,7 +319,7 @@ mod tests {
         let (queue, mut work) = mpsc::unbounded_channel();
         let store = Store::new(Arc::new(journal), recovered, queue);
         let overwrite = |stream: &str| RequestBody::Overwrite(Overwrite {
-            stream: stream.into(), epoch: 1, from_lsn: 0, entries: Vec::new(), complete: true, commit_lsn: -1,
+            stream: stream.into(), epoch: 1, from_lsn: 0, entries: Vec::new(), complete: true, commit_lsn: -1, activate_ensemble: Bytes::new(),
         });
         assert!(matches!(store.mutate(overwrite("first"), MAXIMUM_FRAME_BYTES).await, Outcome::Durable(_, _)));
         let mut second = Box::pin(store.mutate(overwrite("second"), 32));
@@ -325,7 +343,7 @@ mod tests {
         assert!(matches!(store.mutate(check(), 32).await, Outcome::Now(ResponseBody::Refused(_))));
         let incoming = RequestBody::Overwrite(Overwrite {
             stream: "pending-sync".into(), epoch: 2, from_lsn: 0,
-            entries: Vec::new(), complete: true, commit_lsn: -1,
+            entries: Vec::new(), complete: true, commit_lsn: -1, activate_ensemble: Bytes::new(),
         });
         let Outcome::Durable(installed, ResponseBody::Accepted(_)) = store.mutate(incoming, 32).await else {
             panic!("the complete overwrite must wait for the journal");
@@ -357,7 +375,7 @@ mod tests {
             from_lsn: 0,
             entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, payload: Bytes::from(vec![1; 2 << 20]) }],
             complete: true,
-            commit_lsn: 0,
+            commit_lsn: 0, activate_ensemble: Bytes::new(),
         }), 2 << 20).await, Outcome::Durable(_, _)));
         let slot = store.existing("drop-me").unwrap();
         let capture = Captured { slot: Arc::clone(&slot), state: slot.state.lock().clone() };
