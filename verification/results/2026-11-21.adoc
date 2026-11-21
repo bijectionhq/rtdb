@@ -1604,3 +1604,41 @@ The machine-local evidence is under
 `/private/tmp/rtdb-formal.QMjPSJsX/gateway-and-key-a997308e7-native.log`,
 `/private/tmp/rtdb-formal.QMjPSJsX/multi-124570088-proofs.log`,
 and `/private/tmp/rtdb-formal.QMjPSJsX/combined-124570088/`.
+
+The combined suite at `124570088` completed successfully with 471 recorded commands.
+Its Lean and Verus cases include the gateway replay laws and controls and the production key enrollment predicate.
+The separate seeded native simulation run passed 13 cases across sessions, storage and the replicated writer.
+Four opt-in simulation cases were ignored.
+The default gateway and storage sweeps each ran 300 seeds with 200 steps per seed.
+The default replicated-writer sweep ran 2,000 seeds with 2,000 steps per seed.
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-multi --features dynamodb,s3-key-vault -p rtdb-simulation \
+  --test sessions --test storage --test simulation --no-fail-fast
+----
+
+Command output is in `/private/tmp/rtdb-formal.QMjPSJsX/gateway-simulation-a997308e7.log`.
+
+=== Trie leaf sort and merge through the pinned sort contract
+
+The integrated trie branch adopts Rust's `Ord` interface for the keyed rows so the proof can use the pinned Verus standard-library specification of `sort_unstable`.
+Verus checks total ordering against the same IID and ordinal rank used by the merge.
+The proof delegates the sort implementation's permutation and ordering behavior to that standard-library contract.
+At `cc77b3550`, Verus checked 35 functions and all 14 mutations produced the declared failures.
+The scoped native suites passed 516 tests across trie, format, index and query.
+Those tests include read failure and retry, duplicate preservation and the unchanged contents of the original trie after a failed insertion.
+The runtime system proof of leaf publication remains open. link:../../dev/doc/rtdb-engine-proof-evidence.md[Engine proof evidence]
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query --no-fail-fast
+----
+
+The machine-local command logs and controls are under
+`/private/tmp/rtdb-formal.QMjPSJsX/leaf-refinement-cc77b3550-native.log`
+and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-refinement-cc77b3550-verus/`.

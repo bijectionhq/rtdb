@@ -184,6 +184,11 @@ The new native regression checks that a read failure stops each sort, a retry re
 Verus 0.2026.11.05.31e44e6 checked thirty-one functions and rejected fourteen mutations, including reversing the sort, discarding projected rows, and losing a run at either composed merge.
 The native run passed 506 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production sort and composition](../../rust/crates/trie/src/leaf_sort_step.rs) · [Trie call sites](../../rust/crates/trie/src/memory.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
 
+The consolidated branch uses the Rust `Ord` interface for keyed rows and calls `sort_unstable`.
+Verus checks the three comparison methods against the existing rank and discharges the standard sort contract's ordering-law premise.
+The sort still relies on the standard-library contract for preserving every row occurrence and returning the order specified by that rank.
+The runtime comparison uses the same IID order and descending ordinal tie-break. [Verus standard-library specification](https://github.com/verus-lang/verus/blob/9da409b/source/vstd/std_specs/slice.rs#L796-L804)
+
 ### Production leaf comparison
 
 The Rust pending-log sort, two-run merge and persisted-leaf validation use the same row-key comparison.
@@ -200,7 +205,7 @@ Lean 4.35.0 audited seven theorems and rejected signed-word comparison, reversed
 The Rust and JVM regressions each insert 4,096 rows and check the leaf against an independent order reference across single-byte values at every IID position, including duplicate IIDs.
 The native run passed 504 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`.
 Run the JVM case with `./gradlew :xtdb-core:test --tests 'xtdb.trie.MemoryHashTrieTest'`.
-The sorted-run and leaf-state refinement remains open. [Comparator study](../../verification/verus/trie_leaf_merge/area.json) · [JVM order proof](../../verification/lean/IidByteOrder.lean) · [Rust regression](../../rust/crates/trie/tests/contracts.rs) · [JVM regression](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
+End-to-end refinement of leaf publication through the Rust and JVM entry points remains open. [Comparator study](../../verification/verus/trie_leaf_merge/area.json) · [JVM order proof](../../verification/lean/IidByteOrder.lean) · [Rust regression](../../rust/crates/trie/tests/contracts.rs) · [JVM regression](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
 
 ### Leaf runs, compaction and persisted order
 
