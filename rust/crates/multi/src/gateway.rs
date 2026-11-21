@@ -89,27 +89,13 @@ async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, option
         Ok(route) => route,
         Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
     };
-    let touching = control.map(|control| {
-        let name = name.clone();
-        let interval = options.touch_interval;
-        let timeout = options.control_timeout;
-        let key = control::ControlKey(options.capabilities.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let _ = control::call(&control, &Request::Touch { name: name.clone() }, timeout, &key).await;
-            }
-        })
-    });
     let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
     let keyed = !startup.read_only();
     let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed);
-    let outcome = tokio::select! {
+    tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
-        outcome = session.run(client, server, epoch) => outcome,
-    };
-    if let Some(touching) = touching { touching.abort(); }
-    outcome
+        outcome = session.run(client, server, control, epoch) => outcome,
+    }
 }
 
 /// The gateway of the cell a deployment lives in, when that is not this gateway's cell.
@@ -137,6 +123,19 @@ impl crate::session::Router for GatewayRouter {
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
         let (stream, control, epoch, _) = self.route_with_record().await?;
         Ok((stream, control, epoch))
+    }
+
+    fn start_touching(&self, address: String) -> Option<tokio::task::JoinHandle<()>> {
+        let name = self.name.clone();
+        let interval = self.options.touch_interval;
+        let timeout = self.options.control_timeout;
+        let key = control::ControlKey(self.options.capabilities.clone());
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let _ = control::call(&address, &Request::Touch { name: name.clone() }, timeout, &key).await;
+            }
+        }))
     }
 }
 

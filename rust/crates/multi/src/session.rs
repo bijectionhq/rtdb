@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, watch};
+use tokio_util::task::AbortOnDropHandle;
 
 const MAXIMUM_FRAME_BYTES: usize = 1 << 30;
 const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -51,7 +52,7 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Frame>
 }
 
 /// Reads frames off `reader` into a channel, so the session can wait on both directions without losing a partly read frame.
-fn pump(mut reader: OwnedReadHalf) -> (mpsc::Receiver<std::io::Result<Frame>>, tokio::task::JoinHandle<()>) {
+fn pump(mut reader: OwnedReadHalf) -> (mpsc::Receiver<std::io::Result<Frame>>, AbortOnDropHandle<()>) {
     let (sender, receiver) = mpsc::channel(64);
     let task = tokio::spawn(async move {
         loop {
@@ -62,7 +63,7 @@ fn pump(mut reader: OwnedReadHalf) -> (mpsc::Receiver<std::io::Result<Frame>>, t
             }
         }
     });
-    (receiver, task)
+    (receiver, AbortOnDropHandle::new(task))
 }
 
 /// Where a session is connected, and how to reconnect it.
@@ -70,23 +71,24 @@ fn pump(mut reader: OwnedReadHalf) -> (mpsc::Receiver<std::io::Result<Frame>>, t
 pub trait Router: Send + Sync {
     /// A connection to the deployment's current holder, the control address to touch it at, and the epoch it holds under.
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)>;
+    /// Keeps a routed backend warm for the duration of its connection.
+    fn start_touching(&self, _address: String) -> Option<tokio::task::JoinHandle<()>> { None }
 }
 
 struct Backend {
     writer: OwnedWriteHalf,
     frames: mpsc::Receiver<std::io::Result<Frame>>,
-    reader: tokio::task::JoinHandle<()>,
+    _reader: AbortOnDropHandle<()>,
+    heartbeat: Option<AbortOnDropHandle<()>>,
     epoch: u64,
     drain_deadline: Option<tokio::time::Instant>,
 }
-
-impl Drop for Backend { fn drop(&mut self) { self.reader.abort(); } }
 
 impl Backend {
     fn new(stream: TcpStream, epoch: u64) -> Self {
         let (read, writer) = stream.into_split();
         let (frames, reader) = pump(read);
-        Self { writer, frames, reader, epoch, drain_deadline: None }
+        Self { writer, frames, _reader: reader, heartbeat: None, epoch, drain_deadline: None }
     }
 
     async fn dispatch(&mut self, frame: &Frame) -> bool {
@@ -160,7 +162,7 @@ impl Session {
     }
 
     async fn connect_once(&mut self) -> Result<Backend> {
-        let (mut stream, _, epoch) = self.router.route().await?;
+        let (mut stream, control, epoch) = self.router.route().await?;
         stream.write_all(&self.reconnection_startup()).await.map_err(io)?;
         let mut backend = Backend::new(stream, epoch);
         let mut replay = BytesMut::new();
@@ -180,6 +182,7 @@ impl Session {
                 _ => {}
             }
         }
+        backend.heartbeat = control.and_then(|address| self.router.start_touching(address)).map(AbortOnDropHandle::new);
         Ok(backend)
     }
 
@@ -199,10 +202,12 @@ impl Session {
     }
 
     /// Runs the session over an already-routed first backend whose greeting the client has not yet seen.
-    pub async fn run(mut self, client: TcpStream, first: TcpStream, first_epoch: u64) -> Result<()> {
+    pub async fn run(mut self, client: TcpStream, first: TcpStream, first_control: Option<String>, first_epoch: u64) -> Result<()> {
         let (client_read, mut client_write) = client.into_split();
-        let (mut requests, client_reader) = pump(client_read);
-        let mut backend = Some(Backend::new(first, first_epoch));
+        let (mut requests, _client_reader) = pump(client_read);
+        let mut first = Backend::new(first, first_epoch);
+        first.heartbeat = first_control.and_then(|address| self.router.start_touching(address)).map(AbortOnDropHandle::new);
+        let mut backend = Some(first);
         enum Event { Request(Option<std::io::Result<Frame>>), Reply(Option<std::io::Result<Frame>>) }
         let outcome = async {
             backend.as_mut().expect("just set").writer.write_all(&self.startup).await.map_err(io)?;
@@ -319,7 +324,6 @@ impl Session {
                 }
             }
         }.await;
-        client_reader.abort();
         if let Err(error) = &outcome {
             let _ = client_write.write_all(&error_frame("08006", error.message.as_deref().unwrap_or(error.code.as_ref())).encode()).await;
         }
@@ -498,7 +502,7 @@ mod tests {
         let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
         framed.extend_from_slice(&startup);
         let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
-        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        let running = tokio::spawn(session.run(gateway_side, first, None, 0));
 
         greet(&mut dying).await;
         assert_eq!(receive(&mut client).await.0, b'R');
@@ -537,7 +541,7 @@ mod tests {
         let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
         framed.extend_from_slice(&startup);
         let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id, None, true);
-        let running = tokio::spawn(session.run(gateway, first, 0));
+        let running = tokio::spawn(session.run(gateway, first, None, 0));
 
         greet(&mut source).await;
         receive(&mut client).await;
@@ -574,7 +578,7 @@ mod tests {
         let (second, mut successor) = pair(&listener).await;
         let startup = crate::gateway::encode_startup(&BTreeMap::from([("user".into(), "xtdb".into())]));
         let session = Session::new(Bytes::from(startup), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id, None, true);
-        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        let running = tokio::spawn(session.run(gateway_side, first, None, 0));
         greet(&mut dying).await;
         assert_eq!(receive(&mut client).await.0, b'R');
         assert_eq!(receive(&mut client).await.0, b'Z');
@@ -619,7 +623,7 @@ mod tests {
         let (second, mut successor) = pair(&listener).await;
         let startup = crate::gateway::encode_startup(&BTreeMap::from([("user".into(), "xtdb".into())]));
         let session = Session::new(Bytes::from(startup), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id, None, true);
-        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        let running = tokio::spawn(session.run(gateway_side, first, None, 0));
         greet(&mut dying).await;
         assert_eq!(receive(&mut client).await.0, b'R');
         assert_eq!(receive(&mut client).await.0, b'Z');
@@ -664,7 +668,7 @@ mod tests {
         let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
         framed.extend_from_slice(&startup);
         let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
-        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        let running = tokio::spawn(session.run(gateway_side, first, None, 0));
         greet(&mut refusing).await;
         receive(&mut client).await;
         receive(&mut client).await;
@@ -702,7 +706,7 @@ mod tests {
         let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
         framed.extend_from_slice(&startup);
         let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
-        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        let running = tokio::spawn(session.run(gateway_side, first, None, 0));
         greet(&mut crashing).await;
         receive(&mut client).await;
         receive(&mut client).await;
@@ -759,7 +763,7 @@ mod tests {
         let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
         framed.extend_from_slice(&startup);
         let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
-        let running = tokio::spawn(session.run(gateway_side, first, 0));
+        let running = tokio::spawn(session.run(gateway_side, first, None, 0));
         greet(&mut dying).await;
         receive(&mut client).await;
         receive(&mut client).await;

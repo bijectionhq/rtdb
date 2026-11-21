@@ -2098,6 +2098,7 @@ surface ClientAccess {
         -- An unanswered keyed command can be retried under its original key, including an extended-protocol exchange flushed before Sync.
         -- A holder's driver shutdown during a command leaves the outcome unknown until a keyed retry returns it.
         -- An authenticated idle session retains its acknowledged named prepared statements across holder changes.
+        -- An open pgwire session renews idle protection for its current backend and stops renewing it when that connection closes.
         -- A failed startup ends the client's authentication exchange.
         -- A finite reconnect window bounds the time an established session waits for a replacement holder.
 

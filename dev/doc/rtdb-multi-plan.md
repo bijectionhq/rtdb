@@ -460,6 +460,7 @@ Moves are invisible to clients only if the gateway owns connections and session 
    Terminates pgwire (reusing `pgwire/src/protocol.rs` and `wire.rs`) and Flight SQL, authenticates, mints capabilities and idempotency keys, and sends statements to nodes over an RPC carrying the capability, the session state and the basis.
 3. **Crate `affinity`**, ported from Bijection's `crates/affinity` with its score vectors, and routing by it (`RouteRead`), with per-key in-flight bounds and pressure.
 4. **Redirects**: `NotHolder`, `Moved`, `Behind`, followed by the gateway without the client noticing.
+   The gateway renews a deployment's idle protection at the backend connected to the session, including after a move.
    A driver that stops during execution can leave the outcome unknown.
    The gateway replays the command under its original key when the client has received no answer.
    A single pgwire autocommit write sends `CommandComplete` after the commit succeeds.

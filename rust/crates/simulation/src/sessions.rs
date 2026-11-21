@@ -403,7 +403,7 @@ impl Client {
             let directory: Arc<dyn Directory> = self.directory.clone();
             let router: Arc<dyn Router> = self.backends.clone();
             let session = Session::new(Self::startup(), router, directory, self.deployment.clone(), None, keyed);
-            let running = tokio::spawn(session.run(gateway, first, 0));
+            let running = tokio::spawn(session.run(gateway, first, None, 0));
             let greeting = read_frame(&mut client).await;
             if !greeting.as_ref().is_some_and(|greeting| same(greeting, &frame(b'R', &[0, 0, 0, 0]))) {
                 return Err(format!("unexpected authentication reply {:?}", greeting.as_ref().map(show)));

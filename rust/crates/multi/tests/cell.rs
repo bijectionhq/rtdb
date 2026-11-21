@@ -420,6 +420,27 @@ async fn an_open_connection_survives_a_planned_move_and_its_holders_death() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_gateway_session_keeps_its_new_holder_from_parking() {
+    let idle = Duration::from_millis(800);
+    let cell = Cell::start(2, Some(idle)).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+
+    let target = 1 - cell.holder("shop").await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id(), &control()).await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    tokio::time::sleep(idle * 2).await;
+    assert_eq!(cell.holder("shop").await, Some(target));
+
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cell.holder("shop").await.is_some() { tokio::time::sleep(Duration::from_millis(50)).await; }
+    }).await.unwrap();
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_planned_move_replays_a_short_tail_and_flushes_a_large_one() {
     let cell = Cell::start_durable(2).await;
     let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
