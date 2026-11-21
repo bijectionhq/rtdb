@@ -969,19 +969,24 @@ An earlier version of the replay warmed the follower's buffer pool with a full q
 The maintenance suite adds a collector test for the lease boundary and a configuration test for the lease and margin.
 Run them with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-storage -p rtdb-maintenance -p rtdb-node -p rtdb-conformance`.
 The storage, maintenance, index, query, node, replication and conformance suites ran 851 tests, of which 850 passed.
-The failing `sorted_and_unsorted_limits_open_their_inputs_before_resolving_bounds` statement test also fails on the base commit `e05aac74f` without this change.
+The `sorted_and_unsorted_limits_open_their_inputs_before_resolving_bounds` statement test failed on the base commit `e05aac74f` as well; `d070d54c4` restored the open order of sorted limits.
 The first suite run found that a database whose log worker had failed before its first query could no longer read its adopted state.
 The maintenance supervisor now confirms the lease anchor on each status change, so a node that was current keeps its lease after its worker stops.
 After rebasing onto `17ad591d6`, the same suites plus `rtdb-multi` ran 991 tests.
 The Multi idempotency test overflowed a worker stack because the lease scope stored a second copy of each cursor future; the scope now returns the work or its scoped future directly, and that test passes.
 Two node search tests timed out awaiting indexed progress under machine load and passed on rerun.
-The maintenance `two_databases_share_a_slot_until_cancelled_uploads_finish` test also hangs on the base commit.
+The maintenance `two_databases_share_a_slot_until_cancelled_uploads_finish` test hung because it awaited a completion without polling the driver whose jobs now run on blocking threads; `7be683f6b` and `441f0b297` fixed the fixture.
 
 Objects are immutable, so a request that outlives `io_bound` can only fail; the I/O region classifies a missing object reported after the deadline as `rtdb.storage/read-lease-expired`.
 A missing object within the lease remains `rtdb.storage/missing-object`, which marks a violated drift or retirement premise.
 Storage tests check admission at the deadline, the overrun classification and lease narrowing.
 The `garbageCollector` configuration accepts `readerLease` and `readerLeaseMargin` as ISO-8601 durations.
 Nodes with log processing disabled hold no lease, because they have no confirmed catalog; the native follower path always processes the log.
+
+The combined formal runner passed with the Rust boundary and native replay options on the lease commits before rebasing onto `8a84b69bb`, including 131 Verus obligations across the baseline areas, 74 Verus controls, and the Lean, TLC, Apalache, Alloy, Maude, mCRL2, AutoHyper and SMT studies.
+Its native checkpoint replay now requires both follower lease tests.
+The runner builds each cargo case with `--no-run` under its own one-hour limit before the five-minute run limit, because a fresh source copy rebuilds the workspace; an earlier attempt spent 4 minutes 42 seconds of the run limit compiling.
+Its input manifest SHA-256 is `ba25a8a301174849e3f69742c51d6d58a661f213803d85658c0c5bf601e3b2ef`.
 Transaction resolution on the leader remains protected by the partition registry and holds no lease.
 
 == Trie dependencies of the installed checkpoint

@@ -31,7 +31,17 @@ def clone_file(relative, directory):
 
 
 def run_case(command, directory, evidence, case, env=None):
-    timeout = 300 if command[0] == "cargo" else 120
+    if command[:2] == ["cargo", "test"] and "--no-run" not in command:
+        # A fresh source copy rebuilds the workspace; the build gets its own limit so the case limit bounds only the run.
+        split = command.index("--") if "--" in command else len(command)
+        build_command = [*command[:split], "--no-run"]
+        build = run_case_with_timeout(build_command, directory, evidence, f"{case}-build", env, 3600)
+        if build.returncode:
+            return build
+    return run_case_with_timeout(command, directory, evidence, case, env, 300 if command[0] == "cargo" else 120)
+
+
+def run_case_with_timeout(command, directory, evidence, case, env, timeout):
     (evidence / f"{case}.command.json").write_text(json.dumps({
         "command": command,
         "directory": str(directory),
@@ -1577,11 +1587,15 @@ def verify_checkpoint_replay(args, source):
         "recovery_advances_after_collection_of_the_listed_checkpoint",
         "recovery_advances_after_collection_of_a_selected_table_block",
     )
+    follower_leases = (
+        "a_follower_cursor_keeps_its_files_while_its_lease_lasts",
+        "a_follower_cursor_past_its_lease_is_refused_before_reading_collected_files",
+    )
     if (
         baseline.returncode
-        or not all(f"{count} passed; 0 failed" in baseline.stdout for count in (1, 6))
+        or not all(f"{count} passed; 0 failed" in baseline.stdout for count in (1, 8))
         or not all(f"{test} ... ok" in baseline.stdout for test in
-                   ("recovery_preserves_queries_through_tiered_publication", *overlapping_collection))
+                   ("recovery_preserves_queries_through_tiered_publication", *overlapping_collection, *follower_leases))
     ):
         raise ValueError("checkpoint replay baseline failed")
     blocks = source / "rust/crates/replication/src/blocks.rs"
@@ -1624,7 +1638,7 @@ def verify_checkpoint_replay(args, source):
             raise ValueError("disabling refresh did not fail both collection replay cases")
     finally:
         blocks.write_bytes(original)
-    print("rust-checkpoint-replay: seven tests passed, root-first and fail-fast mutations rejected")
+    print("rust-checkpoint-replay: nine tests passed, root-first and fail-fast mutations rejected")
 
 
 def verify_checkpoint_trie_retention(args, source):
