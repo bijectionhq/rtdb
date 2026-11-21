@@ -3,6 +3,8 @@ use std::sync::Arc;
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, MemoryBudget, MemoryReservation, Result, TemporalBounds, Timestamp};
 use serde::{Deserialize, Serialize};
 
+mod event_step;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "PolygonParts", into = "PolygonParts")]
 pub struct Polygon {
@@ -160,9 +162,11 @@ impl<C> CalculatorState<C> {
             }
             erased = same_entity && entity.erased;
         }
-        let outside_bounds = header.op != EventOp::Erase
-            && self.bounds.is_some_and(|bounds| header.system_from >= bounds.system_time.upper());
-        Ok(EventStep { same_entity, applies: !erased && !outside_bounds })
+        let applies = event_step::applies(
+            erased, header.op == EventOp::Erase, header.system_from.0,
+            self.bounds.map(|bounds| bounds.system_time.upper().0),
+        );
+        Ok(EventStep { same_entity, applies })
     }
 
     fn advance(&mut self, header: &EventHeader, step: EventStep) -> &mut EntityState<C> {

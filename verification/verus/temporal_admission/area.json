@@ -1,0 +1,39 @@
+{
+  "summary": "Both production temporal resolvers share the checked admission of future events and history-wide ERASE.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 4,
+  "controls": {
+    "admit_upper_endpoint": {
+      "defect": "An ordinary event recorded at the system interval's exclusive upper edge is admitted.",
+      "mutate": [{
+        "file": "rust/crates/temporal/src/event_step.rs",
+        "find": "        Some(upper) => system_from < upper,\n        None",
+        "replace": "        Some(upper) => system_from <= upper,\n        None"
+      }],
+      "expect": [{
+        "file": "rust/crates/temporal/src/event_step.rs",
+        "function": "applies",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 3
+    },
+    "erase_as_ordinary_event": {
+      "defect": "The implementation and its local contract both suppress erase outside the query's system range.",
+      "mutate": [{
+        "file": "rust/crates/temporal/src/event_step.rs",
+        "find": "out == (!already_erased && (erase || (match system_upper {",
+        "replace": "out == (!already_erased && ((match system_upper {"
+      }, {
+        "file": "rust/crates/temporal/src/event_step.rs",
+        "find": "    !already_erased && (erase || match system_upper {",
+        "replace": "    !already_erased && (match system_upper {"
+      }],
+      "expect": [{
+        "file": "verification/verus/temporal_admission/laws.rs",
+        "function": "an_erase_in_the_admitted_history_applies_beyond_the_query_time",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 3
+    }
+  }
+}
