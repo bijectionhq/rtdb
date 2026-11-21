@@ -19,6 +19,7 @@ use tantivy::store::Compressor;
 use tantivy::tokenizer::{PreTokenizedString, Token};
 use tantivy::{Directory, HasLen, Index, IndexSettings, TantivyDocument, Term};
 
+use crate::rank_windows::{document_range, extend_impact, window_of};
 use crate::rectangle::merge_adjacent_valid_time;
 
 const MAGIC: &[u8; 8] = b"RTSRCH01";
@@ -27,8 +28,6 @@ pub const FORMAT_VERSION: i32 = 7;
 const WRITER_MEMORY: usize = 32 << 20;
 /// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
 const SIDECAR: &str = "rtdb.sidecar";
-/// Documents are bounded in windows of this many consecutive ids.
-const WINDOW: u32 = 128;
 /// A term in at least this many documents has its window bounds stored; a rarer term's are computed from its postings when asked.
 const STORED_IMPACTS: u32 = 1024;
 /// A row's place in a column's runs where the row is visible nowhere, and where it is visible with the column null or absent.
@@ -282,9 +281,11 @@ fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tanti
     let mut impacts: Vec<Impact> = Vec::new();
     let mut doc = postings.doc();
     while doc != tantivy::TERMINATED {
-        let (window, frequency, length) = (doc / WINDOW, postings.term_freq(), lengths.fieldnorm(doc));
+        let (window, frequency, length) = (window_of(doc), postings.term_freq(), lengths.fieldnorm(doc));
         match impacts.last_mut() {
-            Some(last) if last.window == window => { last.frequency = last.frequency.max(frequency); last.length = last.length.min(length); }
+            Some(last) if last.window == window => {
+                (last.frequency, last.length) = extend_impact(last.frequency, last.length, frequency, length);
+            }
             _ => impacts.push(Impact { window, frequency, length }),
         }
         doc = postings.advance();
@@ -915,7 +916,7 @@ impl Windows {
         let mut scorer = ExactScorer::open(segment, self.field, Arc::clone(&self.scoring))?;
         let mut found = Vec::new();
         for window in windows {
-            let (start, stop) = (window.saturating_mul(WINDOW), window.saturating_add(1).saturating_mul(WINDOW));
+            let (start, stop) = document_range(window);
             let mut doc = if docs.doc() < start { docs.seek(start) } else { docs.doc() };
             while doc < stop && doc != tantivy::TERMINATED {
                 if self.file.visible(doc, self.bounds) { found.push((self.file.sidecar.doc_match(doc), scorer.score(doc))); }
@@ -1107,7 +1108,7 @@ mod tests {
                 let mut ranked = file.ranked("body", &matching, &rank_scorer, bounds).unwrap();
                 let windows: BTreeMap<u32, f64> = ranked.0.as_ref().map_or_else(BTreeMap::new, |windows| windows.windows.iter().map(|(bound, window)| (*window, *bound)).collect());
                 for (doc, score) in &expected {
-                    let bound = windows.get(&(doc.doc / WINDOW)).unwrap_or_else(|| panic!("{matching:?}: doc {} is in no window", doc.doc));
+                    let bound = windows.get(&window_of(doc.doc)).unwrap_or_else(|| panic!("{matching:?}: doc {} is in no window", doc.doc));
                     assert!(score <= bound, "{matching:?}: doc {} scores {score} above its window's bound {bound}", doc.doc);
                 }
                 let mut handed = Vec::new();

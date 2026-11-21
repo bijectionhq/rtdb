@@ -7,6 +7,7 @@ pub mod definitions;
 pub mod file;
 pub mod lane;
 mod rank_cutoff;
+mod rank_windows;
 mod rectangle;
 pub mod runtime;
 

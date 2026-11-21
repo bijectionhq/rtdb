@@ -112,7 +112,8 @@ In production, cache invalidation and pathname publication share the state lock.
 == Remaining proof obligations
 
 The complete native temporal ceiling and rectangle emitter still need a refinement proof against the point evaluator.
-The search ranking proof still needs coverage of the production floating-point score frontier, alternate physical recency page layouts, and optional build failure under memory pressure.
+At this stage the search ranking proof still needed coverage of the production floating-point score frontier, alternate physical recency page layouts, and optional build failure under memory pressure.
+The later ranking entries below identify the parts of the frontier now checked.
 The durable protocol models assume provider behavior.
 Provider faults, object-store recovery, the full trie coverage transition and cross-node lease accounting need production refinement evidence.
 The observations here support specific component claims and bounded protocol claims.
@@ -443,3 +444,31 @@ All 29 search-crate unit tests and all 18 native SQL search tests passed, along 
 
 The proof depends on the frontier inputs.
 Showing that candidate visibility checks, heap selection, window enumeration and index metadata collectively supply an upper bound for every qualifying row is a separate obligation.
+
+The combined formal runner passed on `de7a2f7b3` with 62 Verus obligations in eight areas and 30 rejected Verus controls.
+It ran the Lean, TLC, Verus, Z3, Alloy, Apalache, and Maude cases.
+The input manifest SHA-256 is `e309ab163d74616f48eb5e6d7c711e3d0cf670185b4fe0186e4d56addb2f37ef`.
+The search tests were run separately from the formal runner.
+
+== Ranked search window coverage
+
+Lean checked link:../lean/SearchWindows.lean[the model] for all posting lists, document IDs, and term lists with at least one matching term.
+A posting's window summary has a frequency at least as large as the posting's and a length at most as large as its length.
+If each term's list contains every window holding that term, their intersection contains the window of every document with all the terms.
+The half-open interval of the assigned window contains the document, including at the first document of a window.
+Three model controls failed their general laws and concrete witnesses when choosing the longest length, consulting the next window in an intersection, or shifting a range's start.
+
+Verus checked six obligations in link:../verus/search_windows/proof.rs[the production window area].
+The Rust functions agree on assignment and the half-open scan interval for every document ID below the maximum word.
+The impact accumulator preserves the maximum frequency and minimum length when a posting joins the window.
+The single mutations failed their contracts.
+With the contracts also weakened, the assignment and scanning law caught both routing mutations and the impact law caught the length mutation.
+
+The 29 search unit tests, 18 SQL search tests, and seven node unit tests passed.
+Reproduce the native search checks from the checkout root with
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-search --lib -p rtdb-node --test search`.
+
+The model and verified functions leave several premises at the call sites.
+Tantivy must enumerate sorted postings of the queried term and preserve document identity.
+The persisted sidecar must represent the same postings and extrema as a computation on demand.
+The remaining native loop, intersection, visibility, and frontier-coverage steps need refinement evidence that these premises hold at the ranker's cutoff.

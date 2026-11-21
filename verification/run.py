@@ -245,6 +245,47 @@ def verify_compaction_projection(args, scratch, history):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 
+def verify_search_windows(args, scratch):
+    path = Path("verification/lean/SearchWindows.lean")
+    controls = {
+        "baseline": None,
+        "longest-document": (
+            "min posting.length impact.length", "max posting.length impact.length",
+            ["summary_bounds_every_posting", "summary_bounds_every_posting",
+             "summary_combines_extrema_from_different_postings"],
+        ),
+        "intersect-next-window": (
+            "(windows term).contains window", "(windows term).contains (window + 1)",
+            ["intersection_keeps_a_shared_window", "intersection_keeps_every_matching_document"],
+        ),
+        "shift-lower-bound": (
+            "min (window * 128) maxWord", "min (window * 128 + 1) maxWord",
+            ["a_window_reads_its_first_document", "scanning_interval_matches_assignment",
+             "scanning_interval_matches_assignment"],
+        ),
+    }
+    allowed = {"propext", "Classical.choice", "Quot.sound"}
+    for name, mutation in controls.items():
+        case = f"lean-search-windows-{name}"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        if mutation:
+            replace_once(source, mutation[0], mutation[1])
+        checked = run_case([args.lean, str(path)], directory, args.evidence, case)
+        if mutation:
+            observed = lean_error_theorems(source, path, checked.stdout)
+            expected = sorted(mutation[2])
+            if not checked.returncode or observed != expected:
+                raise ValueError(f"{case}: expected {expected}, observed {observed}")
+        else:
+            audited = re.findall(r"depends on axioms: \[([^\]]*)\]|does not depend on any axioms", checked.stdout)
+            if checked.returncode or len(audited) != 7 or any(
+                set(re.findall(r"[\w.]+", axioms)) - allowed for axioms in audited
+            ):
+                raise ValueError("Lean search window proof or axiom audit failed")
+        print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
+
+
 def verify_reader_retention(args, scratch):
     path = Path("verification/lean/ReaderRetention.lean")
     controls = {
@@ -327,6 +368,7 @@ def verify_lean(args, scratch):
             verify_ceiling(args, scratch, directory)
             verify_reader_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
+            verify_search_windows(args, scratch)
             independence = Path("verification/lean/Minimality.lean")
             clone_file(independence, directory)
             checked = run_case(

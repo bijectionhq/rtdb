@@ -1043,8 +1043,10 @@ The ledger gives per-model state counts and scopes, plus bounded Apalache, Alloy
 |Lean covers the abstract frontier condition.
 Z3 covers the declared rounding premises, a concrete binary64 witness, and exact binary64 ordering of the cutoff keys.
 Verus checks that the production cutoff requires strict dominance of both the scored-candidate and unread-window frontier bounds.
+Lean proves that complete term-window summaries preserve all conjunctive matches. Verus checks production posting assignment, scan range and impact accumulation.
 The native score witness passes and the unpadded mutation fails.
 |Prove that the planner, visibility verification, and index supply a complete frontier for every qualifying row, and that each supplied maximum covers its whole source.
+Relate the native postings iterator and persisted sidecar to the modeled complete term-window summaries.
 
 |Recovery and Azure
 |Four native checkpoint tests and their root-first control, and two loopback Azure tests and their two source controls, passed as specified in the combined run.
