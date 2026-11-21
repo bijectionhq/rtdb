@@ -519,3 +519,12 @@ Apalache checked the same safety conditions up to ten transitions and independen
 This is bounded model evidence under synchronized selection and deletion authorization, immutable identities, atomic durable head publication, and truthful durability.
 The model represents suffix retention with an ordered floor and assumes recovery can consult the advertised roots.
 It abstracts object discovery failures, concurrent recoveries, exact writes and log offsets, and the production implementation of a recovery reference.
+
+== Combined verification through recovery collection
+
+The complete runner passed on `c50748e38` with both Rust options enabled.
+It checked 68 Verus obligations in nine areas and captured the expected diagnostics for 36 Rust proof mutations.
+TLC completed 17 bounded baselines and found the expected counterexamples or reachability witnesses in 39 controls.
+Lean, Z3, Alloy, Apalache, and Maude also passed their recorded checks.
+The same run checked replica compile failures, the binary64 witness and its mutation, the 4,096-observation native temporal replay, all four checkpoint tests and the root-first mutation, and the two loopback Azure cases with their two source mutations.
+The input manifest SHA-256 is `3bd0140877aef40ef8be727633318d2f33609db813eddabfda4e4b521d0824f7`.
