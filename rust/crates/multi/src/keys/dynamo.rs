@@ -47,6 +47,10 @@ impl DynamoKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for DynamoKeyService {
+    async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>> {
+        self.existing(deployment).await
+    }
+
     async fn key(&self, id: &str) -> Result<[u8; KEY_BYTES]> {
         if let Some(key) = self.existing(id).await? { return Ok(key); }
         let created = new_key()?;

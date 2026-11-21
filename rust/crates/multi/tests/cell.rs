@@ -417,6 +417,53 @@ async fn an_open_connection_survives_a_planned_move_and_its_holders_death() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
+    let cell = Cell::start(1, None).await;
+    let id = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, detail) VALUES (1, 'sample-payload-for-archive')").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    let advance = |previous: Option<i64>| {
+        let cell = &cell;
+        async move {
+            cell.node(holder).agent.flush("shop").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    if let Some(checkpoint) = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap().checkpoint
+                        && previous.is_none_or(|block| checkpoint.block > block)
+                    {
+                        return checkpoint;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await.unwrap()
+        }
+    };
+    let first = advance(None).await;
+    let destination = tempfile::tempdir().unwrap();
+    let archive = CellStorage::Local { root: destination.path().to_owned() };
+    let operation = uuid::Uuid::new_v4();
+    let capture = rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
+    assert_eq!(capture.point.checkpoint, first);
+    assert!(capture.objects.iter().any(|object| object.name.ends_with(".arrow")));
+    assert!(capture.objects.iter().any(|object| object.name.starts_with("blocks/")));
+    const SAMPLE: &[u8] = b"sample-payload-for-archive";
+    for object in &capture.objects {
+        let path = destination.path().join(format!("checkpoint-captures/{id}/{operation}/objects/{}", object.name));
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len() as u64, object.bytes);
+        assert!(!bytes.windows(SAMPLE.len()).any(|window| window == SAMPLE));
+    }
+    client.simple_query("INSERT INTO orders (_id, detail) VALUES (2, 'later')").await.unwrap();
+    assert!(advance(Some(first.block)).await.block > first.block);
+    let replay = rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
+    assert_eq!(replay, capture);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_small_flush_writes_one_pack_and_its_catalog() {
     let cell = Cell::start(1, None).await;
     let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
