@@ -43,6 +43,7 @@ It establishes a useful comparison workload for the warm path.
 | --- | --- | --- |
 | Baseline | Current trie-scoped Tantivy artifacts, corpus assembly, and scan handoff | Records the costs of filtering, scoring, verification, and fetching. |
 | Corpus control | Calculate a score's term statistics once and avoid building complete posting vectors when cached counts and membership lookups suffice | Isolates avoidable work without changing index ownership. |
+| Narrowed MATCH | Check postings only for the selected IIDs on a bitmap cache miss | Isolates predicate verification after ranked narrowing. |
 | Direct ranked hits | Return verified row versions and their scores for eligible point queries, and fetch requested fields after top-k selection | Isolates the scan handoff and late materialization. |
 | Corpus checkpoint | Store exact document count, rounded length sum, and per-term frequencies at a basis and apply exact deltas to the requested basis | Measures query savings against checkpoint and overlay maintenance. |
 | Range reads | Fetch the relevant parts of existing immutable bundles through a range-capable object store | Isolates cold byte amplification and serial requests. |
@@ -245,3 +246,11 @@ The five-file run transferred 94% of the whole-bundle bytes for selective rankin
 Higher fan-out compounds reader overhead, so continue measuring the number of search files touched on real workloads.
 Independent generation publication becomes worth its maintenance and retention costs when production fan-out regularly exceeds what primary compaction keeps small.
 The four-IID update showed almost identical immediate search bytes for the present trie path and an appended overlay.
+
+## Verification
+
+The locked Rust workspace suite passed 4,864 tests, with 3 ignored.
+The focused release run passed all 49 cases, including the same-transaction BM25 and ranged-reader regressions.
+The full Gradle unit rerun passed all 3,187 cases.
+The first Gradle run hit a five-second JVM compaction sync timeout, and that case subsequently passed in isolation and in the full rerun.
+The benchmark harnesses also passed their independent result and score oracles on the release build.
