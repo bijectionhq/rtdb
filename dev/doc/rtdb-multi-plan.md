@@ -502,6 +502,9 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    Clearing quarantine fences the isolation holder so the next claim returns the deployment to the general pool.
    A planned move reserves a target for a bounded interval and releases the reservation if activation fails.
    The source park verifies the holding epoch and reservation, and a delayed target activation requires the reservation at its claim.
+   When the source observes at most 64 live rows and 16 replica records since its last adopted boundary, with the intake processed through its latest position, it can park without uploading a block.
+   The successor seals the quorum and recovers the durable tail before it confirms leadership.
+   Larger or still-processing tails use the source's flush path.
 3. Autoscaling signals per pool, published as metrics through `metrics` and `server/src/metric_export`: nodes by the binding `LoadVector` dimension, logkeepers by ingest, workers by queue depth, gateways by connections.
 
 **Tests.**
@@ -517,6 +520,15 @@ Every deployment returned the result of exactly three counter writes, and each o
 The surviving nodes peaked at 443,264,941 and 442,159,543 execution bytes against a 512 MiB limit each.
 A previous run without memory reclamation reached the execution budget and could not finish the same workload.
 With the JVM suite running on the same host, the interval from move request to the first successful write had a median of 184.7 ms and p99 of 725.0 ms.
+Two release runs without a build running concurrently used the same 1,000-deployment workload and eight concurrent operations.
+
+| Handoff policy | Move and first write p50 | Move and first write p99 | Highest survivor execution memory | Kill through counter verification |
+| --- | ---: | ---: | ---: | ---: |
+| Flush every move | 81.6 ms | 222.4 ms | 422.2 MiB | 19.6 s |
+| Replay the short tail | 39.2 ms | 45.3 ms | 102.1 MiB | 5.5 s |
+
+The short-tail run measured the move alone at 33.5 ms p50 and 39.7 ms p99.
+It verified all 1,000 counters and checked the later epochs of the 346 deployments held by the node that was killed.
 The 30 ms stall gate still needs an isolated workload that measures admission during handoff.
 
 ```sh

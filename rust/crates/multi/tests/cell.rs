@@ -420,6 +420,31 @@ async fn an_open_connection_survives_a_planned_move_and_its_holders_death() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_planned_move_replays_a_short_tail_and_flushes_a_large_one() {
+    let cell = Cell::start_durable(2).await;
+    let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (0, 123)").await.unwrap();
+    let source = cell.holder("shop").await.unwrap();
+    let target = 1 - source;
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id(), &control()).await.unwrap();
+
+    let path = cell.data.path().join("objects").join(record.storage_prefix());
+    assert!(!files_under(&path).iter().any(|file| file.to_string_lossy().contains("/~packs/")));
+    assert_eq!(cell.holder("shop").await, Some(target));
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["123"]);
+
+    let rows = (1..=65).map(|id| format!("({id}, {id})")).collect::<Vec<_>>().join(", ");
+    client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES {rows}")).await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(source).lease.id(), &control()).await.unwrap();
+    assert!(files_under(&path).iter().any(|file| file.to_string_lossy().contains("/~packs/")));
+    assert_eq!(cell.holder("shop").await, Some(source));
+    assert_eq!(values(&client, "SELECT COUNT(*) FROM orders").await, ["66"]);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_small_flush_writes_one_pack_and_its_catalog() {
     let cell = Cell::start(1, None).await;
     let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

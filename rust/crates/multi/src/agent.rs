@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberState, claim, effective_holder, now_ms, park};
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
@@ -58,6 +58,8 @@ pub const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
 const PRESSURE_WAIT: Duration = Duration::from_millis(500);
 const PRESSURE_PARKS_PER_PASS: usize = 8;
+const HANDOFF_REPLAY_ROWS: u64 = 64;
+const HANDOFF_REPLAY_RECORDS: i64 = 16;
 
 struct LocalHolding {
     id: String,
@@ -370,15 +372,18 @@ impl NodeAgent {
             record.id == ticket.deployment && record.epoch == epoch && record.holder.as_ref() == Some(&self.member())
                 && record.active_move(now_ms()).is_some_and(|intent| intent.request == ticket.request)
         });
-        if let Some((move_epoch, ticket)) = moving {
-            if id != ticket.deployment || epoch != move_epoch
-                || !self.directory.deployment(&id).await?.as_ref().is_some_and(is_requested) {
+        let log_epoch = if let Some((move_epoch, ticket)) = moving {
+            if id != ticket.deployment || epoch != move_epoch {
                 return Err(stale_handoff(name));
             }
-        }
+            let record = self.directory.deployment(&id).await?.filter(is_requested).ok_or_else(|| stale_handoff(name))?;
+            Some(StorageEpoch(record.log_epoch))
+        } else { None };
 
-        // The next holder starts from a closed block once the flushed block has been adopted.
-        if let Ok(database) = self.node.catalog().database(name) { self.flush_and_adopt(&database, &id, epoch, flush_wait).await?; }
+        if let Ok(database) = self.node.catalog().database(name)
+            && !log_epoch.is_some_and(|epoch| short_handoff_tail(&database, epoch)) {
+            self.flush_and_adopt(&database, &id, epoch, flush_wait).await?;
+        }
         for _ in 0..8 {
             let Some(record) = self.directory.deployment(&id).await? else { break };
             if !is_requested(&record) { return Err(stale_handoff(name)); }
@@ -677,6 +682,16 @@ impl NodeAgent {
             }
         }
     }
+}
+
+fn short_handoff_tail(database: &Database, log_epoch: StorageEpoch) -> bool {
+    let status = database.status();
+    let boundary = status.adopted_block.as_ref().and_then(|block| block.boundary_replica_position())
+        .map_or(-1, |position| position.after_offset(log_epoch));
+    matches!(status.role, DriverRole::Leading(_))
+        && status.replica_position.after_offset(log_epoch) - boundary <= HANDOFF_REPLAY_RECORDS
+        && database.live_rows() <= HANDOFF_REPLAY_ROWS
+        && database.latest_submitted_position().is_ok_and(|latest| latest <= database.progress().current().source_position)
 }
 
 fn stale_handoff(name: &str) -> Anomaly {

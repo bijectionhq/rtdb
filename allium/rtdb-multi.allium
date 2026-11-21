@@ -1500,6 +1500,20 @@ rule HandOff {
         ClaimAttempted(member: subscription.member, record: subscription.deployment, expected_epoch: source.epoch)
 }
 
+rule ParkForReservedMove {
+    -- This path allows a successor to recover a short tail from the quorum.
+    when: GuardedParkRequested(record, epoch, reservation)
+
+    requires: record.epoch = epoch
+    requires: record.active_move = reservation
+
+    ensures:
+        if not (IntakeCaughtUp(record) and ShortLocalTail(record)):
+            FlushAndAdopt(record)
+        ParkPlacement(record, preserving: reservation)
+        RecoverFromReplicaLog(record, reservation.target)
+}
+
 rule AnswerMoved {
     when: TxArrived(holding, tx, key)
 

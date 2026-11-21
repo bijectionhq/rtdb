@@ -104,7 +104,7 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &Contro
     Err(last.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can hold this deployment")))
 }
 
-/// A planned move reserves the next claim while the current holder flushes and parks.
+/// Reserves the next claim for `target` during the handoff.
 pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
     let members = members(directory).await?;
     let address = control_address(&members, target)?;

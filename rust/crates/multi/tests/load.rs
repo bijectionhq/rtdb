@@ -136,13 +136,17 @@ async fn a_thousand_deployments_keep_their_history_through_handoff_and_failover(
                 let client = cell.connect(name).await;
                 let started = Instant::now();
                 admin::move_deployment(cell.directory.as_ref(), name, &cell.node(*target).lease.id(), &common::control()).await.unwrap();
+                let move_elapsed = started.elapsed();
                 client.simple_query("UPDATE counters SET n = n + 1 WHERE _id = 1").await.unwrap();
+                let write_elapsed = started.elapsed();
                 assert_eq!(cell.holder(name).await, Some(*target));
-                started.elapsed()
+                (move_elapsed, write_elapsed)
             }
         })).await);
     }
-    handoffs.sort_unstable();
+    let (mut moves, mut resumed_writes): (Vec<_>, Vec<_>) = handoffs.into_iter().unzip();
+    moves.sort_unstable();
+    resumed_writes.sort_unstable();
     let memory_before_failure: Vec<_> = cell.nodes.iter().flatten().map(|node| node.server.node().memory().used_bytes()).collect();
     println!("retained_execution_bytes_before_kill={memory_before_failure:?}");
 
@@ -179,9 +183,9 @@ async fn a_thousand_deployments_keep_their_history_through_handoff_and_failover(
     }
 
     println!(
-        "deployments={deployments} concurrency={concurrency} failed_placements={} activation_s={:.3} handoff_and_write_p50_ms={:.3} handoff_and_write_p95_ms={:.3} handoff_and_write_p99_ms={:.3} all_verified_after_kill_s={:.3}",
-        lost_epochs.len(), activation.as_secs_f64(), percentile(&handoffs, 50), percentile(&handoffs, 95),
-        percentile(&handoffs, 99), failure_started.elapsed().as_secs_f64(),
+        "deployments={deployments} concurrency={concurrency} failed_placements={} activation_s={:.3} move_p50_ms={:.3} move_p95_ms={:.3} move_p99_ms={:.3} handoff_and_write_p50_ms={:.3} handoff_and_write_p95_ms={:.3} handoff_and_write_p99_ms={:.3} all_verified_after_kill_s={:.3}",
+        lost_epochs.len(), activation.as_secs_f64(), percentile(&moves, 50), percentile(&moves, 95), percentile(&moves, 99),
+        percentile(&resumed_writes, 50), percentile(&resumed_writes, 95), percentile(&resumed_writes, 99), failure_started.elapsed().as_secs_f64(),
     );
     let peaks: Vec<_> = cell.nodes.iter().flatten().map(|node| node.server.node().memory().peak_bytes()).collect();
     println!("survivor_peak_execution_bytes={peaks:?}");
