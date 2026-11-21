@@ -256,3 +256,18 @@ On the integrated source, 79 multi library tests and 53 loopback cell tests pass
 The separate Logkeeper run passed 27 unit tests and 11 contract tests.
 The transfer test moves a restored checkpoint and ordered tail, returns to an earlier cell after the old serving residence is disposed, and checks the retained custody and query result.
 These runs used local stores and journals. S3 permissions and remote task-stop evidence still require provider qualification.
+
+## S3 erasure ordering
+
+The deletion model tracks the recorded and legacy write lease deadlines, a delayed upload, two empty inventories, and publication of a receipt after key destruction. [RTDBDeletion.tla](../tla/RTDBDeletion.tla)
+The passing configuration assumes accepted uploads complete within one credential lifetime and administrative writers drain before deletion.
+With a two-tick credential lifetime, two-tick upload delay, and seven ticks of modeled time, TLC checked 11,007 distinct states.
+
+| Configuration | TLC result |
+| --- | --- |
+| `RTDBDeletion.cfg` | The first inventory follows expiry, the receipt follows separated observations, and the inventory remains empty after the receipt. |
+| `RTDBDeletionWithoutLegacyHorizon.cfg` | The first inventory can run while a legacy write lease remains active. |
+| `RTDBDeletionWithoutSpacing.cfg` | An upload admitted before expiry can complete after the receipt. |
+| `RTDBDeletionUndrainedAdministrator.cfg` | A delayed administrative upload can recreate an object after the receipt. |
+
+Use `dev/tla/RTDBDeletion.tla` as the module for all four configurations with the same TLC command above.
