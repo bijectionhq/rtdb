@@ -1849,3 +1849,74 @@ The native reset test now restarts with compaction enabled, recompacts, and chec
 A planning test checks that outputs differ from the pre-reset plan only by epoch, and format tests cover round trips, partition groups and non-canonical epochs.
 The format, index, maintenance, replication, node, conformance, Multi and server suites passed apart from that test before the historical-output fix, and the reset and maintenance suites passed after it.
 
+
+=== Hosted catalog floors and compaction naming epochs
+
+The current Multi writer advances the catalog admission floor from an installed retirement receipt.
+The floor, reader registrations and writer fence use the same versioned directory record.
+An open registration for an older or opaque capture in that storage root and replica journal blocks advancement.
+A new capture at or above the installed floor is admissible, while earlier or untracked captures fail with retryable `rtdb.node/catalog-not-current`.
+The blocked writer retains the pending intent, and a successor can retry from its durable receipt after the captured provider work drains.
+The floor is scoped by residence, root, object namespace and journal, and survives DynamoDB parking.
+Recovery and fork dependencies and physical erasure still use their existing mechanisms.
+
+TLC exhausted 2,112 distinct states to graph depth 15 with one reader, three catalog cuts, one writer replacement and at most six updates of the directory version.
+It rejected four controls that admit an older capture, ignore an opaque hold, skip the reader CAS or skip the floor CAS.
+A separate reachable state witnesses admission of a current reader after the floor advances and the writer changes.
+Apalache independently checked the same safety laws through eight transitions and found the stale-floor-write counterexample.
+The model assumes a linearizable directory CAS and a receipt from an installed replica prefix. link:../tla/CatalogAdmissionFloor.tla[Catalog admission model]
+
+Lean checked four theorems over arbitrary finite lists of registered readers and finite histories of atomic changes.
+Three negative controls removed registration validation, removed held-reader validation, or permitted a rewind.
+Verus checked eleven functions in the exact Rust reader admission module and its laws.
+Fourteen controls failed at their expected proof sites, including six that change the floor boundary or admit an opaque capture. link:../lean/CatalogAdmissionFloor.lean[Ledger invariants] · link:../verus/catalog_reader_admission/area.json[Rust admission contracts]
+
+The epoch-qualified compaction branch on main made physical names distinct across resets.
+The trie catalog now checks a publication against the current naming epoch and requires full trie identity when removing a garbage entry.
+A follower installs the checkpoint's exact catalog and naming epoch together when they differ from its local epoch.
+The Rust tests replay delayed publication and removal across a reset and independently exercise follower checkpoint adoption.
+
+The floor supplies an admission constraint.
+A deletion grant still needs an atomic certificate that binds the selected publication to an exact provider identity and accounts for recovery and fork references.
+Mixed engine versions and live provider qualification remain open.
+
+Raw TLC and Apalache evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-model-uud2967g/`.
+Lean and Verus evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-lean-qqi8n_d2/` and `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-verus-lbknwrrt/`.
+The TLA+ source SHA-256 is `492bf139feb3f65c30b02c1565f1d12e39d8e555113e0d51250e61237d2b94fd`.
+The Lean source SHA-256 is `dc5e01868b1a741791774b336c454c3035ed3d159857c88718f92aef5df79054`.
+The Verus production source SHA-256 is `71d6bc201f6650bec3e3229dd8f26160f37eb1708f2b9acd482cc04e93e837d6`.
+
+The selected Rust suites passed 257 tests with one ignored on production revision `b4798f6a2`.
+They cover the in-memory directory CAS, parked record encoding, intent retry, delayed trie notices and reset checkpoint adoption.
+The local suite used the DynamoDB build configuration without contacting a hosted directory.
+The retained suite log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-admission-floor-and-naming-epochs-b4798f6a2.log`, SHA-256 `a747e3e942b33e4c2d8dba7fd1778815507d366a9c4a2bbf71a82a2258cc9b3d`.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --locked --offline \
+  -p rtdb-index -p rtdb-maintenance -p rtdb-multi -p rtdb-directory -p rtdb-replication \
+  --features rtdb-multi/dynamodb --lib --test gc --test catalogs --test jobs --no-fail-fast
+----
+
+The first isolated floor replay built its test executable and then timed out waiting for Cargo's build lock.
+The built executable passed the exact baseline when run directly.
+The runner now uses Cargo's structured build output to run an exact replay directly when it builds one test executable.
+The pending mutation replay records its commands and outputs in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-replay-final-9o0olj0u/`.
+
+The full Gradle invocation first stopped during root Clojure compilation because Testcontainers could not connect to Docker.
+After starting the installed local Docker Desktop daemon, the full run reached the root tests.
+It recorded 2,802 passes and 396 failures.
+Of those failures, 395 bindings tests had no `xtdb.native.library` configured and the single remaining root failure was an SSL connection setup error in `cross-db-refs-in-dml-5831`.
+A focused rerun supplies the installed local library and repeats the affected root namespace.
+The retained full Gradle logs are `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-before-docker.log` and `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-after-docker.log`.
+
+The exact runner selected the executable from Cargo's artifact report and ran it in the package directory.
+The archived naming-epoch replay passed.
+Re-enabling old-epoch publication and removing the physical identity check each failed at its declared assertion.
+The two controls and exact commands are in the replay evidence directory above.
+
+The focused Gradle retry exited zero with 415 passes using a previously built native library.
+It included all 398 binding tests and all 17 tests in the filtered multi-database namespace, including the earlier SSL setup failure.
+The focused log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-focused.log`.
+A new native-library build from the published source and a full Gradle run using that library are in progress.

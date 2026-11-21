@@ -6,8 +6,8 @@ use std::{
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, GenericByteArray, Int8Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
     types::ByteArrayType,
 };
@@ -19,7 +19,7 @@ use rtdb_columnar::{
 };
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
 use rtdb_query::{OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
-use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
+use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, TimeUnit};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -940,6 +940,10 @@ impl Covered {
                     | S::Bool
                     | S::Uuid
                     | S::DateDay
+                    | S::Timestamp {
+                        unit: TimeUnit::Microsecond,
+                        timezone: Some(_)
+                    }
                     | S::I8
                     | S::I16
                     | S::I32
@@ -1111,6 +1115,14 @@ fn covered_array<'a>(
             cells!(Day, |value| i32::try_from(value)
                 .map_err(super::format_error)?)
             .collect::<Result<Date32Array>>()?,
+        ),
+        S::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: Some(timezone),
+        } => Arc::new(
+            cells!(InstantMicros, |value| value)
+                .collect::<Result<TimestampMicrosecondArray>>()?
+                .with_timezone(timezone.clone()),
         ),
         S::I8 => integer!(Int8Array, i8),
         S::I16 => integer!(Int16Array, i16),

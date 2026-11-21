@@ -37,9 +37,10 @@ enum Kind {
     Day = 5,
     Unordered = 6,
     Null = 7,
+    InstantMicros = 8,
 }
 
-const KINDS: [Kind; 8] = [
+const KINDS: [Kind; 9] = [
     Kind::Bool,
     Kind::Integer,
     Kind::Text,
@@ -48,7 +49,9 @@ const KINDS: [Kind; 8] = [
     Kind::Day,
     Kind::Unordered,
     Kind::Null,
+    Kind::InstantMicros,
 ];
+const VALID_LAYOUT_BITS: u16 = (1 << KINDS.len()) - 1;
 
 impl Kind {
     fn of(value: AtomRef<'_>) -> Self {
@@ -59,12 +62,13 @@ impl Kind {
             AtomRef::Binary(_) => Self::Binary,
             AtomRef::Uuid(_) => Self::Uuid,
             AtomRef::Day(_) => Self::Day,
+            AtomRef::InstantMicros(_) => Self::InstantMicros,
             AtomRef::Unordered => Self::Unordered,
             AtomRef::Null => Self::Null,
         }
     }
 
-    fn bit(self) -> u8 {
+    fn bit(self) -> u16 {
         1 << self as u8
     }
 
@@ -75,7 +79,7 @@ impl Kind {
             Self::Text => DataType::Utf8,
             Self::Binary => DataType::Binary,
             Self::Uuid => DataType::FixedSizeBinary(16),
-            Self::Day => DataType::Int64,
+            Self::Day | Self::InstantMicros => DataType::Int64,
             Self::Unordered | Self::Null => DataType::Null,
         }
     }
@@ -104,6 +108,7 @@ impl Kind {
         Ok(match self {
             Self::Bool => primitive!(BooleanArray, Bool),
             Self::Day => primitive!(Int64Array, Day),
+            Self::InstantMicros => primitive!(Int64Array, InstantMicros),
             Self::Integer => {
                 let values = cells
                     .map(|cell| match cell {
@@ -173,6 +178,7 @@ impl Kind {
             Self::Binary => cell!(BinaryArray, Binary),
             Self::Uuid => AtomRef::Uuid(fixed(array, row)),
             Self::Day => cell!(Int64Array, Day),
+            Self::InstantMicros => cell!(Int64Array, InstantMicros),
             Self::Unordered => AtomRef::Unordered,
             Self::Null => AtomRef::Null,
         }
@@ -180,7 +186,7 @@ impl Kind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Layout(u8);
+struct Layout(u16);
 
 impl Layout {
     fn kinds(self) -> impl Iterator<Item = Kind> {
@@ -234,7 +240,7 @@ impl Layout {
         let DataType::Union(fields, UnionMode::Dense) = field.data_type() else {
             return Err(invalid());
         };
-        let mut legs = <[Vec<_>; 8]>::default();
+        let mut legs: [Vec<_>; KINDS.len()] = std::array::from_fn(|_| Vec::new());
         let mut ids = Vec::with_capacity(cells.len());
         let mut offsets = Vec::with_capacity(cells.len());
         for cell in cells {
@@ -448,7 +454,9 @@ impl KeyBatch {
         for length in [self.layouts.len(), data.ipc_message.len(), suffix.len()] {
             bytes.extend_from_slice(&u32::try_from(length).map_err(format_error)?.to_le_bytes());
         }
-        bytes.extend(self.layouts.iter().map(|layout| layout.0));
+        for layout in &self.layouts {
+            bytes.extend_from_slice(&layout.0.to_le_bytes());
+        }
         bytes.extend_from_slice(&data.ipc_message);
         bytes.resize(bytes.len().next_multiple_of(ALIGNMENT), 0);
         bytes.extend_from_slice(&data.arrow_data);
@@ -462,7 +470,8 @@ impl KeyBatch {
             Ok(u32::from_le_bytes(raw.try_into().map_err(format_error)?) as usize)
         };
         let width = length(0)?;
-        let layouts_end = 12usize.checked_add(width).ok_or_else(invalid)?;
+        let layouts_bytes = width.checked_mul(size_of::<u16>()).ok_or_else(invalid)?;
+        let layouts_end = 12usize.checked_add(layouts_bytes).ok_or_else(invalid)?;
         let message_end = layouts_end.checked_add(length(4)?).ok_or_else(invalid)?;
         let body_start = message_end
             .checked_next_multiple_of(ALIGNMENT)
@@ -472,9 +481,10 @@ impl KeyBatch {
             return Err(invalid());
         }
         let layouts = bytes[12..layouts_end]
-            .iter()
-            .map(|&mask| {
-                if mask == 0 {
+            .chunks_exact(size_of::<u16>())
+            .map(|raw| {
+                let mask = u16::from_le_bytes([raw[0], raw[1]]);
+                if mask == 0 || mask & !VALID_LAYOUT_BITS != 0 {
                     Err(invalid())
                 } else {
                     Ok(Layout(mask))
@@ -749,6 +759,7 @@ mod tests {
             ],
             [Atom::Uuid([255; 16]), Atom::Text("x".into()), Atom::Null],
             [Atom::Day(-1), Atom::Text("x".into()), Atom::Unordered],
+            [Atom::InstantMicros(-1), Atom::Text("x".into()), Atom::Null],
             [Atom::Unordered, Atom::Text("x".into()), Atom::Null],
             [Atom::Null, Atom::Text("x".into()), Atom::Unordered],
         ];

@@ -1,11 +1,11 @@
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Int8Array,
-    Int16Array, Int32Array, Int64Array, RunArray, StringArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array, UnionArray,
+    Int16Array, Int32Array, Int64Array, RunArray, StringArray, TimestampMicrosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray,
     types::{Int16Type, Int32Type, Int64Type},
 };
-use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_types::{Interval, LogicalType, Result, ScalarType, Timestamp, Value};
+use arrow_schema::{DataType, Field, TimeUnit as ArrowTimeUnit, UnionMode};
+use rtdb_types::{Interval, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -21,6 +21,7 @@ pub(super) enum Scalar<Text, Binary> {
     Binary(Binary),
     Uuid([u8; 16]),
     Day(i64),
+    InstantMicros(i64),
     Unordered,
     Null,
 }
@@ -36,6 +37,7 @@ pub(super) enum Family {
     Binary,
     Uuid,
     Day,
+    InstantMicros,
 }
 
 impl Atom {
@@ -57,6 +59,11 @@ impl Atom {
             Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => {
                 Self::Day(value.date_days()?)
             }
+            Value::Timestamp {
+                value,
+                unit: TimeUnit::Microsecond,
+                timezone: Some(_),
+            } => Self::InstantMicros(*value),
             _ => return None,
         })
     }
@@ -69,6 +76,7 @@ impl Atom {
             Self::Binary(value) => Scalar::Binary(value),
             Self::Uuid(value) => Scalar::Uuid(*value),
             Self::Day(value) => Scalar::Day(*value),
+            Self::InstantMicros(value) => Scalar::InstantMicros(*value),
             Self::Unordered => Scalar::Unordered,
             Self::Null => Scalar::Null,
         }
@@ -84,6 +92,7 @@ impl<'a> AtomRef<'a> {
             Self::Binary(value) => Scalar::Binary(value.to_vec()),
             Self::Uuid(value) => Scalar::Uuid(value),
             Self::Day(value) => Scalar::Day(value),
+            Self::InstantMicros(value) => Scalar::InstantMicros(value),
             Self::Unordered => Scalar::Unordered,
             Self::Null => Scalar::Null,
         }
@@ -151,6 +160,9 @@ impl<'a> AtomRef<'a> {
             DataType::Binary => Self::Binary(value!(BinaryArray)),
             DataType::Date32 => Self::Day(value!(Date32Array).into()),
             DataType::Date64 => Self::Day(value!(Date64Array) / 86_400_000),
+            DataType::Timestamp(ArrowTimeUnit::Microsecond, Some(_)) => {
+                Self::InstantMicros(value!(TimestampMicrosecondArray))
+            }
             _ => Self::Unordered,
         })
     }
@@ -173,6 +185,7 @@ impl<Text, Binary> Scalar<Text, Binary> {
             Self::Binary(_) => Family::Binary,
             Self::Uuid(_) => Family::Uuid,
             Self::Day(_) => Family::Day,
+            Self::InstantMicros(_) => Family::InstantMicros,
         })
     }
 }
@@ -201,6 +214,10 @@ pub(super) fn family(logical: &LogicalType) -> Option<Family> {
             LogicalType::Scalar(S::Binary) => Family::Binary,
             LogicalType::Scalar(S::Uuid) => Family::Uuid,
             LogicalType::Scalar(S::DateDay | S::DateMilli) => Family::Day,
+            LogicalType::Scalar(S::Timestamp {
+                unit: TimeUnit::Microsecond,
+                timezone: Some(_),
+            }) => Family::InstantMicros,
             _ => return None,
         };
         if family.is_some_and(|prior| prior != next) {
