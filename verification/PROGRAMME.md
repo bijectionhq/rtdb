@@ -200,18 +200,18 @@ Goal: one reproducible claim per requirement, on one committed tree.
 
 ## Structural redesign (R3–R9)
 
-Increments 1 (system time bounded by the log, `d85286ba2`) and 2 (engine-owned retry receipts, `85a868c07`) of the redesign are on main; the remaining seven replace mechanisms rather than patch them, and supersede the matching obligations in W1, W2 and W8.
+Increments R1 (system time bounded by the log, `d85286ba2`), R2 (engine-owned retry receipts, `85a868c07`) and R3 (epoch-qualified physical names, `ae7b66e10`) are on main; the remaining six replace mechanisms rather than patch them, and supersede the matching obligations in W1, W2 and W8.
+Each has a design and handoff note in [`verification/redesign/`](redesign/README.md).
 The contract and owner decisions are in `dev/doc/structural-redesign.adoc`; update its status table as each lands.
 
 | ID | Increment | Depends on | Exit test |
 | --- | --- | --- | --- |
-| R3 | Physical names = positional key + naming epoch (+ input digest), written put-if-absent; a compactor reset starts a new epoch; delete the reset fence (`index/src/partition.rs` `reset_to_l0`) | — | A reset during collection never deletes a live file; redundant compactors still converge |
-| R4 | Residence ledger (Multi directory record; classic conditional-write object) with renewable holds and a collection floor; delete `garbage_lifetime`, the fixed lease and collector wait, the reaper grace, wall-clock release stamps and the unbounded in-process registry | Peer model `verification/tla/ResidenceRetirement.tla` | A follower behind the log tip serves a held generation; the collector never deletes below a live hold |
-| R5 | Recovery roots as holds; L0 becomes collectable (`maintenance/src/gc.rs:138`); compactor reset starts a new epoch from a root | R3, R4 | Crash during compaction and reset recovers from a root plus the log suffix |
-| R6 | Seal every durable unit (log segments, tries, artefacts, checkpoints) under destroyable data keys; caches keyed by key id | — | Every stored byte is ciphertext; destroying a key makes the unit and its cached pages unreadable |
-| R7 | Eraser: successors without erased material, log redaction overlays, propagation to forks sharing the history, score-stale artefacts, `rtdb/erased-under-view` after the deadline (≤ 120 s) | R5, R6 | After the deadline a provider-wide plaintext scan finds no erased IID; a pre-erase view gets `erased-under-view` |
-| R8 | Transaction metadata and retry receipts retained only for the receipt window, removed physically | R7 | Expired receipts and metadata are absent from every storage class |
-| R9 | Capabilities for storage reads, provider deletes and cached pages; one composed residence model checked against emitted traces | Grows with R3–R8 | Every mutation named in the redesign fails under both TLC and the trace checker |
+| [R4](redesign/R4-residence-ledger.md) | Residence ledger (Multi directory record; classic conditional-write object) with renewable holds and a collection floor; delete `garbage_lifetime`, the fixed lease and collector wait, the reaper grace, wall-clock release stamps and the unbounded in-process registry | Peer model `verification/tla/ResidenceRetirement.tla` | A follower behind the log tip serves a held generation; the collector never deletes below a live hold |
+| [R5](redesign/R5-recovery-roots.md) | Recovery roots as holds; L0 becomes collectable; compactor reset starts a new epoch from a root | R4 | Crash during compaction and reset recovers from a root plus the log suffix |
+| [R6](redesign/R6-sealing.md) | Seal every durable unit (log segments, tries, artefacts, checkpoints) under destroyable data keys; caches keyed by key id | — | Every stored byte is ciphertext; destroying a key makes the unit and its cached pages unreadable |
+| [R7](redesign/R7-eraser.md) | Eraser: successors without erased material, log redaction overlays, propagation to forks sharing the history, score-stale artefacts, `rtdb/erased-under-view` after the deadline (≤ 120 s) | R5, R6 | After the deadline a provider-wide plaintext scan finds no erased IID; a pre-erase view gets `erased-under-view` |
+| [R8](redesign/R8-metadata-retention.md) | Transaction metadata and retry receipts retained only for the receipt window, removed physically | R7 | Expired receipts and metadata are absent from every storage class |
+| [R9](redesign/R9-capabilities-and-composition.md) | Capabilities for storage reads, provider deletes and cached pages; one composed residence model checked against emitted traces | Grows with R3–R8 | Every mutation named in the redesign fails under both TLC and the trace checker |
 
 ## Blocked: live provider qualification
 

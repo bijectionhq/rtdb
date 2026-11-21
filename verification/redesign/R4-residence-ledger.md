@@ -1,0 +1,66 @@
+# R4 · Residence ledger, reader holds and the collection floor
+
+## Goal
+
+Replace every timer that today stands in for knowing who still reads a file with one linearizable record per database.
+After R4, a file is deleted only when the ledger proves no admitted reader, recovery root or fork can need it.
+
+## Converged design
+
+All three designers proposed the same mechanism; differences are noted inline.
+
+- **The ledger.** One record per database residence holding: the published catalog generation (head), the collection floor `F`, reader holds `(holder, generation, ticket, expiry)`, recovery roots (R5) and, later, the key catalog (R6).
+  - Multi: the deployment's directory record, updated by compare-and-swap. The peer's `catalog_readers` map (below) is the start of it.
+  - Classic: an object in the database's own store written with conditional writes (put-if-absent for a chain of `ledger/<seq>` objects, or If-Match on one head object), and an atomic link or rename on a local filesystem.
+    Designers differed only in layout (one head object, a sequence chain, or a head object plus one hold object per follower); pick one and record why.
+- **Admission.** Before opening storage, a reader CASes a hold on the generation of the catalog it captured.
+  The CAS succeeds only if that generation is at or above `F` and is not revoked by an erasure (R7).
+  A follower that is behind the log tip can still serve an explicit basis it has applied, because admission needs the ledger, not the tip.
+- **Renewal and self-fencing.** Holders renew every `R`.
+  Before each provider request a reader checks its own monotonic deadline (last renewal start + `T` − margin); this reuses the shape of today's `ReadLease` check in `storage/src/io_region.rs`.
+  Leader-local readers take the same holds through an in-process fast path.
+- **Expiry.** The collector drops a hold only after it has observed the same ticket unchanged across two sweeps a local monotonic `T` apart.
+- **Deletion rule (generation cutoff).** A retired object with retirement generation `r` is deletable iff `r ≤ min(head, every live hold's generation, every recovery root)` in a single ledger observation, and the collector advances `F` by CAS conditioned on that observation's version.
+  Generation cutoff was preferred over exact dependency tracking: it needs no inventory, and bounded handle lifetimes bound the extra retention.
+  `verification/lean/ResidenceReaderRetention.lean` already proves both policies safe and compares them.
+
+## Invariants
+
+- **G1.** No object reachable from an admitted hold's generation or a live recovery root is deleted.
+- **G2.** Every delete is authorized against one ledger version, and the authorization stays valid until the provider delete (names never repeat after R3).
+
+## What R4 deletes
+
+- `GarbageConfig::garbage_lifetime` and the system-time arithmetic in `TrieCollector::default_garbage_as_of` (`maintenance/src/gc.rs`).
+- The fixed read lease and its tip-anchored currency: `storage/src/{read_lease,lease_decision}.rs`, `node/src/read_currency.rs`, `Database::read_lease`, and the collector's first-observed wait (`TrieCollector::leased_out`). Keep the per-request check in `IoRegion`, re-anchored on the hold.
+- The unbounded in-process registry in `index/src/partition.rs` (`Retention::readers`), or reduce it to a cache of ledger holds.
+- Multi's reaper grace and wall-clock release stamps (`multi/src/store.rs` releases, `multi/src/main.rs` `--grace` check), once releases are authorized by the floor.
+
+## State on main (2026-11-21)
+
+- **Peer work, Multi side (extend it, do not duplicate it):**
+  - `dd5a0b0fa` registers held catalog captures with the serving residence: `rust/crates/multi/src/catalog_readers.rs`, the directory's `catalog_readers` map (`CatalogReader { owner, storage_root, replica_epoch, cut }` in `rust/crates/directory/src/lib.rs`), and Verus area `verification/verus/catalog_reader_admission`.
+  - `aa52621d3` models residence retirement and holds: `verification/tla/ResidenceRetirement.tla`.
+  - `b3adb3df5` compares retention policies: `verification/tla/ResidenceReaderRetention.tla` and the Lean laws above.
+- **Classic side:** nothing yet. Readers are protected by bounded monotonic leases (default 1 h, 60 s margin) and the collector waits a lease after first observing a trie; see the "Reader leases across nodes" section of `verification/results/2026-11-21.adoc`.
+- **Directory implementations:** `MemoryDirectory`, `DynamoDirectory`, `RemoteDirectory` exist; there is no object-store-backed one.
+
+## Handoff notes
+
+1. Start by reading the peer's `CatalogReaders` and `ResidenceRetirement.tla`, and the last day of commits touching `multi/src`, `directory/src` and `maintenance/src/gc.rs`. If a peer session is mid-way, coordinate through the programme rather than branching the design.
+2. Define the ledger operations once, as a small trait both deployments implement (admit hold, renew, release, observe, advance floor), and implement it for Multi on the directory and for classic on conditional writes. Avoid making classic depend on the whole `Directory` trait.
+3. Move the trie collector to the floor rule; then delete the lease, the first-observed map and `garbage_lifetime` in the same change, so no two mechanisms coexist.
+4. Thread the hold through `QueryContext` where the read lease is today (`CatalogSnapshot::read_lease`, cursor `IoRegion::leased`), and through served scan fragments (`Node::scan_fragment`).
+5. Classic conditional writes: check each provider adapter (`storage/src/remote.rs`, local store) supports the primitive you choose; record any provider without it as unsupported rather than emulating it.
+
+## Tests and proofs
+
+- **Native:** a follower behind the log tip serves a held generation; the collector never deletes below a live hold; an abandoned hold expires after two sweeps and its generation becomes reclaimable (LIVE-2). Reuse the follower fixtures in `rust/crates/conformance/tests/node_faults.rs` (`follower_cursor_during_collection`).
+- **Verus:** the hold admission predicate and the floor computation.
+- **TLA+:** extend `ResidenceRetirement.tla` or `ResidenceReaderRetention.tla` with renewal, expiry, a follower behind the tip and a failed CAS; retire the age-based branch of `LeaseAdmission.tla`.
+- **Mutations that must fail:** admitting a hold below `F`; expiring a hold after one sweep; computing `F` from an observation the CAS does not cover.
+
+## Open questions
+
+- The classic ledger layout (head object, chain, or per-follower holds).
+- The values of `T`, `R` and the margin; the margin must still cover twice the clock-rate drift over `T` plus the longest provider request.
