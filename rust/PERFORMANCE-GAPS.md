@@ -159,21 +159,33 @@ The Mac mini 2 comparison runs only one benchmark container at a time under the 
 
 ### Mac mini 2
 
-The first matched 1,000,000-row pair used RTDB `ff72d7394`, XTDB `c84f9334e` and glibc defaults.
-Both engines completed their pgwire and Flight row-count checks.
-Other work on the host can affect timing, so the first pair is provisional.
+The two matched 1,000,000-row pairs used RTDB `ff72d7394`, XTDB `c84f9334e` and glibc defaults.
+All four runs completed their pgwire and Flight row-count checks.
+One pair started with RTDB and the other started with XTDB.
+Other work was active on the host.
 
-| Metric | RTDB | XTDB |
+| Metric | RTDB median [range] | XTDB median [range] |
 | --- | ---: | ---: |
-| pgwire ingest | 43.0k rows/s | 47.5k rows/s |
-| Flight prepared INSERT | 90.3k rows/s | 88.9k rows/s |
-| pgwire concurrent INSERT | 1,305 tx/s | 1,138 tx/s |
-| pgwire UPDATE of 10% of orders | 1,527 ms | 868 ms |
-| Peak working set during pgwire | 1,454 MiB | 771 MiB |
+| pgwire ingest | 42.8k [42.5k, 43.0k] rows/s | 40.0k [32.5k, 47.5k] rows/s |
+| Flight prepared INSERT | 64.2k [38.2k, 90.3k] rows/s | 110.0k [88.9k, 131.2k] rows/s |
+| pgwire concurrent INSERT | 982 [660, 1,305] tx/s | 1,195 [1,138, 1,252] tx/s |
+| Flight concurrent INSERT | 856 [621, 1,092] tx/s | 700 [613, 787] tx/s |
+| pgwire UPDATE of 10% of orders | 1,187 [848, 1,527] ms | 800 [732, 868] ms |
+| Flight full-scan fetch p50 | 3,145 [2,754, 3,536] ms | 3,429 [3,117, 3,741] ms |
+| Flight full-scan fetch p95 | 3,310 [2,779, 3,842] ms | 3,561 [3,284, 3,839] ms |
+| Peak working set during pgwire | 1,452 [1,450, 1,454] MiB | 747 [723, 771] MiB |
+| Peak working set during Flight | 1,848 [1,656, 2,040] MiB | 787 [768, 806] MiB |
 
-The first pair places Flight ingest and concurrent pgwire writes at or above the reference.
-The largest remaining pgwire gaps in this pair are working set and set-based UPDATE.
-The reversed pair, both 100,000-row pairs, and the allocator comparison are in progress.
+The slower RTDB Flight run used 26.2 seconds of wall time and 18.6 CPU seconds, compared with 11.1 seconds and 16.6 CPU seconds in the faster run.
+Both showed zero CPU quota throttles during ingest.
+Peak cgroup charge during Flight ingest was 3,250 MiB in the slower run and 3,682 MiB in the faster run.
+The wall-time spread makes a single run unreliable for judging parity.
+At 100,000 rows, the same two-pair comparison favored RTDB on pgwire ingest (41.0k versus 35.4k rows/s), the 10% UPDATE (80 versus 157 ms) and peak working set (124 versus 705 MiB during pgwire, 207 versus 645 MiB during Flight).
+Flight ingest remained open (78.0k versus 96.1k rows/s), as did full-scan fetch (median p50 of 339 versus 299 ms, p95 of 355 versus 305 ms).
+Flight single-row INSERT p95 was 3.4–12.2 ms versus 3.7–3.8 ms at 100,000 rows.
+At 1,000,000 rows pgwire single-row INSERT p95 was 2.6–61.1 ms versus 2.8–3.4 ms, and the median DELETE p95 trailed on both protocols with overlapping ranges.
+These write latency gaps need more repetitions, including heap and storage wait evidence during the slow runs.
+The allocator comparison and phase-specific CPU profiles are in progress.
 
 ## Verification
 
