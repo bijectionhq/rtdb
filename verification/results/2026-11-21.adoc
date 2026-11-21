@@ -1418,3 +1418,13 @@ The conflict resolution keeps the checkpoint-refresh loop, opened fragment scope
 The DynamoDB-enabled Rust run passed 106 library cases and 80 local cell cases.
 The provider-specific DynamoDB destruction case requires a local DynamoDB endpoint and was ignored.
 Re-run these suites with `cargo test --locked --manifest-path rust/Cargo.toml -p rtdb-multi --features dynamodb --lib --test cell`.
+
+The expanded Rust run on `bd4434246` passed all 1,232 cases across replication, index, trie, temporal, maintenance, query, node, columnar, format, storage, transactions, Flight SQL and PgWire.
+The isolated provider case also passed against an ephemeral DynamoDB Local 2.6.1 container.
+It verifies that the vault refuses the destroyed deployment key on reopening, while a different deployment remains usable.
+
+The verification branch advanced to `4fea3fad1` with the JVM snapshot-ownership model and a block-adoption regression.
+Lean 4.36.0 checked seven theorems and rejected all three ownership mutations.
+The model covers local reference ownership and final release, with the locking and Arrow lifetime refinement listed in the engine ledger. link:../lean/SnapshotOwnership.lean[JVM snapshot ownership]
+All 25 JVM live-index cases passed, including reads through a retained snapshot after block adoption.
+The JVM pinning-cache fixture also passed after replacing its assumption about the identity of the evicted entry with checks of the retained pins and the weight limit.
