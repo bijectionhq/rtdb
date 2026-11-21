@@ -365,6 +365,8 @@ A deposed holder must be unable to damage storage, and recovery must not depend 
    The role session requests a 15-minute lifetime and permits writes under the deployment's existing storage prefix and version.
    The node rejects returned expirations beyond that lifetime plus one second of clock allowance.
    The node verifies the current writer or live compaction member against the directory before and after refreshing a session.
+   Before the node uses a session, a conditional directory write retains the latest issued expiration for that deployment prefix plus the clock allowance.
+   Upgrade every directory writer before relying on the recorded expiration, including writers of packed parked records.
    The session policy denies deletes and out-of-prefix writes, and requires conditional PUTs by default. [Enforce S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html)
    For providers such as MinIO that reject the S3 condition key, `--s3-compat-write-policy` keeps the prefix and delete restrictions, and the client sends the conditional header.
    Use `--sts-endpoint URL` when the STS service is at a custom endpoint.
@@ -608,6 +610,10 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    All logkeepers must support the drop operation before using this deletion path, and binaries predating it cannot open a journal containing its record.
    Replica addresses retired before ensemble-transfer tracking was introduced require separate inventory.
    The current deletion path keeps a deployment in `deleting` for retry if objects remain.
+   Deletion fences the deployment and waits for recorded S3 write sessions to expire before touching its object inventory or key.
+   While the lease is active the delete command reports the earliest retry time and the deployment stays fenced.
+   During an upgrade from a writer that issued scoped credentials without recording them, wait 15 minutes and one second after every such writer has stopped before running deletion or source-cell cleanup.
+   Ordinary garbage collection skips a deployment once its lifecycle reaches `deleting`.
    After an empty current inventory and local key destruction, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
    Retrying a completed deletion returns the stored receipt.
    Export the trusted public key with `rtdb-multi deletion-key --keys PATH` and verify the JSON from `delete` with `rtdb-multi verify-deletion --record PATH --public-key KEY`.
@@ -666,6 +672,7 @@ Unbounded means adding cells (spec contract `CellMap`).
    The source reaper verifies the recorded object namespace and any supplied key namespace before erasing the old copy.
    Legacy tombstones without a recorded source binding require recovery of those historical namespace IDs before automatic cleanup.
    With S3 it empties the source's multipart and version inventories before destroying the source key copy.
+   Source cleanup also waits for the stored write lease to expire.
    The tombstone records successful cleanup so future passes can skip it.
    A later pass with `--keys` rechecks storage before finishing a previous objects-only cleanup.
 3. Format upgrades: readers for N-2 to N, rewrite on flush and compaction, a maintenance trickle for the rest.

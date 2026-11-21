@@ -502,6 +502,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     incoming.lifecycle = Lifecycle::Moving;
     incoming.storage_generation = Some(*generation);
     incoming.storage_namespaces = Some(StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys });
+    incoming.s3_write_lease_until_ms = None;
     incoming.cell_move = None;
     incoming.moved_at_ms = None;
     incoming.source_cleanup = None;
@@ -600,6 +601,9 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
         }
     }).await?;
     if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
+    if let Some(deadline) = fenced.active_s3_write_lease(now_ms()) {
+        return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/storage-lease-active", format!("The storage write lease expires at Unix milliseconds {deadline}")));
+    }
     let mut servers = ensemble_servers(&fenced, &members(directory).await?)?;
     if let Some(previous) = &fenced.move_from {
         for server in previous {

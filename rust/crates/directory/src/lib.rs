@@ -259,6 +259,9 @@ pub struct DeploymentRecord {
     pub storage_generation: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_namespaces: Option<StorageNamespaces>,
+    /// The last time a previously issued S3 write session may still be usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_write_lease_until_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_record: Option<DeletionRecord>,
     pub version: Version,
@@ -279,7 +282,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, s3_write_lease_until_ms: None, deletion_record: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {
@@ -298,6 +301,10 @@ impl DeploymentRecord {
 
     pub fn active_move(&self, now_ms: i64) -> Option<&PlacementMove> {
         self.placement_move.as_ref().filter(|reservation| reservation.expires_at_ms > now_ms)
+    }
+
+    pub fn active_s3_write_lease(&self, now_ms: i64) -> Option<i64> {
+        self.s3_write_lease_until_ms.filter(|deadline| *deadline > now_ms)
     }
 
     /// The affinity key: stable across epochs and residency, distinct across incarnations.

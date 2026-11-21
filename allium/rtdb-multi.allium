@@ -1859,7 +1859,8 @@ rule RefreshScopedS3Session {
     ensures:
         let session = ProviderAssumedWriteRole(prefix: record.storage_root.prefix, max_age: config.credential_ttl)
         if WriterOrCompactorAuthorized(record, writer_epoch):
-            ScopedWriteSessionIssued(session)
+            if DirectoryRecordsMaximumWriteExpiry(record, session.expiration):
+                ScopedWriteSessionIssued(session)
         else:
             WriteRefused(record)
 }
@@ -1898,6 +1899,7 @@ rule PublishInventoryReceipt {
 
     requires: record.lifecycle = deleting
     requires: record.storage_namespaces = namespaces
+    requires: RecordedWriteLeasesExpired(record)
 
     ensures:
         KeyService.destroy(record.key_id)
@@ -1976,6 +1978,7 @@ rule CleanUpMovedSource {
     requires: record.source_namespaces != null
     requires: StorageNamespacesMatchSource(record)
     requires: DeploymentPrefixIsDisjoint(record)
+    requires: RecordedWriteLeasesExpired(record)
 
     ensures:
         EraseSourceCopyAfterTransferringSharedObjects(record)

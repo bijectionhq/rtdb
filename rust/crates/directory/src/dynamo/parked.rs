@@ -36,6 +36,8 @@ struct ParkedDeployment {
     storage_namespaces: Vec<u8>,
     #[prost(bool, tag = "14")]
     quarantined: bool,
+    #[prost(sint64, optional, tag = "15")]
+    s3_write_lease_until_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -54,7 +56,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, storage_generation,
-        storage_namespaces, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms, source_cleanup, deletion_record, version: _,
+        storage_namespaces, s3_write_lease_until_ms, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms, source_cleanup, deletion_record, version: _,
     } = record;
     if holder.is_some() || !matches!(lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
         || move_intent.is_some() || placement_move.is_some() || move_from.is_some() || cell_move.is_some()
@@ -90,6 +92,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         storage_generation: storage_generation.map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
         storage_namespaces: namespaces,
         quarantined: *lifecycle == Lifecycle::Quarantined,
+        s3_write_lease_until_ms: *s3_write_lease_until_ms,
     };
     let mut encoded = Vec::with_capacity(1 + packed.encoded_len());
     encoded.push(WIRE_VERSION);
@@ -146,7 +149,24 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         cell_move: None,
         storage_generation,
         storage_namespaces,
+        s3_write_lease_until_ms: packed.s3_write_lease_until_ms,
         deletion_record: None,
         version,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parking_preserves_the_scoped_write_lease_expiration() {
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 1_000);
+        record.s3_write_lease_until_ms = Some(902_000);
+        let bytes = encode(&record).unwrap();
+        let read_back = decode(&bytes, &record.id, &record.name, record.epoch, record.version).unwrap();
+        assert_eq!(read_back, record);
+        assert_eq!(read_back.active_s3_write_lease(901_999), Some(902_000));
+        assert_eq!(read_back.active_s3_write_lease(902_000), None);
+    }
 }

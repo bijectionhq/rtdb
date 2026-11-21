@@ -853,9 +853,17 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     assert_eq!(error.code, "rtdb.multi/storage-binding-missing");
     assert!(left_behind().await > 0);
     assert_eq!(keys.existing(&tombstone.id).unwrap(), destination_key);
-    source.replace_deployment(tombstone.clone(), legacy.version).await.unwrap().applied().unwrap();
+    let mut restored = source.replace_deployment(tombstone.clone(), legacy.version).await.unwrap().applied().unwrap();
 
     assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, now, hour, Some(&keys)).await.unwrap(), 0, "and keeps them within the grace");
+    let lease_expires = due + 1000;
+    restored.s3_write_lease_until_ms = Some(lease_expires);
+    let version = restored.version;
+    source.replace_deployment(restored, version).await.unwrap().applied().unwrap();
+    assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, Some(&keys)).await.unwrap(), 0);
+    assert!(left_behind().await > 0);
+    assert_eq!(keys.existing(&tombstone.id).unwrap(), destination_key);
+    let due = lease_expires;
     assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, None).await.unwrap(), 1);
     assert_eq!(source.deployment(&tombstone.id).await.unwrap().unwrap().source_cleanup, Some(rtdb_directory::SourceCleanup::ObjectsErased));
     assert_eq!(left_behind().await, 0, "after the grace the source erases what the move left");

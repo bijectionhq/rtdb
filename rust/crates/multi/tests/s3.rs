@@ -105,6 +105,14 @@ async fn a_cell_flushes_and_moves_with_deployment_scoped_s3_writes() {
     assert_eq!(writes.other_puts.load(Ordering::Relaxed), 0);
     assert_eq!(writes.unconditional_puts.load(Ordering::Relaxed), 0);
     drop(client);
+
+    let deployed = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert!(deployed.active_s3_write_lease(rtdb_directory::now_ms()).is_some());
+    let keys = cell.keys();
+    let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &keys, "shop", 4 << 20).await.unwrap_err();
+    assert_eq!(deletion.code, "rtdb.multi/storage-lease-active");
+    assert_eq!(cell.directory.deployment(&deployed.id).await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleting);
+    assert!(rtdb_multi::keys::KeyService::existing(&keys, &deployed.id).is_ok());
     cell.stop().await;
     proxy.abort();
 }
