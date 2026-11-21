@@ -93,6 +93,22 @@ The added laws cover distinct candidate order, clearance before duplicate
 elimination, preservation under per-source limits, and replay input provenance
 across primary compaction.
 
+On the hosted continuation the M1 checked the RTDB domain and seek harnesses
+again, with 10 and 6 verified functions respectively at
+`d273ff8fc74c26d8a93279debcb206e72c2315de`.
+On Bijection source `3811208c5b957bd06b9b8efaa55bc899611d582f`, the same
+Verus toolchain checked eight registered-page functions and four protected
+ingress functions. The joint controls failed
+`a_registered_scan_has_no_extra_candidate` and
+`custody_owned_write_is_sealed` at their expected postconditions. The
+included Bijection decision sources are unchanged in the companion clearance
+update at `aa7c7fd086423689a772ccd8fd6b75a1674a6cb7`.
+
+The integration branches still need a native run against the paired RTDB
+and Bijection builds. Physical erasure of the remaining provider objects must
+bind garbage release, superseded publication settlement, and active read
+scopes to the provider's completion evidence.
+
 ## Execution
 
 Use Lean 4.35.0, Bijection's pinned Verus toolchain, and TLC from the authorized proof environment.
