@@ -166,7 +166,10 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 if delegable { writer.parameter(DELEGABLE_PARAMETER, "on").await?; }
                 if let Some(required) = &required_installation { writer.parameter(VERIFIED_INSTALLATION_PARAMETER, required).await?; }
                 writer.backend_key(process).await?;
-                if gateway_session_state { writer.gateway_await_token(None).await?; }
+                if gateway_session_state {
+                    writer.gateway_await_token(None).await?;
+                    writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_KEY_KIND]).await?;
+                }
                 if gateway_settings {
                     writer.gateway_settings(&[]).await?;
                     writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_SQL_PREPARE_KIND]).await?;

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
-use rtdb_pgwire::{GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND};
+use rtdb_pgwire::{GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -101,6 +101,7 @@ struct Backend {
     _reader: AbortOnDropHandle<()>,
     heartbeat: Option<Arc<dyn Send + Sync>>,
     epoch: u64,
+    guarded_keys: bool,
     drain_deadline: Option<tokio::time::Instant>,
 }
 
@@ -108,7 +109,15 @@ impl Backend {
     fn new(stream: TcpStream, epoch: u64, memory: Arc<MemoryBudget>) -> Self {
         let (read, writer) = stream.into_split();
         let (frames, reader) = pump(read, memory);
-        Self { writer, frames, _reader: reader, heartbeat: None, epoch, drain_deadline: None }
+        Self { writer, frames, _reader: reader, heartbeat: None, epoch, guarded_keys: false, drain_deadline: None }
+    }
+
+    async fn prepare_key(&mut self, key: &str) -> bool {
+        if self.guarded_keys {
+            let body = [&[GATEWAY_KEY_KIND], key.as_bytes()].concat();
+            return self.dispatch(&Frame { tag: GATEWAY_SESSION_STATE_TAG, body: Bytes::from(body) }).await;
+        }
+        matches!(tokio::time::timeout(RECONNECT_WITHIN, install_key(self, key)).await, Ok(Ok(())))
     }
 
     async fn dispatch(&mut self, frame: &Frame) -> bool {
@@ -212,6 +221,7 @@ impl Session {
         stream.write_all(&self.reconnection_startup()).await.map_err(io)?;
         let mut backend = Backend::new(stream, epoch, Arc::clone(&self.frame_memory));
         let features = replay_ready(&mut backend.frames).await?;
+        backend.guarded_keys = features.guarded_keys;
         if self.expected_installation.is_some_and(|expected| features.installation != Some(expected)) {
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", "The replacement holder did not verify the requested installation"));
         }
@@ -342,9 +352,9 @@ impl Session {
                         let starts = self.status == Status::Idle;
                         if starts { self.answered = false; self.lost_unanswered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
                         if starts && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
-                        if let Some(current) = backend.as_mut()
-                            && starts && let Some(key) = &self.key
-                            && !matches!(tokio::time::timeout(RECONNECT_WITHIN, install_key(current, key)).await, Ok(Ok(())))
+                        if backend.is_none() { backend = Some(self.connect(None, false).await?); }
+                        if starts && let Some(key) = &self.key
+                            && !backend.as_mut().expect("connected").prepare_key(key).await
                         {
                             backend = None;
                         }
@@ -355,6 +365,9 @@ impl Session {
                     }
                     Event::Reply(Some(Ok(frame))) => {
                         if frame.tag == GATEWAY_SESSION_STATE_TAG {
+                            if !self.greeting.done && frame.body.as_ref() == [GATEWAY_KEY_KIND] {
+                                backend.as_mut().expect("greeting backend").guarded_keys = true;
+                            }
                             if self.greeting.done && !self.discarding {
                                 match frame.body.first().copied() {
                                     Some(0) => self.await_token = None,
@@ -530,7 +543,7 @@ impl Session {
 }
 
 #[derive(Default)]
-struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool, named_parse: bool, installation: Option<uuid::Uuid> }
+struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool, named_parse: bool, guarded_keys: bool, installation: Option<uuid::Uuid> }
 
 async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Result<ReplayFeatures> {
     let mut features = ReplayFeatures::default();
@@ -544,6 +557,7 @@ async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Re
                 Some(GATEWAY_SETTINGS_KIND) => features.settings = true,
                 Some(GATEWAY_SQL_PREPARE_KIND) => features.sql_prepare = true,
                 Some(GATEWAY_NAMED_PARSE_KIND) => features.named_parse = true,
+                Some(GATEWAY_KEY_KIND) if frame.body.len() == 1 => features.guarded_keys = true,
                 _ => {}
             },
             b'S' => {
@@ -1045,6 +1059,42 @@ mod tests {
         assert_eq!(receive(&mut client).await.0, b'Z');
         drop(client);
         running.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_advertises_guarded_keys_gets_the_key_and_command_without_an_acknowledgement() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, mut writer) = pair(&listener).await;
+        let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
+        let startup = Bytes::from_static(b"\0\0\0\x08\0\x03\0\0");
+        let session = Session::new(startup, router, directory, record.id, None, true);
+        let running = tokio::spawn(session.run(gateway, first, None, 0));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            writer.read_exact(&mut [0; 8]).await.unwrap();
+            send(&mut writer, b'R', &[0; 4]).await;
+            send(&mut writer, GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_KIND]).await;
+            send(&mut writer, b'Z', b"I").await;
+            assert_eq!(receive(&mut client).await.0, b'R');
+            assert_eq!(receive(&mut client).await.0, b'Z');
+
+            send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+            let (tag, key) = receive(&mut writer).await;
+            assert_eq!(tag, GATEWAY_SESSION_STATE_TAG);
+            assert_eq!(key[0], GATEWAY_KEY_KIND);
+            assert_eq!(key.len(), 33);
+            assert_eq!(query(&mut writer).await, "UPDATE counters SET n = n + 1");
+
+            send(&mut writer, b'C', b"UPDATE 1\0").await;
+            send(&mut writer, b'Z', b"I").await;
+            assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()));
+            assert_eq!(receive(&mut client).await.0, b'Z');
+            drop(client);
+            running.await.unwrap().unwrap();
+        }).await.unwrap();
     }
 
     #[tokio::test]

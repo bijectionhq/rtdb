@@ -2572,7 +2572,8 @@ surface ClientAccess {
         -- A writable pgwire pipeline waits for ReadyForQuery between command cycles so each autocommit cycle has its own retry key.
         -- A copy-in transfer can send its input frames before ReadyForQuery.
         -- An unanswered keyed command can be retried under its original key, including an extended-protocol exchange flushed before Sync.
-        -- Each writer acknowledges a command's key before the gateway dispatches that command.
+        -- A writer installs a key before executing the command it guards.
+        -- The gateway waits for the replacement writer to acknowledge the original key before replaying the command.
         -- Closed storage before the first command reply allows a keyed retry on a newer writer epoch.
         -- A holder's driver shutdown during a command leaves the outcome unknown until a keyed retry returns it.
         -- An authenticated idle session retains its acknowledged named prepared statements across holder changes.
