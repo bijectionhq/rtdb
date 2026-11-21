@@ -83,13 +83,13 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
-| SESS01 · Legal states | Open | — |
-| SESS02 · Access mode | Open | — |
-| SESS03 · Pinned read basis | Open | — |
+| SESS01 · Legal states | Partial | [Lean explicit phases and terminal closure](rtdb-engine-proof-evidence.md#main-evidence) |
+| SESS02 · Access mode | Partial | [Lean first-statement resolution and Rust session tests](rtdb-engine-proof-evidence.md#main-evidence) |
+| SESS03 · Pinned read basis | Partial | [Lean explicit basis preservation and Rust session observations](rtdb-engine-proof-evidence.md#main-evidence) |
 | SESS04 · Await and snapshot tokens | Open | — |
 | SESS05 · Read your writes | Open | — |
-| SESS06 · Buffer ownership | Open | — |
-| SESS07 · Rollback and rejection | Open | — |
+| SESS06 · Buffer ownership | Partial | [Lean ordered buffer and modeled commit boundary](rtdb-engine-proof-evidence.md#main-evidence) |
+| SESS07 · Rollback and rejection | Partial | [Lean discard and failed-state rejection, and Rust session tests](rtdb-engine-proof-evidence.md#main-evidence) |
 | SESS08 · Frontend parity | Open | — |
 | SESS09 · Transaction handles | Open | — |
 | SESS10 · Sync and async receipts | Open | — |

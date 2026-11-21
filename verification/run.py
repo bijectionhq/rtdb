@@ -519,6 +519,39 @@ def verify_table_slugs(args, scratch):
     verify_lean_model(args, scratch, path, "table-slugs", controls, 6)
 
 
+def verify_explicit_session(args, scratch):
+    path = Path("verification/lean/ExplicitSession.lean")
+    controls = {
+        "use-fresh-basis-instead-of-pin": (
+            "| .active (.reading pinned) false, .query _ => (.active (.reading pinned) false, .read pinned)",
+            "| .active (.reading pinned) false, .query fresh => (.active (.reading pinned) false, .read fresh)",
+            ["a_later_query_observes_the_pinned_basis"] * 2,
+        ),
+        "allow-dml-in-pending-read-only": (
+            "| .active (.pending false) false, .dml op",
+            "| .active (.pending _) false, .dml op",
+            ["first_dml_resolves_only_an_unspecified_pending_transaction"],
+        ),
+        "submit-on-rollback": (
+            "  | _, .rollback => (.idle, .done)",
+            "  | .active (.writing buffered) _, .rollback => (.idle, .submit buffered)\n"
+            "  | _, .rollback => (.idle, .done)",
+            ["rollback_and_close_discard_the_buffer_without_submission"],
+        ),
+        "reverse-buffer-order": (
+            "(.writing (buffered ++ [op]))",
+            "(.writing (op :: buffered))",
+            ["admitted_dml_preserves_complete_operation_order"],
+        ),
+        "clear-closed-state": (
+            "| .closed, _ => (.closed, .refused)",
+            "| .closed, _ => (.idle, .refused)",
+            ["a_closed_session_remains_closed"] * 6,
+        ),
+    }
+    verify_lean_model(args, scratch, path, "explicit-session", controls, 9)
+
+
 def verify_replica_trim_admission(args, scratch):
     path = Path("verification/lean/ReplicaTrimAdmission.lean")
     controls = {
@@ -708,6 +741,7 @@ def verify_lean(args, scratch):
             verify_memory_admission(args, scratch)
             verify_outer_join(args, scratch)
             verify_table_slugs(args, scratch)
+            verify_explicit_session(args, scratch)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
