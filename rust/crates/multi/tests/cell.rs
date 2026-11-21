@@ -468,7 +468,7 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &id.to_string(), 4 << 20).await.unwrap();
     let scheduled = rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.unwrap();
     assert!(scheduled.observed_empty_at_ms.is_none());
-    let retired = rtdb_multi::archive::finish_retirement(cell.directory.as_ref(), id)
+    let retired = rtdb_multi::archive::finish_retirement(cell.directory.as_ref(), &cell.keys(), id)
         .await
         .unwrap();
     assert!(retired.observed_empty_at_ms.is_some());
@@ -613,7 +613,7 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     drop(moved);
     admin::delete_deployment(from.directory.as_ref(), from.storage, from.keys, &id.to_string(), 4 << 20).await.unwrap();
     rtdb_multi::archive::begin_retirement(from.directory.as_ref(), id).await.unwrap();
-    let retired_archives = rtdb_multi::archive::finish_retirement(from.directory.as_ref(), id).await.unwrap();
+    let retired_archives = rtdb_multi::archive::finish_retirement(from.directory.as_ref(), from.keys, id).await.unwrap();
     assert!(retired_archives.observed_empty_at_ms.is_some());
     assert!(files_under(&archive_dir.path().join(format!("checkpoint-captures/{id}/{operation}"))).is_empty());
     archive_dir.close().unwrap();

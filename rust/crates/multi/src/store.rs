@@ -63,7 +63,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let (record, region, release) = self.admit_region(&config, io).await?;
         let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
-            crate::archive::ArchivedCheckpoint::load(&record, region.clone()).await?
+            crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
         } else {
             None
         };
@@ -750,15 +750,15 @@ pub async fn run_reaper(
                                 Some(Ok(_)) => {}
                             }
                         }
-                    }
-                    for record in deployments.iter().filter(|record| record.archive_retirement.as_ref()
-                        .is_some_and(|retirement| retirement.observed_empty_at_ms.is_none()))
-                    {
-                        let Ok(id) = record.id.parse::<Uuid>() else { continue; };
-                        match cancellation.run_until_cancelled(crate::archive::finish_retirement(directory.as_ref(), id)).await {
-                            None => return,
-                            Some(Err(error)) => eprintln!("Archive retirement of {id} is pending: {}", error.code),
-                            Some(Ok(_)) => {},
+                        for record in deployments.iter().filter(|record| record.archive_retirement.as_ref()
+                            .is_some_and(|retirement| retirement.observed_empty_at_ms.is_none()))
+                        {
+                            let Ok(id) = record.id.parse::<Uuid>() else { continue; };
+                            match cancellation.run_until_cancelled(crate::archive::finish_retirement(directory.as_ref(), keys, id)).await {
+                                None => return,
+                                Some(Err(error)) => eprintln!("Archive retirement of {id} is pending: {}", error.code),
+                                Some(Ok(_)) => {},
+                            }
                         }
                     }
                 }

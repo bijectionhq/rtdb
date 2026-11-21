@@ -152,22 +152,27 @@ the same checkpoint and destination. The directory registers both and the
 capture's storage region before the first archive write. An archive binds
 its media witness before payload can be copied. The original directory
 accepts the verified manifest digest before the capture releases its region.
-A hosted retry recovers that receipt from the original cell. The key vault
-stays outside the capture.
+A hosted retry recovers that receipt from the original cell. The archive's
+media key belongs to that capture and stays in the original cell's key vault.
+It survives serving-key withdrawal. Application-level ciphertext is copied
+as data and its keys are never part of the capture.
 
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.
 The reaper settles each registered local archive after confirming its
 media witness. `rtdb-multi recovery-disposal --id UUID` returns the ordered
 retirement and observed absence. Remote archives stay pending until the
-provider proves that versions and unfinished uploads are absent.
+provider proves that versions and unfinished uploads are absent. Before
+issuing its retirement receipt, the reaper withdraws every registered
+capture's media key.
 
 `rtdb-multi restore` accepts the live directory's current checkpoint with
 the original archive manifest and current key. It records a restore intent,
 fences the old writer at the logkeepers, and verifies the objects. The
 directory then admits the checkpoint archive as the source of its exact
-manifest members. Reads check those objects against the manifest digest.
-Objects outside that manifest come from serving storage. A successor
+manifest members. Reads verify their archived ciphertext and reseal each
+under the current serving key. Objects outside that manifest come from
+serving storage. A successor
 recovers the same ordered tail before serving.
 The directory keeps each accepted manifest and completion under its capture ID.
 A retry observes that exact receipt after a later repair or cell move. It

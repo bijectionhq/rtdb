@@ -1751,6 +1751,7 @@ rule HostedCheckpointCapture {
             ReturnOriginalCaptureReceipt(authority, capture_id)
         else:
             RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
+            SealArchiveWithCaptureKey(authority, capture_id)
             RetainAndReturnExactCheckpointAndManifestDigest(authority, capture_id)
 }
 
@@ -1778,6 +1779,7 @@ rule RetireCheckpointArchives {
 
     ensures:
         RetireRegisteredArchiveCopies(record)
+        WithdrawOnlyRegisteredCaptureKeys(record)
 }
 
 ------------------------------------------------------------

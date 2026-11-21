@@ -760,7 +760,7 @@ async fn stage_cell_storage(
         crate::reference::materialize(
             source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(),
         ).await?;
-        if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, IoRegion::new()).await? {
+        if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, from.keys, IoRegion::new()).await? {
             archive.materialize(staged, target_bucket).await?;
         }
         // A never-opened source need not provision a key merely to move.
