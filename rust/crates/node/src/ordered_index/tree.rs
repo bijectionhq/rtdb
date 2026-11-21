@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, btree_map},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -547,12 +547,18 @@ impl<'scope> Tree<'scope> {
     pub fn mark<'a>(
         &'a self,
         pointer: Arc<Pointer>,
-        reachable: &'a mut BTreeSet<ObjectKey>,
+        reachable: &'a mut BTreeMap<ObjectKey, u64>,
+        cancellation: &'a CancellationToken,
     ) -> Work<'a, ()> {
         Box::pin(async move {
-            if !reachable.insert(self.page_key(pointer.generation, &pointer.digest)?) {
-                return Ok(());
+            if cancellation.is_cancelled() {
+                return Err(cancelled());
             }
+            let key = self.page_key(pointer.generation, &pointer.digest)?;
+            let btree_map::Entry::Vacant(first) = reachable.entry(key) else {
+                return Ok(());
+            };
+            first.insert(u64::try_from(pointer.size).map_err(format_error)?);
             let node = self.open(&Link::Stored(pointer)).await?;
             match &node.page {
                 Page::Branch(children) => {
@@ -562,13 +568,13 @@ impl<'scope> Tree<'scope> {
                                 "A stored page contains an unpublished child",
                             ));
                         };
-                        self.mark(Arc::clone(pointer), reachable).await?;
+                        self.mark(Arc::clone(pointer), reachable, cancellation).await?;
                     }
                 }
                 Page::Leaf(entries) => {
                     for entry in entries {
                         if let Item::Revision(Some(pointer)) = &entry.item {
-                            self.mark(Arc::clone(pointer), reachable).await?;
+                            self.mark(Arc::clone(pointer), reachable, cancellation).await?;
                         }
                     }
                 }

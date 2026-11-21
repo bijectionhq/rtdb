@@ -26,6 +26,8 @@ pub(super) struct Checkpoint {
     pub source_rows: i64,
     revisions: Option<Arc<Pointer>>,
     #[serde(skip)]
+    manifest_bytes: u64,
+    #[serde(skip)]
     _allocation: Option<Arc<MemoryReservation>>,
 }
 
@@ -41,6 +43,26 @@ impl Checkpoint {
             archived: self.revisions.clone().map(Link::Stored),
             changes: BTreeMap::new(),
         }
+    }
+
+    async fn reachable(
+        &self,
+        tree: &Tree<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<BTreeMap<ObjectKey, u64>> {
+        let mut pages = BTreeMap::new();
+        if let Some(pointer) = &self.revisions {
+            tree.mark(Arc::clone(pointer), &mut pages, cancellation).await?;
+        }
+        Ok(pages)
+    }
+
+    pub async fn file_bytes(&self, tree: &Tree<'_>, cancellation: &CancellationToken) -> Result<u64> {
+        self.reachable(tree, cancellation).await?.values().try_fold(
+            self.manifest_bytes,
+            |total, bytes| total.checked_add(*bytes)
+                .ok_or_else(|| format_error("Ordered index file bytes overflow")),
+        )
     }
 
     pub async fn finish(&self, tree: &Tree<'_>, cancellation: &CancellationToken) -> Result<()> {
@@ -78,16 +100,13 @@ impl Checkpoint {
         pending: Vec<ObjectKey>,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        let mut reachable = BTreeSet::new();
-        if let Some(pointer) = &self.revisions {
-            tree.mark(Arc::clone(pointer), &mut reachable).await?;
-        }
+        let reachable = self.reachable(tree, cancellation).await?;
         let store = tree.storage.object_store();
         let prefix = tree.pages()?;
         let generations = key(tree.directory, "generations")?;
         let objects = store.list(Some(&generations)).await?;
         let present: BTreeSet<_> = objects.iter().map(|object| &object.key).collect();
-        if !reachable.iter().all(|key| present.contains(key)) {
+        if !reachable.keys().all(|key| present.contains(key)) {
             return Err(format_error(
                 "An ordered index checkpoint references a missing page",
             ));
@@ -114,7 +133,7 @@ impl Checkpoint {
             let block = page_block(&object.key, &prefix);
             if (managed.is_none() && scope < self.scope)
                 || (block.is_some_and(|block| block <= self.through)
-                    && !reachable.contains(&object.key))
+                    && !reachable.contains_key(&object.key))
             {
                 store.delete(&object.key).await?;
                 tree.storage.invalidate(&object.key).await?;
@@ -237,6 +256,7 @@ pub(super) async fn latest(
     {
         return Err(format_error("Invalid ordered index checkpoint"));
     }
+    checkpoint.manifest_bytes = object.size;
     checkpoint._allocation = Some(allocation);
     Ok(Some(checkpoint))
 }
@@ -303,6 +323,7 @@ pub(super) async fn publish(
         scope: tree.scope,
         source_rows,
         revisions,
+        manifest_bytes: 0,
         _allocation: None,
     };
     let encoded = serde_json::to_vec(&checkpoint).map_err(format_error)?;

@@ -6,6 +6,7 @@ mod maintenance;
 mod projection;
 mod seek;
 mod tree;
+mod usage;
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -19,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use accelerate::OrderedIndexAccelerator;
 pub(crate) use maintenance::OrderedIndexMaintenance;
+pub(crate) use usage::Inventory;
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");

@@ -40,7 +40,7 @@ mod join_storage;
 mod mark;
 
 pub use accelerate::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, CorpusSource, FileMatches, MatchAnswers, ScanAccelerator, ScanRequest};
-pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
+pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryOptions};
 pub use fragment::{FragmentDepth, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment};
 pub use cursor::{PreparedQuery, QueryCursor};
 pub use settings::unindexed_tx;

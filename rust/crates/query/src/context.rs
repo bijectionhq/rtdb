@@ -14,12 +14,27 @@ use crate::{invalid, spill::SpillRegion};
 #[derive(Clone)]
 pub struct DatabaseSnapshot { pub partitions: Vec<Snapshot>, pub storage: Arc<BufferPool> }
 
+#[derive(Clone, Debug)]
+pub struct OrderedIndexStorage {
+    pub table: TableRef,
+    pub name: String,
+    pub version: i64,
+    pub through_block: i64,
+    pub bytes: i64,
+}
+
+#[async_trait::async_trait]
+pub trait OrderedIndexInventory: Send + Sync {
+    async fn sample(&self, database: &str, context: &QueryContext) -> Result<rtdb_plan::CatalogRows<OrderedIndexStorage>>;
+}
+
 #[derive(Clone)]
 pub struct CatalogSnapshot {
     pub(crate) default_database: String,
     pub(crate) databases: BTreeMap<String, DatabaseSnapshot>,
     transaction_scoped: bool,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
+    pub(crate) ordered_indexes: Option<Arc<dyn OrderedIndexInventory>>,
     pub(crate) fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>,
 }
 
@@ -31,9 +46,13 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped, runtime: None, fragmenter: None })
+        Ok(Self { default_database, databases, transaction_scoped, runtime: None, ordered_indexes: None, fragmenter: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
+    pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
+        self.ordered_indexes = Some(inventory);
+        self
+    }
     /// Splits this catalog's scans into fragments wherever `fragmenter` asks.
     pub fn with_fragmenter(mut self, fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>) -> Self { self.fragmenter = fragmenter; self }
     pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
