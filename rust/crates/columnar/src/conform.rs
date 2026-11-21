@@ -9,13 +9,18 @@ use crate::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_bu
 mod physical;
 
 /// Adapts compatible physical layouts, sharing value buffers when the target can use them.
-/// The caller reserves new union tags, offsets, and any filtered scalar child.
+/// The caller reserves the space reported by `arrow_relayout_bound`.
 /// The returned field carries the actual nullability, including nested fields.
 pub fn relayout_arrow_column(array: ArrayRef, source: &arrow_schema::Field, target: &arrow_schema::Field) -> Result<(arrow_schema::Field, ArrayRef)> {
     let target_type = from_field(target)?;
     let source_type = from_field(source)?;
     layout(&target_type, &source_type)?;
     physical::relayout(array, source, target)
+}
+
+/// Bounds the temporary and new allocations needed to relayout an already owned array.
+pub fn arrow_relayout_bound(array: &dyn arrow_array::Array, target: &arrow_schema::Field) -> Result<usize> {
+    add(multiply(target.size(), 8)?, physical::additional_bytes(&array.to_data(), target)?)
 }
 
 /// A page in a declared wire layout, retaining its schema and allocation charges.
@@ -65,7 +70,7 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         if input.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
         let ty = layout(&target, &source_type)?;
         if let Some((source_field, array)) = input {
-            let bound = add(multiply(array.len(), 64)?, multiply(field.size(), 4)?)?;
+            let bound = arrow_relayout_bound(array.as_ref(), field)?;
             if let Ok(_scratch) = memory.reserve(bound)
                 && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field) {
                 output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
