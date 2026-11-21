@@ -233,19 +233,19 @@ async fn erase_cuts(
 }
 
 async fn flushed_changes(
-    tree: &Tree<'_>,
+    tree: &Tree,
     definition: &Definition,
     source: &SourceFile,
     cancellation: &CancellationToken,
     retain: impl Fn(rtdb_types::EventHeader) -> bool + Send + Sync,
 ) -> Result<(i64, Changes)> {
     let mut changes = Changes::default();
-    let rows = read_flushed(tree.storage, tree.memory, source, cancellation, |batch| {
+    let rows = read_flushed(&tree.storage, &tree.memory, source, cancellation, |batch| {
         changes.add_batch(
             batch,
             0,
             &definition.columns,
-            tree.memory,
+            &tree.memory,
             cancellation,
             &retain,
         )
@@ -255,7 +255,7 @@ async fn flushed_changes(
 }
 
 async fn replay_flushed(
-    tree: &Tree<'_>,
+    tree: &Tree,
     definition: &Definition,
     sources: &[SourceFile],
     cuts: &ErasureCuts,
@@ -283,7 +283,7 @@ async fn replay_flushed(
 const MAX_TAIL_FILES: usize = 8;
 
 pub(super) async fn read_root(
-    tree: &Tree<'_>,
+    tree: &Tree,
     definition: &Definition,
     snapshot: &Snapshot,
     checkpoint: Option<checkpoint::Checkpoint>,
@@ -302,7 +302,7 @@ pub(super) async fn read_root(
                 batch.view(),
                 skip,
                 &definition.columns,
-                tree.memory,
+                &tree.memory,
                 cancellation,
                 |_| true,
             )?;
@@ -314,7 +314,7 @@ pub(super) async fn read_root(
 }
 
 async fn read_flushed_root(
-    tree: &Tree<'_>,
+    tree: &Tree,
     definition: &Definition,
     snapshot: &Snapshot,
     checkpoint: Option<checkpoint::Checkpoint>,

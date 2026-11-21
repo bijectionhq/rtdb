@@ -104,55 +104,73 @@ pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Exec
     Ok(Some(crate::columnar::retain_batch_state(batches, reservation)))
 }
 
-/// A covered ordered result stays columnar through plain SQL projections and the requested window.
+pub(crate) enum OrderedInput {
+    Batches(crate::columnar::BoxBatchCursor),
+    Rows(BoxPageCursor),
+}
+
+impl OrderedInput {
+    fn pages(self, execution: &Execution) -> BoxPageCursor {
+        match self {
+            Self::Rows(rows) => rows,
+            Self::Batches(batches) => Box::new(crate::columnar::BatchRows::new(batches, Arc::clone(&execution.context.memory))),
+        }
+    }
+
+    fn observe(self, runtime: &Arc<EmittedRelation>, execution: &Execution) -> Result<Self> {
+        let reservation = state_reservation(runtime, execution)?;
+        let relation = runtime.relation();
+        let context = &execution.context;
+        let analysis = execution.analysis.clone();
+        Ok(match self {
+            Self::Rows(rows) => Self::Rows(crate::trace::wrap(
+                crate::analysis::wrap(crate::pages::retain_page_state(rows, reservation), analysis), relation, context,
+            )),
+            Self::Batches(batches) => Self::Batches(crate::trace::wrap_batches(
+                crate::analysis::wrap_batches(crate::columnar::retain_batch_state(batches, reservation), analysis), relation, context,
+            )),
+        })
+    }
+}
+
+fn passthrough(expressions: &[NamedExpr], schema: &Schema, positions: &[usize]) -> Option<Vec<usize>> {
+    positions.iter().map(|&position| match &expressions.get(position)?.expr {
+        Expr::Column { id, .. } => schema.position(*id),
+        _ => None,
+    }).collect()
+}
+
+/// Opens a covered ordered result directly as Arrow when the outer projections only select columns.
 pub(crate) fn build_ordered_columns(
     runtime: Arc<EmittedRelation>,
     execution: Execution,
-    window: Option<(usize, usize)>,
+    projection: Vec<usize>,
 ) -> futures::future::BoxFuture<'static, Result<Option<crate::columnar::BoxBatchCursor>>> {
     let mut build = Box::pin(async move {
-        let relation = runtime.relation();
-        let input: crate::columnar::BoxBatchCursor = match relation.node() {
-            RelationNode::SortLimit { order_by, offset, fetch: Some(fetch), .. }
-                if window.is_none() && !order_by.is_empty() =>
-            {
+        let input = match runtime.relation().node() {
+            RelationNode::SortLimit { order_by, offset, fetch: Some(fetch), .. } if !order_by.is_empty() => {
                 let Some((offset, remaining)) = ordered_window(offset.as_ref(), fetch, &execution) else {
                     return Ok(None);
                 };
                 let limit = offset.saturating_add(remaining).min(i64::MAX as u64);
                 let (Ok(limit), Ok(offset)) = (usize::try_from(limit), usize::try_from(offset)) else { return Ok(None); };
-                let Some(input) = build_ordered_columns(runtime.child(0)?, execution.child(0), Some((limit, offset))).await? else {
+                let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit, offset, Some(projection)).await? else {
                     return Ok(None);
                 };
                 input
             }
             RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
                 let child = runtime.child(0)?;
-                let Some(positions) = expressions.iter().map(|named| match &named.expr {
-                    Expr::Column { id, .. } => child.schema().position(*id),
-                    _ => None,
-                }).collect::<Option<Vec<_>>>() else { return Ok(None); };
-                let Some(input) = build_ordered_columns(child, execution.child(0), window).await? else {
-                    return Ok(None);
-                };
-                Box::new(crate::columnar::BatchProject::new(input, positions, Arc::clone(&execution.context.memory)))
-            }
-            RelationNode::Filter { .. } | RelationNode::Distinct { .. } if window.is_some() => {
-                let Some(input) = build_ordered_columns(runtime.child(0)?, execution.child(0), window).await? else {
-                    return Ok(None);
-                };
-                input
-            }
-            RelationNode::Scan(scan) => {
-                let Some((limit, offset)) = window else { return Ok(None); };
-                let Some(input) = crate::scan::ordered_batches(scan, &execution, limit, offset).await? else {
-                    return Ok(None);
-                };
-                input
+                let Some(positions) = passthrough(expressions, child.schema(), &projection) else { return Ok(None); };
+                let Some(input) = build_ordered_columns(child, execution.child(0), positions).await? else { return Ok(None); };
+                OrderedInput::Batches(input)
             }
             _ => return Ok(None),
         };
-        Ok(Some(crate::columnar::retain_batch_state(input, state_reservation(&runtime, &execution)?)))
+        Ok(match input.observe(&runtime, &execution)? {
+            OrderedInput::Batches(input) => Some(input),
+            OrderedInput::Rows(_) => None,
+        })
     });
     Box::pin(std::future::poll_fn(move |context| {
         stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || build.as_mut().poll(context))
@@ -327,9 +345,9 @@ async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, con
             if !order_by.is_empty()
                 && let Some((offset, remaining)) = fetch.as_ref().and_then(|fetch| ordered_window(offset.as_ref(), fetch, &execution))
                 && let Ok(limit) = usize::try_from(offset.saturating_add(remaining).min(i64::MAX as u64))
-                && let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await?
+                && let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit, 0, None).await?
             {
-                let pages = Box::new(Limit { input: Some(input), offset, remaining: Some(remaining), execution });
+                let pages = Box::new(Limit { input: Some(input.pages(&execution)), offset, remaining: Some(remaining), execution });
                 let pages = crate::pages::retain_page_state(pages, state_reservation);
                 return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
             }
@@ -510,35 +528,59 @@ impl PageCursor for LiteralPageCursor {
         Ok(Some(page))
     }
 }
-fn ordered_input(runtime: Arc<EmittedRelation>, execution: Execution, limit: usize)
-    -> futures::future::BoxFuture<'static, Result<Option<BoxPageCursor>>>
-{
-    Box::pin(async move {
-        let relation = runtime.relation();
-        let input: BoxPageCursor = match relation.node() {
+fn ordered_input(
+    runtime: Arc<EmittedRelation>,
+    execution: Execution,
+    limit: usize,
+    offset: usize,
+    projection: Option<Vec<usize>>,
+) -> futures::future::BoxFuture<'static, Result<Option<OrderedInput>>> {
+    let mut build = Box::pin(async move {
+        let input = match runtime.relation().node() {
             RelationNode::Scan(scan) => {
-                let Some(input) = crate::scan::ordered_pages(scan, &execution, limit).await? else { return Ok(None); };
+                let Some(input) = crate::scan::ordered_input(scan, &execution, limit, offset, projection.as_deref()).await? else { return Ok(None); };
                 input
             }
             RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
                 let child = runtime.child(0)?;
-                let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit).await? else { return Ok(None); };
-                Box::new(PageProject { input, schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone() })
+                match projection {
+                    Some(positions) => {
+                        let Some(positions) = passthrough(expressions, child.schema(), &positions) else { return Ok(None); };
+                        let Some(input) = ordered_input(child, execution.child(0), limit, offset, Some(positions)).await? else { return Ok(None); };
+                        input
+                    }
+                    None => {
+                        let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit, offset, None).await? else { return Ok(None); };
+                        let all = (0..expressions.len()).collect::<Vec<_>>();
+                        match (input, passthrough(expressions, child.schema(), &all)) {
+                            (OrderedInput::Batches(input), Some(positions)) => OrderedInput::Batches(Box::new(
+                                crate::columnar::BatchProject::new(input, positions, Arc::clone(&execution.context.memory)),
+                            )),
+                            (input, _) => OrderedInput::Rows(Box::new(PageProject {
+                                input: input.pages(&execution), schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone(),
+                            })),
+                        }
+                    }
+                }
             }
-            RelationNode::Extend { expressions, .. } => {
+            RelationNode::Extend { expressions, .. } if projection.is_none() => {
                 let child = runtime.child(0)?;
-                let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit).await? else { return Ok(None); };
-                Box::new(PageExtend { input, schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone() })
+                let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit, offset, None).await? else { return Ok(None); };
+                OrderedInput::Rows(Box::new(PageExtend {
+                    input: input.pages(&execution), schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone(),
+                }))
             }
             RelationNode::Filter { .. } | RelationNode::Distinct { .. } => {
-                let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await? else { return Ok(None); };
+                let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit, offset, projection).await? else { return Ok(None); };
                 input
             }
             _ => return Ok(None),
         };
-        let input = crate::pages::retain_page_state(input, state_reservation(&runtime, &execution)?);
-        Ok(Some(crate::trace::wrap(crate::analysis::wrap(input, execution.analysis.clone()), relation, &execution.context)))
-    })
+        input.observe(&runtime, &execution).map(Some)
+    });
+    Box::pin(std::future::poll_fn(move |context| {
+        stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || build.as_mut().poll(context))
+    }))
 }
 
 struct PageProject { input: BoxPageCursor, schema: Schema, expressions: Vec<NamedExpr>, execution: Execution }

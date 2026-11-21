@@ -40,7 +40,7 @@ mod query_cpu;
 mod join_storage;
 mod mark;
 
-pub use accelerate::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, CorpusSource, FileMatches, MatchAnswers, OrderedScan, ScanAccelerator, ScanRequest};
+pub use accelerate::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, CorpusSource, FileMatches, MatchAnswers, OrderedBatches, OrderedScan, ScanAccelerator, ScanRequest};
 pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, retain_catalog_snapshot};
 pub use fragment::{FragmentDepth, FragmentResidence, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment};
 pub use cursor::{PreparedQuery, QueryCursor};

@@ -27,7 +27,7 @@ entity Checkpoint {
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A read or maintenance cycle owns index page buffers for its own lifetime.
 -- A point read merges bucket prefixes in key order.
--- A covered point read returns typed batches from those postings after applying every predicate.
+-- A covered point read streams typed batches of the requested columns from those postings after applying every predicate.
 -- Queries requiring table payload fetch it at the same basis.
 -- An ordered distinct page filters eligible rows before counting each distinct key once.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.

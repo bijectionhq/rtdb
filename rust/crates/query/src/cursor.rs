@@ -248,9 +248,10 @@ impl PreparedQuery {
         let owner = context.owner_cancellation.clone();
         let operators = Arc::clone(&runtime_schema);
         let input = owner.run_until_cancelled(cancellation.run_until_cancelled(async {
-            if analysis.is_none() && context.trace_parent.is_none() && !context.accelerators.is_empty()
-                && !matches!(batching, Batching::Pages)
-                && let Some(batches) = crate::operators::build_ordered_columns(Arc::clone(&operators), execution.clone(), None).await?
+            if !context.accelerators.is_empty() && !matches!(batching, Batching::Pages)
+                && let Some(batches) = crate::operators::build_ordered_columns(
+                    Arc::clone(&operators), execution.clone(), (0..operators.schema().len()).collect(),
+                ).await?
             {
                 return Ok(QueryInput::Columns(batches));
             }
@@ -265,9 +266,19 @@ impl PreparedQuery {
         })).await.flatten().ok_or_else(cancelled)??;
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
         if let (QueryOutput::Analyze(schema), Some(analysis)) = (&self.output, analysis) {
-            let QueryInput::Rows(mut input) = input else { return Err(invalid("analysis-input", "Query analysis requires a row cursor")); };
-            while let Some(row) = owner.run_until_cancelled(cancellation.run_until_cancelled(input.next())).await.flatten().ok_or_else(cancelled)?? { context.check_cancelled()?; drop(row); }
-            drop(input);
+            match input {
+                QueryInput::Rows(mut input) => {
+                    while owner.run_until_cancelled(cancellation.run_until_cancelled(input.next())).await.flatten().ok_or_else(cancelled)??.is_some() {
+                        context.check_cancelled()?;
+                    }
+                }
+                QueryInput::Columns(mut input) => {
+                    while owner.run_until_cancelled(cancellation.run_until_cancelled(input.next_batch())).await.flatten().ok_or_else(cancelled)??.is_some() {
+                        context.check_cancelled()?;
+                    }
+                }
+                QueryInput::Pages(_) => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
+            }
             let peak = context.memory.peak_bytes();
             let reservation = context.memory.reserve(analysis.output_bound()?)?;
             let rows = analysis.rows(peak)?;

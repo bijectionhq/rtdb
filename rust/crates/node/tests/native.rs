@@ -2598,6 +2598,50 @@ async fn ordered_index_limits_distinct_visible_keys_in_both_directions() {
 }
 
 #[tokio::test]
+async fn a_covered_ordered_scan_yields_a_batch_before_opening_later_leaves() {
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (world, key, label)").await;
+    let records = (0..400).map(|id| format!("{{_id: {id}, world: 1, key: 'key-{id:04}', label: 'visible'}}"))
+        .collect::<Vec<_>>().join(", ");
+    index_sql(&mut session, &format!("INSERT INTO orders RECORDS {records}")).await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let query = "SELECT DISTINCT key FROM orders WHERE world = 1 AND label = 'visible' ORDER BY key LIMIT 400";
+    let mut cursor = session.query_sql(query, vec![]).await.unwrap();
+    let first = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(first.batch().num_rows(), 128);
+    assert_eq!(first.batch().num_columns(), 1);
+
+    let objects = database.object_store();
+    let root = rtdb_storage::ObjectKey::new(rtdb_format::keys::ORDERED_INDEX_ROOT).unwrap();
+    let mut removed = 0;
+    for page in objects.list(Some(&root)).await.unwrap() {
+        if !page.key.as_str().contains("/pages/") { continue; }
+        let bytes = objects.get(&page.key).await.unwrap();
+        if bytes.first() == Some(&1) && bytes.windows(b"key-0399".len()).any(|cell| cell == b"key-0399") {
+            objects.delete(&page.key).await.unwrap();
+            removed += 1;
+        }
+    }
+    assert!(removed > 0);
+    let mut delivered = first.batch().num_rows();
+    loop {
+        match cursor.next_batch().await {
+            Ok(Some(batch)) => delivered += batch.batch().num_rows(),
+            Ok(None) => panic!("A missing page completed the index stream"),
+            Err(_) => break,
+        }
+    }
+    assert!(delivered < 400);
+    drop(cursor);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_index_retires_erased_keys_and_drop_recreate_gets_a_fresh_generation() {
     let mut config = options();
     config.automatic_artefacts = false;

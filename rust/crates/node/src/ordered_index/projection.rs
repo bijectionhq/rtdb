@@ -27,7 +27,7 @@ pub(super) struct RevisionRoots {
 impl RevisionRoots {
     pub async fn at(
         &self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         system_from: Timestamp,
     ) -> Result<Option<(Timestamp, Root)>> {
         if let Some((&time, root)) = self.changes.range(..=system_from).next_back() {
@@ -47,7 +47,7 @@ impl RevisionRoots {
 
     async fn stage_archived(
         &mut self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         cancellation: &CancellationToken,
     ) -> Result<()> {
         let mut cursor = Cursor::new(self.archived.take(), false);
@@ -63,7 +63,7 @@ impl RevisionRoots {
 
     pub async fn apply(
         &mut self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         changes: Changes,
         order: EventOrder,
         cancellation: &CancellationToken,
@@ -92,7 +92,7 @@ impl RevisionRoots {
                 }
                 let before = tree.spans(&root, iid).await?;
                 let cut = events.iter().any(|event| event.header.op == EventOp::Erase);
-                let after = resolve(iid, time, &before, &events, tree.memory)?;
+                let after = resolve(iid, time, &before, &events, &tree.memory)?;
                 if cut {
                     cut_at_revision = true;
                     self.stage_archived(tree, cancellation).await?;
@@ -231,7 +231,7 @@ impl Changes {
     /// A read keeps only its selected root. Later erasures still remove older facts from it.
     pub async fn read(
         self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         mut root: Root,
         system_at: Timestamp,
         order: EventOrder,
@@ -254,7 +254,7 @@ impl Changes {
                     if matches!(order, EventOrder::OldestFirst) {
                         events.reverse();
                     }
-                    resolve(iid, time, &before, &events, tree.memory)?
+                    resolve(iid, time, &before, &events, &tree.memory)?
                 };
                 if before.as_ref() != after.as_slice() {
                     project(&mut edits, iid, &before, after.into());
@@ -362,7 +362,7 @@ mod tests {
         changes
     }
 
-    async fn keys(tree: &Tree<'_>, root: Root, valid: Timestamp) -> Vec<(i128, Iid)> {
+    async fn keys(tree: &Tree, root: Root, valid: Timestamp) -> Vec<(i128, Iid)> {
         let mut keys = Vec::new();
         for bucket in Bucket::at(valid) {
             let mut cursor = Cursor::new(root.clone(), false);
@@ -390,7 +390,7 @@ mod tests {
     #[tokio::test]
     async fn a_correction_retracts_the_original_bucket_and_a_pin_keeps_its_root() {
         let directory = ObjectKey::new("index").unwrap();
-        let storage = BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
         let memory = MemoryBudget::new(32 << 20);
         let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
         let token = CancellationToken::new();
@@ -431,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn an_erasure_scrubs_older_revisions_and_respects_commit_order() {
         let directory = ObjectKey::new("index").unwrap();
-        let storage = BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
         let memory = MemoryBudget::new(32 << 20);
         let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
         let token = CancellationToken::new();

@@ -43,7 +43,7 @@ impl Checkpoint {
         }
     }
 
-    pub async fn finish(&self, tree: &Tree<'_>, cancellation: &CancellationToken) -> Result<()> {
+    pub async fn finish(&self, tree: &Tree, cancellation: &CancellationToken) -> Result<()> {
         let pending = self.pending_collection(tree).await?;
         if pending.is_empty() {
             self.retire_manifests(tree, cancellation).await
@@ -52,13 +52,13 @@ impl Checkpoint {
         }
     }
 
-    pub async fn collect(&self, tree: &Tree<'_>, cancellation: &CancellationToken) -> Result<()> {
+    pub async fn collect(&self, tree: &Tree, cancellation: &CancellationToken) -> Result<()> {
         let pending = self.pending_collection(tree).await?;
         self.sweep(tree, pending, cancellation).await
     }
 
-    async fn pending_collection(&self, tree: &Tree<'_>) -> Result<Vec<ObjectKey>> {
-        let root = key(tree.directory, "cleanup")?;
+    async fn pending_collection(&self, tree: &Tree) -> Result<Vec<ObjectKey>> {
+        let root = key(&tree.directory, "cleanup")?;
         Ok(tree
             .storage
             .object_store()
@@ -74,7 +74,7 @@ impl Checkpoint {
 
     async fn sweep(
         &self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         pending: Vec<ObjectKey>,
         cancellation: &CancellationToken,
     ) -> Result<()> {
@@ -84,7 +84,7 @@ impl Checkpoint {
         }
         let store = tree.storage.object_store();
         let prefix = tree.pages()?;
-        let generations = key(tree.directory, "generations")?;
+        let generations = key(&tree.directory, "generations")?;
         let objects = store.list(Some(&generations)).await?;
         let present: BTreeSet<_> = objects.iter().map(|object| &object.key).collect();
         if !reachable.iter().all(|key| present.contains(key)) {
@@ -121,7 +121,7 @@ impl Checkpoint {
             }
         }
         if managed.is_none() {
-            let legacy = key(tree.directory, "pages")?;
+            let legacy = key(&tree.directory, "pages")?;
             for object in store.list(Some(&legacy)).await? {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
@@ -143,12 +143,12 @@ impl Checkpoint {
 
     async fn retire_manifests(
         &self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         cancellation: &CancellationToken,
     ) -> Result<()> {
         let store = tree.storage.object_store();
-        let published = key(tree.directory, MANIFESTS)?;
-        for object in store.list(Some(&key(tree.directory, "manifests")?)).await? {
+        let published = key(&tree.directory, MANIFESTS)?;
+        for object in store.list(Some(&key(&tree.directory, "manifests")?)).await? {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
@@ -164,8 +164,8 @@ impl Checkpoint {
 }
 
 /// Recovery may advance the manifest before the sweep finishes.
-pub(super) async fn request_collection(tree: &Tree<'_>, through: i64) -> Result<()> {
-    let debt = key(tree.directory, format_args!("cleanup/{through:016x}"))?;
+pub(super) async fn request_collection(tree: &Tree, through: i64) -> Result<()> {
+    let debt = key(&tree.directory, format_args!("cleanup/{through:016x}"))?;
     tree.storage
         .object_store()
         .put(&debt, Vec::<u8>::new().into())
@@ -242,7 +242,7 @@ pub(super) async fn latest(
 }
 
 pub(super) async fn store_roots(
-    tree: &Tree<'_>,
+    tree: &Tree,
     block: i64,
     roots: &RevisionRoots,
     cancellation: &CancellationToken,
@@ -278,7 +278,7 @@ pub(super) async fn store_roots(
 }
 
 pub(super) async fn publish(
-    tree: &Tree<'_>,
+    tree: &Tree,
     through: i64,
     source_rows: i64,
     archive: Root,
@@ -315,12 +315,12 @@ pub(super) async fn publish(
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
-    let manifest = key(tree.directory, format_args!("{MANIFESTS}/{through:016x}"))?;
+    let manifest = key(&tree.directory, format_args!("{MANIFESTS}/{through:016x}"))?;
     tree.storage
         .object_store()
         .put(&manifest, encoded.into())
         .await?;
-    latest(tree.storage, tree.directory, tree.memory, through)
+    latest(&tree.storage, &tree.directory, &tree.memory, through)
         .await?
         .ok_or_else(|| format_error("Published checkpoint is unavailable"))
 }
@@ -334,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn advancing_reopens_collection_abandoned_after_manifest_publication() {
-        let storage = BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let memory = MemoryBudget::new(1 << 20);
         let directory = ObjectKey::new("index").unwrap();
         let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
@@ -365,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweeping_a_scope_preserves_pages_staged_in_a_later_scope() {
-        let storage = BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let memory = MemoryBudget::new(1 << 20);
         let directory = ObjectKey::new("index").unwrap();
         let tree = Tree::new(&storage, &directory, &memory, 2).await.unwrap();

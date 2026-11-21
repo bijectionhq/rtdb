@@ -53,13 +53,39 @@ impl Drop for CursorTrace {
         }
     }
 }
-pub(crate) fn wrap(input: BoxPageCursor, relation: &Relation, context: &Arc<QueryContext>) -> BoxPageCursor {
-    if context.trace_parent.is_none() { return input; }
+fn operator_trace(relation: &Relation, context: &Arc<QueryContext>) -> Option<CursorTrace> {
+    context.trace_parent?;
     let kind = crate::analysis::operator(relation);
     let extra = match relation.node() { RelationNode::Scan(scan) => scan.table.name.table.schema.len().saturating_add(scan.table.name.table.table.len()), _ => 0 };
-    let Ok(_name) = context.memory.reserve(extra.saturating_add(1024)) else { return input; };
+    let _name = context.memory.reserve(extra.saturating_add(1024)).ok()?;
     let name = match relation.node() { RelationNode::Scan(scan) => format!("query.cursor.scan.{}.{}", scan.table.name.table.schema, scan.table.name.table.table), _ => format!("query.cursor.{kind}") };
-    match CursorTrace::new(context, kind, &name, true) { Some(trace) => Box::new(TracedCursor { input: Some(input), trace }), None => input }
+    CursorTrace::new(context, kind, &name, true)
+}
+pub(crate) fn wrap(input: BoxPageCursor, relation: &Relation, context: &Arc<QueryContext>) -> BoxPageCursor {
+    match operator_trace(relation, context) { Some(trace) => Box::new(TracedCursor { input: Some(input), trace }), None => input }
+}
+
+pub(crate) fn wrap_batches(input: crate::columnar::BoxBatchCursor, relation: &Relation, context: &Arc<QueryContext>) -> crate::columnar::BoxBatchCursor {
+    match operator_trace(relation, context) { Some(trace) => Box::new(TracedBatches { input, trace }), None => input }
+}
+struct TracedBatches { input: crate::columnar::BoxBatchCursor, trace: CursorTrace }
+
+#[async_trait]
+impl crate::columnar::BatchCursor for TracedBatches {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        self.trace.start();
+        let started = Instant::now();
+        let result = self.input.next_batch().await;
+        if let Ok(batch) = &result { self.trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.len)); }
+        result
+    }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+    fn trace_attributes(&self, span: &mut dyn TraceSpan) { self.input.trace_attributes(span); }
+}
+impl Drop for TracedBatches {
+    fn drop(&mut self) {
+        if let Some(span) = &mut self.trace.span { self.input.trace_attributes(span.as_mut()); }
+    }
 }
 struct TracedCursor { input: Option<BoxPageCursor>, trace: CursorTrace }
 #[async_trait]

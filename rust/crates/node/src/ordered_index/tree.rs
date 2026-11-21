@@ -369,21 +369,21 @@ struct DecodedPages {
     entries: BTreeMap<ObjectKey, Arc<Node>>,
 }
 
-pub(super) struct Tree<'a> {
-    pub storage: &'a BufferPool,
-    pub directory: &'a ObjectKey,
+pub(super) struct Tree {
+    pub storage: Arc<BufferPool>,
+    pub directory: ObjectKey,
     pub scope: u64,
-    pub memory: &'a Arc<MemoryBudget>,
+    pub memory: Arc<MemoryBudget>,
     decoded: Mutex<DecodedPages>,
     // Drop this after the decoded cache.
     permit: Option<Arc<dyn Send + Sync>>,
 }
 
-impl<'scope> Tree<'scope> {
+impl Tree {
     pub async fn new(
-        storage: &'scope BufferPool,
-        directory: &'scope ObjectKey,
-        memory: &'scope Arc<MemoryBudget>,
+        storage: &Arc<BufferPool>,
+        directory: &ObjectKey,
+        memory: &Arc<MemoryBudget>,
         scope: u64,
     ) -> Result<Self> {
         let permit = match storage.object_store().index_page_lifecycle() {
@@ -398,10 +398,10 @@ impl<'scope> Tree<'scope> {
             None => None,
         };
         Ok(Self {
-            storage,
-            directory,
+            storage: storage.clone(),
+            directory: directory.clone(),
             scope,
-            memory,
+            memory: memory.clone(),
             decoded: Mutex::default(),
             permit,
         })
@@ -409,7 +409,7 @@ impl<'scope> Tree<'scope> {
 
     pub fn page_scope(&self) -> IndexPageScope<'_> {
         IndexPageScope {
-            index: self.directory,
+            index: &self.directory,
             generation: self.scope,
         }
     }
@@ -913,7 +913,7 @@ impl Cursor {
 
     pub async fn next(
         &mut self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         position: impl Fn(KeyRef<'_>) -> Ordering,
     ) -> Result<Option<Hit>> {
         let before = if self.reverse {
@@ -975,7 +975,7 @@ impl Cursor {
 
     async fn descend(
         &mut self,
-        tree: &Tree<'_>,
+        tree: &Tree,
         mut link: Link,
         position: &impl Fn(KeyRef<'_>) -> Ordering,
         before: Ordering,

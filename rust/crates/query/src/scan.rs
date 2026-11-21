@@ -432,7 +432,7 @@ impl Part {
     fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts } }
 }
 
-async fn ordered(scan: &Scan, execution: &Execution, limit: usize, covered_only: bool) -> Result<Option<crate::OrderedScan>> {
+async fn ordered(scan: &Scan, execution: &Execution, limit: usize, projection: &[usize], covered_only: bool) -> Result<Option<crate::OrderedScan>> {
     if scan.ordered_top_k.is_none() || scan.iids.is_some() || !scan.matches.is_empty() {
         return Ok(None);
     }
@@ -449,21 +449,27 @@ async fn ordered(scan: &Scan, execution: &Execution, limit: usize, covered_only:
         verifier: &verifier, partitions: &database.partitions,
     };
     for accelerator in context.accelerators.iter() {
-        if let Some(output) = accelerator.ordered(&request, limit, covered_only).await? {
+        if let Some(output) = accelerator.ordered(&request, limit, projection, covered_only).await? {
             return Ok(Some(output));
         }
     }
     Ok(None)
 }
 
-pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usize) -> Result<Option<crate::pages::BoxPageCursor>> {
-    let Some(output) = ordered(scan, execution, limit, false).await? else { return Ok(None); };
+pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, projection: Option<&[usize]>) -> Result<Option<crate::operators::OrderedInput>> {
+    use crate::operators::OrderedInput;
+    let full;
+    let positions = match projection {
+        Some(positions) => positions,
+        None => { full = (0..scan.columns.len()).collect::<Vec<_>>(); &full }
+    };
+    let Some(output) = ordered(scan, execution, limit, positions, projection.is_some()).await? else { return Ok(None); };
     Ok(Some(match output {
         crate::OrderedScan::Covered(batches) => {
-            let input = CoveredBatches::new(batches, execution, 0);
-            Box::new(crate::columnar::BatchRows::new(Box::new(input), Arc::clone(&execution.context.memory)))
+            OrderedInput::Batches(Box::new(CoveredBatches { batches, context: Arc::clone(&execution.context), offset }))
         }
         crate::OrderedScan::Iids(iids) => {
+            if projection.is_some() { return Ok(None); }
             let memory = execution.context.memory.reserve(iids.capacity().saturating_mul(size_of::<Iid>() + 32))?;
             let mut scan = scan.clone();
             let width = scan.columns.len();
@@ -471,33 +477,22 @@ pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usi
             scan.ordered_top_k = None;
             scan.top_k = None;
             scan.predicates.clear();
-            Box::new(OrderedRows { scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory })
+            OrderedInput::Rows(Box::new(OrderedRows { scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory }))
         }
     }))
 }
 
-pub(crate) async fn ordered_batches(scan: &Scan, execution: &Execution, limit: usize, offset: usize) -> Result<Option<crate::columnar::BoxBatchCursor>> {
-    let Some(crate::OrderedScan::Covered(batches)) = ordered(scan, execution, limit, true).await? else { return Ok(None); };
-    Ok(Some(Box::new(CoveredBatches::new(batches, execution, offset))))
-}
-
 struct CoveredBatches {
-    batches: std::vec::IntoIter<OwnedBatch>,
+    batches: Box<dyn crate::OrderedBatches>,
     context: Arc<crate::QueryContext>,
     offset: usize,
-}
-
-impl CoveredBatches {
-    fn new(batches: Vec<OwnedBatch>, execution: &Execution, offset: usize) -> Self {
-        Self { batches: batches.into_iter(), context: Arc::clone(&execution.context), offset }
-    }
 }
 
 #[async_trait]
 impl crate::columnar::BatchCursor for CoveredBatches {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         self.context.check_cancelled()?;
-        for batch in self.batches.by_ref() {
+        while let Some(batch) = self.batches.next_batch().await? {
             let rows = batch.batch().num_rows();
             if self.offset >= rows {
                 self.offset -= rows;

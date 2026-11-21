@@ -10,11 +10,12 @@ use arrow_array::{
 };
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use rtdb_columnar::{BatchBuilder, OwnedBatch, to_field};
+use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, to_field};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
-use rtdb_query::{OrderedScan, ScanAccelerator, ScanRequest};
+use rtdb_query::{OrderedBatches, OrderedScan, ScanAccelerator, ScanRequest};
 use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     Definition, checkpoint, definitions,
@@ -32,7 +33,7 @@ pub(crate) struct OrderedIndexAccelerator;
 #[async_trait]
 impl ScanAccelerator for OrderedIndexAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        Ok(match exact(request, None, false).await? {
+        Ok(match exact(request, None, &[], false).await? {
             Some(OrderedScan::Iids(ids)) => Some(ids.into_iter().collect()),
             _ => None,
         })
@@ -42,18 +43,20 @@ impl ScanAccelerator for OrderedIndexAccelerator {
         &self,
         request: &ScanRequest<'_>,
         limit: usize,
+        projection: &[usize],
         covered_only: bool,
     ) -> Result<Option<OrderedScan>> {
         if limit > MAX_CANDIDATES {
             return Ok(None);
         }
-        exact(request, Some(limit), covered_only).await
+        exact(request, Some(limit), projection, covered_only).await
     }
 }
 
 async fn exact(
     request: &ScanRequest<'_>,
     limit: Option<usize>,
+    projection: &[usize],
     covered_only: bool,
 ) -> Result<Option<OrderedScan>> {
     let table = &request.scan.table.name.table;
@@ -65,7 +68,7 @@ async fn exact(
     {
         return Ok(None);
     }
-    match seek(request, limit, covered_only).await {
+    match seek(request, limit, projection, covered_only).await {
         Err(error) if error.category == AnomalyCategory::Interrupted => Err(error),
         Err(_) => Ok(None),
         found => found,
@@ -75,6 +78,7 @@ async fn exact(
 async fn seek(
     request: &ScanRequest<'_>,
     limit: Option<usize>,
+    projection: &[usize],
     covered_only: bool,
 ) -> Result<Option<OrderedScan>> {
     let definitions = definitions(
@@ -117,8 +121,16 @@ async fn seek(
             }
             None
         };
-        if let Some(found) =
-            use_index(request, definition, &fields, &range, top, covered_only).await?
+        if let Some(found) = use_index(
+            request,
+            definition,
+            &fields,
+            range,
+            top,
+            projection,
+            covered_only,
+        )
+        .await?
         {
             return Ok(Some(found));
         }
@@ -560,8 +572,9 @@ async fn use_index(
     request: &ScanRequest<'_>,
     definition: &Definition,
     fields: &[Option<&Field>],
-    range: &Range,
+    range: Range,
     top: Option<Top>,
+    projection: &[usize],
     covered_only: bool,
 ) -> Result<Option<OrderedScan>> {
     let residuals = request
@@ -585,7 +598,7 @@ async fn use_index(
         return Ok(None);
     }
     let projection = if top.is_some() && covered {
-        Covered::bind(request, definition)?
+        Covered::bind(request, definition, projection)?
     } else {
         None
     };
@@ -594,7 +607,7 @@ async fn use_index(
     }
     if top.is_some_and(|top| top.limit == 0) {
         return Ok(Some(if projection.is_some() {
-            OrderedScan::Covered(Vec::new())
+            OrderedScan::Covered(Box::new(CoveredSeek::empty()))
         } else {
             OrderedScan::Iids(Vec::new())
         }));
@@ -624,38 +637,52 @@ async fn use_index(
     };
     let reverse = top.is_some_and(|top| top.reverse);
     let buckets: Vec<_> = Bucket::at(request.bounds.valid_time.lower()).collect();
-    let mut cursors: Vec<_> = buckets
+    let cursors = buckets
         .iter()
         .map(|_| Cursor::new(root.clone(), reverse))
         .collect();
-    let _scratch = request.memory.reserve(
+    let scratch = request.memory.reserve(
         MAX_CANDIDATES
             .min(top.map_or(MAX_CANDIDATES, |top| top.limit))
             .saturating_mul(64)
             .saturating_add(16_384),
     )?;
-    let mut heap = BinaryHeap::new();
-    for (slot, cursor) in cursors.iter_mut().enumerate() {
-        if let Some(head) = next(cursor, &tree, range, buckets[slot], slot, reverse).await? {
-            heap.push(head);
-        }
+    let mut scan = PostingScan {
+        heap: BinaryHeap::new(),
+        cursors,
+        buckets,
+        advanced: None,
+        range,
+        reverse,
+        width: definition.columns.len(),
+        cancellation: request.cancellation.clone(),
+        _scratch: scratch,
+        tree,
+    };
+    for slot in 0..scan.cursors.len() {
+        scan.advance(slot).await?;
     }
+
+    if let (Some(projection), Some(top)) = (projection, top) {
+        let mut seek = CoveredSeek {
+            state: Some(CoveredState {
+                projection,
+                scan,
+                predicates,
+                distinct_slot,
+                last: None,
+                remaining: top.limit,
+            }),
+            first: None,
+        };
+        seek.first = seek.next_batch().await?;
+        return Ok(Some(OrderedScan::Covered(Box::new(seek))));
+    }
+
     let mut selected = Vec::new();
     let mut pending = Vec::new();
-    let mut batches = Vec::new();
-    let mut batch_rows = Vec::new();
-    let mut batch_count = 0;
     let mut last_distinct = None::<Head>;
-    while let Some(head) = heap.pop() {
-        if request.cancellation.is_cancelled() {
-            return Err(cancelled());
-        }
-        let slot = head.slot;
-        if head.tuple().len() != definition.columns.len() {
-            return Err(super::format_error(
-                "Posting width differs from its index definition",
-            ));
-        }
+    while let Some(head) = scan.next().await? {
         if predicates
             .iter()
             .all(|predicate| predicate.matches(head.tuple()))
@@ -667,18 +694,9 @@ async fn use_index(
                         .is_none_or(|prior| prior.tuple().cell(key) != head.tuple().cell(key))
                 });
                 if emit {
+                    selected.push(head.iid);
                     if distinct_slot.is_some() {
-                        last_distinct = Some(head.clone());
-                    }
-                    if let Some(projection) = &projection {
-                        batch_rows.push(head);
-                        batch_count += 1;
-                        if batch_rows.len() == BATCH_ROWS {
-                            batches.push(projection.batch(request, &batch_rows)?);
-                            batch_rows.clear();
-                        }
-                    } else {
-                        selected.push(head.iid);
+                        last_distinct = Some(head);
                     }
                 }
             } else {
@@ -691,40 +709,143 @@ async fn use_index(
                     filter_payload(request, residuals, &mut pending, &mut selected).await?;
                 }
             }
-            let count = selected.len() + batch_count;
-            if top.is_some_and(|top| count >= top.limit) {
+            if top.is_some_and(|top| selected.len() >= top.limit) {
                 break;
             }
-            if count > MAX_CANDIDATES {
+            if selected.len() > MAX_CANDIDATES {
                 return Ok(None);
             }
         }
-        if let Some(head) = next(
-            &mut cursors[slot],
-            &tree,
-            range,
-            buckets[slot],
-            slot,
-            reverse,
-        )
-        .await?
-        {
-            heap.push(head);
-        }
-    }
-    if let Some(projection) = projection {
-        if !batch_rows.is_empty() {
-            batches.push(projection.batch(request, &batch_rows)?);
-        }
-        return Ok(Some(OrderedScan::Covered(batches)));
     }
     filter_payload(request, residuals, &mut pending, &mut selected).await?;
     Ok(Some(OrderedScan::Iids(selected)))
 }
 
+struct PostingScan {
+    heap: BinaryHeap<Head>,
+    cursors: Vec<Cursor>,
+    buckets: Vec<Bucket>,
+    advanced: Option<usize>,
+    range: Range,
+    reverse: bool,
+    width: usize,
+    cancellation: CancellationToken,
+    _scratch: Arc<MemoryReservation>,
+    tree: Tree,
+}
+
+impl PostingScan {
+    async fn advance(&mut self, slot: usize) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        if let Some(head) = next(
+            &mut self.cursors[slot],
+            &self.tree,
+            &self.range,
+            self.buckets[slot],
+            slot,
+            self.reverse,
+        )
+        .await?
+        {
+            self.heap.push(head);
+        }
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<Head>> {
+        if let Some(slot) = self.advanced.take() {
+            self.advance(slot).await?;
+        }
+        let Some(head) = self.heap.pop() else {
+            return Ok(None);
+        };
+        self.advanced = Some(head.slot);
+        if head.tuple().len() != self.width {
+            return Err(super::format_error(
+                "Posting width differs from its index definition",
+            ));
+        }
+        Ok(Some(head))
+    }
+}
+
+struct CoveredState {
+    projection: Covered,
+    predicates: Vec<Predicate>,
+    distinct_slot: Option<usize>,
+    last: Option<Head>,
+    remaining: usize,
+    scan: PostingScan,
+}
+
+struct CoveredSeek {
+    state: Option<CoveredState>,
+    first: Option<OwnedBatch>,
+}
+
+impl CoveredSeek {
+    fn empty() -> Self {
+        Self {
+            state: None,
+            first: None,
+        }
+    }
+}
+
+#[async_trait]
+impl OrderedBatches for CoveredSeek {
+    async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
+        if let Some(first) = self.first.take() {
+            return Ok(Some(first));
+        }
+        let Some(state) = &mut self.state else {
+            return Ok(None);
+        };
+        let capacity = BATCH_ROWS.min(state.remaining);
+        let mut rows = Vec::with_capacity(capacity);
+        while rows.len() < capacity {
+            let Some(head) = state.scan.next().await? else {
+                break;
+            };
+            if !state
+                .predicates
+                .iter()
+                .all(|predicate| predicate.matches(head.tuple()))
+            {
+                continue;
+            }
+            if let Some(slot) = state.distinct_slot {
+                if state
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.tuple().cell(slot) == head.tuple().cell(slot))
+                {
+                    continue;
+                }
+                state.last = Some(head.clone());
+            }
+            rows.push(head);
+        }
+        let batch = if rows.is_empty() {
+            None
+        } else {
+            Some(state.projection.batch(&state.scan.tree.memory, &rows)?)
+        };
+        state.remaining -= rows.len();
+        let done = rows.len() < capacity || state.remaining == 0;
+        drop(rows);
+        if done {
+            self.state = None;
+        }
+        Ok(batch)
+    }
+}
+
 async fn next(
     cursor: &mut Cursor,
-    tree: &Tree<'_>,
+    tree: &Tree,
     range: &Range,
     bucket: Bucket,
     slot: usize,
@@ -760,9 +881,18 @@ struct Covered {
 }
 
 impl Covered {
-    fn bind(request: &ScanRequest<'_>, definition: &Definition) -> Result<Option<Self>> {
+    fn bind(
+        request: &ScanRequest<'_>,
+        definition: &Definition,
+        projection: &[usize],
+    ) -> Result<Option<Self>> {
+        let fields = projection
+            .iter()
+            .map(|&position| request.scan.columns.get(position))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| super::format_error("Covered scan position exceeds its schema"))?;
         let mut columns = Vec::new();
-        for field in &request.scan.columns {
+        for field in &fields {
             let logical = match &field.data_type {
                 LogicalType::Maybe(value) => value.as_ref(),
                 logical => logical,
@@ -798,9 +928,7 @@ impl Covered {
             };
             columns.push((slot, scalar.clone()));
         }
-        let fields = request
-            .scan
-            .columns
+        let fields = fields
             .iter()
             .map(|field| to_field(&field.name, &field.data_type))
             .collect::<Result<Vec<_>>>()?;
@@ -810,11 +938,8 @@ impl Covered {
         }))
     }
 
-    fn batch(&self, request: &ScanRequest<'_>, rows: &[Head]) -> Result<OwnedBatch> {
-        let mut builder = BatchBuilder::new(
-            4096 + self.columns.len().saturating_mul(256),
-            request.memory,
-        )?;
+    fn batch(&self, memory: &Arc<MemoryBudget>, rows: &[Head]) -> Result<OwnedBatch> {
+        let mut builder = BatchBuilder::new(4096 + self.columns.len().saturating_mul(256), memory)?;
         let mut arrays = Vec::with_capacity(self.columns.len());
         for (slot, scalar) in &self.columns {
             let cells = || rows.iter().map(|head| head.tuple().cell(*slot));
@@ -864,12 +989,16 @@ fn covered_array<'a>(
     Ok(match scalar {
         S::Utf8 => {
             let mut builder = StringBuilder::with_capacity(cells.len(), payload_bytes);
-            for value in cells!(Text, |value| value) { builder.append_option(value?); }
+            for value in cells!(Text, |value| value) {
+                builder.append_option(value?);
+            }
             Arc::new(builder.finish())
         }
         S::Binary => {
             let mut builder = BinaryBuilder::with_capacity(cells.len(), payload_bytes);
-            for value in cells!(Binary, |value| value) { builder.append_option(value?); }
+            for value in cells!(Binary, |value| value) {
+                builder.append_option(value?);
+            }
             Arc::new(builder.finish())
         }
         S::Bool => Arc::new(cells!(Bool, |value| value).collect::<Result<BooleanArray>>()?),

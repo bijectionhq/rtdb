@@ -96,7 +96,12 @@ impl rtdb_expr::CorpusLookup for CorpusRegistry {
 /// Exact ordered output for a point scan in its requested order.
 pub enum OrderedScan {
     Iids(Vec<Iid>),
-    Covered(Vec<OwnedBatch>),
+    Covered(Box<dyn OrderedBatches>),
+}
+
+#[async_trait]
+pub trait OrderedBatches: Send {
+    async fn next_batch(&mut self) -> Result<Option<OwnedBatch>>;
 }
 
 /// Narrows a scan before it opens.
@@ -108,8 +113,8 @@ pub trait ScanAccelerator: Send + Sync {
     /// The first matching rows of a point read, in the requested SQL order.
     /// The returned identities already account for the scan predicates and annotated residual predicates.
     /// A distinct plan returns at most one representative of each SQL key before applying the limit.
-    /// With `covered_only`, return batches with the scan's full schema or decline the seek.
-    async fn ordered(&self, _request: &ScanRequest<'_>, _limit: usize, _covered_only: bool) -> Result<Option<OrderedScan>> { Ok(None) }
+    /// With `covered_only`, return batches for the requested scan positions or decline the seek.
+    async fn ordered(&self, _request: &ScanRequest<'_>, _limit: usize, _projection: &[usize], _covered_only: bool) -> Result<Option<OrderedScan>> { Ok(None) }
     /// The values of `match(column, query)` on the rows of whichever of the scan's data files the accelerator can answer for, so the scan reads no text there.
     /// Each answer must equal MATCH evaluated on the row.
     async fn match_answers(&self, _request: &ScanRequest<'_>, _column: &str, _query: &str) -> Result<Option<MatchAnswers>> { Ok(None) }

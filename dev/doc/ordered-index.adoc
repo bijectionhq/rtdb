@@ -11,7 +11,9 @@ For example, after priority 2 and ID 4, use `priority > 2 OR (priority = 2 AND _
 Include `_id` in the ordering to make continuation deterministic among equal values.
 Reuse both temporal points to continue the same read across SQL statements.
 The scan can reverse the index order and applies predicates before counting rows towards the limit.
-When all predicates and result columns are covered, the seek emits Arrow result batches from the index.
+When all predicates and result columns are covered, the seek emits Arrow result batches from the index as the caller pulls them.
+The seek evaluates predicates against posting cells and gathers only the requested output columns through plain projections.
+Tracing and EXPLAIN ANALYZE observe the same batch cursor.
 When the query needs additional fields, the scan fetches them from the table at the same basis.
 
 For a ranked full-text query, a bounded seek on a structured predicate can supply an IID scope before MATCH candidates are scored.
@@ -48,7 +50,8 @@ Covered results own their projected buffers independently of the page read.
 Ordered-index inputs bypass the persistent node cache, and replay reads its source bytes within the cycle's memory budget.
 Cold page reads carry the published size into a bounded provider fetch and validate the digest before opening Arrow buffers.
 The page admission and memory reservation stay with the provider operation through cancellation.
-A missing checkpoint, missing source coverage or memory admission failure uses the normal SQL executor.
+A missing checkpoint, missing source coverage or memory admission failure while opening the seek uses the normal SQL executor.
+A read failure after it opens terminates the stream at its captured basis.
 
 == Maintenance
 
