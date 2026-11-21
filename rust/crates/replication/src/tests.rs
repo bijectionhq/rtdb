@@ -582,6 +582,69 @@ async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_pay
 }
 
 #[tokio::test]
+async fn staged_leader_and_decoding_follower_publish_the_same_transaction_prefixes() {
+    let config = ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() };
+    let mut leader = fixture(config.clone(), 1 << 27).await;
+    let mut follower = fixture(config, 1 << 27).await;
+    let claim = ReplicaEnvelope {
+        term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }),
+    };
+    leader.logs.enqueue_replica(&claim, BlockIndex(0), Timestamp(99)).await.unwrap().durable().await.unwrap();
+    let mut tail = leader.logs.replica_tail(leader.driver.read_position).await.unwrap();
+    let claim = tail.poll(Duration::from_secs(5)).await.unwrap().pop().unwrap();
+    leader.driver.consume(claim.clone()).await.unwrap();
+    follower.driver.consume(claim).await.unwrap();
+    leader.driver.promote().await.unwrap();
+
+    let transactions: [(&[&str], bool); 5] = [
+        (&["CREATE TABLE empty_docs (_id, v)"], true),
+        (&["INSERT INTO docs (_id, v) VALUES (1, 7), (2, 8)", "INSERT INTO other_docs (_id, v) VALUES (1, 10)"], true),
+        (&["INSERT INTO docs (_id, v) VALUES (3, 11)", "ASSERT FALSE"], false),
+        (&["UPDATE docs SET v = 9 WHERE _id = 1"], true),
+        (&["DELETE FROM docs WHERE _id = 2"], true),
+    ];
+    for (index, (statements, committed)) in transactions.into_iter().enumerate() {
+        let position = SourcePosition(index as i64);
+        let clock = Timestamp(100 + position.0);
+        let context = Arc::clone(&leader.driver.resolve);
+        let operations = statements.iter().map(|sql| TxOp::Sql { sql: (*sql).into(), args: None }).collect();
+        let transaction = SourceTransaction::new(operations, SubmitOptions::default(), &leader.memory).unwrap();
+        let snapshot = leader.driver.partition.value().snapshot();
+        let resolved = leader.driver.leader.as_mut().unwrap().resolver_mut().unwrap()
+            .resolve_source(snapshot, position, clock, transaction, &context).await.unwrap();
+        assert_eq!(resolved.result().committed(), committed, "{statements:?}: {:?}", resolved.result());
+        leader.driver.enqueue_resolved(resolved, None).await.unwrap();
+        let records = tail.poll(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(records.len(), 1);
+        let record = records.into_iter().next().unwrap();
+
+        leader.driver.consume(record.clone()).await.unwrap();
+        follower.driver.consume(record).await.unwrap();
+
+        let expected = leader.driver.partition.value();
+        let actual = follower.driver.partition.value();
+        assert_eq!(expected.live().latest_completed_tx(), actual.live().latest_completed_tx(), "{statements:?}");
+        assert_eq!(expected.snapshot().tables(), actual.snapshot().tables(), "{statements:?}");
+        for (name, staged) in expected.live().tables() {
+            let decoded = &actual.live().tables()[name];
+            assert_eq!(staged.column_types(), decoded.column_types(), "{statements:?}, {name:?}");
+            let events = |table: &rtdb_index::LiveTable| {
+                table.batches().flat_map(|batch| (0..batch.len()).map(move |row| batch.view().read_event(row).unwrap()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(events(staged), events(decoded), "{statements:?}, {name:?}");
+        }
+        let expected = leader.handle.progress().current();
+        let actual = follower.handle.progress().current();
+        assert_eq!(expected.source_position, position);
+        assert_eq!(actual.source_position, position);
+        assert_eq!(actual.tx_key, expected.tx_key);
+        assert_eq!(actual.latest_result, expected.latest_result, "{statements:?}");
+    }
+    leader.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
 async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     let fixture = fixture(ReplicationConfig { rows_per_block: 2, assertion_interval: Duration::from_millis(10), ..Default::default() }, 1 << 27).await;
     let handle = fixture.handle.clone();

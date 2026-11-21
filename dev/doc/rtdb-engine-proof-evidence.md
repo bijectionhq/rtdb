@@ -173,6 +173,20 @@ A separate regression reads the predecessor's staged write and then the previous
 The proof takes one table's list of logical effects as input and assumes the segment and publication layers preserve that history.
 The concrete Arrow segment representation, block turnover, and read-back fencing still need composition with those premises. [Lean model](../../verification/lean/StagedPrefix.lean) · [Native overlay tests](../../rust/crates/tx/tests/resolution.rs) · [Snapshot construction](../../rust/crates/index/src/snapshot.rs)
 
+### Ordered apply produces the same leader and follower prefix
+
+Lean checks that a successful local apply links the staged transaction to the partition's current transaction and block, advances the transaction key, keeps the source position nondecreasing, and appends the transaction to the published history.
+The follower constructs the same staged link using its own prior state.
+Starting from the same published state within one installed block, the follower reaches the same modeled state for every successful local prefix whose codec round-trips each logical transaction body.
+The model stores table effects and outcomes as abstract payloads in order.
+The controls remove the predecessor or source-order requirement, discard the published history, or stop the follower after one record. [Lean prefix model](../../verification/lean/ReplicaPrefix.lean)
+
+A native regression runs the same admitted frames through a staging leader and a decoding follower.
+After each of five transactions it compares published tables, schemas, typed events, transaction results and source progress.
+The sequence includes a zero-row declaration, a transaction writing two tables, an abort after a write, an update and a delete. [Native replication tests](../../rust/crates/replication/src/tests.rs)
+
+Full refinement still needs the production Arrow and Transit codecs to establish logical-body preservation across supported types, plus composition with block adoption, restart and the JVM path.
+
 ### A leader's read-back agrees with its pending transaction
 
 Before handing the encoded replica frame to the log provider, the append pump publishes the assigned sequence and SHA-256 fingerprint together for a pending resolved transaction.

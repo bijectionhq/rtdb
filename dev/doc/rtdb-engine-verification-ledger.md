@@ -102,7 +102,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | TX02 · Ordered resolution | Partial | [Lean same-block prefix and native overlay admission](rtdb-engine-proof-evidence.md#same-block-staged-resolution-prefix) |
 | TX03 · Staged isolation | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Lean staged views and native overlay observations](rtdb-engine-proof-evidence.md#same-block-staged-resolution-prefix) |
 | TX04 · Static DML equivalence | Open | — |
-| TX05 · Ordered apply | Open | — |
+| TX05 · Ordered apply | Partial | [Lean prefix equivalence and native leader/follower replay](rtdb-engine-proof-evidence.md#ordered-apply-produces-the-same-leader-and-follower-prefix) |
 | TX06 · Read-back agreement | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Pending sequence, full-frame fingerprint and staged-head checks](rtdb-engine-proof-evidence.md#a-leaders-read-back-agrees-with-its-pending-transaction) |
 | TX07 · Atomic snapshot publication | Open | — |
 | TX08 · Progress monitor | Open | — |

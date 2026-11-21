@@ -1081,6 +1081,32 @@ def verify_read_back_interleaving(args, scratch):
     verify_lean_model(args, scratch, path, "read-back-interleaving", controls, 5)
 
 
+def verify_replica_prefix(args, scratch):
+    path = Path("verification/lean/ReplicaPrefix.lean")
+    controls = {
+        "ignore-predecessor": (
+            "staged.predecessor = state.head ∧ staged.block = state.block",
+            "staged.block = state.block",
+            ["a_successful_stage_uses_the_decoded_predecessor"],
+        ),
+        "allow-source-regression": (
+            "advances staged.body.key state.head ∧ state.source ≤ staged.body.source",
+            "advances staged.body.key state.head",
+            ["a_successful_stage_advances_the_transaction_and_source"],
+        ),
+        "replace-applied-history": (
+            "history := state.history ++ [staged.body]", "history := [staged.body]",
+            ["successful_local_apply_appends_one_result"],
+        ),
+        "drop-replica-tail": (
+            "(applyReplica state body).bind (fun next => replicaPrefix decode next rest)",
+            "applyReplica state body",
+            ["a_linked_prefix_replays_to_the_same_published_state"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "replica-prefix", controls, 4)
+
+
 def verify_limit_open(args, scratch):
     path = Path("verification/lean/LimitOpen.lean")
     controls = {
@@ -1508,6 +1534,7 @@ def verify_lean(args, scratch):
             verify_read_back_identity(args, scratch)
             verify_queued_read_back(args, scratch)
             verify_read_back_interleaving(args, scratch)
+            verify_replica_prefix(args, scratch)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
