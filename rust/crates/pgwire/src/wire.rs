@@ -106,7 +106,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         let severity = if fatal { "FATAL" } else { "ERROR" };
         let mut fields = vec![(b'S', severity), (b'V', severity), (b'C', crate::error::state(error)), (b'M', error.message.as_deref().unwrap_or(""))];
         if let Some(detail) = &detail { fields.push((b'D', detail)); }
-        if matches!(error.code.as_str(), rtdb_node::NOT_HELD | "xtdb/ingestion-stopped") { fields.push((ANOMALY_CODE_FIELD, &error.code)); }
+        if matches!(error.code.as_str(), rtdb_node::NOT_HELD | "xtdb/ingestion-stopped" | "rtdb.storage/closed") { fields.push((ANOMALY_CODE_FIELD, &error.code)); }
         if matches!(error.code.as_str(), "xtdb/prepared-query-out-of-date" | "prepared-query-out-of-date") { fields.push((b'R', "RevalidateCachedQuery")); }
         self.fields(b'E', &fields).await
     }
@@ -164,7 +164,7 @@ mod tests {
 
     #[tokio::test]
     async fn placement_error_codes_are_independent_of_the_detail_format() {
-        for code in [rtdb_node::NOT_HELD, "xtdb/ingestion-stopped"] {
+        for code in [rtdb_node::NOT_HELD, "xtdb/ingestion-stopped", "rtdb.storage/closed"] {
             let error = Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, code, "holder stopped");
             for fallback in [PgType::Json, PgType::JsonLd, PgType::Transit] {
                 let mut writer = Writer::new(Vec::new(), MemoryBudget::new(1 << 20));

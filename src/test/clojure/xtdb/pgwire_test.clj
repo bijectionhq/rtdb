@@ -658,21 +658,23 @@
       (with-open [client-conn (jdbc-conn)
                   stmt (jdbc/prepare client-conn ["SELECT pg_sleep(3.0)"])
                   server-conn (get-last-conn server)]
-        (future
-          (Thread/sleep 2000)
-          (log/debug "closing server...")
-          (.close server))
-        (let [t0 (System/currentTimeMillis)
-              ex (is (thrown? PSQLException (.executeQuery stmt)))
-              exec-time (- (System/currentTimeMillis) t0)]
-          (is (= "08006" (.getSQLState ex)))
-          (is (< 1500 exec-time 2500)))
-        (is (wait-for-close server-conn 500))
-        (check-conn-resources-freed server-conn)
-        (check-server-resources-freed server)
-        (let [t0 (System/currentTimeMillis)]
-          (.close tu/*node*)
-          (is (> 5000 (- (System/currentTimeMillis) t0))))))))
+        (let [closing (future
+                        (Thread/sleep 2000)
+                        (log/debug "closing server...")
+                        (.close server)
+                        true)]
+          (let [t0 (System/currentTimeMillis)
+                ex (is (thrown? PSQLException (.executeQuery stmt)))
+                exec-time (- (System/currentTimeMillis) t0)]
+            (is (= "08006" (.getSQLState ex)))
+            (is (< 1500 exec-time 2500)))
+          (is (wait-for-close server-conn 500))
+          (is (deref closing 5000 false))
+          (check-conn-resources-freed server-conn)
+          (check-server-resources-freed server)
+          (let [t0 (System/currentTimeMillis)]
+            (.close tu/*node*)
+            (is (> 5000 (- (System/currentTimeMillis) t0)))))))))
 
 (defn test-cancel [sql]
   (with-open [conn (jdbc-conn)

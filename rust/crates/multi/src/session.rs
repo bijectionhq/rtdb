@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
-use rtdb_pgwire::{GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND};
+use rtdb_pgwire::{GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -101,6 +101,7 @@ struct Backend {
     _reader: AbortOnDropHandle<()>,
     heartbeat: Option<Arc<dyn Send + Sync>>,
     epoch: u64,
+    guarded_keys: bool,
     drain_deadline: Option<tokio::time::Instant>,
 }
 
@@ -108,7 +109,15 @@ impl Backend {
     fn new(stream: TcpStream, epoch: u64, memory: Arc<MemoryBudget>) -> Self {
         let (read, writer) = stream.into_split();
         let (frames, reader) = pump(read, memory);
-        Self { writer, frames, _reader: reader, heartbeat: None, epoch, drain_deadline: None }
+        Self { writer, frames, _reader: reader, heartbeat: None, epoch, guarded_keys: false, drain_deadline: None }
+    }
+
+    async fn prepare_key(&mut self, key: &str) -> bool {
+        if self.guarded_keys {
+            let body = [&[GATEWAY_KEY_KIND], key.as_bytes()].concat();
+            return self.dispatch(&Frame { tag: GATEWAY_SESSION_STATE_TAG, body: Bytes::from(body) }).await;
+        }
+        matches!(tokio::time::timeout(RECONNECT_WITHIN, install_key(self, key)).await, Ok(Ok(())))
     }
 
     async fn dispatch(&mut self, frame: &Frame) -> bool {
@@ -158,14 +167,12 @@ pub struct Session {
     keyed: bool,
     /// The key of the pending command, which began while the session was idle.
     key: Option<String>,
-    /// ReadyForQuery replies still owed to the gateway's own statements, swallowed rather than passed to the client.
-    swallowing: usize,
 }
 
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None }
     }
 
     pub(crate) fn with_frame_memory(mut self, memory: Arc<MemoryBudget>) -> Self {
@@ -179,11 +186,18 @@ impl Session {
     }
 
     /// Reconnects to the current holder, retrying through a failover: until the dead holder's lease expires, no other node may claim.
-    async fn connect(&mut self) -> Result<Backend> {
+    async fn connect(&mut self, supersede: Option<u64>, restore_key: bool) -> Result<Backend> {
         let result = tokio::time::timeout(RECONNECT_WITHIN, async {
             loop {
                 let previous = placement(&self.record.borrow());
-                match self.connect_once().await {
+                let attempt = async {
+                    let mut backend = self.connect_once(supersede).await?;
+                    if restore_key && let Some(key) = &self.key {
+                        install_key(&mut backend, key).await?;
+                    }
+                    Ok::<_, Anomaly>(backend)
+                }.await;
+                match attempt {
                     Ok(backend) => return Ok(backend),
                     Err(error) if !matches!(error.category, AnomalyCategory::Unavailable | AnomalyCategory::Conflict) => return Err(error),
                     Err(_) => wait_for_placement(&mut self.record, previous, RECONNECT_RETRY_DELAY).await,
@@ -199,11 +213,15 @@ impl Session {
         })
     }
 
-    async fn connect_once(&mut self) -> Result<Backend> {
+    async fn connect_once(&mut self, supersede: Option<u64>) -> Result<Backend> {
         let (mut stream, control, epoch) = self.router.route().await?;
+        if supersede.is_some_and(|previous| epoch <= previous) {
+            return Err(lost("routing still points to the holder that closed storage"));
+        }
         stream.write_all(&self.reconnection_startup()).await.map_err(io)?;
         let mut backend = Backend::new(stream, epoch, Arc::clone(&self.frame_memory));
         let features = replay_ready(&mut backend.frames).await?;
+        backend.guarded_keys = features.guarded_keys;
         if self.expected_installation.is_some_and(|expected| features.installation != Some(expected)) {
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", "The replacement holder did not verify the requested installation"));
         }
@@ -334,15 +352,22 @@ impl Session {
                         let starts = self.status == Status::Idle;
                         if starts { self.answered = false; self.lost_unanswered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
                         if starts && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
-                        if backend.is_none() { backend = Some(self.connect().await?); }
-                        let current = backend.as_mut().expect("connected");
-                        if starts { if let Some(key) = self.key.clone() { self.send_key(current, &key).await; } }
-                        current.dispatch(&request).await;
+                        if backend.is_none() { backend = Some(self.connect(None, false).await?); }
+                        if starts && let Some(key) = &self.key
+                            && !backend.as_mut().expect("connected").prepare_key(key).await
+                        {
+                            backend = None;
+                        }
+                        if backend.is_none() { backend = Some(self.connect(None, starts).await?); }
+                        backend.as_mut().expect("connected").dispatch(&request).await;
                         self.pending.push(request);
                         self.status = Status::Busy;
                     }
                     Event::Reply(Some(Ok(frame))) => {
                         if frame.tag == GATEWAY_SESSION_STATE_TAG {
+                            if !self.greeting.done && frame.body.as_ref() == [GATEWAY_KEY_KIND] {
+                                backend.as_mut().expect("greeting backend").guarded_keys = true;
+                            }
                             if self.greeting.done && !self.discarding {
                                 match frame.body.first().copied() {
                                     Some(0) => self.await_token = None,
@@ -364,7 +389,7 @@ impl Session {
                                     self.greeting.installation = uuid::Uuid::parse_str(value).ok();
                                     continue;
                                 }
-                                if matches!(name, GATEWAY_SETTINGS_PARAMETER | rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER) { continue; }
+                                if matches!(name, GATEWAY_SETTINGS_PARAMETER | rtdb_pgwire::GATEWAY_REPLICA_READ_PARAMETER | rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER) { continue; }
                             }
                             if frame.tag == b'Z' && self.expected_installation.is_some_and(|expected| self.greeting.installation != Some(expected)) {
                                 client_write.write_all(&error_frame("3D000", "The holder did not verify the requested installation").encode()).await.map_err(io)?;
@@ -389,24 +414,27 @@ impl Session {
                             if frame.tag == b'E' { break Ok(()); }
                             continue;
                         }
-                        if self.swallowing > 0 {
-                            // A key the backend did not take leaves the command unkeyed, and an unkeyed command is never resent.
-                            if frame.tag == b'E' { self.key = None; }
-                            if frame.tag == b'Z' { self.swallowing -= 1; }
-                            continue;
-                        }
-                        if !self.pending.is_empty() && !self.discarding && frame.tag == b'E' && ingestion_stopped(&frame) {
-                            if self.answered || self.key.is_none() {
-                                break Err(lost("the holder's driver stopped during the command, whose outcome is unknown"));
+                        if !self.pending.is_empty() && !self.discarding && frame.tag == b'E' {
+                            let code = backend_error_code(&frame);
+                            if matches!(code, Some("xtdb/ingestion-stopped" | "rtdb.storage/closed")) {
+                                if self.answered || self.key.is_none() {
+                                    break Err(lost("the holder stopped during the command, whose outcome is unknown"));
+                                }
+                                self.lost_unanswered = true;
+                                if code == Some("rtdb.storage/closed") {
+                                    let epoch = backend.take().expect("connected").epoch;
+                                    backend = Some(self.connect(Some(epoch), true).await?);
+                                    self.resend(backend.as_mut().expect("connected")).await;
+                                    continue;
+                                }
+                                self.discarding = true;
                             }
-                            self.lost_unanswered = true;
-                            self.discarding = true;
                         }
                         if !self.answered && !self.discarding && frame.tag == b'E' && not_held(&frame) { self.discarding = true; }
                         if self.discarding {
                             if frame.tag == b'Z' {
                                 self.discarding = false;
-                                backend = Some(self.connect().await?);
+                                backend = Some(self.connect(None, true).await?);
                                 self.resend(backend.as_mut().expect("connected")).await;
                             }
                             continue;
@@ -454,14 +482,15 @@ impl Session {
                         self.discarding = false;
                         if self.status != Status::Idle {
                             // A keyed command none of whose replies reached the client is resent under its key: whatever of it committed is not run again.
-                            if self.key.is_none() || self.answered { break Err(lost("the holder went away during a command, whose outcome is unknown")); }
+                            if self.key.is_none() || self.answered {
+                                break Err(lost("the holder went away during a command, whose outcome is unknown"));
+                            }
                             self.lost_unanswered = true;
-                            self.swallowing = 0;
-                            backend = Some(self.connect().await?);
+                            backend = Some(self.connect(None, true).await?);
                             self.resend(backend.as_mut().expect("connected")).await;
                             continue;
                         }
-                        backend = Some(self.connect().await?);
+                        backend = Some(self.connect(None, false).await?);
                     }
                 }
             }
@@ -483,16 +512,7 @@ impl Session {
         outcome
     }
 
-    /// Keys the transactions of the command that follows on `backend` by `key`, swallowing the statement's replies.
-    async fn send_key(&mut self, backend: &mut Backend, key: &str) {
-        let mut body = format!("SET {} = '{key}'", rtdb_node::IDEMPOTENCY_KEY_PARAMETER).into_bytes();
-        body.push(0);
-        if backend.dispatch(&Frame { tag: b'Q', body: Bytes::from(body) }).await { self.swallowing += 1; }
-    }
-
-    /// Sends the pending command again on a new backend, under its key if it has one.
-    async fn resend(&mut self, backend: &mut Backend) {
-        if let Some(key) = self.key.clone() { self.send_key(backend, &key).await; }
+    async fn resend(&self, backend: &mut Backend) {
         for request in &self.pending {
             if !backend.dispatch(request).await { break; }
         }
@@ -523,7 +543,7 @@ impl Session {
 }
 
 #[derive(Default)]
-struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool, named_parse: bool, installation: Option<uuid::Uuid> }
+struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool, named_parse: bool, guarded_keys: bool, installation: Option<uuid::Uuid> }
 
 async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Result<ReplayFeatures> {
     let mut features = ReplayFeatures::default();
@@ -537,6 +557,7 @@ async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Re
                 Some(GATEWAY_SETTINGS_KIND) => features.settings = true,
                 Some(GATEWAY_SQL_PREPARE_KIND) => features.sql_prepare = true,
                 Some(GATEWAY_NAMED_PARSE_KIND) => features.named_parse = true,
+                Some(GATEWAY_KEY_KIND) if frame.body.len() == 1 => features.guarded_keys = true,
                 _ => {}
             },
             b'S' => {
@@ -548,6 +569,22 @@ async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Re
             _ => {}
         }
     }
+}
+
+async fn install_key(backend: &mut Backend, key: &str) -> Result<()> {
+    let mut body = format!("SET {} = '{key}'", rtdb_node::IDEMPOTENCY_KEY_PARAMETER).into_bytes();
+    body.push(0);
+    if !backend.dispatch(&Frame { tag: b'Q', body: Bytes::from(body) }).await {
+        return Err(lost("the holder closed while installing the idempotency key"));
+    }
+    replay_ready(&mut backend.frames).await.map_err(|error| {
+        if error.code == "rtdb.multi/reconnect-refused" {
+            Anomaly::incorrect("rtdb.multi/key-refused", "the holder refused to install the idempotency key")
+        } else {
+            error
+        }
+    })?;
+    Ok(())
 }
 
 fn parameter_status(frame: &Frame) -> Option<(&str, &str)> {
@@ -579,12 +616,12 @@ fn backend_anomaly_code(frame: &Frame) -> Option<&[u8]> {
     frame.body.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(&[rtdb_pgwire::ANOMALY_CODE_FIELD]))
 }
 
-fn ingestion_stopped(frame: &Frame) -> bool {
+fn backend_error_code(frame: &Frame) -> Option<&str> {
     #[derive(serde::Deserialize)]
     struct ErrorDetail<'a> { code: &'a str }
-    if let Some(code) = backend_anomaly_code(frame) { return code == b"xtdb/ingestion-stopped"; }
+    if let Some(code) = backend_anomaly_code(frame) { return std::str::from_utf8(code).ok(); }
     frame.body.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(b"D"))
-        .is_some_and(|detail| serde_json::from_slice::<ErrorDetail<'_>>(detail).is_ok_and(|anomaly| anomaly.code == "xtdb/ingestion-stopped"))
+        .and_then(|detail| serde_json::from_slice::<ErrorDetail<'_>>(detail).ok()).map(|detail| detail.code)
 }
 
 fn parse_name(frame: &Frame) -> String {
@@ -726,15 +763,17 @@ mod tests {
 
             let first_key = query(&mut dying).await;
             assert!(first_key.starts_with("SET rtdb_idempotency_key = "));
-            assert_eq!(query(&mut dying).await, "UPDATE counters SET n = n + 1");
             send(&mut dying, b'C', b"SET\0").await;
             send(&mut dying, b'Z', b"I").await;
+            assert_eq!(query(&mut dying).await, "UPDATE counters SET n = n + 1");
             send(&mut dying, b'C', b"UPDATE 1\0").await;
             send(&mut dying, b'Z', b"I").await;
 
             let second_key = query(&mut dying).await;
             assert!(second_key.starts_with("SET rtdb_idempotency_key = "), "{second_key}");
             assert_ne!(second_key, first_key);
+            send(&mut dying, b'C', b"SET\0").await;
+            send(&mut dying, b'Z', b"I").await;
             assert_eq!(query(&mut dying).await, "UPDATE counters SET n = n + 2");
             assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()));
             assert_eq!(receive(&mut client).await.0, b'Z');
@@ -742,9 +781,9 @@ mod tests {
 
             greet(&mut successor).await;
             assert_eq!(query(&mut successor).await, second_key);
-            assert_eq!(query(&mut successor).await, "UPDATE counters SET n = n + 2");
             send(&mut successor, b'C', b"SET\0").await;
             send(&mut successor, b'Z', b"I").await;
+            assert_eq!(query(&mut successor).await, "UPDATE counters SET n = n + 2");
             send(&mut successor, b'C', b"UPDATE 2\0").await;
             send(&mut successor, b'Z', b"I").await;
             assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 2\0".to_vec()));
@@ -772,9 +811,9 @@ mod tests {
             send(&mut client, b'Q', b"COPY counters FROM STDIN\0").await;
             let copy_key = query(&mut backend).await;
             assert!(copy_key.starts_with("SET rtdb_idempotency_key = "));
-            assert_eq!(query(&mut backend).await, "COPY counters FROM STDIN");
             send(&mut backend, b'C', b"SET\0").await;
             send(&mut backend, b'Z', b"I").await;
+            assert_eq!(query(&mut backend).await, "COPY counters FROM STDIN");
             send(&mut backend, b'G', &[0, 0, 1, 0, 0]).await;
             assert_eq!(receive(&mut client).await.0, b'G');
 
@@ -791,6 +830,8 @@ mod tests {
             let update_key = query(&mut backend).await;
             assert!(update_key.starts_with("SET rtdb_idempotency_key = "), "{update_key}");
             assert_ne!(update_key, copy_key);
+            send(&mut backend, b'C', b"SET\0").await;
+            send(&mut backend, b'Z', b"I").await;
             assert_eq!(query(&mut backend).await, "UPDATE counters SET n = n + 1");
             send(&mut client, b'X', b"").await;
             send(&mut backend, b'C', b"SET\0").await;
@@ -1021,18 +1062,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_writer_that_advertises_guarded_keys_gets_the_key_and_command_without_an_acknowledgement() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, mut writer) = pair(&listener).await;
+        let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
+        let startup = Bytes::from_static(b"\0\0\0\x08\0\x03\0\0");
+        let session = Session::new(startup, router, directory, record.id, None, true);
+        let running = tokio::spawn(session.run(gateway, first, None, 0));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            writer.read_exact(&mut [0; 8]).await.unwrap();
+            send(&mut writer, b'R', &[0; 4]).await;
+            send(&mut writer, GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_KIND]).await;
+            send(&mut writer, b'Z', b"I").await;
+            assert_eq!(receive(&mut client).await.0, b'R');
+            assert_eq!(receive(&mut client).await.0, b'Z');
+
+            send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+            let (tag, key) = receive(&mut writer).await;
+            assert_eq!(tag, GATEWAY_SESSION_STATE_TAG);
+            assert_eq!(key[0], GATEWAY_KEY_KIND);
+            assert_eq!(key.len(), 33);
+            assert_eq!(query(&mut writer).await, "UPDATE counters SET n = n + 1");
+
+            send(&mut writer, b'C', b"UPDATE 1\0").await;
+            send(&mut writer, b'Z', b"I").await;
+            assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()));
+            assert_eq!(receive(&mut client).await.0, b'Z');
+            drop(client);
+            running.await.unwrap().unwrap();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_command_refused_by_a_backend_lost_before_its_ready_for_query_is_answered_by_the_next() {
+        assert_retry_after_backend_error(BackendFailure::NotHeld).await;
+    }
+
+    #[tokio::test]
+    async fn a_storage_close_during_handoff_retries_the_unanswered_command_with_its_original_key() {
+        assert_retry_after_backend_error(BackendFailure::StorageClosed { accept_key: true }).await;
+    }
+
+    #[tokio::test]
+    async fn a_replacement_that_refuses_the_key_does_not_receive_the_pending_write() {
+        assert_retry_after_backend_error(BackendFailure::StorageClosed { accept_key: false }).await;
+    }
+
+    enum BackendFailure { NotHeld, StorageClosed { accept_key: bool } }
+
+    async fn assert_retry_after_backend_error(failure: BackendFailure) {
+        struct Routes(tokio::sync::Mutex<std::collections::VecDeque<(TcpStream, u64)>>);
+
+        #[async_trait::async_trait]
+        impl Router for Routes {
+            async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
+                let (stream, epoch) = self.0.lock().await.pop_front().expect("a route is available");
+                Ok((stream, None, epoch))
+            }
+        }
+
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (mut client, gateway_side) = pair(&listener).await;
         let (first, mut refusing) = pair(&listener).await;
         let (second, mut successor) = pair(&listener).await;
+        let mut routes = std::collections::VecDeque::new();
+        let stale = if matches!(failure, BackendFailure::StorageClosed { .. }) {
+            let (route, backend) = pair(&listener).await;
+            routes.push_back((route, 0));
+            Some(backend)
+        } else {
+            None
+        };
+        routes.push_back((second, 1));
         let mut startup = 196608i32.to_be_bytes().to_vec();
         startup.extend_from_slice(b"user\0xtdb\0database\0shop\0\0");
         let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
         framed.extend_from_slice(&startup);
-        let session = Session::new(Bytes::from(framed), Arc::new(Next(tokio::sync::Mutex::new(Some(second)))), directory, record.id.clone(), None, true);
+        let session = Session::new(Bytes::from(framed), Arc::new(Routes(tokio::sync::Mutex::new(routes))), directory.clone(), record.id.clone(), None, true);
         let running = tokio::spawn(session.run(gateway_side, first, None, 0));
         greet(&mut refusing).await;
         receive(&mut client).await;
@@ -1042,11 +1154,29 @@ mod tests {
         send(&mut refusing, b'C', b"SET\0").await;
         send(&mut refusing, b'Z', b"I").await;
         query(&mut refusing).await;
-        send(&mut refusing, b'E', format!("SERROR\0C57P03\0M{}\0\0", rtdb_node::NOT_HELD).as_bytes()).await;
+        if let Some(mut stale) = stale {
+            send(&mut refusing, b'E', b"SERROR\0CXX000\0MI/O region is closed\0yrtdb.storage/closed\0\0").await;
+            let mut byte = [0];
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), stale.read(&mut byte)).await.unwrap().unwrap(), 0);
+            let mut next = record.clone();
+            next.epoch += 1;
+            directory.replace_deployment(next, record.version).await.unwrap();
+        } else {
+            send(&mut refusing, b'E', format!("SERROR\0C57P03\0M{}\0\0", rtdb_node::NOT_HELD).as_bytes()).await;
+        }
         drop(refusing);
 
         greet(&mut successor).await;
         assert_eq!(query(&mut successor).await, key);
+        if matches!(failure, BackendFailure::StorageClosed { accept_key: false }) {
+            send(&mut successor, b'E', b"SERROR\0C53200\0MOut of memory\0\0").await;
+            let (tag, body) = receive(&mut client).await;
+            assert_eq!(tag, b'E');
+            assert!(String::from_utf8_lossy(&body).contains("the command's outcome is unknown"));
+            assert_eq!(successor.read(&mut [0]).await.unwrap(), 0);
+            assert!(running.await.unwrap().is_err());
+            return;
+        }
         send(&mut successor, b'C', b"SET\0").await;
         send(&mut successor, b'Z', b"I").await;
         assert_eq!(query(&mut successor).await, "UPDATE counters SET n = n + 1");
@@ -1116,13 +1246,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_whose_key_the_backend_refused_is_not_resent() {
+    async fn a_command_waits_for_a_key_after_the_original_backend_refuses_it() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (mut client, gateway_side) = pair(&listener).await;
         let (first, mut dying) = pair(&listener).await;
-        let (second, _unused) = pair(&listener).await;
+        let (second, mut successor) = pair(&listener).await;
         let mut startup = 196608i32.to_be_bytes().to_vec();
         startup.extend_from_slice(b"user\0xtdb\0database\0shop\0\0");
         let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
@@ -1133,14 +1263,19 @@ mod tests {
         receive(&mut client).await;
         receive(&mut client).await;
         send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
-        query(&mut dying).await;
+        let key = query(&mut dying).await;
         send(&mut dying, b'E', b"SERROR\0C53200\0Mout of memory\0\0").await;
-        send(&mut dying, b'Z', b"I").await;
-        query(&mut dying).await;
-        drop(dying);
-        let (tag, body) = receive(&mut client).await;
-        assert_eq!(tag, b'E', "the client is told the outcome is unknown, rather than the command being run again unkeyed");
-        assert!(String::from_utf8_lossy(&body).contains("outcome is unknown"), "{}", String::from_utf8_lossy(&body));
-        let _ = running.await;
+        assert_eq!(dying.read(&mut [0]).await.unwrap(), 0);
+        greet(&mut successor).await;
+        assert_eq!(query(&mut successor).await, key);
+        send(&mut successor, b'C', b"SET\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(query(&mut successor).await, "UPDATE counters SET n = n + 1");
+        send(&mut successor, b'C', b"UPDATE 1\0").await;
+        send(&mut successor, b'Z', b"I").await;
+        assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()));
+        assert_eq!(receive(&mut client).await.0, b'Z');
+        drop(client);
+        running.await.unwrap().unwrap();
     }
 }

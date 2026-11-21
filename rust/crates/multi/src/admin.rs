@@ -1691,6 +1691,7 @@ pub struct ControllerOptions {
     pub grace: Duration,
     pub rebalance_moves: usize,
     pub load_limits: crate::load::LoadLimits,
+    pub read_width: Option<crate::read_width::ReadWidthOptions>,
     /// Consecutive failed probes after which a node is confirmed dead, ahead of its lease.
     pub suspicion_probes: u32,
     pub probe_timeout: Duration,
@@ -1699,7 +1700,7 @@ pub struct ControllerOptions {
 }
 
 impl Default for ControllerOptions {
-    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, load_limits: Default::default(), suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default() } }
+    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, load_limits: Default::default(), read_width: None, suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default() } }
 }
 
 pub struct FailedMemberProbe { endpoint: String, consecutive: u32 }
@@ -1753,12 +1754,16 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
 pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOptions, cancellation: CancellationToken) {
     let mut failures = BTreeMap::new();
     let mut samples = crate::load::LoadSamples::default();
+    let mut read_width = crate::read_width::ReadWidthScaler::default();
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(options.interval) => {
                 let _ = reap_members(directory.as_ref(), options.grace).await;
                 if options.suspicion_probes > 0 { let _ = confirm_suspicions(directory.as_ref(), &mut failures, &options).await; }
+                if let Some(policy) = options.read_width {
+                    let _ = read_width.adjust(directory.as_ref(), policy, &options.control, options.probe_timeout).await;
+                }
                 if options.rebalance_moves > 0 {
                     if options.load_limits.enabled() {
                         let _ = crate::load::rebalance(directory.as_ref(), options.rebalance_moves, options.load_limits, &options.control, &mut samples).await;

@@ -9,7 +9,7 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
@@ -132,6 +132,15 @@ impl ProtocolSession {
     fn rollback(&mut self) -> Result<()> { self.session.state_mut().rollback_tx()?; self.end_transaction(); Ok(()) }
 
     pub async fn handle<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
+        if frame.tag == GATEWAY_SESSION_STATE_TAG && let Some((&GATEWAY_KEY_KIND, key)) = frame.body.split_first() {
+            // Failure here ends the connection before it can execute the following command.
+            if !self.startup.gateway_session_state || self.extended || self.copy.is_some() || self.ready() != b'I' {
+                return Err(protocol("A gateway key requires an idle gateway session"));
+            }
+            let key = std::str::from_utf8(key).ok().filter(|key| key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .ok_or_else(|| protocol("Invalid gateway key"))?;
+            return self.session.state_mut().set_parameter(rtdb_node::IDEMPOTENCY_KEY_PARAMETER, Some(key.to_owned()));
+        }
         if self.skip_until_sync && frame.tag != b'S' { return Ok(()); }
         if self.copy.is_some() && matches!(frame.tag, b'S' | b'H') { return Ok(()); }
         let result = self.message(&frame, writer).await;
@@ -1019,9 +1028,31 @@ mod tests {
         let options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
         let (node, driver) = Node::open(options, services).await.unwrap();
         let session = node.session("xtdb", identity).unwrap();
-        let startup = Startup { parameters: BTreeMap::new(), gateway_session_state: false, gateway_settings: false, _reservation: node.memory().reserve(0).unwrap() };
+        let startup = Startup { parameters: BTreeMap::new(), gateway_session_state: false, gateway_settings: false, replica_read: false, _reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
+    }
+
+    #[tokio::test]
+    async fn a_gateway_key_is_installed_without_a_reply_and_rejection_ends_the_session() {
+        let (mut frontend, driver) = test_frontend().await;
+        let memory = Arc::clone(frontend.node.memory());
+        let key = "00000000000000000000000000000001";
+        let frame = |key: &str| Frame {
+            tag: GATEWAY_SESSION_STATE_TAG,
+            body: [&[GATEWAY_KEY_KIND], key.as_bytes()].concat(),
+            charge: memory.reserve(0).unwrap(),
+        };
+        let mut writer = Writer::new(Vec::new(), memory.clone());
+        assert!(frontend.handle(frame(key), &mut writer).await.is_err());
+
+        frontend.startup.gateway_session_state = true;
+        frontend.handle(frame(key), &mut writer).await.unwrap();
+        assert_eq!(frontend.session.state().parameter(rtdb_node::IDEMPOTENCY_KEY_PARAMETER), Some(key));
+        assert!(frontend.handle(frame("invalid"), &mut writer).await.is_err());
+        assert!(writer.into_inner().is_empty());
+        drop(frontend);
+        driver.close_without_run().await.unwrap();
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
@@ -19,6 +19,16 @@ use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, Exter
 
 type OrderedIndexCycle = watch::Sender<Option<CycleHandle>>;
 
+struct ReplicaReadSession(std::sync::Weak<Database>);
+
+impl Drop for ReplicaReadSession {
+    fn drop(&mut self) {
+        if let Some(database) = self.0.upgrade() {
+            database.replica_read_sessions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct Database {
     name: String,
     configuration: DatabaseConfig,
@@ -29,6 +39,7 @@ pub struct Database {
     pub(crate) replication: ReplicationHandle,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
     submitted_bytes: AtomicU64,
+    replica_read_sessions: AtomicUsize,
     query_cpu: Option<Arc<rtdb_query::QueryCpu>>,
     fragment_residence: Option<rtdb_query::FragmentResidence>,
     compaction: Option<CompactionHandle>,
@@ -72,6 +83,11 @@ impl Database {
     pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }
     pub fn live_batch_bytes(&self) -> u64 { self.partition.value().live().live_batch_bytes() }
     pub fn cache_bytes(&self) -> u64 { self.storage.pool_retained_bytes() as u64 }
+    pub fn replica_read_sessions(&self) -> usize { self.replica_read_sessions.load(Ordering::Relaxed) }
+    pub(crate) fn track_replica_read_session(self: &Arc<Self>) -> impl Send + use<> {
+        self.replica_read_sessions.fetch_add(1, Ordering::Relaxed);
+        ReplicaReadSession(Arc::downgrade(self))
+    }
     pub fn observe_query_cpu(&self) -> Option<u64> { self.query_cpu.as_ref()?.observe() }
     pub(crate) fn query_cpu_tracker(&self) -> Option<Arc<rtdb_query::QueryCpu>> {
         self.query_cpu.as_ref().filter(|counter| counter.is_observed()).cloned()
@@ -258,7 +274,9 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
+            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication,
+                transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
+                query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         };

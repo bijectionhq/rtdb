@@ -192,7 +192,7 @@ impl Drop for DeploymentTurn<'_> {
     }
 }
 /// `fragments` keeps a replica open for the fragments other nodes send it, whatever the deployment's read width.
-struct LocalSubscription { id: String, last_touch: Instant, opened: Instant, role: Role, fragments: bool }
+struct LocalSubscription { id: String, database: Weak<Database>, last_touch: Instant, opened: Instant, role: Role, fragments: bool }
 
 pub struct NodeAgent {
     storage_namespaces: rtdb_directory::StorageNamespaces,
@@ -239,6 +239,31 @@ impl NodeAgent {
             })
         }).collect()
     }
+    fn read_loads(&self) -> Vec<crate::read_width::ReadLoad> {
+        use crate::read_width::{ReadLoad, ReadPlacement};
+        let mut loads: Vec<_> = self.holdings.lock().values().filter_map(|holding| {
+            let database = holding.database.upgrade()?;
+            let placement = holding.placement.borrow();
+            let record = placement.as_ref().filter(|record| record.id == holding.id && record.epoch == holding.epoch)?;
+            Some(ReadLoad {
+                deployment: holding.id.clone(),
+                sessions: database.replica_read_sessions() as u64,
+                placement: ReadPlacement::Writer { epoch: holding.epoch, width: record.read_width },
+            })
+        }).collect();
+        let writer_ids: BTreeSet<_> = loads.iter().map(|load| load.deployment.clone()).collect();
+        loads.extend(self.subscriptions.lock().values()
+            .filter(|subscription| subscription.role == Role::Subscriber && !writer_ids.contains(&subscription.id))
+            .filter_map(|subscription| {
+                let database = subscription.database.upgrade()?;
+                Some(ReadLoad {
+                    deployment: subscription.id.clone(), sessions: database.replica_read_sessions() as u64,
+                    placement: ReadPlacement::Replica,
+                })
+            }));
+        loads
+    }
+
     /// The deployments this node has open as snapshots.
     pub fn subscribed_snapshots(&self) -> Vec<String> { self.subscriptions.lock().iter().filter(|(_, subscription)| matches!(subscription.role, Role::Snapshot(_))).map(|(name, _)| name.clone()).collect() }
     pub fn subscribed(&self) -> Vec<String> { self.subscriptions.lock().keys().cloned().collect() }
@@ -762,9 +787,9 @@ impl NodeAgent {
         }
         let configuration = database_config(&record, ensemble_servers(&record, &members)?, &self.options.storage, Role::Subscriber);
         self.stop_running(name).await;
-        self.node.database_or_attach(name.to_owned(), configuration).await?
+        let database = self.node.database_or_attach(name.to_owned(), configuration).await?
             .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the replica"))?;
-        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Subscriber, fragments });
+        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, database: Arc::downgrade(&database), last_touch: Instant::now(), opened: Instant::now(), role: Role::Subscriber, fragments });
         Ok(Response::Subscribed { address: self.address.clone() })
     }
 
@@ -813,8 +838,8 @@ impl NodeAgent {
             let checkpoint = record.checkpoint.ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-checkpoint", format!("{name} has published no block to read")))?;
             let configuration = database_config(&record, Vec::new(), &self.options.storage, Role::Snapshot(checkpoint));
             match self.node.database_or_attach(name.to_owned(), configuration).await {
-                Ok(Some(_)) => {
-                    self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Snapshot(checkpoint), fragments: false });
+                Ok(Some(database)) => {
+                    self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, database: Arc::downgrade(&database), last_touch: Instant::now(), opened: Instant::now(), role: Role::Snapshot(checkpoint), fragments: false });
                     return Ok(Response::Subscribed { address: self.address.clone() });
                 }
                 Err(error) if error.code == crate::store::CHECKPOINT_ADVANCED => {
@@ -955,8 +980,8 @@ impl NodeAgent {
             let _turn = turn.lock().await;
             let Ok(servers) = ensemble_servers(&record, &members) else { continue };
             let configuration = database_config(&record, servers, &self.options.storage, Role::Compactor);
-            if let Ok(Some(_)) = self.node.database_or_attach(name.clone(), configuration).await {
-                self.subscriptions.lock().insert(name.clone(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor, fragments: false });
+            if let Ok(Some(database)) = self.node.database_or_attach(name.clone(), configuration).await {
+                self.subscriptions.lock().insert(name.clone(), LocalSubscription { id: record.id, database: Arc::downgrade(&database), last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor, fragments: false });
             }
         }
     }
@@ -1148,6 +1173,7 @@ impl Handler for NodeAgent {
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
             Request::Ping => Ok(Response::Done),
             Request::HoldingLoads { measure_query_cpu } => Ok(Response::HoldingLoads { holdings: self.holding_loads(measure_query_cpu) }),
+            Request::ReadLoads => Ok(Response::ReadLoads { loads: self.read_loads() }),
             Request::FlightEndpoint => self.flight_endpoint.clone().map(|address| Response::FlightEndpoint { address })
                 .ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-flight-endpoint", "The holder does not have a Flight SQL endpoint")),
             Request::Subscribe { name } => self.subscribe(&name).await,

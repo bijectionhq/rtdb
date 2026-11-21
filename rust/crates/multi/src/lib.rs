@@ -22,6 +22,7 @@ pub mod load;
 pub mod logs;
 mod ordered_index_storage;
 pub mod packing;
+pub mod read_width;
 pub mod recovery;
 mod recovery_holds;
 pub mod reference;
