@@ -1,0 +1,35 @@
+{
+  "summary": "The production search selects the unique owning chunk and exact offset for a row in a contiguous layout.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 3,
+  "controls": {
+    "exclude_chunk_start": {
+      "defect": "A row at a chunk's first ordinal is assigned to the wrong chunk.",
+      "mutate": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "find": "if chunks[middle].0 <= row {",
+        "replace": "if chunks[middle].0 < row {"
+      }],
+      "expect": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "last_started_chunk",
+        "category": "invariant not satisfied at end of loop body"
+      }],
+      "min_verified_functions": 2
+    },
+    "drop_relative_offset": {
+      "defect": "Every row is read from the first offset in its chunk.",
+      "mutate": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "find": "Some((index, row - chunks[index].0))",
+        "replace": "Some((index, 0))"
+      }],
+      "expect": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "last_started_chunk",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 2
+    }
+  }
+}

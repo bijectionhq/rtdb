@@ -2,6 +2,7 @@ mod catalog;
 mod live;
 mod partition;
 mod reader_retention;
+mod row_address;
 mod snapshot;
 mod tiered_publication;
 mod trie_catalog;

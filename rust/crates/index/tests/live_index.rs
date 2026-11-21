@@ -184,6 +184,45 @@ fn block_adoption_publishes_catalogs_and_rollover_together() {
 }
 
 #[test]
+fn retained_snapshots_resolve_their_trie_rows_after_discard_and_rollover() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let table = table();
+    state.apply(&stage(&state, &budget, 0)).unwrap();
+    let pinned = state.open_snapshot(Some(key(0).system_time));
+
+    let mut tx = TransactionBuffer::new(
+        state.resolving_snapshot(&[]).unwrap(), key(1), Arc::clone(&budget),
+    ).unwrap();
+    tx.put(table.clone(), document(42, 42), Interval::ALL).unwrap();
+    let discarded = tx.snapshot().unwrap();
+    drop(tx);
+    assert_eq!(rows(&state.open_snapshot(None)), 1);
+
+    let prepared = state.prepare_block().unwrap();
+    let durable = block(&prepared);
+    let catalog_trie = CatalogTrie::notification(TrieKey::l0(BlockIndex(0)).unwrap(), 10, None).unwrap();
+    let tries = BTreeMap::from([(table.clone(), vec![catalog_trie])]);
+    let table_blocks = prepared.table_blocks(&tries, Timestamp(101)).unwrap();
+    state.adopt_block(prepared, durable, &table_blocks, &tries, Timestamp(101)).unwrap();
+    state.apply(&stage(&state, &budget, 1)).unwrap();
+    let next = state.open_snapshot(Some(key(1).system_time));
+    drop(state);
+
+    for (snapshot, expected) in [(pinned, vec![0]), (discarded, vec![42, 0]), (next, vec![1])] {
+        let segments = snapshot.segments(&table);
+        assert_eq!(segments.len(), expected.len());
+        for (segment, id) in segments.iter().zip(expected) {
+            assert_eq!(segment.trie().sorted_rows(segment.as_ref()).unwrap(), [0]);
+            let location = segment.locate(0).unwrap();
+            let header = segment.header_at(location).unwrap();
+            assert_eq!(header.iid, EntityId::Integer(id).iid());
+            assert_eq!(segment.row(0).unwrap().header().unwrap(), header);
+        }
+    }
+}
+
+#[test]
 fn failed_adoption_and_stale_apply_leave_one_unchanged_value() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);

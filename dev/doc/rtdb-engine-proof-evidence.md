@@ -35,6 +35,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
 | IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, and stable partition of an insertion or split batch at every valid depth. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Compose grouping, leaf ordering, and recursive replacement at actual Rust and JVM call sites, then connect the resulting trees to traversal and replay. |
 | IDX02, IDX03, IDX07 | Verus checks that the production Rust leaf merge returns every input occurrence in order. An injective logical rank uniquely determines the successful output sequence from those occurrences. | Prove that each leaf supplies correctly ordered runs, that its reader and comparator realize the logical rank, and that the JVM merge satisfies the same contract. |
+| IDX01, IDX08 | Verus checks the production Rust search for the owning chunk and local offset. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Refine the actual append and Arrow concatenation paths to the contiguous-layout invariant, and prove ownership across snapshot and block transitions and the JVM equivalents. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
 | STORE03 · Read entitlements | Lean proves a lease timing inequality and preservation of read entitlement across arbitrary abstract pin transitions, including close while a read remains active. | Prove clock, I/O completion, decoded page ownership, cache eviction, and provider lifetime assumptions at production call sites. |
@@ -169,6 +170,19 @@ The merge proof takes sorted input runs and the production comparator's agreemen
 The native tests exercise repeated rows, the unconsumed tail, and propagation of a comparison failure.
 Verus 0.2026.11.05.31e44e6 checked fourteen functions and rejected four mutations that select the larger head, omit the tail, consume a row without emitting it, or reverse the order within an IID.
 The native run passed 499 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production merge and tests](../../rust/crates/trie/src/leaf_merge_step.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
+
+### Live row addresses across chunk layouts
+
+The Rust live table uses the checked search for row and header reads, cached leaf addresses, and the block-copy path.
+Verus proves that the search returns the last chunk start at or before the requested ordinal and the exact relative offset.
+The owner law assumes contiguous chunks and proves that every in-range row has one nonempty owner, even when empty chunks cause repeated starts.
+The compact address API reports an error if the chunk index exceeds its 32-bit representation.
+Lean proves that the returned address reads the same value as the flat layout and that arbitrary appends and contiguous chunk joins preserve every captured row ordinal.
+The join model assumes the Arrow concatenation produces the original rows in the original order.
+The native tests check chunk boundaries, repeated starts, retained reads after actual chunk coalescing, and trie reads from snapshots retained through discard and block rollover.
+Lean 4.35.0 audited five theorems and rejected both mutations.
+Verus 0.2026.11.05.31e44e6 checked three functions and rejected both mutations.
+The native run passed 501 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Lean model](../../verification/lean/LiveRowAddress.lean) · [Verus study](../../verification/verus/live_row_address/area.json) · [Snapshot regression](../../rust/crates/index/tests/live_index.rs)
 
 ## Multi evidence
 

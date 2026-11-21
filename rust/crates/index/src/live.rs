@@ -188,10 +188,15 @@ impl LiveTable {
         let first = self.chunks.partition_point(|(start, batch)| u64::from(*start) + batch.len() as u64 <= u64::from(row));
         self.chunks[first..].iter().map(move |(start, batch)| (batch, row.saturating_sub(*start) as usize))
     }
-    pub fn locate(&self, row: u32) -> Result<(u32, u32)> {
+    fn locate_row(&self, row: u32) -> Result<(usize, u32)> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
-        let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
-        Ok((index as u32, row - self.chunks[index].0))
+        crate::row_address::last_started_chunk(&self.chunks, row)
+            .ok_or_else(|| invalid("Live table row has no owning batch"))
+    }
+    pub fn locate(&self, row: u32) -> Result<(u32, u32)> {
+        let (index, offset) = self.locate_row(row)?;
+        let index = u32::try_from(index).map_err(|_| invalid("Live table chunk exceeds u32 address space"))?;
+        Ok((index, offset))
     }
     /// `leaf`'s rows located and their headers copied, once per snapshot; `leaf` is one of this table's trie leaves.
     pub fn located_rows(&self, leaf: &rtdb_trie::Leaf) -> Result<Arc<LocatedRows>> {
@@ -226,16 +231,12 @@ impl LiveTable {
     }
     /// The header of `row`, without taking a handle on its batch.
     pub fn header(&self, row: u32) -> Result<EventHeader> {
-        if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
-        let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
-        let (start, batch) = &self.chunks[index];
-        batch.header((row - start) as usize)
+        let (index, offset) = self.locate_row(row)?;
+        self.chunks[index].1.header(offset as usize)
     }
     pub fn row(&self, row: u32) -> Result<RowSource> {
-        if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
-        let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
-        let (start, batch) = &self.chunks[index];
-        Ok(RowSource { batch: Arc::clone(batch), row: (row - start) as usize })
+        let (index, offset) = self.locate_row(row)?;
+        Ok(RowSource { batch: Arc::clone(&self.chunks[index].1), row: offset as usize })
     }
     pub fn append(&self, write: &TableWrite, system_time: Timestamp) -> Result<Self> {
         if self.last_system_time.is_some_and(|previous| previous > system_time) { return Err(invalid("Live table system time moved backwards")); }
@@ -329,9 +330,9 @@ impl BlockPages<'_> {
             let bytes = rows.len().checked_mul(32).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| invalid("Invalid block row selection size"))?;
             let result = self.memory.reserve(bytes).and_then(|_scratch| {
                 let positions = rows.iter().map(|&row| {
-                    let index = self.table.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
-                    let start = self.table.chunks[index].0;
-                    Ok((index, (row - start) as usize))
+                    let (index, offset) = crate::row_address::last_started_chunk(&self.table.chunks, row)
+                        .ok_or_else(|| invalid("Live table row has no owning batch"))?;
+                    Ok((index, offset as usize))
                 }).collect::<Result<Vec<_>>>()?;
                 OwnedBatch::interleave_distinct_rows(sources, &positions, &self.memory)
             });
@@ -738,6 +739,13 @@ mod chunk_tests {
         assert!(Arc::ptr_eq(&located, &live.located_rows(leaf).unwrap()));
         assert_eq!(located.headers.iter().map(|header| header.system_from).collect::<OrderedSet<_>>(), (0..3).map(Timestamp).collect());
         let appended = live.append(&put(3, &memory), Timestamp(3)).unwrap();
+        assert_eq!(appended.chunks.len(), 1);
+        for id in 0..3 {
+            let iid = EntityId::Integer(i64::from(id)).iid();
+            assert_eq!(live.iid(id).unwrap(), iid);
+            assert_eq!(appended.iid(id).unwrap(), iid);
+            assert_eq!(appended.header_at(appended.locate(id).unwrap()).unwrap(), live.header(id).unwrap());
+        }
         let relocated = appended.located_rows(appended.trie().leaves()[0]).unwrap();
         assert!(!Arc::ptr_eq(&located, &relocated));
         assert_eq!(relocated.headers.len(), 4);
