@@ -1429,6 +1429,8 @@ The replication driver uses that same cursor after checking the log and checkpoi
 Ordinary hosted discovery validates the block and journal boundary captured in the directory admission.
 A retry following prefix collection checks the successor against the last accepted checkpoint.
 Verus checks the coordinate decision. Lean proves preservation across successive replacements, and native replays exercise refusal and successful recovery.
+New Rust roots commit to every table block by OID and SHA-256 of its stored bytes.
+The Rust loader checks those bindings before decoding. Lean proves preservation of metadata-derived dependencies under the digest premise.
 Verus checks the exact first-required-offset rule.
 The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
 TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
@@ -1440,7 +1442,7 @@ The native trie collector protects live and nascent trie files from the latest i
 The reference comes from the persisted table blocks, and it changes atomically with local block adoption.
 Verus checks the selection decision independently of whether a query reader exists.
 TLC and Apalache check the installed-checkpoint rule separately from the current catalog, including nascent trie dependencies and delayed deletion.
-|Bind the admitted coordinate to a complete dependency manifest and extend protection across multiple authorities.
+|Bind the admitted root to its provider identity and its exact trie and artefact publications, then extend protection across multiple authorities.
 Protect the required log suffix through replay and account for deletion entry points outside trie collection.
 Establish supported remote configurations and any eventual retry and staging cleanup guarantees.
 

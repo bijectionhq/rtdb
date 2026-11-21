@@ -2236,3 +2236,32 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-7f9-rust.log`
 
 This establishes the hosted recovery coordinate under the existing deployment-to-log configuration binding.
 The root's full dependency manifest, protection of that manifest across reaping and fork creation, and archive-specific refinement remain open.
+
+=== Table metadata bindings in checkpoint roots
+
+The Rust block producer now writes an OID-keyed SHA-256 manifest in each new checkpoint root.
+It hashes the exact encoded bytes passed to the table metadata write and publishes the root after all those writes complete.
+The Rust loader requires exactly the registered OIDs and validates each table block before decoding it.
+It checks the logical bytes returned by storage, including after decryption or unpacking.
+Older roots without a manifest retain the existing read path.
+
+Lean 4.36.0 audited four theorems about exact registry coverage, acceptance of the written metadata, equality of an accepted table block under the stated pairwise digest premise, and preservation of any dependencies derived from those bytes.
+The two mutations admit unregistered tables or accept any block at the expected path and fail at their declared laws. link:../lean/CheckpointTableManifest.lean[Table binding laws]
+TLC explored all 17 states for two tables, each with a write, confirmation and possible wrong-byte observation.
+It rejected premature root publication and accepting valid metadata under the wrong registered path, and reached an open complete checkpoint.
+Apalache checked eight transitions and independently rejected the path-only acceptance rule.
+The model and Lean records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-models-mlaewjgq/`. link:../tla/CheckpointTableManifest.tla[Publication and recovery model]
+
+The Rust format and replication selections passed 85 cases on parent `81585e972` with this change.
+The two exact native replays passed, and three mutations failed at their named assertions for OID coverage, writer binding and reader verification.
+The suite log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-81585-rust.log`, and the per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-native-6ek4vi0w/`.
+The nine existing checkpoint recovery conformance cases passed with the new manifest.
+Publishing the root before the table writes and refusing to refresh discovery still triggered the expected failures.
+The conformance records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-manifest-recovery-warm-d71ns30n/`.
+The JVM build regenerated core Protobuf and recompiled Kotlin and Java with the new field.
+All 3,198 standard JVM cases passed with the reused native library from `818a6dfd5`.
+The Rust replay exercises the new writer and verifier.
+The JVM log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-81585-jvm.log`.
+
+The manifest validates table metadata relative to trusted root bytes.
+The root's exact provider identity, payload and artefact publication bindings, and joint root-and-suffix retention still need evidence and enforcement.

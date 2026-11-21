@@ -63,7 +63,15 @@ impl BlockCatalog {
     pub fn from_proto(wire: pb::Block) -> Result<Self> {
         if wire.block_index.unwrap_or_default() < 0 { return Err(invalid("Block index is negative")); }
         let catalog = Self { wire: Arc::new(wire), charge: None };
-        catalog.table_entries()?;
+        let entries = catalog.table_entries()?;
+        if let Some(manifest) = &catalog.wire.table_block_manifest {
+            let digests = &manifest.sha256_by_oid;
+            if entries.len() != digests.len()
+                || entries.iter().any(|entry| digests.get(&entry.oid).is_none_or(|digest| digest.len() != 32))
+            {
+                return Err(invalid("Table block manifest does not match the checkpoint registry"));
+            }
+        }
         Ok(catalog)
     }
 
@@ -75,6 +83,9 @@ impl BlockCatalog {
     pub fn boundary_replica_position(&self) -> Option<ReplicaPosition> { self.wire.boundary_replica_msg_id.map(ReplicaPosition) }
     pub fn external_source_token(&self) -> Option<&[u8]> { self.wire.external_source_token.as_deref() }
     pub fn secondary_databases(&self) -> &BTreeMap<String, DatabaseConfig> { &self.wire.secondary_databases }
+    pub fn table_block_digest(&self, oid: u32) -> Option<&[u8]> {
+        self.wire.table_block_manifest.as_ref()?.sha256_by_oid.get(&oid).map(Vec::as_slice)
+    }
 
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> {
         self.wire.latest_completed_tx.as_ref().map(|tx| TransactionKey {

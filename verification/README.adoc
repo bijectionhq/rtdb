@@ -207,6 +207,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/PublishedCheckpoint.lean` proves the coordinate relationship for arbitrary retry histories.
   `verus/checkpoint_discovery` checks the exact Rust predicate for the admitted boundary and a valid successor.
   Native replays exercise a mismatched checkpoint, a different journal, a prefix gap and successful recovery from a later boundary.
+* `tla/CheckpointTableManifest.tla` checks publication after table writes and acceptance only when the observed bytes match the checkpoint bindings.
+  `lean/CheckpointTableManifest.lean` proves registry coverage and preservation of derived dependencies under the stated digest premise.
+  The Rust replays check exact OID coverage and refusal when valid bytes for a different table appear under the expected path.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `hyperltl/CheckpointRecovery.hltl` compares every pair of modeled startup schedules with the same stable, readable replacement.

@@ -9,6 +9,7 @@ use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, Part
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool, log::LogTail};
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{AppliedProgress, PartitionLogs, ReplicaRecord, TermFence};
@@ -384,6 +385,12 @@ impl BlockStore {
         let mut tables = BTreeMap::new();
         for entry in block.table_entries()? {
             let lease = self.cache.get(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;
+            if let Some(expected) = block.table_block_digest(entry.oid) {
+                let observed: [u8; 32] = Sha256::digest(lease.as_slice()).into();
+                if expected != observed {
+                    return Err(invalid(format!("The stored table block for {} does not match its checkpoint manifest", entry.table.schema_and_table())));
+                }
+            }
             let reservation = self.reserve_decode(lease.as_slice().len())?;
             tables.insert(entry.table, TableBlock::decode_reserved(lease.as_slice(), reservation)?);
         }
@@ -435,10 +442,13 @@ impl BlockStore {
             tokio::task::yield_now().await;
         }
         let table_blocks = prepared.table_blocks(&tries, boundary.metadata.timestamp)?;
+        let mut sha256_by_oid = BTreeMap::new();
         for entry in table_catalog.entries() {
             check_cancelled(cancellation)?;
             let block = table_blocks.get(&entry.table).ok_or_else(|| invalid("Recorded table has no block metadata"))?;
-            self.store.put(&ObjectKey::new(entry.slug.block_key(index)?)?, Bytes::from(block.encode())).await?;
+            let bytes = Bytes::from(block.encode());
+            sha256_by_oid.insert(entry.oid, Sha256::digest(&bytes).to_vec());
+            self.store.put(&ObjectKey::new(entry.slug.block_key(index)?)?, bytes).await?;
         }
         let tx_key = prepared.value().live().latest_completed_tx();
         check_cancelled(cancellation)?;
@@ -450,6 +460,7 @@ impl BlockStore {
             boundary_replica_msg_id: Some(boundary.metadata.position.0), external_source_token: message.external_source_token.clone(),
             term_id: Some(boundary.envelope.term.0), boundary_term_seq: boundary.envelope.term_sequence.map(|sequence| sequence.0),
             naming_epoch: Some(i64::try_from(prepared.value().trie_catalog().naming_epoch()).map_err(|_| invalid("Naming epoch exceeds the block format"))?),
+            table_block_manifest: Some(block_pb::TableBlockManifest { sha256_by_oid }),
         })?;
         self.store.put(&key, Bytes::from(catalog.encode())).await?;
         Ok(ProducedBlock { catalog, tries })

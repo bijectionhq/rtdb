@@ -578,6 +578,47 @@ async fn hosted_checkpoint_recovery_can_use_a_later_boundary_after_prefix_collec
 }
 
 #[tokio::test]
+async fn a_checkpoint_manifest_refuses_a_different_tables_valid_metadata() {
+    use rtdb_storage::ObjectKey;
+    use sha2::{Digest, Sha256};
+
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 20).await;
+    let partition = &fixture.driver.partition;
+    let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
+    let mut write = TransactionBuffer::new(partition.value().snapshot(), key, Arc::clone(&fixture.memory)).unwrap();
+    for (name, rows) in [("left_table", 1), ("right_table", 2)] {
+        for id in 0..rows {
+            write.put(TableRef::new("public", name), StructFields::from([("_id".into(), Value::I64(id))]), Interval::ALL).unwrap();
+        }
+    }
+    partition.apply(&write.stage().unwrap()).unwrap();
+    fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
+    let pending = fixture.driver.pending_block.as_ref().unwrap();
+    let produced = fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let entries = produced.catalog.table_entries().unwrap();
+    let left = entries.iter().find(|entry| entry.table.table == "left_table").unwrap();
+    let right = entries.iter().find(|entry| entry.table.table == "right_table").unwrap();
+    let key_for = |entry: &rtdb_format::catalog::TableEntry| ObjectKey::new(entry.slug.block_key(BlockIndex(0)).unwrap()).unwrap();
+    let left_key = key_for(left);
+    let left_bytes = fixture.store.get(&left_key).await.unwrap();
+    let right_bytes = fixture.store.get(&key_for(right)).await.unwrap();
+    assert_ne!(left_bytes, right_bytes);
+    let expected: [u8; 32] = Sha256::digest(&left_bytes).into();
+    assert_eq!(produced.catalog.table_block_digest(left.oid), Some(expected.as_slice()),
+        "a newly published root commits to the bytes written for each table OID");
+    fixture.blocks.load(BlockIndex(0)).await.unwrap();
+
+    fixture.store.delete(&left_key).await.unwrap();
+    fixture.store.put(&left_key, right_bytes).await.unwrap();
+    let cache = Arc::new(BufferPool::new(fixture.store.clone(), 1 << 20));
+    let reopened = BlockStore::new(fixture.store.clone(), cache, fixture.memory.clone(), 100_000_000).unwrap();
+    let recovered = reopened.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), BlockDiscovery::List).await;
+    let Err(error) = recovered else { panic!("recovery must refuse mismatched table metadata even when it decodes"); };
+    assert_eq!(error.code, "rtdb.replication/invalid-block");
+    assert!(error.message.unwrap().contains("does not match its checkpoint manifest"));
+}
+
+#[tokio::test]
 async fn applying_a_deletion_drops_this_nodes_cached_copies_of_the_collected_files() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
     let state = &fixture.driver.partition;

@@ -702,6 +702,23 @@ def verify_published_checkpoint(args, scratch):
                       "published-checkpoint", controls, 5)
 
 
+def verify_checkpoint_table_manifest(args, scratch):
+    controls = {
+        "include-unregistered-tables": (
+            "if registry table then some (digest (written table)) else none",
+            "some (digest (written table))",
+            ["published_manifest_covers_exactly_the_registered_tables"],
+        ),
+        "trust-any-table-block": (
+            "manifest table = some (digest (observed table))",
+            "(manifest table).isSome",
+            ["acceptance_preserves_each_bound_table"],
+        ),
+    }
+    verify_lean_model(args, scratch, Path("verification/lean/CheckpointTableManifest.lean"),
+                      "checkpoint-table-manifest", controls, 4)
+
+
 def verify_reader_reclamation_minimality(args, scratch):
     path = Path("verification/lean/ReaderReclamationMinimality.lean")
     controls = {
@@ -1624,6 +1641,7 @@ def verify_lean(args, scratch):
             verify_replica_hold_close(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
             verify_published_checkpoint(args, scratch)
+            verify_checkpoint_table_manifest(args, scratch)
             verify_residence_reader_retention(args, scratch)
             verify_delegated_scan(args, scratch, directory)
             verify_compaction_projection(args, scratch, directory)
@@ -1829,6 +1847,13 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "open_wrong_journal"'), "OpensAdmittedJournal"),
     ("PublishedCheckpoint", "published-checkpoint-advance-witness",
      ("INVARIANTS MatchesAdmittedBoundary OpensAdmittedJournal", "INVARIANT NeverOpensAfterAdvancing"), "NeverOpensAfterAdvancing"),
+    ("CheckpointTableManifest", "checkpoint-table-manifest", None, None),
+    ("CheckpointTableManifest", "checkpoint-table-manifest-partial",
+     ('Mutation = "none"', 'Mutation = "partial_manifest"'), "CompletePublication"),
+    ("CheckpointTableManifest", "checkpoint-table-manifest-trust-path",
+     ('Mutation = "none"', 'Mutation = "trust_path"'), "AcceptedMetadataMatches"),
+    ("CheckpointTableManifest", "checkpoint-table-manifest-open-witness",
+     ("INVARIANTS CompletePublication AcceptedMetadataMatches", "INVARIANT NeverOpensPublishedRoot"), "NeverOpensPublishedRoot"),
     ("RecoveryDiscovery", "checkpoint-discovery-fail-fast", ('Mutation = "none"', 'Mutation = "fail_fast"'), "MissingFailureHasRefreshed"),
     ("RecoveryDiscovery", "checkpoint-discovery-allow-same", ('Mutation = "none"', 'Mutation = "allow_same"'), "AttemptsAdvance"),
     ("RecoveryDiscovery", "checkpoint-discovery-ignore-newer", ('Mutation = "none"', 'Mutation = "ignore_newer"'), "UsesNewerListing"),
@@ -2217,6 +2242,10 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "PublishedCheckpoint", "published-checkpoint-forget-retry-anchor",
                    "MatchesAdmittedBoundary", 5, ('Mutation = "none"', 'Mutation = "forget_retry_anchor"'),
                    "retry regresses the installed boundary")
+    check_apalache(args, scratch, "CheckpointTableManifest", "checkpoint-table-manifest", "Safe", 8)
+    check_apalache(args, scratch, "CheckpointTableManifest", "checkpoint-table-manifest-trust-path",
+                   "AcceptedMetadataMatches", 8, ('Mutation = "none"', 'Mutation = "trust_path"'),
+                   "a valid table block appears under a different registered path")
     check_apalache(
         args, scratch, "RecoveryDiscovery", "checkpoint-discovery-fail-fast", "MissingFailureHasRefreshed", 10,
         ('Mutation = "none"', 'Mutation = "fail_fast"'), "missing checkpoint without refreshed discovery",
@@ -2419,6 +2448,7 @@ def verify_checkpoint_replay(args, source):
         raise ValueError("checkpoint replay baseline failed")
     blocks = source / "rust/crates/replication/src/blocks.rs"
     original = blocks.read_bytes()
+    table_write = "            self.store.put(&ObjectKey::new(entry.slug.block_key(index)?)?, bytes).await?;\n"
     table_writes = """        for entry in table_catalog.entries() {
             check_cancelled(cancellation)?;
             let block = table_blocks.get(&entry.table).ok_or_else(|| invalid("Recorded table has no block metadata"))?;
@@ -2426,12 +2456,15 @@ def verify_checkpoint_replay(args, source):
         }
 """
     root_write = "        self.store.put(&key, Bytes::from(catalog.encode())).await?;\n"
-    replace_once(blocks, table_writes, "")
-    replace_once(blocks, root_write, root_write + table_writes)
     test = "recovery_reads_the_complete_checkpoint_if_interrupted_after_putting_the_root"
-    checked = run_case(
-        [*command, test, "--", "--exact"], source / "rust", args.evidence, "rust-checkpoint-root-first", env,
-    )
+    try:
+        replace_once(blocks, table_write, "")
+        replace_once(blocks, root_write, root_write + table_writes)
+        checked = run_case(
+            [*command, test, "--", "--exact"], source / "rust", args.evidence, "rust-checkpoint-root-first", env,
+        )
+    finally:
+        blocks.write_bytes(original)
     if (
         checked.returncode != 101
         or f"{test} ... FAILED" not in checked.stdout
@@ -2439,8 +2472,6 @@ def verify_checkpoint_replay(args, source):
         or "0 passed; 1 failed" not in checked.stdout
     ):
         raise ValueError("root-first mutation did not fail at checkpoint startup")
-    blocks.write_bytes(original)
-
     missing = 'Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {'
     try:
         replace_once(blocks, missing, missing.replace("if ", "if false && ", 1))
@@ -2458,6 +2489,55 @@ def verify_checkpoint_replay(args, source):
     finally:
         blocks.write_bytes(original)
     print("rust-checkpoint-replay: nine tests passed, root-first and fail-fast mutations rejected")
+
+
+def verify_checkpoint_table_manifest_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    exact = ["cargo", "test", "--locked", "-p"]
+    registry = "a_table_block_manifest_covers_exactly_the_recorded_oids"
+    table = "driver::tests::a_checkpoint_manifest_refuses_a_different_tables_valid_metadata"
+    format_command = [*exact, "rtdb-format", "--test", "catalog_retention", registry, "--", "--exact"]
+    read_command = [*exact, "rtdb-replication", "--lib", table, "--", "--exact"]
+    format_path = "rust/crates/format/src/catalog.rs"
+    read_path = "rust/crates/replication/src/blocks.rs"
+    cases = {
+        "registry": (format_command, registry, None),
+        "recovery": (read_command, table, None),
+        "bound-by-count-only": (format_command, registry, (
+            format_path, "|| entries.iter().any(|entry| digests.get(&entry.oid).is_none_or(|digest| digest.len() != 32))", "",
+            "the manifest must cover exactly the table OIDs with SHA-256 digests",
+        )),
+        "write-unbound-digest": (read_command, table, (
+            read_path, "sha256_by_oid.insert(entry.oid, Sha256::digest(&bytes).to_vec());",
+            "sha256_by_oid.insert(entry.oid, vec![0; 32]);",
+            "a newly published root commits to the bytes written for each table OID",
+        )),
+        "accept-substituted-table": (read_command, table, (
+            read_path, "if expected != observed {", "if false && expected != observed {",
+            "recovery must refuse mismatched table metadata even when it decodes",
+        )),
+    }
+    for name, (command, test, control) in cases.items():
+        if control:
+            relative, before, after, failure = control
+            path = source / relative
+            original = path.read_bytes()
+            try:
+                replace_once(path, before, after)
+                checked = run_case(command, source / "rust", args.evidence, f"rust-table-manifest-{name}", env)
+            finally:
+                path.write_bytes(original)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"table manifest control {name} missed its declared assertion")
+        else:
+            checked = run_case(command, source / "rust", args.evidence, f"rust-table-manifest-{name}", env)
+            if checked.returncode or f"{test} ... ok" not in checked.stdout or "1 passed; 0 failed" not in checked.stdout:
+                raise ValueError(f"table manifest baseline {name} failed")
+    print("rust-table-manifest: both replays passed and three manifest controls failed")
 
 
 def verify_published_checkpoint_replay(args, source):
@@ -3446,6 +3526,7 @@ def main():
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
             verify_published_checkpoint_replay(args, source)
+            verify_checkpoint_table_manifest_replay(args, source)
             verify_checkpoint_trie_retention(args, source)
             verify_trie_removal_readback(args, source)
             verify_durable_trie_retirement(args, source)

@@ -669,6 +669,10 @@ config {
 -- A stored catalog at the admitted block must match the boundary exactly.
 -- A successor must advance both the block and the replica boundary in that journal, including on a retry after prefix collection.
 -- The opened replica log must belong to the same journal as the admitted checkpoint.
+-- A new Rust checkpoint root carries the SHA-256 digest of each table block, keyed by the table registry OID.
+-- The root is written after every referenced table block write completes.
+-- Recovery checks the manifest covers exactly those OIDs and checks the stored bytes before accepting table metadata.
+-- Roots without this manifest use the existing table-block load.
 -- Other admission failures end startup with the provider error.
 -- The replication driver consumes the admitted cursor for that same log and boundary.
 -- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.
