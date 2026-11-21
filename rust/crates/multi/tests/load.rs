@@ -41,21 +41,59 @@ fn percentile(samples: &[Duration], percentile: usize) -> f64 {
     samples[index].as_secs_f64() * 1_000.0
 }
 
+struct WriteSample {
+    started: Instant,
+    acquired: Instant,
+    sent: Instant,
+    finished: Instant,
+    rank: usize,
+}
+
+fn sample_write_latencies<'a>(phase: &str, samples: impl Iterator<Item = &'a WriteSample>) {
+    let (mut total, mut queue, mut wire) = (Vec::new(), Vec::new(), Vec::new());
+    for sample in samples {
+        total.push(sample.finished - sample.started);
+        queue.push(sample.acquired - sample.started);
+        wire.push(sample.finished - sample.sent);
+    }
+    if total.is_empty() { return; }
+    total.sort_unstable();
+    queue.sort_unstable();
+    wire.sort_unstable();
+    println!("phase={phase} commits={} p95_ms={:.3} p99_ms={:.3} queue_p99_ms={:.3} wire_p99_ms={:.3}",
+        total.len(), percentile(&total, 95), percentile(&total, 99), percentile(&queue, 99), percentile(&wire, 99));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn durable_pgwire_updates_under_zipf_activity() {
     let deployments = setting("RTDB_CELL_BENCH_DEPLOYMENTS", 32);
     let workers = setting("RTDB_CELL_BENCH_WORKERS", 16);
     let scale = std::env::var_os("RTDB_CELL_BENCH_SCALE").is_some();
+    let cold = std::env::var_os("RTDB_CELL_BENCH_COLD").is_some();
+    let parked = setting("RTDB_CELL_BENCH_PARKED", 0);
     let commands = setting("RTDB_CELL_BENCH_COMMANDS", if scale { 2048 } else { 256 });
     let mut cell = Cell::start_durable(if scale { 2 } else { 3 }).await;
+    let gateway = cell.gateway;
+    if parked > 0 {
+        let logkeepers: Vec<_> = cell.directory.members().await.unwrap().into_iter()
+            .filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper).map(|member| member.id).collect();
+        let created_at = rtdb_directory::now_ms();
+        for index in 0..parked {
+            cell.directory.create_deployment(rtdb_directory::DeploymentRecord::new(
+                format!("parked-{index}"), "bench", logkeepers.clone(), created_at)).await.unwrap();
+        }
+    }
 
     let mut connections = Vec::with_capacity(deployments);
     for index in 0..deployments {
         let name = format!("bench-{index}");
         admin::create_deployment(cell.directory.as_ref(), &name, "bench", 3).await.unwrap();
-        let client = cell.connect(&name).await;
-        client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
+        let client = if cold { None } else {
+            let client = cell.connect(&name).await;
+            client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
+            Some(client)
+        };
         connections.push(Mutex::new(client));
     }
     let connections = Arc::new(connections);
@@ -63,10 +101,12 @@ async fn durable_pgwire_updates_under_zipf_activity() {
     let ready = Arc::new(Barrier::new(workers + 1));
     let first_write = Arc::new(Notify::new());
     let completed = Arc::new(AtomicUsize::new(0));
+    let activations = Arc::new(AtomicUsize::new(0));
     let mut tasks = JoinSet::new();
     for worker in 0..workers {
         let (connections, ranks, ready) = (connections.clone(), ranks.clone(), ready.clone());
         let (first_write, completed) = (first_write.clone(), completed.clone());
+        let activations = activations.clone();
         tasks.spawn(async move {
             let mut rng = (worker as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
             let mut totals = vec![0; ranks.len()];
@@ -75,8 +115,17 @@ async fn durable_pgwire_updates_under_zipf_activity() {
             for _ in 0..commands {
                 let rank = pick_rank(&mut rng, &ranks);
                 let started = Instant::now();
-                connections[rank].lock().await.simple_query("UPDATE counters SET n = n + 1 WHERE _id = 1").await.unwrap();
-                samples.push((started, started.elapsed()));
+                let mut connection = connections[rank].lock().await;
+                let acquired = Instant::now();
+                if connection.is_none() {
+                    let client = common::connect(&gateway.to_string(), &format!("bench-{rank}")).await;
+                    client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
+                    *connection = Some(client);
+                    activations.fetch_add(1, Ordering::Relaxed);
+                }
+                let sent = Instant::now();
+                connection.as_ref().unwrap().simple_query("UPDATE counters SET n = n + 1 WHERE _id = 1").await.unwrap();
+                samples.push(WriteSample { started, acquired, sent, finished: Instant::now(), rank });
                 totals[rank] += 1;
                 if scale && completed.fetch_add(1, Ordering::Relaxed) == 0 { first_write.notify_one(); }
             }
@@ -98,7 +147,14 @@ async fn durable_pgwire_updates_under_zipf_activity() {
     };
     let scaling = async {
         if !scale { return None; }
-        tokio::time::timeout(Duration::from_secs(10), first_write.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            first_write.notified().await;
+            if cold {
+                while completed.load(Ordering::Relaxed) < deployments || cell.holder("bench-0").await.is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }).await.unwrap();
         let before = completed.load(Ordering::Relaxed);
         let scale_out_start = Instant::now();
         let added = cell.add_node().await;
@@ -127,23 +183,38 @@ async fn durable_pgwire_updates_under_zipf_activity() {
     };
     let ((totals, samples, elapsed), windows) = tokio::join!(measurements, scaling);
 
-    for (client, expected) in connections.iter().zip(&totals) {
-        assert_eq!(values(&*client.lock().await, "SELECT n FROM counters").await, [expected.to_string()]);
-    }
-    if let Some(windows) = windows {
-        let overlaps = |started: Instant, duration: Duration, (first, last): (Instant, Instant)| started <= last && started + duration >= first;
-        for (name, window) in [("scale_out", Some(windows[0])), ("scale_in", Some(windows[1])), ("outside_moves", None)] {
-            let mut local: Vec<_> = samples.iter().filter(|(started, duration)| match window {
-                Some(window) => overlaps(*started, *duration, window),
-                None => windows.iter().all(|window| !overlaps(*started, *duration, *window)),
-            }).map(|(_, duration)| *duration).collect();
-            local.sort_unstable();
-            if !local.is_empty() {
-                println!("phase={name} commits={} p95_ms={:.3} p99_ms={:.3}", local.len(), percentile(&local, 95), percentile(&local, 99));
-            }
+    for (rank, (client, expected)) in connections.iter().zip(&totals).enumerate() {
+        if let Some(client) = client.lock().await.as_ref() {
+            assert_eq!(values(client, "SELECT n FROM counters").await, [expected.to_string()]);
+        } else {
+            assert_eq!(*expected, 0);
+            assert_eq!(cell.holder(&format!("bench-{rank}")).await, None);
         }
     }
-    let mut latencies: Vec<_> = samples.into_iter().map(|(_, duration)| duration).collect();
+    if parked > 0 {
+        for index in [0, parked / 2, parked - 1] {
+            assert_eq!(cell.holder(&format!("parked-{index}")).await, None);
+        }
+    }
+    if cold || parked > 0 { println!("lazy_activations={} unrelated_parked={parked}", activations.load(Ordering::Relaxed)); }
+    if let Some(windows) = windows {
+        let overlaps = |sample: &WriteSample, (first, last): (Instant, Instant)| sample.started <= last && sample.finished >= first;
+        for (name, window) in [("scale_out", Some(windows[0])), ("scale_in", Some(windows[1])), ("outside_moves", None)] {
+            sample_write_latencies(name, samples.iter().filter(|sample| match window {
+                Some(window) => overlaps(sample, window),
+                None => windows.iter().all(|window| !overlaps(sample, *window)),
+            }));
+        }
+    }
+    for (phase, first, last) in [("first_third", started, started + elapsed / 3),
+        ("second_third", started + elapsed / 3, started + elapsed * 2 / 3),
+        ("last_third", started + elapsed * 2 / 3, started + elapsed)]
+    {
+        sample_write_latencies(phase, samples.iter().filter(|sample| sample.started >= first && sample.started < last));
+    }
+    sample_write_latencies("hottest_deployment", samples.iter().filter(|sample| sample.rank == 0));
+    sample_write_latencies("other_deployments", samples.iter().filter(|sample| sample.rank > 0));
+    let mut latencies: Vec<_> = samples.into_iter().map(|sample| sample.finished - sample.started).collect();
     assert_eq!(latencies.len(), workers * commands);
     latencies.sort_unstable();
     println!(

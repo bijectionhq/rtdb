@@ -780,6 +780,10 @@ Three repeats with placement-triggered reconnects and cancellation-aware block c
 The repeats measured p95 of 17.4–19.2 ms and p99 of 21.2–112.0 ms.
 Three warm trials with direct drain handoffs matched all 32,768 writes per run.
 Their p99 was 25.0–151.9 ms during scale-out, 96.6–132.5 ms during scale-in, and 104.1–128.4 ms outside both transitions.
+With the client queue measured separately, one further warm trial with all 32,768 writes matched recorded 146.8 ms p99 waiting for the hottest deployment's connection and 13.1 ms p99 from send to reply on that connection.
+The remaining 31 deployments recorded 17.6 ms end-to-end p99 in that trial.
+Send-to-reply p99 was 25.3 ms during scale-out, 34.3 ms during scale-in, and 12.8 ms outside these intervals.
+Other Rust builds were running on the host during part of the additional measurements.
 The continuous workload still has inconsistent tail latency.
 The workload reports latency separately for commands overlapping each transition and for commands outside both transitions.
 
@@ -788,7 +792,10 @@ RTDB_CELL_BENCH_SCALE=1 cargo test --manifest-path rust/Cargo.toml -p rtdb-multi
   durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
 ```
 
-The staging acceptance run needs a production directory, lazy activation of parked deployments and repeatable p99 across live scale transitions.
+A local run with `RTDB_CELL_BENCH_COLD=1 RTDB_CELL_BENCH_PARKED=100000 RTDB_CELL_BENCH_SCALE=1` added 100,000 parked records and activated the 32 queried deployments on demand.
+All counters matched the 32,768 writes, with 1,013 updates/s and 155.2 ms p99 including the connection queue.
+Send-to-reply p99 was 31.9 ms during scale-out, 27.6 ms during scale-in, and 16.0 ms outside these intervals.
+The staging acceptance run needs a production directory, ten million parked deployments, and repeatable p99 across live scale transitions.
 
 ## 6. Existing specs affected
 
