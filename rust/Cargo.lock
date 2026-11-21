@@ -4999,6 +4999,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.6",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]

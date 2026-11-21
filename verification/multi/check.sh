@@ -60,6 +60,18 @@ RTDBGatewayReplay|RTDBGatewayReplay|0|No error has been found
 RTDBGatewayReplay|RTDBGatewayReplaySqlKey|12|Invariant OneEffect is violated
 RTDBGatewayReplay|RTDBGatewayReplayMalformedKey|12|Invariant OneEffect is violated
 RTDBGatewayReplay|RTDBGatewayReplayRenewedWindow|12|Invariant FixedCutoff is violated
+RTDBServingFailure|RTDBServingFailure|0|No error has been found
+RTDBServingFailure|RTDBServingFailureControlOnly|13|Temporal property StartupEventuallyConnects was violated
+RTDBServingFailure|RTDBServingFailureStaleProbe|12|Invariant EvidenceMatchesCurrentEndpoints is violated
+RTDBServingFailure|RTDBServingFailureOneDial|13|Temporal property StartupEventuallyConnects was violated
+RTDBReplayPermit|RTDBReplayPermit|0|No error has been found
+RTDBReplayPermit|RTDBReplayPermitBatch|12|Invariant OneMutation is violated
+RTDBReplayPermit|RTDBReplayPermitDelayedOriginal|12|Invariant OneMutation is violated
+RTDBReplayPermit|RTDBReplayPermitEarlyExpiry|12|Invariant OneMutation is violated
+RTDBReplayPermit|RTDBReplayPermitErasedMarker|12|Invariant OneMutation is violated
+RTDBReplayPermit|RTDBReplayPermitLegacyWriter|12|Invariant OneMutation is violated
+RTDBSetupReplay|RTDBSetupReplay|0|No error has been found
+RTDBSetupReplay|RTDBSetupReplayStaleCheck|12|Invariant SetupReplayHasNoExecute is violated
 CONFIGURATIONS
 
 printf 'Proof logs: %s\n' "$run"

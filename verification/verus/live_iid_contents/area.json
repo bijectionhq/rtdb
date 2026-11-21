@@ -1,0 +1,57 @@
+{
+  "summary": "The production live-row addressing operations preserve the exact IID at retained rows under ordered payload concatenation.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "contents", "--rlimit", "40"],
+  "min_verified_functions": 9,
+  "controls": {
+    "read_first_cell": {
+      "defect": "The payload reader uses the first IID in the owning chunk for every row.",
+      "mutate": [{
+        "file": "verification/verus/live_iid_contents/contents.rs",
+        "find": "(index, offset, chunks[index].1[offset as usize])",
+        "replace": "(index, offset, chunks[index].1[0])"
+      }],
+      "expect": [{
+        "file": "verification/verus/live_iid_contents/contents.rs",
+        "function": "locate_iid",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "verification/verus/live_iid_contents/contents.rs",
+        "function": "locate_iid",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 8
+    },
+    "forget_append_length": {
+      "defect": "The append claims no extra rows when the incoming chunk has payload.",
+      "mutate": [{
+        "file": "verification/verus/live_iid_contents/contents.rs",
+        "find": "let count = batch.len() as u32;",
+        "replace": "let count = 0u32;"
+      }],
+      "expect": [{
+        "file": "verification/verus/live_iid_contents/contents.rs",
+        "function": "append_keeps_a_retained_iid",
+        "category": "precondition not satisfied"
+      }],
+      "min_verified_functions": 8
+    },
+    "reverse_tail_chunk_payloads": {
+      "defect": "Concatenation retains the total extent while reversing the chunks' IID payload order.",
+      "mutate": [{
+        "file": "verification/verus/live_iid_contents/contents.rs",
+        "find": "replacement@ == old(chunks)@[old(chunks)@.len() - 2].1@ + old(chunks)@.last().1@,",
+        "replace": "replacement@ == old(chunks)@.last().1@ + old(chunks)@[old(chunks)@.len() - 2].1@,"
+      }],
+      "expect": [{
+        "file": "verification/verus/live_iid_contents/contents.rs",
+        "function": "joining_tail_keeps_a_retained_iid",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/live_iid_contents/contents.rs",
+        "function": "joining_tail_keeps_a_retained_iid",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 8
+    }
+  }
+}

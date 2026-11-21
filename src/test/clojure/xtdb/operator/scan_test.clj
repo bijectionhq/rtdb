@@ -298,25 +298,25 @@
                                {:node tu/*node*}))))))
 
 (t/deftest test-aligns-temporal-columns-correctly-363
-  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last_updated "tx1"}]] {:system-time #inst "3000"})
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last_updated "tx1"}]] {:system-time #inst "2000"})
 
-  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last_updated "tx2"}]] {:system-time #inst "3001"})
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id :my-doc, :last_updated "tx2"}]] {:system-time #inst "2001"})
 
   (tu/flush-block! tu/*node*)
 
   (t/is (= #{{:last-updated "tx2",
-              :xt/valid-from #xt/zoned-date-time "3001-01-01T00:00Z[UTC]",
-              :xt/system-from #xt/zoned-date-time "3001-01-01T00:00Z[UTC]"}
+              :xt/valid-from #xt/zoned-date-time "2001-01-01T00:00Z[UTC]",
+              :xt/system-from #xt/zoned-date-time "2001-01-01T00:00Z[UTC]"}
              {:last-updated "tx1",
-              :xt/valid-from #xt/zoned-date-time "3000-01-01T00:00Z[UTC]",
-              :xt/valid-to #xt/zoned-date-time "3001-01-01T00:00Z[UTC]",
-              :xt/system-from #xt/zoned-date-time "3000-01-01T00:00Z[UTC]"}
+              :xt/valid-from #xt/zoned-date-time "2000-01-01T00:00Z[UTC]",
+              :xt/valid-to #xt/zoned-date-time "2001-01-01T00:00Z[UTC]",
+              :xt/system-from #xt/zoned-date-time "2000-01-01T00:00Z[UTC]"}
              {:last-updated "tx1",
-              :xt/valid-from #xt/zoned-date-time "3001-01-01T00:00Z[UTC]",
-              :xt/system-from #xt/zoned-date-time "3000-01-01T00:00Z[UTC]",
-              :xt/system-to #xt/zoned-date-time "3001-01-01T00:00Z[UTC]"}}
+              :xt/valid-from #xt/zoned-date-time "2001-01-01T00:00Z[UTC]",
+              :xt/system-from #xt/zoned-date-time "2000-01-01T00:00Z[UTC]",
+              :xt/system-to #xt/zoned-date-time "2001-01-01T00:00Z[UTC]"}}
            (set (tu/query-ra '[:scan {:db-name "xtdb", :table #xt/table foo,
-                                      :for-system-time [:between #xt/zoned-date-time "2999-01-01T00:00Z" #xt/zoned-date-time "3002-01-01T00:00Z"]
+                                      :for-system-time [:between #xt/zoned-date-time "1999-01-01T00:00Z" #xt/zoned-date-time "2002-01-01T00:00Z"]
                                       :for-valid-time :all-time, :columns [_system_from _system_to
                                 _valid_from _valid_to
                                 last_updated]}]

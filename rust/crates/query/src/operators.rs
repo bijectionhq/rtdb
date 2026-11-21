@@ -8,6 +8,7 @@ use rtdb_types::{Result, Value};
 
 use crate::context::Execution;
 use crate::cursor::{BoxCursor, OwnedRow};
+use crate::limit_bounds::{checked_row_count, sort_prefix_len};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
 use crate::{invalid, QueryContext};
 use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
@@ -218,7 +219,7 @@ pub(crate) fn build_ordered_columns(
                 let Some((offset, remaining)) = ordered_window(offset.as_ref(), fetch, &execution) else {
                     return Ok(None);
                 };
-                let limit = offset.saturating_add(remaining).min(i64::MAX as u64);
+                let limit = sort_prefix_len(offset, Some(remaining));
                 let (Ok(limit), Ok(offset)) = (usize::try_from(limit), usize::try_from(offset)) else { return Ok(None); };
                 let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit, offset, Some(projection)).await? else {
                     return Ok(None);
@@ -422,7 +423,7 @@ async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, con
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
             if !order_by.is_empty()
                 && let Some((offset, remaining)) = fetch.as_ref().and_then(|fetch| ordered_window(offset.as_ref(), fetch, &execution))
-                && let Ok(limit) = usize::try_from(offset.saturating_add(remaining).min(i64::MAX as u64))
+                && let Ok(limit) = usize::try_from(sort_prefix_len(offset, Some(remaining)))
                 && let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit, 0, None).await?
             {
                 let pages = Box::new(Limit { input: Some(input.pages(&execution)), offset, remaining: Some(remaining), execution });
@@ -437,9 +438,9 @@ async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, con
                 Some(batches) => Ok(batches),
                 None => Err(build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?),
             };
-            let offset_value = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
-            let remaining = row_limit(fetch.as_ref(), &execution).await?;
-            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
+            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
+            let remaining = row_limit(fetch.as_ref(),&execution).await?;
+            let row_limit = sort_prefix_len(offset_value, remaining);
             let mut pages: BoxPageCursor = match input {
                 Ok((batches,projected)) if crate::sort::SortCursor::batch_eligible(&schema,order_by,row_limit) =>
                     Box::new(crate::sort::SortCursor::top_batches(batches,projected,schema,order_by.clone(),row_limit,execution.clone())),
@@ -552,20 +553,16 @@ fn ordered_window(offset: Option<&Expr>, fetch: &Expr, execution: &Execution) ->
             Expr::Parameter { index, .. } => execution.parameters.values().get(*index)?,
             _ => return None,
         };
-        row_count(value)
+        integer(value).and_then(checked_row_count)
     };
     Some((match offset { Some(expr) => bound(expr)?, None => 0 }, bound(fetch)?))
-}
-
-fn row_count(value: &Value) -> Option<u64> {
-    integer(value).filter(|value| (0..=i128::from(i64::MAX)).contains(value)).map(|value| value as u64)
 }
 
 async fn row_limit(expr: Option<&Expr>, execution: &Execution) -> Result<Option<u64>> {
     let Some(expr) = expr else { return Ok(None); };
     let scope = execution.scope()?;
     let value = execution.evaluate(&scope, expr, &Schema::default(), &[]).await?;
-    if let Some(value) = row_count(&value) { return Ok(Some(value)); }
+    if let Some(count) = integer(&value).and_then(checked_row_count) { return Ok(Some(count)); }
     let description = match value {
         Value::Null | Value::Undefined => "null".to_owned(),
         Value::Utf8(value) => value,

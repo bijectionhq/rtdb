@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, TransactionStatus, control_schema};
+use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, ReplaySubmissionPermit, TransactionStatus, control_schema};
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
 use rtdb_query::QueryCursor;
@@ -9,7 +9,11 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, GatewayReplayMode, GatewayReplayPermit, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+
+fn replay_requires_autocommit() -> Anomaly {
+    Anomaly::unsupported("rtdb.pgwire/replay-command", "Automatic replay requires a single autocommit statement without transaction controls")
+}
 
 enum PreparedKind { Empty, Query(PreparedSql), CopyOut(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
@@ -90,12 +94,13 @@ pub(crate) struct ProtocolSession {
     statements: BTreeMap<String, RegisteredStatement>,
     portals: BTreeMap<String, Portal>,
     copy: Option<crate::copy::CopyInput>,
+    replay_permit: Option<GatewayReplayPermit>,
 }
 impl ProtocolSession {
     pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self {
         let reported_settings = session.state().settings_revision();
         Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0,
-            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None }
+            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None, replay_permit: None }
     }
     pub fn extended(&self) -> bool { self.extended }
     pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.session.state_mut().close(); }
@@ -128,10 +133,33 @@ impl ProtocolSession {
     fn options(&self) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: search_path(self.session.state().parameter("search_path").unwrap_or("public")), ..Default::default() } }
     fn begin_implicit(&mut self, read_only: Option<bool>) -> Result<()> { if self.session.state().status() != TransactionStatus::Idle { return Ok(()); } let mut settings = rtdb_node::TransactionSettings::default(); settings.access = read_only.map(|read_only| if read_only { rtdb_node::AccessSettings::ReadOnly(Default::default()) } else { rtdb_node::AccessSettings::ReadWrite(Default::default()) }); self.session.state_mut().begin_with(settings)?; self.implicit = true; Ok(()) }
     fn end_transaction(&mut self) { self.portals.clear(); self.implicit = false; self.transaction_generation = self.transaction_generation.wrapping_add(1); }
-    async fn commit(&mut self) -> Result<()> { let _sample = rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction); let result = self.session.state_mut().commit_tx(None).await; self.end_transaction(); if let CommitResult::Executed(tx) = result? { if let Some(error) = tx.error() { return Err(error.clone()); } } Ok(()) }
+    async fn commit(&mut self, permit: Option<ReplaySubmissionPermit>) -> Result<()> {
+        let _sample = rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction);
+        let state = self.session.state_mut();
+        let result = match permit {
+            Some(permit) => state.commit_tx_with_replay_permit(permit).await,
+            None => state.commit_tx(None).await,
+        };
+        self.end_transaction();
+        if let CommitResult::Executed(tx) = result? && let Some(error) = tx.error() { return Err(error.clone()); }
+        Ok(())
+    }
     fn rollback(&mut self) -> Result<()> { self.session.state_mut().rollback_tx()?; self.end_transaction(); Ok(()) }
 
     pub async fn handle<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
+        if self.replay_permit.is_some() && frame.tag != b'Q' {
+            return Err(protocol("A gateway replay permit must be followed by a simple query"));
+        }
+        if frame.tag == GATEWAY_SESSION_STATE_TAG && frame.body.first() == Some(&GATEWAY_REPLAY_PERMIT_KIND) {
+            if !self.startup.gateway_session_state || self.extended || self.copy.is_some() || self.ready() != b'I' {
+                return Err(protocol("A gateway replay permit requires an idle gateway session"));
+            }
+            let permit = GatewayReplayPermit::decode(&frame.body).ok_or_else(|| protocol("Invalid gateway replay permit"))?;
+            self.session.state_mut().set_gateway_key(permit.nonce.simple().to_string())?;
+            self.replay_permit = Some(permit);
+            if permit.mode != GatewayReplayMode::Dispatch { writer.ready(b'I').await?; }
+            return Ok(());
+        }
         if frame.tag == GATEWAY_SESSION_STATE_TAG && let Some((&kind @ (GATEWAY_KEY_KIND | GATEWAY_KEY_CONFIRM_KIND), key)) = frame.body.split_first() {
             // Failure here ends the connection before it can execute the following command.
             if !self.startup.gateway_session_state || self.extended || self.copy.is_some() || self.ready() != b'I' {
@@ -220,12 +248,12 @@ impl ProtocolSession {
                 let name = input.string()?.to_owned(); let limit = input.integer()?; input.end()?; if limit < 0 { return Err(protocol("Execute row limit cannot be negative")); }
                 let generation = self.transaction_generation;
                 let mut portal = self.portals.remove(&name).ok_or_else(|| protocol("no such portal"))?;
-                let result = self.execute(&mut portal, limit as usize, false, writer).await;
+                let result = self.execute(&mut portal, limit as usize, false, None, writer).await;
                 if generation == self.transaction_generation { self.portals.insert(name, portal); }
                 result?;
             }
             b'C' => { let kind = input.byte()?; let name = input.string()?; input.end()?; match kind { b'P' => { self.portals.remove(name); }, b'S' => { if let Some(statement) = self.statements.remove(name) { self.portals.retain(|_, portal| !Arc::ptr_eq(&portal.prepared, &statement.prepared)); } }, _ => return Err(protocol("Invalid close target")) } writer.empty(b'3').await?; }
-            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit().await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
+            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit(None).await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
             b'd' => { self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))?.append(input.remaining()).await?; }
             b'c' => {
@@ -455,7 +483,7 @@ impl ProtocolSession {
     fn record_transaction_error(&self) { if let Some(observer) = self.node.execution_observer() { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
     async fn description<W: AsyncWrite + Unpin>(columns: Option<&[Column]>, fallback: PgType, writer: &mut Writer<W>) -> Result<()> { match columns { Some(columns) => writer.columns(columns, fallback).await, None => writer.empty(b'n').await } }
 
-    async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, commit_dml_before_reply: bool, writer: &mut Writer<W>) -> Result<()> {
+    async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, commit_dml_before_reply: bool, permit: Option<ReplaySubmissionPermit>, writer: &mut Writer<W>) -> Result<()> {
         let prepared = Arc::clone(&portal.prepared);
         let failed = self.session.state().status() == TransactionStatus::Failed;
         let control = prepared.control();
@@ -496,7 +524,7 @@ impl ProtocolSession {
                 let _arguments = self.node.memory().reserve(bound)?;
                 let args = if portal.arguments.is_empty() { None } else { Some(rtdb_tx::SqlArguments::from_rows(vec![portal.arguments.clone()], self.node.memory())?) };
                 self.session.state_mut().execute_operation(statement.dml_operation(args)?).await?;
-                if commit_dml_before_reply { self.commit().await?; }
+                if commit_dml_before_reply { self.commit(permit).await?; }
                 match statement.ordered_index_command_tag() {
                     Some(tag) => writer.string(b'C', tag).await,
                     None => writer.string(b'C', &dml_tag(source)).await,
@@ -588,13 +616,14 @@ impl ProtocolSession {
 
     async fn simple<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
         self.extended = false; self.portals.remove("");
-        let result = self.simple_statements(source, writer).await;
+        let permit = self.replay_permit.take();
+        let result = self.simple_statements(source, permit, writer).await;
         if let Err(error) = result { writer.error(error.anomaly(), self.environment()?.fallback(), false).await?; }
         if self.copy.is_none() { self.report_ready(writer).await?; }
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(
-        &mut self, original: &str, writer: &mut Writer<W>,
+        &mut self, original: &str, mut permit: Option<GatewayReplayPermit>, writer: &mut Writer<W>,
     ) -> std::result::Result<(), SimpleQueryFailure> {
         let normalized = normalized_simple_text(original);
         let keyword = keyword_prefix(normalized);
@@ -637,6 +666,9 @@ impl ProtocolSession {
         };
         let mut batch = parsed.map_err(|error| SimpleQueryFailure::from_batch(error, &source, original, &memory))?;
         let single_autocommit = batch.len() == 1 && self.session.state().status() == TransactionStatus::Idle;
+        if !single_autocommit && permit.is_some_and(|permit| permit.mode == GatewayReplayMode::Replay) {
+            return Err(replay_requires_autocommit().into());
+        }
         while let Some(statement) = batch.next_for_execution() {
             let start_transaction = match &statement {
                 BatchExecution::Prepare(_) => true,
@@ -646,17 +678,20 @@ impl ProtocolSession {
                 },
             };
             if start_transaction { self.begin_implicit(None)?; }
-            let result = self.run_simple_statement(statement, single_autocommit, writer).await;
+            let permit = if single_autocommit { permit.take() } else { None };
+            let result = self.run_simple_statement(statement, single_autocommit, permit, writer).await;
             self.simple_statement_result(result, writer).await?;
         }
         drop(batch);
         self.settle_simple_transaction().await.map_err(Into::into)
     }
 
-    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, commit_dml_before_reply: bool, writer: &mut Writer<W>) -> Result<()> {
+    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, commit_dml_before_reply: bool, permit: Option<GatewayReplayPermit>, writer: &mut Writer<W>) -> Result<()> {
+        let replay = permit.is_some_and(|permit| permit.mode == GatewayReplayMode::Replay);
         let (syntax, allocation) = match statement {
             BatchExecution::Command { syntax, allocation } => (syntax, allocation),
             BatchExecution::Prepare(statement) => {
+                if replay { return Err(replay_requires_autocommit()); }
                 if self.session.state().status() == TransactionStatus::Failed {
                     return Err(protocol("current transaction is aborted, commands ignored until ROLLBACK is received"));
                 }
@@ -669,11 +704,19 @@ impl ProtocolSession {
             }
         };
         let prepared = self.prepare_batch_command(syntax, allocation, None).await?;
+        let permit = match prepared.ordinary_kind() {
+            Some(PreparedKind::Dml(_)) => permit.map(|permit| ReplaySubmissionPermit {
+                key: format!("{}/0", permit.nonce.simple()), not_after: permit.not_after,
+            }),
+            Some(PreparedKind::Query(_) | PreparedKind::Empty | PreparedKind::Keywords) => None,
+            _ if replay => return Err(replay_requires_autocommit()),
+            _ => None,
+        };
         Self::planning_warnings(&prepared, writer).await?;
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
         let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
         if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
-        self.execute(&mut portal, 0, commit_dml_before_reply, writer).await
+        self.execute(&mut portal, 0, commit_dml_before_reply, permit, writer).await
     }
 
     async fn simple_statement_result<W: AsyncWrite + Unpin>(&mut self, result: Result<()>, writer: &mut Writer<W>) -> Result<()> {
@@ -693,7 +736,7 @@ impl ProtocolSession {
             if self.session.state().status() == TransactionStatus::Failed {
                 self.rollback()?;
             } else {
-                self.commit().await?;
+                self.commit(None).await?;
             }
         }
         Ok(())
@@ -1136,6 +1179,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_permits_bind_one_autocommit_write_and_refuse_batches_and_expired_submissions() {
+        let (mut frontend, driver) = test_frontend(true).await;
+        frontend.startup.gateway_session_state = true;
+        let node = frontend.node.clone();
+        let driver = tokio::spawn(driver.run());
+        let memory = Arc::clone(node.memory());
+        let future_cutoff = rtdb_types::Timestamp(node.now().0 + 60_000_000);
+        let expired_cutoff = rtdb_types::Timestamp(node.now().0 - 1);
+        let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+        frontend.simple("INSERT INTO counters (_id, n) VALUES (1, 0), (2, 0), (3, 0)", &mut writer).await.unwrap();
+
+        for (id, mode, not_after, sql) in [
+            (1, GatewayReplayMode::Dispatch, future_cutoff, "UPDATE counters SET n = n + 1 WHERE _id = 1"),
+            (1, GatewayReplayMode::Replay, future_cutoff, "UPDATE counters SET n = n + 1 WHERE _id = 1"),
+            (2, GatewayReplayMode::Dispatch, future_cutoff, "BEGIN READ WRITE WITH (METADATA = {idempotency_key: 'app-key'}); UPDATE counters SET n = n + 1 WHERE _id = 2; COMMIT"),
+            (2, GatewayReplayMode::Replay, future_cutoff, "BEGIN READ WRITE WITH (METADATA = {idempotency_key: 'app-key'}); UPDATE counters SET n = n + 1 WHERE _id = 2; COMMIT"),
+            (3, GatewayReplayMode::Dispatch, expired_cutoff, "UPDATE counters SET n = n + 1 WHERE _id = 3"),
+            (3, GatewayReplayMode::Replay, expired_cutoff, "UPDATE counters SET n = n + 1 WHERE _id = 3"),
+        ] {
+            let permit = GatewayReplayPermit { nonce: uuid::Uuid::from_u128(id), not_after, mode };
+            let frame = Frame { tag: GATEWAY_SESSION_STATE_TAG, body: permit.encode().to_vec(), charge: memory.reserve(0).unwrap() };
+            frontend.handle(frame, &mut writer).await.unwrap();
+            frontend.simple(sql, &mut writer).await.unwrap();
+        }
+        frontend.simple("SELECT n FROM counters ORDER BY _id", &mut writer).await.unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = crate::wire::Reader::new(bytes.as_slice(), memory);
+        let mut counters = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(frame) = reader.read(1 << 20).await.unwrap() {
+            if frame.tag == b'D' { counters.push(frame.body[6..].to_vec()); }
+            if frame.tag == b'E' { errors.push(String::from_utf8_lossy(&frame.body).into_owned()); }
+        }
+        assert_eq!(counters, [b"1".to_vec(), b"1".to_vec(), b"0".to_vec()]);
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].contains("Automatic replay requires"), "{errors:?}");
+        drop(frontend);
+        node.shutdown();
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn a_single_autocommit_write_reports_success_only_after_commit() {
         let (mut frontend, driver) = test_frontend(true).await;
         let node = frontend.node.clone();
@@ -1481,7 +1566,7 @@ mod tests {
         let leaf_bytes = leaf.len() * 128 + 8192;
         let held = memory.reserve(memory.limit_bytes() - retained - arguments - leaf_bytes + 1).unwrap();
         let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
-        let error = frontend.execute(&mut portal, 0, false, &mut writer).await.unwrap_err();
+        let error = frontend.execute(&mut portal, 0, false, None, &mut writer).await.unwrap_err();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let request = format!("Cannot reserve {leaf_bytes} bytes");
         assert!(error.message.as_deref().unwrap().starts_with(request.as_str()));
@@ -1489,7 +1574,7 @@ mod tests {
         drop(held);
         assert_eq!(memory.used_bytes(), retained);
 
-        frontend.execute(&mut portal, 0, false, &mut writer).await.unwrap();
+        frontend.execute(&mut portal, 0, false, None, &mut writer).await.unwrap();
         assert!(old_statement.upgrade().is_none());
         frontend.portals.insert("portal".into(), portal);
         let mut body = vec![b'S'];

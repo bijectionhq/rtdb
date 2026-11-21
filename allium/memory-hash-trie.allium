@@ -520,6 +520,7 @@ rule AddIfNotPresent {
 
 -- 5. Splitting: leaves split into branches when exceeding page_limit,
 --    EXCEPT at max depth where leaves can grow unbounded
+--    Each child receives its matching subsequence of the parent run, preserving its order and repeated indices.
 
 -- 6. Max depth overflow: at MAX_LEVEL depth, a leaf CANNOT split further.
 --    It accumulates all indices for that IID prefix regardless of page_limit.

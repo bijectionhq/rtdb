@@ -86,6 +86,8 @@ impl Path {
     pub fn as_slice(&self) -> &[u8] { &self.0 }
     pub fn len(&self) -> usize { self.0.len() }
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub(crate) fn into_buckets(self) -> Vec<u8> { self.0 }
+    pub(crate) fn from_split_buckets(buckets: Vec<u8>) -> Self { Self(buckets) }
     pub fn child(&self, bucket: u8, bucketer: Bucketer) -> Result<Self> {
         let mut child = self.0.clone();
         child.push(bucket);

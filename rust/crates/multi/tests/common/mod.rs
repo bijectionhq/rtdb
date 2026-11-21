@@ -177,10 +177,11 @@ impl Cell {
     pub fn keys(&self) -> rtdb_multi::keys::LocalKeyService { rtdb_multi::keys::LocalKeyService::new(self.data.path().join("keys")).unwrap() }
     pub fn node(&self, index: usize) -> &process::RunningNode { self.nodes[index].as_ref().unwrap() }
 
-    pub async fn stop(mut self) {
+    pub async fn stop(mut self) -> tempfile::TempDir {
         self.gateway_cancellation.cancel();
         for node in self.nodes.iter_mut().filter_map(Option::take) { node.kill().await.unwrap(); }
         for logkeeper in self.logkeepers.drain(..) { logkeeper.stop().await.unwrap(); }
+        self.data
     }
 }
 

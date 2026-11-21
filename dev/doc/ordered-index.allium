@@ -36,6 +36,8 @@ entity Checkpoint {
 -- Hosted shared buffers retain the page permit through synchronous wire encoding and drop before transport waits.
 -- Hosted APIs returning Arrow arrays to callers use independent result buffers.
 -- An ordered distinct page filters eligible rows before counting each distinct key once.
+-- On the ordinary fallback plan, an input-opening error takes precedence over an OFFSET or FETCH error.
+-- After the input opens, OFFSET is checked before FETCH.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
 -- A checkpoint's page scope is zero before the first captured erase, and one past the last source block containing an erase afterward.
