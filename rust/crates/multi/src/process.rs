@@ -169,19 +169,41 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
     let endpoint = advertised(address, settings.advertise_host.as_deref())?;
+    let journal = rtdb_logkeeper::PreparedJournal::open(rtdb_logkeeper::ServerOptions {
+        data_dir: settings.data_dir,
+        fsync: settings.fsync,
+        cache_bytes: settings.cache_bytes,
+    }).await?;
     let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: endpoint, control_address: None, availability_zone: settings.availability_zone, pool: Default::default() }, settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    tasks.spawn(rtdb_logkeeper::serve(listener, rtdb_logkeeper::ServerOptions { data_dir: settings.data_dir, fsync: settings.fsync, cache_bytes: settings.cache_bytes }, cancellation.clone()));
+    tasks.spawn(journal.serve(listener, cancellation.clone()));
     { let lease = Arc::clone(&lease); let cancellation = cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     Ok(RunningLogkeeper { address, lease, cancellation, tasks })
 }
 
 impl RunningLogkeeper {
+    pub async fn run_until(mut self, shutdown: CancellationToken) -> Result<()> {
+        let failure = tokio::select! {
+            _ = shutdown.cancelled() => None,
+            exited = self.tasks.join_next() => Some(match exited {
+                Some(Ok(Err(error))) => error,
+                Some(Err(error)) => Anomaly::fault("rtdb.multi/logkeeper-task", error.to_string()),
+                Some(Ok(Ok(()))) | None => Anomaly::fault("rtdb.multi/logkeeper-stopped", "Logkeeper terminated before shutdown"),
+            }),
+        };
+        let stopped = self.stop().await;
+        failure.map_or(stopped, Err)
+    }
+
     pub async fn stop(mut self) -> Result<()> {
         self.cancellation.cancel();
-        while let Some(result) = self.tasks.join_next().await { if let Ok(Err(error)) = result { return Err(error); } }
-        Ok(())
+        let mut failure = None;
+        while let Some(result) = self.tasks.join_next().await {
+            if let Ok(Err(error)) = result { failure.get_or_insert(error); }
+        }
+        let retired = self.lease.retire().await;
+        failure.map_or(retired, Err)
     }
 }
 
@@ -209,6 +231,28 @@ fn advertised(bound: SocketAddr, host: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_locked_journal_is_never_advertised_as_a_second_logkeeper() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let data = tempfile::tempdir().unwrap();
+        let settings = || LogkeeperSettings {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            advertise_host: None,
+            data_dir: data.path().to_owned(),
+            fsync: true,
+            cache_bytes: 1 << 20,
+            availability_zone: "local".into(),
+            lease: LeaseOptions::default(),
+        };
+        let original = start_logkeeper(directory.clone(), settings()).await.unwrap();
+        assert!(start_logkeeper(directory.clone(), settings()).await.is_err());
+        assert_eq!(directory.members().await.unwrap().len(), 1);
+        original.stop().await.unwrap();
+        let replacement = start_logkeeper(directory.clone(), settings()).await.unwrap();
+        assert_eq!(directory.members().await.unwrap().iter().filter(|member| member.is_live(rtdb_directory::now_ms())).count(), 1);
+        replacement.stop().await.unwrap();
+    }
 
     #[test]
     fn wildcard_listeners_advertise_a_reachable_address_and_bound_port() {

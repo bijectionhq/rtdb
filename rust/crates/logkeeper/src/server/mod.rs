@@ -31,12 +31,32 @@ impl ServerOptions {
     pub const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 }
 
+/// A recovered journal holding the exclusive data-directory lock.
+pub struct PreparedJournal {
+    journal: Journal,
+    recovered: Vec<journal::Recovered>,
+}
+
+impl PreparedJournal {
+    pub async fn open(options: ServerOptions) -> Result<Self> {
+        let (journal, recovered) = tokio::task::spawn_blocking(move || Journal::open(&options.data_dir, options.fsync, options.cache_bytes))
+            .await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))??;
+        Ok(Self { journal, recovered })
+    }
+
+    pub async fn serve(self, listener: TcpListener, cancellation: CancellationToken) -> Result<()> {
+        serve_prepared(listener, self, cancellation).await
+    }
+}
+
 /// Serves until `cancellation`, then closes every connection and drains the journal.
 /// A failed journal write stops the server, since its later acknowledgements could no longer be trusted.
 pub async fn serve(listener: TcpListener, options: ServerOptions, cancellation: CancellationToken) -> Result<()> {
-    let opened = tokio::task::spawn_blocking(move || Journal::open(&options.data_dir, options.fsync, options.cache_bytes))
-        .await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))?;
-    let (journal, recovered) = opened?;
+    PreparedJournal::open(options).await?.serve(listener, cancellation).await
+}
+
+async fn serve_prepared(listener: TcpListener, opened: PreparedJournal, cancellation: CancellationToken) -> Result<()> {
+    let PreparedJournal { journal, recovered } = opened;
     let journal = Arc::new(journal);
     let (queue, work) = mpsc::unbounded_channel();
     let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));

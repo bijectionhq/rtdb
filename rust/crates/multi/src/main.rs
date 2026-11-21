@@ -17,6 +17,7 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
+                          [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
@@ -80,7 +81,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
     let arguments = Arguments::parse(rest)?;
     let cancellation = CancellationToken::new();
-    { let cancellation = cancellation.clone(); tokio::spawn(async move { let _ = tokio::signal::ctrl_c().await; cancellation.cancel(); }); }
+    { let cancellation = cancellation.clone(); tokio::spawn(async move { shutdown_signal().await; cancellation.cancel(); }); }
     match command.as_str() {
         "help" | "--help" | "-h" => { print!("{HELP}"); Ok(()) }
         "directory" => {
@@ -97,8 +98,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(), lease: LeaseOptions::default(),
             }).await?;
             eprintln!("logkeeper {} listening on {}", logkeeper.lease.id(), logkeeper.address);
-            cancellation.cancelled().await;
-            logkeeper.stop().await
+            logkeeper.run_until(cancellation).await
         }
         "node" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -134,14 +134,28 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             } else {
                 None
             };
-            let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls, ..Default::default() };
+            let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls: tls.clone(), ..Default::default() };
             if let (Some(cell), Some(map)) = (arguments.optional("cell"), arguments.optional("cell-map")) {
                 let map: Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::RemoteCellMap::new(map);
                 let advertised = arguments.optional("advertise").map(str::to_owned).unwrap_or(listener.local_addr().map_err(io)?.to_string());
                 map.register_cell(cell, &advertised).await?;
                 options.cells = Some((map, cell.to_owned()));
             }
-            gateway::serve(listener, directory, options, cancellation).await
+            if arguments.present("install-listen") {
+                let tls = tls.ok_or_else(|| usage("The installation listener requires a TLS configuration".into()))?;
+                let installer = rtdb_multi::install::Installer::from_file(
+                    std::path::Path::new(arguments.required("install-token-file")?),
+                    arguments.required("install-org")?.to_owned(),
+                    arguments.number("install-replicas", 3usize)?,
+                )?;
+                let installs = tokio::net::TcpListener::bind(arguments.address("install-listen", "127.0.0.1:0")?).await.map_err(io)?;
+                tokio::select! {
+                    gateway = gateway::serve(listener, directory.clone(), options, cancellation.clone()) => gateway,
+                    installation = rtdb_multi::install::serve(installs, tls, directory, Arc::new(installer), cancellation) => installation,
+                }
+            } else {
+                gateway::serve(listener, directory, options, cancellation).await
+            }
         }
         "controller" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -269,6 +283,21 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         other => Err(usage(format!("Unknown command {other}"))),
     }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// The cell secret from `--cell-secret FILE`, shared by a cell's gateways and nodes; without one, reconnection needs nodes that trust the gateway.
