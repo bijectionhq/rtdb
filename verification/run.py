@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -686,7 +687,9 @@ def main():
     args.evidence.mkdir(parents=True, exist_ok=False)
     tools = {}
     for name in ("lean", "verus", "z3", "java", "tlc", "alloy", "apalache", "maude"):
-        executable = Path(getattr(args, name)).resolve()
+        supplied = getattr(args, name)
+        executable = Path(shutil.which(supplied) or supplied).resolve()
+        setattr(args, name, str(executable))
         with executable.open("rb") as handle:
             tools[name] = {"path": str(executable), "sha256": hashlib.file_digest(handle, "sha256").hexdigest()}
     (args.evidence / "run.json").write_text(json.dumps({
