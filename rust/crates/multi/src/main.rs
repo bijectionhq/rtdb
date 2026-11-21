@@ -25,7 +25,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--grace SECONDS]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
@@ -41,7 +41,6 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
        rtdb-multi schedule-recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi recovery-disposal --directory DIR --id UUID\n\
-       rtdb-multi recovery --directory DIR --listen ADDR --config FILE --token-file FILE --org ORG --storage-root PATH --archive-root PATH --keys PATH\n\
        rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
@@ -216,8 +215,42 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 Some(specification) => Some(key_service(specification).await?),
                 None => None,
             };
-            rtdb_multi::store::run_reaper(directory, CellStorage::parse(arguments.required("storage-root")?)?, keys, grace, Duration::from_secs(10), cancellation).await;
-            Ok(())
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let recovery = if arguments.present("recovery-listen") {
+                let configuration = NodeConfiguration::from_yaml(
+                    &std::fs::read_to_string(arguments.required("recovery-config")?).map_err(io)?,
+                )?;
+                let tls_settings = configuration.server.and_then(|server| server.ssl)
+                    .ok_or_else(|| usage("The recovery configuration must provide server.ssl".into()))?;
+                let tls = rtdb_server::tls::load(&tls_settings, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
+                let service = rtdb_multi::recovery::RecoveryService::from_file(
+                    std::path::Path::new(arguments.required("recovery-token-file")?),
+                    arguments.required("recovery-org")?.to_owned(),
+                    storage.clone(),
+                    CellStorage::parse(arguments.required("archive-root")?)?,
+                    keys.clone().ok_or_else(|| usage("The recovery endpoint requires --keys".into()))?,
+                )?;
+                let listener = tokio::net::TcpListener::bind(
+                    arguments.address("recovery-listen", "127.0.0.1:0")?,
+                ).await.map_err(io)?;
+                Some((listener, tls, Arc::new(service)))
+            } else {
+                None
+            };
+            let reaper = rtdb_multi::store::run_reaper(
+                directory.clone(), storage, keys, grace, Duration::from_secs(10), cancellation.clone(),
+            );
+            if let Some((listener, tls, service)) = recovery {
+                let (_, result) = tokio::join!(reaper, async {
+                    let result = rtdb_multi::recovery::serve(listener, tls, directory, service, cancellation.clone()).await;
+                    cancellation.cancel();
+                    result
+                });
+                result
+            } else {
+                reaper.await;
+                Ok(())
+            }
         }
         "move" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -294,26 +327,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let receipt = directory.deployment(&id.to_string()).await?.and_then(|record| record.archive_retirement);
             println!("{}", serde_json::to_string_pretty(&receipt).expect("archive retirement serializes"));
             Ok(())
-        }
-        "recovery" => {
-            let directory = directory(arguments.required("directory")?).await?;
-            let configuration = NodeConfiguration::from_yaml(
-                &std::fs::read_to_string(arguments.required("config")?).map_err(io)?,
-            )?;
-            let tls_settings = configuration.server.and_then(|server| server.ssl)
-                .ok_or_else(|| usage("The recovery configuration must provide server.ssl".into()))?;
-            let tls = rtdb_server::tls::load(&tls_settings, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
-            let service = rtdb_multi::recovery::RecoveryService::from_file(
-                std::path::Path::new(arguments.required("token-file")?),
-                arguments.required("org")?.to_owned(),
-                CellStorage::parse(arguments.required("storage-root")?)?,
-                CellStorage::parse(arguments.required("archive-root")?)?,
-                key_service(arguments.required("keys")?).await?,
-            )?;
-            let listener = tokio::net::TcpListener::bind(
-                arguments.address("listen", "127.0.0.1:0")?,
-            ).await.map_err(io)?;
-            rtdb_multi::recovery::serve(listener, tls, directory, Arc::new(service), cancellation).await
         }
         "capture" => {
             let directory = directory(arguments.required("directory")?).await?;
