@@ -39,7 +39,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi roll-engine --directory DIR --version VERSION\n\
        rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
-       rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--expect DIGEST]\n\
+       rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
@@ -757,6 +757,9 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             Ok(())
         }
         "audit-log" => {
+            #[derive(serde::Deserialize)]
+            struct PrefixReport { stream: String, interval: [i64; 2], digest: String }
+
             let data = PathBuf::from(arguments.required("data")?);
             let stream = arguments.required("stream")?.to_owned();
             let interval = match (arguments.present("from"), arguments.present("through")) {
@@ -767,8 +770,16 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 (false, false) => None,
                 _ => return Err(usage("--from and --through must be supplied together".into())),
             };
+            let prefix = if arguments.present("prefix-report") {
+                let file = std::fs::File::open(arguments.required("prefix-report")?).map_err(io)?;
+                let report: PrefixReport = serde_json::from_reader(file)
+                    .map_err(|error| usage(format!("Invalid journal prefix report: {error}")))?;
+                Some(rtdb_logkeeper::JournalDigest { stream: report.stream, interval: report.interval, digest: report.digest })
+            } else {
+                None
+            };
             let journal_stream = stream.clone();
-            let proof = tokio::task::spawn_blocking(move || rtdb_logkeeper::inspect_retained(&data, &journal_stream, interval)).await
+            let proof = tokio::task::spawn_blocking(move || rtdb_logkeeper::inspect_retained_with_prefix(&data, &journal_stream, interval, prefix.as_ref())).await
                 .map_err(|error| Anomaly::fault("rtdb.multi/audit-log", error.to_string()))??;
             println!("{}", serde_json::json!({"stream": stream, "interval": proof.as_ref().map(|proof| proof.interval),
                 "digest": proof.as_ref().map(|proof| &proof.digest)}));

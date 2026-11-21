@@ -101,6 +101,48 @@ async fn a_stopped_journal_matches_the_online_digest_across_epochs_and_preserves
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_prefix_verifies_the_same_chain_after_trim_and_an_epoch_change() {
+    let mut ensemble = Ensemble::start(3).await;
+    let config = ensemble.config("continued-history");
+    let first = open_writer(config.clone(), 1, CancellationToken::new()).await.unwrap();
+    append(first.as_ref(), "first", 1).await;
+    let second = open_writer(config.clone(), 2, CancellationToken::new()).await.unwrap();
+    append(second.as_ref(), "second", 2).await;
+    append(second.as_ref(), "third", 3).await;
+    let initial = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let report = rtdb_logkeeper::audit_retained(&config).await.unwrap();
+            if report.interval == Some([0, 2]) && report.digests.contains_key(&config.servers[0]) {
+                return report.digests[&config.servers[0]].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    drop((first, second));
+    ensemble.stop(0).await;
+    let directory = ensemble.directories[0].path();
+    let prefix = rtdb_logkeeper::inspect_retained(directory, &config.stream, Some([0, 0])).unwrap().unwrap();
+
+    ensemble.restart(0).await;
+    let node = ensemble.config_of(&[0], &config.stream);
+    rtdb_logkeeper::trim(&node, LogOffset(0)).await.unwrap();
+    ensemble.stop(0).await;
+    let directory = ensemble.directories[0].path();
+    assert!(rtdb_logkeeper::inspect_retained(directory, &config.stream, Some([0, 2])).is_err());
+    let continued = rtdb_logkeeper::inspect_retained_with_prefix(directory, &config.stream, None, Some(&prefix)).unwrap().unwrap();
+    assert_eq!(continued.interval, [0, 2]);
+    assert_eq!(continued.digest, initial);
+    assert!(rtdb_logkeeper::inspect_retained_with_prefix(directory, &config.stream, Some([2, 2]), Some(&prefix)).is_err());
+    let mut wrong_stream = prefix.clone();
+    wrong_stream.stream = "another".into();
+    assert!(rtdb_logkeeper::inspect_retained_with_prefix(directory, &config.stream, None, Some(&wrong_stream)).is_err());
+    let mut wrong_digest = prefix;
+    wrong_digest.digest = "00".repeat(32);
+    let mismatching = rtdb_logkeeper::inspect_retained_with_prefix(directory, &config.stream, None, Some(&wrong_digest)).unwrap().unwrap();
+    assert_ne!(mismatching.digest, initial);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offsets_start_at_zero_and_tails_ranges_and_latest_follow_the_committed_tip() {
     let ensemble = Ensemble::start(3).await;
     let log = open_writer(ensemble.config("contract"), 1, CancellationToken::new()).await.unwrap();

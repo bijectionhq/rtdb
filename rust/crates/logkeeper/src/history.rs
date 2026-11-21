@@ -14,6 +14,17 @@ impl RetainedChain {
         Self(root.finalize())
     }
 
+    pub fn continue_from(encoded: &str) -> Option<Self> {
+        let mut digest = [0; 32];
+        if encoded.len() != 2 * digest.len() || !encoded.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+            return None;
+        }
+        for (index, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[2 * index..2 * index + 2], 16).ok()?;
+        }
+        Some(Self(digest.into()))
+    }
+
     pub fn append(&mut self, entry: &Entry) {
         let mut link = Sha256::new();
         link.update(self.0);

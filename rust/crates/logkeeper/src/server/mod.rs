@@ -5,7 +5,7 @@ mod payload;
 pub(crate) mod state;
 mod store;
 
-pub use journal::{JournalDigest, inspect_retained};
+pub use journal::{JournalDigest, inspect_retained, inspect_retained_with_prefix};
 use crate::local::LocalListener;
 
 use crate::protocol::{Request, RequestBody, Response, ResponseBody, encode_frame, read_sized_frame};

@@ -1191,6 +1191,7 @@ rule AuditRetainedReplicaHistory {
 }
 
 rule VerifyRetainedJournalOffline {
+    -- A saved digest for the same stream can supply the chain through the position immediately before the requested interval.
     when: JournalVerificationRequested(logkeeper, stream, interval, expected_digest)
 
     requires: logkeeper.stopped

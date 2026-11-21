@@ -1008,7 +1008,11 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
    On a stopped logkeeper, `rtdb-multi audit-log --data PATH --stream STREAM --from LSN --through LSN --expect DIGEST` verifies the same interval directly from journal segments.
    The command takes a shared filesystem lock and reads the segments without modifying them.
    A damaged record or a digest mismatch makes the command fail.
-   A durable anchor and offline verification of the discarded prefix remain open.
+   Save the JSON from an earlier `audit-log` run and provide it to a later run with `--prefix-report FILE` to continue the same digest across a trim.
+   The saved report must name the same stream and end immediately before the retained interval being verified.
+   Compare the result with an independently known full-chain digest using `--expect DIGEST`.
+   The supplied report serves as evidence for the discarded prefix.
+   Automatically recording an authoritative prefix before each trim remains open.
 4. A staging cell holds ten million deployments (300 bytes each when parked) under Zipf activity.
 
 **Local parked-density measurement**

@@ -667,10 +667,15 @@ fn read_payload(file: &File, path: &Path, lsn: i64, location: Location) -> Resul
 
 /// A fingerprint of the committed interval read from a stopped logkeeper.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JournalDigest { pub interval: [i64; 2], pub digest: String }
+pub struct JournalDigest { pub stream: String, pub interval: [i64; 2], pub digest: String }
 
 /// Reads a stopped logkeeper's journal without changing its files.
 pub fn inspect_retained(data_dir: &Path, stream: &str, requested: Option<[i64; 2]>) -> Result<Option<JournalDigest>> {
+    inspect_retained_with_prefix(data_dir, stream, requested, None)
+}
+
+/// Extends a retained digest using the committed entries immediately after its interval.
+pub fn inspect_retained_with_prefix(data_dir: &Path, stream: &str, requested: Option<[i64; 2]>, prefix: Option<&JournalDigest>) -> Result<Option<JournalDigest>> {
     let lock_path = data_dir.join("LOCK");
     let lock = File::open(&lock_path).map_err(|error| io_error(&lock_path, error))?;
     FileExt::try_lock_shared(&lock).map_err(|error| io_error(&lock_path, error))?;
@@ -695,12 +700,23 @@ pub fn inspect_retained(data_dir: &Path, stream: &str, requested: Option<[i64; 2
     let [first, last] = match requested {
         Some([first, last]) if first >= retained && last <= through && first <= last => [first, last],
         Some(_) => return Err(Anomaly::incorrect("rtdb.logkeeper/audit-range", format!("The journal's retained committed interval is {retained} through {through}"))),
-        None if retained > through => return Ok(None),
+        None if retained > through && prefix.is_none() => return Ok(None),
+        None if retained > through => return Err(Anomaly::incorrect("rtdb.logkeeper/audit-range", "The journal has no committed suffix to audit")),
         None => [retained, through],
+    };
+    let (chain_first, mut digest) = if let Some(prefix) = prefix {
+        let [prefix_first, prefix_last] = prefix.interval;
+        if prefix.stream != stream || prefix_first < 0 || prefix_first > prefix_last || prefix_last.checked_add(1) != Some(first) {
+            return Err(Anomaly::incorrect("rtdb.logkeeper/audit-prefix", "The prefix must name this stream and end immediately before the audited interval"));
+        }
+        let digest = RetainedChain::continue_from(&prefix.digest)
+            .ok_or_else(|| Anomaly::incorrect("rtdb.logkeeper/audit-prefix", "The prefix digest must be a lowercase SHA-256 value"))?;
+        (prefix_first, digest)
+    } else {
+        (first, RetainedChain::new(stream, first))
     };
     let paths: BTreeMap<_, _> = chain.into_iter().collect();
     let mut file: Option<(u64, File)> = None;
-    let mut digest = RetainedChain::new(stream, first);
     for lsn in first..=last {
         let held = state.entries.get((lsn - retained) as usize).ok_or_else(|| corrupt(&segments, format!("missing committed position {lsn}")))?;
         let Stored::Written(location) = held.payload else { return Err(corrupt(&segments, format!("unfinished committed position {lsn}"))); };
@@ -711,7 +727,7 @@ pub fn inspect_retained(data_dir: &Path, stream: &str, requested: Option<[i64; 2
         let payload = read_payload(&file.as_ref().expect("opened segment").1, path, lsn, location)?;
         digest.append(&Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload });
     }
-    Ok(Some(JournalDigest { interval: [first, last], digest: digest.digest() }))
+    Ok(Some(JournalDigest { stream: stream.to_owned(), interval: [chain_first, last], digest: digest.digest() }))
 }
 
 /// Group commit: whatever has queued while the previous round was syncing goes into the next round together, across every stream.
