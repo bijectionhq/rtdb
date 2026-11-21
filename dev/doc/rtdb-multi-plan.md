@@ -446,6 +446,9 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    A full queue waits for a durable round before accepting more work.
 2. **Logkeeper loglet.**
    A client in `loglet` holding one connection per ensemble member per node, multiplexing every deployment the node holds, with write quorum 2 of 3 across zones.
+   During recovery, the final overwrite acknowledgements also report the durable commit positions.
+   An extra commit round is needed only when those acknowledgements leave fewer than a write quorum at the recovered commit position.
+   A wire-level test drops the old writer's commit markers and checks that the successor confirms the recovered entry on a quorum before it is readable.
 3. **Ensemble assignment.**
    The directory records each loglet's ensemble; the controller balances writers across logkeepers.
    Assignment spreads an ensemble across distinct declared zones where possible and retains surviving members during repair.
@@ -786,6 +789,11 @@ The checkpoint build measured scale-out p99 from 32.0 to 1,992.6 ms and scale-in
 The variant that sent both key opens and storage-region witness I/O to the blocking pool measured scale-out p99 from 52.3 to 120.9 ms and scale-in p99 from 130.3 to 270.8 ms, at 2,140–3,211 writes/s overall.
 The comparisons leave the 30 ms acceptance gate open.
 The implementation offloads only the key opens, which have a regression test for holding a filesystem lock while the runtime services a timer.
+
+One instrumented run of the same workload traced 21 moves.
+Target database attach took 30.9 ms at the median and 197.1 ms at the slowest, while the source park RPC took 8.8 ms at the median and 16.7 ms at the slowest.
+A second instrumented run traced 21 moves and measured local storage-region admission at 13.3 ms median and 103.4 ms maximum, checkpoint recovery at 5.5 ms median, and log opening at 5.1 ms median.
+That run verified all 32,768 updates and measured end-to-end p99 of 50.0 ms during scale-out and 69.3 ms during scale-in.
 
 ### Stage 12: encryption, lineages, forks and deletion
 

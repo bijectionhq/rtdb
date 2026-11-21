@@ -80,16 +80,20 @@ pub struct CountingProxy {
     pub address: SocketAddr,
     pub requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     appends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    commits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    drop_commits: std::sync::Arc<std::sync::atomic::AtomicBool>,
     append_refusal_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     held: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(prost::Message)]
-struct RequestWithAppend {
+struct CountedRequest {
     #[prost(uint64, tag = "1")]
     id: u64,
     #[prost(bytes = "bytes", optional, tag = "2")]
     append: Option<Bytes>,
+    #[prost(bytes = "bytes", optional, tag = "7")]
+    commit: Option<Bytes>,
 }
 
 #[derive(prost::Message)]
@@ -113,9 +117,13 @@ impl CountingProxy {
         let address = listener.local_addr().unwrap();
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let appends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drop_commits = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let append_refusal_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = std::sync::Arc::clone(&requests);
         let append_counter = std::sync::Arc::clone(&appends);
+        let commit_counter = std::sync::Arc::clone(&commits);
+        let dropping_commits = std::sync::Arc::clone(&drop_commits);
         let refusals = std::sync::Arc::clone(&append_refusal_epoch);
         let held = tokio::sync::watch::channel(false).0;
         let holding = held.clone();
@@ -126,6 +134,8 @@ impl CountingProxy {
                 let (mut server_reader, mut server_writer) = server.into_split();
                 let counter = std::sync::Arc::clone(&counter);
                 let append_counter = std::sync::Arc::clone(&append_counter);
+                let commit_counter = std::sync::Arc::clone(&commit_counter);
+                let dropping_commits = std::sync::Arc::clone(&dropping_commits);
                 let refusals = std::sync::Arc::clone(&refusals);
                 let pending_appends = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new()));
                 let append_ids = std::sync::Arc::clone(&pending_appends);
@@ -136,11 +146,15 @@ impl CountingProxy {
                         let mut body = vec![0; length as usize];
                         if client_reader.read_exact(&mut body).await.is_err() { break; }
                         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if let Ok(request) = RequestWithAppend::decode(body.as_slice())
-                            && request.append.is_some()
-                        {
-                            append_ids.lock().insert(request.id);
-                            append_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if let Ok(request) = CountedRequest::decode(body.as_slice()) {
+                            if request.append.is_some() {
+                                append_ids.lock().insert(request.id);
+                                append_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            if request.commit.is_some() {
+                                commit_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if dropping_commits.load(std::sync::atomic::Ordering::SeqCst) { continue; }
+                            }
                         }
                         if holding.wait_for(|held| !held).await.is_err() { break; }
                         if server_writer.write_all(&length.to_be_bytes()).await.is_err() || server_writer.write_all(&body).await.is_err() { break; }
@@ -161,12 +175,14 @@ impl CountingProxy {
                 });
             }
         });
-        Self { address, requests, appends, append_refusal_epoch, held }
+        Self { address, requests, appends, commits, drop_commits, append_refusal_epoch, held }
     }
 
     pub fn hold(&self, held: bool) { self.held.send_replace(held); }
 
     pub fn requests(&self) -> usize { self.requests.load(std::sync::atomic::Ordering::SeqCst) }
     pub fn appends(&self) -> usize { self.appends.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn commits(&self) -> usize { self.commits.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn drop_commits(&self) { self.drop_commits.store(true, std::sync::atomic::Ordering::SeqCst); }
     pub fn append_refusal_epoch(&self) -> u64 { self.append_refusal_epoch.load(std::sync::atomic::Ordering::SeqCst) }
 }

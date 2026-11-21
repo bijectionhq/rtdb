@@ -1062,6 +1062,7 @@ rule RecoverTail {
     --   Records keep the epoch they were written at, so a record's own epoch does not say whether its server holds a later writer's whole history; the synced epoch does.
     -- Its records above the checkpoint are the tail: every committed record is in it (NothingCommittedIsLost).
     -- Records a deposed holder put on a minority were never acknowledged; recovery may keep or drop them, and a client retry with the same idempotency key settles the outcome either way.
+    -- Durable sync acknowledgements can confirm the recovered commit when they already report it on a write quorum.
     when: holding: Holding.state becomes recovering
 
     ensures:

@@ -10,6 +10,58 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_successor_skips_commit_requests_when_the_synced_quorum_has_committed_the_tip() {
+    let ensemble = Ensemble::start(3).await;
+    let config = ensemble.config("committed-tip");
+    let previous = open_writer(config.clone(), 1, CancellationToken::new()).await.unwrap();
+    assert_eq!(append(previous.as_ref(), "first", 1).await.offset, LogOffset(0));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for server in 0..ensemble.addresses.len() {
+            let reader = open_reader(ensemble.config_of(&[server], "committed-tip"), CancellationToken::new()).await.unwrap();
+            while reader.read_range(LogOffset(0), LogOffset(1)).await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }).await.expect("each replica has exposed the committed entry");
+    drop(previous);
+
+    let mut proxies = Vec::new();
+    for address in &ensemble.addresses { proxies.push(CountingProxy::start(*address).await); }
+    let proxied = StreamConfig { servers: proxies.iter().map(|proxy| proxy.address.to_string()).collect(), ..config };
+    let successor = open_writer(proxied, 2, CancellationToken::new()).await.unwrap();
+    assert_eq!(successor.latest().unwrap(), LogOffset(0));
+    assert_eq!(proxies.iter().map(CountingProxy::commits).sum::<usize>(), 0);
+    assert_eq!(append(successor.as_ref(), "second", 2).await.offset, LogOffset(1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_successor_publishes_a_recovered_tip_when_the_previous_commit_requests_were_lost() {
+    let ensemble = Ensemble::start(3).await;
+    let config = ensemble.config("unpublished-tip");
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for address in &ensemble.addresses {
+        before.push(CountingProxy::start(*address).await);
+        after.push(CountingProxy::start(*address).await);
+    }
+    let initial = StreamConfig { servers: before.iter().map(|proxy| proxy.address.to_string()).collect(), ..config.clone() };
+    let previous = open_writer(initial, 1, CancellationToken::new()).await.unwrap();
+    for proxy in &before { proxy.drop_commits(); }
+    assert_eq!(append(previous.as_ref(), "first", 1).await.offset, LogOffset(0));
+    let reader = open_reader(config.clone(), CancellationToken::new()).await.unwrap();
+    assert_eq!(reader.latest().unwrap(), LogOffset(-1));
+
+    let proxied = StreamConfig { servers: after.iter().map(|proxy| proxy.address.to_string()).collect(), ..config.clone() };
+    let successor = open_writer(proxied, 2, CancellationToken::new()).await.unwrap();
+    assert_eq!(successor.latest().unwrap(), LogOffset(0));
+    assert!(after.iter().map(CountingProxy::commits).sum::<usize>() >= 2);
+    let reader = open_reader(config, CancellationToken::new()).await.unwrap();
+    let records = reader.read_range(LogOffset(0), LogOffset(1)).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].payload, Bytes::from_static(b"first"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_writer_confirms_its_leadership_while_idle_and_while_appending() {
     let ensemble = Ensemble::start(3).await;
     let log = open_writer(ensemble.config("confirmed"), 1, CancellationToken::new()).await.unwrap();

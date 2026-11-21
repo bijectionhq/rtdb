@@ -3,7 +3,7 @@
 use super::ensemble::{Ack, Ensemble, MAXIMUM_BATCH_ENTRIES};
 use super::CopyFrom;
 use super::recovery::{Holding, plan_repair, winner};
-use crate::protocol::{Append, Commit, Entry, RequestBody, Sealed};
+use crate::protocol::{Accepted, Append, Commit, Entry, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -127,16 +127,16 @@ pub(crate) async fn seal_quorum(ensemble: &Ensemble, epoch: u64) -> Result<Vec<(
     Ok(replies)
 }
 
-fn deposed_by(epoch: u64, ack: Ack) -> Result<i64> {
+fn deposed_by(epoch: u64, ack: Ack) -> Result<Accepted> {
     match ack {
-        Ack::Accepted(accepted) => Ok(accepted.last_lsn),
+        Ack::Accepted(accepted) => Ok(accepted),
         Ack::Refused(refused) if refused.promised > epoch => Err(Error::Deposed { epoch, promised: refused.promised }),
         Ack::Refused(refused) => Err(Error::Remote { key: String::new(), message: format!("refused at promised epoch {}, last lsn {}", refused.promised, refused.last_lsn) }),
     }
 }
 
 /// Copies `source`'s entries `[from, to]` onto `target` from `from`, marking it synced with its last chunk.
-async fn copy(source: (&Ensemble, usize), target: (&Ensemble, usize), epoch: u64, mut from: i64, to: i64) -> Result<()> {
+async fn copy(source: (&Ensemble, usize), target: (&Ensemble, usize), epoch: u64, mut from: i64, to: i64) -> Result<Accepted> {
     let ((source, source_server), (target, server)) = (source, target);
     loop {
         let entries = if from > to { Vec::new() } else {
@@ -150,8 +150,8 @@ async fn copy(source: (&Ensemble, usize), target: (&Ensemble, usize), epoch: u64
         let last = entries.last().map_or(from - 1, |entry| entry.lsn);
         let complete = last >= to;
         let acked = deposed_by(epoch, target.overwrite(server, epoch, from, entries, complete).await?)?;
-        if complete { return Ok(()); }
-        from = acked + 1;
+        if complete { return Ok(acked); }
+        from = acked.last_lsn + 1;
     }
 }
 
@@ -164,7 +164,7 @@ struct Recovered<'a> {
 }
 
 /// Brings one sealed server to exactly the recovered history from `recovered.start` or below, and syncs it at this epoch.
-async fn sync_server(ensemble: &Ensemble, epoch: u64, server: usize, sealed: &Sealed, recovered: &Recovered<'_>) -> Result<()> {
+async fn sync_server(ensemble: &Ensemble, epoch: u64, server: usize, sealed: &Sealed, recovered: &Recovered<'_>) -> Result<Accepted> {
     let plan = plan_repair(&Holding::from(sealed), &recovered.history).map_err(|message| Error::Remote { key: ensemble.config.stream.clone(), message })?;
     if let Some(through) = plan.trim_through { deposed_by(epoch, ensemble.trim(server, through).await?)?; }
     let holds_nothing = sealed.last_lsn <= sealed.trim_lsn.max(plan.trim_through.unwrap_or(sealed.trim_lsn));
@@ -179,25 +179,29 @@ async fn sync_server(ensemble: &Ensemble, epoch: u64, server: usize, sealed: &Se
 
 /// Syncs every sealed server to the recovered history and commits `commit` on those that took it, which must be a write quorum.
 async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)], recovered: &Recovered<'_>, commit: i64) -> Result<Vec<usize>> {
-    let synced: Vec<(usize, Result<()>)> = replies.iter()
+    let replies: Vec<_> = replies.iter()
         .map(|(server, sealed)| async move { (*server, sync_server(ensemble, epoch, *server, sealed, recovered).await) })
         .collect::<FuturesUnordered<_>>().collect().await;
-    if let Some(promised) = synced.iter().find_map(|(_, result)| match result { Err(Error::Deposed { promised, .. }) => Some(*promised), _ => None }) {
+    if let Some(promised) = replies.iter().find_map(|(_, result)| match result { Err(Error::Deposed { promised, .. }) => Some(*promised), _ => None }) {
         return Err(Error::Deposed { epoch, promised });
     }
-    let synced: Vec<usize> = synced.into_iter().filter_map(|(server, result)| result.ok().map(|_| server)).collect();
+    let synced: Vec<_> = replies.into_iter().filter_map(|(server, result)| result.ok().map(|ack| (server, ack))).collect();
     if synced.len() < ensemble.config.write_quorum {
         return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("recovered onto {} servers, a write quorum is {}", synced.len(), ensemble.config.write_quorum) });
     }
-    let commits: Vec<Result<Ack>> = synced.iter().map(|&server| ensemble.commit(server, epoch, commit)).collect::<FuturesUnordered<_>>().collect().await;
-    let committed = commits.into_iter().flatten().try_fold(0, |count, ack| match ack {
-        Ack::Accepted(accepted) => Ok(count + usize::from(accepted.commit_lsn >= commit)),
-        refused => deposed_by(epoch, refused).map(|_| count),
-    })?;
-    if committed < ensemble.config.write_quorum {
-        return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("confirmed commit on {committed} servers, a write quorum is {}", ensemble.config.write_quorum) });
+    let previously_committed = synced.iter().filter(|(_, ack)| ack.commit_lsn >= commit).count();
+    if previously_committed < ensemble.config.write_quorum {
+        let commits: Vec<Result<Ack>> = synced.iter().filter(|(_, ack)| ack.commit_lsn < commit)
+            .map(|(server, _)| ensemble.commit(*server, epoch, commit)).collect::<FuturesUnordered<_>>().collect().await;
+        let committed = commits.into_iter().flatten().try_fold(previously_committed, |count, ack| match ack {
+            Ack::Accepted(accepted) => Ok(count + usize::from(accepted.commit_lsn >= commit)),
+            refused => deposed_by(epoch, refused).map(|_| count),
+        })?;
+        if committed < ensemble.config.write_quorum {
+            return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("confirmed commit on {committed} servers, a write quorum is {}", ensemble.config.write_quorum) });
+        }
     }
-    Ok(synced)
+    Ok(synced.into_iter().map(|(server, _)| server).collect())
 }
 
 impl Writer {
@@ -440,7 +444,7 @@ impl Writer {
             }
             match chunk {
                 Some(entries) if entries.is_empty() => continue,
-                Some(entries) => from = deposed_by(epoch, ensemble.overwrite(server, epoch, from, entries, false).await?)? + 1,
+                Some(entries) => from = deposed_by(epoch, ensemble.overwrite(server, epoch, from, entries, false).await?)?.last_lsn + 1,
                 None if empty_fetches < 50 => { empty_fetches += 1; tokio::time::sleep(Duration::from_millis(20)).await; }
                 None => return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("no live server holds lsn {from} to repair from") }),
             }
