@@ -34,7 +34,8 @@ It emits both retractions and insertions when a key or interval moves.
 Payload-only changes with the same projected valid-time spans share the previous root.
 The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
 The point read applies later erasures to the selected root.
-Repeated head reads reuse an admitted live root and apply only the unconsumed tail of the same open block.
+Each read or maintenance cycle owns its decoded pages and its live replay state.
+Ordered-index inputs bypass the persistent node cache, and replay reads its source bytes within the cycle's memory budget.
 A missing checkpoint, missing source coverage or memory admission failure uses the normal SQL executor.
 
 == Maintenance

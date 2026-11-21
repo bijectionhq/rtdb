@@ -89,6 +89,9 @@ pub trait ObjectStore: Send + Sync {
     /// A missing key returns `Error::MissingObject`.
     async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> { self.head(key).await }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes>;
+    /// Reads from the current backing provider without creating a durable cache copy.
+    /// Wrappers that cache reads must forward this request to their backing store.
+    async fn get_fresh(&self, key: &ObjectKey) -> Result<Bytes> { self.get(key).await }
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
     /// Retains the allocation charge during the read and with the returned bytes.

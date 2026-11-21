@@ -19,7 +19,6 @@ pg-source = ["dep:rtdb-pg-source"]
 all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source"]
 
 [dependencies]
-tempfile.workspace = true
 sha2.workspace = true
 stacker.workspace = true
 rtdb-types.workspace = true
@@ -58,6 +57,7 @@ tokio-util.workspace = true
 [dev-dependencies]
 rtdb-text.workspace = true
 tantivy.workspace = true
+tempfile.workspace = true
 
 [[example]]
 name = "fts_architecture_bench"
