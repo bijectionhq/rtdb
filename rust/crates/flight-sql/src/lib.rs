@@ -13,5 +13,5 @@ mod state;
 mod ticket;
 mod wire;
 
-pub use config::FlightConfig;
+pub use config::{FORWARDED_PEER_HEADER, FlightConfig, FlightPeerVerifier};
 pub use server::{ServerDriver, ServerHandle, ServerStatus};

@@ -46,11 +46,17 @@ pub struct ReplicationConfig {
     pub pending_block_records: usize,
     pub pending_block_bytes: usize,
     pub election_seed: u64,
+    /// Whether an idle leader appends a no-op every `assertion_interval` so that followers can tell a quiet log from a leaderless one.
+    /// A placed holder needs none: only it may claim, and its liveness is its member lease.
+    pub idle_heartbeat: bool,
+    /// How long a node that may lead waits on an empty replica read before claiming, in place of the randomized election wait.
+    pub claim_wait: Option<Duration>,
 }
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: 100_000, assertion_interval: Duration::from_millis(100), flush_timeout: Duration::from_secs(4 * 60 * 60),
-            pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64 }
+            pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64,
+            idle_heartbeat: true, claim_wait: None }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,6 +276,7 @@ pub struct ReplicationDriver {
     restart: Option<Arc<DriverRestart>>,
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
+    compaction_replay_cutoff: Option<ReplicaPosition>,
     historical_confirmations: VecDeque<RecoveredBlockConfirmation>,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
@@ -309,7 +316,7 @@ impl ReplicationDriver {
             recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
         } else { None };
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, historical_confirmations: VecDeque::new(), fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, historical_confirmations: VecDeque::new(), fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -497,7 +504,11 @@ impl ReplicationDriver {
             if let Some(tail) = self.replica_tail.take() {
                 self.config.election_seed = self.config.election_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let factor = 5 + self.config.election_seed % 6;
-                self.replica_poll = Some(start_poll(tail, self.config.assertion_interval.saturating_mul(factor as u32)));
+                let timeout = match self.config.claim_wait {
+                    Some(wait) if self.config.may_lead && self.leader.is_none() => wait,
+                    _ => self.config.assertion_interval.saturating_mul(factor as u32),
+                };
+                self.replica_poll = Some(start_poll(tail, timeout));
             }
         }
         if let Some(leader) = &mut self.leader {
@@ -556,7 +567,7 @@ impl ReplicationDriver {
         let recovery_write = self.next_recovery_write().await?;
         let produce_inherited = recovery_write.is_none() && self.pending_block.is_some();
         let confirmed = recovery_write.is_none() && !produce_inherited;
-        let job = pump.run(recovery_write.clone());
+        let job = pump.with_heartbeat(self.config.idle_heartbeat).run(recovery_write.clone());
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed, recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
             pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
@@ -800,7 +811,9 @@ impl ReplicationDriver {
                     }
                 }
                 ReplicaBody::TriesAdded(message) => {
-                    if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
+                    if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff)
+                        && message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0
+                    {
                         self.partition.add_tries(&additions(&message.tries)?, record.metadata.timestamp)?;
                     }
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
@@ -837,12 +850,14 @@ impl ReplicationDriver {
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
                 ReplicaBody::NoOp(message) => { self.progress.applied(message.src_msg_id.map(SourcePosition), None, None)?; self.complete_control(&record); }
                 ReplicaBody::TriesDeleted(message) => {
-                    let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
-                    let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
-                    let cached = cached_objects(&self.partition.value(), &table, &keys);
-                    self.partition.delete_tries(&BTreeMap::from([(table, keys)]));
-                    // Every node holds its own cached copies, and the leader's delete reached only the remote store.
-                    for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
+                    if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff) {
+                        let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
+                        let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
+                        let cached = cached_objects(&self.partition.value(), &table, &keys);
+                        self.partition.delete_tries(&BTreeMap::from([(table, keys)]));
+                        // Every node holds its own cached copies, and the leader's delete reached only the remote store.
+                        for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
+                    }
                     self.complete_control(&record);
                 }
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("Unresolved oversized body reached apply")),

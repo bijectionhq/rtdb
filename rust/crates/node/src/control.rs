@@ -38,7 +38,7 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
     let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
     let fields = match name.as_str() {
         "clock_time" => vec![(name.as_str(), instant)],
-        "snapshot_token" | "timezone" | "transaction_isolation" => vec![(name.as_str(), text)],
+        "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_source_barrier" | "rtdb_hosted_source_barrier" => vec![(name.as_str(), text)],
         "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
         "latest_submitted_tx" => vec![("tx_id", integer), ("system_time", instant.maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.maybe())],
         "latest_completed_txs" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("tx_id", integer), ("system_time", instant.maybe())],
@@ -52,9 +52,15 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
 impl NativeSession {
     /// `cancellation` must descend from `state().cancellation()`; dropping preparation never pins a bare BEGIN.
     pub async fn prepare_context(&mut self, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+        self.prepare_context_with_timezone(None, cancellation).await
+    }
+
+    /// Prepares on the current catalogue with the timezone captured by a gateway before a move.
+    pub async fn prepare_context_with_timezone(&mut self, timezone: Option<&str>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
-            let basis = self.state.prepare_basis().await?;
-            Ok(self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            let mut basis = self.state.prepare_basis().await?;
+            if let Some(timezone) = timezone { basis.timezone = rtdb_expr::normalize_timezone(timezone)?; }
+            Ok(self.service.query_context(self.state.database(), &basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -63,7 +69,7 @@ impl NativeSession {
     pub async fn prepare_context_for(&mut self, database: &str, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
             let basis = self.state.prepare_basis().await?;
-            Ok(self.service.node.query_context(database, &basis, self.service.identity.as_ref(), cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.service.query_context(database, &basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -72,7 +78,7 @@ impl NativeSession {
     pub async fn query_context_for(&mut self, database: &str, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
             let basis = self.state.read_basis().await?;
-            Ok(self.service.node.query_context(database, &basis, self.service.identity.as_ref(), cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.service.query_context(database, &basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -81,7 +87,7 @@ impl NativeSession {
     pub async fn query_context_at(&mut self, basis: &crate::QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
             self.state.prepare_basis().await?;
-            Ok(self.service.node.query_context(self.state.database(), basis, self.service.identity.as_ref(), cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.service.query_context(self.state.database(), basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -90,7 +96,7 @@ impl NativeSession {
     pub async fn query_context_with(&mut self, cancellation: &CancellationToken, checked: bool) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
             let basis = if checked { self.state.read_basis().await? } else { self.state.unchecked_read_basis().await? };
-            Ok(self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.service.query_context(self.state.database(), &basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -149,7 +155,7 @@ impl NativeSession {
         };
         let catalog_context = if needs_catalog {
             let basis = self.state.inspection_basis()?;
-            Some(self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), cancellation).await?)
+            Some(self.service.query_context(self.state.database(), &basis, cancellation).await?)
         } else { None };
         let catalog = catalog_context.as_ref().map(|context| &context.catalog as &dyn rtdb_expr::PgCatalogLookup);
         match statement {
@@ -203,7 +209,19 @@ impl NativeSession {
                 if *target == DiscardTarget::All { self.state.reset()?; }
                 Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }, allocation))
             }
-            ControlStatement::Show { name } => self.show(name, statement.requires_read_transaction(), cancellation).await.map(ControlResult::Rows),
+            ControlStatement::Show { name } => {
+                let hosted_history = if matches!(name.as_str(), "rtdb_source_barrier" | "rtdb_hosted_source_barrier") {
+                    if self.state.status() != TransactionStatus::Idle && !options.implicit_transaction {
+                        return Err(Anomaly::incorrect("rtdb/source-barrier-in-transaction", "Complete the transaction before awaiting a source barrier"));
+                    }
+                    self.service.await_durable_source(
+                        self.state.database(), name == "rtdb_hosted_source_barrier", cancellation,
+                    ).await?
+                } else {
+                    None
+                };
+                self.show(name, statement.requires_read_transaction(), hosted_history, cancellation).await.map(ControlResult::Rows)
+            },
             ControlStatement::Prepare { name, source } => {
                 allocation.reserve(size(name.len(), source.len())?)?;
                 Ok(ControlResult::Prepare { name: name.clone(), source: source.clone(), allocation })
@@ -253,9 +271,9 @@ impl NativeSession {
         Ok(())
     }
 
-    async fn show(&mut self, name: &str, checked: bool, cancellation: &CancellationToken) -> Result<QueryCursor> {
+    async fn show(&mut self, name: &str, checked: bool, hosted_history: Option<String>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let basis = if checked { self.state.read_basis().await? } else { self.state.inspection_basis()? };
-        let context = self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), cancellation).await?
+        let context = self.service.query_context(self.state.database(), &basis, cancellation).await?
             .with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None);
         let mut bound = 8192usize;
         if let Some(value) = self.state.parameter(name) { bound = size(bound, value.len().checked_mul(4).ok_or_else(|| invalid("SHOW allocation size overflow"))?)?; }
@@ -265,8 +283,8 @@ impl NativeSession {
         let error = match (name, self.state.last_submitted()) { ("latest_submitted_tx", Some(LastSubmittedTx::Executed(tx))) => tx.encoded_error()?, _ => None };
         if let Some(error) = &error { bound = size(bound, error.as_ref().len().checked_mul(4).ok_or_else(|| invalid("SHOW error size overflow"))?)?; }
         let databases = if ["latest_completed_txs", "latest_submitted_msg_ids", "latest_processed_msg_ids"].contains(&name) {
-            self.service.node.await_basis(self.state.effective_await_token().map(decode_tx_basis).transpose()?, Duration::from_secs(60), cancellation).await?;
-            self.service.node.catalog().open_databases()
+            crate::SessionService::await_basis(self.service.as_ref(), self.state.effective_await_token().map(decode_tx_basis).transpose()?, Duration::from_secs(60), cancellation).await?;
+            self.service.visible_databases()?
         } else { Default::default() };
         for name in databases.keys() { bound = size(bound, size(8192, name.len().checked_mul(4).ok_or_else(|| invalid("SHOW database name size overflow"))?)?)?; }
         let reservation = context.memory.reserve(bound)?;
@@ -281,6 +299,11 @@ impl NativeSession {
                  vec![vec![Value::Timestamp { value: basis.current_time.as_micros()?.0, unit: TimeUnit::Microsecond, timezone: zone }]])
             }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
+            "rtdb_ordered_system_time" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
+            "rtdb_hosted_source_barrier" => {
+                let history = hosted_history.ok_or_else(|| Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source barrier has no history"))?;
+                (vec![(name, text.clone())], vec![vec![Value::Utf8(history)]])
+            },
             "transaction_isolation" => (vec![(name, text.clone())], vec![vec![Value::Utf8("read committed".into())]]),
             "await_token" => (vec![(name, text.clone().maybe())], vec![vec![self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]]),
             "standard_conforming_strings" => (vec![(name, LogicalType::Scalar(ScalarType::Bool).maybe())], vec![vec![Value::Bool(self.state.parameter(name).is_some_and(|value| ["on", "true", "yes", "1"].contains(&value.to_ascii_lowercase().as_str())))]]),

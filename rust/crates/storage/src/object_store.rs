@@ -89,8 +89,8 @@ pub trait ObjectStore: Send + Sync {
     /// A missing key returns `Error::MissingObject`.
     async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> { self.head(key).await }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes>;
-    /// Reads from the current backing provider without creating a durable cache copy.
-    /// Wrappers that cache reads must forward this request to their backing store.
+    /// Reads without creating or trusting a node-local durable cache copy.
+    /// Store wrappers must forward this request across any cache boundary.
     async fn get_fresh(&self, key: &ObjectKey) -> Result<Bytes> { self.get(key).await }
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
@@ -251,7 +251,7 @@ fn open_object(path: &Path, key: &ObjectKey) -> Result<File> {
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path).and_then(|file| crate::sync_file(&file)).map_err(|error| Error::io(path, error))
+    crate::sync_directory(path).map_err(|error| Error::io(path, error))
 }
 
 fn sync_parents(path: &Path, root: &Path) -> Result<()> {
@@ -343,13 +343,7 @@ impl ObjectStore for LocalStore {
                 }
                 Err(error) => return Err(Error::io(&path, error.error)),
             }
-            let mut current = parent;
-            loop {
-                sync_directory(current)?;
-                if current == root.as_path() { break; }
-                current = current.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
-            }
-            Ok(())
+            sync_parents(&path, &root)
         }).await
     }
 
@@ -404,11 +398,24 @@ impl ObjectStore for LocalStore {
 
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         let path = self.path(key);
+        let root = self.root.clone();
         self.io.run(move || {
             match fs::remove_file(&path) {
-                Ok(()) => sync_directory(path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(Error::io(&path, error)),
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(Error::io(&path, error)),
+            }
+            // A retry can observe an unlink whose parent was not flushed.
+            // If a containing directory is also absent, confirm its removal.
+            let mut parent = path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
+            loop {
+                match crate::sync_directory(parent) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && parent != root.as_path() => {
+                        parent = parent.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
+                    }
+                    Err(error) => return Err(Error::io(parent, error)),
+                }
             }
         }).await
     }

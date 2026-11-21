@@ -62,12 +62,14 @@ impl AppenderHandle {
 pub(crate) struct ReplicaAppender {
     logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, sequence: TermSequence,
     queue: mpsc::UnboundedReceiver<AppendRequest>, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock,
+    heartbeat: bool,
 }
 impl ReplicaAppender {
     pub fn new(logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock) -> (AppenderHandle, Self) {
         let (sender, queue) = mpsc::unbounded_channel();
-        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock })
+        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true })
     }
+    pub fn with_heartbeat(mut self, heartbeat: bool) -> Self { self.heartbeat = heartbeat; self }
     pub async fn run(mut self, mut first: Option<Arc<PendingWrite>>) -> Result<()> {
         let mut timer = tokio::time::interval(self.assertion_interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -82,7 +84,7 @@ impl ReplicaAppender {
                 receipt = receipts.next(), if !receipts.is_empty() => {
                     if let Some(Err(error)) = receipt { break Err(error); }
                 },
-                _ = timer.tick(), if !start_with_confirmation => {
+                _ = timer.tick(), if self.heartbeat && !start_with_confirmation => {
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };

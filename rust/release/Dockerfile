@@ -1,6 +1,6 @@
 ARG RUST_IMAGE
 ARG RUNTIME_IMAGE
-FROM ${RUST_IMAGE} AS build
+FROM ${RUST_IMAGE} AS build-environment
 
 ARG DEBIAN_SNAPSHOT
 RUN . /etc/os-release && test "$VERSION_CODENAME" = bookworm \
@@ -18,6 +18,12 @@ ARG SOURCE_DATE_EPOCH
 ENV RTDB_REVISION=${RTDB_REVISION}
 ENV RTDB_TZDB_PATH=/source/release-tzdb.dat
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+
+FROM build-environment AS multi-build
+RUN test "$(rustc --version | cut -d ' ' -f 2)" = 1.94.1 \
+    && cargo build --manifest-path rust/Cargo.toml --release --locked -p rtdb-multi --features dynamodb
+
+FROM build-environment AS build
 RUN test "$(rustc --version | cut -d ' ' -f 2)" = 1.94.1 \
     && if [ -n "$RTDB_FEATURES" ]; then \
          cargo build --manifest-path rust/Cargo.toml --release --locked --no-default-features -p rtdb-server -p rtdb-config -p rtdb-ffi --features "$RTDB_FEATURES"; \
@@ -25,7 +31,7 @@ RUN test "$(rustc --version | cut -d ' ' -f 2)" = 1.94.1 \
          cargo build --manifest-path rust/Cargo.toml --release --locked --no-default-features -p rtdb-server -p rtdb-config -p rtdb-ffi; \
        fi
 
-FROM ${RUNTIME_IMAGE} AS runtime
+FROM ${RUNTIME_IMAGE} AS runtime-environment
 ARG DEBIAN_SNAPSHOT
 RUN . /etc/os-release && test "$VERSION_CODENAME" = bookworm \
     && rm -f /etc/apt/sources.list.d/debian.sources \
@@ -48,21 +54,33 @@ LABEL org.opencontainers.image.source=https://github.com/bijectionhq/rtdb \
       io.rtdb.source-dirty=false \
       io.rtdb.test-hooks=false
 
+COPY LICENSE /usr/share/licenses/rtdb/LICENSE
+COPY rust/crates/types/data/tzdb/LICENSE rust/crates/types/data/tzdb/ASSEMBLY_EXCEPTION rust/crates/types/data/tzdb/ADDITIONAL_LICENSE_INFO /usr/share/licenses/rtdb/tzdb/
+COPY release-input.json /usr/share/rtdb/build.json
+COPY release-tzdb.dat /usr/share/rtdb/tzdb.dat
+
+WORKDIR /var/lib/rtdb
+ENV TZ=UTC
+STOPSIGNAL SIGTERM
+
+FROM runtime-environment AS multi
+LABEL io.rtdb.hosted-protocol=13
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y curl jq netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=multi-build /source/rust/target/release/rtdb-multi /usr/local/bin/rtdb-multi
+COPY --chmod=0555 rust/release/multi-entrypoint.sh /usr/local/bin/rtdb-multi-entrypoint
+USER rtdb
+ENTRYPOINT ["/usr/local/bin/rtdb-multi-entrypoint"]
+
+FROM runtime-environment AS runtime
 COPY --from=build /source/rust/target/release/rtdb /usr/local/bin/rtdb
 COPY --from=build /source/rust/target/release/rtdb-config /usr/local/bin/rtdb-config
 COPY --from=build /source/rust/target/release/librtdb_ffi.so /usr/local/lib/librtdb_ffi.so
 COPY --from=build /source/rust/target/release/librtdb_ffi.a /usr/local/lib/librtdb_ffi.a
 COPY rust/crates/ffi/include/rtdb.h /usr/local/include/rtdb.h
-COPY LICENSE /usr/share/licenses/rtdb/LICENSE
-COPY rust/crates/types/data/tzdb/LICENSE rust/crates/types/data/tzdb/ASSEMBLY_EXCEPTION rust/crates/types/data/tzdb/ADDITIONAL_LICENSE_INFO /usr/share/licenses/rtdb/tzdb/
 COPY rust/release/default.yaml /etc/rtdb/config.yaml
-COPY release-input.json /usr/share/rtdb/build.json
-COPY release-tzdb.dat /usr/share/rtdb/tzdb.dat
-
 USER rtdb
-WORKDIR /var/lib/rtdb
-ENV TZ=UTC
 EXPOSE 5432 3000 8080
-STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/rtdb"]
 CMD ["node", "--file", "/etc/rtdb/config.yaml"]

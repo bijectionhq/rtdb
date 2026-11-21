@@ -3,6 +3,7 @@ mod credential;
 use std::sync::Arc;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use rtdb_format::generated::xtdb::gcp::proto::GcsObjectStoreConfig;
+use rtdb_format::keys::StorageRoot;
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -14,13 +15,8 @@ impl GcsConfig {
     pub fn new(project_id: impl Into<String>, bucket: impl Into<String>) -> Self { Self { project_id: project_id.into(), bucket: bucket.into(), prefix: None } }
 
     pub fn object_prefix(&self, storage_root: &ObjectKey) -> Result<ObjectKey> {
-        match &self.prefix {
-            Some(prefix) if !prefix.is_empty() => {
-                let prefix = ObjectKey::new(prefix.clone()).map_err(Anomaly::from)?;
-                ObjectKey::new(format!("{prefix}/{storage_root}")).map_err(Anomaly::from)
-            }
-            _ => Ok(storage_root.clone()),
-        }
+        if let Some(prefix) = self.prefix.as_deref().filter(|prefix| !prefix.is_empty()) { ObjectKey::new(prefix.to_owned()).map_err(Anomaly::from)?; }
+        ObjectKey::new(StorageRoot::under_prefix(self.prefix.as_deref(), storage_root.as_str())).map_err(Anomaly::from)
     }
 
     /// `storage_root` is appended to the configured prefix and must already contain the storage version and epoch.

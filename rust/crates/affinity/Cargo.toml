@@ -1,0 +1,19 @@
+[package]
+name = "rtdb-affinity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Ported verbatim from Bijection's `crates/affinity`, which carries this licence.
+license = "LicenseRef-FSL-1.1-Apache-2.0"
+publish.workspace = true
+description = "Cache-affinity routing policy: the rendezvous score, the preference order, the warm set and the bounded selection walk"
+
+[lib]
+doctest = false
+
+[dependencies]
+sha2.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

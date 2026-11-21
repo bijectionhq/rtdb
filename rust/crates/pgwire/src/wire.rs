@@ -7,6 +7,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{network, protocol};
 
 pub(crate) const STARTUP_LIMIT: usize = 10_000;
+/// ErrorResponse field carrying a placement interruption code in every detail format.
+pub const ANOMALY_CODE_FIELD: u8 = b'y';
 
 pub(crate) struct Frame { pub tag: u8, pub body: Vec<u8>, pub charge: Arc<MemoryReservation> }
 pub(crate) struct Reader<R> { input: R, memory: Arc<MemoryBudget> }
@@ -16,7 +18,7 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         let mut tag = [0u8; 1]; if self.input.read(&mut tag).await.map_err(network)? == 0 { return Ok(None); }
         self.body(tag[0], limit).await.map(Some)
     }
-    pub async fn startup(&mut self) -> Result<Frame> { self.body(0, STARTUP_LIMIT).await }
+    pub async fn startup(&mut self, extra: usize) -> Result<Frame> { self.body(0, STARTUP_LIMIT + extra).await }
     async fn body(&mut self, tag: u8, limit: usize) -> Result<Frame> {
         let length = self.input.read_i32().await.map_err(network)?;
         let length = usize::try_from(length).ok().and_then(|n| n.checked_sub(4)).filter(|n| *n <= limit).ok_or_else(|| protocol("Invalid message length"))?;
@@ -42,6 +44,39 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
     pub async fn string(&mut self, tag: u8, text: &str) -> Result<()> { self.record(tag, text.len() + 1, |bytes| cstring(bytes, text)).await }
     pub async fn auth(&mut self, method: i32) -> Result<()> { self.send(b'R', &method.to_be_bytes()).await?; self.flush().await }
     pub async fn parameter(&mut self, key: &str, value: &str) -> Result<()> { self.record(b'S', key.len() + value.len() + 2, |bytes| { cstring(bytes, key)?; cstring(bytes, value) }).await?; self.flush().await }
+    pub async fn gateway_await_token(&mut self, token: Option<&str>) -> Result<()> {
+        self.record(crate::GATEWAY_SESSION_STATE_TAG, 1 + token.map_or(0, str::len), |body| {
+            body.push(u8::from(token.is_some()));
+            if let Some(token) = token { body.extend_from_slice(token.as_bytes()); }
+            Ok(())
+        }).await
+    }
+    pub async fn gateway_settings(&mut self, encoded: &[u8]) -> Result<()> {
+        self.record(crate::GATEWAY_SESSION_STATE_TAG, 1 + encoded.len(), |body| {
+            body.push(crate::GATEWAY_SETTINGS_KIND);
+            body.extend_from_slice(encoded);
+            Ok(())
+        }).await
+    }
+    pub async fn gateway_sql_prepare(&mut self, name: &str, source: &str, search_path: &str, timezone: &str) -> Result<()> {
+        let length = [name, source, search_path, timezone].into_iter().try_fold(1usize, |length, field| length.checked_add(field.len())?.checked_add(1))
+            .ok_or_else(|| protocol("Gateway PREPARE state is too large"))?;
+        self.record(crate::GATEWAY_SESSION_STATE_TAG, length, |body| {
+            body.push(crate::GATEWAY_SQL_PREPARE_KIND);
+            for field in [name, source, search_path, timezone] { cstring(body, field)?; }
+            Ok(())
+        }).await
+    }
+    pub async fn gateway_named_parse(&mut self, name: &str, search_path: &str, timezone: &str, parse: &[u8]) -> Result<()> {
+        let length = [name, search_path, timezone].into_iter().try_fold(1usize, |length, field| length.checked_add(field.len())?.checked_add(1))
+            .and_then(|length| length.checked_add(parse.len())).ok_or_else(|| protocol("Gateway Parse state is too large"))?;
+        self.record(crate::GATEWAY_SESSION_STATE_TAG, length, |body| {
+            body.push(crate::GATEWAY_NAMED_PARSE_KIND);
+            for field in [name, search_path, timezone] { cstring(body, field)?; }
+            body.extend_from_slice(parse);
+            Ok(())
+        }).await
+    }
     pub async fn ready(&mut self, status: u8) -> Result<()> { self.send(b'Z', &[status]).await?; self.flush().await }
     pub async fn backend_key(&mut self, process: i32) -> Result<()> { self.record(b'K', 8, |bytes| { bytes.extend_from_slice(&process.to_be_bytes()); bytes.extend_from_slice(&0i32.to_be_bytes()); Ok(()) }).await }
     pub async fn parameters(&mut self, oids: &[i32]) -> Result<()> { self.record(b't', 2 + oids.len() * 4, |bytes| { count(bytes, oids.len())?; for oid in oids { bytes.extend_from_slice(&(if *oid == 0 { 25 } else { *oid }).to_be_bytes()); } Ok(()) }).await }
@@ -71,6 +106,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         let severity = if fatal { "FATAL" } else { "ERROR" };
         let mut fields = vec![(b'S', severity), (b'V', severity), (b'C', crate::error::state(error)), (b'M', error.message.as_deref().unwrap_or(""))];
         if let Some(detail) = &detail { fields.push((b'D', detail)); }
+        if matches!(error.code.as_str(), rtdb_node::NOT_HELD | "xtdb/ingestion-stopped") { fields.push((ANOMALY_CODE_FIELD, &error.code)); }
         if matches!(error.code.as_str(), "xtdb/prepared-query-out-of-date" | "prepared-query-out-of-date") { fields.push((b'R', "RevalidateCachedQuery")); }
         self.fields(b'E', &fields).await
     }
@@ -118,9 +154,24 @@ mod tests {
                 loop { let tag = input.byte().unwrap(); if tag == 0 { break; } fields.insert(tag, input.string().unwrap()); }
                 input.end().unwrap();
                 assert_eq!(fields[&b'M'], message.as_deref().unwrap_or(""));
+                assert!(!fields.contains_key(&ANOMALY_CODE_FIELD));
                 assert_eq!(fields[&b'D'].as_bytes(), rtdb_pg_codec::encode_error(&error, fallback).unwrap());
                 assert_eq!(error.message, message);
                 assert_eq!(memory.used_bytes(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_error_codes_are_independent_of_the_detail_format() {
+        for code in [rtdb_node::NOT_HELD, "xtdb/ingestion-stopped"] {
+            let error = Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, code, "holder stopped");
+            for fallback in [PgType::Json, PgType::JsonLd, PgType::Transit] {
+                let mut writer = Writer::new(Vec::new(), MemoryBudget::new(1 << 20));
+                writer.error(&error, fallback, false).await.unwrap();
+                let bytes = writer.into_inner();
+                assert!(bytes[5..].split(|byte| *byte == 0)
+                    .any(|field| field.strip_prefix(&[ANOMALY_CODE_FIELD]) == Some(code.as_bytes())));
             }
         }
     }
@@ -131,7 +182,7 @@ mod tests {
         for length in [-1i32, 0, 3, 10_005] {
             let bytes = length.to_be_bytes();
             let mut reader = Reader::new(bytes.as_slice(), Arc::clone(&memory));
-            assert!(reader.startup().await.is_err()); assert_eq!(memory.used_bytes(), 0);
+            assert!(reader.startup(0).await.is_err()); assert_eq!(memory.used_bytes(), 0);
         }
     }
 

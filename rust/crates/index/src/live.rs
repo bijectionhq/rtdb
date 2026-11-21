@@ -265,13 +265,15 @@ impl LiveTable {
             if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
             let schema = previous.arrow().schema();
             let budget = Arc::clone(previous.owned.reservation().budget());
-            let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_add(4096))
+            // A concatenation's buffers can outgrow its inputs' (variable-width columns round and grow theirs), so it is reserved for twice them and shrunk to what it holds.
+            let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_mul(2)).and_then(|bytes| bytes.checked_add(4096))
                 .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
             let mut reservation = budget.reserve(bound)?;
             let merged = arrow_select::concat::concat_batches(&schema, [previous.arrow(), last.arrow()]).map_err(invalid)?;
             // Concatenating a dense union sizes every leg for all of its rows, so the merge can outgrow its inputs.
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
             lease.grow_to(lease.bytes().max(merged.get_array_memory_size()))?;
+            lease.shrink_to(merged.get_array_memory_size())?;
             let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
             let start = *start;
             self.chunks.truncate(self.chunks.len() - 2);

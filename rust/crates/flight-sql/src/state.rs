@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
+use std::{collections::BTreeMap, sync::{Arc, Mutex, Weak, atomic::{AtomicBool, Ordering}}};
 use bytes::Bytes;
 use rtdb_auth::Principal;
 use rtdb_columnar::MemoryReservation;
-use rtdb_node::{NativeSession, Node};
+use rtdb_node::{Database, NativeSession, Node};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use uuid::Uuid;
@@ -10,6 +10,19 @@ use crate::{error::status, lease::Leased};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Owner { Anonymous, Authenticated(Uuid) }
+pub(crate) struct ResourceOwner {
+    principal: Owner,
+    placement: Option<Weak<Database>>,
+}
+impl ResourceOwner {
+    fn matches(&self, principal: Owner, placement: Option<&Weak<Database>>) -> bool {
+        self.principal == principal && match (&self.placement, placement) {
+            (Some(expected), Some(actual)) => expected.ptr_eq(actual),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
 pub(crate) struct Caller { pub owner: Owner, pub principal: Arc<Principal>, pub mac: Option<[u8; 32]> }
 pub(crate) struct ConnectionResource { pub native: tokio::sync::Mutex<NativeSession>, pub cancellation: CancellationToken, closed: AtomicBool }
 impl ConnectionResource {
@@ -25,36 +38,78 @@ impl Leased for ConnectionResource {
 impl Drop for ConnectionResource { fn drop(&mut self) { self.native.get_mut().state_mut().close(); } }
 struct CatalogSelection { name: String, _reservation: Arc<MemoryReservation> }
 enum SessionState { Open { connections: BTreeMap<String, (Arc<ConnectionResource>, Arc<MemoryReservation>)>, catalog: Option<CatalogSelection> }, Closed }
-pub(crate) struct Session { pub id: String, pub caller: Arc<Caller>, state: Mutex<SessionState>, _reservation: Arc<MemoryReservation> }
+struct Placement { name: String, attachment: Weak<Database> }
+
+pub(crate) struct Session {
+    pub id: String,
+    pub caller: Arc<Caller>,
+    placement: Option<Placement>,
+    state: Mutex<SessionState>,
+    _reservation: Arc<MemoryReservation>,
+}
 impl Session {
-    pub fn new(id: String, caller: Arc<Caller>, reservation: Arc<MemoryReservation>) -> Self { Self { id, caller, state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }), _reservation: reservation } }
+    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, reservation: Arc<MemoryReservation>) -> Self {
+        let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
+        Self { id, caller, placement, state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }), _reservation: reservation }
+    }
     pub fn closed(&self) -> bool { matches!(*self.state.lock().expect("session lock"), SessionState::Closed) }
-    pub fn database(&self, header: Option<&str>) -> Result<String, Status> {
-        match &*self.state.lock().expect("session lock") { SessionState::Open { catalog, .. } => Ok(header.or_else(|| catalog.as_ref().map(|selection| selection.name.as_str())).unwrap_or("xtdb").into()), SessionState::Closed => Err(Status::not_found("session closed")) }
+    pub fn placed_database(&self) -> Option<&str> { self.placement.as_ref().map(|placement| placement.name.as_str()) }
+    pub fn owner(&self) -> ResourceOwner {
+        ResourceOwner { principal: self.caller.owner, placement: self.placement.as_ref().map(|placement| placement.attachment.clone()) }
+    }
+    pub fn owns(&self, owner: &ResourceOwner) -> bool {
+        owner.matches(self.caller.owner, self.placement.as_ref().map(|placement| &placement.attachment))
+    }
+    fn require_database(&self, database: &str, node: &Node) -> Result<(), Status> {
+        if let Some(placement) = &self.placement {
+            if database != placement.name {
+                return Err(Status::permission_denied("This Flight SQL session belongs to another deployment"));
+            }
+            let current = node.catalog().database(database).map_err(|_| placement_changed())?;
+            if !std::ptr::eq(placement.attachment.as_ptr(), Arc::as_ptr(&current)) { return Err(placement_changed()); }
+        }
+        Ok(())
+    }
+    pub fn database(&self, header: Option<&str>, node: &Node) -> Result<String, Status> {
+        let state = self.state.lock().expect("session lock");
+        let SessionState::Open { catalog, .. } = &*state else { return Err(Status::not_found("session closed")); };
+        let database = header.or_else(|| self.placed_database()).or_else(|| catalog.as_ref().map(|selection| selection.name.as_str())).unwrap_or("xtdb");
+        self.require_database(database, node)?;
+        Ok(database.into())
     }
     pub fn select_catalog(&self, name: Option<String>, node: &Node) -> Result<(), Status> {
         let selection = name.map(|name| Ok::<_, Status>(CatalogSelection { _reservation: node.memory().reserve(name.capacity() + 128).map_err(status)?, name })).transpose()?;
         match &mut *self.state.lock().expect("session lock") { SessionState::Open { catalog, .. } => { *catalog = selection; Ok(()) }, SessionState::Closed => Err(Status::not_found("session closed")) }
     }
+    pub fn open_native(&self, database: &str, node: &Node) -> Result<NativeSession, Status> {
+        self.require_database(database, node)?;
+        let native = node.session(database, self.caller.principal.clone()).map_err(status)?;
+        self.require_database(database, node)?;
+        Ok(native)
+    }
     pub fn connection(&self, database: &str, node: &Node) -> Result<Arc<ConnectionResource>, Status> {
+        self.require_database(database, node)?;
         let mut state = self.state.lock().expect("session lock");
         let SessionState::Open { connections, .. } = &mut *state else { return Err(Status::not_found("session closed")); };
         if let Some((connection, _)) = connections.get(database) { return Ok(Arc::clone(connection)); }
         let charge = node.memory().reserve(database.len() + 512).map_err(status)?;
-        let connection = ConnectionResource::new(node.session(database, self.caller.principal.clone()).map_err(status)?);
+        let connection = ConnectionResource::new(self.open_native(database, node)?);
         connections.insert(database.into(), (Arc::clone(&connection), charge)); Ok(connection)
     }
 }
+
+fn placement_changed() -> Status { Status::unavailable("This node no longer holds the Flight SQL session's deployment") }
+
 impl Leased for Session {
     fn close(&self) { if let SessionState::Open { connections, .. } = std::mem::replace(&mut *self.state.lock().expect("session lock"), SessionState::Closed) { for (connection, _) in connections.into_values() { connection.close(); } } }
 }
 impl Drop for Session { fn drop(&mut self) { self.close(); } }
-pub(crate) struct Transaction { pub owner: Owner, pub connection: Arc<ConnectionResource>, _reservation: Arc<MemoryReservation> }
-impl Transaction { pub fn new(owner: Owner, connection: Arc<ConnectionResource>, reservation: Arc<MemoryReservation>) -> Self { Self { owner, connection, _reservation: reservation } } }
+pub(crate) struct Transaction { pub owner: ResourceOwner, pub connection: Arc<ConnectionResource>, _reservation: Arc<MemoryReservation> }
+impl Transaction { pub fn new(owner: ResourceOwner, connection: Arc<ConnectionResource>, reservation: Arc<MemoryReservation>) -> Self { Self { owner, connection, _reservation: reservation } } }
 impl Leased for Transaction { fn close(&self) { self.connection.close(); } }
 impl Drop for Transaction { fn drop(&mut self) { self.close(); } }
 #[derive(Clone)]
 pub(crate) enum PreparedScope { Session(String), Transaction(Bytes) }
-pub(crate) struct Prepared { pub owner: Owner, pub sql: String, pub scope: PreparedScope, pub params: Mutex<Option<Bytes>>, _reservation: Arc<MemoryReservation> }
-impl Prepared { pub fn new(owner: Owner, sql: String, scope: PreparedScope, reservation: Arc<MemoryReservation>) -> Self { Self { owner, sql, scope, params: Mutex::new(None), _reservation: reservation } } }
+pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub scope: PreparedScope, pub params: Mutex<Option<Bytes>>, _reservation: Arc<MemoryReservation> }
+impl Prepared { pub fn new(owner: ResourceOwner, sql: String, scope: PreparedScope, reservation: Arc<MemoryReservation>) -> Self { Self { owner, sql, scope, params: Mutex::new(None), _reservation: reservation } } }
 impl Leased for Prepared { fn close(&self) { *self.params.lock().expect("prepared parameters lock") = None; } }

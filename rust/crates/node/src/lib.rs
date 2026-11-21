@@ -23,8 +23,8 @@ pub use session::*;
 pub use resources::*;
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
-pub use database::Database;
-pub use node::{NativeSession, Node, NodeDriver, NodeServices};
+pub use database::{CompactionRelay, Database};
+pub use node::{IDEMPOTENCY_KEY_PARAMETER, IDEMPOTENCY_TABLE, NOT_HELD, NativeSession, Node, NodeDriver, NodeServices, ReadFence};
 
 mod statement;
 pub use statement::{PreparedSql, ResultSignaturePolicy};

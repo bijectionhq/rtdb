@@ -113,7 +113,7 @@ impl Trial {
             let logs = PartitionLogs::new(source.clone(), transport.actor(actor), StorageEpoch(0), StorageEpoch(0),
                 CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), memory.scope())?;
             let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), memory.scope(), 100_000_000)?;
-            let recovered = blocks.recover(Default::default(), logs.source_floor()?, initial).await?;
+            let recovered = blocks.recover(Default::default(), logs.source_floor()?, initial, rtdb_replication::BlockDiscovery::List).await?;
             if let Some(partitions) = &mut partitions { partitions.push(Arc::clone(&recovered.partition)); }
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let node_cancellation = cancellation.child_token();

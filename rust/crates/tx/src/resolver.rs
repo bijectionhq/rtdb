@@ -153,13 +153,27 @@ impl TxResolver {
         let default_time = self.smooth(log_time)?;
         let invalid_time = request.options.system_time.zip(self.resolved_head)
             .filter(|(time, previous)| !crate::system_time::advances(Some(previous.system_time.0), time.0));
-        let key = TransactionKey { tx_id: TxId(position.0), system_time: if invalid_time.is_some() { default_time } else { request.options.system_time.unwrap_or(default_time) } };
+        let behind_log = request.options.system_time.filter(|time| {
+            *time < log_time && request.options.user_metadata.as_ref().is_some_and(UserMetadata::requires_ordered_system_time)
+        });
+        let key = TransactionKey {
+            tx_id: TxId(position.0),
+            system_time: if invalid_time.is_some() || behind_log.is_some() {
+                default_time
+            } else {
+                request.options.system_time.unwrap_or(default_time)
+            },
+        };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.trace_parent = span.as_ref().map(|span| span.context());
         let outcome = if let Some((requested, previous)) = invalid_time {
             Err(Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
                 .with_context("latest-completed-tx", tx_key_context(previous)?))
+        } else if let Some(requested) = behind_log {
+            Err(Anomaly::incorrect("rtdb/ordered-system-time", "specified system-time precedes the source-log timestamp")
+                .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
+                .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?))
         } else {
             let mut outcome = Ok(());
             for (index, operation) in request.operations.iter().enumerate() {

@@ -168,6 +168,7 @@ contract Election {
         --   - With traffic: met by the writes it is making anyway.
         --   - Idle: a no-op stamped with its own term.
         --   Otherwise a quiet database and a leaderless one are the same log to a reader.
+        -- A holder placed by rtdb-multi.allium's directory is exempt: no other node may claim its database, its liveness is its member lease, and an idle deployment's log stays silent.
 
     @invariant StandingDownLeavesTheDatabaseReadable
         -- A node that stands down for a higher term leaves its database queryable on that node.
@@ -282,6 +283,7 @@ entity LogProcessor {
 
 rule ClaimOnEmptyRead {
     -- A read of this node's own returned nothing, so the log is at its tip and whoever last led it has stopped writing.
+    -- A placed holder reads with a short claim wait in place of the randomized election wait, so it claims as soon as it reaches the tip.
     when: ReadReturnedEmpty(processor)
 
     requires: processor.state = following

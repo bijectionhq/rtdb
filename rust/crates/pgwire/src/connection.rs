@@ -3,28 +3,34 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use rtdb_auth::{Authenticator, Method};
 use rtdb_columnar::MemoryReservation;
-use rtdb_node::{NativeSession, Node, SessionIdentity};
+use rtdb_node::{DatabaseAccess, NativeSession, Node, SessionIdentity};
 use rtdb_types::{Anomaly, AnomalyCategory, PgType, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use crate::{ServerConfig, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
+use crate::{CAPABILITY_PARAMETER, DELEGABLE_PARAMETER, GATEWAY_AWAIT_TOKEN_PARAMETER, GATEWAY_SETTINGS_PARAMETER, ServerConfig, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
 
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
 type Stream = Box<dyn Socket>;
 
-pub(crate) struct Startup { pub parameters: BTreeMap<String, String>, pub _reservation: Arc<MemoryReservation> }
-pub(crate) struct ConnectionDriver { process: i32, stream: TcpStream, address: SocketAddr, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken }
+pub(crate) struct Startup { pub parameters: BTreeMap<String, String>, pub gateway_session_state: bool, pub gateway_settings: bool, pub _reservation: Arc<MemoryReservation> }
+pub(crate) struct ConnectionDriver { process: i32, stream: Stream, address: SocketAddr, encrypted: bool, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken }
 impl ConnectionDriver {
-    pub fn new(process: i32, stream: TcpStream, address: SocketAddr, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken) -> Self { Self { process, stream, address, node, auth, config, registry, cancellation, draining } }
+    pub fn new(
+        process: i32, stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        address: SocketAddr, encrypted: bool, node: Node, auth: Arc<Authenticator>,
+        config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>,
+        cancellation: CancellationToken, draining: CancellationToken,
+    ) -> Self {
+        Self { process, stream: Box::new(stream), address, encrypted, node, auth, config, registry, cancellation, draining }
+    }
     pub async fn run(self) -> Result<()> {
         let memory = Arc::clone(self.node.memory());
         let _region = memory.reserve(32 * 1024)?;
-        let mut stream: Option<Stream> = Some(Box::new(self.stream));
+        let mut stream = Some(self.stream);
         let startup = self.cancellation.run_until_cancelled(tokio::time::timeout(self.config.authentication_timeout,
-            startup(self.process, &mut stream, self.address, &self.node, &self.auth, &self.config, &self.registry, &self.cancellation))).await;
+            startup(self.process, &mut stream, self.address, self.encrypted, &self.node, &self.auth, &self.config, &self.registry, &self.cancellation))).await;
         let (session, settings) = match startup {
             None | Some(Err(_)) | Some(Ok(Ok(None))) => return Ok(()),
             Some(Ok(Err(error))) => { if let Some(stream) = &mut stream { let mut writer = Writer::new(stream, Arc::clone(&memory)); let send = writer.error(&error, PgType::Json, error.context.get("sql-state").and_then(serde_json::Value::as_str) == Some("3D000")); let _ = tokio::time::timeout(std::time::Duration::from_secs(1), self.cancellation.run_until_cancelled(send)).await; } return Err(error); },
@@ -69,11 +75,13 @@ impl ConnectionDriver {
     }
 }
 
-async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAddr, node: &Node, auth: &Arc<Authenticator>, config: &ServerConfig, registry: &CancellationRegistry, cancellation: &CancellationToken) -> Result<Option<(NativeSession, Startup)>> {
-    let mut encrypted = false;
+async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAddr, mut encrypted: bool, node: &Node, auth: &Arc<Authenticator>, config: &ServerConfig, registry: &CancellationRegistry, cancellation: &CancellationToken) -> Result<Option<(NativeSession, Startup)>> {
     loop {
         let stream = transport.as_mut().ok_or_else(|| protocol("Missing PostgreSQL transport"))?;
-        let frame = Reader::new(&mut **stream, Arc::clone(node.memory())).startup().await?;
+        let extra = if config.gateway_session_state {
+            GATEWAY_AWAIT_TOKEN_PARAMETER.len() + GATEWAY_SETTINGS_PARAMETER.len() + 2 * ("on".len() + 2)
+        } else { 0 };
+        let frame = Reader::new(&mut **stream, Arc::clone(node.memory())).startup(extra).await?;
         let mut input = Input::new(&frame.body); let version = input.integer()?;
         match version {
             80877103 => {
@@ -89,13 +97,29 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
             80877104 => return Err(protocol("GSSAPI is not supported")),
             80877102 => { let process = input.integer()?; let _secret = input.integer()?; input.end()?; registry.cancel(process); return Ok(None); }
             196608 => {
-                let requested = input.startup()?; input.end()?;
+                if config.require_tls && !encrypted {
+                    return Err(protocol("This PostgreSQL listener requires TLS"));
+                }
+                let mut requested = input.startup()?; input.end()?;
+                if requested.keys().any(|key| key.eq_ignore_ascii_case(crate::config::CHECKPOINT_STAGE_PARAMETER)) {
+                    return Err(protocol("The checkpoint stage is assigned by the reader"));
+                }
+                let capability = requested.remove(CAPABILITY_PARAMETER);
+                let gateway_session_state = requested.remove(GATEWAY_AWAIT_TOKEN_PARAMETER).as_deref() == Some("on")
+                    && config.gateway_session_state;
+                let gateway_settings = requested.remove(GATEWAY_SETTINGS_PARAMETER).as_deref() == Some("on")
+                    && gateway_session_state;
                 let database = requested.get("database").map_or("xtdb", String::as_str);
                 if config.playground { node.database_or_attach(database.to_owned(), Default::default()).await?; }
                 node.catalog().database(database).map_err(|_| Anomaly::incorrect("xtdb.pgwire/invalid-catalog", format!("database '{database}' does not exist")).with_context("sql-state", "3D000".into()))?;
                 let user = requested.get("user").map(String::as_str); let remote = address.ip().to_string();
-                let method = auth.method_for(user, Some(&remote)).ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/no-matching-rule", format!("no authentication record found for user: {}", user.unwrap_or_default())))?;
-                let identity: Arc<dyn SessionIdentity> = match method {
+                let method = if capability.is_some() { Method::Trust } else { auth.method_for(user, Some(&remote)).ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/no-matching-rule", format!("no authentication record found for user: {}", user.unwrap_or_default())))? };
+                let identity: Arc<dyn SessionIdentity> = if let Some(token) = &capability {
+                    let verifier = config.capabilities.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/capability-not-accepted", "This server does not accept capabilities").with_context("sql-state", "28000".into()))?;
+                    let granted = verifier.verify(token, database).map_err(|error| error.with_context("sql-state", "28000".into()))?;
+                    if user.is_some_and(|user| user != granted.principal) { return Err(Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/capability-principal", "The capability was granted to another user").with_context("sql-state", "28000".into())); }
+                    Arc::new(CapabilityIdentity { principal: auth.authenticate_trusted(&granted.principal)?, read_only: granted.read_only })
+                } else { match method {
                     Method::Trust => match user { Some(user) => auth.authenticate_trusted(user)?, None => auth.unauthenticated()? },
                     Method::Password | Method::ClientCredentials => {
                         Writer::new(&mut **stream, Arc::clone(node.memory())).auth(3).await?;
@@ -111,7 +135,8 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                         writer.notice(&format!("\nHello! Please head over here to authenticate:\n\n{}\n", device.url())).await?;
                         device.await_principal(cancellation).await?
                     }
-                };
+                } };
+                let delegable = identity.delegable();
                 let mut session = node.session(database, identity)?;
                 let size = config.parameters.iter().chain(requested.iter()).try_fold(8192usize, |size, (key, value)| size.checked_add(key.len().checked_mul(4)?).and_then(|size| size.checked_add(value.len())).and_then(|size| size.checked_add(256))).ok_or_else(|| protocol("Startup parameters exceed memory range"))?;
                 let reservation = node.memory().reserve(size)?;
@@ -120,11 +145,34 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 let mut writer = Writer::new(&mut **stream, Arc::clone(node.memory()));
                 if method != Method::DeviceAuth { writer.auth(0).await?; }
                 apply_startup(&mut session, &parameters, &mut writer).await?;
-                writer.backend_key(process).await?; writer.ready(b'I').await?;
-                return Ok(Some((session, Startup { parameters, _reservation: reservation })));
+                // Tells a gateway it may vouch for this session's user when it reconnects it elsewhere.
+                if delegable { writer.parameter(DELEGABLE_PARAMETER, "on").await?; }
+                writer.backend_key(process).await?;
+                if gateway_session_state { writer.gateway_await_token(None).await?; }
+                if gateway_settings {
+                    writer.gateway_settings(&[]).await?;
+                    writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_SQL_PREPARE_KIND]).await?;
+                    writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_NAMED_PARSE_KIND]).await?;
+                }
+                writer.ready(b'I').await?;
+                return Ok(Some((session, Startup { parameters, gateway_session_state, gateway_settings, _reservation: reservation })));
             }
             _ => return Err(protocol("Unknown protocol version")),
         }
+    }
+}
+
+/// A principal admitted by a capability: the access the capability grants bounds what the principal may do.
+struct CapabilityIdentity { principal: Arc<dyn SessionIdentity>, read_only: bool }
+
+#[async_trait::async_trait]
+impl SessionIdentity for CapabilityIdentity {
+    fn user(&self) -> Option<&str> { self.principal.user() }
+    fn delegable(&self) -> bool { self.principal.delegable() }
+    async fn revalidate(&self, now: rtdb_types::Timestamp) -> Result<()> { self.principal.revalidate(now).await }
+    fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()> {
+        if self.read_only && access == DatabaseAccess::Write { return Err(Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authz/read-only-capability", "This session's capability grants read access only")); }
+        self.principal.authorize_database(database, access)
     }
 }
 

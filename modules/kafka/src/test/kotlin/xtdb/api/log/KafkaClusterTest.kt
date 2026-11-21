@@ -40,6 +40,7 @@ import xtdb.util.asPath
 import java.nio.ByteBuffer
 import java.nio.file.Path
 import java.time.Duration
+import java.time.ZonedDateTime
 import java.util.*
 import java.util.Collections.synchronizedList
 import java.util.concurrent.atomic.AtomicReference
@@ -323,9 +324,18 @@ class KafkaClusterTest {
             log(KafkaCluster.LogFactory("my-kafka", topicName))
         }.use { node ->
             node.connection.use { conn ->
-                conn.createStatement().use { stmt ->
+                val committedAt = conn.createStatement().use { stmt ->
                     stmt.execute("INSERT INTO foo (_id, x) VALUES ('a', 1)")
-                    stmt.executeQuery("SELECT _id, x FROM foo").use { rs ->
+                    stmt.executeQuery("SHOW latest_submitted_tx").use { tx ->
+                        assertTrue(tx.next())
+                        assertTrue(tx.getBoolean("committed"))
+                        ZonedDateTime.parse(tx.getString("system_time")).toOffsetDateTime()
+                    }
+                }
+                // Kafka stamps the write with the broker clock, which can lead the node's clock.
+                conn.prepareStatement("SELECT _id, x FROM foo FOR VALID_TIME AS OF ?").use { query ->
+                    query.setObject(1, committedAt)
+                    query.executeQuery().use { rs ->
                         assertTrue(rs.next())
                         assertEquals("a", rs.getString("_id"))
                         assertEquals(1, rs.getInt("x"))
