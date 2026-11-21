@@ -128,19 +128,26 @@ def verify_verus(args, scratch):
 
 def verify_jvm_leaf_merge(args, scratch):
     path = Path("core/src/main/java/xtdb/trie/LeafMerge.java")
+    capacity = "      @ requires left.length + right.length <= Integer.MAX_VALUE;"
     cases = {
         "baseline": None,
         "larger-head": (
             "order.compare(left[leftIndex], right[rightIndex]) < 0",
             "order.compare(left[leftIndex], right[rightIndex]) > 0",
+            "left.length == 1 && right.length == 1 && order.rank(left[0]) == 0 && order.rank(right[0]) == 1",
+            "Assert",
         ),
         "drop-suffix": (
             "while (next < merged.length)",
             "while (next < merged.length && leftIndex < left.length && rightIndex < right.length)",
+            "left.length == 1 && right.length == 0",
+            "Assert",
         ),
         "change-right-value": (
             "merged[next] = right[rightIndex];",
             "merged[next] = 0;",
+            "left.length == 0 && right.length == 1 && right[0] != 0",
+            "LoopInvariant",
         ),
     }
     version = run_case([args.openjml, "--version"], ROOT, args.evidence, "openjml-version")
@@ -150,11 +157,21 @@ def verify_jvm_leaf_merge(args, scratch):
         case = f"openjml-leaf-merge-{name}"
         directory = scratch / case
         source = clone_file(path, directory)
+        flags = []
+        expected_diagnostic = None
         if mutation:
-            replace_once(source, *mutation)
+            before, after, witness, expected_diagnostic = mutation
+            replace_once(source, before, after)
+            replace_once(source, capacity, f"      @ requires {witness};\n{capacity}")
+        if name == "larger-head":
+            # The reversed comparator reaches the right branch for this witness.
+            # End this control after the order assertion, before loop preservation.
+            assertion = "//@ assert leftIndex == left.length || order.rank(right[rightIndex]) <= order.rank(left[leftIndex]);"
+            replace_once(source, assertion, assertion + "\n                //@ halt;")
+            flags = ["--method=merge", "--split=AB"]
         checked = run_case(
             [args.openjml, "--esc", "--timeout=40", "--timeout-method=65",
-             "--esc-max-warnings=1", "--progress", str(path)],
+             "--esc-max-warnings=1", "--progress", *flags, str(source)],
             directory, args.evidence, case,
         )
         output = checked.stdout + "\n" + checked.stderr
@@ -162,19 +179,21 @@ def verify_jvm_leaf_merge(args, scratch):
             r"(?m)^\s*(Valid|Invalid|Infeasible|Timeout|Error|Skipped):\s+(\d+)\s*$", output,
         )}
         expected = {
-            "Valid": 1 if mutation else 2,
+            "Valid": 2,
             "Invalid": 1 if mutation else 0,
             "Infeasible": 0,
             "Timeout": 0,
             "Error": 0,
             "Skipped": 2,
         }
-        diagnostic = re.search(
-            r"LeafMerge\.java:\d+: verify:.*\((?:Assert|LoopInvariant|Postcondition)[^)]*\) in method merge",
-            output,
-        )
-        if checked.returncode != (6 if mutation else 0) or observed != expected or bool(diagnostic) != bool(mutation):
-            raise ValueError(f"{case}: expected {expected}, observed {observed}")
+        if mutation:
+            expected["Valid"] = 1
+        if flags:
+            expected.update(Valid=0, Skipped=3)
+        diagnostics = re.findall(r"LeafMerge\.java:\d+: verify:.*\((Assert|LoopInvariant)\) in method merge", output)
+        wanted = [expected_diagnostic] if mutation else []
+        if checked.returncode != (6 if mutation else 0) or observed != expected or diagnostics != wanted:
+            raise ValueError(f"{case}: expected {expected} and {wanted}, observed {observed} and {diagnostics}")
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 

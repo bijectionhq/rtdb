@@ -1659,13 +1659,17 @@ The focused JVM trie suite at `dfbeb7e0d` passed 15 tests.
 They cover repeated ordinals across runs and retry after an IID lookup error.
 OpenJML 21.0.29 with Z3 5.1.0 checked the production Java merge with the control-flow split annotations in `77027b899`.
 For the solver proof, the ordered inputs and Kotlin comparator contract are premises.
-The local full mutation rerun hit its time limit, so the Java control results documented on the incoming branch do not establish reproducibility on this combined checkout.
+The first local mutation rerun hit its time limit.
+The revised runner checked the general baseline again and rejected three mutations at the declared obligations: selecting the larger head, dropping an unread suffix, and replacing a right-side value.
+The controls use singleton or empty runs to witness the failure, and the head-selection case follows the affected branch through its order assertion.
 The release archive used in the local check was `openjml-macos-arm64-21.0.29.zip`, SHA-256 `9378a3abb3bb81e0e59edd1241b47da101cb3a14751c38cbcbc86c12b465950d`. https://github.com/OpenJML/OpenJML/releases/tag/21.0.29[OpenJML release]
 
 The native trie, format, index, query and columnar run at `dfbeb7e0d` recorded 590 passes and one failure.
 The failing columnar case measured 88.07 seconds against its 60-second limit while round-tripping nested unions.
 No assertion about a row value or a trie result failed in that run.
 The overall suite therefore did not pass.
+The same test binary recorded 72.70 seconds in the first isolated retry and passed in 49.83 seconds in a second isolated retry.
+The isolated result leaves the original suite result unchanged.
 
 Run the formal cases with the pinned tools described in link:../README.adoc#run-the-studies[the verification runner instructions], and the runtime cases with the commands below.
 
@@ -1679,5 +1683,7 @@ BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test
 
 Raw formal output is under `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-proofs/`,
 `/private/tmp/rtdb-formal.QMjPSJsX/leaf-load-separated-verus/`,
-and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-openjml/`.
-The native log is `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-native.log`.
+and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-openjml-final/`.
+The native logs are `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-native.log`,
+`/private/tmp/rtdb-formal.QMjPSJsX/leaf-arrow-timing-focused.log`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-arrow-timing-sampled.log`.

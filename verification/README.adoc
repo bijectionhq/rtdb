@@ -111,6 +111,9 @@ Pass `--openjml` to check the Java merge called by the production Kotlin trie.
 The recorded run used OpenJML 21.0.29 with its bundled Z3 5.1.0.
 The runner retains the baseline, tool version, and three negative controls.
 The controls select the larger head, drop an unread suffix, and replace a right-side value.
+Each control uses singleton or empty input runs as a witness.
+The head-selection control checks the affected branch through its order assertion.
+The unmodified proof checks all branches for arbitrary ordered input runs. https://www.openjml.org/tutorial/SplittingProofs[OpenJML proof splitting]
 The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
