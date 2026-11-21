@@ -198,11 +198,11 @@ pub(super) struct Tree<'a> {
     decoded: Mutex<DecodedPages>,
 }
 
-impl<'a> Tree<'a> {
+impl<'scope> Tree<'scope> {
     pub fn new(
-        storage: &'a BufferPool,
-        directory: &'a ObjectKey,
-        memory: &'a Arc<MemoryBudget>,
+        storage: &'scope BufferPool,
+        directory: &'scope ObjectKey,
+        memory: &'scope Arc<MemoryBudget>,
     ) -> Self {
         Self { storage, directory, memory, decoded: Mutex::default() }
     }
