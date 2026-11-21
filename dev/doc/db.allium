@@ -264,6 +264,8 @@ external entity StorageFormat {
 
 value MessageId {
     -- An epoch and an offset, ordered lexicographically.
+    -- Source and replica logs have configured epochs from 0 through 32,767.
+    -- An offset of -1 denotes the position before the first record in a log epoch.
     epoch: Integer
     offset: Integer
 }

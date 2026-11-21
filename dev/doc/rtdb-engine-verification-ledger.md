@@ -147,7 +147,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
-| FMT01 · Codec round trips | Partial | [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) |
+| FMT01 · Codec round trips | Partial | [Signed position bounds and production codec checks](rtdb-engine-proof-evidence.md#main-evidence) · [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) |
 | FMT02 · Optional field presence | Open | — |
 | FMT03 · Arrow event fidelity | Open | — |
 | FMT04 · Version dispatch | Open | — |

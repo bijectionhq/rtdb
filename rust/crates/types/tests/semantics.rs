@@ -174,7 +174,7 @@ fn await_basis_merge_keeps_each_database_and_partition() {
 
 #[test]
 fn message_ids_preserve_epoch_offsets_and_before_first_sentinels() {
-    for epoch in [0, 3] {
+    for epoch in [0, 3, 32767] {
         let position = SourcePosition::from_epoch_offset(StorageEpoch(epoch), 123).unwrap();
         assert_eq!(position.epoch(), StorageEpoch(epoch));
         assert_eq!(position.offset(), 123);
@@ -184,8 +184,24 @@ fn message_ids_preserve_epoch_offsets_and_before_first_sentinels() {
     assert_eq!(ReplicaPosition::from_epoch_offset(StorageEpoch(1), -1).unwrap().0, (1_i64 << 48) - 1);
     assert_eq!(SourcePosition(-1).after_offset(StorageEpoch(0)), -1);
     assert_eq!(SourcePosition::from_epoch_offset(StorageEpoch(3), 123).unwrap().after_offset(StorageEpoch(4)), -1);
-    assert!(SourcePosition::from_epoch_offset(StorageEpoch(1 << 16), 0).is_err());
     assert!(SourcePosition::from_epoch_offset(StorageEpoch(0), 1_i64 << 48).is_err());
+}
+
+#[test]
+fn message_ids_reject_epochs_that_cannot_preserve_signed_order() {
+    let maximum = StorageEpoch(32767);
+    let last_offset = (1_i64 << 48) - 1;
+    let last = ReplicaPosition::from_epoch_offset(maximum, last_offset).unwrap();
+    let prior = ReplicaPosition::from_epoch_offset(StorageEpoch(maximum.0 - 1), last_offset).unwrap();
+    assert_eq!(last.0, i64::MAX);
+    assert!(prior < last);
+    assert_eq!(last.after_offset(maximum), last_offset);
+    for epoch in [i32::MIN, -1, 32768, 65535, 65536, i32::MAX] {
+        for offset in [-1, 0, last_offset] {
+            assert_eq!(SourcePosition::from_epoch_offset(StorageEpoch(epoch), offset).unwrap_err().code, "xtdb/invalid-log-epoch");
+            assert_eq!(ReplicaPosition::from_epoch_offset(StorageEpoch(epoch), offset).unwrap_err().code, "xtdb/invalid-log-epoch");
+        }
+    }
 }
 
 #[test]

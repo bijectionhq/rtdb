@@ -4,13 +4,13 @@ import xtdb.types.LogOffset
 import xtdb.types.MessageId
 
 object MsgIdUtil {
-    private const val EPOCH_LIMIT = 1L shl 16
+    private const val EPOCH_LIMIT = 1 shl 15
     private const val OFFSET_LIMIT = 1L shl 48
     private const val OFFSET_MASK = OFFSET_LIMIT - 1
 
     @JvmStatic
     fun offsetToMsgId(epoch: Int, offset: LogOffset): MessageId {
-        require(epoch < EPOCH_LIMIT) { "Epoch value ($epoch) exceeds the limit ($EPOCH_LIMIT)" }
+        require(epoch in 0 until EPOCH_LIMIT) { "Log epoch ($epoch) must be in 0..${EPOCH_LIMIT - 1}" }
         require(offset < OFFSET_LIMIT) { "Offset value ($offset) exceeds the limit ($OFFSET_LIMIT)" }
         return (epoch.toLong() shl 48) + offset
     }

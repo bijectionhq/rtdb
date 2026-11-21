@@ -411,6 +411,23 @@ def verify_system_time(args, scratch):
     verify_lean_model(args, scratch, path, "system-time", controls, 5)
 
 
+def verify_message_position(args, scratch):
+    path = Path("verification/lean/MessagePosition.lean")
+    controls = {
+        "allow-sign-bit": (
+            "def epochLimit : Int := 32768",
+            "def epochLimit : Int := 32769",
+            ["an_epoch_fits_exactly_within_the_supported_range", "supported_positions_fit_signed_order"],
+        ),
+        "short-epoch-spacing": (
+            "epoch * offsetLimit + offset",
+            "epoch * (offsetLimit - 1) + offset",
+            ["an_epoch_fits_exactly_within_the_supported_range", "order_is_lexicographic", "packed_round_trip"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "message-position", controls, 5)
+
+
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
     controls = {
@@ -518,6 +535,7 @@ def verify_lean(args, scratch):
             env = os.environ | {"LEAN_PATH": str(directory)}
             verify_ceiling(args, scratch, directory)
             verify_system_time(args, scratch)
+            verify_message_position(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)

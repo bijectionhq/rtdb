@@ -16,6 +16,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | TX01, TX03, TX06, TX11, LOG04, LOG05 | The bounded kernel and read-back models cover transaction publication, refusal, and the append, delivery, apply, and acknowledgment sequence. A Verus harness checks production replica admission. | Prove the production transaction and log traces refine those transitions under the provider and transaction assumptions. |
 | TX09 | Lean checks strictly ordered system times for arbitrary modeled mixed resolver histories and restart from the last completed time. Bounded TLC and a native catalog-clock replay check other portions of the same contract. | Refine the remaining ingress, time sources, resolve/apply paths, and provider-specific ordering. |
 | LOG08, LOG09, GC05, STORE10, STORE11 | Bounded checkpoint discovery and replay models check a readable root and retained suffix, including the handoff at the observed log floor. A native test exercises the newer-checkpoint refresh and suffix replay. | Compose checkpoint publication, root and dependency discovery, trim authority and provider behavior over arbitrary executions. |
+| LOG08, FMT01 · Packed log positions | Lean proves the exact signed epoch limit, lexicographic order, quotient and remainder extraction, and the start sentinel. Kani checks the Rust admission predicate and checks encoding and resumption on the admitted domain. JVM tests exercise the same boundary. | Compose the codec with admitted checkpoint metadata, all supported readers, and retained-log recovery. |
 | IDX04 | Verus checks the Rust base-four IID bucket function. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Prove every admitted row is placed and found under the corresponding serialized and live subtree through insertion, splitting, and replay. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | STORE04, STORE08 | An offline Azure provider replay exercised pending-copy acknowledgment and checked the corrected publication path. The checkpoint interruption model separates the provider's durable outcome from the reply. | Cover all provider adapters and their ambiguous, retried, and concurrent publication paths. |
@@ -24,6 +25,11 @@ These results apply to the classic and full-text Rust paths at the particular re
 
 Main's [kernel design](rtdb-formal-verification-design.adoc) gives the public observation and simulation contracts used by those studies.
 The checked source boundaries and known counterexamples are documented alongside the [individual studies](rtdb-verification.adoc) and [runner](../../verification/README.adoc).
+
+At baseline `2f1019b68`, the Rust encoder accepted epoch 32,768 and offset zero, returning `-9223372036854775808` and resume offset `-1` for that same epoch.
+The signed order places that value below the observed epoch-32,767 position `9223090561878065152`.
+The checked epoch domain is 0 through 32,767, with nonnegative 48-bit positions and the before-first sentinel at offset `-1`.
+The model runner rejects weakening the upper limit to admit the sign bit or reducing the spacing between epochs. [Position theorems](../../verification/lean/MessagePosition.lean) · [Rust harnesses](../../rust/crates/types/tests/proofs.rs) · [JVM tests](../../core/src/test/kotlin/xtdb/util/MsgIdUtilTest.kt)
 
 ## Multi evidence
 
@@ -55,4 +61,5 @@ The supplementary Rust position and IID harnesses on main use Kani 0.68.0.
 ```sh
 cd rust
 cargo kani -p rtdb-types -p rtdb-trie --tests --output-format terse
+cargo kani -p rtdb-types --lib --output-format terse
 ```
