@@ -968,6 +968,23 @@ RTDB_PARKED_BENCH_DEPLOYMENTS=1000000 \
   parked_directory_density_with_an_active_watch -- --ignored --exact --nocapture
 ```
 
+**Local cell under Zipf load**
+
+A release run on `94f351686` kept ten million unrelated deployments in memory while 16 writers drove 32 other deployments through real pgwire sessions and three fsync-enabled logkeepers.
+All 32 active deployments started cold and acquired holders.
+The workload verified every final counter across 32,768 writes, seven scale-out moves and a scale-in drain of 12 holdings.
+The process peaked at 8.61 GiB of sampled RSS.
+It sustained 3,766 writes/s with overall p99 of 18.9 ms and p99 of 16.4 ms outside scale transitions.
+Scale-out and scale-in p99 reached 279.5 ms and 105.5 ms respectively.
+The provider staging run still needs equivalent evidence from the production directory and storage.
+
+```sh
+RTDB_CELL_BENCH_PARKED=10000000 RTDB_CELL_BENCH_COLD=1 RTDB_CELL_BENCH_SCALE=1 \
+RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_TIMEOUT_SECONDS=240 RTDB_TEST_PGWIRE_CONNECTIONS=256 \
+  cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
+  durable_pgwire_updates_under_zipf_activity -- --ignored --exact --nocapture
+```
+
 **DynamoDB parked item size**
 
 For an unheld deployment with three UUID logkeeper IDs, the prepared DynamoDB item uses the following estimated storage from attribute names and values.
