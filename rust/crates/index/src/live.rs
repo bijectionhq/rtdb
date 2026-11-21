@@ -86,17 +86,9 @@ impl IndexBatch {
             }
         }
         let _schema_scratch = budget.reserve(schema_bytes.checked_mul(4).ok_or_else(|| invalid("Put schema allocation size overflow"))?)?;
-        let mut has_put = matches!(mode, EventBuild::CopyCaptured) || !declared.is_empty();
-        let mut documents = Vec::new();
-        for event in events {
-            if let StoredOperation::Put(document) = &event.operation {
-                if !matches!(mode, EventBuild::CopyCaptured) {
-                    documents.push(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect::<StructFields<_>>());
-                }
-                has_put = true;
-            }
-        }
-        let rows = row_column_types(&documents);
+        let captured = matches!(mode, EventBuild::CopyCaptured);
+        let rows = if captured { None } else { event_column_types(events) };
+        let has_put = captured || rows.is_some() || !declared.is_empty();
         let fields = match rows { Some(rows) => declare_column_types(&rows, declared), None => declared.clone() };
         let copy = !matches!(mode, EventBuild::Write);
         Self::from_owned(owned_event_batch(events, has_put.then_some(fields), copy, budget)?)
@@ -642,6 +634,29 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
     drop(blocker);
 }
 
+fn event_column_types(events: &[StoredEvent]) -> Option<StructFields<LogicalType>> {
+    let mut documents = events.iter().filter_map(|event| match &event.operation {
+        StoredOperation::Put(document) => Some(document),
+        _ => None,
+    });
+    let column_types = |document: &StructFields<Value>| {
+        document.iter()
+            .map(|(name, value)| (name.clone(), value.logical_type()))
+            .collect::<StructFields<_>>()
+    };
+    let first = column_types(documents.next()?);
+    if documents.clone().all(|document| {
+        document.len() == first.len()
+            && document.iter().zip(&first).all(|((name, value), (first_name, ty))| {
+                name == first_name && value.logical_type() == *ty
+            })
+    }) {
+        return Some(first);
+    }
+    let types: Vec<_> = std::iter::once(first).chain(documents.map(column_types)).collect();
+    row_column_types(&types)
+}
+
 /// Joins every document's column types once per column, which equals folding `merge_column_types` over the documents
 /// in order: each document lacking a column contributes its own absence.
 fn row_column_types(documents: &[StructFields<LogicalType>]) -> Option<StructFields<LogicalType>> {
@@ -659,6 +674,36 @@ fn row_column_types(documents: &[StructFields<LogicalType>]) -> Option<StructFie
 mod row_column_type_tests {
     use super::*;
     use rtdb_types::{ListKind, ScalarType};
+
+    #[test]
+    fn event_schema_preserves_field_order_and_joins_rows_with_missing_or_retyped_cells() {
+        let put = |document| StoredEvent {
+            iid: Iid([1; 16]),
+            system_from: Timestamp(10),
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Put(document),
+            recency: None,
+        };
+        let events = [
+            put(StructFields::from([("_id".into(), Value::I64(1)), ("name".into(), Value::Utf8("a".into()))])),
+            put(StructFields::from([("_id".into(), Value::I64(2)), ("name".into(), Value::Utf8("b".into()))])),
+            put(StructFields::from([("name".into(), Value::Utf8("c".into())), ("_id".into(), Value::I64(3))])),
+            put(StructFields::from([("_id".into(), Value::I64(4)), ("name".into(), Value::I64(5))])),
+            put(StructFields::from([("_id".into(), Value::I64(5)), ("age".into(), Value::I64(6))])),
+        ];
+        let document_types: Vec<_> = events.iter().map(|event| {
+            let StoredOperation::Put(document) = &event.operation else { panic!("expected a put"); };
+            document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect()
+        }).collect();
+        for size in 0..=events.len() {
+            assert_eq!(event_column_types(&events[..size]), row_column_types(&document_types[..size]));
+        }
+        for size in 1..=events.len() {
+            let fields = event_column_types(&events[..size]).unwrap();
+            let expected = if size == events.len() { vec!["_id", "name", "age"] } else { vec!["_id", "name"] };
+            assert_eq!(fields.keys().map(String::as_str).collect::<Vec<_>>(), expected);
+        }
+    }
 
     #[test]
     fn joining_each_column_once_matches_folding_documents_in_order() {
