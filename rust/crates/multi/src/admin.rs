@@ -655,7 +655,7 @@ async fn finish_deletion(storage: &CellStorage, bucket: &dyn rtdb_storage::Objec
     if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name)));
     }
-    let inventory = storage.purge_versions(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await?;
+    let inventory = storage.purge_inventory(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await?;
     let objects_erased_at_ms = now_ms();
     keys.destroy(&deployment.id)?;
     keys.sign_deletion(DeletionFacts {

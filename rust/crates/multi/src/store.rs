@@ -443,7 +443,7 @@ pub async fn finish_moves(directory: &dyn Directory, storage: &crate::deployment
             if !bucket.list(Some(&prefix)).await?.is_empty() && !crate::reference::erase_deployment(bucket.as_ref(), prefix.as_str(), &others).await? {
                 return Err(Anomaly::fault("rtdb.multi/move-cleanup-incomplete", format!("The source still holds objects for {}", record.name)));
             }
-            storage.purge_versions(&prefix).await?;
+            storage.purge_inventory(&prefix).await?;
             if let Some(keys) = keys { keys.destroy(&record.id)?; }
             record.source_cleanup = Some(completion);
             let version = record.version;

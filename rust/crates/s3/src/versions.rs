@@ -1,4 +1,5 @@
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier, RequestPayer};
 use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -8,28 +9,93 @@ pub struct VersionedInventory {
     bucket: String,
     root: ObjectKey,
     request_payer: Option<RequestPayer>,
+    scope_multipart_listing: bool,
 }
 
 impl VersionedInventory {
-    pub(crate) fn new(client: Client, bucket: String, root: ObjectKey, requester_pays: bool) -> Self {
-        Self { client, bucket, root, request_payer: requester_pays.then_some(RequestPayer::Requester) }
+    pub(crate) fn new(client: Client, bucket: String, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
+        Self { client, bucket, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing }
     }
 
-    /// Purges object versions and delete markers under a deployment prefix.
-    /// Each batch is followed by a fresh listing from the beginning of that prefix.
+    /// Empties multipart uploads, object versions and delete markers under a deployment prefix.
     pub async fn purge(&self, deployment: &ObjectKey) -> Result<()> {
         let path = object_store::path::Path::from(format!("{}/{deployment}", self.root));
         let prefix = format!("{path}/");
+        self.abort_uploads(&prefix).await?;
+        self.purge_versions(&prefix).await
+    }
+
+    async fn abort_uploads(&self, prefix: &str) -> Result<()> {
         let mut previous = Vec::new();
         loop {
-            let page = self.client.list_object_versions().bucket(&self.bucket).prefix(&prefix).max_keys(1000)
+            let uploads = self.multipart_batch(prefix).await?;
+            if uploads.is_empty() { return Ok(()); }
+            if uploads == previous { return Err(unavailable("A batch of aborted multipart uploads is still listed")); }
+            for (key, id) in &uploads { self.abort_upload(key, id).await?; }
+            previous = uploads;
+        }
+    }
+
+    async fn multipart_batch(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut marker = (None, None);
+        loop {
+            let page = self.client.list_multipart_uploads().bucket(&self.bucket).max_uploads(1000)
+                .set_prefix(self.scope_multipart_listing.then(|| prefix.to_owned()))
+                .set_key_marker(marker.0.clone()).set_upload_id_marker(marker.1.clone())
+                .set_request_payer(self.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Listing multipart uploads failed: {error}")))?;
+            let mut uploads = Vec::new();
+            for upload in page.uploads() {
+                let key = upload.key().ok_or_else(|| unavailable("S3 returned a multipart upload without a key"))?;
+                if !key.starts_with(prefix) {
+                    if self.scope_multipart_listing { return Err(unavailable("S3 returned an upload outside the deployment prefix")); }
+                    continue;
+                }
+                let id = upload.upload_id().filter(|id| !id.is_empty())
+                    .ok_or_else(|| unavailable("S3 returned a multipart upload without an identifier"))?;
+                uploads.push((key.to_owned(), id.to_owned()));
+            }
+            if !uploads.is_empty() || page.is_truncated() != Some(true) { return Ok(uploads); }
+            let next = (page.next_key_marker().map(str::to_owned), page.next_upload_id_marker().map(str::to_owned));
+            if next.0.as_deref().is_none_or(str::is_empty) || next <= marker {
+                return Err(unavailable("S3 returned a non-advancing multipart listing"));
+            }
+            marker = next;
+        }
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<()> {
+        for _ in 0..4 {
+            match self.client.abort_multipart_upload().bucket(&self.bucket).key(key).upload_id(id)
+                .set_request_payer(self.request_payer.clone()).send().await
+            {
+                Ok(_) => {}
+                Err(error) if error.as_service_error().is_some_and(|error| error.is_no_such_upload()) => {}
+                Err(error) => return Err(unavailable(format!("Aborting a multipart upload failed: {error}"))),
+            }
+            match self.client.list_parts().bucket(&self.bucket).key(key).upload_id(id).max_parts(1)
+                .set_request_payer(self.request_payer.clone()).send().await
+            {
+                Ok(parts) if parts.parts().is_empty() && parts.is_truncated() != Some(true) => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("NoSuchUpload") => return Ok(()),
+                Err(error) => return Err(unavailable(format!("Checking an aborted multipart upload failed: {error}"))),
+            }
+        }
+        Err(unavailable("Parts remain after aborting a multipart upload"))
+    }
+
+    async fn purge_versions(&self, prefix: &str) -> Result<()> {
+        let mut previous = Vec::new();
+        loop {
+            let page = self.client.list_object_versions().bucket(&self.bucket).prefix(prefix).max_keys(1000)
                 .set_request_payer(self.request_payer.clone()).send().await
                 .map_err(|error| unavailable(format!("Listing object versions failed: {error}")))?;
             let mut versions = Vec::new();
             for (key, version) in page.versions().iter().map(|entry| (entry.key(), entry.version_id()))
                 .chain(page.delete_markers().iter().map(|entry| (entry.key(), entry.version_id())))
             {
-                let key = key.filter(|key| key.starts_with(&prefix))
+                let key = key.filter(|key| key.starts_with(prefix))
                     .ok_or_else(|| unavailable("S3 returned a key outside the deployment prefix"))?;
                 let version = version.filter(|version| !version.is_empty())
                     .ok_or_else(|| unavailable("S3 returned a key without a version identifier"))?;
@@ -70,7 +136,7 @@ mod tests {
     use crate::{S3Config, S3Credentials};
 
     #[tokio::test]
-    async fn versions_and_delete_markers_are_purged_under_the_encoded_deployment_prefix() {
+    async fn versions_delete_markers_and_pending_uploads_are_purged_under_the_encoded_deployment_prefix() {
         let Ok(endpoint) = std::env::var("RTDB_S3_ENDPOINT") else { return };
         let endpoint_url = url::Url::parse(&endpoint).unwrap();
         if !matches!(endpoint_url.host(), Some(url::Host::Ipv4(host)) if host.is_loopback()) { return; }
@@ -101,12 +167,24 @@ mod tests {
         let before = client.list_object_versions().bucket(&bucket).prefix(&target).send().await.unwrap();
         assert_eq!(before.versions().len(), 2);
         assert_eq!(before.delete_markers().len(), 1);
+        let mut pending = Vec::new();
+        for key in [&target, &sibling] {
+            let upload = client.create_multipart_upload().bucket(&bucket).key(key).send().await.unwrap();
+            let id = upload.upload_id().unwrap();
+            client.upload_part().bucket(&bucket).key(key).upload_id(id).part_number(1)
+                .body(ByteStream::from_static(b"unfinished")).send().await.unwrap();
+            pending.push(id.to_owned());
+        }
 
         inventory.purge(&deployment).await.unwrap();
         inventory.purge(&deployment).await.unwrap();
         let after = client.list_object_versions().bucket(&bucket).prefix(&target).send().await.unwrap();
         assert!(after.versions().is_empty());
         assert!(after.delete_markers().is_empty());
+        let uploads = client.list_multipart_uploads().bucket(&bucket).send().await.unwrap();
+        assert_eq!(uploads.uploads().iter().map(|upload| upload.upload_id().unwrap()).collect::<Vec<_>>(), [pending[1].as_str()]);
+        let parts = client.list_parts().bucket(&bucket).key(&target).upload_id(&pending[0]).send().await.unwrap_err();
+        assert_eq!(parts.as_service_error().and_then(|error| error.code()), Some("NoSuchUpload"));
         let neighbor_body = client.get_object().bucket(&bucket).key(&sibling).send().await.unwrap().body.collect().await.unwrap();
         assert_eq!(neighbor_body.into_bytes().as_ref(), b"kept");
 

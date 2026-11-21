@@ -824,7 +824,7 @@ entity DeletionRecord {
     epoch: Epoch
     storage_prefix: String
     namespaces: StorageNamespaces
-    inventory_scope: current_objects | all_versions
+    inventory_scope: current_objects | all_versions | all_versions_and_multipart_uploads
     key_destroyed_at: Timestamp
     prefix_empty_first_at: Timestamp
     prefix_empty_second_at: Timestamp?
@@ -1812,16 +1812,17 @@ rule EraseAndProve {
     requires: DeploymentPrefixIsDisjoint(record)
 
     ensures:
+        AbortMultipartUploadsUnder(record.storage_root.prefix)
         DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
         AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
         KeyService.destroy(record.key_id)
-        let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, inventory_scope: all_versions, signature: SignedByCell())
+        let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, inventory_scope: all_versions_and_multipart_uploads, signature: SignedByCell())
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
 }
 
 rule PublishInventoryReceipt {
     -- A local store attests to the current inventory.
-    -- An S3 store attests to its version inventory after removing data versions and delete markers.
+    -- An S3 store attests to its multipart and version inventories after aborting uploads and removing data versions and delete markers.
     when: InventoryEmptied(record, namespaces, inventory_scope)
 
     requires: record.lifecycle = deleting
@@ -1908,6 +1909,7 @@ rule CleanUpMovedSource {
     ensures:
         EraseSourceCopyAfterTransferringSharedObjects(record)
         if SourceUsesS3(record):
+            EmptyMultipartInventoryObserved(record.storage_root.prefix)
             EmptyVersionInventoryObserved(record.storage_root.prefix)
         SourceCleanupRecorded(record, objects_erased)
         if SourceKeyServiceConfigured(record):

@@ -109,8 +109,10 @@ impl S3Config {
         let mut builder = aws_sdk_s3::config::Builder::from(&config)
             .region(region)
             .force_path_style(!self.virtual_hosted(endpoint.as_ref()));
+        // MinIO's multipart prefix query only returns exact key matches.
+        let scope_multipart_listing = endpoint.is_none();
         builder.set_endpoint_url(endpoint.map(|endpoint| endpoint.to_string()));
-        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root, requester_pays))
+        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root, requester_pays, scope_multipart_listing))
     }
 
     fn configured_endpoint(&self) -> Result<Option<url::Url>> {

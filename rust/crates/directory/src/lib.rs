@@ -178,6 +178,7 @@ pub struct StorageNamespaces {
 pub enum DeletionInventory {
     CurrentObjects,
     AllVersions,
+    AllVersionsAndMultipartUploads,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

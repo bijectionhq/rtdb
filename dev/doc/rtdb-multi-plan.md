@@ -585,8 +585,12 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    Export the trusted public key with `rtdb-multi deletion-key --keys PATH` and verify the JSON from `delete` with `rtdb-multi verify-deletion --record PATH --public-key KEY`.
    The signed `facts` name the deployment, its fencing epoch, prefix, object and key namespaces, and the inventory scope.
    A local receipt has scope `current_objects`.
-   S3 deletion also removes retained versions and delete markers by version ID and confirms an empty version listing below the slash-delimited deployment prefix before signing scope `all_versions`.
+   Below the slash-delimited deployment prefix, S3 deletion aborts incomplete multipart uploads and verifies that their parts are gone, then removes retained versions and delete markers by version ID.
+   It confirms both inventories are empty during the attempt before signing scope `all_versions_and_multipart_uploads`.
    The S3 deletion role needs `s3:ListBucketVersions` and `s3:DeleteObjectVersion` alongside its current-object permissions. [ListObjectVersions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html) [DeleteObjects](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html)
+   Multipart cleanup uses `s3:ListBucketMultipartUploads`, `s3:AbortMultipartUpload` and `s3:ListMultipartUploadParts`. [Multipart upload permissions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html#mpuAndPermissions)
+   MinIO's multipart prefix query returns exact key matches.
+   Custom S3 endpoints use a paged bucket listing for multipart uploads and abort only entries under the deployment prefix.
    Upgrade all directory readers before an S3 deletion writes the new scope to its tombstone.
    The timestamps record successful observations during the attempt that publishes the receipt.
    A new deployment or fork uses an organisation identifier that fits one storage path component.
@@ -633,7 +637,7 @@ Unbounded means adding cells (spec contract `CellMap`).
    The destination's holder imports the old log ensemble before log-fed replicas can serve it.
    The source reaper verifies the recorded object namespace and any supplied key namespace before erasing the old copy.
    Legacy tombstones without a recorded source binding require recovery of those historical namespace IDs before automatic cleanup.
-   With S3 it empties the source's version inventory before destroying the source key copy.
+   With S3 it empties the source's multipart and version inventories before destroying the source key copy.
    The tombstone records successful cleanup so future passes can skip it.
    A later pass with `--keys` rechecks storage before finishing a previous objects-only cleanup.
 3. Format upgrades: readers for N-2 to N, rewrite on flush and compaction, a maintenance trickle for the rest.
