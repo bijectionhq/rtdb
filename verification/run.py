@@ -1009,6 +1009,53 @@ def verify_staged_prefix(args, scratch, history):
                       os.environ | {"LEAN_PATH": str(history)})
 
 
+def verify_read_back_identity(args, scratch):
+    path = Path("verification/lean/ReadBackIdentity.lean")
+    controls = {
+        "accept-missing-sequence": (
+            "delivery.sequence = some pending.sequence ∧ delivery.resolved = true ∧",
+            "(delivery.sequence = some pending.sequence ∨ delivery.sequence = none) ∧ delivery.resolved = true ∧",
+            ["confirmation_proves_equal_frames_given_no_collision", "missing_sequence_refuses"],
+        ),
+        "accept-control-as-transaction": (
+            " ∧ delivery.resolved = true", "",
+            ["control_at_pending_sequence_refuses"],
+        ),
+        "ignore-different-fingerprint": (
+            "hash delivery.frame = hash pending.frame)", "hash delivery.frame = hash delivery.frame)",
+            ["confirmation_proves_equal_frames_given_no_collision"],
+        ),
+        "ignore-queue-head": (
+            " ∧ head = some pending.staged then", " then",
+            ["publication_uses_the_confirmed_queue_head"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "read-back-identity", controls, 5)
+
+
+def verify_queued_read_back(args, scratch):
+    path = Path("verification/lean/QueuedReadBack.lean")
+    controls = {
+        "reverse-durable-order": (
+            "unread := flow.unread ++ [entry]", "unread := entry :: flow.unread",
+            ["step_preserves_order"],
+        ),
+        "reverse-held-order": (
+            "held := flow.held ++ [entry]", "held := entry :: flow.held",
+            ["step_preserves_order"],
+        ),
+        "replace-applied-prefix": (
+            "published := flow.published ++ [entry]", "published := [entry]",
+            ["successful_publication_consumes_the_first_held_entry"],
+        ),
+        "discard-held-on-term-end": (
+            "replayCandidates := flow.held ++ flow.unread", "replayCandidates := flow.unread",
+            ["resignation_preserves_accepted_and_unread_durable_entries"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "queued-read-back", controls, 5)
+
+
 def verify_limit_open(args, scratch):
     path = Path("verification/lean/LimitOpen.lean")
     controls = {
@@ -1433,6 +1480,8 @@ def verify_lean(args, scratch):
             verify_private_replay(args, scratch)
             verify_limit_open(args, scratch)
             verify_staged_prefix(args, scratch, directory)
+            verify_read_back_identity(args, scratch)
+            verify_queued_read_back(args, scratch)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)

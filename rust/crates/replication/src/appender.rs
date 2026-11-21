@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -11,15 +11,21 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{PartitionLogs, ReplicaMetadata, ReplicationClock, progress::term_ended};
+use crate::readback_identity::{ReplicaFingerprint, fingerprint};
 
 pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>), Message(ReplicaBody) }
 #[derive(Clone, Debug)]
 pub(crate) enum Applied { Transaction(Arc<TransactionResult>), Control, TrieRemoval(ReplicaPosition) }
 
+pub(crate) struct AppendStamp {
+    pub sequence: TermSequence,
+    pub fingerprint: Option<ReplicaFingerprint>,
+}
+
 pub(crate) struct PendingWrite {
     pub body: WriteBody,
     pub block: BlockIndex,
-    sequence: AtomicI64,
+    append: OnceLock<AppendStamp>,
     completion: Mutex<Option<oneshot::Sender<Result<Applied>>>>,
     _reservation: Arc<MemoryReservation>,
 }
@@ -37,9 +43,15 @@ impl PendingWrite {
             .ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Pending message allocation size overflow"))
     }
     fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
-        Arc::new(Self { body, block, sequence: AtomicI64::new(-1), completion: Mutex::new(completion), _reservation: reservation })
+        Arc::new(Self { body, block, append: OnceLock::new(), completion: Mutex::new(completion), _reservation: reservation })
     }
-    pub fn sequence(&self) -> Option<TermSequence> { let value = self.sequence.load(Ordering::Acquire); (value >= 0).then_some(TermSequence(value)) }
+    pub fn append_stamp(&self) -> Option<&AppendStamp> { self.append.get() }
+    pub fn sequence(&self) -> Option<TermSequence> { self.append_stamp().map(|stamp| stamp.sequence) }
+    fn stamp_append(&self, sequence: TermSequence, frame: &[u8]) -> Result<()> {
+        let fingerprint = matches!(&self.body, WriteBody::Resolved(_)).then(|| fingerprint(frame));
+        self.append.set(AppendStamp { sequence, fingerprint })
+            .map_err(|_| Anomaly::fault("rtdb.replication/invalid-transition", "Pending replica write was submitted twice"))
+    }
     pub fn finish(&self, result: Result<Applied>) { if let Some(completion) = self.completion.lock().take() { let _ = completion.send(result); } }
 }
 impl Drop for PendingWrite { fn drop(&mut self) { if let Some(completion) = self.completion.get_mut().take() { let _ = completion.send(Err(term_ended())); } } }
@@ -103,7 +115,6 @@ impl ReplicaAppender {
                     let Some(request) = request else { break Ok(()); };
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
-                    request.write.sequence.store(sequence.0, Ordering::Release);
                     let resolved;
                     let body = match &request.write.body {
                         WriteBody::Resolved(tx) => match tx.to_replica_body(&self.memory) { Ok(body) => { resolved = body; resolved.body() }, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } },
@@ -112,7 +123,9 @@ impl ReplicaAppender {
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
-                    match observe_enqueue(self.logs.enqueue_replica(&envelope, request.write.block, (self.clock)()), &self.cancellation, &mut receipts).await {
+                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, (self.clock)(),
+                        |frame| request.write.stamp_append(sequence, frame));
+                    match observe_enqueue(enqueue, &self.cancellation, &mut receipts).await {
                         Ok(Some(receipt)) => { receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable)); timer.reset(); }
                         Ok(None) => { request.write.finish(Err(term_ended())); if let Some(sender) = request.durable { let _ = sender.send(Err(term_ended())); } break Ok(()); }
                         Err(error) => { request.write.finish(Err(error.clone())); if let Some(sender) = request.durable { let _ = sender.send(Err(error.clone())); } break Err(error); }
@@ -167,6 +180,7 @@ pub(crate) fn join_error(error: tokio::task::JoinError) -> Anomaly { Anomaly::fa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use async_trait::async_trait;
     use bytes::Bytes;
     use rtdb_storage::{MemoryStore, cache::BufferPool, log::{AppendReceipt, Log, LogOffset, LogRecord, LogTail, MemoryLog}};

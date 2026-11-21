@@ -8,6 +8,7 @@ mod replay_floor;
 mod driver;
 mod logs;
 mod progress;
+mod readback_identity;
 mod retirement_receipt;
 mod state;
 

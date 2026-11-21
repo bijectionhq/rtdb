@@ -173,6 +173,33 @@ A separate regression reads the predecessor's staged write and then the previous
 The proof takes one table's list of logical effects as input and assumes the segment and publication layers preserve that history.
 The concrete Arrow segment representation, block turnover, and read-back fencing still need composition with those premises. [Lean model](../../verification/lean/StagedPrefix.lean) · [Native overlay tests](../../rust/crates/tx/tests/resolution.rs) · [Snapshot construction](../../rust/crates/index/src/snapshot.rs)
 
+### A leader's read-back agrees with its pending transaction
+
+Before handing the encoded replica frame to the log provider, the append pump publishes the assigned sequence and SHA-256 fingerprint together for a pending resolved transaction.
+The driver checks an admitted resolved transaction at its own term against that pending sequence and fingerprint before the record can enter a hold buffer.
+For an oversized record, it compares the fetched frame after checking the inner term and sequence against the admitted outer envelope.
+Before applying the transaction, the driver also checks that the pending append owns the resolver's oldest staged transaction.
+That staged transaction supplies the applied rows, catalog operation, result and source progress.
+
+Lean checks that publishing requires both a confirmed append and the corresponding staged head.
+Its frame agreement theorem assumes the compared frames do not collide under the fingerprint.
+The four controls remove the sequence, record kind, fingerprint, or queue-head requirement.
+Verus checks the exact production pending-sequence predicate and rejects defaulting an absent sequence to zero or treating a later sequence as equal. [Lean model](../../verification/lean/ReadBackIdentity.lean) · [Verus study](../../verification/verus/readback_identity/area.json)
+
+A second Lean model proves that, under FIFO durability and delivery within one term, the transaction queue is the concatenation of the held read-backs, unread durable transactions and transactions awaiting durability.
+The oldest held transaction is then the pending head.
+Publishing consumes that head, and ending the term preserves the published prefix and the durable replay candidates while dropping the local pending queue.
+The model projects out control frames and leaves admission of replay candidates to the term fence. [Lean queue model](../../verification/lean/QueuedReadBack.lean)
+
+The native regressions exercise the appender and driver with an absent transaction ID at transaction zero, changed transaction metadata and error bytes, a control or unrecognized body at a pending transaction's sequence, a missing append or staged head, and a changed table payload or sequence fetched behind an oversized envelope.
+They check that a rejected record leaves the transaction's partition state, catalog effects and applied progress untouched.
+The positive oversized case reaches the original caller with the corresponding transaction result. [Native replication tests](../../rust/crates/replication/src/tests.rs)
+
+End-to-end refinement still needs the concurrent appender and driver to refine the queue model, including a provider append that becomes durable after cancellation and replay through a later term.
+The frame check applies to the native driver when it admits read-back at the current leader's term.
+The Kotlin path checks the transaction ID against the staged head and still applies the replica record's catalog operation ahead of that check.
+Inherited recovery still relies on the log and object providers to return the stored records and on the follower decoder to reconstruct the same effects.
+
 ### Limit opening and count admission
 
 The ordinary native limit opens the input before evaluating OFFSET and then FETCH.

@@ -19,8 +19,9 @@ use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, Pro
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
-use crate::logs::replica_decode_bound;
+use crate::logs::{DecodedReplica, replica_decode_bound};
 use crate::progress::{DriverRestart, stopped, term_ended};
+use crate::readback_identity::matching_present_integer;
 use crate::state::fail_pending;
 
 #[async_trait]
@@ -280,6 +281,13 @@ impl LeaderState {
     fn resolver_mut(&mut self) -> Result<&mut TxResolver> { self.resolver.as_mut().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
     fn can_poll_source(&self) -> bool { self.recovery_write.is_none() && self.cycle.accepting() }
     fn accepting(&self) -> bool { self.can_poll_source() && self.resolution.is_none() }
+    fn pending_tx_at(&self, sequence: Option<TermSequence>) -> Option<(&Arc<PendingWrite>, &Arc<ResolvedTx>)> {
+        self.pending.iter().find_map(|pending| {
+            let WriteBody::Resolved(tx) = &pending.body else { return None; };
+            let expected = pending.sequence()?;
+            matching_present_integer(sequence.map(|sequence| sequence.0), expected.0).then_some((pending, tx))
+        })
+    }
     fn enqueue(&mut self, body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, memory: &Arc<MemoryBudget>) -> Result<()> {
         let write = PendingWrite::new(body, block, completion, memory)?;
         self.appender.enqueue(Arc::clone(&write))?;
@@ -679,16 +687,23 @@ impl ReplicationDriver {
     async fn consume_record(&mut self, raw: LogRecord, decode_reservation: Option<Arc<MemoryReservation>>) -> Result<()> {
         let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, raw.metadata.offset.0)?;
         if position <= self.read_position { return Err(invalid("Replica reader did not advance")); }
-        let decoded = match decode_reservation {
-            Some(reservation) => self.logs.decode_reserved_replica(raw, reservation)?,
-            None => self.logs.decode_replica(raw)?,
-        };
-        let Some(record) = decoded else {
-            // The protobuf body can be omitted or too new for this reader to recognize.
-            self.recognized_prefix = false;
-            self.read_position = position;
-            self.complete_trie_removals();
-            return Ok(());
+        let own_term = self.leader.as_ref().map(|leader| leader.term);
+        let record = match self.logs.decode_readback(raw, decode_reservation, own_term)? {
+            DecodedReplica::Known(record) => record,
+            DecodedReplica::Unrecognized { term, sequence } => {
+                if let Some(pending) = self.own_pending_tx_at(term, sequence)
+                    && self.fence.clone().admit(term, sequence)?.verdict == Verdict::Apply
+                {
+                    let error = readback_mismatch(None);
+                    pending.finish(Err(error.clone()));
+                    return Err(error);
+                }
+                // The protobuf body can be omitted or too new for this reader to recognize.
+                self.recognized_prefix = false;
+                self.read_position = position;
+                self.complete_trie_removals();
+                return Ok(());
+            }
         };
         let observed_term = record.envelope.term;
         let (admission, record) = self.fence.admit_record(record)?;
@@ -703,7 +718,13 @@ impl ReplicationDriver {
         }
         if let Some(record) = record {
             if wins { self.try_promote().await?; }
-            let record = record.resolve_payload(&self.logs).await?;
+            let sequence = record.envelope.term_sequence;
+            let record = record.resolve_payload(&self.logs).await.inspect_err(|error| {
+                if let Some(pending) = self.own_pending_tx_at(observed_term, sequence) {
+                    pending.finish(Err(error.clone()));
+                }
+            })?;
+            self.validate_own_readback(&record)?;
             if !self.confirm_recovered_block(&record).await? {
                 self.apply_admitted(record).await?;
             }
@@ -713,6 +734,25 @@ impl ReplicationDriver {
         self.publish_status(self.role());
         if admission.verdict == Verdict::Voided { self.start_claim()?; }
         Ok(())
+    }
+    fn own_pending_tx_at(&self, term: Term, sequence: Option<TermSequence>) -> Option<&PendingWrite> {
+        let leader = self.leader.as_ref().filter(|leader| leader.term == term)?;
+        leader.pending_tx_at(sequence).map(|(pending, _)| pending.as_ref())
+    }
+    fn validate_own_readback(&self, record: &ReplicaRecord) -> Result<()> {
+        let Some(leader) = self.leader.as_ref().filter(|leader| leader.term == record.envelope.term) else { return Ok(()); };
+        let resolved = matches!(&record.envelope.message, ReplicaBody::ResolvedTx(_));
+        let Some((pending, _)) = leader.pending_tx_at(record.envelope.term_sequence) else {
+            return if resolved { Err(readback_mismatch(replica_tx_id(record))) } else { Ok(()) };
+        };
+        if resolved && pending.append_stamp().and_then(|stamp| stamp.fingerprint)
+            .zip(record.fingerprint).is_some_and(|(expected, observed)| expected == observed)
+        {
+            return Ok(());
+        }
+        let error = readback_mismatch(replica_tx_id(record));
+        pending.finish(Err(error.clone()));
+        Err(error)
     }
     async fn next_recovery_write(&mut self) -> Result<Option<Arc<PendingWrite>>> {
         let block = self.partition.value().live().block_index();
@@ -837,17 +877,15 @@ impl ReplicationDriver {
                     let leading = self.leader.is_some();
                     let own = self.leader.as_ref().is_some_and(|leader| leader.term == record.envelope.term);
                     if own {
-                        let head = self.leader.as_mut().and_then(|leader| leader.resolver.as_mut()).and_then(TxResolver::take_head);
-                        let mismatch = || Anomaly::fault("xtdb.indexer/leader-read-back-mismatch", "Replica transaction does not match the oldest staged transaction")
-                            .with_context("replica-tx-id", message.tx_id.unwrap_or_default().into());
-                        let Some(head) = head else { return Err(mismatch()); };
-                        let applied = async {
-                            if head.result().tx_key().tx_id != TxId(message.tx_id.unwrap_or_default()) {
-                                return Err(mismatch());
-                            }
+                        let leader = self.leader.as_mut().ok_or_else(term_ended)?;
+                        let head = leader.resolver_mut()?.take_head();
+                        let (pending, expected) = leader.pending_tx_at(record.envelope.term_sequence).ok_or_else(|| readback_mismatch(message.tx_id))?;
+                        let pending = Arc::clone(pending);
+                        let applied: Result<_> = async {
+                            let head = head.filter(|head| Arc::ptr_eq(head, expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
                             self.partition.apply(head.writes())?;
-                            if message.committed.unwrap_or(false) {
-                                if let Some(operation) = &message.db_op { self.effects.apply_db_op(operation).await?; }
+                            if head.result().committed() && let Some(operation) = head.db_op() {
+                                self.effects.apply_db_op(operation).await?;
                             }
                             let result = Arc::new(head.result().clone());
                             self.progress.applied(Some(head.source_position()), Some(Arc::clone(&result)), head.external_token().map(<[u8]>::to_vec))?;
@@ -856,14 +894,7 @@ impl ReplicationDriver {
                         let result = match applied {
                             Ok(result) => result,
                             Err(error) => {
-                                if let Some(leader) = &self.leader {
-                                    let pending = leader.pending.iter().find(|pending| {
-                                        matches!(&pending.body, WriteBody::Resolved(tx) if Arc::ptr_eq(tx, &head))
-                                    });
-                                    if let Some(pending) = pending {
-                                        pending.finish(Err(error.clone()));
-                                    }
-                                }
+                                pending.finish(Err(error.clone()));
                                 return Err(error);
                             }
                         };
@@ -973,7 +1004,8 @@ impl ReplicationDriver {
         let progress = self.progress.current();
         let block = self.partition.value().table_catalog().block_index().map_or(-1, |index| index.0);
         match &record.envelope.message {
-            ReplicaBody::ResolvedTx(message) => message.tx_id.unwrap_or_default() <= progress.tx_id().0,
+            ReplicaBody::ResolvedTx(message) => self.leader.as_ref().is_none_or(|leader| leader.term != record.envelope.term)
+                && message.tx_id.unwrap_or_default() <= progress.tx_id().0,
             ReplicaBody::TriesAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
             ReplicaBody::ArtefactsAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
             ReplicaBody::ArtefactsRemoved(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
@@ -1276,6 +1308,17 @@ fn check_db_op(effects: &dyn DatabaseEffects, resolver: &TxResolver, operation: 
     }
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::fault("rtdb.replication/invalid-transition", message) }
+fn replica_tx_id(record: &ReplicaRecord) -> Option<i64> {
+    match &record.envelope.message { ReplicaBody::ResolvedTx(message) => message.tx_id, _ => None }
+}
+fn readback_mismatch(tx_id: Option<i64>) -> Anomaly {
+    let error = Anomaly::fault("xtdb.indexer/leader-read-back-mismatch", "Replica transaction does not match the oldest staged transaction");
+    if let Some(tx_id) = tx_id {
+        error.with_context("replica-tx-id", tx_id.into())
+    } else {
+        error
+    }
+}
 
 fn trie_removal_unconfirmed() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.replication/trie-removal-unconfirmed", "The installed catalog and checkpoint do not confirm this trie removal")

@@ -211,8 +211,7 @@ entity TxResolver {
 
     -- The queue itself is not modelled here.
     -- What db.allium relies on is the ORDER PROPERTY that makes the queue head predictable: resolution order = append order = read-back order, and terms are unique per leader.
-    -- So an equal-term resolved transaction read back is always the matching head, which is why apply can import without re-reading the record.
-    -- It is checked rather than assumed (see LeaderAppliesOwnTx).
+    -- An equal-term resolved transaction must match the staged head before apply can import its rows (see LeaderAppliesOwnTx).
 }
 
 entity TableCatalog {
@@ -1106,6 +1105,9 @@ rule LeaderAppliesRecord {
     -- Apply one record read back off our own replica log, fenced by TERM.
     -- The fence discards anything below this term, ends this term on anything above it, and discards a rival's losing claim at this same term, its position being behind this term's.
     -- So a record reaching here carries this term, unless it was held behind the block this term inherited and drained at the adopt, having met the fence at its own position under a lower term.
+    -- The native driver matches a read-back of its own resolved transaction to the pending append at its sequence before apply or buffering.
+    -- A record at the sequence of a pending transaction must carry that transaction, including when an oversized envelope supplies its payload separately.
+    -- A mismatch faults the processor, delivers the fault to a pending caller identified by the admitted term and sequence, and leaves the transaction's rows, catalog and applied progress untouched.
     when: HandleReplicaMessage(record)
     requires: log_processor.mode = Leader
 
@@ -1130,27 +1132,27 @@ rule LeaderAppliesRecord {
 
 rule LeaderAppliesOwnTx {
     -- The leader reads its own staged transaction back at its own term and IMPORTS it, from the resolver's QUEUE HEAD.
-    -- The head still holds the transaction's rows, so nothing is re-read from the replica record; that record's only job was to confirm durability and term.
-    -- A head whose tx_id doesn't match the record just read back, or no head at all, is a fault (xtdb.indexer/leader-read-back-mismatch).
+    -- Apply must find the corresponding staged transaction at the head of the resolver queue, or it faults with xtdb.indexer/leader-read-back-mismatch.
+    -- The catalog operation below describes native apply.
+    -- The Kotlin leader currently applies the replica record's catalog operation before checking the staged head.
     --
     -- This is the point at which the transaction becomes queryable: the DURABLE head advances here, the watchers advance here, and an external caller's durability handle completes here — after, not before, the transaction is durable.
     --
     -- The database operation it carries is applied here, as a follower applies it on its own read — before the durability handle completes, so a caller that submitted an attach can use the database the moment its transaction returns.
     when: ApplyOwnRecord(record)
     requires: record.kind = ResolvedTxMessage
-    requires: record.term_id >= log_processor.leader_term
+    requires: record.term_id = log_processor.leader_term
 
-    -- Take the head FIRST, then check it.
-    -- Taking it first is what makes the failure path safe: once off the queue, the end of the term can no longer reach it, so this rule owns failing its durability handle on ANY throw here, the tx_id mismatch included.
+    -- In the native driver, the pending append retains the caller's durability handle when apply takes the staged head.
+    -- A failure applying the transaction or publishing its progress is delivered to that caller.
     let head = TakeResolvedHead(tx_resolver)
-    requires: head.tx_key.tx_id = record.tx_id
+    requires: OwnReadbackMatchesHead(record, head)
 
     ensures:
-        -- Everything reported below comes from the HEAD, not from the record: the head still holds the transaction's result, watermark stamp and token, which is exactly why the record needs no re-reading.
-        -- The two agree by construction — the head is what was stamped onto the record at append time.
+        -- The staged head supplies the rows, catalog operation, result and source progress.
         ApplyResolvedTx(tx_resolver, head)
-        if record.committed and record.db_op != null:
-            ApplyDbOpToCatalog(database.catalog, record.db_op)
+        if head.tx_result.committed and head.db_op != null:
+            ApplyDbOpToCatalog(database.catalog, head.db_op)
         watchers.notifyTx(head.tx_result, head.src_msg_id, head.external_source_token)
 }
 
@@ -1798,9 +1800,13 @@ deferred ApplyDbOpToCatalog
   -- Bring the catalog into line with a committed database operation, swallowing a caller fault: the transaction has already committed, so a node that cannot carry the instruction out holds none of a database the cluster agrees exists.
   -- See: database-lifecycle.allium AdmitInstructionCreatesEntry, RemoveBeginsTeardown
 deferred TakeResolvedHead
-  -- Remove and return the OLDEST staged transaction, passing responsibility for it to the caller, which must then import it, or fail its durability handle, on every path.
-  -- Removal precedes validation deliberately; see LeaderAppliesOwnTx.
+  -- Remove and return the oldest staged transaction for the caller to verify against the read-back it is about to apply.
+  -- A failure after removal still reaches the caller's durability handle (see LeaderAppliesOwnTx).
   -- See: live-index.allium ApplyResolvedTx
+deferred OwnReadbackMatchesHead -- see: ../../allium/live-index.allium
+  -- Match the record to the oldest staged transaction in the current term.
+  -- The native driver requires the pending append's encoded transaction and the staged transaction it owns.
+  -- The Kotlin leader compares the transaction ID with its staged head.
 deferred ApplyResolvedTx
   -- Apply on read-back: import the head's rows into the durable live tables, advance the DURABLE head to it, and complete its durability handle.
   -- See: live-index.allium ApplyResolvedTx

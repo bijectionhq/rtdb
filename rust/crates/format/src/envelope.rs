@@ -118,6 +118,27 @@ pub struct ReplicaEnvelope {
     pub message: ReplicaBody,
 }
 
+pub struct ReplicaFrame {
+    pub term: Term,
+    pub term_sequence: Option<TermSequence>,
+    pub message: Option<ReplicaBody>,
+}
+
+impl ReplicaFrame {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
+        if header != PROTOBUF_LOG_HEADER {
+            return Err(invalid(format!("Unknown replica message header: {header}")));
+        }
+        let wire = ReplicaLogMessage::decode(payload).map_err(|error| invalid(error.to_string()))?;
+        Ok(Self { term: Term(wire.term_id.unwrap_or_default()), term_sequence: wire.term_seq.map(TermSequence), message: wire.message })
+    }
+
+    pub fn into_envelope(self) -> Option<ReplicaEnvelope> {
+        self.message.map(|message| ReplicaEnvelope { term: self.term, term_sequence: self.term_sequence, message })
+    }
+}
+
 impl ReplicaEnvelope {
     pub fn encoded_len(&self) -> usize {
         1 + self.message.encoded_len() + 1 + varint_length(self.term.0 as u64)
@@ -125,16 +146,7 @@ impl ReplicaEnvelope {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
-        let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
-        if header != PROTOBUF_LOG_HEADER {
-            return Err(invalid(format!("Unknown replica message header: {header}")));
-        }
-        let wire = ReplicaLogMessage::decode(payload).map_err(|error| invalid(error.to_string()))?;
-        Ok(wire.message.map(|message| Self {
-            term: Term(wire.term_id.unwrap_or_default()),
-            term_sequence: wire.term_seq.map(TermSequence),
-            message,
-        }))
+        Ok(ReplicaFrame::decode(bytes)?.into_envelope())
     }
 
     pub fn encode(&self) -> Vec<u8> {
