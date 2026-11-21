@@ -262,7 +262,7 @@ pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usi
     let database = context.catalog.database(&scan.table.name.database)?;
     let [snapshot] = database.partitions.as_slice() else { return Ok(None); };
     let storage = &database.storage;
-    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage };
+    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false };
     let bounds = bounds(scan, snapshot, execution).await?;
     let request = crate::ScanRequest {
         database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
@@ -395,7 +395,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
                 data_type: self.scan.table.columns.get(column).cloned().unwrap_or(rtdb_types::LogicalType::Null),
             }],
             valid_time: point.clone(), system_time: point, clamp_valid_time: false,
-            iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
+            iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         };
         let memory = &self.execution.context.memory;
         let mut cursor = ScanCursor::over(scan, self.execution.clone(), None, partitions, self.storage, false).await?;
