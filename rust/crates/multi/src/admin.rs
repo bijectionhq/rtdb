@@ -324,6 +324,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
         return Err(conflict());
     }
     if fenced.lifecycle == Lifecycle::Moving {
+        await_storage_drain(from.directory, &fenced).await?;
         if target.is_none() {
             let stream = administration_stream(from.directory, &fenced, maximum_message_bytes).await?;
             rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
@@ -333,6 +334,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
             crate::reference::materialize(source_bucket.as_ref(), &prefix, target_bucket.as_ref(), &prefix).await?;
             to.keys.install(id, from.keys.key(id).await?).await?;
             let mut arrived = fenced.clone();
+            arrived.storage_regions.clear();
             arrived.activation_crashes = 0;
             arrived.move_from = Some(stream.servers);
             arrived.ensemble = choose_ensemble(to.directory, &arrived, fenced.ensemble.len()).await?;
@@ -462,7 +464,8 @@ pub(crate) async fn begin_hosted_disposal(directory: &dyn Directory, id: uuid::U
 
 /// Fences and removes an installation's serving storage. The tombstone retains its receipt.
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
-    begin_disposal(directory, id).await?;
+    let fence = begin_disposal(directory, id).await?;
+    await_storage_drain(directory, &fence).await?;
     finish_disposal(directory, storage, keys, id, maximum_message_bytes).await
 }
 
@@ -476,6 +479,7 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         (Lifecycle::Deleting, None) => {},
         _ => return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-unaccepted", format!("The directory has not accepted disposal of {id}"))),
     }
+    require_storage_drained(&fenced)?;
     let mut stream = administration_stream(directory, &fenced, maximum_message_bytes).await?;
     stream.servers.extend(fenced.replica_journals.iter().cloned());
     stream.servers.sort();
@@ -516,6 +520,38 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         }
     }).await?;
     deleted.disposal.ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
+}
+
+fn require_storage_drained(record: &DeploymentRecord) -> Result<()> {
+    if !record.storage_regions.is_empty() {
+        return Err(Anomaly::new(
+            AnomalyCategory::Unavailable,
+            "rtdb.multi/storage-not-drained",
+            format!("Installation {} still has admitted storage regions", record.id),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn await_storage_drain(directory: &dyn Directory, fence: &DeploymentRecord) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let mut current = fence.clone();
+    loop {
+        let pending = match require_storage_drained(&current) {
+            Ok(()) => return Ok(()),
+            Err(pending) => pending,
+        };
+        if start.elapsed() >= CONTROL_TIMEOUT {
+            return Err(pending);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        current = directory.deployment(&fence.id).await?
+            .filter(|current| current.epoch == fence.epoch && (
+                current.lifecycle == fence.lifecycle
+                    || fence.lifecycle == Lifecycle::Deleting && current.lifecycle == Lifecycle::Deleted
+            ))
+            .ok_or_else(|| Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/storage-drain-fence", "The installation left its storage drain fence"))?;
+    }
 }
 
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).

@@ -100,10 +100,14 @@ also fences an empty identity if retirement arrives before installation.
 Inspection reads the directory without fencing. A settled response identifies
 the retired writer epoch and hashes the receipt retained by the directory.
 
-Holders and compactors consult the current directory record before accepting
-each object mutation. Failure to read the directory leaves the mutation
-unadmitted. A provider call admitted before the fence can still be in flight
-while the reaper runs.
+Nodes register a serving storage region in the deployment record before
+opening objects. Holders and compactors consult the current directory record
+at the provider boundary before issuing a mutation. After an attachment
+closes, its directory admission is removed only after its region's provider
+work has drained, including work whose caller was cancelled. Disposal,
+cross-cell transfer and same-history recovery wait for those admissions to
+clear after fencing. A producer that exits without releasing its region
+keeps cleanup pending until its outstanding work can be accounted for.
 
 `rtdb-multi capture --id UUID --operation UUID` retains the selected
 published checkpoint and copies its catalog, table metadata and referenced
