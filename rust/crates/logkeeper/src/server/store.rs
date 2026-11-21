@@ -3,15 +3,17 @@
 use super::journal::{Captured, Journal, Recovered, Work, Write};
 use super::payload::{Item, Source, Stored};
 use super::state::{Decision, StreamState, Window};
-use crate::protocol::{Entries, Entry, Failed, RequestBody, ResponseBody};
+use crate::protocol::{Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, RequestBody, ResponseBody};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const COMPACTION_SLACK_BYTES: u64 = 1 << 20;
+const PENDING_WRITE_BYTES: usize = MAXIMUM_FRAME_BYTES + 1024;
+const MINIMUM_WRITE_CHARGE: usize = 1024;
 
 /// A stream's state; a stream with no waiting reader owns no task and no timer.
 pub(crate) struct Slot {
@@ -27,6 +29,7 @@ pub(crate) struct Store {
     journal: Arc<Journal>,
     streams: Mutex<HashMap<String, Arc<Slot>>>,
     queue: mpsc::UnboundedSender<Work>,
+    pending_writes: Arc<Semaphore>,
 }
 
 pub(crate) enum Outcome {
@@ -41,7 +44,7 @@ impl Store {
             let slot = Slot { id: stream.id, name: stream.name.clone(), state: Mutex::new(stream.state), progressed: Notify::new() };
             (stream.name, Arc::new(slot))
         }).collect();
-        Self { journal, streams: Mutex::new(streams), queue }
+        Self { journal, streams: Mutex::new(streams), queue, pending_writes: Arc::new(Semaphore::new(PENDING_WRITE_BYTES)) }
     }
 
     fn slot(&self, name: &str) -> Arc<Slot> {
@@ -54,8 +57,14 @@ impl Store {
 
     fn existing(&self, name: &str) -> Option<Arc<Slot>> { self.streams.lock().get(name).cloned() }
 
-    /// Decides a mutation and queues its events, both under the stream's lock, so the journal sees the stream's decisions in order.
-    pub fn mutate(&self, body: RequestBody) -> Outcome {
+    /// Reserves journal capacity before deciding the mutation.
+    /// The decision and submission share the stream lock, so decisions reach the journal in order.
+    pub async fn mutate(&self, body: RequestBody, frame_bytes: usize) -> Outcome {
+        let charge = frame_bytes.saturating_add(MINIMUM_WRITE_CHARGE).min(PENDING_WRITE_BYTES) as u32;
+        let Ok(admission) = self.pending_writes.clone().acquire_many_owned(charge).await else {
+            return Outcome::Now(failed("the journal has stopped"));
+        };
+        if self.queue.is_closed() { return Outcome::Now(failed("the journal has stopped")); }
         let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision>) = match body {
             RequestBody::Append(append) => (append.stream, Box::new(move |state| state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn))),
             RequestBody::Overwrite(overwrite) => (overwrite.stream, Box::new(move |state| state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn))),
@@ -71,7 +80,7 @@ impl Store {
         let decision = decide(&mut state);
         if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
         let (done, durable) = oneshot::channel();
-        if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done }).is_err() {
+        if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done, _admission: Some(admission) }).is_err() {
             return Outcome::Now(failed("the journal has stopped"));
         }
         if (state.commit, state.trim, state.dropped) != before { slot.progressed.notify_waiters(); }
@@ -89,7 +98,7 @@ impl Store {
         let streams = self.streams.lock();
         let locked: Vec<_> = streams.values().map(|slot| (slot, slot.state.lock())).collect();
         let captured = locked.iter().map(|(slot, state)| Captured { slot: Arc::clone(slot), state: (**state).clone() }).collect();
-        if self.queue.send(Work { write: Write::Compact(captured), done: oneshot::channel().0 }).is_err() { self.journal.release_compaction(); }
+        if self.queue.send(Work { write: Write::Compact(captured), done: oneshot::channel().0, _admission: None }).is_err() { self.journal.release_compaction(); }
     }
 
     pub fn check(&self, stream: &str, epoch: u64) -> ResponseBody {
@@ -173,6 +182,26 @@ mod tests {
     use bytes::Bytes;
 
     #[tokio::test]
+    async fn a_full_journal_queue_delays_the_decision_until_capacity_is_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, recovered) = Journal::open(directory.path(), false, 0).unwrap();
+        let (queue, mut work) = mpsc::unbounded_channel();
+        let store = Store::new(Arc::new(journal), recovered, queue);
+        let overwrite = |stream: &str| RequestBody::Overwrite(Overwrite {
+            stream: stream.into(), epoch: 1, from_lsn: 0, entries: Vec::new(), complete: true, commit_lsn: -1,
+        });
+        assert!(matches!(store.mutate(overwrite("first"), MAXIMUM_FRAME_BYTES).await, Outcome::Durable(_, _)));
+        let mut second = Box::pin(store.mutate(overwrite("second"), 32));
+        assert!(futures::poll!(&mut second).is_pending());
+        assert!(store.existing("second").is_none());
+        let pending = work.recv().await.unwrap();
+        assert!(futures::poll!(&mut second).is_pending());
+        drop(pending);
+        assert!(matches!(second.await, Outcome::Durable(_, _)));
+        assert!(store.existing("second").is_some());
+    }
+
+    #[tokio::test]
     async fn a_drop_queued_after_an_older_compaction_schedules_reclamation_again() {
         let directory = tempfile::tempdir().unwrap();
         let (journal, recovered) = Journal::open(directory.path(), true, 0).unwrap();
@@ -186,13 +215,13 @@ mod tests {
             entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, payload: Bytes::from(vec![1; 2 << 20]) }],
             complete: true,
             commit_lsn: 0,
-        })), Outcome::Durable(_, _)));
+        }), 2 << 20).await, Outcome::Durable(_, _)));
         let slot = store.existing("drop-me").unwrap();
         let capture = Captured { slot: Arc::clone(&slot), state: slot.state.lock().clone() };
         assert!(journal.claim_compaction());
-        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0 };
+        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0, _admission: None };
         assert!(store.queue.send(first_compaction).is_ok());
-        let Outcome::Durable(dropped, _) = store.mutate(RequestBody::DropStream(DropStream { stream: "drop-me".into(), epoch: 2 })) else {
+        let Outcome::Durable(dropped, _) = store.mutate(RequestBody::DropStream(DropStream { stream: "drop-me".into(), epoch: 2 }), 32).await else {
             panic!("the drop was refused");
         };
         let task = tokio::spawn(super::super::journal::run(Arc::clone(&journal), Arc::downgrade(&store), work));

@@ -661,6 +661,16 @@ entity LogServerStream {
     retained_bytes: Integer
 }
 
+rule AdmitJournalMutation {
+    when: JournalMutationReceived(server, mutation)
+
+    requires: PendingJournalCapacityAvailable(server, mutation)
+
+    ensures:
+        JournalCapacityReservedUntilCompletion(server, mutation)
+        MutationMayBeDecided(mutation)
+}
+
 entity LogRecord {
     deployment: DeploymentId
     epoch: Epoch

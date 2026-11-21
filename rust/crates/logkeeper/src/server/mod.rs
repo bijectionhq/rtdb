@@ -7,7 +7,7 @@ mod store;
 
 pub use journal::{JournalDigest, inspect_retained};
 
-use crate::protocol::{Request, RequestBody, Response, ResponseBody, read_frame, encode_frame};
+use crate::protocol::{Request, RequestBody, Response, ResponseBody, encode_frame, read_sized_frame};
 use bytes::BytesMut;
 use journal::Journal;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -73,9 +73,9 @@ async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, ca
     let (replies, outbox) = mpsc::unbounded_channel::<Response>();
     let writing = tasks.spawn(write_replies(writer, outbox));
     loop {
-        let request = tokio::select! {
+        let (request, frame_bytes) = tokio::select! {
             _ = cancellation.cancelled() => break,
-            request = read_frame::<Request>(&mut reader) => match request { Ok(Some(request)) => request, Ok(None) | Err(_) => break },
+            request = read_sized_frame::<Request>(&mut reader) => match request { Ok(Some(request)) => request, Ok(None) | Err(_) => break },
         };
         let id = request.id;
         let reply = |body: ResponseBody| Response { id, body: Some(body) };
@@ -101,7 +101,10 @@ async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, ca
                     let _ = replies.send(Response { id, body: Some(body) });
                 });
             }
-            Some(mutation) => match store.mutate(mutation) {
+            Some(mutation) => match tokio::select! {
+                _ = cancellation.cancelled() => break,
+                outcome = store.mutate(mutation, frame_bytes) => outcome,
+            } {
                 Outcome::Now(body) => { let _ = replies.send(reply(body)); }
                 Outcome::Durable(durable, body) => {
                     let replies = replies.clone();
