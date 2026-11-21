@@ -45,6 +45,7 @@ pub enum Request {
     /// Answers Done while the agent is serving: the controller's liveness probe.
     Ping,
     FlightEndpoint,
+    HoldingLoads,
     /// A client is using the deployment through a gateway.
     Touch { name: String },
     /// Serve the deployment's reads from a log-fed replica on this node.
@@ -75,6 +76,7 @@ pub enum Response {
     /// This member serves the deployment's reads from a replica; clients reach it at `address`.
     Subscribed { address: String },
     FlightEndpoint { address: String },
+    HoldingLoads { holdings: Vec<crate::load::HoldingLoad> },
     Done,
     Flushed { block: i64 },
     Published { position: i64 },

@@ -1674,6 +1674,9 @@ rule Rebalance {
     -- Each eligible target belongs to the deployment's placement pool.
     -- A reservation uses the source holding's identity and epoch from the plan.
     -- A conflicting reservation or a changed source ends the current pass.
+    -- Configured byte watermarks use sampled live batch and in-memory object cache charges on active writers.
+    -- A target must fit both configured watermarks after the proposed move.
+    -- A busy source samples only its local active holders.
     when: NodeOverWatermark(member, dimension)
 
     ensures:

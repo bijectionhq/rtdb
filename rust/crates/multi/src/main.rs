@@ -30,7 +30,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
-       rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
+       rtdb-multi controller --directory DIR [--rebalance MOVES] [--rebalance-tail-bytes BYTES] [--rebalance-cache-bytes BYTES] [--cell-secret FILE]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
@@ -467,7 +467,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "controller" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", 0usize)?, control: rtdb_multi::control::ControlKey(cell_secret(&arguments)?), ..Default::default() };
+            let limit = |flag| -> Result<Option<std::num::NonZeroU64>> {
+                if !arguments.present(flag) { return Ok(None); }
+                arguments.required(flag)?.parse().map(Some)
+                    .map_err(|_| usage(format!("--{flag} must be a positive byte count")))
+            };
+            let load_limits = rtdb_multi::load::LoadLimits { tail_bytes: limit("rebalance-tail-bytes")?, cache_bytes: limit("rebalance-cache-bytes")? };
+            let default_moves = if load_limits.tail_bytes.is_some() || load_limits.cache_bytes.is_some() { 8 } else { 0 };
+            let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", default_moves)?,
+                load_limits, control: rtdb_multi::control::ControlKey(cell_secret(&arguments)?), ..Default::default() };
             admin::run_controller(directory, options, cancellation).await;
             Ok(())
         }

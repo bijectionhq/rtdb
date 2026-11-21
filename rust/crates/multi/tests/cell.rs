@@ -14,7 +14,7 @@ use std::{
 use common::*;
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemoryDirectory};
 use rtdb_multi::admin;
-use rtdb_multi::control::Response;
+use rtdb_multi::control::{Request, Response};
 use rtdb_multi::keys::KeyService;
 use rtdb_multi::cells::{CellMap, MemoryCellMap};
 use rtdb_multi::deployment::CellStorage;
@@ -201,6 +201,34 @@ async fn routing_to_a_current_writer_does_not_scan_the_member_inventory() {
         drop(client);
     }
     assert_eq!(directory.membership_scans.load(Ordering::Relaxed), scans);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resource_rebalancing_moves_the_largest_tail_toward_an_eligible_node() {
+    let cell = Cell::start(2, None).await;
+    let directory = cell.directory.as_ref();
+    for (name, bytes) in [("heavy", 8192), ("light", 16)] {
+        admin::create_deployment(directory, name, "acme", 3).await.unwrap();
+        assert!(matches!(cell.node(0).agent.activate(name).await.unwrap(), Response::Held { .. }));
+        let client = connect_eventually(&cell, name).await;
+        client.simple_query(&format!("INSERT INTO docs (_id, payload) VALUES (1, '{}')", "x".repeat(bytes))).await.unwrap();
+    }
+    let snapshot = rtdb_multi::control::call(&cell.node(0).control_address.to_string(), &Request::HoldingLoads, Duration::from_secs(2), &control()).await.unwrap();
+    let Response::HoldingLoads { holdings } = snapshot else { panic!("expected the writer's active loads") };
+    assert_eq!(holdings.len(), 2);
+    let by_name: BTreeMap<_, _> = holdings.into_iter().map(|holding| (holding.name, holding.load.tail_bytes)).collect();
+    assert!(by_name["heavy"] > by_name["light"] && by_name["light"] > 0);
+    let limit = std::num::NonZeroU64::new(by_name["heavy"] + by_name["light"] / 2).unwrap();
+    let limits = rtdb_multi::load::LoadLimits { tail_bytes: Some(limit), cache_bytes: None };
+
+    assert_eq!(rtdb_multi::load::rebalance(directory, 4, limits, &control()).await.unwrap(), 1);
+    assert_eq!(cell.holder("heavy").await, Some(1));
+    assert_eq!(cell.holder("light").await, Some(0));
+    let client = connect_eventually(&cell, "heavy").await;
+    assert_eq!(values(&client, "SELECT CHAR_LENGTH(payload) FROM docs").await, ["8192"]);
+    drop(client);
+    assert_eq!(rtdb_multi::load::rebalance(directory, 4, limits, &control()).await.unwrap(), 0);
     cell.stop().await;
 }
 

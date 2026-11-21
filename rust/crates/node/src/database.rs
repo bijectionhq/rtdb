@@ -61,6 +61,8 @@ impl Database {
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
     /// Rows applied since the last block, held in the live index until the next flush.
     pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }
+    pub fn live_batch_bytes(&self) -> u64 { self.partition.value().live().live_batch_bytes() }
+    pub fn cache_bytes(&self) -> u64 { self.storage.pool_retained_bytes() as u64 }
     /// Pauses new user submissions and waits for the admitted ones to apply.
     pub async fn pause_transactions(&self) -> Result<PausedTransactions<'_>> {
         let paused = self.transaction_admission.write().await;

@@ -147,6 +147,7 @@ impl BufferPool {
     }
 
     pub fn retained_bytes(&self) -> usize { self.budget.retained.load(Ordering::Acquire) }
+    pub fn pool_retained_bytes(&self) -> usize { self.shared.retained.load(Ordering::Acquire) }
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { &self.store }
 
     /// An evicted object remains charged while a caller retains any slice of its lease.

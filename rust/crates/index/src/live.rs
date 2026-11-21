@@ -365,16 +365,18 @@ pub struct LiveIndex {
     block_index: BlockIndex,
     latest_completed_tx: Option<TransactionKey>,
     block_row_count: u64,
+    live_batch_bytes: u64,
     tables: BTreeMap<TableRef, Arc<LiveTable>>,
     config: TrieConfig,
 }
 impl LiveIndex {
     pub fn new(block_index: BlockIndex, latest_completed_tx: Option<TransactionKey>, config: TrieConfig) -> Self {
-        Self { block_index, latest_completed_tx, block_row_count: 0, tables: BTreeMap::new(), config }
+        Self { block_index, latest_completed_tx, block_row_count: 0, live_batch_bytes: 0, tables: BTreeMap::new(), config }
     }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> { self.latest_completed_tx }
     pub fn block_row_count(&self) -> u64 { self.block_row_count }
+    pub fn live_batch_bytes(&self) -> u64 { self.live_batch_bytes }
     pub fn tables(&self) -> &BTreeMap<TableRef, Arc<LiveTable>> { &self.tables }
     pub fn apply(&self, staged: &StagedWrite) -> Result<Self> {
         if staged.block_index != self.block_index || staged.predecessor != self.latest_completed_tx { return Err(invalid("Staged transaction no longer follows this live index")); }
@@ -382,6 +384,10 @@ impl LiveIndex {
         for (table, write) in &staged.tables {
             let previous = self.tables.get(table).cloned().unwrap_or_else(|| Arc::new(LiveTable::new(table.clone(), self.block_index, self.config)));
             next.tables.insert(table.clone(), Arc::new(previous.append(write, staged.tx_key.system_time)?));
+            if let Some(batch) = &write.batch {
+                let bytes = batch.owned.reservation().bytes().saturating_add(batch.headers.1.bytes());
+                next.live_batch_bytes = next.live_batch_bytes.saturating_add(bytes as u64);
+            }
         }
         next.block_row_count = next.block_row_count.checked_add(staged.row_count()?).ok_or_else(|| invalid("Block row count overflow"))?;
         next.latest_completed_tx = Some(staged.tx_key);

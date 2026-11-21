@@ -17,6 +17,7 @@ pub mod gateway;
 pub mod install;
 pub mod keys;
 pub mod lease;
+pub mod load;
 pub mod logs;
 pub mod packing;
 pub mod recovery;
