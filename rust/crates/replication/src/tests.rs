@@ -369,7 +369,7 @@ async fn applying_a_deletion_drops_this_nodes_cached_copies_of_the_collected_fil
     let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
     let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&fixture.memory)).unwrap();
     let table = TableRef::new("public", "docs");
-    write.put(table.clone(), BTreeMap::from([("_id".into(), Value::I64(1))]), Interval::ALL).unwrap();
+    write.put(table.clone(), BTreeMap::from([("_id".into(), Value::I64(1))]).into(), Interval::ALL).unwrap();
     state.apply(&write.stage().unwrap()).unwrap();
     fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key })), None).unwrap();
     fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
@@ -453,7 +453,7 @@ async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_ent
     let (handle, partition, store) = (fixture.handle.clone(), Arc::clone(&fixture.driver.partition), Arc::clone(&fixture.store));
     let writer = tokio::spawn(fixture.driver.run());
     let table = TableRef::new("public", "docs");
-    let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: table.clone(), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("value".into()))])], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
+    let transaction = SourceTransaction::new(vec![TxOp::PutDocs { table: table.clone(), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("value".into()))]).into()], &fixture.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None }], SubmitOptions::default(), &fixture.memory).unwrap();
     handle.submit_source_encoded(transaction.encode().unwrap().into_bytes(), Timestamp(100)).await.unwrap();
     let mut status = handle.watch_status();
     tokio::time::timeout(Duration::from_secs(5), async {

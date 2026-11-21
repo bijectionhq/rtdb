@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
+use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
 use crate::logs::replica_decode_bound;
@@ -245,7 +246,7 @@ async fn pending_production(production: &mut Option<Production>) -> ProductionRe
 struct LeaderState {
     term: Term, resolver: Option<TxResolver>, resolution: Option<Resolution>, production: Option<Production>, confirmed: bool,
     recovery_write: Option<Arc<PendingWrite>>,
-    held: VecDeque<ReplicaRecord>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
+    held: VecDeque<AdmittedReplica>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
     source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>, source_head: Option<ReplayHead>,
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
     deferred_commands: VecDeque<Command>,
@@ -565,7 +566,7 @@ impl ReplicationDriver {
         self.publish_status(self.role());
         Ok(())
     }
-    async fn demote(&mut self) -> Result<VecDeque<ReplicaRecord>> {
+    async fn demote(&mut self) -> Result<VecDeque<AdmittedReplica>> {
         if let Some(mut leader) = self.leader.take() {
             leader.cancellation.cancel();
             drop(leader.compactor_reset.take());
@@ -605,19 +606,20 @@ impl ReplicationDriver {
             None => self.logs.decode_replica(raw)?,
         };
         let Some(record) = decoded else { self.read_position = position; return Ok(()); };
-        let admission = self.fence.admit(record.envelope.term, record.envelope.term_sequence)?;
+        let observed_term = record.envelope.term;
+        let (admission, record) = self.fence.admit_record(record)?;
         let wins = self.claim == Some(position) && admission.opens_term();
         if let Some(claim) = &mut self.claiming {
-            if record.envelope.term == claim.term && admission.opens_term() { claim.observed = Some(position); }
+            if observed_term == claim.term && admission.opens_term() { claim.observed = Some(position); }
         }
         if self.claim == Some(position) { self.claim = None; }
         if self.leader.as_ref().is_some_and(|leader| admission.highest_term > leader.term || admission.verdict == Verdict::Voided) {
             let held = self.demote().await?;
             for held in held { self.apply_admitted(held).await?; }
         }
-        if admission.verdict == Verdict::Apply {
+        if let Some(record) = record {
             if wins { self.try_promote().await?; }
-            let record = self.logs.resolve_oversized(record).await?;
+            let record = record.resolve_payload(&self.logs).await?;
             if !self.confirm_recovered_block(&record).await? {
                 self.apply_admitted(record).await?;
             }
@@ -684,7 +686,7 @@ impl ReplicationDriver {
         Ok(())
     }
 
-    async fn apply_admitted(&mut self, record: ReplicaRecord) -> Result<()> {
+    async fn apply_admitted(&mut self, record: AdmittedReplica) -> Result<()> {
         if matches!(&record.envelope.message, ReplicaBody::NoOp(message) if message.src_msg_id.is_none()) { return Ok(()); }
         if let Some(leader) = &mut self.leader {
             if leader.resolution.is_some() {
@@ -827,7 +829,7 @@ impl ReplicationDriver {
                 }
                 ReplicaBody::BlockBoundary(_) => {
                     let prepared = self.partition.prepare_block()?;
-                    self.pending_block = Some(PendingBlock::new(record.clone(), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
+                    self.pending_block = Some(PendingBlock::new(ReplicaRecord::clone(&record), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
                     if let Some(leader) = &mut self.leader { leader.cycle = BlockCycle::Cut; }
                     self.complete_control(&record);
                     if self.leader.is_some() { self.produce_pending()?; }
