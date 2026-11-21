@@ -1,6 +1,7 @@
 = Ordered secondary indexes
 
 `CREATE INDEX orders_customer_priority ON orders (customer, priority, _id)` declares an ordered index.
+`CREATE INDEX IF NOT EXISTS` leaves an existing definition of the same name in place.
 `DROP INDEX orders_customer_priority` retires the definition.
 The catalog assigns a fresh generation when a name is reused.
 
