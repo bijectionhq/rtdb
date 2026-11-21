@@ -112,6 +112,17 @@ async fn source_barrier_refuses_a_node_without_an_indexer() {
 }
 
 #[tokio::test]
+async fn hosted_source_barrier_requires_an_authoritative_multi_holder() {
+    let (node, driver) = running(options(), services()).await;
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = reader.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("SHOW rtdb_hosted_source_barrier", &Default::default()).unwrap().unwrap();
+    let Err(error) = reader.execute_control(&statement, &[], &token).await else { panic!("standalone node certified a hosted history"); };
+    assert_eq!(error.code, "rtdb.node/hosted-source-unavailable");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn read_transaction_pinned_before_ingestion_retains_a_null_partition_time() {
     let (node, driver) = running(options(), services()).await;
     let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();

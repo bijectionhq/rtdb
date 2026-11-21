@@ -38,7 +38,7 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
     let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
     let fields = match name.as_str() {
         "clock_time" => vec![(name.as_str(), instant)],
-        "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_source_barrier" => vec![(name.as_str(), text)],
+        "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_source_barrier" | "rtdb_hosted_source_barrier" => vec![(name.as_str(), text)],
         "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
         "latest_submitted_tx" => vec![("tx_id", integer), ("system_time", instant.maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.maybe())],
         "latest_completed_txs" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("tx_id", integer), ("system_time", instant.maybe())],
@@ -204,13 +204,17 @@ impl NativeSession {
                 Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }, allocation))
             }
             ControlStatement::Show { name } => {
-                if name == "rtdb_source_barrier" {
+                let hosted_history = if matches!(name.as_str(), "rtdb_source_barrier" | "rtdb_hosted_source_barrier") {
                     if self.state.status() != TransactionStatus::Idle && !options.implicit_transaction {
                         return Err(Anomaly::incorrect("rtdb/source-barrier-in-transaction", "Complete the transaction before awaiting a source barrier"));
                     }
-                    self.service.node.await_durable_source(self.state.database(), self.service.identity.as_ref(), cancellation).await?;
-                }
-                self.show(name, statement.requires_read_transaction(), cancellation).await.map(ControlResult::Rows)
+                    self.service.node.await_durable_source(
+                        self.state.database(), self.service.identity.as_ref(), name == "rtdb_hosted_source_barrier", cancellation,
+                    ).await?
+                } else {
+                    None
+                };
+                self.show(name, statement.requires_read_transaction(), hosted_history, cancellation).await.map(ControlResult::Rows)
             },
             ControlStatement::Prepare { name, source } => {
                 allocation.reserve(size(name.len(), source.len())?)?;
@@ -261,7 +265,7 @@ impl NativeSession {
         Ok(())
     }
 
-    async fn show(&mut self, name: &str, checked: bool, cancellation: &CancellationToken) -> Result<QueryCursor> {
+    async fn show(&mut self, name: &str, checked: bool, hosted_history: Option<String>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let basis = if checked { self.state.read_basis().await? } else { self.state.inspection_basis()? };
         let context = self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), cancellation).await?
             .with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None);
@@ -290,6 +294,10 @@ impl NativeSession {
             }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
             "rtdb_ordered_system_time" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
+            "rtdb_hosted_source_barrier" => {
+                let history = hosted_history.ok_or_else(|| Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source barrier has no history"))?;
+                (vec![(name, text.clone())], vec![vec![Value::Utf8(history)]])
+            },
             "transaction_isolation" => (vec![(name, text.clone())], vec![vec![Value::Utf8("read committed".into())]]),
             "await_token" => (vec![(name, text.clone().maybe())], vec![vec![self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]]),
             "standard_conforming_strings" => (vec![(name, LogicalType::Scalar(ScalarType::Bool).maybe())], vec![vec![Value::Bool(self.state.parameter(name).is_some_and(|value| ["on", "true", "yes", "1"].contains(&value.to_ascii_lowercase().as_str())))]]),

@@ -57,7 +57,35 @@ pub const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
 const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
 
-struct LocalHolding { id: String, epoch: u64, last_touch: Instant, linearizable: bool }
+fn require_recovered_checkpoint(record: &DeploymentRecord, database: &Database) -> Result<()> {
+    let Some(required) = record.checkpoint else { return Ok(()); };
+    let block = database.status().adopted_block;
+    let recovered = block.as_ref().is_some_and(|block| {
+        let epoch = rtdb_types::StorageEpoch(record.log_epoch);
+        let index = block.block_index().0;
+        let boundary = block.boundary_replica_position().map_or(-1, |pos| pos.after_offset(epoch));
+        let source = block.latest_source_position().map_or(-1, |pos| pos.after_offset(epoch));
+        let system_time = block.latest_completed_tx().map_or(i64::MIN, |tx| tx.system_time.0);
+        (index == required.block && boundary == required.boundary && source == required.source && system_time == required.system_time)
+            || (index > required.block && boundary >= required.boundary && source >= required.source && system_time >= required.system_time)
+    });
+    if recovered {
+        Ok(())
+    } else {
+        Err(Anomaly::new(
+            AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-not-recovered",
+            format!("{} has not recovered the directory's durable checkpoint", record.name),
+        ))
+    }
+}
+
+struct LocalHolding {
+    id: String,
+    epoch: u64,
+    last_touch: Instant,
+    linearizable: bool,
+    database: std::sync::Weak<Database>,
+}
 /// `fragments` keeps a replica open for the fragments other nodes send it, whatever the deployment's read width.
 struct LocalSubscription { id: String, last_touch: Instant, opened: Instant, role: Role, fragments: bool }
 
@@ -148,11 +176,18 @@ impl NodeAgent {
             let configuration = self.holder_config(&record, members)?;
             let database = self.node.database_or_attach(record.name.clone(), configuration).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the deployment"))?;
-            self.await_leadership(&record.name, &database).await
+            self.await_leadership(&record.name, &database).await?;
+            if record.linearizable_reads {
+                require_recovered_checkpoint(&record, &database)?;
+            }
+            Ok::<_, Anomaly>(database)
         }.await;
         match opened {
-            Ok(()) => {
-                self.holdings.lock().insert(record.name.clone(), LocalHolding { id: record.id.clone(), epoch: record.epoch, last_touch: Instant::now(), linearizable: record.linearizable_reads });
+            Ok(database) => {
+                self.holdings.lock().insert(record.name.clone(), LocalHolding {
+                    id: record.id.clone(), epoch: record.epoch, last_touch: Instant::now(),
+                    linearizable: record.linearizable_reads, database: Arc::downgrade(&database),
+                });
                 Ok(Response::Held { epoch: record.epoch, address: self.address.clone() })
             }
             Err(error) => {
@@ -190,7 +225,30 @@ impl NodeAgent {
     /// Before a query on a deployment held with linearizable reads, confirms with a quorum of its logkeepers that no later holder has sealed its stream (`ServeLinearizableReadOnWriter`).
     pub async fn confirm_read(&self, name: &str) -> Result<()> {
         let Some(id) = self.holdings.lock().get(name).filter(|holding| holding.linearizable).map(|holding| holding.id.clone()) else { return Ok(()) };
-        let writer = self.writers.lock().get(&id).and_then(std::sync::Weak::upgrade)
+        self.confirm_holder(name, &id).await
+    }
+
+    pub async fn confirm_hosted_read(&self, database: &Database) -> Result<String> {
+        let name = database.name();
+        let unavailable = || Anomaly::new(
+            AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node does not hold a linearizable database for {name}"),
+        );
+        let (id, epoch) = self.holdings.lock().get(name)
+            .filter(|holding| holding.linearizable && std::ptr::eq(holding.database.as_ptr(), database))
+            .map(|holding| (holding.id.clone(), holding.epoch))
+            .ok_or_else(unavailable)?;
+        let record = self.directory.deployment(&id).await?
+            .filter(|record| record.linearizable_reads && record.epoch == epoch
+                && record.holder.as_ref() == Some(&self.member())
+                && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined))
+            .ok_or_else(unavailable)?;
+        require_recovered_checkpoint(&record, database)?;
+        self.confirm_holder(name, &id).await?;
+        Ok(id)
+    }
+
+    async fn confirm_holder(&self, name: &str, id: &str) -> Result<()> {
+        let writer = self.writers.lock().get(id).and_then(std::sync::Weak::upgrade)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}")))?;
         match tokio::time::timeout(CONFIRM_WITHIN, writer.confirm_leadership()).await {
             Ok(Ok(())) => Ok(()),
