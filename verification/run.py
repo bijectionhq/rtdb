@@ -30,10 +30,16 @@ def clone_file(relative, directory):
 
 
 def run_case(command, directory, evidence, case, env=None):
+    timeout = 300 if command[0] == "cargo" else 120
+    (evidence / f"{case}.command.json").write_text(json.dumps({
+        "command": command,
+        "directory": str(directory),
+        "timeout_seconds": timeout,
+    }, indent=2) + "\n")
     try:
         result = subprocess.run(
             command, cwd=directory, text=True, capture_output=True,
-            timeout=300 if command[0] == "cargo" else 120, env=env,
+            timeout=timeout, env=env,
         )
     except subprocess.TimeoutExpired as error:
         (evidence / f"{case}.stdout").write_bytes(error.stdout or b"")
@@ -678,6 +684,17 @@ def main():
         parser.error("local proof execution requires BIJECTION_LOCAL_EXECUTION=owner-authorized")
     args.evidence = args.evidence.resolve()
     args.evidence.mkdir(parents=True, exist_ok=False)
+    tools = {}
+    for name in ("lean", "verus", "z3", "java", "tlc", "alloy", "apalache", "maude"):
+        executable = Path(getattr(args, name)).resolve()
+        with executable.open("rb") as handle:
+            tools[name] = {"path": str(executable), "sha256": hashlib.file_digest(handle, "sha256").hexdigest()}
+    (args.evidence / "run.json").write_text(json.dumps({
+        "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "rust_boundary": args.rust_boundary,
+        "native_replay": args.native_replay,
+        "tools": tools,
+    }, indent=2) + "\n")
     source_paths = [
         path for path in (ROOT / "verification").rglob("*")
         if path.is_file() and path.suffix in {".lean", ".tla", ".cfg", ".als", ".maude", ".py", ".rs", ".json", ".tsv", ".smt2"}
@@ -694,6 +711,8 @@ def main():
         "rust/crates/index/src/trie_catalog.rs",
         "rust/crates/maintenance/src/gc.rs",
         "rust/crates/maintenance/tests/gc.rs",
+        "rust/crates/maintenance/src/merge/planner.rs",
+        "rust/crates/trie/src/bucketer.rs",
         "rust/crates/conformance/src/faults.rs",
         "rust/crates/conformance/tests/node_faults.rs",
         "rust/crates/conformance/tests/recovery.rs",

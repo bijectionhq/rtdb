@@ -75,7 +75,8 @@ Reclamation liveness requires readers to release or expire and storage calls to 
 == Run the studies
 
 Use an owner-authorized local execution from the checkout root.
-The runner uses the supplied executables and JARs, writes each mutation into a disposable directory, and records per-case diagnostics and input hashes.
+The runner uses the supplied executables and JARs, writes each mutation into a disposable directory, and records per-case commands, diagnostics and input hashes.
+The run record names the source revision, execution options and SHA-256 of each supplied tool or launcher.
 It requires a fresh output directory.
 
 [source,sh]

@@ -16,7 +16,9 @@ fn expand(segment: usize, index: usize, inputs: &[InputSegment], output: &mut Ve
 
 pub(super) fn matches_path(iid: Iid, path: &[u8]) -> bool { path.iter().enumerate().all(|(depth, expected)| bucket(iid, depth) == *expected) }
 
-pub(super) fn bucket(iid: Iid, depth: usize) -> u8 { (iid.0[depth / 4] >> (6 - 2 * (depth % 4))) & 3 }
+pub(super) fn bucket(iid: Iid, depth: usize) -> u8 {
+    rtdb_trie::base4_bucket(&iid.0, depth).expect("the compaction path fits in the IID")
+}
 
 pub(super) fn plan(inputs: &[InputSegment], part: &[u8]) -> Result<Vec<Task>> {
     if part.len() > 64 || part.iter().any(|bucket| *bucket > 3) { return Err(crate::invalid("Compaction IID path is invalid")); }

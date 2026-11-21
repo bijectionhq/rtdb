@@ -374,3 +374,16 @@ The Rust checks included replica admission compile failures, 4,096 temporal obse
 The SHA-256 of the combined run's `inputs.json` is
 `da019a9521a95b5bf821e946da3ca0e85c5bcfa5cccfb213e51bd4ecc9248c25`.
 The later overlapping-group change has its focused TLC and Rust evidence above.
+
+== IID bucket agreement
+
+The default trie bucketer and compaction planner now use the same Rust function.
+Verus verified seven obligations in link:../verus/iid_partition/proof.rs[the IID partition area].
+For every 128-bit identifier, the function returns the corresponding big-endian base-four digit at depths 0 through 63 and refuses greater depths.
+Its arithmetic specification uses division and remainder, and the executable uses a shift and mask.
+Two production controls select only 63 digits or collapse all valid depths to bucket zero.
+With each local contract also weakened, the independent final-digit or bucket coverage law fails.
+
+All five trie contract tests and all 18 maintenance merge tests passed.
+The proof concerns default base-four extraction and assumes callers use their checked depth.
+It leaves the alternative-width paths, query range endpoints, event equivalence and selection across a complete trie catalog to separate proofs.

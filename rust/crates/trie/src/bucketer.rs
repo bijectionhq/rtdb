@@ -19,7 +19,11 @@ impl Bucketer {
     pub fn level_bits(self) -> u8 { self.level_bits }
 
     pub fn bucket(self, iid: Iid, level: usize) -> Result<u8> {
-        if level >= self.max_depth() { return Err(Anomaly::incorrect("rtdb/trie-depth", "IID bucketing exceeds 128 bits")); }
+        let depth_error = || Anomaly::incorrect("rtdb/trie-depth", "IID bucketing exceeds 128 bits");
+        if self == Self::DEFAULT {
+            return crate::base4_bucket(&iid.0, level).ok_or_else(depth_error);
+        }
+        if level >= self.max_depth() { return Err(depth_error()); }
         let bit = level * self.level_bits as usize;
         Ok((iid.0[bit / 8] >> (8 - self.level_bits as usize - bit % 8)) & (self.width() - 1) as u8)
     }

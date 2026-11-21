@@ -1,9 +1,11 @@
 mod bucketer;
+mod partition_step;
 mod memory;
 mod merge;
 mod metadata;
 
 pub use bucketer::{Bucketer, Path};
+pub use partition_step::base4_bucket;
 pub use memory::{IidReader, Leaf, MemoryHashTrie, PersistedNode, PersistedTrie, TrieConfig, TrieNode};
 pub use merge::{EventMerge, EventRow, RowRef};
 pub use metadata::{ColumnSummary, Comparison, PageSummary, PruningOptions, ScalarBounds, TemporalSummary, select_pages};
