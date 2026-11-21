@@ -1107,3 +1107,50 @@ It checked 24 TLC baseline configurations and the registered controls and witnes
 The native replay and Rust boundary flags were omitted in this combined run.
 Its input manifest SHA-256 is `9db36db755083ddc52a18203d897c48d7771710baef0854202f4a7311affd4f1`.
 See the link:../README.adoc#_run_the_studies[runner command and tool versions].
+
+=== Durable holds for Multi's ordinary catch-up
+
+Commit `e298879a0` stores each nonempty catch-up window as a recovery hold on the same deployment record as the authorized replica trim.
+The serving cursor captures the observed committed tip and registers its first required position before opening the provider cursor.
+The holder certifies a trim strictly below both the published checkpoint boundary and the least position in any recovery hold.
+The directory CAS validates both observations before physical trim can begin.
+The hold ends when the cursor has delivered its captured tip or when the cursor and its pending read have been dropped.
+The serving-region drain keeps whole-residence disposal behind outstanding holds.
+
+The release worker survives cancellation of its opener and uses the storage-region close CAS to fence an ambiguous admission.
+The reaper can act on a drained local witness or a confirmed stop of the exact hosted task.
+A missing stop witness leaves the hold in place.
+The local reaper test clears a discharged witness while preserving another live hold at the same offset.
+The local cell test blocks the reply to a successful hold registration, publishes a newer checkpoint, observes a real logkeeper trim that retains the first required record, then checks the subscriber's SQL rows and later trim progress.
+
+The native run at `a456fd6c5` passed 98 library tests and 76 cell tests.
+The rebase to `e298879a0` changed independent ordered-index proof files and preserved the tested Rust, Allium, and Verus sources byte for byte.
+
+[source,sh]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_TARGET_DIR=../target \
+  CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 cargo test --offline --locked -p rtdb-multi --lib --test cell
+----
+
+Verus verifies six obligations in the production replica-trim area.
+The additional single control drops the earliest hold from the cap.
+The joint control changes the contract along with the implementation, and the explicit retention law still fails.
+The Lean and TLC models cover closed and ambiguous holds under their stated authority and provider premises.
+The Rust arithmetic proof assumes its supplied minimum reflects the directory record, and runtime evidence for that adapter comes from the local cell case.
+
+The focused `verify_recovery_hold_replay` and `verify_multi_trim_admission` runner cases both passed on the landed Rust source.
+The first control omits holds from the trim input and fails the physical-retention assertion in the real cell test.
+The second omits the authorized-prefix check and fails the pending-trim admission assertion.
+Both expected failures ran with one selected test apiece.
+The originals have SHA-256 `0872a179d04164527539ef1af82ef1bfa40b11a7934f59e494c2a2bfabebb53e` for `agent.rs` and `e1e941202be4c3a5662c48ec9ffa506b89fc54c01b2776907ed13883b3841d29` for `recovery_holds.rs`.
+Both cases can be selected through the runner's `--native-replay` lane.
+
+The production hold covers an ordinary Multi startup's captured replica suffix.
+Checkpoint-object reachability across authorities, the live tail after catch-up, provider-side proof of hosted stop and drain, and retained-history reads for separate exact restore paths have different lifetime obligations.
+
+The combined formal runner passed at `a456fd6c5` with Lean, Verus, Z3, TLC, Apalache, Alloy, Maude, mCRL2, and AutoHyper.
+It exercised 24 TLC baseline configurations and the registered controls and witnesses.
+The native replay and Rust boundary flags were omitted from the combined run, and the focused native results are recorded above.
+The input manifest SHA-256 is `1b8ebc14ef98cfa0ce628c009e7d3607635e40aec0364a702d410a788071bf21`. link:../README.adoc#_run_the_studies[Runner command and tool versions]
