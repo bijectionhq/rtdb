@@ -1960,6 +1960,14 @@ async fn ordered_index_serves_later_pages_after_independent_data_compaction() {
     let query = "SELECT _id FROM orders WHERE priority >= 520 ORDER BY priority, _id LIMIT 2";
     assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(520)], vec![Value::I64(521)]]);
     assert!(observer.take().is_empty());
+
+    let reverse = "SELECT _id FROM orders WHERE priority < 520 ORDER BY priority DESC, _id DESC LIMIT 2";
+    assert_eq!(rows(session.query_sql(reverse, vec![]).await.unwrap()).await, [vec![Value::I64(519)], vec![Value::I64(518)]]);
+    assert!(observer.take().is_empty());
+
+    let gap = "SELECT _id FROM orders WHERE priority > 519 AND priority < 520 ORDER BY priority, _id LIMIT 1";
+    assert!(rows(session.query_sql(gap, vec![]).await.unwrap()).await.is_empty());
+    assert!(observer.take().is_empty());
     stop(&node, driver).await;
 }
 

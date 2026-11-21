@@ -4,6 +4,7 @@ mod domain;
 mod key;
 mod maintenance;
 mod projection;
+mod seek;
 mod tree;
 
 use std::{collections::BTreeMap, sync::Arc};

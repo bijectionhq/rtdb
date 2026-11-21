@@ -20,6 +20,7 @@ use super::{
     format_error,
     key::{Atom, Bucket},
     maintenance::cancelled,
+    seek,
 };
 
 const FANOUT: usize = 64;
@@ -608,22 +609,21 @@ impl Cursor {
                 Page::Leaf(entries) => entries.len(),
                 Page::Branch(children) => children.len(),
             };
-            if *offset == size {
+            let Some(slot) = seek::slot(size, *offset, self.reverse) else {
                 self.pages.pop();
                 continue;
-            }
-            let slot = if self.reverse {
-                size - 1 - *offset
-            } else {
-                *offset
             };
             *offset += 1;
             match &node.page {
                 Page::Leaf(entries) => {
                     let key = &entries[slot].key;
-                    if position(key) == after {
+                    let found = position(key);
+                    if found == after {
                         self.pages.clear();
                         return Ok(None);
+                    }
+                    if found == before {
+                        return Err(format_error("Ordered index seek lost its lower boundary"));
                     }
                     return Ok(Some(entries[slot].clone()));
                 }
@@ -671,26 +671,30 @@ impl Cursor {
                 Page::Leaf(entries) => {
                     let offset = if self.reverse {
                         entries.len()
-                            - entries.partition_point(|entry| position(&entry.key) != before)
+                            - seek::partition(entries.len(), |i| {
+                                position(&entries[i].key) != before
+                            })
                     } else {
-                        entries.partition_point(|entry| position(&entry.key) == before)
+                        seek::partition(entries.len(), |i| position(&entries[i].key) == before)
                     };
                     self.pages.push((node, offset));
                     return Ok(Some(()));
                 }
                 Page::Branch(children) => {
-                    let slot = if self.reverse {
-                        children.partition_point(|child| position(child.first()) != before) - 1
+                    let skipped = if self.reverse {
+                        children.len()
+                            - seek::partition(children.len(), |i| {
+                                position(children[i].first()) != before
+                            })
                     } else {
-                        children.partition_point(|child| position(child.last()) == before)
+                        seek::partition(children.len(), |i| position(children[i].last()) == before)
                     };
-                    let offset = if self.reverse {
-                        children.len() - slot
-                    } else {
-                        slot + 1
-                    };
+                    let slot =
+                        seek::slot(children.len(), skipped, self.reverse).ok_or_else(|| {
+                            format_error("Ordered index seek contradicts its page fences")
+                        })?;
                     link = children[slot].clone();
-                    self.pages.push((node, offset));
+                    self.pages.push((node, skipped + 1));
                 }
             }
         }
