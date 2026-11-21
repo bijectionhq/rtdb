@@ -182,6 +182,40 @@ def verify_ceiling(args, scratch, history):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 
+def verify_reader_retention(args, scratch):
+    path = Path("verification/lean/ReaderRetention.lean")
+    controls = {
+        "baseline": None,
+        "include-expiry": (
+            "readerClock + skewBound + ioBound < expiry",
+            "readerClock + skewBound + ioBound ≤ expiry",
+            ["lease_read_finishes_before_reclamation"],
+        ),
+        "drop-on-close": (
+            "opened := false, pinned := decide (0 < s.active)",
+            "opened := false, pinned := false",
+            ["pin_step_preserves_entitlement"],
+        ),
+    }
+    allowed = {"propext", "Classical.choice", "Quot.sound"}
+    for name, mutation in controls.items():
+        case = f"lean-reader-retention-{name}"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        if mutation:
+            replace_once(source, mutation[0], mutation[1])
+        result = run_case([args.lean, str(path)], directory, args.evidence, case)
+        if mutation:
+            observed = lean_error_theorems(source, path, result.stdout)
+            if not result.returncode or observed != mutation[2]:
+                raise ValueError(f"{case}: expected {mutation[2]}, observed {observed}")
+        else:
+            audited = re.findall(r"depends on axioms: \[([^\]]*)\]", result.stdout)
+            if result.returncode or len(audited) != 3 or any(set(axioms.split(", ")) - allowed for axioms in audited):
+                raise ValueError("Lean reader-retention proof or axiom audit failed")
+        print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
+
+
 def verify_lean(args, scratch):
     path = Path("verification/lean/History.lean")
     controls = {
@@ -228,6 +262,7 @@ def verify_lean(args, scratch):
         if not mutation:
             env = os.environ | {"LEAN_PATH": str(directory)}
             verify_ceiling(args, scratch, directory)
+            verify_reader_retention(args, scratch)
             independence = Path("verification/lean/Minimality.lean")
             clone_file(independence, directory)
             checked = run_case(
@@ -329,6 +364,13 @@ TLA_CASES = (
     ("LeaseAdmission", "coordinated-reader-pin", ('Mode = "validated_lease"', 'Mode = "pin"'), None),
     ("LeaseAdmission", "age-only-collection", ('Mode = "validated_lease"', 'Mode = "age_only"'), "LiveReaderHasObject"),
     ("LeaseAdmission", "stale-follower-admission", ('Mode = "validated_lease"', 'Mode = "stale_follower"'), "LiveReaderHasObject"),
+    ("ReaderIO", "bounded-reader-io", None, None),
+    ("ReaderIO", "pinned-reader-io", ('Mode = "lease"', 'Mode = "pin"'), None),
+    ("ReaderIO", "reader-io-raw-clock", ('Mode = "lease"', 'Mode = "raw_clock"'), "InflightHasObject"),
+    ("ReaderIO", "reader-io-inclusive-deadline", ('Mode = "lease"', 'Mode = "inclusive_deadline"'), "InflightHasObject"),
+    ("ReaderIO", "reader-io-overruns", ('Mode = "lease"', 'Mode = "unbounded_io"'), "InflightHasObject"),
+    ("ReaderIO", "reader-io-release-on-close", ('Mode = "lease"', 'Mode = "release_during_io"'), "InflightHasObject"),
+    ("ReaderIO", "reader-io-failover-loses-pin", ('Mode = "lease"', 'Mode = "forget_pin_on_failover"'), "InflightHasObject"),
     ("Checkpoint", "checkpoint-root-last", None, None),
     ("Checkpoint", "checkpoint-root-after-data", ('Mutation = "none"', 'Mutation = "root_after_data"'), "CompletePublishedRoot"),
     ("Checkpoint", "checkpoint-lost-dependency", ('Mutation = "none"', 'Mutation = "durability_lie"'), "CompletePublishedRoot"),

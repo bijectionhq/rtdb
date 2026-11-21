@@ -114,6 +114,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   It checks one root and three dependencies with finite failures, including early publication, loss of an acknowledged dependency, and log trimming followed by a listing omission.
   It compares an acknowledged pending copy with a copy whose completion is checked.
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
+* `tla/ReaderIO.tla` separates admission and in-flight I/O, with controls for clock error, expiry, overrun, release, and authority change.
+  `lean/ReaderRetention.lean` proves strict lease timing and preservation of an abstract counted pin, with matching expiry and close controls.
 * `alloy/Reclamation.als` independently checks the structural last-reference rule over a finite scope, including one deliberately faulty collector.
 * `smt/rank-bound.smt2` checks the exact-real inequalities behind the binary64 score bound under the normal-rounding model and its two negative controls.
   `smt/rank-witness.smt2` checks the concrete counterexample with exact binary64 operations.

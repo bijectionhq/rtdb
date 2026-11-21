@@ -263,3 +263,29 @@ TLC reran 11 passing bounded configurations and found counterexamples in all 18 
 
 The proof covers the actual vector operations under the standard Verus vector specifications.
 The allocation and event shell, production input order and the full resolver's assembly of fragments still rely on source inspection and replay.
+
+== Integrated main and in-flight reader obligations
+
+The combined runner passed with both Rust options from `95c6b37d6`, after integrating the FTS architecture experiments and the existing verification branch.
+The exact input manifest SHA-256 was `d67ef6fb71fa9c8cb0e6e8eee5e89d6dd7409a7fd0e7499001e02dfe75bfb7c6`.
+A separate native package run passed 99 tests, including 18 node search tests, and the FTS architecture benchmark example compiled.
+The combined run checked all five Verus areas and 18 associated controls and replayed the temporal, score, checkpoint and Azure observations.
+
+A follow-on study distinguishes permission to start a read from the obligation to keep its object available during I/O.
+Lean proves that completion precedes the collection threshold if the authority bounds the reader's clock error, the read starts with strict room for its full I/O bound, and the provider meets that bound.
+A second Lean result proves that an atomic pin protocol preserves protection under arbitrary histories and any count of active operations.
+A control admitting equality at expiry fails the lease theorem.
+A control releasing the pin on handle close fails the inductive pin step.
+All three audited theorems use standard Lean axioms.
+
+TLC explored 1,238 states for the lease and 3,664 states for the pin.
+Five weakened variants violate `InflightHasObject`.
+They omit the clock margin, admit equality at expiry, allow I/O to overrun, release a pin before active I/O ends, or forget a pin during authority change.
+The model permits terminal states at its finite time bound.
+Explicit grouping of the pin assignments on close and finish matters.
+The release-on-close mutant remained green before that grouping was corrected.
+
+These are model results for the checked retention contracts.
+The lease result assumes completion or cancellation that is conclusive at the provider, not just a caller timeout.
+The pin result assumes atomic registration and retention across the authority's relevant lifecycle.
+The earlier native cursor attempt timed out and does not establish a production counterexample.
