@@ -2,6 +2,8 @@
 
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use ring::rand::{SecureRandom, SystemRandom};
@@ -32,31 +34,34 @@ impl LocalKeyService {
     }
     fn path(&self, deployment: &str) -> PathBuf { self.directory.join(format!("{deployment}.key")) }
 
-    fn publish(&self, path: &Path, contents: &[u8], withdraw: bool) -> Result<()> {
-        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-        let mut pending = File::options().write(true).create_new(true).open(&temporary).map_err(io)?;
-        let published = (|| -> std::io::Result<()> {
-            pending.write_all(contents)?;
-            pending.sync_all()?;
-            if withdraw {
-                fs::rename(&temporary, path)?;
-            } else {
-                // Provisioning cannot overwrite another writer's key or undo withdrawal.
-                match fs::hard_link(&temporary, path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        })();
-        drop(pending);
-        match fs::remove_file(&temporary) {
-            Ok(()) => {}
+    fn lock_key(&self, path: &Path) -> Result<File> {
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .map_err(io)?;
+        lock.lock().map_err(io)?;
+        match fs::remove_file(path.with_extension("pending")) {
+            Ok(()) => self.sync_directory()?,
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(io(error)),
         }
-        published.map_err(io)?;
+        Ok(lock)
+    }
+
+    fn publish(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        let temporary = path.with_extension("pending");
+        let mut options = File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut pending = options.open(&temporary).map_err(io)?;
+        pending.write_all(contents).map_err(io)?;
+        pending.sync_all().map_err(io)?;
+        drop(pending);
+        fs::rename(temporary, path).map_err(io)?;
         self.sync_directory()
     }
 
@@ -65,11 +70,17 @@ impl LocalKeyService {
     }
     fn local_key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
         let path = self.path(deployment);
+        let _lock = self.lock_key(&path)?;
         match fs::read(&path) {
-            Ok(bytes) => decode_key(deployment, bytes),
+            Ok(bytes) => {
+                let key = decode_key(deployment, bytes)?;
+                self.sync_directory()?;
+                Ok(key)
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                self.publish(&path, &new_key()?, false)?;
-                decode_key(deployment, fs::read(&path).map_err(io)?)
+                let key = new_key()?;
+                self.publish(&path, &key)?;
+                Ok(key)
             }
             Err(error) => Err(io(error)),
         }
@@ -95,18 +106,25 @@ impl KeyService for LocalKeyService {
 
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()> {
         let path = self.path(deployment);
-        self.publish(&path, &key, false)?;
-        if decode_key(deployment, fs::read(&path).map_err(io)?)? != key {
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/key-conflict", format!("A different key is already installed for {deployment}")));
+        let _lock = self.lock_key(&path)?;
+        match fs::read(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => self.publish(&path, &key),
+            Err(error) => Err(io(error)),
+            Ok(bytes) => {
+                if decode_key(deployment, bytes)? != key {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/key-conflict", format!("A different key is already installed for {deployment}")));
+                }
+                self.sync_directory()
+            }
         }
-        Ok(())
     }
     async fn destroy(&self, deployment: &str) -> Result<()> {
         let path = self.path(deployment);
+        let _lock = self.lock_key(&path)?;
         if fs::metadata(&path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0) {
             return self.sync_directory();
         }
-        self.publish(&path, &[], true)
+        self.publish(&path, &[])
     }
 }
 
@@ -134,7 +152,10 @@ mod tests {
         let key = keys.key("a").await.unwrap();
         assert_eq!(keys.key("a").await.unwrap(), key);
         keys.copy("a", "b").await.unwrap();
+        let interrupted = keys.path("a").with_extension("pending");
+        fs::write(&interrupted, key).unwrap();
         keys.destroy("a").await.unwrap();
+        assert!(!interrupted.exists());
         keys.destroy("a").await.unwrap();
         let keys = LocalKeyService::new(directory.path()).unwrap();
         assert!(keys.key("a").await.is_err());
