@@ -413,7 +413,13 @@ impl DeploymentRecord {
 
     /// The key custody record for one residence. Withdrawing an old
     /// residence's key cannot withdraw the current residence's key record.
-    pub fn key_id(&self) -> String { format!("{}-{}", self.id, self.incarnation) }
+    pub fn key_id(&self) -> String {
+        if self.checkpoint_stage.is_some() {
+            format!("stage-{}-{}", self.id, self.incarnation)
+        } else {
+            format!("{}-{}", self.id, self.incarnation)
+        }
+    }
 
     /// The name of a physical log stream on this residence's ensemble.
     pub fn stream(&self, kind: &str) -> String { format!("{}/{}/{kind}", self.id, self.incarnation) }

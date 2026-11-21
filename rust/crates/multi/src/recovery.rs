@@ -3,7 +3,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rtdb_directory::{Directory, HostedTask};
+use rtdb_directory::{CheckpointStageIntent, Directory, HostedTask};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -40,6 +40,11 @@ struct Request {
 enum Action {
     CaptureCheckpoint,
     RecoverCheckpoint { manifest_sha256: String },
+    StageCheckpoint {
+        source_manifest_sha256: String,
+        destination: Uuid,
+        stage_operation: Uuid,
+    },
 }
 
 #[derive(Serialize)]
@@ -58,6 +63,16 @@ enum Reply {
         manifest_sha256: String,
         epoch: u64,
         completed_at_ms: i64,
+    },
+    Staged {
+        name: String,
+        authority: Uuid,
+        capture: Uuid,
+        source_manifest_sha256: String,
+        database: String,
+        destination: Uuid,
+        stage_operation: Uuid,
+        staged_manifest_sha256: String,
     },
     Refused,
     Deferred,
@@ -138,11 +153,7 @@ impl RecoveryService {
                 })
             }
             Action::RecoverCheckpoint { manifest_sha256 } => {
-                if manifest_sha256.len() != 43
-                    || !URL_SAFE_NO_PAD
-                        .decode(&manifest_sha256)
-                        .is_ok_and(|bytes| bytes.len() == 32)
-                {
+                if !valid_manifest(&manifest_sha256) {
                     return Ok(Reply::Refused);
                 }
                 let recovery = archive::restore_checkpoint(
@@ -171,6 +182,54 @@ impl RecoveryService {
                     completed_at_ms,
                 })
             }
+            Action::StageCheckpoint {
+                source_manifest_sha256,
+                destination,
+                stage_operation,
+            } => {
+                if !valid_manifest(&source_manifest_sha256)
+                    || destination.is_nil()
+                    || destination == request.authority
+                    || stage_operation.is_nil()
+                    || installation.checkpoint_stage.is_some()
+                {
+                    return Ok(Reply::Refused);
+                }
+                let database = format!("checkpoint-stage-{destination}");
+                let stage = archive::stage_checkpoint(
+                    directory,
+                    &self.archive,
+                    &self.storage,
+                    self.keys.as_ref(),
+                    CheckpointStageIntent {
+                        operation: stage_operation,
+                        source: request.authority,
+                        capture: request.capture,
+                        source_manifest_sha256: source_manifest_sha256.clone(),
+                        destination,
+                        name: database.clone(),
+                        org: self.org.clone(),
+                    },
+                    self.hosted_task.clone(),
+                )
+                .await?;
+                let staged_manifest_sha256 = stage.staged_manifest_sha256.ok_or_else(|| {
+                    Anomaly::incorrect(
+                        "rtdb.multi/recovery-endpoint",
+                        "Checkpoint stage has no inventory receipt",
+                    )
+                })?;
+                Ok(Reply::Staged {
+                    name: installation.name,
+                    authority: request.authority,
+                    capture: request.capture,
+                    source_manifest_sha256,
+                    database,
+                    destination,
+                    stage_operation,
+                    staged_manifest_sha256,
+                })
+            }
         }
     }
 
@@ -193,6 +252,10 @@ impl RecoveryService {
             Err(_) => Reply::Deferred,
         }
     }
+}
+
+fn valid_manifest(digest: &str) -> bool {
+    digest.len() == 43 && URL_SAFE_NO_PAD.decode(digest).is_ok_and(|bytes| bytes.len() == 32)
 }
 
 pub async fn serve(
