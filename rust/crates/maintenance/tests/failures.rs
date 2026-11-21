@@ -123,6 +123,43 @@ impl CompactionExecutor for CancelThenFail {
 }
 
 #[tokio::test]
+async fn two_databases_share_a_slot_until_cancelled_uploads_finish() {
+    let slots = Arc::new(Semaphore::new(1));
+    let first = Arc::new(CancelThenFail {
+        started: Semaphore::new(0), cancelling: Semaphore::new(0), release: Semaphore::new(0),
+        error: Anomaly::new(AnomalyCategory::Interrupted, "test/cancelled", "The job was cancelled"),
+    });
+    let second = Arc::new(FailedJob { error: denied(), calls: AtomicUsize::new(0) });
+    let (first_driver, _) = CompactionDriver::new(state(), first.clone(), Arc::new(RejectPublication), 2, 1, false).unwrap();
+    let (second_driver, second_handle) = CompactionDriver::new(state(), second.clone(), Arc::new(RejectPublication), 2, 1, false).unwrap();
+    let first_cancel = CancellationToken::new();
+    let second_cancel = CancellationToken::new();
+    let mut first_run = Box::pin(first_driver.with_job_slots(slots.clone()).run(first_cancel.clone()));
+    let mut second_run = Box::pin(second_driver.with_job_slots(slots.clone()).run(second_cancel.clone()));
+
+    assert!(futures::poll!(first_run.as_mut()).is_pending());
+    assert_eq!(first.started.available_permits(), 1);
+    assert!(futures::poll!(second_run.as_mut()).is_pending());
+    assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+    first_cancel.cancel();
+    assert!(futures::poll!(first_run.as_mut()).is_pending());
+    assert_eq!(first.cancelling.available_permits(), 1);
+    assert!(futures::poll!(second_run.as_mut()).is_pending());
+    assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+
+    first.release.add_permits(1);
+    first_run.await.unwrap();
+    let mut completion = Box::pin(second_handle.compact_all());
+    assert!(futures::poll!(completion.as_mut()).is_pending());
+    assert!(futures::poll!(second_run.as_mut()).is_pending());
+    assert_eq!(completion.await.unwrap_err(), denied());
+    assert_eq!(second.calls.load(Ordering::SeqCst), 1);
+    second_cancel.cancel();
+    second_run.await.unwrap();
+    assert_eq!(slots.available_permits(), 1);
+}
+
+#[tokio::test]
 async fn shutdown_reports_actual_worker_failure_after_joining_and_does_not_report_it_twice() {
     let executor = Arc::new(CancelThenFail { started: Semaphore::new(0), cancelling: Semaphore::new(0), release: Semaphore::new(0), error: denied() });
     let observer = Arc::new(Recorder::default());

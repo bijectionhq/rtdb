@@ -41,6 +41,11 @@ Session closure leaves dedicated transaction handles independently owned.
 == Authentication and sessions
 
 Authentication accepts Basic, Client, Bearer, and anonymous trust calls according to `rtdb-auth` rules.
+A placed endpoint uses the `x-xtdb-database` header on the first authenticated call to bind the session to its local deployment.
+Use `rtdb-multi gateway --flight-listen ADDR` and the cell secret to route to the local cell's writer over the private network.
+Non-loopback Flight SQL gateways require TLS.
+The gateway sends proof of the original peer address so the writer applies the same authentication rules to forwarded calls.
+After a writer move, establish a new Flight SQL session.
 The transport peer address comes from the accepted socket.
 Each authenticated session retains a principal and an HMAC of the complete original authorization header, using a fresh service-lifetime secret.
 A repeated Basic or Client header must match that MAC.

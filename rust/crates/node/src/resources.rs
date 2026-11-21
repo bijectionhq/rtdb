@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use prost_types::Any;
-use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, storage_root}};
+use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, StorageRoot}};
 use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_storage::disk_cache::DiskCache;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
@@ -40,6 +41,8 @@ pub struct DatabaseResources {
 
 pub struct DatabaseStorage {
     pub store: Arc<dyn ObjectStore>,
+    /// How recovery finds the latest block: listing, unless the provider knows where to start.
+    pub blocks: rtdb_replication::BlockDiscovery,
     pub storage_epoch: StorageEpoch,
     pub storage_version: StorageVersion,
     /// The caller drains this region if later database assembly fails.
@@ -58,6 +61,18 @@ pub trait RemoteStorageFactory: Send + Sync {
     /// The returned store is scoped to `storage_root`, under the provider's configured prefix.
     /// Retained provider operations belong to the supplied database region, including after caller cancellation.
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>>;
+    /// A remote store normally uses a disk cache. An isolated read-only
+    /// factory may opt out to avoid retaining an extra physical copy.
+    fn use_disk_cache(&self) -> bool { true }
+    /// Wraps the store after the node's disk cache, so that whatever this adds (decryption, say) happens above the cache and the cache holds only what `open` returned.
+    async fn wrap_cached(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> { Ok(cached) }
+    /// Identifies the raw objects returned by `open` before `wrap_cached`.
+    /// Two configurations may share an identity when a matching immutable key has the same bytes in both.
+    fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<Cow<'a, [u8]>> {
+        Ok(Cow::Borrowed(&configuration.value))
+    }
+    /// How recovery should find the store's latest block; a provider that tracks it spares recovery a listing.
+    async fn block_discovery(&self, _configuration: &Any) -> Result<rtdb_replication::BlockDiscovery> { Ok(rtdb_replication::BlockDiscovery::List) }
 }
 
 #[async_trait]
@@ -212,7 +227,7 @@ impl ResourceFactory for NativeResources {
             }
             None => 0,
         };
-        storage_root(CURRENT_STORAGE_VERSION, StorageEpoch(epoch), 0, 1)?;
+        StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(epoch))?;
         Ok(())
     }
 
@@ -227,18 +242,28 @@ impl ResourceFactory for NativeResources {
                 None => None,
             }.unwrap_or(0);
             let storage_epoch = StorageEpoch(epoch);
-            let root = ObjectKey::new(storage_root(CURRENT_STORAGE_VERSION, storage_epoch, 0, 1)?)?;
+            let root = ObjectKey::new(StorageRoot::new(CURRENT_STORAGE_VERSION, storage_epoch)?.key())?;
+            let mut blocks = rtdb_replication::BlockDiscovery::List;
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
                 Some(database_config::Storage::LocalStorage(storage)) => Arc::new(LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?).join(root.as_str()), Arc::clone(&io))?),
                 Some(database_config::Storage::RemoteStorage(storage)) => {
                     let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
-                    let remote = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?.open(configuration, &root, Arc::clone(&io)).await?;
-                    let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
-                    cache.scope_in(cache_namespace(configuration, storage_epoch)?, remote, Arc::clone(&io))?
+                    let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
+                    let remote = factory.open(configuration, &root, Arc::clone(&io)).await?;
+                    blocks = factory.block_discovery(configuration).await?;
+                    let storage = if factory.use_disk_cache() {
+                        let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
+                        let identity = factory.cache_identity(configuration)?;
+                        let namespace = cache_namespace(&configuration.type_url, &identity, storage_epoch)?;
+                        cache.scope_in(namespace, remote, Arc::clone(&io))?
+                    } else {
+                        remote
+                    };
+                    factory.wrap_cached(configuration, storage).await?
                 }
             };
-            Ok(DatabaseStorage { store, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
+            Ok(DatabaseStorage { store, blocks, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened
@@ -270,10 +295,10 @@ impl ResourceFactory for NativeResources {
 
 /// Cached objects belong to the store they came from, so the namespace is the store's identity, never the database's name.
 /// A name re-attached to a different bucket, prefix or storage epoch must not be served the previous store's objects.
-fn cache_namespace(store: &Any, epoch: StorageEpoch) -> Result<ObjectKey> {
+fn cache_namespace(provider_type: &str, store_identity: &[u8], epoch: StorageEpoch) -> Result<ObjectKey> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for part in [store.type_url.as_bytes(), &store.value, &epoch.0.to_be_bytes()] {
+    for part in [provider_type.as_bytes(), store_identity, &epoch.0.to_be_bytes()] {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part);
     }
@@ -285,14 +310,14 @@ fn cache_namespace(store: &Any, epoch: StorageEpoch) -> Result<ObjectKey> {
 mod cache_namespace_tests {
     use super::*;
 
-    fn store(value: &[u8]) -> Any { Any { type_url: "type.googleapis.com/xtdb.aws.proto.S3ObjectStoreConfig".into(), value: value.to_vec() } }
-
     #[test]
     fn the_cache_namespace_follows_the_store_not_the_database_name() {
-        assert_eq!(cache_namespace(&store(b"bucket-a"), StorageEpoch(0)).unwrap(), cache_namespace(&store(b"bucket-a"), StorageEpoch(0)).unwrap());
-        assert_ne!(cache_namespace(&store(b"bucket-a"), StorageEpoch(0)).unwrap(), cache_namespace(&store(b"bucket-b"), StorageEpoch(0)).unwrap(), "another bucket or prefix");
-        assert_ne!(cache_namespace(&store(b"bucket-a"), StorageEpoch(0)).unwrap(), cache_namespace(&store(b"bucket-a"), StorageEpoch(1)).unwrap(), "another storage epoch");
+        let key = |identity: &[u8], epoch| cache_namespace("type.googleapis.com/xtdb.aws.proto.S3ObjectStoreConfig", identity, StorageEpoch(epoch)).unwrap();
+        assert_eq!(key(b"bucket-a", 0), key(b"bucket-a", 0));
+        assert_ne!(key(b"bucket-a", 0), key(b"bucket-b", 0), "another bucket or prefix");
+        assert_ne!(key(b"bucket-a", 0), key(b"bucket-a", 1), "another storage epoch");
     }
+
 }
 
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.db-catalog/invalid-db-config", message) }

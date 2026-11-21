@@ -148,7 +148,10 @@ pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: 
     Ok(file)
 }
 
-pub fn open_input(mut file: impl Read + Seek + Send + 'static, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
+pub fn open_input(
+    mut file: impl Read + Seek + Send + 'static,
+    memory: &Arc<MemoryBudget>,
+) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
     let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
     let reservation = memory.reserve(layout.opening_allocation_bound()?)?;
     let reader = ArrowFile::from_inspected_reader(file, None, layout)?;
@@ -477,6 +480,64 @@ mod tests {
                 drop((resolved, charges));
                 assert_eq!(memory.used_bytes(), 0);
             }
+        }
+    }
+
+    #[test]
+    fn row_heap_matches_flatten_and_sort_without_losing_occurrences() {
+        use std::cmp::Reverse;
+
+        let iids = [
+            Iid([0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255]),
+            Iid([128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+        let events: Vec<_> = iids.into_iter().flat_map(|iid| {
+            [i64::MAX - 1, i64::MIN + 1].map(|system_from| StoredEvent {
+                iid,
+                system_from: Timestamp(system_from),
+                valid_time: Interval::from_micros(10, 20).unwrap(),
+                operation: StoredOperation::Delete,
+                recency: None,
+            })
+        }).collect();
+
+        let mut pages = vec![Vec::new()];
+        for (index, event) in events.iter().enumerate() {
+            pages.push(vec![event.clone()]);
+            for later in &events[index..] {
+                pages.push(vec![event.clone(), later.clone()]);
+            }
+        }
+
+        let key = |event: &StoredEvent| (event.iid, Reverse(event.system_from));
+        for count in 0..=4 {
+            for mut choice in 0..pages.len().pow(count) {
+                let streams: Vec<_> = (0..count).map(|_| {
+                    let rows = pages[choice % pages.len()].clone();
+                    choice /= pages.len();
+                    rows
+                }).collect();
+                let lengths: Vec<_> = streams.iter().map(Vec::len).collect();
+                let mut expected: Vec<_> = streams.iter().flatten().map(key).collect();
+                expected.sort();
+
+                let mut heap = planner::RowHeap::new(&streams).unwrap();
+                let mut positions = vec![0; streams.len()];
+                let mut observed = Vec::with_capacity(expected.len());
+                while let Some((stream, row)) = heap.next() {
+                    assert_eq!(row, positions[stream], "merge skipped or repeated a row in a stream");
+                    positions[stream] += 1;
+                    observed.push(key(&streams[stream][row]));
+                }
+                assert_eq!(positions, lengths, "merge did not consume every input occurrence");
+                assert_eq!(observed, expected, "merge order differs from sorting the input");
+            }
+        }
+
+        for [later, earlier] in [[&events[1], &events[0]], [&events[2], &events[0]]] {
+            let unsorted = [vec![later.clone(), earlier.clone()]];
+            let error = planner::RowHeap::new(&unsorted).err().unwrap();
+            assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-time descending"));
         }
     }
 

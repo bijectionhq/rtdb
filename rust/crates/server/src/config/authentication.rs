@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use rtdb_auth::{AuthConfig, Method, MethodRule, OidcConfig, PasswordHash, Secret};
+use rtdb_auth::{AuthConfig, GrantedAccess, Method, MethodRule, OidcConfig, PasswordHash, Secret};
 use rtdb_format::config::{Yaml, YamlFields, scalar_string};
 use rtdb_types::{Anomaly, Result};
 use super::invalid;
@@ -20,7 +20,23 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
                 let hash = if tagged.tag == "Argon2id" { PasswordHash::Argon2id(encoded) } else if tagged.tag == "BCrypt" { PasswordHash::BCrypt(encoded) } else { return Err(invalid("Password hashes require !Argon2id or !BCrypt tags")); };
                 users.insert(name, hash);
             }
-            AuthConfig::UserList { users, rules: rules(fields.sequence("rules")?, Method::Password)? }
+            let mut grants = rtdb_auth::Grants::new();
+            if let Some(value) = fields.take("grants") {
+                for (user, databases) in YamlFields::new(value, "grants")?.into_entries() {
+                    let mut granted = BTreeMap::new();
+                    for (database, access) in YamlFields::new(databases, "grant")?.into_entries() {
+                        let access = match scalar_string(&access, "access")?.as_str() {
+                            "DENY" => GrantedAccess::Deny,
+                            "READ" => GrantedAccess::Read,
+                            "READ_WRITE" => GrantedAccess::Write,
+                            _ => return Err(invalid("A grant's access is DENY, READ or READ_WRITE")),
+                        };
+                        granted.insert(database, access);
+                    }
+                    grants.insert(user, granted);
+                }
+            }
+            AuthConfig::UserList { users, rules: rules(fields.sequence("rules")?, Method::Password)?, grants }
         }
         "!OpenIdConnect" => AuthConfig::OpenIdConnect(OidcConfig {
             issuer_url: fields.required_string("issuerUrl")?.parse().map_err(|_| invalid("issuerUrl must be an absolute URL"))?,

@@ -1,0 +1,22 @@
+[
+  {
+    "deployment": "tenant",
+    "worker": "worker-a",
+    "score": "641f281bd9c93fbd6ff16e7b803ac36c1d7b1055fef5844200b695b6deb54d99"
+  },
+  {
+    "deployment": "ab",
+    "worker": "c",
+    "score": "c6ffd343b263df23888fcd1dfaaa86b4f7cac07491e5aebbb0d95e313e8bbf60"
+  },
+  {
+    "deployment": "a",
+    "worker": "bc",
+    "score": "bbdac16f0e2e7dc4179ee8a353ba95bae8c66898727b0261a82e2a66757cadba"
+  },
+  {
+    "deployment": "déploiement",
+    "worker": "worker-b",
+    "score": "fc704fafb94401b74d93d2d1b612286bfec99207631ec857d1e7d8a53af309a3"
+  }
+]

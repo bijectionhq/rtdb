@@ -162,7 +162,7 @@ impl LocalLog {
         let latest = inspect(&mut file, path, options.maximum_message_bytes)?;
         crate::sync_file(&file).map_err(|error| Error::io(path, error))?;
         if let Some(parent) = path.parent() {
-            File::open(parent).and_then(|directory| crate::sync_file(&directory)).map_err(|error| Error::io(parent, error))?;
+            crate::sync_directory(parent).map_err(|error| Error::io(parent, error))?;
         }
         let path = Arc::new(path.to_path_buf());
         let progress = Arc::new(Progress::new(latest));

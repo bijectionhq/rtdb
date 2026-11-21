@@ -236,7 +236,8 @@ class PostgresSourceIntegrationTest {
         node.createConnectionBuilder().database("xtdb").build().use { conn ->
             conn.createStatement().use { stmt ->
                 stmt.execute("INSERT INTO primary_health (_id, v) VALUES ('$id', 'ok')")
-                stmt.executeQuery("SELECT v FROM primary_health WHERE _id = '$id'").use { rs ->
+                // The broker's clock can be ahead of the test driver when the insert commits.
+                stmt.executeQuery("SELECT v FROM primary_health FOR ALL VALID_TIME WHERE _id = '$id'").use { rs ->
                     assertTrue(rs.next(), "primary insert should be visible")
                     assertEquals("ok", rs.getString("v"))
                 }

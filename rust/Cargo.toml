@@ -58,6 +58,11 @@ rtdb-metrics = { path = "crates/metrics" }
 rtdb-flight-sql = { path = "crates/flight-sql" }
 rtdb-ffi = { path = "crates/ffi" }
 rtdb-tls = { path = "crates/tls" }
+rtdb-affinity = { path = "crates/affinity" }
+rtdb-directory = { path = "crates/directory" }
+rtdb-logkeeper = { path = "crates/logkeeper" }
+rtdb-multi = { path = "crates/multi" }
+rtdb-simulation = { path = "crates/simulation" }
 rtdb-text = { path = "crates/text" }
 rtdb-search = { path = "crates/search" }
 sqlparser = { path = "vendor/sqlparser", version = "=0.63.0" }
@@ -79,6 +84,7 @@ async-stream = "=0.3.6"
 http = "1"
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
+crc32fast = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
 bigdecimal = "0.4.10"
@@ -110,6 +116,9 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+aws-types = "=1.7.0"
+aws-sdk-dynamodb = "=1.132.0"
+aws-sdk-dynamodbstreams = "=1.126.0"
 uuid = { version = "1", features = ["serde", "v4"] }
 url = "2"
 

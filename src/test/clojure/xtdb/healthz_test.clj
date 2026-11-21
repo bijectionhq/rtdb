@@ -11,10 +11,10 @@
            xtdb.storage.BufferPoolKt))
 
 (defn ->healthz-url [port endpoint]
-  (format "http://localhost:%s/healthz/%s" port endpoint))
+  (format "http://127.0.0.1:%s/healthz/%s" port endpoint))
 
 (defn ->system-url [port endpoint]
-  (format "http://localhost:%s/system/%s" port endpoint))
+  (format "http://127.0.0.1:%s/system/%s" port endpoint))
 
 (t/deftest test-healthz-endpoints
   (util/with-tmp-dirs #{local-path}
@@ -158,7 +158,7 @@
 
           (t/testing "successful block flush"
             (let [resp (clj-http/post (->system-url port "finish-block") {:throw-exceptions false})]
-              (t/is (= 200 (:status resp)))))
+              (t/is (= 200 (:status resp)) (pr-str (select-keys resp [:status :headers :body])))))
 
           (xt/execute-tx node [[:put-docs :bar {:xt/id "bar1"}]])
 
@@ -170,7 +170,7 @@
 
           (t/testing "second successful block flush"
             (let [resp (clj-http/post (->system-url port "finish-block") {:throw-exceptions false})]
-              (t/is (= 200 (:status resp)))))
+              (t/is (= 200 (:status resp)) (pr-str (select-keys resp [:status :headers :body])))))
 
           (xt/execute-tx node [[:put-docs :bar {:xt/id "bar1"}]])
 

@@ -67,13 +67,12 @@ impl Drop for CloseSchedule {
 }
 
 async fn flush_and_adopt(database: &rtdb_node::Database) -> BlockIndex {
-    let target = database.status().open_block;
+    let mut status = database.watch_status();
+    let target = status.borrow().open_block;
     database.flush().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !database.status().adopted_block.is_some_and(|block| block.block_index() >= target) {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    }).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), status.wait_for(|state| {
+        state.adopted_block.as_ref().is_some_and(|block| block.block_index() >= target)
+    })).await.unwrap().unwrap();
     target
 }
 
@@ -306,9 +305,11 @@ async fn recovery_advances_after_collection_of_a_selected_table_block() {
 enum RecoveryPause { Listed, LoadingTable }
 
 async fn recover_during_block_collection(pause: RecoveryPause) {
-    use rtdb_index::{PartitionState, PartitionValue};
     use rtdb_maintenance::{BlockCollector, CycleWorker, GarbageConfig};
-    use rtdb_storage::{Error, ObjectKey};
+    use rtdb_node::ResourceFactory;
+    use rtdb_replication::{BlockDiscovery, BlockStore};
+    use rtdb_storage::{Error, ObjectKey, cache::BufferPool};
+    use rtdb_types::SourcePosition;
 
     async fn commit_checkpoint(
         node: &Node, database: &rtdb_node::Database, session: &mut rtdb_node::NativeSession, id: i64,
@@ -332,7 +333,9 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
     let mut session = writer.session("xtdb", Arc::new(Identity)).unwrap();
     let old = commit_checkpoint(&writer, &database, &mut session, 1).await;
     let table = TableRef::new("public", "docs");
-    let old_table = database.snapshot().table_entry(&table).unwrap().slug.block_key(old).unwrap();
+    let old_catalog = database.status().adopted_block.unwrap();
+    let entry = old_catalog.table_entries().unwrap().into_iter().find(|entry| entry.table == table).unwrap();
+    let old_table = entry.slug.block_key(old).unwrap();
     let (operation, phase, key) = match pause {
         RecoveryPause::Listed => (Operation::List, Phase::After, "blocks".to_owned()),
         RecoveryPause::LoadingTable => (Operation::Head, Phase::Before, old_table.clone()),
@@ -343,6 +346,7 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
         occurrence: 1, action: Action::Hold("checkpoint-open".into()),
     }], 10_000).unwrap();
     let _close = CloseSchedule(reader_schedule.clone());
+    let reader_file_size = settings.file_size_target;
     let mut reader_options = settings;
     reader_options.read_only = true;
     let reader_services = services(clock, reader_schedule.clone());
@@ -350,11 +354,15 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
     tokio::time::timeout(Duration::from_secs(10), reader_schedule.wait_for_rule(0)).await.unwrap().unwrap();
 
     let latest = commit_checkpoint(&writer, &database, &mut session, 2).await;
-    let view = database.snapshot();
-    let snapshot = PartitionValue::loaded(view.trie_catalog().clone(), view.table_catalog().clone(), Default::default()).unwrap();
-    let store = database.object_store();
+    let storage = NativeResources::default().open_storage("xtdb", database.configuration()).await.unwrap();
+    let store = &storage.store;
+    let cache = Arc::new(BufferPool::new(Arc::clone(store), 16 << 20));
+    let blocks = BlockStore::new(Arc::clone(store), cache, Arc::clone(writer.memory()), reader_file_size).unwrap();
+    let recovered = blocks.recover(
+        Default::default(), SourcePosition(-1), Timestamp(0), BlockDiscovery::At(latest),
+    ).await.unwrap();
     let collector = BlockCollector::new(
-        Arc::clone(store), Arc::new(PartitionState::new(snapshot)), Arc::new(Observer),
+        Arc::clone(store), recovered.partition, Arc::new(Observer),
         GarbageConfig { blocks_to_keep: 1, ..GarbageConfig::default() },
     ).unwrap();
     collector.collect(writer.cancellation()).await.unwrap();
@@ -362,6 +370,7 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
         assert!(matches!(store.head_fresh(&ObjectKey::new(key).unwrap()).await, Err(Error::MissingObject(_))));
     }
     store.head_fresh(&ObjectKey::new(block_key(latest).unwrap()).unwrap()).await.unwrap();
+    storage.io.close_and_wait().await;
     reader_schedule.release("checkpoint-open").unwrap();
 
     let (reader, driver) = tokio::time::timeout(Duration::from_secs(10), open).await.unwrap().unwrap()

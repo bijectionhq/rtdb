@@ -42,6 +42,9 @@ pub struct ServerDriver { listener: TcpListener, config: Arc<ServerConfig>, node
 impl ServerDriver {
     pub async fn bind(config: ServerConfig, node: Node, auth: Arc<Authenticator>) -> Result<(ServerHandle, Self)> {
         if config.maximum_connections == 0 || config.maximum_message_bytes < 4 || config.maximum_message_bytes > 0x3fff_ffff || config.authentication_timeout.is_zero() { return Err(Anomaly::incorrect("xtdb.pgwire/configuration", "PostgreSQL capacities and authentication timeout must be positive")); }
+        if config.require_tls && config.tls.is_none() {
+            return Err(Anomaly::incorrect("xtdb.pgwire/configuration", "This listener requires a TLS identity"));
+        }
         let listener = TcpListener::bind(config.address).await.map_err(network)?;
         let address = listener.local_addr().map_err(network)?;
         let shutdown = node.cancellation().child_token();
@@ -60,7 +63,7 @@ impl ServerDriver {
             while tasks.len() < self.config.maximum_connections {
                 let Some((stream, address)) = pending.pop_front() else { break; };
                 let Some(process) = next_process.checked_add(1) else { failure = Some(Anomaly::fault("xtdb.pgwire/process-id", "PostgreSQL connection identifier exhausted")); break 'accept; }; next_process = process;
-                let connection = crate::connection::ConnectionDriver::new(next_process, stream, address, self.node.clone(), Arc::clone(&self.auth), Arc::clone(&self.config), Arc::clone(&self.registry), cancellation.child_token(), draining.clone());
+                let connection = crate::connection::ConnectionDriver::new(next_process, stream, address, false, self.node.clone(), Arc::clone(&self.auth), Arc::clone(&self.config), Arc::clone(&self.registry), cancellation.child_token(), draining.clone());
                 tasks.spawn(connection.run());
             }
             state.active_connections = tasks.len(); state.pending_connections = pending.len(); self.status.send_replace(state.clone());
@@ -84,6 +87,28 @@ impl ServerDriver {
         state.active_connections = 0; state.pending_connections = 0; state.stopped = true; self.status.send_replace(state);
         failure.map_or(Ok(()), Err)
     }
+}
+
+/// Serve one read-only session on an established TLS stream. The caller
+/// authorizes entry into the stream. PgWire also applies its node authenticator.
+pub async fn serve_read_only_tls(
+    stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    node: Node,
+    auth: Arc<Authenticator>,
+    parameters: BTreeMap<String, String>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let address = stream.get_ref().0.peer_addr().map_err(network)?;
+    let mut config = ServerConfig { read_only: true, require_tls: true, ..Default::default() };
+    config.parameters.extend(parameters);
+    let registry = Arc::new(CancellationRegistry {
+        slots: Mutex::new(BTreeMap::new()),
+        observer: node.execution_observer(),
+    });
+    crate::connection::ConnectionDriver::new(
+        1, stream, address, true, node, auth, Arc::new(config),
+        registry, cancellation, CancellationToken::new(),
+    ).run().await
 }
 
 #[derive(Default)]

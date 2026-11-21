@@ -5,12 +5,12 @@ use futures::Stream;
 use prost::Message;
 use rtdb_auth::Authenticator;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_node::{Clock, Node, SessionIdentity};
+use rtdb_node::{Clock, DatabaseAccess, Node, SessionIdentity};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
-use crate::{FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::{FORWARDED_PEER_HEADER, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 #[derive(Clone)]
@@ -88,10 +88,15 @@ impl Service {
             wire::add(bytes, wire::mul(size, 16)?)
         })?;
         let reservation = self.memory().reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
+        let requested_database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose()?;
+        let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let credentials = Credentials::parse(request)?;
         let cookie = auth::cookie(request); let bearer = credentials.bearer();
         if let (Some(cookie), Some(bearer)) = (cookie, bearer) { if !auth::equal(cookie.as_bytes(), bearer.as_bytes()) { return Err(auth::unauthenticated("the session cookie and bearer token name different sessions")); } }
         let (session, minted, lease) = if let Some(id) = bearer.or(cookie) {
+            if forwarded_peer.is_some() {
+                return Err(auth::unauthenticated("Forwarded peer proof is for a new session"));
+            }
             let session = match self.0.sessions.lookup(&id.to_owned(), true) {
                 Lookup::Found(session) => session,
                 Lookup::Expired(after) => return Err(session_error(bearer.is_some(), format!("session expired after {} idle", crate::lease::duration(after)))),
@@ -105,14 +110,32 @@ impl Service {
             if let Err(error) = verified { if let Lookup::Found(removed) = self.0.sessions.take(&session.id) { removed.close(); } return Err(auth::auth_error(error)); }
             (session, false, lease)
         } else {
-            let peer = request.remote_addr().map(|address| address.ip().to_string());
+            let catalog = self.0.node.catalog();
+            let placed_name = || requested_database.filter(|name| !name.is_empty())
+                .ok_or_else(|| Status::invalid_argument("A placed Flight SQL session requires x-xtdb-database"));
+            let (peer, verified_attachment) = if let Some(proof) = forwarded_peer {
+                let verifier = self.0.config.forwarded_peer.as_ref()
+                    .ok_or_else(|| auth::unauthenticated("This listener does not accept forwarded peers"))?;
+                let proof = proof.to_str().map_err(|_| auth::unauthenticated("Invalid forwarded peer proof"))?;
+                let attachment = catalog.database(placed_name()?).map_err(status)?;
+                let peer = verifier.verify(proof, &attachment).map_err(auth::auth_error)?;
+                (Some(peer.to_string()), Some(attachment))
+            } else {
+                (request.remote_addr().map(|address| address.ip().to_string()), None)
+            };
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
-            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, self.memory().reserve(1024).map_err(status)?));
+            let placement = if catalog.is_placed() {
+                let name = placed_name()?;
+                caller.principal.authorize_database(name, DatabaseAccess::Read).map_err(status)?;
+                match verified_attachment { Some(attachment) => Some(attachment), None => Some(catalog.database(name).map_err(status)?) }
+            } else { None };
+            let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
+            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), self.memory().reserve(capacity).map_err(status)?));
             self.0.sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)
         };
-        let database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose().and_then(|header| session.database(header))?;
+        let database = session.database(requested_database, &self.0.node)?;
         let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(), _admission: admission, _lease: Some(lease), _reservation: reservation };
         self.publish(); Ok(call)
     }
@@ -126,11 +149,11 @@ impl Service {
     }
     pub fn transaction(&self, call: &Call, handle: &Bytes) -> Result<Arc<Transaction>, Status> {
         let value = found(self.0.transactions.lookup(handle, false), "transaction")?;
-        if value.owner != call.session.caller.owner { return Err(Status::not_found("unknown transaction")); } Ok(value)
+        if !call.session.owns(&value.owner) { return Err(Status::not_found("unknown transaction")); } Ok(value)
     }
     pub fn prepared(&self, call: &Call, handle: &Bytes) -> Result<Arc<Prepared>, Status> {
         let value = found(self.0.prepared.lookup(handle, false), "prepared statement")?;
-        if value.owner != call.session.caller.owner { return Err(Status::not_found("unknown prepared statement")); } Ok(value)
+        if !call.session.owns(&value.owner) { return Err(Status::not_found("unknown prepared statement")); } Ok(value)
     }
     pub async fn scoped(&self, call: &Call, scope: &PreparedScope) -> Result<Arc<ConnectionResource>, Status> {
         match scope { PreparedScope::Session(database) => self.connection(call, database).await, PreparedScope::Transaction(handle) => Ok(Arc::clone(&self.transaction(call, handle)?.connection)) }

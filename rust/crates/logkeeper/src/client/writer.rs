@@ -1,0 +1,565 @@
+//! The writer of one stream at one epoch: recovery on open, pipelined appends, quorum commit, lazy repair of lagging servers.
+
+use super::ensemble::{Ack, Ensemble, MAXIMUM_BATCH_ENTRIES};
+use super::CopyFrom;
+use super::recovery::{Holding, plan_repair, winner};
+use crate::protocol::{Accepted, Append, Commit, Entry, RequestBody, Sealed};
+use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
+use parking_lot::Mutex;
+use rtdb_storage::log::{AppendReceipt, LogMetadata, LogOffset, LogRecord};
+use rtdb_storage::{Error, Result};
+use rtdb_types::Timestamp;
+use std::collections::VecDeque;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, watch};
+
+const REPAIR_BACKOFF: Duration = Duration::from_millis(200);
+const SEAL_GRACE: Duration = Duration::from_millis(100);
+const RECOVERY_GRACE: Duration = Duration::from_millis(2);
+/// Committed entries kept for the writer's own tails, beyond those still awaiting a quorum.
+const RECENT_ENTRIES: usize = 4096;
+const RECENT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub(crate) enum Tip {
+    Open(i64),
+    Deposed { promised: u64 },
+}
+
+enum Link {
+    Live,
+    Repairing,
+    Down(Instant),
+}
+
+struct Replica {
+    /// The highest lsn this server has acknowledged durable at this writer's epoch.
+    acked: i64,
+    link: Link,
+}
+
+struct Buffered {
+    entry: Entry,
+    receipt: Option<oneshot::Sender<Result<LogMetadata>>>,
+}
+
+/// One leadership confirmation, by identity: a reply counts towards it only if its request was sent while it was the round in flight.
+struct Round {
+    outcome: watch::Sender<Option<Confirmation>>,
+}
+
+#[derive(Clone, Debug)]
+enum Confirmation {
+    Confirmed,
+    Deposed { promised: u64 },
+    Unavailable(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Pending,
+    Confirmed,
+    Failed,
+}
+
+/// The round in flight, what each server has told it, and the round its late callers wait on, which starts when this one ends.
+struct Confirming {
+    round: Arc<Round>,
+    marks: Vec<Mark>,
+    next: Option<Arc<Round>>,
+}
+
+impl Round {
+    fn new() -> Arc<Self> { Arc::new(Self { outcome: watch::channel(None).0 }) }
+}
+
+struct Pipeline {
+    next_lsn: i64,
+    commit: i64,
+    history: Holding,
+    /// Entry `i` has lsn `buffer_first + i`; it holds every uncommitted entry and some recent committed ones.
+    buffer_first: i64,
+    buffer: VecDeque<Buffered>,
+    buffered_bytes: usize,
+    replicas: Vec<Replica>,
+    confirming: Option<Confirming>,
+}
+
+enum State {
+    Open(Pipeline),
+    Deposed { promised: u64 },
+}
+
+pub(crate) struct Writer {
+    ensemble: Arc<Ensemble>,
+    epoch: u64,
+    state: Mutex<State>,
+    tip: watch::Sender<Tip>,
+}
+
+fn record(entry: &Entry) -> LogRecord {
+    LogRecord { metadata: LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, payload: entry.payload.clone() }
+}
+
+/// Seals every server and gathers a write quorum of replies, plus any that arrive shortly after.
+pub(crate) async fn seal_quorum(ensemble: &Ensemble, epoch: u64) -> Result<Vec<(usize, Sealed)>> {
+    let mut pending: FuturesUnordered<_> = (0..ensemble.len()).map(|server| async move { (server, ensemble.seal(server, epoch).await) }).collect();
+    let mut replies = Vec::new();
+    let mut failures = Vec::new();
+    let mut grace = None;
+    loop {
+        let next = match grace {
+            None => pending.next().await,
+            Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await { Ok(next) => next, Err(_) => None },
+        };
+        let Some((server, reply)) = next else { break };
+        match reply {
+            Ok(sealed) if sealed.promised > epoch => return Err(Error::Deposed { epoch, promised: sealed.promised }),
+            Ok(sealed) => replies.push((server, sealed)),
+            Err(error) => failures.push(error.to_string()),
+        }
+        if replies.len() >= ensemble.config.write_quorum && grace.is_none() { grace = Some(tokio::time::Instant::now() + SEAL_GRACE); }
+    }
+    if replies.len() < ensemble.config.write_quorum {
+        return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("sealed {} of {} servers, a write quorum is {}: {}", replies.len(), ensemble.len(), ensemble.config.write_quorum, failures.join("; ")) });
+    }
+    Ok(replies)
+}
+
+fn deposed_by(epoch: u64, ack: Ack) -> Result<Accepted> {
+    match ack {
+        Ack::Accepted(accepted) => Ok(accepted),
+        Ack::Refused(refused) if refused.promised > epoch => Err(Error::Deposed { epoch, promised: refused.promised }),
+        Ack::Refused(refused) => Err(Error::Remote { key: String::new(), message: format!("refused at promised epoch {}, last lsn {}", refused.promised, refused.last_lsn) }),
+    }
+}
+
+/// Copies `source`'s entries `[from, to]` onto `target` from `from`, marking it synced with its last chunk.
+async fn copy(source: (&Ensemble, usize), target: (&Ensemble, usize), epoch: u64, mut from: i64, to: i64) -> Result<Accepted> {
+    let ((source, source_server), (target, server)) = (source, target);
+    loop {
+        let entries = if from > to { Vec::new() } else {
+            let fetched = source.fetch(source_server, from, to + 1, MAXIMUM_BATCH_ENTRIES).await?;
+            super::ensemble::check_retained(from, &fetched)?;
+            if fetched.entries.first().is_none_or(|entry| entry.lsn != from) {
+                return Err(Error::Remote { key: target.config.stream.clone(), message: format!("the recovery source no longer holds lsn {from}") });
+            }
+            fetched.entries
+        };
+        let last = entries.last().map_or(from - 1, |entry| entry.lsn);
+        let complete = last >= to;
+        let acked = deposed_by(epoch, target.overwrite(server, epoch, from, entries, complete).await?)?;
+        if complete { return Ok(acked); }
+        from = acked.last_lsn + 1;
+    }
+}
+
+/// Where the recovered history comes from and where the writer's ensemble starts holding it.
+struct Recovered<'a> {
+    source: (&'a Ensemble, usize),
+    history: Holding,
+    /// A server holding no entries starts here rather than at the history's trim point; lower lsns stay with an earlier loglet.
+    start: i64,
+}
+
+/// Brings one sealed server to exactly the recovered history from `recovered.start` or below, and syncs it at this epoch.
+async fn sync_server(ensemble: &Ensemble, epoch: u64, server: usize, sealed: &Sealed, recovered: &Recovered<'_>) -> Result<Accepted> {
+    let plan = plan_repair(&Holding::from(sealed), &recovered.history).map_err(|message| Error::Remote { key: ensemble.config.stream.clone(), message })?;
+    if let Some(through) = plan.trim_through { deposed_by(epoch, ensemble.trim(server, through).await?)?; }
+    let holds_nothing = sealed.last_lsn <= sealed.trim_lsn.max(plan.trim_through.unwrap_or(sealed.trim_lsn));
+    let from = if holds_nothing && plan.from < recovered.start {
+        deposed_by(epoch, ensemble.trim(server, recovered.start - 1).await?)?;
+        recovered.start
+    } else {
+        plan.from
+    };
+    copy(recovered.source, (ensemble, server), epoch, from, recovered.history.last).await
+}
+
+/// Syncs and commits the recovered history on a write quorum, including other replicas that have already caught up.
+async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)], recovered: &Recovered<'_>, commit: i64) -> Result<Vec<usize>> {
+    let quorum = ensemble.config.write_quorum;
+    let mut syncing = replies.iter()
+        .map(|(server, sealed)| async move { (*server, sync_server(ensemble, epoch, *server, sealed, recovered).await) })
+        .collect::<FuturesUnordered<_>>();
+    let mut committing = FuturesUnordered::new();
+    let mut synced = Vec::with_capacity(replies.len());
+    let mut uncommitted = Vec::new();
+    let mut committed = 0;
+    let mut grace = None;
+    loop {
+        if committed >= quorum {
+            grace.get_or_insert_with(|| tokio::time::Instant::now() + RECOVERY_GRACE);
+        } else if synced.len() >= quorum {
+            for server in uncommitted.drain(..) {
+                committing.push(ensemble.commit(server, epoch, commit));
+            }
+        }
+
+        if syncing.is_empty() && committing.is_empty() { break; }
+        tokio::select! {
+            biased;
+            Some((server, reply)) = syncing.next(), if !syncing.is_empty() => match reply {
+                Ok(ack) => {
+                    synced.push(server);
+                    if ack.commit_lsn >= commit { committed += 1; }
+                    else { uncommitted.push(server); }
+                }
+                Err(Error::Deposed { promised, .. }) => return Err(Error::Deposed { epoch, promised }),
+                Err(_) => (),
+            },
+            Some(reply) = committing.next(), if !committing.is_empty() => {
+                if let Ok(reply) = reply {
+                    let ack = deposed_by(epoch, reply)?;
+                    committed += usize::from(ack.commit_lsn >= commit);
+                }
+            }
+            _ = async {
+                match grace {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => break,
+        }
+    }
+    if committed < quorum {
+        return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!(
+            "recovered on {} servers and confirmed commit on {committed}, a write quorum is {quorum}", synced.len()) });
+    }
+    Ok(synced)
+}
+
+impl Writer {
+    pub async fn open(ensemble: Arc<Ensemble>, epoch: u64) -> Result<Arc<Self>> {
+        let replies = seal_quorum(&ensemble, epoch).await?;
+        let sealed: Vec<Sealed> = replies.iter().map(|(_, sealed)| sealed.clone()).collect();
+        let (source, winning) = &replies[winner(&sealed)];
+        let history = Holding::from(winning);
+        let recovered = Recovered { source: (&ensemble, *source), start: history.trim + 1, history };
+        Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered).await
+    }
+
+    /// Recovers the same history used by a local ensemble move and by a
+    /// copy to a different physical stream.
+    async fn recover_moved(previous: &Ensemble, previous_start: i64, epoch: u64, from: CopyFrom) -> Result<Recovered<'_>> {
+        let previous_replies = seal_quorum(previous, epoch).await?;
+        let sealed: Vec<Sealed> = previous_replies.iter().map(|(_, sealed)| sealed.clone()).collect();
+        let (source, winning) = &previous_replies[winner(&sealed)];
+        let history = Holding::from(winning);
+        let start = match from { CopyFrom::Retained => previous_start, CopyFrom::Lsn(lsn) => lsn }.clamp(history.trim + 1, history.last + 1);
+        let in_place = Recovered { source: (previous, *source), start: history.trim + 1, history: history.clone() };
+        sync_quorum(previous, epoch, &previous_replies, &in_place, start - 1).await?;
+        Ok(Recovered { source: (previous, *source), history, start })
+    }
+
+    /// Copies the recovered suffix into another ensemble and opens its writer.
+    pub async fn open_moved(previous: &Ensemble, previous_start: i64, ensemble: Arc<Ensemble>, epoch: u64, from: CopyFrom) -> Result<(Arc<Self>, i64)> {
+        let recovered = Self::recover_moved(previous, previous_start, epoch, from).await?;
+        let start = recovered.start;
+        let replies = seal_quorum(&ensemble, epoch).await?;
+        Ok((Self::establish(ensemble, epoch, &replies, recovered).await?, start))
+    }
+
+    /// Commits the retained history in its new journal without opening a writer.
+    pub(super) async fn copy_retained(previous: &Ensemble, destination: &Ensemble, epoch: u64) -> Result<()> {
+        let recovered = Self::recover_moved(previous, 0, epoch, CopyFrom::Retained).await?;
+        let replies = seal_quorum(destination, epoch).await?;
+        sync_quorum(destination, epoch, &replies, &recovered, recovered.history.last).await?;
+        Ok(())
+    }
+
+    /// Recovers a durable write quorum of `ensemble` before opening the pipeline.
+    async fn establish(ensemble: Arc<Ensemble>, epoch: u64, replies: &[(usize, Sealed)], recovered: Recovered<'_>) -> Result<Arc<Self>> {
+        let last = recovered.history.last;
+        let synced = sync_quorum(&ensemble, epoch, replies, &recovered, last).await?;
+        let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
+        let replicas = (0..ensemble.len()).map(|server| if synced.contains(&server) {
+            Replica { acked: last, link: Link::Live }
+        } else {
+            Replica { acked: -1, link: Link::Down(long_ago) }
+        }).collect();
+        let pipeline = Pipeline { next_lsn: last + 1, commit: last, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None };
+        let writer = Arc::new(Self { ensemble, epoch, state: Mutex::new(State::Open(pipeline)), tip: watch::channel(Tip::Open(last)).0 });
+        {
+            let mut state = writer.state.lock();
+            if let State::Open(pipeline) = &mut *state { writer.repair_down(pipeline); }
+        }
+        Ok(writer)
+    }
+
+    pub fn tip(&self) -> watch::Receiver<Tip> { self.tip.subscribe() }
+
+    pub fn latest(&self) -> Result<LogOffset> {
+        match &*self.tip.borrow() {
+            Tip::Open(commit) => Ok(LogOffset(*commit)),
+            Tip::Deposed { promised } => Err(Error::Deposed { epoch: self.epoch, promised: *promised }),
+        }
+    }
+
+    pub fn enqueue(self: &Arc<Self>, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+        let mut state = self.state.lock();
+        let pipeline = match &mut *state {
+            State::Open(pipeline) => pipeline,
+            State::Deposed { promised } => return Err(Error::Deposed { epoch: self.epoch, promised: *promised }),
+        };
+        let lsn = pipeline.next_lsn;
+        pipeline.next_lsn = lsn.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        // The stream owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
+        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, payload: Bytes::copy_from_slice(&payload) };
+        pipeline.history.push(lsn, self.epoch);
+        let (receipt, durable) = oneshot::channel();
+        pipeline.buffered_bytes += entry.payload.len();
+        pipeline.buffer.push_back(Buffered { entry: entry.clone(), receipt: Some(receipt) });
+        for server in 0..pipeline.replicas.len() {
+            if matches!(pipeline.replicas[server].link, Link::Live) {
+                let body = RequestBody::Append(Append { stream: self.ensemble.stream(), epoch: self.epoch, first_lsn: lsn, entries: vec![entry.clone()], commit_lsn: pipeline.commit });
+                self.send(pipeline, server, body);
+            }
+        }
+        self.repair_down(pipeline);
+        Ok(AppendReceipt::new(durable))
+    }
+
+    /// Sends a pipeline request; its reply also answers the confirmation round in flight when it was sent.
+    fn send(self: &Arc<Self>, pipeline: &Pipeline, server: usize, body: RequestBody) {
+        let writer = Arc::downgrade(self);
+        let ensemble = Arc::clone(&self.ensemble);
+        let round = pipeline.confirming.as_ref().map(|confirming| Arc::clone(&confirming.round));
+        self.ensemble.links[server].send(body, Box::new(move |reply| {
+            if let Some(writer) = Weak::upgrade(&writer) { writer.acknowledged(server, ensemble.ack(server, reply), round); }
+        }));
+    }
+
+    fn send_check(self: &Arc<Self>, server: usize, round: &Arc<Round>) {
+        let writer = Arc::downgrade(self);
+        let ensemble = Arc::clone(&self.ensemble);
+        let round = Arc::clone(round);
+        self.ensemble.links[server].send(self.ensemble.check_request(self.epoch), Box::new(move |reply| {
+            let Some(writer) = Weak::upgrade(&writer) else { return };
+            let mut state = writer.state.lock();
+            match ensemble.ack(server, reply) {
+                Ok(Ack::Refused(refused)) if refused.promised > writer.epoch => writer.depose(&mut state, refused.promised),
+                ack => if let State::Open(pipeline) = &mut *state { writer.mark(pipeline, &round, server, ack.is_ok()); },
+            }
+        }));
+    }
+
+    fn acknowledged(self: &Arc<Self>, server: usize, ack: Result<Ack>, round: Option<Arc<Round>>) {
+        let mut state = self.state.lock();
+        if let Ok(Ack::Refused(refused)) = ack && refused.promised > self.epoch { return self.depose(&mut state, refused.promised); }
+        let State::Open(pipeline) = &mut *state else { return };
+        if let Some(round) = &round { self.mark(pipeline, round, server, ack.is_ok()); }
+        match ack {
+            Ok(Ack::Accepted(accepted)) => {
+                let replica = &mut pipeline.replicas[server];
+                replica.acked = replica.acked.max(accepted.last_lsn);
+                self.advance(pipeline);
+            }
+            Ok(Ack::Refused(_)) | Err(_) => {
+                if matches!(pipeline.replicas[server].link, Link::Live) {
+                    pipeline.replicas[server].link = Link::Repairing;
+                    self.spawn_repair(server);
+                }
+            }
+        }
+    }
+
+    fn advance(self: &Arc<Self>, pipeline: &mut Pipeline) {
+        let mut acked: Vec<i64> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
+        acked.sort_unstable_by(|left, right| right.cmp(left));
+        let quorum = acked[self.ensemble.config.write_quorum - 1].min(pipeline.next_lsn - 1);
+        if quorum <= pipeline.commit { return; }
+        let previous = pipeline.commit;
+        pipeline.commit = quorum;
+        self.tip.send_replace(Tip::Open(quorum));
+        let first = (previous + 1 - pipeline.buffer_first).max(0) as usize;
+        let last = (quorum - pipeline.buffer_first) as usize;
+        for buffered in pipeline.buffer.range_mut(first..=last) {
+            if let Some(receipt) = buffered.receipt.take() {
+                let _ = receipt.send(Ok(record(&buffered.entry).metadata));
+            }
+        }
+        if pipeline.commit == pipeline.next_lsn - 1 {
+            for server in 0..pipeline.replicas.len() {
+                if matches!(pipeline.replicas[server].link, Link::Live) {
+                    self.send(pipeline, server, RequestBody::Commit(Commit { stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: quorum }));
+                }
+            }
+        }
+        while pipeline.buffer.front().is_some_and(|buffered| buffered.entry.lsn <= pipeline.commit)
+            && (pipeline.buffer.len() > RECENT_ENTRIES || pipeline.buffered_bytes > RECENT_BYTES) {
+            let dropped = pipeline.buffer.pop_front().expect("checked above");
+            pipeline.buffered_bytes -= dropped.entry.payload.len();
+            pipeline.buffer_first += 1;
+        }
+    }
+
+    fn depose(&self, state: &mut State, promised: u64) {
+        let deposed = std::mem::replace(state, State::Deposed { promised });
+        if let State::Open(pipeline) = deposed {
+            for buffered in pipeline.buffer {
+                if let Some(receipt) = buffered.receipt { let _ = receipt.send(Err(Error::Deposed { epoch: self.epoch, promised })); }
+            }
+            if let Some(confirming) = pipeline.confirming {
+                for round in std::iter::once(confirming.round).chain(confirming.next) { round.outcome.send_replace(Some(Confirmation::Deposed { promised })); }
+            }
+        }
+        self.tip.send_replace(Tip::Deposed { promised });
+    }
+
+    fn repair_down(self: &Arc<Self>, pipeline: &mut Pipeline) {
+        for server in 0..pipeline.replicas.len() {
+            if let Link::Down(since) = pipeline.replicas[server].link && since.elapsed() >= REPAIR_BACKOFF {
+                pipeline.replicas[server].link = Link::Repairing;
+                self.spawn_repair(server);
+            }
+        }
+    }
+
+    fn spawn_repair(self: &Arc<Self>, server: usize) {
+        let writer = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = writer.repair(server).await;
+            let mut state = writer.state.lock();
+            match result {
+                Err(Error::Deposed { promised, .. }) => writer.depose(&mut state, promised),
+                Err(_) => if let State::Open(pipeline) = &mut *state && matches!(pipeline.replicas[server].link, Link::Repairing) {
+                    pipeline.replicas[server].link = Link::Down(Instant::now());
+                },
+                Ok(()) => (),
+            }
+        });
+    }
+
+    /// Matches the server against this writer's history, copies what it lacks from a live peer, and rejoins it to the pipeline with an overwrite carrying the buffered tail, sent under the lock so later appends follow it.
+    async fn repair(self: &Arc<Self>, server: usize) -> Result<()> {
+        let epoch = self.epoch;
+        let ensemble = &self.ensemble;
+        let sealed = ensemble.seal(server, epoch).await?;
+        if sealed.promised > epoch { return Err(Error::Deposed { epoch, promised: sealed.promised }); }
+        let history = match &*self.state.lock() { State::Open(pipeline) => pipeline.history.clone(), State::Deposed { promised } => return Err(Error::Deposed { epoch, promised: *promised }) };
+        let plan = plan_repair(&Holding::from(&sealed), &history).map_err(|message| Error::Remote { key: ensemble.config.stream.clone(), message })?;
+        if let Some(through) = plan.trim_through { deposed_by(epoch, ensemble.trim(server, through).await?)?; }
+        let mut from = plan.from;
+        let mut empty_fetches = 0;
+        loop {
+            let (sources, buffer_first) = {
+                let mut state = self.state.lock();
+                let pipeline = match &mut *state { State::Open(pipeline) => pipeline, State::Deposed { promised } => return Err(Error::Deposed { epoch, promised: *promised }) };
+                if from >= pipeline.buffer_first {
+                    let entries = pipeline.buffer.iter().skip((from - pipeline.buffer_first) as usize).map(|buffered| buffered.entry.clone()).collect();
+                    let body = ensemble.overwrite_request(epoch, from, entries, true, pipeline.commit);
+                    pipeline.replicas[server].link = Link::Live;
+                    self.send(pipeline, server, body);
+                    return Ok(());
+                }
+                let sources: Vec<usize> = (0..pipeline.replicas.len()).filter(|&peer| peer != server && matches!(pipeline.replicas[peer].link, Link::Live)).collect();
+                (sources, pipeline.buffer_first)
+            };
+            let mut chunk = None;
+            for source in sources {
+                let Ok(fetched) = ensemble.fetch(source, from, buffer_first, MAXIMUM_BATCH_ENTRIES).await else { continue };
+                if from <= fetched.trim_lsn {
+                    deposed_by(epoch, ensemble.trim(server, fetched.trim_lsn).await?)?;
+                    from = fetched.trim_lsn + 1;
+                    chunk = Some(Vec::new());
+                    break;
+                }
+                if fetched.entries.first().is_some_and(|entry| entry.lsn == from) { chunk = Some(fetched.entries); break; }
+            }
+            match chunk {
+                Some(entries) if entries.is_empty() => continue,
+                Some(entries) => from = deposed_by(epoch, ensemble.overwrite(server, epoch, from, entries, false).await?)?.last_lsn + 1,
+                None if empty_fetches < 50 => { empty_fetches += 1; tokio::time::sleep(Duration::from_millis(20)).await; }
+                None => return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("no live server holds lsn {from} to repair from") }),
+            }
+        }
+    }
+
+    /// Succeeds once a write quorum of servers has answered, in a round that started after this call, that the stream is not sealed beyond this writer's epoch.
+    /// So no successor had committed anything when the call began: a successor commits only after sealing a write quorum, which meets the confirming one.
+    /// Concurrent callers share a round, at most one is in flight, and callers arriving during it wait for the next.
+    /// A busy writer's round is answered by the replies to its appends and commits sent after it started; an idle writer's sends each server a check.
+    pub async fn confirm_leadership(self: &Arc<Self>) -> Result<()> {
+        let mut outcome = {
+            let mut state = self.state.lock();
+            match &mut *state {
+                State::Open(pipeline) => self.join_confirmation(pipeline),
+                State::Deposed { promised } => return Err(Error::Deposed { epoch: self.epoch, promised: *promised }),
+            }
+        };
+        let confirmation = outcome.wait_for(Option::is_some).await.map_err(|_| Error::Closed("writer dropped".into()))?.clone().expect("waited for an outcome");
+        match confirmation {
+            Confirmation::Confirmed => Ok(()),
+            Confirmation::Deposed { promised } => Err(Error::Deposed { epoch: self.epoch, promised }),
+            Confirmation::Unavailable(message) => Err(Error::Remote { key: self.ensemble.config.stream.clone(), message }),
+        }
+    }
+
+    fn join_confirmation(self: &Arc<Self>, pipeline: &mut Pipeline) -> watch::Receiver<Option<Confirmation>> {
+        match &mut pipeline.confirming {
+            Some(confirming) => confirming.next.get_or_insert_with(Round::new).outcome.subscribe(),
+            None => {
+                let round = Round::new();
+                let outcome = round.outcome.subscribe();
+                self.start_round(pipeline, round);
+                outcome
+            }
+        }
+    }
+
+    /// A live server with an append in flight is answered by the commit that follows once the pipeline reaches its tip, or by later appends; every other server is sent a check.
+    fn start_round(self: &Arc<Self>, pipeline: &mut Pipeline, round: Arc<Round>) {
+        // Every server is asked directly: a reply to an append in flight could otherwise be the round's only answer from a server that then fails, leaving the round unsettled.
+        pipeline.confirming = Some(Confirming { round: Arc::clone(&round), marks: vec![Mark::Pending; pipeline.replicas.len()], next: None });
+        for server in 0..pipeline.replicas.len() { self.send_check(server, &round); }
+    }
+
+    /// Records one server's answer to `round` if it is still the round in flight, and ends the round once its outcome is settled.
+    fn mark(self: &Arc<Self>, pipeline: &mut Pipeline, round: &Arc<Round>, server: usize, confirmed: bool) {
+        let Some(confirming) = &mut pipeline.confirming else { return };
+        if !Arc::ptr_eq(&confirming.round, round) { return; }
+        let mark = &mut confirming.marks[server];
+        if confirmed { *mark = Mark::Confirmed; } else if *mark == Mark::Pending { *mark = Mark::Failed; }
+        let quorum = self.ensemble.config.write_quorum;
+        let count = |wanted: Mark| confirming.marks.iter().filter(|mark| **mark == wanted).count();
+        let outcome = if count(Mark::Confirmed) >= quorum {
+            Confirmation::Confirmed
+        } else if count(Mark::Failed) > confirming.marks.len() - quorum {
+            Confirmation::Unavailable(format!("{} of {} servers failed to confirm leadership, a write quorum is {quorum}", count(Mark::Failed), confirming.marks.len()))
+        } else {
+            return;
+        };
+        let finished = pipeline.confirming.take().expect("matched above");
+        finished.round.outcome.send_replace(Some(outcome));
+        if let Some(next) = finished.next { self.start_round(pipeline, next); }
+    }
+
+    /// Committed entries in `[from, to)` from the buffer, or `None` when it no longer holds `from`.
+    pub fn buffered(&self, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Option<Vec<LogRecord>> {
+        let state = self.state.lock();
+        let State::Open(pipeline) = &*state else { return Some(Vec::new()) };
+        if from < pipeline.buffer_first { return None; }
+        let to = to.min(pipeline.commit + 1);
+        let mut records = Vec::new();
+        let mut bytes = 0usize;
+        for buffered in pipeline.buffer.iter().skip((from - pipeline.buffer_first) as usize).take_while(|buffered| buffered.entry.lsn < to).take(max_entries) {
+            bytes = bytes.saturating_add(buffered.entry.payload.len());
+            if bytes > max_bytes && !records.is_empty() { break; }
+            records.push(record(&buffered.entry));
+        }
+        Some(records)
+    }
+
+    /// Servers synced to this writer, to read its committed history from.
+    pub fn live(&self) -> Vec<usize> {
+        match &*self.state.lock() {
+            State::Open(pipeline) => (0..pipeline.replicas.len()).filter(|&server| matches!(pipeline.replicas[server].link, Link::Live)).collect(),
+            State::Deposed { .. } => Vec::new(),
+        }
+    }
+
+    pub fn epoch(&self) -> u64 { self.epoch }
+}

@@ -51,6 +51,18 @@ impl MemoryLog {
         }) }
     }
 
+    /// An empty log whose first record takes offset `next`, for a log that continues positions a previous owner assigned.
+    pub fn starting_at(maximum_message_bytes: usize, next: LogOffset) -> Self {
+        let next = next.0.max(0);
+        Self { shared: Arc::new(Shared {
+            records: Mutex::new(Records { first: next, next, values: VecDeque::new() }),
+            progress: Progress::new(LogOffset(next - 1)), maximum_message_bytes, timestamps: Arc::new(SuppliedTimestamp),
+        }) }
+    }
+
+    /// The offset of the oldest record still retained.
+    pub fn first_retained(&self) -> LogOffset { LogOffset(self.shared.records.lock().first) }
+
     /// The caller must retain every record at and above the last recoverable block boundary.
     pub fn truncate_before(&self, boundary: LogOffset) -> Result<()> {
         let mut records = self.shared.records.lock();
@@ -225,5 +237,15 @@ mod tests {
             assert!(batch.iter().zip(from..to).all(|(record, offset)| record.metadata.offset == LogOffset(offset as i64)));
         }
         assert!(tail.poll_with_payload_limit(Duration::ZERO, 5).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_log_started_at_an_offset_continues_from_it() {
+        let log = MemoryLog::starting_at(1024, LogOffset(42));
+        assert_eq!(log.latest().unwrap(), LogOffset(41));
+        let appended = log.enqueue(Bytes::from_static(b"a"), Timestamp(1)).await.unwrap().durable().await.unwrap();
+        assert_eq!(appended.offset, LogOffset(42));
+        let mut tail = log.tail(LogOffset(41)).await.unwrap();
+        assert_eq!(tail.poll(Duration::from_millis(10)).await.unwrap()[0].metadata.offset, LogOffset(42));
     }
 }

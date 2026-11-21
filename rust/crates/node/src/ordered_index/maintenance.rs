@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, io::Cursor, sync::Arc};
+use std::{collections::BTreeSet, io, sync::Arc};
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::data::EventBatch;
@@ -169,20 +169,19 @@ async fn flushed_changes(
     source: &SourceFile,
     cancellation: &CancellationToken,
 ) -> Result<(i64, Changes)> {
-    let store = tree.storage.object_store();
-    if store.head_fresh(&source.object).await?.size != source.size {
-        return Err(incomplete_source());
-    }
-    let size = usize::try_from(source.size).map_err(format_error)?;
-    let _source_memory = tree.memory.reserve(size)?;
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
-    let bytes = store.get_fresh(&source.object).await?;
-    if bytes.len() != size {
-        return Err(incomplete_source());
+    let store = tree.storage.object_store();
+    if store.head_fresh(&source.object).await?.size != source.size as u64 {
+        return Err(format_error("An ordered index source differs from the adopted file"));
     }
-    let (mut input, _footer) = open_input(Cursor::new(bytes), tree.memory)?;
+    let _input_bytes = tree.memory.reserve(source.size)?;
+    let bytes = store.get_fresh(&source.object).await?;
+    if bytes.len() != source.size {
+        return Err(format_error("An ordered index source file changed length"));
+    }
+    let (mut input, _footer) = open_input(io::Cursor::new(bytes), tree.memory)?;
     let mut changes = Changes::default();
     let mut rows = 0_i64;
     for page in 0..input.page_count() {
@@ -312,7 +311,7 @@ fn source_frontier(snapshot: &Snapshot, table: &TableRef) -> i64 {
 struct SourceFile {
     block: i64,
     object: ObjectKey,
-    size: u64,
+    size: usize,
 }
 
 fn source_files(
@@ -334,11 +333,11 @@ fn source_files(
             Ok(SourceFile {
                 block: trie.key.block_index().0,
                 object: ObjectKey::new(storage.slug.data_key(&trie.key))?,
-                size: u64::try_from(trie.data_file_size).map_err(format_error)?,
+                size: usize::try_from(trie.data_file_size).map_err(format_error)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    if files.last().map(|file| file.block) != Some(through) {
+    if files.last().map(|source| source.block) != Some(through) {
         return Err(incomplete_source());
     }
     Ok(files)

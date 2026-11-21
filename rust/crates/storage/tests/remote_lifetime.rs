@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, memory::InMemory, path::Path};
 use rtdb_columnar::MemoryBudget;
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::RemoteStore};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::{PublicationJournal, PublicationUploads, RemoteStore}};
 use tokio::sync::Semaphore;
 
 #[derive(Debug)]
@@ -34,12 +34,17 @@ struct Hooks {
     fail_abort: bool,
     fail_delete: bool,
     fail_copy: bool,
+    lose_put_reply: bool,
+    fail_before_put: bool,
+    forget_put_witness: bool,
+    fail_first_publication_abort: bool,
     deny_list: bool,
 }
 
 #[derive(Debug, Default)]
 struct Observed {
     calls: AtomicUsize,
+    publication_aborts: AtomicUsize,
     parts: AtomicUsize,
     completed: AtomicUsize,
     abort_calls: AtomicUsize,
@@ -49,11 +54,19 @@ struct Observed {
 }
 
 #[derive(Debug)]
-struct ControlledStore { inner: Arc<InMemory>, hooks: Arc<Hooks>, observed: Arc<Observed> }
+struct ControlledStore {
+    inner: Arc<InMemory>,
+    hooks: Arc<Hooks>,
+    observed: Arc<Observed>,
+    uploads: std::sync::Mutex<std::collections::BTreeMap<String, (Path, uuid::Uuid)>>,
+}
 
 impl ControlledStore {
     fn new(hooks: Hooks) -> Arc<Self> {
-        Arc::new(Self { inner: Arc::new(InMemory::new()), hooks: Arc::new(hooks), observed: Arc::new(Observed::default()) })
+        Arc::new(Self {
+            inner: Arc::new(InMemory::new()), hooks: Arc::new(hooks), observed: Arc::new(Observed::default()),
+            uploads: Default::default(),
+        })
     }
     fn called(&self) { self.observed.calls.fetch_add(1, Ordering::SeqCst); }
 }
@@ -64,9 +77,19 @@ impl fmt::Display for ControlledStore {
 
 #[async_trait]
 impl ProviderStore for ControlledStore {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, options: PutOptions) -> object_store::Result<PutResult> {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, mut options: PutOptions) -> object_store::Result<PutResult> {
         self.called();
-        self.inner.put_opts(location, payload, options).await
+        if self.hooks.fail_before_put {
+            return Err(injected("provider publication is unconfirmed"));
+        }
+        if self.hooks.forget_put_witness {
+            options.attributes = Default::default();
+        }
+        let result = self.inner.put_opts(location, payload, options).await?;
+        if self.hooks.lose_put_reply {
+            return Err(injected("lost publication reply"));
+        }
+        Ok(result)
     }
     async fn put_multipart_opts(&self, location: &Path, options: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.called();
@@ -117,6 +140,41 @@ impl ProviderStore for ControlledStore {
     }
 }
 
+#[async_trait]
+impl PublicationUploads for ControlledStore {
+    async fn reserve(&self, path: &Path, attempt: uuid::Uuid) -> rtdb_storage::Result<String> {
+        let upload = format!("upload-{attempt}");
+        assert!(self.uploads.lock().unwrap().insert(upload.clone(), (path.clone(), attempt)).is_none());
+        Ok(upload)
+    }
+
+    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<bool> {
+        let (owner, attempt) = self.uploads.lock().unwrap().get(upload).unwrap().clone();
+        assert_eq!(owner, *path);
+        let mut options = PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
+        options.attributes.insert(object_store::Attribute::Metadata("rtdb-publication".into()), attempt.to_string().into());
+        match self.put_opts(path, bytes.into(), options).await {
+            Ok(_) => {
+                self.uploads.lock().unwrap().remove(upload);
+                Ok(true)
+            }
+            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => Ok(false),
+            Err(error) => Err(Error::Remote { key: path.to_string(), message: error.to_string() }),
+        }
+    }
+
+    async fn abort(&self, path: &Path, upload: &str) -> rtdb_storage::Result<()> {
+        let aborts = self.observed.publication_aborts.fetch_add(1, Ordering::SeqCst);
+        if self.hooks.fail_first_publication_abort && aborts == 0 {
+            return Err(Error::Remote { key: path.to_string(), message: "provider did not confirm abort".into() });
+        }
+        if let Some((owner, _)) = self.uploads.lock().unwrap().remove(upload) {
+            assert_eq!(owner, *path);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct ControlledUpload { inner: Box<dyn MultipartUpload>, hooks: Arc<Hooks>, observed: Arc<Observed>, next_part: usize }
 
@@ -149,6 +207,146 @@ fn injected(message: &'static str) -> object_store::Error {
 
 async fn bounded<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(10), future).await.expect("controlled I/O did not finish")
+}
+
+#[derive(Default)]
+struct PublicationInventory {
+    pending: std::sync::Mutex<std::collections::BTreeMap<uuid::Uuid, (ObjectKey, String)>>,
+}
+
+#[async_trait]
+impl PublicationJournal for PublicationInventory {
+    async fn admit(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str) -> rtdb_storage::Result<()> {
+        assert!(self.pending.lock().unwrap().insert(attempt, (key.clone(), upload.to_owned())).is_none());
+        Ok(())
+    }
+
+    async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str, submitted: bool) -> rtdb_storage::Result<()> {
+        assert!(submitted);
+        assert_eq!(self.pending.lock().unwrap().remove(&attempt), Some((key.clone(), upload.to_owned())));
+        Ok(())
+    }
+}
+
+fn journaled_region() -> (Arc<IoRegion>, Arc<PublicationInventory>) {
+    let mut io = IoRegion::new();
+    let journal = Arc::new(PublicationInventory::default());
+    Arc::get_mut(&mut io).unwrap().track_publications(journal.clone());
+    (io, journal)
+}
+
+#[tokio::test]
+async fn managed_completion_recovers_exact_bytes_or_retires_the_upload() {
+    let key = ObjectKey::new("data.arrow").unwrap();
+    let contents = Bytes::from_static(b"sealed");
+    let prefix = ObjectKey::new("cell").unwrap();
+    let (io, journal) = journaled_region();
+    let provider = ControlledStore::new(Hooks::default());
+    let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider);
+    store.put(&key, contents.clone()).await.unwrap();
+    assert!(matches!(
+        store.put(&key, Bytes::from_static(b"other")).await,
+        Err(Error::ConflictingObject(_))
+    ));
+    io.close_and_wait().await;
+    assert!(journal.pending.lock().unwrap().is_empty());
+
+    let (io, journal) = journaled_region();
+    let provider = ControlledStore::new(Hooks { lose_put_reply: true, ..Default::default() });
+    let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider.clone());
+    store.put(&key, contents.clone()).await.unwrap();
+    io.close_and_wait().await;
+    assert!(journal.pending.lock().unwrap().is_empty());
+    assert_eq!(paths(&provider.inner).await, ["cell/data.arrow"]);
+
+    for (hooks, objects) in [
+        (Hooks { fail_before_put: true, ..Default::default() }, Vec::<&str>::new()),
+        (Hooks { lose_put_reply: true, forget_put_witness: true, ..Default::default() }, vec!["cell/data.arrow"]),
+    ] {
+        let (io, journal) = journaled_region();
+        let provider = ControlledStore::new(hooks);
+        let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider.clone());
+        assert!(matches!(store.put(&key, contents.clone()).await, Err(Error::Remote { .. })));
+        io.close_and_wait().await;
+        assert!(journal.pending.lock().unwrap().is_empty());
+        assert!(provider.uploads.lock().unwrap().is_empty());
+        assert_eq!(paths(&provider.inner).await, objects);
+    }
+}
+
+#[tokio::test]
+async fn a_replacement_can_abort_the_closed_writers_exact_upload() {
+    let key = ObjectKey::new("data.arrow").unwrap();
+    let prefix = ObjectKey::new("cell").unwrap();
+    let (io, journal) = journaled_region();
+    let provider = ControlledStore::new(Hooks {
+        fail_before_put: true,
+        fail_first_publication_abort: true,
+        ..Default::default()
+    });
+    let old = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider.clone());
+    assert!(matches!(old.put(&key, Bytes::from_static(b"sealed")).await, Err(Error::Remote { .. })));
+    io.close_and_wait().await;
+    let pending = journal.pending.lock().unwrap().clone();
+    assert_eq!(pending.len(), 1);
+    let (_, (retained_key, upload)) = pending.first_key_value().unwrap();
+    assert_eq!(retained_key, &key);
+    drop(old);
+    drop(io);
+
+    let path = Path::from("cell/data.arrow");
+    let other = provider.reserve(&path, uuid::Uuid::new_v4()).await.unwrap();
+    provider.abort(&path, upload).await.unwrap();
+    let open = provider.uploads.lock().unwrap();
+    assert!(!open.contains_key(upload));
+    assert!(open.contains_key(&other));
+}
+
+struct PublicationGate {
+    admission: Arc<Gate>,
+    refused: bool,
+    settlements: AtomicUsize,
+}
+
+#[async_trait]
+impl PublicationJournal for PublicationGate {
+    async fn admit(&self, _key: &ObjectKey, _attempt: uuid::Uuid, _upload: &str) -> rtdb_storage::Result<()> {
+        self.admission.enter().await;
+        if self.refused {
+            return Err(Error::Task("directory refused the publication".into()));
+        }
+        Ok(())
+    }
+
+    async fn settle(&self, _key: &ObjectKey, _attempt: uuid::Uuid, _upload: &str, submitted: bool) -> rtdb_storage::Result<()> {
+        assert_eq!(submitted, !self.refused);
+        self.settlements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_tracked_remote_put_waits_for_durable_admission_before_uploading_payload() {
+    for refused in [false, true] {
+        let gate = Gate::new();
+        let journal = Arc::new(PublicationGate { admission: gate.clone(), refused, settlements: AtomicUsize::new(0) });
+        let mut io = IoRegion::new();
+        Arc::get_mut(&mut io).unwrap().track_publications(journal.clone());
+        let provider = ControlledStore::new(Hooks::default());
+        let store = RemoteStore::new_managed(provider.clone(), ObjectKey::new("cell").unwrap(), io.clone(), provider.clone());
+        let key = ObjectKey::new("data.arrow").unwrap();
+        let mut write = Box::pin(store.put(&key, Bytes::from_static(b"sealed")));
+        assert_pending(write.as_mut()).await;
+        gate.arrived().await;
+        assert_eq!(provider.observed.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.uploads.lock().unwrap().len(), 1);
+        gate.release();
+        assert_eq!(bounded(write).await.is_err(), refused);
+        io.close_and_wait().await;
+        assert_eq!(journal.settlements.load(Ordering::SeqCst), 1);
+        assert!(provider.uploads.lock().unwrap().is_empty());
+        assert_eq!(provider.observed.calls.load(Ordering::SeqCst), if refused { 0 } else { 1 });
+    }
 }
 
 async fn assert_pending<F: Future + ?Sized>(mut future: Pin<&mut F>) {

@@ -14,6 +14,9 @@ use crate::Database;
 pub enum Membership {
     Durable { primary: DatabaseConfig, skipped: BTreeSet<String> },
     Fixed(BTreeMap<String, DatabaseConfig>),
+    /// The node holds exactly what a placement authority outside it attaches and detaches locally, and nothing starts open.
+    /// Instructions carried by a database's log are refused, as for a fixed catalog.
+    Placed,
 }
 
 #[derive(Clone)]
@@ -34,6 +37,8 @@ impl DatabaseCatalog {
         Arc::new(Self { value: RwLock::new(Arc::new(DatabaseSet::default())), membership })
     }
     pub fn database_names(&self) -> BTreeSet<String> { self.open_databases().into_keys().collect() }
+    /// Whether this node's databases are tenants placed by an outside authority, each visible only to its own sessions.
+    pub fn is_placed(&self) -> bool { matches!(self.membership, Membership::Placed) }
     pub fn database(&self, name: &str) -> Result<Arc<Database>> {
         match self.value.read().entries.get(name) {
             Some(Entry::Open { database, .. }) => Ok(Arc::clone(database)),
@@ -54,7 +59,7 @@ impl DatabaseCatalog {
         Ok(rtdb_plan::CatalogRows::new(databases, reservation))
     }
     pub fn secondary_databases(&self) -> BTreeMap<String, DatabaseConfig> {
-        if matches!(self.membership, Membership::Fixed(_)) { return BTreeMap::new(); }
+        if matches!(self.membership, Membership::Fixed(_) | Membership::Placed) { return BTreeMap::new(); }
         self.value.read().entries.iter().filter_map(|(name, entry)| {
             if name == "xtdb" { return None; }
             let configuration = match entry { Entry::Open { database, .. } => database.configuration(), Entry::Skipped(configuration) => configuration, Entry::Detaching(_) => return None };
@@ -66,6 +71,12 @@ impl DatabaseCatalog {
     }
     pub fn check_attach(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
         self.require_mutable()?;
+        self.check_new_name(name, configuration)
+    }
+    /// Whether a name is still occupied by a database whose detach is draining it.
+    pub fn is_draining(&self, name: &str) -> bool { matches!(self.value.read().entries.get(name), Some(Entry::Detaching(_))) }
+    pub(crate) fn check_local_attach(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
+        if !matches!(self.membership, Membership::Placed) { self.require_mutable()?; }
         self.check_new_name(name, configuration)
     }
     fn check_new_name(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
@@ -86,7 +97,7 @@ impl DatabaseCatalog {
         }
     }
     fn require_mutable(&self) -> Result<()> {
-        if matches!(self.membership, Membership::Fixed(_)) { return Err(Anomaly::unsupported("xtdb/fixed-database-catalog", "A fixed database catalog does not accept membership instructions")); }
+        if matches!(self.membership, Membership::Fixed(_) | Membership::Placed) { return Err(Anomaly::unsupported("xtdb/fixed-database-catalog", "A fixed database catalog does not accept membership instructions")); }
         Ok(())
     }
     pub(crate) fn insert_open(&self, database: Arc<Database>) -> Result<()> {
@@ -107,6 +118,13 @@ impl DatabaseCatalog {
     }
     pub(crate) fn begin_detach(&self, name: &str) -> Result<Option<Arc<Database>>> {
         self.check_detach(name)?;
+        self.remove_for_detach(name)
+    }
+    pub(crate) fn begin_local_detach(&self, name: &str) -> Result<Option<Arc<Database>>> {
+        if !matches!(self.membership, Membership::Placed) { return Err(Anomaly::unsupported("rtdb.node/local-detach", "Only a placed catalog detaches databases locally")); }
+        self.remove_for_detach(name)
+    }
+    fn remove_for_detach(&self, name: &str) -> Result<Option<Arc<Database>>> {
         let mut value = self.value.write();
         let mut next = value.as_ref().clone();
         let (cancel, drain) = match next.entries.remove(name) {
@@ -159,6 +177,7 @@ impl DatabaseCatalog {
 pub(crate) enum CatalogCommand {
     Apply { operation: DbOp, completion: oneshot::Sender<Result<()>> },
     AttachLocal { name: String, configuration: DatabaseConfig, completion: oneshot::Sender<Result<Option<Arc<Database>>>> },
+    DetachLocal { name: String, completion: oneshot::Sender<Result<()>> },
 }
 
 pub(crate) struct CatalogEffects { pub catalog: Arc<DatabaseCatalog>, pub commands: mpsc::Sender<CatalogCommand>, pub primary: bool }

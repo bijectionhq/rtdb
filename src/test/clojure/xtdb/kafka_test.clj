@@ -107,6 +107,8 @@
                                                          :topic "topic"
                                                          :create-topic? false}]}))))
 
+;; Kafka assigns valid-from timestamps using the broker's clock.
+;; The recovery and awaiting assertions query all valid time under the normal system snapshot.
 (t/deftest ^:integration test-kafka-topic-cleared
   (let [original-topic (str "xtdb.kafka-test." (random-uuid))
         empty-topic (str "xtdb.kafka-test." (random-uuid))]
@@ -123,7 +125,7 @@
         (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :foo}]])
         (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :bar}]])
         (t/is (= (set [{:xt/id :foo} {:xt/id :bar}])
-                 (set (xt/q node "SELECT _id FROM xt_docs"))))
+                 (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME"))))
         ;; Finish the block
         (t/is (nil? (tu/flush-block! node)))
 
@@ -134,7 +136,7 @@
                        {:xt/id :bar}
                        {:xt/id :willbe}
                        {:xt/id :lost}])
-                 (set (xt/q node "SELECT _id FROM xt_docs")))))
+                 (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))
 
       ;; Node with intact storage and (now) empty topic
       (t/is
@@ -160,7 +162,7 @@
                                         :storage [:local {:path local-disk-path}]})]
         (t/testing "can query previous indexed values, unindexed values will be lost"
           (t/is (= (set [{:xt/id :foo} {:xt/id :bar}])
-                   (set (xt/q node "SELECT _id FROM xt_docs")))))
+                   (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))
 
         (t/testing "can index/query new transactions"
           (t/is (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :new}]]))
@@ -169,7 +171,7 @@
                          {:xt/id :bar}
                          {:xt/id :new}
                          {:xt/id :new2}])
-                   (set (xt/q node "SELECT _id FROM xt_docs")))))
+                   (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))
 
         (t/testing "can finish the block"
           (t/is (nil? (tu/flush-block! node)))))
@@ -187,7 +189,7 @@
                          {:xt/id :bar}
                          {:xt/id :new}
                          {:xt/id :new2}])
-                   (set (xt/q node "SELECT _id FROM xt_docs")))))
+                   (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))
 
         (t/testing "can continue to index/query new transactions"
           (t/is (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :new3}]]))
@@ -196,7 +198,7 @@
                          {:xt/id :new}
                          {:xt/id :new2}
                          {:xt/id :new3}])
-                   (set (xt/q node "SELECT _id FROM xt_docs")))))))))
+                   (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))))))
 
 (t/deftest ^:integration test-stale-log-recovery
   (let [original-topic (str "xtdb.kafka-test." (random-uuid))
@@ -212,7 +214,7 @@
         (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :bar}]])
         (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :baz}]])
         (t/is (= (set [{:xt/id :foo} {:xt/id :bar} {:xt/id :baz}])
-                 (set (xt/q node "SELECT _id FROM xt_docs"))))
+                 (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME"))))
 
         ;; Finish the block
         (t/is (nil? (tu/flush-block! node)))
@@ -220,7 +222,7 @@
         ;; Submit a few more transactions
         (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :willbelost}]])
         (t/is (= (set [{:xt/id :foo} {:xt/id :bar} {:xt/id :baz} {:xt/id :willbelost}])
-                 (set (xt/q node "SELECT _id FROM xt_docs")))))
+                 (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))
 
       ;; Setup a "stale log":
       ;; - Start a node with a new topic and memory storage.
@@ -255,7 +257,7 @@
                                         :storage [:local {:path local-disk-path}]})]
         (t/testing "can query previous indexed values, unindexed values will be lost"
           (t/is (= (set [{:xt/id :foo} {:xt/id :bar} {:xt/id :baz}])
-                   (set (xt/q node "SELECT _id FROM xt_docs")))))
+                   (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))
 
         (t/testing "can index/query new transactions"
           (t/is (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :new}]]))
@@ -265,7 +267,7 @@
                          {:xt/id :baz}
                          {:xt/id :new}
                          {:xt/id :new2}])
-                   (set (xt/q node "SELECT _id FROM xt_docs")))))
+                   (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))
 
         (t/testing "can finish the block"
           (t/is (nil? (tu/flush-block! node)))))
@@ -294,7 +296,7 @@
                          {:xt/id :new}
                          {:xt/id :new2}
                          {:xt/id :new3}])
-                   (set (xt/q node "SELECT _id FROM xt_docs")))))
+                   (set (xt/q node "SELECT _id FROM xt_docs FOR ALL VALID_TIME")))))
 
         (t/testing "can finish another block"
           (t/is (nil? (tu/flush-block! node))))))))
@@ -312,7 +314,7 @@
           (doseq [batch (->> (range 100) (partition-all 10))]
             (xt/execute-tx node (for [i batch] [:put-docs :docs {:xt/id i}])))
           (t/is (= 100 (count (xt/q node "SELECT *, _valid_from, _system_from FROM docs FOR VALID_TIME ALL FOR SYSTEM_TIME ALL"))))
-          (t/is (= 10 (count (xt/q node "SELECT * FROM xt.txs"))))
+          (t/is (= 10 (count (xt/q node "SELECT * FROM xt.txs FOR ALL VALID_TIME"))))
           (t/testing "ensure blocks have been written"
             (Thread/sleep 1000)
             (t/is (= ["l00-rc-b00.arrow" "l00-rc-b01.arrow" "l00-rc-b02.arrow" "l00-rc-b03.arrow" "l00-rc-b04.arrow"]
@@ -328,12 +330,12 @@
           (t/testing "shouldn't reindex any transactions when starting up"
             (Thread/sleep 1000)
             (t/is (= 100 (count (xt/q node "SELECT *, _valid_from, _system_from FROM docs FOR VALID_TIME ALL FOR SYSTEM_TIME ALL"))))
-            (t/is (= 10 (count (xt/q node "SELECT *  FROM xt.txs")))))
+            (t/is (= 10 (count (xt/q node "SELECT *  FROM xt.txs FOR ALL VALID_TIME")))))
 
           (t/testing "sending a new transaction shouldnt cut a block yet - still ten blocks off"
             (xt/execute-tx node (for [i (range 101 111)] [:put-docs :docs {:xt/id i}]))
             (t/is (= 110 (count (xt/q node "SELECT *, _valid_from, _system_from FROM docs FOR VALID_TIME ALL FOR SYSTEM_TIME ALL"))))
-            (t/is (= 11 (count (xt/q node "SELECT *  FROM xt.txs"))))
+            (t/is (= 11 (count (xt/q node "SELECT *  FROM xt.txs FOR ALL VALID_TIME"))))
             (t/is (= ["l00-rc-b00.arrow" "l00-rc-b01.arrow" "l00-rc-b02.arrow" "l00-rc-b03.arrow" "l00-rc-b04.arrow"]
                      (tu/read-files-from-bp-path node "tables/public$docs/meta/")))))))))
 
@@ -349,7 +351,7 @@
           (doseq [batch (->> (range 100) (partition-all 10))]
             (xt/execute-tx node (for [i batch] [:put-docs :docs {:xt/id i}])))
           (t/is (= 100 (count (xt/q node "SELECT *, _valid_from, _system_from FROM docs FOR VALID_TIME ALL FOR SYSTEM_TIME ALL"))))
-          (t/is (= 10 (count (xt/q node "SELECT * FROM xt.txs"))))
+          (t/is (= 10 (count (xt/q node "SELECT * FROM xt.txs FOR ALL VALID_TIME"))))
           (tu/flush-block! node)
           (t/testing "ensure block has been written"
             (t/is (= ["l00-rc-b00.arrow"] (tu/read-files-from-bp-path node "tables/public$docs/meta/"))))))
@@ -363,7 +365,7 @@
           (t/testing "shouldn't reindex any transactions when starting up"
             (Thread/sleep 1000)
             (t/is (= 100 (count (xt/q node "SELECT *, _valid_from, _system_from FROM docs FOR VALID_TIME ALL FOR SYSTEM_TIME ALL"))))
-            (t/is (= 10 (count (xt/q node "SELECT *  FROM xt.txs")))))
+            (t/is (= 10 (count (xt/q node "SELECT *  FROM xt.txs FOR ALL VALID_TIME")))))
 
           (t/testing "shouldn't have flushed another block / re-read the flush block"
             (t/is (= ["l00-rc-b00.arrow"] (tu/read-files-from-bp-path node "tables/public$docs/meta/")))))))))
@@ -388,13 +390,13 @@
         (log/info "Testing that both nodes can read from the topic after flush and compact")
         (log/info "Running query against node 1") 
         (t/is (= #{{:_id "primary"} {:_id "primary2"}}
-                 (set (jdbc/execute! xtdb-conn-1 ["SELECT * FROM foo"]))))
+                 (set (jdbc/execute! xtdb-conn-1 ["SELECT * FROM foo FOR ALL VALID_TIME"]))))
 
         (log/info "Running query against node 2") 
         (t/is (= #{{:_id "primary"} {:_id "primary2"}}
-                 (set (jdbc/execute! xtdb-conn-2 ["SELECT * FROM foo"]))))
+                 (set (jdbc/execute! xtdb-conn-2 ["SELECT * FROM foo FOR ALL VALID_TIME"]))))
         
         (log/info "Running second query against node 2")
         (jdbc/execute! xtdb-conn-2 ["INSERT INTO foo RECORDS {_id: 'primary3'}"])
         (t/is (= #{{:_id "primary"} {:_id "primary2"} {:_id "primary3"}}
-                 (set (jdbc/execute! xtdb-conn-2 ["SELECT * FROM foo"]))))))))
+                 (set (jdbc/execute! xtdb-conn-2 ["SELECT * FROM foo FOR ALL VALID_TIME"]))))))))

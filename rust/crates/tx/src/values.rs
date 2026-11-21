@@ -170,6 +170,13 @@ impl UserMetadata {
         Ok(Self { value: Arc::new(value), _reservation: reservation })
     }
     pub fn value(&self) -> &Value { &self.value }
+
+    pub(crate) fn requires_ordered_system_time(&self) -> bool {
+        matches!(
+            self.value(),
+            Value::Struct(fields) if fields.get("rtdb_ordered_system_time") == Some(&Value::Bool(true))
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
