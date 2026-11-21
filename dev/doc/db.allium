@@ -368,6 +368,8 @@ entity SourceMessage {
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
+    -- Compatible Arrow document vectors include nested lists and structs.
+    -- Batches with compatible column types retain first-seen column order and represent missing columns as nulls without converting the documents to rows.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
     default_tz: ZoneId               -- always present

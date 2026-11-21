@@ -268,6 +268,35 @@ async fn bulk_ingestion_uses_each_arrow_batch_and_catalog_metadata_uses_dense_un
 }
 
 #[tokio::test]
+async fn bulk_ingest_preserves_nested_arrow_lists_with_signed_execution_values() {
+    use arrow_array::{Array, ListArray, types::UInt64Type};
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let items = ListArray::from_iter_primitive::<UInt64Type, _, _>([
+        Some(vec![Some(u64::MAX), None]),
+        Some(vec![Some(9)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_id", DataType::Int64, false),
+        Field::new("items", items.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![
+        Arc::new(Int64Array::from(vec![1, 2])), Arc::new(items),
+    ]).unwrap();
+    client.upload(CommandStatementIngest { table: "docs".into(), ..Default::default() }, vec![batch]).await;
+
+    let actual = client.query("SELECT items FROM docs ORDER BY _id").await;
+
+    let lists: Vec<_> = actual.iter().flat_map(|batch| {
+        let column = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        column.iter().map(|value| value.unwrap().as_any().downcast_ref::<Int64Array>().unwrap().iter().collect::<Vec<_>>())
+    }).collect();
+    assert_eq!(lists, [vec![Some(-1), None], vec![Some(9)]]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn arrow_ingest_batches_and_sql_deletes_keep_transaction_order() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
