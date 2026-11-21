@@ -740,10 +740,14 @@ VALUES (2, DATE '2022-01-01', DATE '2021-01-01')"])
 
       (t/is (= expected (set (xt/q *conn* "SELECT * FROM foo")))))))
 
-(t/deftest processed-msg-ids-equal-to-submitted-msg-ids-4813
+(t/deftest processed-msg-ids-catch-up-to-submitted-msg-ids-4813
   (xt/execute-tx *conn* [[:put-docs :docs {:xt/id :foo, :name "Foo"}]])
-  (tu/flush-block! tu/*node*)
-
-  (let [{:keys [latest-submitted-msg-ids latest-processed-msg-ids]} (xt/status *conn*)]
-    (t/is (seq latest-submitted-msg-ids))
-    (t/is (= latest-submitted-msg-ids latest-processed-msg-ids))))
+  (let [submitted (:latest-submitted-msg-ids (xt/status *conn*))]
+    (t/is (seq submitted))
+    (tu/flush-block! tu/*node*)
+    (let [processed (:latest-processed-msg-ids (xt/status *conn*))]
+      (t/is (= (set (keys submitted)) (set (keys processed))))
+      (doseq [[db submitted-ids] submitted
+              :let [processed-ids (get processed db)]]
+        (t/is (= (count submitted-ids) (count processed-ids)))
+        (t/is (every? true? (map <= submitted-ids processed-ids)))))))

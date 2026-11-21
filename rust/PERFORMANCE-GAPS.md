@@ -244,7 +244,7 @@ Keep the existing correctness tests and run the relevant Rust, JVM and conforman
 - The recovered corpus had one early node stop in the health test.
   Fifteen targeted and parallel reruns did not reproduce it.
   Keep the case open for a diagnostic trace if it recurs under concurrent build and test load.
-- The processed-message-ID test awaits a flush and then compares submitted and processed positions.
-  Compaction can submit a subsequent message between the flush barrier and the observations.
-  Both engines allow that interleaving.
-  The positions should be checked against a captured target if the test is revised.
+- The original processed-message-ID test compared two independently sampled live positions after a flush.
+  The JVM Flight SQL suite reproduced the race with submitted position 2 and processed position 4.
+  The branch test captures submitted positions before the flush and checks that processing has reached each captured position.
+  Both engines permit background compaction to advance the processed watermark during the observations.
