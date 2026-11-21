@@ -832,6 +832,7 @@ impl ObjectStore for EncryptingStore {
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
         self.inner.retain_catalog(cut).await
     }
+    fn defers_trie_releases(&self) -> bool { self.inner.defers_trie_releases() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         self.inner.advance_catalog_floor(installed).await
     }
@@ -925,6 +926,7 @@ impl ObjectStore for GarbageStore {
         let Some(readers) = &self.catalog_readers else { return Ok(None); };
         readers.retain(cut).await.map(Some)
     }
+    fn defers_trie_releases(&self) -> bool { self.catalog_readers.is_some() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { return Ok(true); };
         readers.advance(installed).await

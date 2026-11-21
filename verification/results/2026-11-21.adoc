@@ -2104,3 +2104,33 @@ The final product-wide refinement and native qualification remain open.
 The optional versioned-provider fixture remains pending.
 The Docker image pulls and the direct attempt to obtain the published MinIO checksums failed.
 The official checksum requests returned HTTP 410. link:https://dl.min.io/server/minio/release/darwin-arm64/archive/[MinIO archive]
+
+=== Hosted trie release handoff
+
+The hosted trie collector stages the file plan, waits for the replica removal to install, persists a matching receipt, and advances or observes the catalog admission floor before it queues file releases.
+A blocked floor leaves the plan pending.
+If a release fails, the next collector can read the same plan and receipt, confirm floor coverage and retry the handoff.
+Artefacts and data precede metadata within a batch.
+Classic stores still use the existing collection path.
+
+TLC explored all 19 distinct states for one retirement, two files, one older reader and an interrupted release.
+It rejected four weakened rules at their named invariants, and found a trace that finishes the interrupted release and removes the pending plan.
+Apalache checked the safety conjunction through nine transitions and rejected discarding the plan after releasing only one file.
+The run records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-models-a6o8twnq/`. link:../tla/HostedTrieRelease.tla[Handoff model]
+
+Lean 4.36.0 audited four theorems covering release authority, retention of unfinished plans and file accounting for arbitrary lists and finite histories.
+Each corresponding step law rejected its control, which queues before the floor, discards an unfinished plan, or silently loses an unreleased file.
+The Lean model takes the installed receipt and floor as abstract transitions. It does not prove the hosted floor implementation or provider actions.
+The run records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-lean-1kfnxzyx/`. link:../lean/HostedTrieRelease.lean[Unbounded handoff laws]
+
+The Rust storage, maintenance and Multi suite selections passed 252 cases on parent `5f41a7d13` with this change.
+They include the local restart replay, classic GC tests, and hosted directory and cell tests.
+One optional test was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/hosted-retirement-release-5f41-rust.log`.
+The exact restart replay passed on parent `f71c07a0c` with this change.
+Seven mutations failed at their declared assertions, including queueing before installation and losing the plan on partial release.
+The per-case native build and test records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-native-en304von/`.
+
+The handoff controls new release markers from the hosted trie collector.
+The downstream reaper still acts on logical keys and its grace period.
+An exact deletion certificate still needs recovery and fork dependency coverage and enforcement at the provider effect.

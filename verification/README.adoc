@@ -218,7 +218,10 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `verus/trie_removal_receipt` checks the native decision to acknowledge a removal after installed read-back and exclusion of its trie keys.
   The native replay checks include a control that sends the acknowledgement during application, before the prefix is published.
   `verus/trie_retirement_intent` checks the receipt's journal and its order relative to the persisted selection cut.
-  The associated native replay checks restart on both sides of installation and controls that omit the durable stage or its replay.
+  The associated native replay checks restart on both sides of installation and after a partial release. Its controls cover durable staging, replay, receipt and floor ordering, file accounting and metadata ordering.
+* `tla/HostedTrieRelease.tla` checks the ordering from installed receipt through admission floor to queued release, with one older reader and a restart during handoff.
+  Apalache independently checks the safety conjunction and loss of the pending plan.
+  `lean/HostedTrieRelease.lean` checks release authority and complete accounting for arbitrary file plans over finite histories.
 * `tla/ResidenceRetirement.tla` composes durable intent and exact-identity deletion with a serving view, an in-flight provider request, a recovery cursor, a checkpoint, and a fork.
   It includes three generations, one shared file, one pair of physical versions of a logical key, and one delayed deletion grant per file.
   Its controls drop each hold or fence independently and include loss of a durable intent both before and after installation.

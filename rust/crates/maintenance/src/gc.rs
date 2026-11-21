@@ -14,7 +14,7 @@ use rtdb_types::{Anomaly, BlockIndex, CatalogCut, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use crate::{CycleWorker, SnapshotSource, TrieDeletionPublisher};
-use crate::retirement_intent::{self, PendingRetirement, RetirementFile};
+use crate::retirement_intent::{self, FileRelease, PendingRetirement, RetirementFile};
 
 #[derive(Clone, Debug)]
 pub struct GarbageConfig {
@@ -109,11 +109,18 @@ impl TrieCollector {
     }
 
     pub async fn collect_as_of(&self, as_of: Timestamp, cancellation: &CancellationToken) -> Result<()> {
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
         let collection = Arc::new(self.partition.trie_collection());
         let cut = collection.current().snapshot().catalog_cut();
+        if self.store.defers_trie_releases() && cut.is_none() { return Ok(()); }
+        let release = FileRelease {
+            slots: Arc::new(Semaphore::new(self.config.delete_parallelism)),
+            parallelism: self.config.delete_parallelism,
+            cancellation: cancellation.clone(),
+        };
         if let Some(cut) = cut
             && let Err(error) = IoRegion::retaining(collection.clone(), retirement_intent::resume(
-                self.store.as_ref(), self.publisher.as_ref(), collection.current(), cut, cancellation,
+                self.store.as_ref(), self.publisher.as_ref(), collection.current(), cut, &release,
             )).await
         {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
@@ -121,9 +128,8 @@ impl TrieCollector {
             return Ok(());
         }
         let tables: Vec<_> = collection.current().table_catalog().entries().cloned().collect();
-        let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
         let tasks = stream::iter(tables).map(|entry| {
-            let deletes = Arc::clone(&deletes);
+            let release = release.clone();
             let collection = Arc::clone(&collection);
             async move {
                 let keys = match self.leased_out(&entry.table, collection.eligible(&entry.table, as_of)) {
@@ -132,7 +138,7 @@ impl TrieCollector {
                 };
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
                 let result = IoRegion::retaining(collection.clone(), self.collect_table(
-                    &entry, &keys, &groups, cut, collection.current().trie_catalog(), &deletes, cancellation,
+                    &entry, &keys, &groups, cut, collection.current().trie_catalog(), &release,
                 )).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
@@ -141,7 +147,9 @@ impl TrieCollector {
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 
-    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, catalog: &TrieCatalog, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, catalog: &TrieCatalog, release: &FileRelease) -> Result<()> {
+        let deletes = release.slots.as_ref();
+        let cancellation = &release.cancellation;
         if keys.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
         let chunk_size = self.config.chunk_size;
         // A shared file belongs in the receipt of the last batch removing members
@@ -193,22 +201,27 @@ impl TrieCollector {
             batches.push((chunk, trie_files, intent));
         }
 
-        for key in group_files.values().flatten() {
-            if cancellation.is_cancelled() { return Err(crate::closed()); }
-            self.store.delete(key).await?;
+        let deferred = self.store.defers_trie_releases();
+        if !deferred {
+            for key in group_files.values().flatten() {
+                if cancellation.is_cancelled() { return Err(crate::closed()); }
+                self.store.delete(key).await?;
+            }
         }
         for (chunk, trie_files, intent) in batches {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let results = stream::iter(trie_files).map(|files| async move {
-                let _permit = deletes.acquire().await.map_err(crate::invalid)?;
-                if cancellation.is_cancelled() { return Err(crate::closed()); }
-                for file in files { self.store.delete(&file).await?; }
-                Ok::<_, Anomaly>(())
-            }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<_>>().await;
-            for result in results { result?; }
+            if !deferred {
+                let results = stream::iter(trie_files).map(|files| async move {
+                    let _permit = deletes.acquire().await.map_err(crate::invalid)?;
+                    if cancellation.is_cancelled() { return Err(crate::closed()); }
+                    for file in files { self.store.delete(&file).await?; }
+                    Ok::<_, Anomaly>(())
+                }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<_>>().await;
+                for result in results { result?; }
+            }
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let position = self.publisher.publish(entry.table.clone(), chunk.to_vec()).await?;
-            if let Some(intent) = intent { intent.finish(self.store.as_ref(), position).await?; }
+            if let Some(intent) = intent { intent.finish(self.store.as_ref(), position, release).await?; }
         }
         Ok(())
     }

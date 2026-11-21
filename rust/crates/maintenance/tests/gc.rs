@@ -144,6 +144,7 @@ struct CatalogFloorStore {
     inner: Arc<LocalStore>,
     blocked: AtomicBool,
     proposals: Mutex<Vec<CatalogCut>>,
+    fail_release: Mutex<Option<ObjectKey>>,
 }
 
 #[async_trait]
@@ -154,7 +155,17 @@ impl ObjectStore for CatalogFloorStore {
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, path).await }
     async fn list(&self, prefix: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::object_store::StoredObject>> { self.inner.list(prefix).await }
-    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        {
+            let mut fail = self.fail_release.lock().unwrap();
+            if fail.as_ref() == Some(key) {
+                *fail = None;
+                return Err(rtdb_storage::Error::Task("simulated release failure".into()));
+            }
+        }
+        self.inner.delete(key).await
+    }
+    fn defers_trie_releases(&self) -> bool { true }
     async fn advance_catalog_floor(&self, installed: CatalogCut) -> Result<bool> {
         self.proposals.lock().unwrap().push(installed);
         Ok(!self.blocked.load(Ordering::Relaxed))
@@ -185,9 +196,18 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
         let collector = |store: Arc<dyn ObjectStore>, publisher: Arc<InstallingPublisher>, observer: Arc<Observer>| {
             TrieCollector::new(store, state.clone(), publisher, observer, unleased(), fixed_clock()).unwrap()
         };
+        let slug = &tables_for_footprint.entry(&table).unwrap().slug;
+        let data = ObjectKey::new(slug.data_key(&old)).unwrap();
+        let metadata = ObjectKey::new(slug.metadata_key(&old)).unwrap();
+        let artefact = ObjectKey::new(slug.artefact_key(&old, "search", "body", 1).unwrap()).unwrap();
+        for key in [&artefact, &data, &metadata] { store.put(key, Bytes::from_static(b"trie file")).await.unwrap(); }
+        let coordination = Arc::new(CatalogFloorStore {
+            inner: store.clone(), blocked: AtomicBool::new(true),
+            proposals: Mutex::new(Vec::new()), fail_release: Mutex::new(None),
+        });
         let owner = publisher(failed, store.clone());
         let observer = Arc::new(Observer::default());
-        let first = collector(store.clone(), owner.clone(), observer.clone());
+        let first = collector(coordination.clone(), owner.clone(), observer.clone());
         let cancellation = CancellationToken::new();
         if matches!(failed, Removal::StopBeforeInstall) {
             let malformed = ObjectKey::new(format!("{pending}/malformed")).unwrap();
@@ -206,23 +226,33 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
         assert_eq!(staged.len(), 1);
         let staged_bytes = store.get(&staged[0].key).await.unwrap();
         let encoded: serde_json::Value = serde_json::from_slice(&staged_bytes).unwrap();
-        let slug = &tables_for_footprint.entry(&table).unwrap().slug;
         assert_eq!(encoded["files"], serde_json::json!([
+            {"key": artefact.as_str()},
             {"key": slug.data_key(&old)},
             {"key": slug.metadata_key(&old)},
         ]), "the staged intent must include the file plan");
         assert!(store.list(Some(&installed)).await.unwrap().is_empty());
+        for key in [&artefact, &data, &metadata] {
+            assert!(store.head(key).await.is_ok(), "a hosted file cannot be released before its receipt");
+        }
+        drop(coordination);
         drop(owner);
         drop(store);
 
         let store = Arc::new(LocalStore::open(directory.path()).unwrap());
         let replacement = publisher(Removal::Complete, store.clone());
-        let coordination = Arc::new(CatalogFloorStore { inner: store.clone(), blocked: AtomicBool::new(true), proposals: Mutex::new(Vec::new()) });
+        let coordination = Arc::new(CatalogFloorStore {
+            inner: store.clone(), blocked: AtomicBool::new(true),
+            proposals: Mutex::new(Vec::new()), fail_release: Mutex::new(None),
+        });
         let next = collector(coordination.clone(), replacement.clone(), Arc::new(Observer::default()));
         next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(*replacement.requests.lock().unwrap(), [vec![old.clone()]], "the successor must confirm the staged removal");
         assert!(!state.value().retains_trie(&table, &old));
         assert_eq!(store.list(Some(&pending)).await.unwrap().len(), 1, "a hold blocking the floor keeps the intent durable");
+        for key in [&artefact, &data, &metadata] {
+            assert!(store.head(key).await.is_ok(), "a hosted file cannot be released below an admitted hold");
+        }
         let receipts = store.list(Some(&installed)).await.unwrap();
         assert_eq!(receipts.len(), 1);
         let receipt = store.get(&receipts[0].key).await.unwrap();
@@ -233,10 +263,26 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
         // A successor can retry floor admission from the receipt without submitting another removal.
         drop(next);
         coordination.blocked.store(false, Ordering::Relaxed);
+        *coordination.fail_release.lock().unwrap() = Some(metadata.clone());
+        let observer = Arc::new(Observer::default());
+        let next = collector(coordination.clone(), replacement.clone(), observer.clone());
+        next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+        assert_eq!(store.list(Some(&pending)).await.unwrap().len(), 1, "a failed hosted release keeps the file plan durable");
+        assert!(store.head(&metadata).await.is_ok());
+        for key in [&artefact, &data] {
+            assert!(matches!(store.head(key).await, Err(rtdb_storage::Error::MissingObject(_))),
+                "artefact and data releases precede metadata");
+        }
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        drop(next);
+
         let next = collector(coordination.clone(), replacement.clone(), Arc::new(Observer::default()));
         next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
-        assert_eq!(*coordination.proposals.lock().unwrap(), [installed_cut, installed_cut]);
+        assert_eq!(*coordination.proposals.lock().unwrap(), [installed_cut; 3]);
         assert!(store.list(Some(&pending)).await.unwrap().is_empty());
+        for key in [&artefact, &data, &metadata] {
+            assert!(matches!(store.head(key).await, Err(rtdb_storage::Error::MissingObject(_))));
+        }
 
         store.put(&staged[0].key, staged_bytes).await.unwrap();
         next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();

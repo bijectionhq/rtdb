@@ -648,6 +648,28 @@ def verify_retirement_certificate(args, scratch):
                       "retirement-certificate", controls, 6, os.environ | {"LEAN_PATH": str(directory)})
 
 
+def verify_hosted_trie_release(args, scratch):
+    controls = {
+        "queue-before-floor": (
+            "state.pending = true ∧ state.receipt = true ∧ state.floor = true ∧ state.interrupted = false",
+            "state.pending = true ∧ state.receipt = true ∧ state.interrupted = false",
+            ["step_preserves_release_authority"],
+        ),
+        "discard-unfinished-plan": (
+            "state.pending = true ∧ state.remaining = []",
+            "state.pending = true",
+            ["step_retains_an_unfinished_plan"],
+        ),
+        "lose-an-unreleased-file": (
+            "remaining := rest, released := file :: state.released",
+            "remaining := rest.drop 1, released := file :: state.released",
+            ["step_accounts_for_every_file"],
+        ),
+    }
+    verify_lean_model(args, scratch, Path("verification/lean/HostedTrieRelease.lean"),
+                      "hosted-trie-release", controls, 4)
+
+
 def verify_reader_reclamation_minimality(args, scratch):
     path = Path("verification/lean/ReaderReclamationMinimality.lean")
     controls = {
@@ -1565,6 +1587,7 @@ def verify_lean(args, scratch):
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
+            verify_hosted_trie_release(args, scratch)
             verify_replica_trim_admission(args, scratch)
             verify_replica_hold_close(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
@@ -1799,6 +1822,18 @@ TLA_CASES = (
     ("PublicationVersion", "publication-version-verified-retry", (
         "INVARIANTS BindsCheckedVersion RetirementMatchesBinding",
         "INVARIANT VerifiedRetryWitness"), "VerifiedRetryWitness"),
+    ("HostedTrieRelease", "hosted-trie-release", None, None),
+    ("HostedTrieRelease", "hosted-trie-release-before-receipt",
+     ('Mutation = "none"', 'Mutation = "release_before_receipt"'), "ReleaseHasReceipt"),
+    ("HostedTrieRelease", "hosted-trie-release-before-floor",
+     ('Mutation = "none"', 'Mutation = "release_before_floor"'), "ReleaseHasFloor"),
+    ("HostedTrieRelease", "hosted-trie-release-admit-below-floor",
+     ('Mutation = "none"', 'Mutation = "admit_below_floor"'), "ReleaseExcludesOldReader"),
+    ("HostedTrieRelease", "hosted-trie-release-forget-partial",
+     ('Mutation = "none"', 'Mutation = "forget_after_one"'), "PlanCoversUnreleased"),
+    ("HostedTrieRelease", "hosted-trie-release-recovery-witness",
+     ("INVARIANTS ReleaseHasReceipt ReleaseHasFloor ReleaseExcludesOldReader PlanCoversUnreleased",
+      "INVARIANT NeverRecoversPartialRelease"), "NeverRecoversPartialRelease"),
     ("CatalogAdmissionFloor", "catalog-admission-floor", None, None),
     ("CatalogAdmissionFloor", "catalog-floor-admit-older", (
         'Mutation = "none"', 'Mutation = "ignore_floor"'), "HeldViewAdmissible"),
@@ -2073,6 +2108,11 @@ def verify_apalache(args, scratch):
     check_apalache(
         args, scratch, "PublicationVersion", "publication-version-head-after-read", "BindsCheckedVersion", 6,
         ('Mutation = "none"', 'Mutation = "head_after_read"'), "a later version substituted for the verified read",
+    )
+    check_apalache(args, scratch, "HostedTrieRelease", "hosted-trie-release", "Safety", 9)
+    check_apalache(
+        args, scratch, "HostedTrieRelease", "hosted-trie-release-forget-partial", "PlanCoversUnreleased", 9,
+        ('Mutation = "none"', 'Mutation = "forget_after_one"'), "a partial release lost its durable plan",
     )
     check_apalache(args, scratch, "CatalogAdmissionFloor", "catalog-admission-floor", "Safety", 8)
     check_apalache(
@@ -2402,30 +2442,42 @@ def verify_durable_trie_retirement(args, source):
     if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
         raise ValueError("native restart failed to recover the staged retirement")
 
-    journal = source / "rust/crates/maintenance/src/retirement_intent.rs"
-    original = journal.read_bytes()
+    journal = "rust/crates/maintenance/src/retirement_intent.rs"
+    collector = "rust/crates/maintenance/src/gc.rs"
     controls = {
-        "skip-stage": ("store.put(&pending.intent, pending.encoded.clone()).await?;", "", "retirement intent was not durable before publication"),
-        "skip-replay": ("if keys.iter().all(|key| !view.retains_trie(&intent.table, key)) {",
-                        "if false && keys.iter().all(|key| !view.retains_trie(&intent.table, key)) {",
+        "skip-stage": (journal, "store.put(&pending.intent, pending.encoded.clone()).await?;", "",
+                       "retirement intent was not durable before publication"),
+        "skip-replay": (journal, "if keys.iter().all(|key| !view.retains_trie(&pending.plan.table, key)) {",
+                        "if false && keys.iter().all(|key| !view.retains_trie(&pending.plan.table, key)) {",
                         "the successor must confirm the staged removal"),
-        "omit-files": ("tries: keys.iter().map(TrieKey::to_string).collect(), files };",
+        "omit-files": (journal, "tries: keys.iter().map(TrieKey::to_string).collect(), files };",
                        "tries: keys.iter().map(TrieKey::to_string).collect(), files: Vec::new() };",
                        "the staged intent must include the file plan"),
-        "drop-before-floor": ("if store.advance_catalog_floor(cut).await? {",
+        "drop-before-floor": (journal, "if store.advance_catalog_floor(cut).await? {",
                               "if { store.advance_catalog_floor(cut).await?; true } {",
                               "a hold blocking the floor keeps the intent durable"),
+        "early-release": (collector, "if !deferred {\n                let results = stream::iter(trie_files)",
+                          "if true {\n                let results = stream::iter(trie_files)",
+                          "a hosted file cannot be released before its receipt"),
+        "abandon-partial-release": (journal, ".buffer_unordered(release.parallelism).try_collect::<()>().await?;",
+                                    ".buffer_unordered(release.parallelism).try_collect::<()>().await.ok();",
+                                    "a failed hosted release keeps the file plan durable"),
+        "release-metadata-first": (journal, "[ReleasePhase::Artefacts, ReleasePhase::Data, ReleasePhase::Metadata]",
+                                   "[ReleasePhase::Metadata, ReleasePhase::Artefacts, ReleasePhase::Data]",
+                                   "artefact and data releases precede metadata"),
     }
-    for name, (before, after, failure) in controls.items():
+    for name, (relative, before, after, failure) in controls.items():
+        path = source / relative
+        original = path.read_bytes()
         try:
-            replace_once(journal, before, after)
+            replace_once(path, before, after)
             checked = run_case(command, source / "rust", args.evidence, f"rust-trie-retirement-intent-{name}", env)
             if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
                 or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
                 raise ValueError(f"trie retirement control {name} did not fail at its declared assertion")
         finally:
-            journal.write_bytes(original)
-    print("rust-trie-retirement-intent: restart passed, omitting stage, replay, the file plan or the floor gate failed")
+            path.write_bytes(original)
+    print("rust-trie-retirement-intent: restart passed, early release and six weakened journal rules failed")
 
 
 def verify_catalog_admission_floor(args, source):

@@ -105,6 +105,8 @@ pub trait ObjectStore: Send + Sync {
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
     }
+    /// Whether retiring trie files releases them to a shared reaper after the installed catalog floor.
+    fn defers_trie_releases(&self) -> bool { false }
     /// Records an installed retirement as a lower bound for new hosted catalog captures.
     /// Returns false while a reader still needs a catalog before the proposed floor.
     /// Standalone stores have no coordinated catalog admissions.
