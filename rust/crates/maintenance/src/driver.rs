@@ -37,6 +37,7 @@ pub struct CompactionDriver {
     executor: Arc<dyn CompactionExecutor>,
     publisher: Arc<dyn CompactionPublisher>,
     observer: Arc<dyn CompactionObserver>,
+    job_slots: Option<Arc<Semaphore>>,
     parallelism: usize,
     automatic: bool,
     signals: mpsc::Receiver<()>,
@@ -54,13 +55,19 @@ impl CompactionDriver {
         if parallelism == 0 || request_capacity == 0 { return Err(crate::invalid("Maintenance concurrency and request capacity must be positive")); }
         let (signals, signal_receiver) = mpsc::channel(1);
         let (requests, request_receiver) = mpsc::channel(request_capacity);
-        Ok((Self { snapshots, executor, publisher, observer: Arc::new(StderrCompactionObserver), parallelism, automatic: !ignore_signal,
+        Ok((Self { snapshots, executor, publisher, observer: Arc::new(StderrCompactionObserver), job_slots: None, parallelism, automatic: !ignore_signal,
                 signals: signal_receiver, requests: request_receiver },
             CompactionHandle { signals, requests, capacity: Arc::new(Semaphore::new(request_capacity)), ignore_signal }))
     }
 
     /// Replaces the default stderr observer before the driver starts; the driver retains it until all workers finish.
     pub fn with_observer(mut self, observer: Arc<dyn CompactionObserver>) -> Self { self.observer = observer; self }
+
+    /// Shares job execution slots across database drivers on one node.
+    pub fn with_job_slots(mut self, slots: Arc<Semaphore>) -> Self {
+        self.job_slots = Some(slots);
+        self
+    }
 
     fn report_failure(&self, key: &JobKey, error: &Anomaly) {
         if error.code == "rtdb.maintenance/closed" || error.category == AnomalyCategory::Interrupted { return; }
@@ -88,11 +95,21 @@ impl CompactionDriver {
                 let executor = Arc::clone(&self.executor);
                 let publisher = Arc::clone(&self.publisher);
                 let snapshots = Arc::clone(&self.snapshots);
+                let job_slots = self.job_slots.clone();
                 let token = workers.clone();
                 running.push(async move {
                     let result = async {
-                        if !available_jobs(snapshots.snapshot().trie_catalog())?.iter().any(|available| available == &job) { return Ok(()); }
-                        let notification = executor.execute(&job, &token).await?;
+                        let notification = {
+                            let _slot = if let Some(slots) = job_slots {
+                                Some(tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => return Err(crate::closed()),
+                                    permit = slots.acquire_owned() => permit.map_err(|_| crate::closed())?,
+                                })
+                            } else { None };
+                            if !available_jobs(snapshots.snapshot().trie_catalog())?.iter().any(|available| available == &job) { return Ok(()); }
+                            executor.execute(&job, &token).await?
+                        };
                         tokio::select! {
                             biased;
                             _ = token.cancelled() => Err(crate::closed()),

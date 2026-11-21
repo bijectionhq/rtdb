@@ -404,6 +404,8 @@ Compaction on every node holding a database duplicates work and costs even when 
 3. The holder adopts outputs with `TriesAdded` and releases inputs with `TriesReleased` (`maintenance/src/publication.rs` becomes the adoption path).
 4. A parked deployment with compaction debt gets a maintenance claim.
 5. `MaintenanceSupervisor` (`node/src/database.rs`) starts no compactor in multi mode.
+   A placed node that runs compaction shares its configured thread count as an execution limit across every deployment.
+   A cancelled merge holds its slot through the completion of its object writes.
 
 **Tests.**
 Duplicated job execution is harmless; outputs of a stale job are abandoned and reaped; compaction results equal the classic compactor's on the same inputs (reusing `compaction.allium`'s merge tests).

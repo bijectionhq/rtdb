@@ -10,7 +10,7 @@ use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDr
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
 use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -82,6 +82,7 @@ pub(crate) struct DatabaseFactory {
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     pub external_sources: ExternalSources,
     pub compaction_relay: Option<Arc<dyn CompactionRelay>>,
+    pub compaction_slots: Option<Arc<Semaphore>>,
 }
 
 /// Publishes a compaction a read-only database produced through the database's writer, which alone may append it.
@@ -151,6 +152,10 @@ impl DatabaseFactory {
             let (compactor, compaction) = match publisher { None => (None, None), Some(publisher) => {
                 let executor = Arc::new(TimedCompaction { executor: SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?, observer: self.execution_observer.clone() });
                 let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
+                let driver = match &self.compaction_slots {
+                    Some(slots) => driver.with_job_slots(Arc::clone(slots)),
+                    None => driver,
+                };
                 (Some(driver), Some(handle))
             } };
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {

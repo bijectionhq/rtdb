@@ -1261,6 +1261,8 @@ rule PublishCheckpoint {
 
 rule RunCompactionJob {
     -- Workers are selected by affinity on (deployment, job_key), so a retry lands on the worker that has the inputs cached.
+    -- A placed node shares its configured execution slots across all deployments.
+    -- A cancelled job keeps its slot until its admitted writes have finished.
     when: job: CompactionJob.state becomes queued
 
     ensures:

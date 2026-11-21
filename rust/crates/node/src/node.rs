@@ -13,7 +13,7 @@ use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext,
 use rtdb_storage::cache::CacheBudget;
 use rtdb_tx::{RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -117,9 +117,11 @@ impl Node {
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
         let read_fence = services.read_fence.clone();
         let scan_fragmenter = services.scan_fragmenter.clone();
+        let compaction_slots = (matches!(options.membership, Membership::Placed) && options.compaction_threads > 0)
+            .then(|| Arc::new(Semaphore::new(options.compaction_threads.min(Semaphore::MAX_PERMITS))));
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
-            external_sources: services.external_sources, compaction_relay: services.compaction_relay, clock: services.clock, options });
+            external_sources: services.external_sources, compaction_relay: services.compaction_relay, compaction_slots, clock: services.clock, options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, keyed: Arc::default() };
         let mut initial = Vec::new();
