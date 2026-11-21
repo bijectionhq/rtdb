@@ -71,6 +71,10 @@ A quorum of exact active-loglet replies can conservatively bound completed write
 Such a bound can include unpublished entries.
 The subscriber waits until its committed prefix is applied through the bound and refuses freshness if it cannot reach it.
 The read path can keep the one-quorum append contract with this rule.
+[ActiveLogletReadIndex.tla](../tla/ActiveLogletReadIndex.tla) checks this rule with overlapping three-journal ensembles, two available positions and a single read.
+It separates a synced predecessor from an active successor and allows publication to lag acknowledgement.
+The move and activation are atomic in the model.
+The runtime still needs durable activation, a per-read bound and the apply wait.
 Logkeepers' active journal identity must follow the exclusive journal and the fencing protocol.
 All trim requests require a grant bound to the history, loglet, epoch and protected recovery frontier.
 

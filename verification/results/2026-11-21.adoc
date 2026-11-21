@@ -2247,7 +2247,16 @@ The native logkeeper suite passed 61 cases and left one throughput benchmark ign
 The regression replaced two journals with blank journals at the same addresses and required the holder's check to fail.
 Switching the client back to the seal-only check let that blank quorum confirm and failed the regression.
 A journal-queue test checked that the confirmation waits behind the epoch installation.
+All 85 native Multi cell tests and all 3,198 tests in the serial full Gradle run passed on the rebased tree.
 The separate requirements for subscriber read indexes remain in link:../redesign/authority-boundaries.md[Authority boundaries].
+
+=== Active loglet read-index model
+
+TLC explored 74,981 reachable states with two overlapping three-journal ensembles, two positions, one move and one read.
+Replacing exact activation with predecessor sync, or using only the published commit watermark, each admitted a read bound below an already acknowledged write.
+Reachability checks found a read served after the move and a speculative bound that must wait for progress.
+The model treats sealing and activation as atomic stages.
+Native subscriber integration and the production refinement for those stages remain open. link:../tla/ActiveLogletReadIndex.tla[Active loglet model]
 
 === Table metadata bindings in checkpoint roots
 

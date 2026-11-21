@@ -1731,6 +1731,17 @@ def write_generated_temporal_trace(path):
 
 
 TLA_CASES = (
+    ("ActiveLogletReadIndex", "active-loglet-read-index", None, None),
+    ("ActiveLogletReadIndex", "read-index-trusts-synced-predecessor",
+     ('Mutation = "none"', 'Mutation = "synced_is_active"'), "BoundCoversAcknowledgements"),
+    ("ActiveLogletReadIndex", "read-index-uses-only-published-tips",
+     ('Mutation = "none"', 'Mutation = "published_only"'), "BoundCoversAcknowledgements"),
+    ("ActiveLogletReadIndex", "read-index-serves-after-move-witness",
+     ("INVARIANTS BoundCoversAcknowledgements ServedReadCoversAcknowledgements",
+      "INVARIANT NeverServesOnNewLoglet"), "NeverServesOnNewLoglet"),
+    ("ActiveLogletReadIndex", "read-index-waits-for-speculative-tail-witness",
+     ("INVARIANTS BoundCoversAcknowledgements ServedReadCoversAcknowledgements",
+      "INVARIANT NeverSamplesPastPublished"), "NeverSamplesPastPublished"),
     ("PlacedServingAuthority", "placed-serving-authority", None, None),
     ("PlacedServingAuthority", "placed-receipt-reused-intake",
      ('Mutation = "none"', 'Mutation = "reuse_slot"'), "ReceiptNamesTheAttempt"),
