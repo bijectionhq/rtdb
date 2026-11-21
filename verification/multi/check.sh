@@ -59,6 +59,9 @@ RTDBRecoveryIdentity|RTDBRecoveryIdentityStartup|12|Invariant FailedJournalsAreI
 RTDBJournalReplacement|RTDBJournalReplacement|0|No error has been found
 RTDBJournalReplacement|RTDBJournalReplacementPartialCopy|12|Invariant AcknowledgedPrefixRecoverable is violated
 RTDBJournalReplacement|RTDBJournalReplacementUnpublishedTrim|12|Invariant AcknowledgedPrefixRecoverable is violated
+RTDBCatalogReaderBatch|RTDBCatalogReaderBatch|0|No error has been found
+RTDBCatalogReaderBatch|RTDBCatalogReaderBatchStaleVersion|12|Invariant AdmissionsRespectFloor is violated
+RTDBCatalogReaderBatch|RTDBCatalogReaderBatchAbsentRelease|12|Invariant ReleaseFencesAdmission is violated
 RTDBGatewayReplay|RTDBGatewayReplay|0|No error has been found
 RTDBGatewayReplay|RTDBGatewayReplaySqlKey|12|Invariant OneEffect is violated
 RTDBGatewayReplay|RTDBGatewayReplayMalformedKey|12|Invariant OneEffect is violated

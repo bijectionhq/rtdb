@@ -599,3 +599,12 @@ A later restore recovers the original checkpoint and bitemporal tail.
 The deletion fixture puts an object into the fenced prefix after the first empty observation and verifies that the key survives until a new observation sequence succeeds.
 The tests exercise real S3 object requests with local directory and logkeeper processes.
 They supply a fixture task identity for hosted storage ownership and exercise the deletion interval with controlled timestamps. [Move and restore tests](../../rust/crates/multi/tests/cell.rs) · [Deletion tests](../../rust/crates/multi/tests/s3.rs) · [Deletion model](../../verification/multi/tla/RTDBDeletion.tla)
+
+### Batched catalog reader admissions
+
+A three-zone workload against the persistent TCP directory reproduced contention failures when concurrent sessions each tried to register catalog holds independently.
+The serving store batches pending admissions and releases on the same residence record while retaining one identity per live catalog reader.
+A batch resolves each admission against the authoritative floor and uses a CAS to order its mutations with external floor advances.
+An uncertain release fences a stale admission even when its reader is absent.
+The TCP directory regression confirms that 64 concurrent readers all receive distinct holds and require fewer directory updates than one CAS per reader.
+TLC checks that batching respects the floor and that a completed release cannot be reversed by a stale admission. [TLA+ model](../../verification/multi/tla/RTDBCatalogReaderBatch.tla) · [Native regression](../../rust/crates/multi/src/catalog_readers.rs)

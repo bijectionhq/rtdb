@@ -966,6 +966,17 @@ The bounded model distinguishes a delayed CAS, locally observed cancellation, dr
 Lean proves that closing one modeled hold leaves the others alone and that the resulting monotone revision fences older requests.
 The local cell regression pauses a real subscriber after registration, publishes a newer checkpoint, verifies that the physical trim retains the required record, and observes the subscriber's SQL state and trim progress after release. link:../../verification/tla/ReplicaHoldLifecycle.tla[Hold lifecycle] · link:../../verification/lean/ReplicaHoldClose.lean[Close and fencing laws]
 
+=== Hosted catalog reader batches
+
+The serving store serializes catalog reader mutations for its own storage region and batches operations that are already queued.
+It commits releases separately from admissions, so an admission that would grow the record cannot block a batch of releases.
+Every admitted reader still has a distinct directory identity and registered cut.
+Each batch checks the current residence, storage owner, and catalog admission floor before its directory CAS.
+A conflict retries against the returned current record.
+An ambiguous release still issues a CAS when the reader is absent, fencing a delayed admission against the older version.
+The reader remains held until its retained I/O drains.
+The batch is an optimization of the existing authority order and leaves the provider reclamation rules unchanged.
+
 === Multi startup checkpoint metadata
 
 A packed store derives its discovery hint and startup metadata hold from the same successful storage admission CAS.
