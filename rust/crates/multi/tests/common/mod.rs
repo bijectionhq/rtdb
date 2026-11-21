@@ -11,12 +11,13 @@ use rtdb_server::config::NodeConfiguration;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
-async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agent: AgentOptions, index: usize, pool: MemberPool, compaction_workers: bool) -> process::RunningNode {
+async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agent: AgentOptions, index: usize,
+                    pool: MemberPool, compaction_workers: bool, engine_version: Option<String>) -> process::RunningNode {
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
     process::start_node(Arc::clone(directory), process::NodeSettings {
         configuration: NodeConfiguration::from_yaml("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n").unwrap(), allocation_limit_bytes: 1 << 30,
-        control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), agent, lease: lease(), claim_wait: Duration::from_millis(claim_wait), pool,
+        control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), engine_version, agent, lease: lease(), claim_wait: Duration::from_millis(claim_wait), pool,
         keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers, capabilities: Some(secret()),
     }).await.unwrap()
 }
@@ -96,7 +97,7 @@ impl Cell {
         }
         let mut running = Vec::new();
         for (index, pool) in pools.into_iter().enumerate() {
-            running.push(Some(start_node(&directory, data.path(), agent.clone(), index, pool, compaction_workers).await));
+            running.push(Some(start_node(&directory, data.path(), agent.clone(), index, pool, compaction_workers, None).await));
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = listener.local_addr().unwrap();
@@ -117,9 +118,13 @@ impl Cell {
 
     /// Starts one more general node, as autoscaling or a replacement would.
     pub async fn add_node(&mut self) -> usize {
+        self.add_node_with_engine(None).await
+    }
+
+    pub async fn add_node_with_engine(&mut self, engine_version: Option<String>) -> usize {
         let index = self.nodes.len();
         let agent = AgentOptions::new(self.objects.clone());
-        self.nodes.push(Some(start_node(&self.directory, self.data.path(), agent, index, MemberPool::General, false).await));
+        self.nodes.push(Some(start_node(&self.directory, self.data.path(), agent, index, MemberPool::General, false, engine_version).await));
         index
     }
 

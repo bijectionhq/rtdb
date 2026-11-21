@@ -565,8 +565,8 @@ entity DeploymentRecord {
     isolation_class: IsolationClass
     -- Members permitted when isolation_class is pinned or dedicated.
     pinned_members: Set<MemberId>
-    -- The engine versions permitted to hold this deployment.
-    engine_pin: String
+    -- An exact engine version for the holder and its compaction worker.
+    engine_pin: String?
     format_version: Integer
     quotas: Quotas
 
@@ -1963,8 +1963,20 @@ rule RollEngine {
     when: EngineRolloutStarted(cell, version)
 
     ensures:
-        for member in cell.members where member.engine_version != version:
-            DrainScheduled(member)
+        for member in cell.members where member.engine_version != version and member.may_receive_placements:
+            if EligibleTargetOfVersionAndPoolExists(member, version) and EveryHoldingHasEligibleTargetOfVersion(member, version) and ParkedPinsRetainEligibleMembers(member):
+                DrainScheduled(member, target_engine: version)
+}
+
+rule SetEnginePin {
+    when: EnginePinRequested(record, version)
+
+    requires: record.lifecycle in {live, quarantined}
+    requires: version = null or HolderAndActivePlacementMatchEngine(record, version)
+    requires: version = null or EligibleEngineExists(record, version)
+
+    ensures:
+        Directory.cas(record.id, record.version, change: { engine_pin: version })
 }
 
 rule UpgradeFormatLazily {
@@ -1991,6 +2003,7 @@ rule BeginCellMove {
 
     requires: record.lifecycle = live
     requires: DestinationDeploymentPrefixIsDisjoint(record, target_cell)
+    requires: DestinationCanServeEnginePin(record, target_cell)
 
     ensures:
         Directory.cas(record.id, record.epoch, change: {
@@ -2009,6 +2022,7 @@ rule MoveCutover {
     when: DestinationPrepared(record, target_cell)
 
     requires: record.lifecycle = moving
+    requires: DestinationCanServeEnginePin(record, target_cell)
 
     ensures:
         CellMapRowWritten(deployment: record.id, cell: target_cell)

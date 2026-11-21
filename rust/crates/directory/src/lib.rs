@@ -77,6 +77,8 @@ pub struct MemberRecord {
     pub engine_version: String,
     pub lease_expires_at_ms: i64,
     pub state: MemberState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_target_engine: Option<String>,
     /// Which nodes may hold what: a quarantined deployment is placed only on the isolation pool.
     #[serde(default)]
     pub pool: MemberPool,
@@ -85,7 +87,7 @@ pub struct MemberRecord {
     pub version: Version,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberPool {
     #[default]
@@ -166,7 +168,7 @@ pub enum SourceCleanup {
     ObjectsAndKeyErased,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageNamespaces {
     pub objects: uuid::Uuid,
@@ -275,6 +277,8 @@ pub struct DeploymentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_observation: Option<DeletionObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_record: Option<DeletionRecord>,
     pub version: Version,
 }
@@ -294,7 +298,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, s3_write_lease_until_ms: None, deletion_observation: None, deletion_record: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None, deletion_record: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {
@@ -307,8 +311,16 @@ impl DeploymentRecord {
 
     pub fn can_fork(&self) -> bool { self.writer_pool().is_some() }
 
+    pub fn permits_engine(&self, member: &MemberRecord) -> bool {
+        self.engine_pin.as_deref().is_none_or(|pin| member.engine_version == pin)
+    }
+
+    pub fn may_hold_on(&self, member: &MemberRecord, now_ms: i64) -> bool {
+        self.writer_pool() == Some(member.pool) && self.permits_engine(member) && member.may_hold(now_ms)
+    }
+
     pub fn may_place_on(&self, member: &MemberRecord, now_ms: i64) -> bool {
-        self.writer_pool() == Some(member.pool) && member.may_receive_placements(now_ms)
+        self.writer_pool() == Some(member.pool) && self.permits_engine(member) && member.may_receive_placements(now_ms)
     }
 
     pub fn active_move(&self, now_ms: i64) -> Option<&PlacementMove> {

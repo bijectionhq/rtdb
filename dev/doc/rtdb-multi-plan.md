@@ -543,6 +543,18 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    Larger tails use the source's flush path, and the source stops serving before it resumes admission.
    A placed writer waits 2 ms at the committed log tip before its claim.
    Control requests observe the replication driver's leadership and block-adoption updates directly.
+   Start nodes with `--engine-version VERSION` when the package version does not identify their image.
+   `pin-engine --name NAME --version VERSION` restricts claims, planned moves and compaction to the named engine version.
+   With an active holder or placement reservation, a new pin must match that engine version.
+   Forks inherit the pin, and DynamoDB keeps it when writing a packed parked record.
+   After adding eligible nodes of the desired version, `roll-engine --version VERSION` starts drains where every current holding has a compatible destination in its pool.
+   It reads the deployment inventory and preserves an eligible member for a pool with a parked deployment or an already-draining holding pinned to the old version.
+   Serialize engine-pin changes with rollout scheduling for the same cell.
+   These drains send holdings to the selected version, including idle holdings.
+   A pinned cell move checks for an eligible destination of the pinned version before fencing the source and before changing cell placement.
+   To move a deployment between compatible images, clear its pin, move it to a member of the new version, and set the new pin.
+   Upgrade all placement and directory writers before using pins or starting a version-targeted drain.
+   Lazy format conversion and mixed engine storage-format validation remain open.
 3. Autoscaling signals per pool, published as metrics through `metrics` and `server/src/metric_export`: nodes by the binding `LoadVector` dimension, logkeepers by ingest, workers by queue depth, gateways by connections.
 
 **Tests.**

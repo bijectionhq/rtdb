@@ -462,6 +462,10 @@ impl NodeAgent {
 
     async fn relieve_execution_memory(&self, protected: Option<&str>) {
         if !self.execution_memory_pressured() { return; }
+        let member = self.member();
+        let Ok(Some(local_member)) = self.directory.member(&member).await else { return };
+        let draining = local_member.state == MemberState::Draining;
+        if draining && local_member.drain_target_engine.is_some() { return; }
         let Ok(_relief) = tokio::time::timeout(PRESSURE_WAIT, self.memory_relief.lock()).await else { return };
         if !self.execution_memory_pressured() { return; }
         let budget = self.node.memory();
@@ -481,9 +485,9 @@ impl NodeAgent {
             });
             if !same_activity() { continue; }
             attempted += 1;
-            let member = self.member();
             match self.directory.deployment(&id).await {
                 Ok(Some(record)) if record.epoch == epoch && record.holder.as_ref() == Some(&member) => {
+                    if draining && record.engine_pin.is_some() { continue; }
                     if same_activity() { let _ = self.park_with_turn(&name, None, PRESSURE_WAIT).await; }
                 }
                 Ok(_) => self.stop_running(&name).await,
@@ -638,7 +642,8 @@ impl NodeAgent {
         let me = self.member();
         let assigned_here = |record: &DeploymentRecord| {
             if record.lifecycle != Lifecycle::Live || record.move_from.is_some() || effective_holder(record, &members, now).is_none() { return false; }
-            let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &workers, |member| member.id.as_str());
+            let compatible: Vec<_> = workers.iter().copied().filter(|member| record.permits_engine(member)).collect();
+            let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &compatible, |member| member.id.as_str());
             ranked.first().is_some_and(|first| first.id == me)
         };
         let mut wanted: BTreeMap<_, _> = deployments.into_iter().filter(&assigned_here).map(|record| (record.name.clone(), record)).collect();
@@ -678,7 +683,9 @@ impl NodeAgent {
     /// Reconciles holdings and replicas with the directory, handing off recently used holdings when draining.
     pub async fn reconcile(&self) {
         self.relieve_execution_memory(None).await;
-        let draining = self.lease.record().state == MemberState::Draining;
+        let local_member = self.lease.record();
+        let draining = local_member.state == MemberState::Draining;
+        let target_engine = local_member.drain_target_engine.as_deref();
         let warming = std::mem::take(&mut *self.warming.lock());
         if !draining { for name in warming { let _ = self.subscribe_for(&name, true).await; } }
         let me = self.member();
@@ -703,14 +710,17 @@ impl NodeAgent {
             }
             self.publish_and_trim(&name, &id, epoch).await;
             if draining {
-                if last_touch.elapsed() >= active_within {
+                let Some(record) = current.as_ref() else { continue };
+                if target_engine.is_none() && record.engine_pin.is_none() && last_touch.elapsed() >= active_within {
                     let _ = self.park(&name).await;
                 } else if handoffs.len() < DRAIN_HANDOFFS_PER_PASS
-                    && let (Some(record), Some(members)) = (current.as_ref(), destinations.as_ref())
+                    && let Some(members) = destinations.as_ref()
                 {
                     let now = now_ms();
                     let candidates: Vec<_> = members.values().filter(|member| member.id != me
-                        && member.control_address.is_some() && record.may_place_on(member, now)).collect();
+                        && member.control_address.is_some() && record.may_place_on(member, now)
+                        && target_engine.is_none_or(|target| member.engine_version == target)
+                        && record.storage_namespaces.is_none_or(|namespaces| member.storage_namespaces == Some(namespaces))).collect();
                     if let Some(target) = rtdb_affinity::rank(&record.storage_identity(), &candidates, |member| member.id.as_str()).first() {
                         handoffs.push((name, epoch, target.id.clone()));
                     }

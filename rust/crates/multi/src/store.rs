@@ -87,10 +87,9 @@ impl rtdb_s3::WriteAuthorization for ScopedWriter {
             let (mut current, member) = current.zip(member).ok_or_else(&inactive)?;
             let now = now_ms();
             let admitted = current.storage_prefix() == self.prefix && match self.epoch {
-                Some(epoch) => current.epoch == epoch && current.holder.as_ref() == Some(&self.member)
-                    && current.writer_pool() == Some(member.pool) && member.may_hold(now),
+                Some(epoch) => current.epoch == epoch && current.holder.as_ref() == Some(&self.member) && current.may_hold_on(&member, now),
                 None => current.lifecycle == Lifecycle::Live && member.role == MemberRole::Node && member.pool == MemberPool::Compaction
-                    && member.state == MemberState::Eligible && member.is_live(now),
+                    && member.state == MemberState::Eligible && member.is_live(now) && current.permits_engine(&member),
             };
             if !admitted { return Err(inactive()); }
             let Some(lease_until) = lease_until.filter(|deadline| current.s3_write_lease_until_ms.is_none_or(|existing| *deadline > existing))
@@ -850,7 +849,7 @@ mod tests {
         let register = |id: &str, pool| rtdb_directory::MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None,
             availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: now_ms() + 60_000,
-            state: MemberState::Eligible, pool, storage_namespaces: None, version: 0,
+            state: MemberState::Eligible, drain_target_engine: None, pool, storage_namespaces: None, version: 0,
         };
         let mut holder = directory.register_member(register("holder", MemberPool::General)).await.unwrap();
         let worker = directory.register_member(register("compactor", MemberPool::Compaction)).await.unwrap();

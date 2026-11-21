@@ -19,12 +19,14 @@ use crate::lease::{LeaseOptions, MemberLease, Registration};
 use crate::logs::LogkeeperLogFactory;
 
 const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct NodeSettings {
     pub configuration: NodeConfiguration,
     pub allocation_limit_bytes: usize,
     pub control: SocketAddr,
     pub availability_zone: String,
+    pub engine_version: Option<String>,
     pub agent: AgentOptions,
     pub lease: LeaseOptions,
     pub pool: rtdb_directory::MemberPool,
@@ -52,6 +54,8 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    let engine_version = settings.engine_version.take().unwrap_or_else(|| ENGINE_VERSION.into());
+    crate::admin::validate_engine_version(&engine_version)?;
     let scoped_writes = match (&settings.agent.s3_write_role, &settings.agent.storage) {
         (Some(role), crate::deployment::CellStorage::S3 { config }) => {
             let issuer = rtdb_s3::ScopedS3Writes::new(&role.arn, config.region.as_deref(), role.sts_endpoint.as_deref(),
@@ -102,7 +106,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let control_address = control.local_addr().map_err(io)?;
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
         role: MemberRole::Node, address: pgwire_address.to_string(), control_address: Some(control_address.to_string()), availability_zone: settings.availability_zone, pool: settings.pool,
-        storage_namespaces: Some(storage_namespaces),
+        engine_version, storage_namespaces: Some(storage_namespaces),
     }, settings.lease).await?;
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
@@ -168,7 +172,7 @@ pub struct RunningLogkeeper {
 pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperSettings) -> Result<RunningLogkeeper> {
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
-    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: address.to_string(), control_address: None, availability_zone: settings.availability_zone, pool: Default::default(), storage_namespaces: None }, settings.lease).await?;
+    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: address.to_string(), control_address: None, availability_zone: settings.availability_zone, engine_version: ENGINE_VERSION.into(), pool: Default::default(), storage_namespaces: None }, settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
     tasks.spawn(rtdb_logkeeper::serve(listener, rtdb_logkeeper::ServerOptions { data_dir: settings.data_dir, fsync: settings.fsync, cache_bytes: settings.cache_bytes }, cancellation.clone()));

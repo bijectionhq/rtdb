@@ -12,6 +12,119 @@ use rtdb_multi::keys::KeyService;
 use tokio_postgres::NoTls;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_engine_pin_constrains_claims_and_moves_until_explicitly_cleared() {
+    let mut cell = Cell::start(1, None).await;
+    let newer = cell.add_node_with_engine(Some("next-image".into())).await;
+    let new_member = cell.node(newer).lease.id();
+    let old_engine = cell.node(0).lease.record().engine_version;
+    let directory = cell.directory.as_ref();
+    admin::create_deployment(directory, "shop", "acme", 3).await.unwrap();
+    admin::pin_engine(directory, "shop", Some(&old_engine)).await.unwrap();
+    assert!(cell.node(newer).agent.activate("shop").await.is_err());
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 23)").await.unwrap();
+    assert_eq!(cell.holder("shop").await, Some(0));
+    assert_eq!(admin::move_deployment(directory, "shop", &new_member, &control()).await.unwrap_err().code, "rtdb.multi/not-placeable");
+    assert_eq!(admin::pin_engine(directory, "shop", Some("next-image")).await.unwrap_err().code, "rtdb.multi/engine-pin-in-use");
+
+    for name in ["pinned-b", "pinned-c"] {
+        admin::create_deployment(directory, name, "acme", 3).await.unwrap();
+        admin::pin_engine(directory, name, Some(&old_engine)).await.unwrap();
+        cell.node(0).agent.activate(name).await.unwrap();
+    }
+    assert_eq!(admin::rebalance(directory, 10, &control()).await.unwrap(), 0);
+    assert!(admin::roll_engine(directory, "next-image").await.unwrap().is_empty());
+    admin::pin_engine(directory, "shop", None).await.unwrap();
+    assert_eq!(admin::rebalance(directory, 10, &control()).await.unwrap(), 1);
+    assert_eq!(cell.holder("shop").await, Some(newer));
+    admin::pin_engine(directory, "shop", Some("next-image")).await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["23"]);
+    let old_member = cell.node(0).lease.id();
+    assert!(admin::roll_engine(directory, "next-image").await.unwrap().is_empty());
+    for name in ["pinned-b", "pinned-c"] { admin::pin_engine(directory, name, None).await.unwrap(); }
+    admin::create_deployment(directory, "parked-old", "acme", 3).await.unwrap();
+    admin::pin_engine(directory, "parked-old", Some(&old_engine)).await.unwrap();
+    assert_eq!(cell.holder("parked-old").await, None);
+    assert!(admin::roll_engine(directory, "next-image").await.unwrap().is_empty());
+    admin::pin_engine(directory, "parked-old", None).await.unwrap();
+    assert_eq!(admin::roll_engine(directory, "next-image").await.unwrap(), [old_member.clone()]);
+    let draining = directory.member(&old_member).await.unwrap().unwrap();
+    assert_eq!(draining.state, rtdb_directory::MemberState::Draining);
+    assert_eq!(draining.drain_target_engine.as_deref(), Some("next-image"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cell.holder("pinned-b").await != Some(newer) || cell.holder("pinned-c").await != Some(newer) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_version_rollout_keeps_a_target_for_a_pinned_holder_already_draining() {
+    let mut cell = Cell::start(2, None).await;
+    cell.add_node_with_engine(Some("next-image".into())).await;
+    let old = cell.node(0).lease.record();
+    let spare = cell.node(1).lease.id();
+    let directory = cell.directory.as_ref();
+    admin::create_deployment(directory, "shop", "acme", 3).await.unwrap();
+    admin::pin_engine(directory, "shop", Some(&old.engine_version)).await.unwrap();
+    cell.node(0).agent.activate("shop").await.unwrap();
+    admin::drain(directory, &old.id).await.unwrap();
+    assert!(admin::roll_engine(directory, "next-image").await.unwrap().is_empty());
+    assert_eq!(directory.member(&spare).await.unwrap().unwrap().state, rtdb_directory::MemberState::Eligible);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_engine_pin_can_advance_after_its_old_holder_dies() {
+    let mut cell = Cell::start(1, None).await;
+    let newer = cell.add_node_with_engine(Some("next-image".into())).await;
+    let old = cell.node(0).lease.record();
+    let directory = std::sync::Arc::clone(&cell.directory);
+    admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    admin::pin_engine(directory.as_ref(), "shop", Some(&old.engine_version)).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 23)").await.unwrap();
+    cell.nodes[0].take().unwrap().kill().await.unwrap();
+    let mut dead = directory.member(&old.id).await.unwrap().unwrap();
+    dead.state = rtdb_directory::MemberState::Dead;
+    let version = dead.version;
+    assert!(directory.replace_member(dead, version).await.unwrap().applied().is_some());
+    admin::pin_engine(directory.as_ref(), "shop", Some("next-image")).await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["23"]);
+    assert_eq!(cell.holder("shop").await, Some(newer));
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_engine_pin_without_a_compatible_destination_prevents_cell_move_fencing() {
+    use rtdb_multi::cells::{CellMap, MemoryCellMap};
+
+    let map = MemoryCellMap::new();
+    let east = Cell::start_in("east", map.clone(), 1).await;
+    let mut west = Cell::start_in("west", map.clone(), 0).await;
+    west.add_node_with_engine(Some("next-image".into())).await;
+    let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
+    let from = admin::CellHandle { name: "east", directory: east.directory.as_ref(), storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: west.directory.as_ref(), storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
+    let client = east.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 23)").await.unwrap();
+    let engine = east.node(0).lease.record().engine_version;
+    let before = admin::pin_engine(east.directory.as_ref(), "shop", Some(&engine)).await.unwrap();
+    assert_eq!(admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20).await.unwrap_err().code, "rtdb.multi/engine-pin-no-target");
+    let after = east.directory.deployment(&before.id).await.unwrap().unwrap();
+    assert_eq!((after.epoch, after.holder, after.lifecycle), (before.epoch, before.holder, before.lifecycle));
+    assert_eq!(map.cell_of("shop").await.unwrap().as_deref(), Some("east"));
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["23"]);
+    drop(client);
+    east.stop().await;
+    west.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deployment_is_served_through_the_gateway_and_survives_its_holder_dying() {
     let mut cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

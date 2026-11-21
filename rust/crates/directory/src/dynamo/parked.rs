@@ -38,6 +38,8 @@ struct ParkedDeployment {
     quarantined: bool,
     #[prost(sint64, optional, tag = "15")]
     s3_write_lease_until_ms: Option<i64>,
+    #[prost(string, optional, tag = "16")]
+    engine_pin: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -57,7 +59,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, storage_generation,
         storage_namespaces, s3_write_lease_until_ms, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms, source_cleanup,
-        deletion_observation, deletion_record, version: _,
+        engine_pin, deletion_observation, deletion_record, version: _,
     } = record;
     if holder.is_some() || !matches!(lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
         || move_intent.is_some() || placement_move.is_some() || move_from.is_some() || cell_move.is_some()
@@ -94,6 +96,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         storage_namespaces: namespaces,
         quarantined: *lifecycle == Lifecycle::Quarantined,
         s3_write_lease_until_ms: *s3_write_lease_until_ms,
+        engine_pin: engine_pin.clone(),
     };
     let mut encoded = Vec::with_capacity(1 + packed.encoded_len());
     encoded.push(WIRE_VERSION);
@@ -152,6 +155,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         storage_namespaces,
         s3_write_lease_until_ms: packed.s3_write_lease_until_ms,
         deletion_observation: None,
+        engine_pin: packed.engine_pin,
         deletion_record: None,
         version,
     })
@@ -170,5 +174,13 @@ mod tests {
         assert_eq!(read_back, record);
         assert_eq!(read_back.active_s3_write_lease(901_999), Some(902_000));
         assert_eq!(read_back.active_s3_write_lease(902_000), None);
+    }
+
+    #[test]
+    fn parking_preserves_the_engine_pin() {
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 1_000);
+        record.engine_pin = Some("rtdb-2026.11.2".into());
+        let bytes = encode(&record).unwrap();
+        assert_eq!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).unwrap(), record);
     }
 }

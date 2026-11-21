@@ -28,7 +28,7 @@ async fn the_resident_cost_of_an_idle_deployment() {
     }
     let node = process::start_node(Arc::clone(&directory), process::NodeSettings {
         configuration: NodeConfiguration::from_yaml("server:\n  port: 0\n").unwrap(), allocation_limit_bytes: 4 << 30, control: "127.0.0.1:0".parse().unwrap(),
-        availability_zone: "z0".into(), agent: AgentOptions::new(CellStorage::Local { root: data.path().join("objects") }), lease, claim_wait: Duration::from_millis(2),
+        availability_zone: "z0".into(), engine_version: None, agent: AgentOptions::new(CellStorage::Local { root: data.path().join("objects") }), lease, claim_wait: Duration::from_millis(2),
         pool: MemberPool::General, keys: Arc::new(rtdb_multi::keys::LocalKeyService::new(data.path().join("keys")).unwrap()), cache_dir: data.path().join("cache"), local_compaction: true, capabilities: None,
     }).await.unwrap();
     for index in 0..count { admin::create_deployment(directory.as_ref(), &format!("d{index}"), "bench", 3).await.unwrap(); }

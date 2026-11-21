@@ -1,6 +1,6 @@
 //! Cell administration: creating, moving, rebalancing, forking and deleting deployments, and confirming dead members (`CreateDeployment`, `IntendMove`, `Rebalance`, `Fork`, `BeginDeletion`, `EraseAndProve`, `ExpireLease`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -192,25 +192,64 @@ pub async fn rebalance(directory: &dyn Directory, moves: usize, control: &Contro
     let now = now_ms();
     let mut moved = 0;
     for pool in [MemberPool::General, MemberPool::Isolation] {
-        let mut load: BTreeMap<MemberId, Vec<&str>> = members.values()
+        let mut load: BTreeMap<MemberId, Vec<&DeploymentRecord>> = members.values()
             .filter(|member| member.pool == pool && member.may_receive_placements(now) && member.control_address.is_some())
             .map(|member| (member.id.clone(), Vec::new())).collect();
         for record in deployments.iter().filter(|record| record.writer_pool() == Some(pool)) {
             if let Some(held) = effective_holder(record, &members, now).and_then(|holder| load.get_mut(holder)) {
-                held.push(&record.name);
+                held.push(record);
             }
         }
         while moved < moves {
-            let Some((busiest, busy)) = load.iter().max_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
-            let Some((idlest, idle)) = load.iter().min_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
-            if busy <= idle + 1 { break; }
-            let name = load.get_mut(&busiest).and_then(Vec::pop).expect("the busiest node holds something");
-            move_deployment(directory, name, &idlest, control).await?;
-            load.get_mut(&idlest).expect("listed").push(name);
+            let mut ranked: Vec<_> = load.iter().collect();
+            ranked.sort_by_key(|(_, held)| held.len());
+            let planned = ranked.iter().rev().find_map(|&(source, holdings)| {
+                ranked.iter().take_while(|(_, held)| holdings.len() > held.len() + 1).find_map(|&(target, _)| {
+                    holdings.iter().rposition(|record| record.may_place_on(&members[target], now))
+                        .map(|index| (source.clone(), target.clone(), index))
+                })
+            });
+            let Some((source, target, index)) = planned else { break };
+            let deployment = load.get_mut(&source).expect("listed").swap_remove(index);
+            move_deployment(directory, &deployment.name, &target, control).await?;
+            load.get_mut(&target).expect("listed").push(deployment);
             moved += 1;
         }
     }
     Ok(moved)
+}
+
+pub(crate) fn validate_engine_version(version: &str) -> Result<()> {
+    if version.is_empty() || version.len() > 128 || version.chars().any(|character| character.is_whitespace() || character.is_control()) {
+        return Err(Anomaly::incorrect("rtdb.multi/engine-version", "An engine version must be a nonempty identifier of at most 128 bytes"));
+    }
+    Ok(())
+}
+
+pub async fn pin_engine(directory: &dyn Directory, name: &str, version: Option<&str>) -> Result<DeploymentRecord> {
+    if let Some(version) = version { validate_engine_version(version)?; }
+    let members = members(directory).await?;
+    update(directory, name, |record| {
+        if !record.can_fork() { return Err(Anomaly::incorrect("rtdb.multi/engine-pin", format!("{name} cannot change its engine pin in its current state"))); }
+        if record.engine_pin.as_deref() == version { return Ok(()); }
+        if let Some(version) = version {
+            let now = now_ms();
+            let serves_version = |id| members.get(id).is_some_and(|member| member.engine_version == version);
+            if effective_holder(record, &members, now).is_some_and(|id| !serves_version(id))
+                || record.active_move(now).is_some_and(|reservation| !serves_version(&reservation.target))
+            {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/engine-pin-in-use", format!("Park {name} and let its placement reservation finish before changing the engine pin")));
+            }
+            if !members.values().any(|member| member.engine_version == version && record.writer_pool() == Some(member.pool)
+                && member.control_address.is_some() && member.may_receive_placements(now)
+                && record.storage_namespaces.is_none_or(|namespaces| member.storage_namespaces == Some(namespaces)))
+            {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/engine-pin-no-target", format!("No eligible node can serve {name} on engine {version}")));
+            }
+        }
+        record.engine_pin = version.map(str::to_owned);
+        Ok(())
+    }).await
 }
 
 pub async fn set_read_width(directory: &dyn Directory, name: &str, width: u32) -> Result<DeploymentRecord> {
@@ -292,6 +331,7 @@ async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::Ob
     let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
     child.lineage = source.lineage.clone();
     child.parent = Some(source.id.clone());
+    child.engine_pin = source.engine_pin.clone();
     child.log_epoch = source.log_epoch + 1;
     child.storage_namespaces = source.storage_namespaces;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
@@ -341,7 +381,7 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
         let current = directory.deployment(&source.id).await.map_err(ForkPublicationError::Rejected)?
             .filter(|current| current.can_fork() && current.epoch == source.epoch
                 && current.log_epoch == source.log_epoch && current.storage_prefix() == source.storage_prefix()
-                && current.storage_namespaces == child.storage_namespaces)
+                && current.storage_namespaces == child.storage_namespaces && current.engine_pin == child.engine_pin)
             .ok_or_else(|| ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{} changed while the fork was prepared", source.name))))?;
         match directory.create_fork(child.clone(), current.version).await {
             Ok(stored) => return Ok(stored),
@@ -446,6 +486,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     if ready.is_some() {
         return finish_cell_move(map, from, to, &current).await;
     }
+    require_cell_move_engine(to.directory, &current, StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys }).await?;
 
     let previous_ensemble = replica_servers(from.directory, &current).await?;
     let key = if existing.is_some() { from.keys.existing(&current.id)? } else { from.keys.key(&current.id)? };
@@ -502,6 +543,15 @@ fn move_conflict(name: &str, reason: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-raced", format!("Cannot move {name}: {reason}"))
 }
 
+async fn require_cell_move_engine(directory: &dyn Directory, record: &DeploymentRecord, namespaces: StorageNamespaces) -> Result<()> {
+    let Some(version) = record.engine_pin.as_deref() else { return Ok(()) };
+    let now = now_ms();
+    if directory.members().await?.iter().any(|member| member.engine_version == version && member.pool == MemberPool::General
+        && member.may_receive_placements(now) && member.control_address.is_some() && member.storage_namespaces == Some(namespaces))
+    { return Ok(()); }
+    Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/engine-pin-no-target", format!("The destination cell has no eligible node for {} on engine {version}", record.name)))
+}
+
 async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, to: &CellHandle<'_>, source: &DeploymentRecord) -> Result<DeploymentRecord> {
     let name = &source.name;
     let Some(CellMove { phase: CellMovePhase::Ready { generation, previous_ensemble, ensemble }, namespaces, .. }) = source.cell_move.as_ref() else {
@@ -510,7 +560,8 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     let mut incoming = source.clone();
     incoming.lifecycle = Lifecycle::Moving;
     incoming.storage_generation = Some(*generation);
-    incoming.storage_namespaces = Some(StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys });
+    let destination_namespaces = StorageNamespaces { objects: namespaces.destination_objects, keys: namespaces.destination_keys };
+    incoming.storage_namespaces = Some(destination_namespaces);
     incoming.s3_write_lease_until_ms = None;
     incoming.cell_move = None;
     incoming.moved_at_ms = None;
@@ -529,7 +580,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     let waiting_for_cutover = |record: &DeploymentRecord| record.lifecycle == Lifecycle::Moving && record.cell_move.is_none();
     let valid_staged = |record: &DeploymentRecord| {
         record.epoch == incoming.epoch && record.holder.is_none() && record.checkpoint == incoming.checkpoint
-            && record.ensemble == incoming.ensemble && record.move_from == incoming.move_from
+            && record.ensemble == incoming.ensemble && record.move_from == incoming.move_from && record.engine_pin == incoming.engine_pin
     };
     let destination = match to.directory.deployment_by_name(name).await? {
         Some(found) => found,
@@ -547,6 +598,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
 
     if map.cell_of(name).await?.as_deref() == Some(from.name) {
         if !waiting_for_cutover(&destination) { return Err(move_conflict(name, "the destination is already serving")); }
+        require_cell_move_engine(to.directory, &incoming, destination_namespaces).await?;
         map.assign(name, to.name, Some(from.name)).await?;
     }
     let placement = map.cell_of(name).await?;
@@ -842,16 +894,57 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     Ok(report)
 }
 
-/// Starts scaling a node in: it keeps serving what it holds, receives no new placements, and parks everything it holds so that each deployment's next request activates it elsewhere.
+/// Stops adding placements to a node and lets its agent hand off or park its holdings.
 pub async fn drain(directory: &dyn Directory, member: &MemberId) -> Result<()> {
+    mark_draining(directory, member, None).await.map(|_| ())
+}
+
+async fn mark_draining(directory: &dyn Directory, member: &MemberId, target_engine: Option<&str>) -> Result<bool> {
     for _ in 0..8 {
         let current = directory.member(member).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-member", format!("No member {member}")))?;
-        if current.state != MemberState::Eligible { return Ok(()); }
+        if current.state != MemberState::Eligible { return Ok(false); }
         let mut draining = current.clone();
         draining.state = MemberState::Draining;
-        if let Cas::Applied(_) = directory.replace_member(draining, current.version).await? { return Ok(()); }
+        draining.drain_target_engine = target_engine.map(str::to_owned);
+        if let Cas::Applied(_) = directory.replace_member(draining, current.version).await? { return Ok(true); }
     }
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/drain-contended", "The member kept changing while being drained"))
+}
+
+/// Starts drains on older nodes whose current deployments can all run on the requested engine in the same pool.
+pub async fn roll_engine(directory: &dyn Directory, version: &str) -> Result<Vec<MemberId>> {
+    validate_engine_version(version)?;
+    let members = members(directory).await?;
+    let now = now_ms();
+    let deployments = directory.deployments().await?;
+    let mut parked_pins = HashSet::new();
+    let mut held: BTreeMap<&MemberId, Vec<&DeploymentRecord>> = BTreeMap::new();
+    for record in &deployments {
+        let holder = effective_holder(record, &members, now);
+        if let Some(holder) = holder { held.entry(holder).or_default().push(record); }
+        if let Some((pin, pool)) = record.engine_pin.as_deref().zip(record.writer_pool())
+            && holder.and_then(|id| members.get(id)).is_none_or(|member| !member.may_receive_placements(now) || member.control_address.is_none())
+        {
+            parked_pins.insert((pin, pool, record.storage_namespaces));
+        }
+    }
+    let mut draining = Vec::new();
+    for older in members.values().filter(|member| member.engine_version != version && member.may_receive_placements(now)
+        && member.control_address.is_some() && member.pool != MemberPool::Compaction)
+    {
+        let serves_bound_pin = parked_pins.remove(&(older.engine_version.as_str(), older.pool, older.storage_namespaces));
+        let serves_unbound_pin = parked_pins.remove(&(older.engine_version.as_str(), older.pool, None));
+        if serves_bound_pin || serves_unbound_pin { continue; }
+        let targets: Vec<_> = members.values().filter(|target| {
+            target.engine_version == version && target.pool == older.pool && target.may_receive_placements(now) && target.control_address.is_some()
+        }).collect();
+        if targets.is_empty() { continue; }
+        if held.get(&older.id).is_some_and(|records| records.iter().any(|record| !targets.iter().any(|target| {
+            record.may_place_on(target, now) && record.storage_namespaces.is_none_or(|namespaces| target.storage_namespaces == Some(namespaces))
+        }))) { continue; }
+        if mark_draining(directory, &older.id, Some(version)).await? { draining.push(older.id.clone()); }
+    }
+    Ok(draining)
 }
 
 /// Marks every member whose lease expired more than `grace` ago as dead.
