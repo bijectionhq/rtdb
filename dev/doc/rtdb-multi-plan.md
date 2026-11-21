@@ -669,6 +669,7 @@ A parked deployment must cost nothing but its record and objects (`CostFollowsAc
    The directory keeps the placement and last activity time, and the node closes its database, logs and placement watch.
    A request wakes the deployment by claiming the next epoch and opening its checkpoint on the same eligible member.
    A later park deadline, drain or planned move can release the idle placement directly.
+   The node checks due park deadlines in small batches using the IDs and epochs recorded at suspension.
    The node skips a candidate from an earlier sweep once the deployment has awakened under another epoch.
    An open Flight SQL call counts as activity through response streaming or cancellation.
    The status command counts these placements separately as `resident_idle` and excludes them from the recommended active-node count.

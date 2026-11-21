@@ -147,6 +147,14 @@ impl ActivationWindow {
     }
 }
 
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct ResidentDeadline {
+    at_ms: i64,
+    name: String,
+    deployment: String,
+    epoch: u64,
+}
+
 struct DeploymentTurn<'a> {
     turns: &'a Turns,
     name: &'a str,
@@ -203,7 +211,7 @@ pub struct NodeAgent {
     /// One activation, subscription or park at a time per deployment name.
     turns: Turns,
     activations: Mutex<ActivationWindow>,
-    last_resident_sweep: Mutex<Instant>,
+    resident_deadlines: Mutex<BTreeSet<ResidentDeadline>>,
     memory_relief: tokio::sync::Mutex<()>,
     /// How many fragments this node has read for other nodes' scans, by deployment, table and prefix.
     fragments_read: Mutex<BTreeMap<(String, String, String), u64>>,
@@ -211,7 +219,7 @@ pub struct NodeAgent {
 
 impl NodeAgent {
     pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoint: Option<String>, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), last_resident_sweep: Mutex::new(Instant::now()), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
+        Arc::new(Self { directory, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -290,7 +298,10 @@ impl NodeAgent {
             }
             next.storage_namespaces = Some(self.storage_namespaces);
             match self.directory.replace_deployment(next, record.version).await? {
-                Cas::Applied(held) => return self.open(held, &members).await,
+                Cas::Applied(held) => {
+                    self.cancel_resident_deadline(&record);
+                    return self.open(held, &members).await;
+                }
                 Cas::Conflict(_) => continue,
             }
         }
@@ -550,6 +561,37 @@ impl NodeAgent {
         Ok(Response::Done)
     }
 
+    fn resident_deadline(&self, record: &DeploymentRecord) -> Option<ResidentDeadline> {
+        let period = self.options.park_after?;
+        let idle = record.resident_idle.filter(|_| record.is_resident_idle())?;
+        let at_ms = idle.last_activity_at_ms.saturating_add(period.as_millis().min(i64::MAX as u128) as i64);
+        Some(ResidentDeadline { at_ms, name: record.name.clone(), deployment: record.id.clone(), epoch: idle.epoch })
+    }
+
+    fn cancel_resident_deadline(&self, record: &DeploymentRecord) {
+        if let Some(deadline) = self.resident_deadline(record) {
+            self.resident_deadlines.lock().remove(&deadline);
+        }
+    }
+
+    async fn park_due_residents(&self) {
+        let mut due = Vec::new();
+        {
+            let now = now_ms();
+            let mut deadlines = self.resident_deadlines.lock();
+            while due.len() < RESIDENT_IDLE_PER_PASS && deadlines.first().is_some_and(|deadline| deadline.at_ms <= now) {
+                due.push(deadlines.pop_first().expect("a due deadline exists"));
+            }
+        }
+        for deadline in due {
+            let turn = self.turn(&deadline.name);
+            let _turn = turn.lock().await;
+            if self.park_resident(&deadline.name, None, Some((&deadline.deployment, deadline.epoch))).await.is_err() {
+                self.resident_deadlines.lock().insert(deadline.clone());
+            }
+        }
+    }
+
     pub(crate) async fn park_resident_holdings(&self) {
         if self.options.resident_idle_after.is_none() { return; }
         if let Ok(records) = self.directory.deployments_held_by(&self.member()).await {
@@ -578,6 +620,7 @@ impl NodeAgent {
             }
             let parked = park(&record, &member, record.epoch).expect("the resident holder matches");
             if let Cas::Applied(_) = self.directory.replace_deployment(parked, record.version).await? {
+                self.cancel_resident_deadline(&record);
                 return Ok(Response::Done);
             }
         }
@@ -610,7 +653,10 @@ impl NodeAgent {
                 suspended.checkpoint = Some(checkpoint);
             }
             if !unchanged() { return Ok(()); }
-            if let Cas::Applied(_) = self.directory.replace_deployment(suspended, record.version).await? {
+            if let Cas::Applied(suspended) = self.directory.replace_deployment(suspended, record.version).await? {
+                if let Some(deadline) = self.resident_deadline(&suspended) {
+                    self.resident_deadlines.lock().insert(deadline);
+                }
                 self.stop_serving(name).await;
                 drop(pause);
                 self.wait_until_detached(name).await;
@@ -941,26 +987,16 @@ impl NodeAgent {
                 let _ = self.flush(&name).await;
             }
         }
-        let park_residents_after = self.options.park_after.filter(|_| self.options.resident_idle_after.is_some()).filter(|_| {
-            let mut last_sweep = self.last_resident_sweep.lock();
-            if last_sweep.elapsed() < Duration::from_secs(1) { return false; }
-            *last_sweep = Instant::now();
-            true
-        });
-        if self.options.resident_idle_after.is_some() && (draining || park_residents_after.is_some())
-            && handoffs.len() < DRAIN_HANDOFFS_PER_PASS
+        if self.options.park_after.is_some() {
+            self.park_due_residents().await;
+        }
+        if self.options.resident_idle_after.is_some() && draining
             && let Ok(residents) = self.directory.deployments_held_by(&me).await
         {
-            let now = now_ms();
-            let expired = |record: &DeploymentRecord| park_residents_after.is_some_and(|after| {
-                record.resident_idle.is_some_and(|idle| now.saturating_sub(idle.last_activity_at_ms) >= after.as_millis().min(i64::MAX as u128) as i64)
-            });
-            for record in residents.into_iter().filter(|record| record.is_resident_idle() && (draining || expired(record)))
-                .take(DRAIN_HANDOFFS_PER_PASS - handoffs.len())
-            {
-                if !draining || target_engine.is_none() && record.engine_pin.is_none() {
+            for record in residents.into_iter().filter(DeploymentRecord::is_resident_idle) {
+                if target_engine.is_none() && record.engine_pin.is_none() {
                     let _ = self.park_if_resident(&record).await;
-                } else if let Some(target) = choose_drain_target(&record) {
+                } else if handoffs.len() < DRAIN_HANDOFFS_PER_PASS && let Some(target) = choose_drain_target(&record) {
                     handoffs.push((record.name, record.epoch, target));
                 }
             }

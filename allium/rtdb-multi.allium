@@ -1485,6 +1485,7 @@ rule WakeOnRequest {
 
 rule ParkResidentIdle {
     -- An idle deadline or drain can release a retained placement from the directory.
+    -- The node checks due deadlines in order, without reading the inventory of idle placements.
     -- A parking attempt from an older scan must still match the deployment and idle epoch.
     when: ResidentIdleParkRequested(holding)
 

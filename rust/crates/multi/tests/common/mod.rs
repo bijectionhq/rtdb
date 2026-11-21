@@ -82,6 +82,11 @@ impl Cell {
         Self::start_configured(None, vec![MemberPool::General; nodes], park_after, None, None, true, |agent| agent.resident_idle_after = Some(after)).await
     }
 
+    pub async fn start_with_resident_deadline(directory: Arc<dyn Directory>, idle: Duration, park: Duration) -> Self {
+        Self::start_configured_with_directory(directory, None, vec![MemberPool::General], Some(park), None, None, true,
+            |agent| agent.resident_idle_after = Some(idle)).await
+    }
+
     pub async fn start_with_idle_flush(delay: Duration) -> Self {
         Self::start_configured(None, vec![MemberPool::General], None, None, None, true, |agent| agent.clean_after_idle = delay).await
     }
