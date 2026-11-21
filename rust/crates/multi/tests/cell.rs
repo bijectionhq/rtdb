@@ -1111,6 +1111,26 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_flush_publishes_a_checkpoint_before_replying() {
+    let cell = Cell::start_watching(vec![MemberPool::General], None, Some(Duration::from_secs(60))).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 9)").await.unwrap();
+    let database = cell.node(0).server.node().catalog().database("shop").unwrap();
+    let position = database.latest_submitted_position().unwrap();
+    assert!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap().checkpoint.is_none());
+
+    cell.node(0).agent.flush("shop").await.unwrap();
+
+    let held = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    let checkpoint = held.checkpoint.expect("the flush has a publicly visible checkpoint");
+    assert_eq!(held.holder, Some(cell.node(0).lease.id()));
+    assert!(checkpoint.source >= position.after_offset(rtdb_types::StorageEpoch(held.log_epoch)));
+    drop((database, client));
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn park_drains_admission_before_flushing_and_publishes_its_checkpoint() {
     let cell = Cell::start_durable(1).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

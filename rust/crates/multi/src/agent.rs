@@ -438,7 +438,13 @@ impl NodeAgent {
         let (id, epoch) = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch))
             .ok_or_else(|| Anomaly::incorrect("rtdb.multi/not-held", format!("This node does not hold {name}")))?;
         let database = self.node.catalog().database(name)?;
+        let deadline = tokio::time::Instant::now() + self.options.activation_timeout;
         self.flush_and_adopt(&database, &id, epoch, self.options.activation_timeout).await?;
+        let missing = || Anomaly::fault("rtdb.multi/flush-checkpoint", format!("{name} did not adopt a block in its current log epoch"));
+        let block = database.status().adopted_block.ok_or_else(&missing)?;
+        tokio::time::timeout_at(deadline, self.publish_checkpoint(&id, epoch, &block)).await.map_err(|_| {
+            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-timeout", format!("The checkpoint for {name} was not published in time"))
+        })??.ok_or_else(missing)?;
         Ok(Response::Done)
     }
 
@@ -631,20 +637,34 @@ impl NodeAgent {
         Ok(Response::Published { position: position.0 })
     }
 
+    async fn publish_checkpoint(&self, id: &str, epoch: u64, block: &BlockCatalog) -> Result<Option<(DeploymentRecord, Checkpoint)>> {
+        let member = self.member();
+        let deposed = || Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder changed before publishing its checkpoint");
+        let mut record = self.directory.deployment(id).await?.ok_or_else(&deposed)?;
+        for _ in 0..8 {
+            if record.epoch != epoch || record.holder.as_ref() != Some(&member) { return Err(deposed()); }
+            let Some(checkpoint) = checkpoint_for_block(block, StorageEpoch(record.log_epoch)) else { return Ok(None); };
+            if record.checkpoint.is_some_and(|published| published.block >= checkpoint.block) {
+                return Ok(Some((record, checkpoint)));
+            }
+            let mut next = record.clone();
+            next.checkpoint = Some(checkpoint);
+            match self.directory.replace_deployment(next, record.version).await? {
+                Cas::Applied(stored) => return Ok(Some((stored, checkpoint))),
+                Cas::Conflict(Some(current)) => record = current,
+                Cas::Conflict(None) => return Err(deposed()),
+            }
+        }
+        Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/checkpoint-contended", "The deployment kept changing while publishing its checkpoint"))
+    }
+
     /// Publishes the holding's last adopted block as the deployment's checkpoint, and trims its stream below that block's boundary, whose records the block now holds (`TrimFollowsPublication`).
     /// The boundary record itself is kept: it names the source position a later holder's intake starts past.
     async fn publish_and_trim(&self, name: &str, id: &str, epoch: u64) {
         let Ok(database) = self.node.catalog().database(name) else { return };
         let Some(block) = database.status().adopted_block else { return };
-        let Ok(Some(record)) = self.directory.deployment(id).await else { return };
-        if record.epoch != epoch || record.holder.as_ref() != Some(&self.member()) { return; }
-        let Some(checkpoint) = checkpoint_for_block(&block, StorageEpoch(record.log_epoch)) else { return };
+        let Ok(Some((record, checkpoint))) = self.publish_checkpoint(id, epoch, &block).await else { return; };
         let boundary = checkpoint.boundary;
-        if record.checkpoint.is_none_or(|previous| previous.block < checkpoint.block) {
-            let mut next = record.clone();
-            next.checkpoint = Some(checkpoint);
-            if !matches!(self.directory.replace_deployment(next, record.version).await, Ok(Cas::Applied(_))) { return; }
-        }
 
         if boundary == 0 || !self.holdings.lock().get(name).is_some_and(|holding| {
             holding.id == id && holding.epoch == epoch && holding.trimmed_through.is_none_or(|trimmed| trimmed < boundary - 1)

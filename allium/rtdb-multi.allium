@@ -1312,6 +1312,7 @@ rule WritePackAndManifest {
 }
 
 rule PublishCheckpoint {
+    -- An explicit flush returns after publishing its adopted checkpoint for the current holding.
     -- Publication is a cas conditional on the epoch, batched per node.
     -- A checkpointed store with an independent object inventory can recover its packs by name.
     when: AppendCommitted(holding, record: BlockUploaded)
