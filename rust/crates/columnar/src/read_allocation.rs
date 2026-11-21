@@ -16,7 +16,7 @@ pub fn estimate_read_cell_bytes(field: &Field, array: &dyn Array, row: usize) ->
     estimate_cell_bytes(field, array, row, false)
 }
 
-/// Bounds a cell copied by an Arrow selection, including child payloads masked by a parent's validity.
+/// Bounds a cell copied by an Arrow selection and the placeholders used beneath null parents.
 pub fn estimate_copy_cell_bytes(field: &Field, array: &dyn Array, row: usize) -> Result<usize> {
     estimate_cell_bytes(field, array, row, true)
 }
@@ -41,7 +41,9 @@ fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: bool)
         let field = fields.iter().find_map(|(candidate, field)| (candidate == id).then_some(field)).ok_or_else(layout)?;
         return add(base, estimate_cell_bytes(field, union.child(id).as_ref(), union.value_offset(row), copy)?);
     }
-    if array.is_null(row) && !copy { return Ok(base); }
+    if array.is_null(row) {
+        return if copy { masked_copy_bytes(field) } else { Ok(base) };
+    }
     let value = match field.data_type() {
         DataType::Utf8 => mul(cast::<StringArray>(array)?.value(row).len(), 2)?,
         DataType::Binary => mul(cast::<BinaryArray>(array)?.value(row).len(), 2)?,
@@ -80,6 +82,21 @@ fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: bool)
         _ => 0,
     };
     add(base, value)
+}
+
+fn masked_copy_bytes(field: &Field) -> Result<usize> {
+    let base = 256 + 2 * std::mem::size_of::<Value>();
+    let children = match field.data_type() {
+        DataType::Struct(fields) => fields.iter().try_fold(0, |bytes, field| add(bytes, masked_copy_bytes(field)?))?,
+        DataType::FixedSizeList(child, count) => mul(usize::try_from(*count).map_err(|_| layout())?, masked_copy_bytes(child)?)?,
+        DataType::FixedSizeBinary(width) => mul(usize::try_from(*width).map_err(|_| layout())?, 2)?,
+        DataType::Union(fields, UnionMode::Dense) => {
+            let (_, field) = crate::interleave::masked_union_leg(fields).ok_or_else(layout)?;
+            masked_copy_bytes(field)?
+        }
+        _ => 0,
+    };
+    add(base, children)
 }
 
 fn range(field: &Field, values: &dyn Array, start: usize, end: usize, copy: bool) -> Result<usize> {
@@ -144,7 +161,7 @@ fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Arrow ce
 fn layout() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
 
 #[test]
-fn copying_a_null_fixed_list_admits_its_hidden_child_payload() {
+fn copying_a_null_fixed_list_skips_its_hidden_child_payload() {
     use std::sync::Arc;
 
     let item = Arc::new(Field::new("$data$", DataType::Utf8, false));
@@ -153,6 +170,11 @@ fn copying_a_null_fixed_list_admits_its_hidden_child_payload() {
     let array = FixedSizeListArray::try_new(item, 1, values, Some(arrow_buffer::NullBuffer::from(vec![false]))).unwrap();
     let field = Field::new("list", array.data_type().clone(), true);
 
-    assert!(estimate_read_cell_bytes(&field, &array, 0).unwrap() < text.len());
-    assert!(estimate_copy_cell_bytes(&field, &array, 0).unwrap() >= text.len());
+    assert!(estimate_copy_cell_bytes(&field, &array, 0).unwrap() < text.len());
+    let copied = crate::copy_selected_cells(&[&array], &[(0, 0)]).unwrap();
+    let copied = cast::<FixedSizeListArray>(copied.as_ref()).unwrap();
+    assert!(copied.is_null(0));
+    let child = cast::<StringArray>(copied.values().as_ref()).unwrap();
+    assert!(child.is_null(0));
+    assert!(child.value_data().is_empty());
 }

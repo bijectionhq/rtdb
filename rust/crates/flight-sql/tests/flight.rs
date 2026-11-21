@@ -263,6 +263,40 @@ async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_ke
 }
 
 #[tokio::test]
+async fn prepared_updates_coalesce_compatible_parameter_layouts_across_uploads() {
+    use rtdb_types::Value;
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO docs (_id,v) VALUES (1,0),(2,0),(3,0)", None).await;
+    let transaction = client.begin().await;
+    let prepared = client.prepare("UPDATE docs SET v = ? WHERE _id = ?", Some(transaction.clone())).await;
+    let command = CommandPreparedStatementUpdate { prepared_statement_handle: prepared.prepared_statement_handle };
+    let arguments = |label: &str, value: Value, id| {
+        let ty = value.logical_type();
+        let schema = Arc::new(Schema::new(vec![
+            rtdb_columnar::to_field(label, &ty).unwrap(),
+            Field::new(format!("{label}_id"), DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(schema, vec![rtdb_columnar::build_array(&ty, &[value]).unwrap(), Arc::new(Int64Array::from(vec![id]))]).unwrap()
+    };
+    client.upload(command.clone(), vec![arguments("number", Value::U64(u64::MAX), 1)]).await;
+    client.upload(command.clone(), vec![arguments("text", Value::Utf8("changed".into()), 2)]).await;
+    client.upload(command, vec![arguments("absent", Value::Null, 3)]).await;
+    client.end(transaction, true).await.unwrap();
+
+    let mut rows = client.query("SELECT _id, v FROM docs").await.iter().flat_map(|batch| {
+        let schema = batch.schema();
+        (0..batch.num_rows()).map(|row| {
+            (integer(batch, 0, row), rtdb_columnar::read_value(schema.field(1), batch.column(1).as_ref(), row).unwrap())
+        }).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(rows, [(1, Value::I64(-1)), (2, Value::Utf8("changed".into())), (3, Value::Null)]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn authenticated_handles_are_session_scoped_but_query_tickets_can_be_redeemed_by_another_caller() {
     let running = Running::start(Some("correct"), FlightConfig::default()).await;
     let mut first = Client::connect(&running.server, Some("xtdb:correct")).await; let mut second = Client::connect(&running.server, Some("xtdb:correct")).await;

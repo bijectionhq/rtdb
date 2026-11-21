@@ -877,6 +877,9 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
             .map_err(|error| invalid(error.to_string()))?;
         return crate::ipc::encode(&schema, [&page], memory);
     }
+    if let Ok(Some(batch)) = arguments.source_columnar_batch(memory) {
+        return crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], memory);
+    }
     let rows = arguments.rows().collect::<Result<Vec<_>>>()?;
     let bound = arguments.types().iter().enumerate().try_fold(4096usize, |bytes, (index, ty)| {
         bytes.checked_add(rtdb_columnar::estimate_builder_bytes_refs(ty, rows.iter().map(|row| &row[index]))?).ok_or_else(overflow)
@@ -990,6 +993,7 @@ fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.tx/
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_types::ListKind;
 
     fn budget() -> Arc<MemoryBudget> { MemoryBudget::new(128 * 1024 * 1024) }
     fn roundtrip(source: &SourceTransaction) -> SourceTransaction {
@@ -1035,6 +1039,121 @@ mod tests {
             (index, values[0].clone())
         }).collect();
         assert_eq!(rows, [(0, Value::U64(u64::MAX)), (1, Value::Null), (2, Value::U64(5))]);
+    }
+
+    #[test]
+    fn coalesced_argument_chunks_align_arrow_columns_and_replay_in_input_order() {
+        let memory = budget();
+        let page = |names: [&str; 2], row: [Value; 2]| {
+            let types = row.each_ref().map(Value::logical_type);
+            let fields = names.into_iter().zip(&types).map(|(name, ty)| to_field(name, ty).unwrap()).collect::<Vec<_>>();
+            let columns = row.iter().zip(&types).map(|(value, ty)| build_array(ty, std::slice::from_ref(value)).unwrap()).collect();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let a = Value::List(vec![Value::I64(7)]);
+        let b = Value::Bool(true);
+        let record = |fields| Value::Struct(StructFields::from(fields));
+        let mut arguments = page(["raw", "document"], [Value::U64(u64::MAX), record([("a".into(), a.clone())])]);
+        arguments.append(page(["number", "details"], [Value::I64(9), record([("b".into(), b.clone())])])).unwrap();
+        arguments.append(SqlArguments::from_rows(vec![vec![Value::Null, Value::Null]], &memory).unwrap()).unwrap();
+        assert!(arguments.uniform_arrow_pages().is_none());
+
+        let batch = arguments.source_columnar_batch(&memory).unwrap().unwrap();
+        let schema = batch.batch().schema();
+        assert_eq!(schema.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["?_0", "?_1"]);
+        assert!(batch.batch().column(0).as_any().is::<UnionArray>());
+        assert!(batch.batch().column(1).as_any().is::<StructArray>());
+        let bytes = encode_arguments(&arguments, &memory).unwrap();
+        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
+
+        let rows = replayed.indexed_rows().map(|row| {
+            let (ordinal, row) = row.unwrap();
+            (ordinal, row.to_vec())
+        }).collect::<Vec<_>>();
+        assert_eq!(rows, [
+            (0, vec![Value::U64(u64::MAX), Value::Struct(StructFields::from([("a".into(), a), ("b".into(), Value::Null)]))]),
+            (1, vec![Value::I64(9), Value::Struct(StructFields::from([("a".into(), Value::Null), ("b".into(), b)]))]),
+            (2, vec![Value::Null, Value::Null]),
+        ]);
+    }
+
+    #[test]
+    fn coalesced_argument_chunks_keep_explicit_union_nulls_inside_lists() {
+        let memory = budget();
+        let element = LogicalType::from_legs([LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8), LogicalType::Null]);
+        let types = [ListKind::List, ListKind::FixedSizeList(2)].map(|kind| LogicalType::List { kind, element: Box::new(element.clone()) });
+        let chunk = |names: [&str; 2], values: &[Value; 2]| {
+            let fields = names.into_iter().zip(&types).map(|(name, ty)| to_field(name, ty).unwrap()).collect::<Vec<_>>();
+            let arrays = values.iter().zip(&types).map(|(value, ty)| build_array(ty, std::slice::from_ref(value)).unwrap()).collect();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let first = [Value::List(vec![Value::I64(4), Value::Null]), Value::FixedSizeList(vec![Value::Null, Value::Utf8("x".into())])];
+        let second = [Value::List(vec![Value::Null]), Value::FixedSizeList(vec![Value::I64(5), Value::Null])];
+        let mut arguments = chunk(["left_list", "left_pair"], &first);
+        arguments.append(chunk(["right_list", "right_pair"], &second)).unwrap();
+        assert!(arguments.uniform_arrow_pages().is_none());
+        assert!(arguments.source_columnar_batch(&memory).unwrap().is_some());
+
+        let bytes = encode_arguments(&arguments, &memory).unwrap();
+        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
+
+        assert_eq!(replayed.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [first.to_vec(), second.to_vec()]);
+    }
+
+    #[test]
+    fn coalesced_argument_chunks_discard_children_of_null_structs_and_lists() {
+        let memory = budget();
+        let binary = Arc::new(Field::new("payload", DataType::Binary, false));
+        let payload = vec![19; 65536];
+        let values = Arc::new(arrow_array::BinaryArray::from_iter_values([payload.as_slice(), b"keep"]));
+        let mask = arrow_buffer::NullBuffer::from(vec![false, true]);
+        let records = rtdb_columnar::build_struct_array(vec![Arc::clone(&binary)].into(), &[values.clone()], 2, Some(mask.clone())).unwrap();
+        let lists: ArrayRef = Arc::new(ListArray::try_new(binary, arrow_buffer::OffsetBuffer::new(vec![0i32, 1, 2].into()), values, Some(mask)).unwrap());
+        let chunk = |names: [&str; 2], row| {
+            let fields = [records.data_type(), lists.data_type()].into_iter().zip(names)
+                .map(|(ty, name)| Field::new(name, ty.clone(), true)).collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![records.slice(row, 1), lists.slice(row, 1)]).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let mut arguments = chunk(["record", "list"], 0);
+        arguments.append(chunk(["document", "items"], 1)).unwrap();
+        let batch = arguments.source_columnar_batch(&memory).unwrap().unwrap();
+        let records = batch.batch().column(0).as_struct();
+        let lists = batch.batch().column(1).as_list::<i32>();
+        assert_eq!(records.column(0).as_binary::<i32>().value_data(), b"keep");
+        assert_eq!(lists.values().as_binary::<i32>().value_data(), b"keep");
+        assert_eq!(lists.value_offsets(), &[0, 0, 1]);
+
+        let bytes = encode_arguments(&arguments, &memory).unwrap();
+        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
+
+        assert!(bytes.as_slice().len() < payload.len());
+        assert_eq!(&*replayed.rows().next().unwrap().unwrap(), &[Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn coalescing_rejects_a_null_value_in_a_nonnullable_arrow_union() {
+        let memory = budget();
+        let ty = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8));
+        let chunk = |name, value: Option<i64>| {
+            let field = to_field(name, &ty).unwrap();
+            let DataType::Union(legs, UnionMode::Dense) = field.data_type() else { panic!("Expected union"); };
+            let array = UnionArray::try_new(legs.clone(), vec![0i8].into(), Some(vec![0i32].into()), vec![
+                Arc::new(arrow_array::Int64Array::from(vec![value])),
+                Arc::new(arrow_array::StringArray::from(Vec::<&str>::new())),
+            ]).unwrap();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(array)]).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let mut arguments = chunk("a", None);
+        arguments.append(chunk("b", Some(7))).unwrap();
+        assert!(arguments.uniform_arrow_pages().is_none());
+
+        let error = encode_arguments(&arguments, &memory).unwrap_err();
+
+        assert_eq!(error.code, "rtdb/column-type-mismatch");
     }
 
     #[test]

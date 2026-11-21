@@ -7,6 +7,7 @@ use arrow_schema::{DataType, Fields, Schema};
 use rtdb_columnar::{ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
+mod arguments;
 mod union;
 
 #[derive(Clone, Debug)]

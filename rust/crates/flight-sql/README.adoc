@@ -6,6 +6,8 @@ The source and regression cases remain uncompiled and unexecuted during Phase 1.
 Schema descriptions retain the supplied physical parameter fields, while query execution opens their signed vector view.
 Retained parameter IPC remains lossless.
 Prepared updates retain uploaded Arrow parameter batches through transaction buffering and encoding when the batch layouts agree.
+Separate uploads of the same statement can have different schemas when they are coalesced in a transaction.
+The source encoder aligns compatible argument vectors by position in Arrow and preserves the order of the argument rows.
 Bulk ingestion retains compatible Arrow document columns during source-log encoding, replay and transaction staging.
 This includes lists and structs with compatible child fields.
 When a struct gains fields between compatible Arrow uploads, source encoding joins those fields in Arrow, including structs inside lists.

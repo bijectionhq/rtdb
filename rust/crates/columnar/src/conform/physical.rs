@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use arrow_array::{Array, ArrayRef, BooleanArray, NullArray, UnionArray, make_array};
+use arrow_array::{Array, ArrayRef, NullArray, UnionArray, make_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_types::{LogicalType as L, Result};
-use crate::{from_field, leg_name, to_field};
+use crate::{copy_selected_cells, estimate_copy_cell_bytes, from_field, leg_name, to_field};
 
 pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field) -> Result<usize> {
     let null_bytes = |target: &Field| {
@@ -22,11 +22,16 @@ pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field)
                     })?
                 }
                 _ => {
-                    let copy = data.get_slice_memory_size().map_err(crate::arrow_error)?;
                     if let Some(name) = monomorphic_leg(source)?
                         && let Some((_, _, target)) = union_leg(targets, &name) {
+                        let copy = if data.null_count() > 0 {
+                            let array = make_array(data.clone());
+                            (0..array.len()).filter(|&row| array.is_valid(row)).try_fold(0, |bytes, row| {
+                                super::add(bytes, super::multiply(estimate_copy_cell_bytes(source, array.as_ref(), row)?, 4)?)
+                            })?
+                        } else { 0 };
                         super::add(copy, additional_bytes(data, source, target)?)?
-                    } else { copy }
+                    } else { 0 }
                 }
             };
             super::add(tags, children)
@@ -126,7 +131,10 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
         } else if source_leg.as_deref() == Some(name.as_str()) {
             nonnull_id = Some(target_id);
             let child = match valid {
-                Some(valid) => arrow_select::filter::filter(array.as_ref(), &BooleanArray::new(valid.inner().clone(), None)).map_err(crate::arrow_error)?,
+                Some(valid) => {
+                    let picks = valid.valid_indices().map(|row| (0, row)).collect::<Vec<_>>();
+                    copy_selected_cells(&[array.as_ref()], &picks)?
+                }
                 None => Arc::clone(&array),
             };
             (source.clone().with_nullable(false), child)
@@ -168,3 +176,33 @@ fn union_leg<'a>(fields: &'a UnionFields, name: &str) -> Option<(usize, i8, &'a 
 }
 
 fn incompatible() -> rtdb_types::Anomaly { super::fault("page-outside-declared-type", "Page physical layout differs from its declared type") }
+
+#[test]
+fn union_relayout_copies_only_the_selected_children_of_a_nullable_list() {
+    use arrow_array::cast::AsArray;
+    use arrow_buffer::NullBuffer;
+    use rtdb_types::{ListKind, ScalarType, Value};
+
+    let width = 1 << 20;
+    let element = L::from_legs([L::Scalar(ScalarType::I64), L::Scalar(ScalarType::FixedSizeBinary(width))]);
+    let ty = L::List { kind: ListKind::FixedSizeList(1), element: Box::new(element) }.maybe();
+    let field = to_field("column", &ty).unwrap();
+    let cells = [
+        Value::FixedSizeList(vec![Value::FixedSizeBinary(vec![9; width as usize])]),
+        Value::FixedSizeList(vec![Value::I64(42)]),
+    ];
+    let array = crate::build_array(&ty, &cells).unwrap();
+    let data = array.to_data().into_builder().nulls(Some(NullBuffer::from(vec![false, true]))).build().unwrap();
+    let array = make_array(data);
+    let joined = ty.join(&L::Scalar(ScalarType::Utf8));
+    let target = to_field("column", &joined).unwrap();
+    assert!(crate::arrow_relayout_bound(array.as_ref(), &field, &target).unwrap() < width as usize);
+
+    let (target, output) = crate::relayout_arrow_column(array, &field, &target).unwrap();
+
+    assert!(output.get_buffer_memory_size() < width as usize);
+    assert_eq!(crate::read_value(&target, output.as_ref(), 0).unwrap(), Value::Null);
+    assert_eq!(crate::read_value(&target, output.as_ref(), 1).unwrap(), cells[1]);
+    let union = output.as_union();
+    assert_eq!(union.child(union.type_id(1)).len(), 1);
+}
