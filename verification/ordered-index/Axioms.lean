@@ -26,3 +26,5 @@ import SeekRange
 #print axioms RTDB.OrderedIndex.scrubbed_replay_preserves_points
 #print axioms RTDB.OrderedIndex.distinct_runs_refine_membership
 #print axioms RTDB.OrderedIndex.ordered_route_preserves_page_and_witness
+#print axioms RTDB.OrderedIndex.coalesce_adjacent_preserves_points
+#print axioms RTDB.OrderedIndex.bucket_postings_refine_table

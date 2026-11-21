@@ -1,4 +1,5 @@
 import Temporal
+import Buckets
 import DistinctPage
 import OrderedRead
 
@@ -90,6 +91,40 @@ theorem ordered_route_preserves_page_and_witness
     rw [serve_exact]
   rw [keys, rows]
   exact ⟨rfl, rfl⟩
+
+def keysAtBuckets (buckets : Span K → List Bucket) (point : Nat) (spans : List (Span K)) : List K :=
+  spans.flatMap fun span => List.replicate (hits point (buckets span)) span.key
+
+private theorem keysAtBuckets_refines_spans (buckets : Span K → List Bucket)
+    (point : Nat) (validAt : Int) (spans : List (Span K))
+    (exact : ∀ span ∈ spans, hits point (buckets span) =
+      if span.valid.contains validAt then 1 else 0) :
+    let keys := keysAtBuckets buckets point spans
+    keys.head? = seekSpan validAt spans ∧ keys.length = hitsSpans validAt spans := by
+  induction spans with
+  | nil => simp [keysAtBuckets, seekSpan, hitsSpans]
+  | cons span rest ih =>
+    have head := exact span (by simp)
+    obtain ⟨restHead, restLength⟩ := ih (fun row member => exact row (by simp [member]))
+    change (List.replicate (hits point (buckets span)) span.key ++
+      keysAtBuckets buckets point rest).head? = seekSpan validAt (span :: rest) ∧
+      (List.replicate (hits point (buckets span)) span.key ++
+        keysAtBuckets buckets point rest).length = hitsSpans validAt (span :: rest)
+    by_cases contains : span.valid.contains validAt <;>
+      simp [hitsSpans, seekSpan, head, contains, restHead, restLength, Nat.add_comm]
+
+/-- Exact tiling and temporal projection give one matching indexed tuple per
+visible IID, with the same point value as the original captured events. -/
+theorem bucket_postings_refine_table (buckets : Span K → List Bucket)
+    (events : List (Event K)) (systemAt : Nat) (validAt : Int) (point : Nat)
+    (ordered : ∀ event ∈ events, event.valid.lower ≤ event.valid.upper)
+    (exact : ∀ span ∈ events.foldl (edits systemAt) [], hits point (buckets span) =
+      if span.valid.contains validAt then 1 else 0) :
+    let keys := keysAtBuckets buckets point (events.foldl (edits systemAt) [])
+    keys.head? = tableAt events systemAt validAt ∧ keys.length ≤ 1 := by
+  obtain ⟨value, count⟩ := keysAtBuckets_refines_spans buckets point validAt _ exact
+  exact ⟨value.trans (replay_refines_table events systemAt validAt),
+    count ▸ replay_keeps_one events systemAt validAt [] (by simp [hitsSpans]) ordered⟩
 
 def weight {A : Type} (rows : A → Nat) : List A → Nat
   | [] => 0

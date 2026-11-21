@@ -207,6 +207,21 @@ after acknowledgement. Discarding the durable catalog fence allowed a stale
 capture to reopen the removed definition. The positive configurations
 preserved its replacement.
 
+## Temporal projection composition
+
+Lean 4.35.0 checked that coalescing adjacent spans with an equal tuple
+preserves every point. `bucket_postings_refine_table` composes exact bucket
+tiling with the temporal replay laws. At one captured basis and valid point,
+the postings for a single IID carry the authoritative value and contribute
+at most one matching tuple. The exact tiling hypothesis is supplied by the
+bucket laws, with Verus checking the signed timestamp mapping and maximal
+aligned production step.
+
+The core `History.lean` and `Ceiling.lean` checks also passed.
+Verus checked 18 obligations in the production ceiling harness covering its
+update, clipping window, and half-open cell geometry. The ordered projection
+opens the same admitted history resolver used by the engine's scan.
+
 ## Page and read witness composition
 
 Lean 4.35.0 checked `distinct_runs_refine_membership` and
@@ -237,6 +252,6 @@ ancestry, and operation decoding.
 
 Use Lean 4.35.0, Bijection's pinned Verus toolchain, and TLC from the authorized proof environment.
 Write generated proof products and TLC state under an ignored task target directory.
-Compile `Temporal.lean`, `DistinctPage.lean`, and `OrderedRead.lean` into the module search path before checking `Recovery.lean`, then run `Axioms.lean` against the compiled modules.
+Compile `Temporal.lean`, `Buckets.lean`, `DistinctPage.lean`, and `OrderedRead.lean` into the module search path before checking `Recovery.lean`, then run `Axioms.lean` against the compiled modules.
 Run Verus on `domain.rs`, `seek.rs`, and `scope.rs` so the included paths resolve to the production sources used by RTDB.
 Run TLC against each configuration, retaining the source identity, tool version, and each diagnostic trace.

@@ -46,6 +46,26 @@ def seekSpan (validAt : Int) : List (Span K) → Option K
   | [] => none
   | span :: rest => if span.valid.contains validAt then some span.key else seekSpan validAt rest
 
+/-- Joining adjacent spans with the same tuple preserves every point. -/
+theorem coalesce_adjacent_preserves_points (left right : Interval) (key : K)
+    (rest : List (Span K)) (point : Int)
+    (touch : left.upper = right.lower)
+    (leftOrdered : left.lower ≤ left.upper) (rightOrdered : right.lower ≤ right.upper) :
+    seekSpan point (⟨left, key⟩ :: ⟨right, key⟩ :: rest) =
+      seekSpan point (⟨⟨left.lower, right.upper⟩, key⟩ :: rest) := by
+  let combined : Interval := ⟨left.lower, right.upper⟩
+  have union : combined.contains point ↔ left.contains point ∨ right.contains point := by
+    simp only [combined, Interval.contains]
+    omega
+  change _ = seekSpan point (⟨combined, key⟩ :: rest)
+  by_cases insideLeft : left.contains point
+  · simp [seekSpan, insideLeft, union.mpr (Or.inl insideLeft)]
+  · by_cases insideRight : right.contains point
+    · simp [seekSpan, insideLeft, insideRight, union.mpr (Or.inr insideRight)]
+    · have outside : ¬combined.contains point := by
+        simpa [insideLeft, insideRight] using union
+      simp [seekSpan, insideLeft, insideRight, outside]
+
 /-- Two disjoint fragments of a span after removing a cut. Empty fragments carry no points. -/
 def subtract (cut : Interval) (span : Span K) : List (Span K) :=
   [⟨⟨span.valid.lower, min cut.lower span.valid.upper⟩, span.key⟩,
