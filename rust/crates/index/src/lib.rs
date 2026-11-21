@@ -2,6 +2,7 @@ mod catalog;
 mod live;
 mod partition;
 mod snapshot;
+mod tiered_publication;
 mod trie_catalog;
 
 pub use catalog::{TableCatalog, TableMeta, absent_type, declare_column_types, merge_column_types};

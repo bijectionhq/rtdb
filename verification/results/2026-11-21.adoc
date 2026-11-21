@@ -545,3 +545,23 @@ Using that index gives the same promotion as scanning the catalog, for any seque
 The controls check loss of the pending index and lookup at the next block.
 The proof abstracts decoding and the rest of catalog mutation.
 The Rust regression covers the catalog interface with split notices. It does not establish that the native L0 compactor emits those notices separately.
+
+The combined runner passed on `d9725442d`, including native replay of the production mutation that omits the pending index.
+All thirteen catalog tests passed with the same fix on `rtdb-multi` at `2047bc424`.
+The first run's input manifest SHA-256 is `614fbf0073fd69e87c57065a3436b200a875310304c1b593983a4478fd9f5a7c`.
+
+== Production tiered publication and checkpoint replay
+
+The catalog now calls link:../verus/tiered_publication/proof.rs[the verified tiered publication guard] before it promotes the replacement and supersedes the parent.
+Verus checked six obligations.
+The guard requires all four buckets to supply an entry at the target block in nascent or live state.
+Three source changes that omit a bucket, admit a newer generation, or count a garbage member fail their local contracts.
+Changing each contract along with its function still fails an independent law.
+
+A native catalog test runs 70 order-preserving interleavings of two four-notice groups in each of two catalog layouts.
+The layouts exercise current and historical tiers.
+At all 1,260 checkpoint cuts, the test serializes and decodes the table block, then replays the remaining notices.
+Every resumed step agrees with uninterrupted execution on persisted trie membership, phases and watermarks.
+All eighteen catalog tests and seventeen maintenance integration tests passed.
+The production proof depends on the Rust catalog looking up the four branches at one level, recency and parent prefix.
+The replay checks the persisted catalog transition. Full data and metadata closure and equality of query answers through concurrent storage operations remain open.

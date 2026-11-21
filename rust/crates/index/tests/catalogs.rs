@@ -34,9 +34,11 @@ fn levelled_current_files_supersede_only_partial_files() {
 
 #[test]
 fn four_iid_parts_promote_together_and_garbage_deletion_keeps_watermark_4946() {
-    let initial = apply(&[("l01-rc-b00", 2), ("l02-rc-p0-b00", 10), ("l02-rc-p3-b00", 10)]);
+    let initial = apply(&[
+        ("l01-rc-b00", 2), ("l02-rc-p0-b00", 10), ("l02-rc-p1-b00", 10), ("l02-rc-p2-b00", 10),
+    ]);
     assert_eq!(current(&initial), names(&["l01-rc-b00"]));
-    let complete = initial.with_tries(table(), [notification("l02-rc-p1-b00", 10), notification("l02-rc-p2-b00", 10)], Timestamp(101)).unwrap();
+    let complete = initial.with_tries(table(), [notification("l02-rc-p3-b00", 10)], Timestamp(101)).unwrap();
     assert_eq!(current(&complete), names(&["l02-rc-p0-b00", "l02-rc-p1-b00", "l02-rc-p2-b00", "l02-rc-p3-b00"]));
     let garbage = complete.garbage_tries(&table(), Timestamp(101)).iter().map(|trie| trie.key.clone()).collect();
     let deleted = complete.without_tries(&table(), &garbage);
@@ -236,4 +238,47 @@ fn a_newer_nascent_sibling_cannot_complete_an_older_group() {
     assert_eq!(keys(&complete), [
         "l02-rc-p0-b01", "l02-rc-p1-b01", "l02-rc-p2-b01", "l02-rc-p3-b01",
     ]);
+}
+
+#[test]
+fn checkpoint_replay_preserves_overlapping_group_publication() {
+    for (parent, output) in [
+        ("l01-rc-b00", "l02-rc"),
+        ("l02-r20200101-b00", "l03-r20200101"),
+    ] {
+        let initial = apply(&[(parent, 20)]);
+        for order in (0..256u16).filter(|order| order.count_ones() == 4) {
+            let mut next_bucket = [0; 2];
+            let notices: Vec<_> = (0..8).map(|position| {
+                let block = usize::from((order >> position) & 1);
+                let bucket = next_bucket[block];
+                next_bucket[block] += 1;
+                notification(&format!("{output}-p{bucket}-b0{block}"), 10)
+            }).collect();
+
+            let mut uninterrupted = vec![initial.clone()];
+            for notice in &notices {
+                let next = uninterrupted.last().unwrap()
+                    .with_tries(table(), [notice.clone()], Timestamp(102)).unwrap();
+                uninterrupted.push(next);
+            }
+            for (cut, expected) in uninterrupted.iter().enumerate() {
+                let checkpoint = TableBlock::from_parts(
+                    BTreeMap::new(), &Default::default(), 0, expected.partitions(&table()).unwrap(),
+                ).unwrap();
+                let decoded = TableBlock::decode(&checkpoint.encode()).unwrap();
+                let mut resumed = TrieCatalog::load(
+                    &BTreeMap::from([(table(), decoded)]), 20, Timestamp(101),
+                ).unwrap();
+                assert_eq!(resumed.partitions(&table()).unwrap(), expected.partitions(&table()).unwrap());
+                for (index, notice) in notices.iter().enumerate().skip(cut) {
+                    resumed = resumed.with_tries(table(), [notice.clone()], Timestamp(102)).unwrap();
+                    assert_eq!(
+                        resumed.partitions(&table()).unwrap(), uninterrupted[index + 1].partitions(&table()).unwrap(),
+                        "{output}: order {order:08b}, checkpoint {cut}, notice {index}",
+                    );
+                }
+            }
+        }
+    }
 }

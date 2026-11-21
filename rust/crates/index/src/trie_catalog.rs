@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_types::CivilDate;
-use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{PartGroup, TrieKey}, log::proto as log_pb};
+use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{BRANCH_FACTOR, PartGroup, TrieKey}, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,16 +142,17 @@ impl TableTries {
                 if parent_part.pop().is_none() { return Err(invalid("Tiered trie has no IID partition")); }
                 trie.state = TrieState::Nascent;
                 self.shards.entry(shard.clone()).or_default().insert(trie);
-                let siblings: Vec<_> = (0..4).map(|bucket| {
-                    let mut part = parent_part.clone(); part.push(bucket);
+                let siblings: [Shard; BRANCH_FACTOR as usize] = std::array::from_fn(|bucket| {
+                    let mut part = parent_part.clone();
+                    part.push(bucket as u8);
                     Shard { level: shard.level, recency: shard.recency, part }
-                }).collect();
-                // A higher watermark can belong to a different, still-nascent group.
-                // Retire the parent only when this block has a serving candidate in every bucket.
-                if siblings.iter().all(|key| self.shards.get(key)
-                    .and_then(|shard| shard.tries.get(&block))
-                    .is_some_and(|sibling| matches!(sibling.state, TrieState::Nascent | TrieState::Live)))
-                {
+                });
+                let members = siblings.each_ref().map(|key| {
+                    let member = self.shards.get(key)?.tries.get(&block)?;
+                    let usable = matches!(member.state, TrieState::Nascent | TrieState::Live);
+                    Some((member.key.block_index().0, usable))
+                });
+                if crate::tiered_publication::can_publish(members, block.0) {
                     for sibling in siblings {
                         if let Some(value) = self.shards.get_mut(&sibling) { value.promote(block); }
                     }

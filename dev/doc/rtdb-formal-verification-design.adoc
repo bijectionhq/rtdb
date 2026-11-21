@@ -1053,6 +1053,7 @@ Relate the native postings iterator and persisted sidecar to the modeled complet
 |Recovery and Azure
 |Four native checkpoint tests and their root-first control, and two loopback Azure tests and their two source controls, passed.
 TLC and Apalache check two overlapping checkpoint generations, one recovery reference, protected objects, and its required log suffix under delayed collection.
+Lean checks the pending historical promotion reconstructed from a checkpoint. Verus checks the exact four-member guard in the tiered catalog.
 |Generalize object closure, recovery selection and log retirement to production compaction and collection.
 Establish supported remote configurations and any eventual retry and staging cleanup guarantees.
 

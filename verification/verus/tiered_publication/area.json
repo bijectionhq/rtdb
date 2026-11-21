@@ -1,0 +1,136 @@
+{
+  "summary": "Tiered publication requires a nascent or live sibling from the exact block in all four buckets.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 6,
+  "controls": {
+    "skip_last_bucket": {
+      "defect": "Count three buckets as a complete group.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "\n        && is_usable(members[3], block)",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "function": "can_publish",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "skip_last_bucket_with_weakened_contract": {
+      "defect": "The published group and its specification both omit bucket three.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "\n        && is_usable(members[3], block)",
+          "replace": ""
+        },
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "0 <= bucket < 4",
+          "replace": "0 <= bucket < 3"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/tiered_publication/laws.rs",
+          "function": "an_absent_bucket_keeps_the_parent",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "accept_later_generation": {
+      "defect": "Use a usable output from a later block.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "actual == block && usable",
+          "replace": "actual >= block && usable"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "function": "is_usable",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "accept_later_generation_with_weakened_contract": {
+      "defect": "Both membership checks admit a usable output from a later block.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "actual == block && usable",
+          "replace": "actual >= block && usable"
+        },
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "candidate == Some((block, true))",
+          "replace": "match candidate { Some((actual, usable)) => actual >= block && usable, None => false }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/tiered_publication/laws.rs",
+          "function": "another_generation_keeps_the_parent",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "accept_garbage_member": {
+      "defect": "Count a garbage trie as a serving member.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "actual == block && usable",
+          "replace": "actual == block"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "function": "is_usable",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "accept_garbage_member_with_weakened_contract": {
+      "defect": "Both checks count garbage tries as serving members.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "actual == block && usable",
+          "replace": "actual == block"
+        },
+        {
+          "file": "rust/crates/index/src/tiered_publication.rs",
+          "find": "candidate == Some((block, true))",
+          "replace": "match candidate { Some((actual, _)) => actual == block, None => false }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/tiered_publication/laws.rs",
+          "function": "a_garbage_member_keeps_the_parent",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    }
+  }
+}

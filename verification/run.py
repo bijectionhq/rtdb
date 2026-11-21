@@ -733,21 +733,21 @@ def verify_checkpoint_replay(args, source):
     print("rust-checkpoint-replay: four tests passed, root-first production mutation rejected")
 
 
-def verify_catalog_recovery_replay(args, source):
+def verify_catalog_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
         "CARGO_PROFILE_DEV_DEBUG": "0",
         "CARGO_PROFILE_TEST_DEBUG": "0",
         "CARGO_INCREMENTAL": "0",
     }
-    test = "a_checkpoint_preserves_pending_historical_promotion_for_each_block"
-    command = ["cargo", "test", "--locked", "-p", "rtdb-index", "--test", "catalogs", test, "--", "--exact"]
-    baseline = run_case(command, source / "rust", args.evidence, "rust-catalog-recovery-baseline", env)
-    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
-        raise ValueError("checkpoint catalog promotion baseline failed")
+    command = ["cargo", "test", "--locked", "-p", "rtdb-index", "--test", "catalogs"]
+    historical = "a_checkpoint_preserves_pending_historical_promotion_for_each_block"
+    complete = "four_iid_parts_promote_together_and_garbage_deletion_keeps_watermark_4946"
+    overlap = "checkpoint_replay_preserves_overlapping_group_publication"
+    baseline = run_case(command, source / "rust", args.evidence, "rust-catalog-baseline", env)
+    if baseline.returncode or not all(f"{test} ... ok" in baseline.stdout for test in (historical, complete, overlap)):
+        raise ValueError("catalog promotion or checkpoint replay baseline failed")
 
-    catalog = source / "rust/crates/index/src/trie_catalog.rs"
-    original = catalog.read_bytes()
     restore = """            for (shard, value) in &state.shards {
                 let (1, Some(recency), []) = (shard.level, shard.recency, shard.part.as_slice()) else { continue; };
                 for (block, trie) in &value.tries {
@@ -757,18 +757,32 @@ def verify_catalog_recovery_replay(args, source):
                 }
             }
 """
-    try:
-        replace_once(catalog, restore, "")
-        mutation = run_case(command, source / "rust", args.evidence, "rust-catalog-recovery-forget-pending", env)
-        if (
-            mutation.returncode != 101 or f"{test} ... FAILED" not in mutation.stdout
-            or 'left: {"l00-rc-b01", "l01-rc-b00"}' not in mutation.stdout
-            or "0 passed; 1 failed" not in mutation.stdout
-        ):
-            raise ValueError("dropping the pending index did not fail at historical promotion")
-    finally:
-        catalog.write_bytes(original)
-    print("rust-catalog-recovery-replay: persisted promotion passed, forgetting pending history rejected")
+    controls = (
+        (
+            "forget-pending", "trie_catalog.rs", restore, historical,
+            'left: {"l00-rc-b01", "l01-rc-b00"}',
+        ),
+        (
+            "skip-last-bucket", "tiered_publication.rs", "\n        && is_usable(members[3], block)", complete,
+            'left: {"l02-rc-p0-b00", "l02-rc-p1-b00", "l02-rc-p2-b00"}',
+        ),
+    )
+    for name, file, find, test, expected in controls:
+        path = source / "rust/crates/index/src" / file
+        original = path.read_bytes()
+        try:
+            replace_once(path, find, "")
+            checked = run_case(
+                [*command, test, "--", "--exact"], source / "rust", args.evidence, f"rust-catalog-{name}", env,
+            )
+            if (
+                checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or expected not in checked.stdout or "0 passed; 1 failed" not in checked.stdout
+            ):
+                raise ValueError(f"{name}: expected a failure at {test}")
+        finally:
+            path.write_bytes(original)
+    print("rust-catalog-replay: checkpoint and promotion tests passed, both production mutations rejected")
 
 
 def verify_azure_replay(args, source):
@@ -947,7 +961,7 @@ def main():
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
-            verify_catalog_recovery_replay(args, source)
+            verify_catalog_replay(args, source)
             verify_azure_replay(args, source)
 
 

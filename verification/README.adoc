@@ -97,7 +97,8 @@ The optional Rust boundary check compiles an unchanged copy and two mutated copi
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
 The same option runs the local checkpoint interruption and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
-It also tests historical trie promotion after a binary checkpoint round trip and checks a mutation that skips rebuilding the pending index.
+It also tests catalog promotion after a binary checkpoint round trip.
+The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
 It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
 
 == Evidence boundaries
@@ -134,6 +135,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `verus/` checks the exact Rust functions called by the search builder, temporal resolvers, half-open interval operations and replica fence.
   The ceiling area checks the in-place vector transitions and window clipping while the interval area checks per-fragment admission.
   The catalog reclamation area checks the latest-block rule and the last-held-sibling predicate.
+  The tiered publication area checks that all four serving siblings for the same block exist before the catalog retires the parent.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.
   The rank cutoff area checks the production decision given the two maximum frontier bounds.
   The search window area checks the native functions that assign postings, set the scan endpoints, and combine frequency and length extrema.
