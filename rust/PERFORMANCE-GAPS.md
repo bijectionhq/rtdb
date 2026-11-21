@@ -59,6 +59,10 @@ Keep those workloads in subsequent regression runs.
   RTDB retains decoded pages and event headers in its own cache.
   That can add transient heap copies and retained anonymous memory at scale.
   Sources are [RTDB scan loading](crates/query/src/scan.rs), [RTDB buffer pool](crates/storage/src/cache.rs) and [XTDB memory cache](../core/src/main/kotlin/xtdb/cache/MemoryCache.kt).
+- RTDB's local object writer synchronizes the staged file and each destination directory up to the storage root.
+  XTDB's local object writer writes the temporary file and publishes it with an atomic move.
+  RTDB's extra storage synchronization can add foreground wait when block flush and compaction share the disk with the logs.
+  Sources are [RTDB local publication](crates/storage/src/object_store.rs) and [XTDB local publication](../core/src/main/kotlin/xtdb/storage/LocalStorage.kt).
 - RTDB's live table stores immutable Arrow chunks and merges some by copying both batches.
   XTDB appends into a table relation and takes retained slices.
   This can add foreground copy and allocation cost during ingest, and can amplify staging work during large updates.
@@ -247,6 +251,25 @@ The two RTDB full-scan phases took 20.9–24.2 seconds and used 4.4–4.7 server
 XTDB took 13.1–15.0 seconds and used 3.0–4.7 server CPU seconds.
 Full-scan fetch includes client decoding and transfers, so these timings call for separate server and client measurements.
 The combined write-path candidate `55277dbf3` is the next packaged comparison.
+
+### Combined write-path candidate
+
+The packaged `55277dbf3` finished both 100,000-row pairs against `c84f9334e` on Mac mini 2.
+The 1-minute host load was 5.80–7.22 at the start of these runs.
+RTDB led on every reported metric in this cohort.
+
+| Metric | RTDB median [range] | XTDB median [range] |
+| --- | ---: | ---: |
+| pgwire ingest | 67.7k [60.8k, 74.6k] rows/s | 51.2k [50.9k, 51.4k] rows/s |
+| Flight prepared INSERT | 163.1k [143.5k, 182.8k] rows/s | 104.7k [81.9k, 127.5k] rows/s |
+| pgwire concurrent INSERT | 2,685 [2,670, 2,700] tx/s | 2,313 [2,121, 2,505] tx/s |
+| Flight concurrent INSERT | 1,520 [1,321, 1,719] tx/s | 717 [693, 740] tx/s |
+| pgwire UPDATE of 10% of orders | 43 [38, 47] ms | 121 [113, 129] ms |
+| Flight full-scan fetch p50 | 216 [204, 228] ms | 247 [208, 287] ms |
+| Peak working set during pgwire | 126 [125, 127] MiB | 737 [673, 800] MiB |
+| Peak working set during Flight | 185 [184, 185] MiB | 667 [646, 687] MiB |
+
+The complete million-row pairs are in progress.
 
 ### Flight and UPDATE CPU samples
 
