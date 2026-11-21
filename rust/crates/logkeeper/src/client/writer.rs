@@ -190,7 +190,13 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
         return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("recovered onto {} servers, a write quorum is {}", synced.len(), ensemble.config.write_quorum) });
     }
     let commits: Vec<Result<Ack>> = synced.iter().map(|&server| ensemble.commit(server, epoch, commit)).collect::<FuturesUnordered<_>>().collect().await;
-    for ack in commits.into_iter().flatten() { deposed_by(epoch, ack)?; }
+    let committed = commits.into_iter().flatten().try_fold(0, |count, ack| match ack {
+        Ack::Accepted(accepted) => Ok(count + usize::from(accepted.commit_lsn >= commit)),
+        refused => deposed_by(epoch, refused).map(|_| count),
+    })?;
+    if committed < ensemble.config.write_quorum {
+        return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!("confirmed commit on {committed} servers, a write quorum is {}", ensemble.config.write_quorum) });
+    }
     Ok(synced)
 }
 

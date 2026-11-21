@@ -537,20 +537,21 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
         map.as_ref(),
         &admin::CellHandle {
             name: "source",
-            directory: cell.directory.as_ref(),
+            directory: &cell.directory,
             storage: &storage,
             keys: &cell.keys(),
             maximum_deployments: 1,
         },
         &admin::CellHandle {
             name: "destination",
-            directory: destination.directory.as_ref(),
+            directory: &destination.directory,
             storage: &destination.storage(),
             keys: &destination.keys(),
             maximum_deployments: 1,
         },
         "shop",
         4 << 20,
+        None,
     ).await.unwrap();
     assert!(arrived.checkpoint_recovery.is_none());
     archive_dir.close().unwrap();
@@ -731,7 +732,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let west = Cell::start_in("west", map.clone(), 1).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
     fn handle<'a>(name: &'a str, cell: &'a Cell, storage: &'a rtdb_multi::deployment::CellStorage, keys: &'a rtdb_multi::keys::LocalKeyService, maximum_deployments: usize) -> admin::CellHandle<'a> {
-        admin::CellHandle { name, directory: cell.directory.as_ref(), storage, keys, maximum_deployments }
+        admin::CellHandle { name, directory: &cell.directory, storage, keys, maximum_deployments }
     }
     let (placed, _) = admin::create_in_cells(map.as_ref(), &[handle("east", &east, &east_storage, &east_keys, 10), handle("west", &west, &west_storage, &west_keys, 0)], "shop", "acme", 3).await.unwrap();
     assert_eq!(placed, "east", "a deployment goes to a cell with room");
@@ -742,14 +743,18 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
 
     let source = handle("east", &east, &east_storage, &east_keys, 10);
     let destination = handle("west", &west, &west_storage, &west_keys, 10);
-    let error = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20).await.unwrap_err();
+    let error = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20, None).await.unwrap_err();
     assert_eq!(error.code, "test/lost-transfer-reply");
     let fenced = east.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert_eq!(fenced.lifecycle, Lifecycle::Moving);
     let pending = west.directory.deployment(&fenced.id).await.unwrap().unwrap();
     assert_eq!(pending.lifecycle, Lifecycle::Moving);
+    assert!(pending.move_from.is_none(), "the destination recovered the tail before the route changed");
+    assert!(fenced.replica_journals.is_disjoint(&pending.replica_journals));
+    let replay = admin::audit(west.directory.as_ref(), &west_keys, "shop", 4 << 20).await.unwrap();
+    assert!(replay.transactions >= 2 && replay.violations.is_empty());
 
-    let arrived = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20).await.unwrap();
+    let arrived = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20, None).await.unwrap();
     assert_eq!(arrived.epoch, fenced.epoch);
     assert_eq!(map.cell_of("shop").await.unwrap().as_deref(), Some("west"));
     let through_east = connect_eventually(&east, "shop").await;
@@ -758,24 +763,28 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let through_west = west.connect("shop").await;
     assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"]);
     let settled = west.directory.deployment(&arrived.id).await.unwrap().unwrap();
-    assert!(settled.move_from.is_none(), "the first holder in the new cell moved the stream onto the new cell's logkeepers");
+    assert!(settled.move_from.is_none(), "activation never reopened the source journals");
     assert_eq!(east.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
 
     let tombstone = east.directory.deployment_by_name("shop").await.unwrap().unwrap();
     let east_bucket = east.storage().bucket(rtdb_storage::IoRegion::new()).await.unwrap();
     let left_behind = || async { east_bucket.list(Some(&rtdb_storage::ObjectKey::new(tombstone.storage_prefix()).unwrap())).await.unwrap().len() };
     assert!(left_behind().await > 0, "the old cell still holds the deployment's objects right after the move");
-    let deployments = east.directory.deployments().await.unwrap();
     let keys = east.keys();
     let hour = Duration::from_secs(3600);
-    assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms(), hour, Some(&keys)).await.unwrap(), 0, "and keeps them within the grace");
-    assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms() + hour.as_millis() as i64, hour, Some(&keys)).await.unwrap(), 1);
-    assert_eq!(left_behind().await, 0, "after the grace, the old cell erases what the move left");
+    let moved = tombstone.moved_at_ms.unwrap();
+    assert!(!rtdb_multi::store::move_cleanup_due(&tombstone, moved, hour));
+    assert!(rtdb_multi::store::move_cleanup_due(&tombstone, moved + 3_600_000, hour));
+    let receipt = admin::finish_disposal(east.directory.as_ref(), &east_storage, &keys, &tombstone.id, 4 << 20).await.unwrap();
+    assert_eq!(receipt.journals, tombstone.replica_journals);
+    assert_eq!(left_behind().await, 0, "the source disposal receipt follows removal of its serving objects");
     assert!(rtdb_multi::keys::KeyService::key(&keys, &tombstone.id).await.is_err(), "the source key stays withdrawn");
-    let recovered = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20).await.unwrap();
+    let recovered = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20, None).await.unwrap();
     assert_eq!(recovered.id, arrived.id);
     assert_eq!(recovered.cell_transfer, arrived.cell_transfer);
-    assert_eq!(east.directory.deployment(&tombstone.id).await.unwrap().unwrap().version, tombstone.version);
+    let retired = east.directory.deployment(&tombstone.id).await.unwrap().unwrap();
+    assert_eq!(retired.disposal, Some(receipt));
+    assert!(!rtdb_multi::store::move_cleanup_due(&retired, moved + 3_600_000, hour));
     assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"], "while the deployment reads on in its new cell");
     drop((through_east, through_west));
     east.stop().await;

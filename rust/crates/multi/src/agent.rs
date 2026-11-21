@@ -203,9 +203,6 @@ impl NodeAgent {
         let now = now_ms();
         let live = |id: &MemberId| members.get(id).is_some_and(|member| member.is_live(now));
         let servers = Self::servers(record, members)?;
-        if let Some(previous) = &record.move_from {
-            return Ok(crate::deployment::moving_config(record, servers, Some((previous.clone(), record.ensemble.clone())), &self.options.storage, Role::Holder));
-        }
         let alive: Vec<MemberId> = record.ensemble.iter().filter(|id| live(id)).cloned().collect();
         if alive.len() == record.ensemble.len() || alive.len() < crate::deployment::write_quorum(record.ensemble.len()) {
             return Ok(database_config(record, servers, &self.options.storage, Role::Holder));

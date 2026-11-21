@@ -162,7 +162,7 @@ pub struct DeploymentRecord {
     /// The deployment a fork was taken from.
     #[serde(default)]
     pub parent: Option<String>,
-    /// The logkeepers of the cell a deployment moved from, until its first holder here has moved the stream onto this cell's ensemble.
+    /// Source logkeepers still needed to stage the replica tail before a cell transfer can activate.
     #[serde(default)]
     pub move_from: Option<Vec<String>>,
     /// Whether its holder confirms its leadership with the logkeepers before serving each query.
@@ -262,6 +262,15 @@ pub struct CellTransfer {
     pub source: String,
     pub destination: String,
     pub epoch: u64,
+    pub source_media: CellMedia,
+    pub destination_media: CellMedia,
+}
+
+/// The cell providers authorized for a transfer, without their credentials.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellMedia {
+    pub objects: [u8; 32],
+    pub keys: String,
 }
 
 /// The provider inventory shown empty by a serving disposal.

@@ -21,6 +21,8 @@ pub trait KeyService: Send + Sync {
     async fn copy(&self, from: &str, to: &str) -> Result<()>;
     /// Withdraws the key and permanently refuses provisioning for this deployment ID.
     async fn destroy(&self, deployment: &str) -> Result<()>;
+    /// Identifies custody so a move cannot install into the vault it will withdraw.
+    fn custody_namespace(&self) -> Result<String>;
     /// Installs a key brought from another cell's key service, for a deployment that moved here.
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
 
@@ -109,6 +111,10 @@ fn decode_key(deployment: &str, bytes: Vec<u8>) -> Result<[u8; KEY_BYTES]> {
 impl KeyService for LocalKeyService {
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
         self.local_key(deployment)
+    }
+
+    fn custody_namespace(&self) -> Result<String> {
+        Ok(format!("local:{:?}", self.directory.canonicalize().map_err(io)?))
     }
 
     async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>> {

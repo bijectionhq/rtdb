@@ -191,7 +191,19 @@ pub(crate) fn track_publications(
     writer_epoch: Option<u64>,
 ) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch },
+        DirectoryPublications { directory, deployment, region, writer_epoch, transfer: false },
+    ));
+}
+
+pub(crate) fn track_transfer_publications(
+    io: &mut Arc<IoRegion>,
+    directory: Arc<dyn Directory>,
+    deployment: String,
+    region: Uuid,
+    epoch: u64,
+) {
+    Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
+        DirectoryPublications { directory, deployment, region, writer_epoch: Some(epoch), transfer: true },
     ));
 }
 
@@ -200,6 +212,7 @@ struct DirectoryPublications {
     deployment: String,
     region: Uuid,
     writer_epoch: Option<u64>,
+    transfer: bool,
 }
 
 #[async_trait]
@@ -210,8 +223,12 @@ impl PublicationJournal for DirectoryPublications {
         }
         let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned() };
         crate::admin::update_installation(self.directory.as_ref(), &self.deployment, |record| {
-            if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
-                || self.writer_epoch.is_some_and(|epoch| record.epoch != epoch)
+            let accepts_writes = if self.transfer {
+                record.lifecycle == Lifecycle::Moving && record.move_from.is_some()
+            } else {
+                matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+            };
+            if !accepts_writes || self.writer_epoch.is_some_and(|epoch| record.epoch != epoch)
             {
                 return Err(storage_region_error("The installation no longer admits provider publications"));
             }
@@ -713,9 +730,10 @@ pub async fn run_reaper(
                     }
                     let now = wall_clock()();
                     let _ = reaper_pass(bucket.as_ref(), &deployments, now, grace).await;
-                    let _ = finish_moves(bucket.as_ref(), &deployments, now, grace, keys.as_deref()).await;
                     if let Some(keys) = keys.as_deref() {
-                        for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Deleting) {
+                        for record in deployments.iter().filter(|record| {
+                            record.lifecycle == Lifecycle::Deleting || move_cleanup_due(record, now, grace)
+                        }) {
                             let disposal = crate::admin::finish_disposal(
                                 directory.as_ref(), &storage, keys, &record.id, 4 << 20,
                             );
@@ -742,33 +760,20 @@ pub async fn run_reaper(
     }
 }
 
-/// Erases what deployments that moved to other cells left here, once the grace has passed since they moved: readers that were reading here at the cutover have finished by then.
-/// Their forks here keep what they share, copied into them first, and the key this cell held for each is destroyed, so its sealed log tail here is unreadable too.
-pub async fn finish_moves(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration, keys: Option<&dyn KeyService>) -> Result<usize> {
-    let mut finished = 0;
-    let others: Vec<DeploymentRecord> = deployments.iter().filter(|record| record.moved_at_ms.is_none()).cloned().collect();
-    for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Deleted && record.moved_at_ms.is_some_and(|moved| moved + grace.as_millis() as i64 <= now_ms)) {
-        let prefix = crate::reference::key(&record.storage_prefix())?;
-        if !record.storage_regions.is_empty() {
-            continue;
-        }
-        if !bucket.list(Some(&prefix)).await?.is_empty() {
-            if !crate::reference::erase_deployment(bucket, &record.storage_prefix(), &others).await? {
-                return Err(Anomaly::fault("rtdb.multi/move-cleanup-incomplete", format!("The source still holds objects for {}", record.name)));
-            }
-            finished += 1;
-        }
-        if let Some(keys) = keys { keys.destroy(&record.id).await?; }
-    }
-    Ok(finished)
+/// A moved source retains its serving media until the route is published
+/// to a prepared destination and the grace has elapsed.
+pub fn move_cleanup_due(record: &DeploymentRecord, now_ms: i64, grace: Duration) -> bool {
+    record.lifecycle == Lifecycle::Deleted && record.disposal.is_none()
+        && record.moved_at_ms.is_some_and(|moved| now_ms.saturating_sub(moved) >= grace.as_millis() as i64)
 }
 
-/// One pass of the reaper over a cell's `bucket`, whose deployments are `deployments`, as of `now_ms`: every deployment that is not deleted is reaped, in order, against the references of them all.
+/// Reaps live and quarantined deployments against the references of the cell.
+/// Transfer and disposal fences keep their inventories stable.
 /// A deployment that fails to reap does not stop the others'.
 pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration) -> Result<Vec<Result<Reaped>>> {
     let references = crate::reference::References::scan(bucket, deployments).await?;
     let mut reaped = Vec::new();
-    for record in deployments.iter().filter(|record| !matches!(record.lifecycle, Lifecycle::Deleted | Lifecycle::Restoring)) {
+    for record in deployments.iter().filter(|record| matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)) {
         reaped.push(reap_as_of(bucket, record, now_ms, grace, &references).await);
     }
     Ok(reaped)
@@ -1004,7 +1009,7 @@ mod tests {
         let record = directory.create_deployment(record).await.unwrap();
         let object = key(&format!("{}/v06/data", record.storage_prefix()));
         let journal = DirectoryPublications {
-            directory: directory.clone(), deployment: record.id.clone(), region, writer_epoch: Some(record.epoch),
+            directory: directory.clone(), deployment: record.id.clone(), region, writer_epoch: Some(record.epoch), transfer: false,
         };
         assert!(journal.admit(&key("another-installation/data"), attempt, "upload").await.is_err());
         journal.admit(&object, attempt, "upload").await.unwrap();

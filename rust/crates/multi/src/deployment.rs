@@ -23,6 +23,44 @@ pub enum CellStorage {
 pub(crate) const S3_CELL_ROOT: &str = "cell";
 
 impl CellStorage {
+    fn local_root(root: &std::path::Path) -> rtdb_types::Result<PathBuf> {
+        std::fs::create_dir_all(root)
+            .and_then(|()| root.canonicalize())
+            .map_err(|error| rtdb_types::Anomaly::fault("rtdb.multi/storage-root", error.to_string()))
+    }
+
+    fn s3_root(config: &rtdb_s3::S3Config) -> rtdb_storage::Result<rtdb_storage::ObjectKey> {
+        let prefix = config.prefix.as_deref().unwrap_or_default().trim_matches('/');
+        rtdb_storage::ObjectKey::new(if prefix.is_empty() {
+            S3_CELL_ROOT.to_owned()
+        } else {
+            format!("{prefix}/{S3_CELL_ROOT}")
+        })
+    }
+
+    pub(crate) fn overlaps(&self, other: &Self) -> rtdb_types::Result<bool> {
+        match (self, other) {
+            (Self::Local { root: left }, Self::Local { root: right }) => {
+                let (left, right) = (Self::local_root(left)?, Self::local_root(right)?);
+                Ok(left.starts_with(&right) || right.starts_with(&left))
+            }
+            (Self::S3 { config: left }, Self::S3 { config: right }) if left.bucket == right.bucket => {
+                let (left, right) = (Self::s3_root(left)?, Self::s3_root(right)?);
+                Ok(left.is_under(&right) || right.is_under(&left))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn custody_namespace(&self) -> rtdb_types::Result<[u8; 32]> {
+        let location = match self {
+            Self::Local { root } => format!("local:{:?}", Self::local_root(root)?),
+            Self::S3 { config } => format!("s3:{:?}", (&config.bucket, &config.endpoint, Self::s3_root(config)?)),
+        };
+        let digest = ring::digest::digest(&ring::digest::SHA256, location.as_bytes());
+        Ok(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
+    }
+
     /// The cell's objects as one store, keyed relative to the cell's storage root.
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
         match self {

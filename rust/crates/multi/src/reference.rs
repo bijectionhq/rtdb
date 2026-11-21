@@ -291,9 +291,28 @@ pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &
     for store in stores(from_bucket, from).await? {
         let version = store.rsplit('/').next().expect("a store has a version").to_owned();
         let target = format!("{to}/{version}");
-        for name in physical_objects(from_bucket, &store).await? { copy_in(from_bucket, &format!("{store}/{name}"), to_bucket, &format!("{target}/{name}")).await?; }
-        for (name, owner) in Base::load(from_bucket, &store).await?.objects {
-            if holds(from_bucket, &owner, &name).await? { copy_in(from_bucket, &format!("{owner}/{name}"), to_bucket, &format!("{target}/{name}")).await?; }
+        let base = Base::load(from_bucket, &store).await?;
+        for name in physical_objects(from_bucket, &store).await? {
+            copy_in(from_bucket, &format!("{store}/{name}"), to_bucket, &format!("{target}/{name}")).await?;
+        }
+        for (name, owner) in base.objects {
+            let destination = key(&format!("{target}/{name}"))?;
+            match to_bucket.head(&destination).await {
+                Ok(_) => continue,
+                Err(Error::MissingObject(_)) => {},
+                Err(error) => return Err(error.into()),
+            }
+            let own = key(&format!("{store}/{name}"))?;
+            let bytes = match from_bucket.get(&own).await {
+                Err(Error::MissingObject(_)) => match from_bucket.get(&key(&format!("{owner}/{name}"))?).await {
+                    // Concurrent retirement materializes the reference before
+                    // removing the original, so look again in the fork.
+                    Err(Error::MissingObject(_)) => from_bucket.get(&own).await?,
+                    value => value?,
+                },
+                value => value?,
+            };
+            to_bucket.put(&destination, bytes).await?;
         }
     }
     Ok(())

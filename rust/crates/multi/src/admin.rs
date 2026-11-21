@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_directory::{Cas, CellTransfer, DeploymentRecord, Directory, DisposalReceipt, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMedia, CellTransfer, DeploymentRecord, Directory, DisposalReceipt, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
@@ -335,7 +335,13 @@ async fn discard_fork(storage: &CellStorage, keys: &dyn KeyService, child: &Depl
 
 
 /// One cell, as cell administration reaches it.
-pub struct CellHandle<'a> { pub name: &'a str, pub directory: &'a dyn Directory, pub storage: &'a CellStorage, pub keys: &'a dyn KeyService, pub maximum_deployments: usize }
+pub struct CellHandle<'a> {
+    pub name: &'a str,
+    pub directory: &'a Arc<dyn Directory>,
+    pub storage: &'a CellStorage,
+    pub keys: &'a dyn KeyService,
+    pub maximum_deployments: usize,
+}
 
 /// Creates a deployment in the least occupied cell with room, and records the cell in the cell map.
 pub async fn create_in_cells(map: &dyn crate::cells::CellMap, cells: &[CellHandle<'_>], name: &str, org: &str, replicas: usize) -> Result<(String, DeploymentRecord)> {
@@ -347,127 +353,257 @@ pub async fn create_in_cells(map: &dyn crate::cells::CellMap, cells: &[CellHandl
     }
     let (_, cell) = best.ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/cells-full", "Every cell is at its envelope"))?;
     if !map.assign(name, cell.name, None).await? { return Err(crate_exists(name)); }
-    Ok((cell.name.to_owned(), create_deployment(cell.directory, name, org, replicas).await?))
+    Ok((cell.name.to_owned(), create_deployment(cell.directory.as_ref(), name, org, replicas).await?))
 }
 
 fn crate_exists(name: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/exists", format!("A deployment named {name} exists in some cell")) }
 
-/// Moves a deployment to another cell. Both directories retain the transfer
-/// while the cell map changes, so a retry can resume after any lost response.
-pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, to: &CellHandle<'_>, name: &str, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    let conflict = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/cell-transfer", format!("The transfer of {name} from {} to {} conflicts with its recorded placement", from.name, to.name));
+/// Moves a deployment after preparing the destination's storage and replica
+/// quorum. The route is the activation decision and a lost reply leaves the
+/// prepared destination fenced for a retry.
+pub async fn move_cell(
+    map: &dyn crate::cells::CellMap,
+    from: &CellHandle<'_>,
+    to: &CellHandle<'_>,
+    name: &str,
+    maximum_message_bytes: usize,
+    hosted_task: Option<rtdb_directory::HostedTask>,
+) -> Result<DeploymentRecord> {
     let routed = map.cell_of(name).await?;
     let at_source = routed.as_deref() == Some(from.name);
-    if from.name == to.name || from.storage == to.storage
-        || !at_source && routed.as_deref() != Some(to.name)
+    let conflict = || cell_move_conflict(from, to, name);
+    if from.name == to.name || !at_source && routed.as_deref() != Some(to.name) {
+        return Err(conflict());
+    }
+    let (source, target) = prepare_cell_move(from, to, name, at_source, maximum_message_bytes, hosted_task).await?;
+    if at_source
+        && !map.assign(name, to.name, Some(from.name)).await?
+        && map.cell_of(name).await?.as_deref() != Some(to.name)
     {
         return Err(conflict());
     }
-    let source = record(from.directory, name).await?;
-    if source.lifecycle == Lifecycle::Live && to.directory.deployment_by_name(name).await?.is_some() {
-        return Err(conflict());
-    }
-    let id = &source.id;
-    let fenced = update_installation(from.directory, id, |record| {
-        if matches!(record.lifecycle, Lifecycle::Moving | Lifecycle::Deleted)
-            && record.cell_transfer.as_ref().is_some_and(|transfer| {
-                transfer.source == from.name && transfer.destination == to.name
-                    && transfer.epoch == record.epoch
-            })
-        {
-            return Ok(());
-        }
-        if at_source && record.lifecycle == Lifecycle::Live && record.move_from.is_none() {
-            record.lifecycle = Lifecycle::Moving;
-            record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
-                Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {id} has no remaining writer epochs"))
-            })?;
-            record.holder = None;
-            record.move_intent = None;
-            record.cell_transfer = Some(CellTransfer {
-                source: from.name.to_owned(),
-                destination: to.name.to_owned(),
-                epoch: record.epoch,
-            });
-            return Ok(());
-        }
-        Err(conflict())
-    }).await?;
-    let same_transfer = |record: &DeploymentRecord| {
-        record.id == fenced.id && record.name == fenced.name
-            && record.incarnation == fenced.incarnation && record.cell_transfer == fenced.cell_transfer
-    };
-    let target = to.directory.deployment_by_name(name).await?;
-    if let Some(arrived) = &target {
-        if !same_transfer(arrived) {
-            return Err(conflict());
-        }
-    } else if fenced.lifecycle == Lifecycle::Deleted {
-        return Err(conflict());
-    }
-    if fenced.lifecycle == Lifecycle::Moving {
-        await_storage_drain(from.directory, from.storage, from.keys, &fenced).await?;
-        if target.is_none() {
-            let stream = administration_stream(from.directory, &fenced, maximum_message_bytes).await?;
-            rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
-            let source_bucket = from.storage.bucket(rtdb_storage::IoRegion::new()).await?;
-            let target_bucket = to.storage.bucket(rtdb_storage::IoRegion::new()).await?;
-            let prefix = fenced.storage_prefix();
-            crate::reference::materialize(source_bucket.as_ref(), &prefix, target_bucket.as_ref(), &prefix).await?;
-            if let Some(archive) = crate::archive::ArchivedCheckpoint::load(&fenced, rtdb_storage::IoRegion::new()).await? {
-                archive.materialize(&fenced, target_bucket).await?;
-            }
-            to.keys.install(id, from.keys.key(id).await?).await?;
-            let mut arrived = fenced.clone();
-            arrived.checkpoint_recovery = None;
-            arrived.storage_regions.clear();
-            arrived.activation_crashes = 0;
-            arrived.move_from = Some(stream.servers);
-            arrived.ensemble = choose_ensemble(to.directory, &arrived, fenced.ensemble.len()).await?;
-            if let Err(error) = to.directory.create_deployment(arrived).await {
-                if !to.directory.deployment(id).await?.is_some_and(|record| same_transfer(&record)) {
-                    return Err(error);
-                }
-            }
-        }
-        let arrived = to.directory.deployment(id).await?.ok_or_else(&conflict)?;
-        if !same_transfer(&arrived) {
-            return Err(conflict());
-        }
-        if !map.assign(name, to.name, Some(from.name)).await?
-            && map.cell_of(name).await?.as_deref() != Some(to.name)
-        {
-            return Err(conflict());
-        }
-        update_installation(from.directory, id, |record| {
-            if !same_transfer(record) || record.epoch != fenced.epoch {
-                return Err(conflict());
-            }
-            match record.lifecycle {
-                Lifecycle::Moving => {
-                    record.lifecycle = Lifecycle::Deleted;
-                    record.moved_at_ms = Some(now_ms());
-                }
-                Lifecycle::Deleted if record.moved_at_ms.is_some() => {}
-                _ => return Err(conflict()),
-            }
-            Ok(())
-        }).await?;
-    } else if at_source {
-        return Err(conflict());
-    }
-    // Only the published cell may activate the arrival and recover the sealed tail.
-    update_installation(to.directory, id, |record| {
-        if !same_transfer(record) {
+    // The accepted route points to a destination with an independent
+    // replica quorum. Settle the source before the destination can move again.
+    update_installation(from.directory.as_ref(), &source.id, |record| {
+        if !same_cell_move(record, &source) || record.epoch != source.epoch {
             return Err(conflict());
         }
         match record.lifecycle {
-            Lifecycle::Moving => record.lifecycle = Lifecycle::Live,
+            Lifecycle::Moving => {
+                record.lifecycle = Lifecycle::Deleted;
+                record.moved_at_ms = Some(now_ms());
+            }
+            Lifecycle::Deleted if record.moved_at_ms.is_some() => {}
+            _ => return Err(conflict()),
+        }
+        Ok(())
+    }).await?;
+    update_installation(to.directory.as_ref(), &target.id, |record| {
+        if !same_cell_move(record, &target) || record.move_from.is_some() {
+            return Err(conflict());
+        }
+        match record.lifecycle {
+            Lifecycle::Moving if record.epoch == target.epoch => record.lifecycle = Lifecycle::Live,
             Lifecycle::Live | Lifecycle::Quarantined => {}
             _ => return Err(conflict()),
         }
         Ok(())
     }).await
+}
+
+fn cell_move_conflict(from: &CellHandle<'_>, to: &CellHandle<'_>, name: &str) -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Conflict, "rtdb.multi/cell-transfer",
+        format!("The transfer of {name} from {} to {} conflicts with its recorded placement", from.name, to.name),
+    )
+}
+
+fn same_cell_move(record: &DeploymentRecord, expected: &DeploymentRecord) -> bool {
+    record.id == expected.id && record.name == expected.name && record.org == expected.org
+        && record.incarnation == expected.incarnation && record.cell_transfer == expected.cell_transfer
+}
+
+fn cell_media(storage: &CellStorage, keys: &dyn KeyService) -> Result<CellMedia> {
+    Ok(CellMedia {
+        objects: storage.custody_namespace()?,
+        keys: keys.custody_namespace()?,
+    })
+}
+
+async fn prepare_cell_move(
+    from: &CellHandle<'_>,
+    to: &CellHandle<'_>,
+    name: &str,
+    at_source: bool,
+    maximum_message_bytes: usize,
+    hosted_task: Option<rtdb_directory::HostedTask>,
+) -> Result<(DeploymentRecord, DeploymentRecord)> {
+    let conflict = || cell_move_conflict(from, to, name);
+    let current = record(from.directory.as_ref(), name).await?;
+    let target = to.directory.deployment_by_name(name).await?;
+    let transfer_matches = |record: &DeploymentRecord| record.cell_transfer.as_ref().is_some_and(|transfer| {
+        transfer.source == from.name && transfer.destination == to.name && transfer.epoch == record.epoch
+    });
+    if !at_source {
+        let prepared = target.filter(|record| same_cell_move(record, &current) && record.move_from.is_none())
+            .ok_or_else(&conflict)?;
+        if !matches!(current.lifecycle, Lifecycle::Moving | Lifecycle::Deleted) || !transfer_matches(&current) {
+            return Err(conflict());
+        }
+        return Ok((current, prepared));
+    }
+    if current.lifecycle == Lifecycle::Live && target.is_some() {
+        return Err(conflict());
+    }
+    let source_media = cell_media(from.storage, from.keys)?;
+    let destination_media = cell_media(to.storage, to.keys)?;
+    if from.storage.overlaps(to.storage)? || source_media.keys == destination_media.keys {
+        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-storage", "Cell moves require independent serving storage and key custody"));
+    }
+    if matches!(to.storage, CellStorage::S3 { .. }) && hosted_task.is_none() {
+        return Err(Anomaly::incorrect("rtdb.multi/transfer-task", "A remote transfer needs a recoverable task identity"));
+    }
+
+    let same_media = |record: &DeploymentRecord| record.cell_transfer.as_ref().is_some_and(|transfer| {
+        transfer.source_media == source_media && transfer.destination_media == destination_media
+    });
+    if current.lifecycle == Lifecycle::Moving && !same_media(&current) {
+        return Err(conflict());
+    }
+    let mut arrival = current.clone();
+    if let Some(staged) = target {
+        if !same_cell_move(&staged, &current) || !transfer_matches(&current) || staged.lifecycle != Lifecycle::Moving {
+            return Err(conflict());
+        }
+        if staged.move_from.is_none() {
+            return Ok((current, staged));
+        }
+        arrival = staged;
+    } else {
+        arrival.ensemble = choose_ensemble(to.directory.as_ref(), &arrival, current.ensemble.len()).await?;
+    }
+    let source_stream = administration_stream(from.directory.as_ref(), &current, maximum_message_bytes).await?;
+    let target_stream = administration_stream(to.directory.as_ref(), &arrival, maximum_message_bytes).await?;
+    if target_stream.servers.iter().any(|server| source_stream.servers.contains(server) || current.replica_journals.contains(server)) {
+        return Err(Anomaly::incorrect("rtdb.multi/shared-cell-journal", "Cell moves require independent replica journals"));
+    }
+
+    let source = update_installation(from.directory.as_ref(), &current.id, |record| {
+        if record.lifecycle == Lifecycle::Moving && transfer_matches(record) && same_media(record) {
+            return Ok(());
+        }
+        if record.lifecycle != Lifecycle::Live || record.version != current.version || record.move_from.is_some() {
+            return Err(conflict());
+        }
+        record.lifecycle = Lifecycle::Moving;
+        record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
+            Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {} has no remaining writer epochs", record.id))
+        })?;
+        record.holder = None;
+        record.move_intent = None;
+        record.replica_journals.extend(source_stream.servers.iter().cloned());
+        record.cell_transfer = Some(CellTransfer {
+            source: from.name.to_owned(),
+            destination: to.name.to_owned(),
+            epoch: record.epoch,
+            source_media: source_media.clone(),
+            destination_media: destination_media.clone(),
+        });
+        Ok(())
+    }).await?;
+    let mut staged = source.clone();
+    staged.ensemble = arrival.ensemble;
+    staged.replica_journals = target_stream.servers.iter().cloned().collect();
+    staged.move_from = Some(source_stream.servers.clone());
+    staged.storage_regions.clear();
+    staged.checkpoint_recovery = None;
+    staged.checkpoint_captures.clear();
+    staged.archive_retirement = None;
+    staged.activation_crashes = 0;
+    let confirm_arrival = |record: &DeploymentRecord| same_cell_move(record, &staged)
+        && record.epoch == staged.epoch && record.ensemble == staged.ensemble
+        && record.replica_journals == staged.replica_journals
+        && record.lifecycle == Lifecycle::Moving;
+    let staged = match to.directory.create_deployment(staged.clone()).await {
+        Ok(created) => created,
+        Err(error) => to.directory.deployment(&staged.id).await?.filter(confirm_arrival).ok_or(error)?,
+    };
+    if staged.move_from.is_none() {
+        return Ok((source, staged));
+    }
+
+    rtdb_logkeeper::seal(&source_stream, source.epoch).await?;
+    await_storage_drain(from.directory.as_ref(), from.storage, from.keys, &source).await?;
+    crate::store::reconcile_storage_regions(to.directory.as_ref(), to.storage, to.keys, &staged).await?;
+    stage_cell_storage(from, to, &source, &staged, hosted_task).await?;
+
+    let previous = rtdb_logkeeper::Loglet {
+        servers: staged.move_from.clone().ok_or_else(&conflict)?,
+        start_lsn: 0,
+    };
+    rtdb_logkeeper::open_writer_on(
+        vec![previous], target_stream, source.epoch, rtdb_logkeeper::CopyFrom::Retained, CancellationToken::new(),
+    ).await?;
+    let prepared = update_installation(to.directory.as_ref(), &staged.id, |record| {
+        if !same_cell_move(record, &staged) || record.lifecycle != Lifecycle::Moving || record.epoch != staged.epoch {
+            return Err(conflict());
+        }
+        require_storage_drained(record)?;
+        record.move_from = None;
+        Ok(())
+    }).await?;
+    Ok((source, prepared))
+}
+
+async fn stage_cell_storage(
+    from: &CellHandle<'_>,
+    to: &CellHandle<'_>,
+    source: &DeploymentRecord,
+    staged: &DeploymentRecord,
+    hosted_task: Option<rtdb_directory::HostedTask>,
+) -> Result<()> {
+    use rtdb_directory::StorageRegion;
+    use rtdb_storage::IoRegion;
+    let local = matches!(to.storage, CellStorage::Local { .. });
+    let region = uuid::Uuid::new_v4();
+    let witness = if local { to.keys.hold_local_storage_region(region)? } else { None };
+    let mut io = IoRegion::new().child_holding(witness.map(|file| Arc::new(file) as Arc<dyn Send + Sync>));
+    if !local {
+        crate::store::track_transfer_publications(&mut io, to.directory.clone(), staged.id.clone(), region, staged.epoch);
+    }
+    let admitted = update_installation(to.directory.as_ref(), &staged.id, |record| {
+        if !same_cell_move(record, staged) || record.epoch != staged.epoch
+            || record.lifecycle != Lifecycle::Moving || record.move_from != staged.move_from
+        {
+            return Err(cell_move_conflict(from, to, &staged.name));
+        }
+        record.storage_regions.insert(region, if local {
+            StorageRegion::Local
+        } else {
+            crate::store::remote_storage_region(None, hosted_task.clone())
+        });
+        Ok(())
+    }).await;
+    let uncertain = admitted.as_ref().is_err_and(|error| error.code != "rtdb.multi/cell-transfer");
+    let result = async {
+        admitted?;
+        let source_bucket = from.storage.bucket(IoRegion::new()).await?;
+        let target_bucket = to.storage.bucket(io.clone()).await?;
+        crate::reference::materialize(
+            source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(),
+        ).await?;
+        if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, IoRegion::new()).await? {
+            archive.materialize(staged, target_bucket).await?;
+        }
+        to.keys.install(&source.id, from.keys.key(&source.id).await?).await
+    }.await;
+    io.close_and_wait().await;
+    drop(io);
+    crate::store::release_region(to.directory.as_ref(), &staged.id, region, uncertain).await?;
+    if local {
+        to.keys.forget_local_storage_region(region)?;
+    }
+    result
 }
 
 pub(crate) async fn update_installation(
@@ -569,14 +705,30 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
     match (fenced.lifecycle, fenced.disposal.as_ref()) {
         (Lifecycle::Deleted, Some(receipt)) => return Ok(receipt.clone()),
         (Lifecycle::Deleting, None) => {},
+        (Lifecycle::Deleted, None) if fenced.moved_at_ms.is_some() => {},
         _ => return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-unaccepted", format!("The directory has not accepted disposal of {id}"))),
     }
     require_storage_drained(&fenced)?;
+    if fenced.moved_at_ms.is_some() {
+        let media = cell_media(storage, keys)?;
+        if !fenced.cell_transfer.as_ref().is_some_and(|transfer| transfer.source_media == media) {
+            return Err(Anomaly::incorrect("rtdb.multi/move-storage-custody", "The moved source is bound to different storage or keys"));
+        }
+    }
     let prefix = crate::reference::key(&fenced.storage_prefix())?;
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter()
         .filter(|record| record.id != fenced.id).collect();
     crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
-    let mut stream = administration_stream(directory, &fenced, maximum_message_bytes).await?;
+    let mut stream = if fenced.moved_at_ms.is_some() {
+        StreamConfig {
+            write_quorum: write_quorum(fenced.replica_journals.len()),
+            servers: Vec::new(),
+            stream: fenced.stream("replica"),
+            maximum_message_bytes,
+        }
+    } else {
+        administration_stream(directory, &fenced, maximum_message_bytes).await?
+    };
     stream.servers.extend(fenced.replica_journals.iter().cloned());
     stream.servers.sort();
     stream.servers.dedup();
@@ -611,6 +763,10 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
             Lifecycle::Deleting => {
                 record.disposal = Some(receipt.clone());
                 record.lifecycle = Lifecycle::Deleted;
+                Ok(())
+            }
+            Lifecycle::Deleted if record.moved_at_ms.is_some() => {
+                record.disposal = Some(receipt.clone());
                 Ok(())
             }
             _ => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-fence", format!("Installation {id} left disposal"))),

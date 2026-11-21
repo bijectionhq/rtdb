@@ -47,6 +47,10 @@ impl DynamoKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for DynamoKeyService {
+    fn custody_namespace(&self) -> Result<String> {
+        Ok(format!("dynamodb:{}", self.table))
+    }
+
     async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>> {
         self.existing(deployment).await
     }
