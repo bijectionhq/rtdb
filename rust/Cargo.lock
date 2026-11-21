@@ -4626,6 +4626,7 @@ dependencies = [
  "rtdb-plan",
  "rtdb-query",
  "rtdb-sql",
+ "rtdb-storage",
  "rtdb-tx",
  "rtdb-types",
  "serde",

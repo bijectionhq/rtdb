@@ -84,6 +84,8 @@ A Direct parser admission failure after eligibility returns its resource error, 
 Paired Flight SQL diagnostic execution remains pending.
 DoGet revalidates the redeeming session, waits its visibility barrier, then opens the captured basis through `NativeSession::query_context_at`.
 A ticket remains usable by a different authorized caller.
+Flight SQL opens a columnar query cursor where the operators can provide Arrow batches.
+An index-covered ordered point read streams typed results from the posting leaves under the ticket's captured basis.
 Query streams retain their cursor, connection, session lease, cancellation scope, and Arrow allocation owners through completion or cancellation.
 
 GetFlightInfo issues DML and SET once.

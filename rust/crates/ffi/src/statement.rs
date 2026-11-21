@@ -164,7 +164,7 @@ impl StatementHandle {
                     }
                     let context = session.query_context_for(&self.creation_database, token).await?;
                     let values = argument_row(args, self.session.region.memory())?;
-                    prepared.as_ref().ok_or_else(not_prepared)?.open_query_typed(context, values.0, args.map(SqlArguments::types).unwrap_or_default()).await
+                    prepared.as_ref().ok_or_else(not_prepared)?.open_query_columns_typed(context, values.0, args.map(SqlArguments::types).unwrap_or_default()).await
                 }
                 Source::Show { statement: control, prepared } => {
                     if !*prepared && args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }

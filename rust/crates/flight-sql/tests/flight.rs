@@ -183,6 +183,39 @@ async fn ticket_basis_is_immutable_and_update_ticket_redemption_is_effect_free()
 }
 
 #[tokio::test]
+async fn flight_redeems_ordered_distinct_from_index_batches_at_the_ticket_basis() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("CREATE INDEX docs_candidates ON docs (world, key, label)", None).await;
+    client.update("INSERT INTO docs RECORDS
+        {_id: 1, world: 1, key: 'a', label: 'hidden'},
+        {_id: 2, world: 1, key: 'b', label: 'public'},
+        {_id: 3, world: 1, key: 'b', label: 'public'},
+        {_id: 4, world: 1, key: 'c', label: 'public'}", None).await;
+    let database = running.node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.build_artefacts().await.unwrap();
+
+    let table = TableRef::new("public", "docs");
+    let snapshot = database.snapshot();
+    let entry = snapshot.table_entry(&table).unwrap();
+    let trie = rtdb_format::keys::TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
+    let primary = rtdb_storage::ObjectKey::new(entry.slug.data_key(&trie)).unwrap();
+    let info = client.info("SELECT DISTINCT key FROM docs WHERE world = 1 AND label = 'public' ORDER BY key LIMIT 2", None).await;
+    assert_eq!(info.clone().try_decode_schema().unwrap().field(0).data_type(), &DataType::Utf8);
+    database.object_store().delete(&primary).await.unwrap();
+    database.storage().invalidate(&primary).await.unwrap();
+
+    let batches = client.redeem(&info).await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_columns(), 1);
+    let keys = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(keys.iter().collect::<Vec<_>>(), [Some("b"), Some("c")]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn prepared_update_info_buffers_the_bound_operation_once() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;

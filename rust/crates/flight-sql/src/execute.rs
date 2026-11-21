@@ -134,7 +134,7 @@ impl Service {
                 let bound = row.iter().try_fold(wire::add(1024, wire::mul(row.len(), std::mem::size_of::<rtdb_types::Value>())?)?, |bytes, value| wire::add(bytes, value.retained_bytes().map_err(status)?))?;
                 let _values = self.memory().reserve(bound).map_err(status)?;
                 let values = row.to_vec();
-                prepared.open_query_typed(context, values, arguments.as_ref().map(SqlArguments::types).unwrap_or_default()).await.map_err(status)?
+                prepared.open_query_columns_typed(context, values, arguments.as_ref().map(SqlArguments::types).unwrap_or_default()).await.map_err(status)?
             };
             drop(native); Ok::<_, Status>((cursor, connection, token_guard))
         };
