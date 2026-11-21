@@ -682,6 +682,7 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 
 1. Crate `controller`: suspicion confirmation from corroborated gateway reports; admission of prewarmed members; drain (`DrainMember`); rebalancing on `LoadVector` watermarks (`Rebalance`); the drainer for orphaned tails (`DrainOrphanedTails`); quarantine (`CountActivationCrash`); engine rollouts (`RollEngine`).
    A draining node hands off up to eight recently used deployments per pass and parks its idle deployments.
+   It runs the handoffs one at a time.
    The source's identity and epoch must still match at reservation.
    A recently used deployment keeps serving on a draining node while its pool has no eligible successor.
 2. Planned handoff (`IntendMove`, `HandOff`): subscription warm-up, hot-range prefetch from the source, admission pause, `Handoff` record, claim by move intent.
@@ -763,6 +764,13 @@ RTDB_CELL_HANDOFF_DEPLOYMENTS=1000 \
   cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
   a_thousand_deployments_keep_their_history_through_handoff_and_failover -- --ignored --nocapture
 ```
+
+Three alternating release comparisons used the same local build with durable retry lookup, 32 warm deployments, 16 workers, four connection slots per deployment and 32,768 updates.
+The builds differed only in the number of simultaneous planned moves on the draining node.
+All six runs completed and verified the final counter of each deployment.
+Serial drains held scale-out p99 between 10.1 and 17.1 ms and scale-in p99 between 16.1 and 21.4 ms.
+With two concurrent moves, scale-out p99 ranged from 10.4 to 18.3 ms and scale-in p99 ranged from 18.3 to 35.9 ms.
+The tested build preceded the hosted transfer and archive integration.
 
 ### Stage 12: encryption, lineages, forks and deletion
 

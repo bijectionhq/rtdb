@@ -1607,7 +1607,7 @@ rule AnswerMoved {
 rule DrainMember {
     -- Scale-in, replacement and rollout drain a member by handing off its active deployments and parking its idle ones, at most moves_per_node_per_pass per pass.
     -- The source's identity and epoch still match when the drain reserves a handoff.
-    -- A draining member runs at most two handoffs at once.
+    -- A draining member runs one handoff at a time.
     -- A recent holding stays on its source while the placement pool has no eligible destination.
     when: member: MemberRecord.state becomes draining
 

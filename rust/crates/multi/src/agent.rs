@@ -73,7 +73,7 @@ const IDLE_FLUSHES_PER_PASS: usize = 2;
 const HANDOFF_REPLAY_ROWS: u64 = 64;
 const HANDOFF_REPLAY_RECORDS: i64 = 16;
 const DRAIN_HANDOFFS_PER_PASS: usize = 8;
-const DRAIN_CONCURRENT_HANDOFFS: usize = 2;
+const DRAIN_CONCURRENT_HANDOFFS: usize = 1;
 const ACTIVE_DRAIN_WINDOW: Duration = Duration::from_secs(60);
 
 fn require_recovered_checkpoint(record: &DeploymentRecord, database: &Database) -> Result<()> {
