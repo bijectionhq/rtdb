@@ -340,6 +340,7 @@ impl Node {
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) });
         }
         let mut catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
+            .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory))
             .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
         if let Some(lease) = lease { catalog = catalog.with_read_lease(lease); }
         QueryContext::with_owner(catalog, self.factory.options.query.query_memory(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?

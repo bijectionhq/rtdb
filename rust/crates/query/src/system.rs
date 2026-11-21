@@ -16,6 +16,7 @@ enum RuntimeRows {
     Roles { users: CatalogRows<CatalogUser>, memberships: CatalogRows<(String, String)> },
     Memberships(CatalogRows<(String, String)>),
     Metrics(CatalogRows<CatalogMetric>),
+    OrderedIndexes(CatalogRows<crate::OrderedIndexStorage>),
 }
 
 pub(crate) struct SystemCursor { scan: Scan, execution: Execution, rows: Option<VecDeque<OwnedRow>> }
@@ -31,6 +32,12 @@ impl SystemCursor {
             ("pg_catalog", "pg_roles") => RuntimeRows::Roles { users: runtime()?.users()?, memberships: runtime()?.memberships().await? },
             ("pg_catalog", "pg_auth_members") => RuntimeRows::Memberships(runtime()?.memberships().await?),
             ("xt", "metrics_timers" | "metrics_gauges" | "metrics_counters") => RuntimeRows::Metrics(runtime()?.sample().await?),
+            ("xt", "live_ordered_index_storage") => {
+                let inventory = context.catalog.ordered_indexes.as_ref().ok_or_else(|| {
+                    Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.query/catalog-runtime-unavailable", "Ordered index inventory provider was not supplied")
+                })?;
+                RuntimeRows::OrderedIndexes(inventory.sample(&self.scan.table.name.database, context).await?)
+            }
             _ => RuntimeRows::None,
         };
         context.check_cancelled()?;
@@ -118,6 +125,14 @@ impl SystemCursor {
                 metrics.rows().iter().filter_map(|metric| metric_record(&table.table, metric)).collect()
             }
             ("xt", "live_trie_artefacts") => self.live_trie_artefacts(tables)?,
+            ("xt", "live_ordered_index_storage") => {
+                let RuntimeRows::OrderedIndexes(indexes) = runtime else { return Err(invalid("catalog-runtime", "Ordered index inventory is absent")); };
+                indexes.rows().iter().map(|index| record([
+                    ("schema_name", text(&index.table.schema)), ("table_name", text(&index.table.table)),
+                    ("index_name", text(&index.name)), ("definition_version", Value::I64(index.version)),
+                    ("through_block", Value::I64(index.through_block)), ("file_bytes", Value::I64(index.bytes)),
+                ])).collect()
+            }
             ("xt", "live_tables" | "live_columns" | "trie_stats") => self.snapshot_records(&table.table, tables)?,
             ("information_schema", "table_constraints" | "key_column_usage" | "constraint_column_usage")
             | ("pg_catalog", "pg_description" | "pg_views" | "pg_matviews" | "pg_depend" | "pg_enum" | "pg_constraint" | "pg_extension" | "pg_attrdef" | "pg_sequence" | "pg_collation" | "pg_opclass" | "pg_index") => vec![],
@@ -280,6 +295,11 @@ fn allocation_bound(tables: &[TableBinding], runtime: &RuntimeRows, execution: &
         RuntimeRows::Roles { users, memberships } => { for user in users.rows() { add_name(&user.name)?; } for (user, role) in memberships.rows() { add_name(user)?; add_name(role)?; } }
         RuntimeRows::Memberships(memberships) => for (user, role) in memberships.rows() { add_name(user)?; add_name(role)?; },
         RuntimeRows::Metrics(metrics) => for metric in metrics.rows() { add_name(metric.name())?; for (key, value) in metric.tags() { add_name(key)?; add_name(value)?; } },
+        RuntimeRows::OrderedIndexes(indexes) => for index in indexes.rows() {
+            add_name(&index.name)?;
+            add_name(&index.table.schema)?;
+            add_name(&index.table.table)?;
+        },
         RuntimeRows::None => {}
     }
     Ok(bytes)

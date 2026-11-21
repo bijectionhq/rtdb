@@ -3006,6 +3006,24 @@ async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_ba
     let manifest: serde_json::Value = serde_json::from_slice(&database.object_store().get(&manifests[0].key).await.unwrap()).unwrap();
     assert_eq!(manifest["layout"]["source_rows"], 6);
     assert!(manifest["layout"]["revisions"].is_object());
+
+    let measured = rows(session.query_sql(
+        "SELECT index_name, definition_version, through_block, file_bytes \
+         FROM xt.live_ordered_index_storage WHERE schema_name = 'public' AND table_name = 'orders'",
+        vec![],
+    ).await.unwrap()).await;
+    let [entry] = measured.as_slice() else { panic!("Expected exactly one published index: {measured:?}"); };
+    let [Value::Utf8(name), Value::I64(version), Value::I64(through), Value::I64(bytes)] = entry.as_slice()
+    else { panic!("Expected one published index's metadata: {entry:?}"); };
+    assert_eq!(name, "orders_by_customer");
+    assert!(*version >= 0);
+    assert_eq!(Some(*through), manifest["layout"]["through"].as_i64());
+    let published_bytes: u64 = paths.iter().filter(|entry| {
+        entry.key.as_str().contains("/pages/") || entry.key.as_str().contains("/manifests/")
+    }).map(|entry| entry.size).sum();
+    let manifest_bytes = manifests[0].size;
+    assert!((*bytes as u64) > manifest_bytes);
+    assert!((*bytes as u64) <= published_bytes);
     assert!(database.snapshot().trie_entries(&TableRef::new("public", "orders")).iter().all(|trie| trie.key.level() == 0));
 
     let warm = "SELECT _id FROM orders WHERE customer = 'a' ORDER BY priority, _id LIMIT 1";

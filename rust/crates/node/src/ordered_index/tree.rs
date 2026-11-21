@@ -377,6 +377,13 @@ struct DecodedPages {
     entries: BTreeMap<ObjectKey, Arc<Node>>,
 }
 
+#[derive(Default)]
+pub(super) struct ReachablePages {
+    pub keys: BTreeSet<ObjectKey>,
+    pub bytes: u64,
+    allocations: Vec<Arc<MemoryReservation>>,
+}
+
 pub(super) struct Tree {
     pub storage: Arc<BufferPool>,
     pub directory: ObjectKey,
@@ -827,12 +834,26 @@ impl Tree {
     pub fn mark<'a>(
         &'a self,
         pointer: Arc<Pointer>,
-        reachable: &'a mut BTreeSet<ObjectKey>,
+        reachable: &'a mut ReachablePages,
+        cancellation: &'a CancellationToken,
     ) -> Work<'a, ()> {
         Box::pin(async move {
-            if !reachable.insert(self.page_key(pointer.generation, &pointer.digest)?) {
+            if cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            let key = self.page_key(pointer.generation, &pointer.digest)?;
+            if reachable.keys.contains(&key) {
                 return Ok(());
             }
+            let reservation = self
+                .memory
+                .reserve(key.as_str().len().saturating_add(512))?;
+            reachable.keys.insert(key);
+            reachable.allocations.push(reservation);
+            reachable.bytes = reachable
+                .bytes
+                .checked_add(pointer.size as u64)
+                .ok_or_else(|| format_error("Ordered index file bytes overflow"))?;
             let node = self.open(&Link::Stored(pointer)).await?;
             match &node.page {
                 Page::Branch(children) => {
@@ -842,13 +863,15 @@ impl Tree {
                                 "A stored page contains an unpublished child",
                             ));
                         };
-                        self.mark(Arc::clone(pointer), reachable).await?;
+                        self.mark(Arc::clone(pointer), reachable, cancellation)
+                            .await?;
                     }
                 }
                 Page::Leaf(leaf) => {
                     for entry in &leaf.metadata {
                         if let Item::Revision(Some(pointer)) = &entry.item {
-                            self.mark(Arc::clone(pointer), reachable).await?;
+                            self.mark(Arc::clone(pointer), reachable, cancellation)
+                                .await?;
                         }
                     }
                 }
