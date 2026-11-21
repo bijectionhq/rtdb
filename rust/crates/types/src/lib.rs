@@ -11,6 +11,8 @@ pub mod java_hash_map;
 mod logical;
 mod ordered;
 mod position;
+mod placed_attempt;
+pub use placed_attempt::{PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, PlacedAttemptScope, PlacedAttemptSeed};
 mod pg;
 mod type_edn;
 mod time;

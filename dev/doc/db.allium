@@ -921,6 +921,9 @@ rule LeaderProcessesTx {
         -- Private replay markers can be created by the resolver only and are protected from application writes and erases.
         -- A duplicate records the original transaction key in its durable outcome and skips the user operations.
         -- A caller error while looking up a private marker records a durable abort for that attempt and skips its user operations.
+        -- A placed request carries a nonce and an attempt scope bound to its history and writer epoch.
+        -- Resolution combines the scope with the authenticated principal and source position from the record.
+        -- The resolved frame carries that identity and its transaction outcome witness in the same delta.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }

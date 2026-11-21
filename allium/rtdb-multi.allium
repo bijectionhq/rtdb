@@ -1206,6 +1206,8 @@ rule ResolveAndAppend {
 
 rule ApplyOnCommit {
     -- The applied outcome and its basis are retained against the exact attempt through the receipt window, including at recovery.
+    -- The indexed outcome witness is written in the same resolved delta as the transaction result.
+    -- Its visible receipt window starts at the logged intake timestamp.
     -- Closing an epoch lets receipt lookup distinguish an unresolved attempt from a pending one after recovering the sealed prefix.
     when: AppendCommitted(holding, record: ResolvedTx)
 

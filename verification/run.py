@@ -1742,6 +1742,20 @@ def write_generated_temporal_trace(path):
 
 
 TLA_CASES = (
+    ("PlacedAttemptOutcome", "placed-attempt-outcome", None, None),
+    ("PlacedAttemptOutcome", "placed-attempt-visible-before-commit",
+     ('Mutation = "none"', 'Mutation = "visible_before_commit"'), "WitnessesCoverInstalledPrefix"),
+    ("PlacedAttemptOutcome", "placed-attempt-forgotten-at-restore",
+     ('Mutation = "none"', 'Mutation = "forget_witness_at_restore"'), "WitnessesCoverInstalledPrefix"),
+    ("PlacedAttemptOutcome", "placed-attempt-lookup-ignores-history",
+     ('Mutation = "none"', 'Mutation = "ignore_history"'), "LookupNamesExactAttempt"),
+    ("PlacedAttemptOutcome", "placed-attempt-lookup-ignores-epoch",
+     ('Mutation = "none"', 'Mutation = "ignore_epoch"'), "LookupNamesExactAttempt"),
+    ("PlacedAttemptOutcome", "placed-attempt-lookup-ignores-principal",
+     ('Mutation = "none"', 'Mutation = "ignore_principal"'), "LookupNamesExactAttempt"),
+    ("PlacedAttemptOutcome", "placed-attempt-recovered-witness",
+     ("INVARIANTS WitnessesCoverInstalledPrefix LookupNamesExactAttempt",
+      "INVARIANT NeverRecoversWitness"), "NeverRecoversWitness"),
     ("ActiveLogletReadIndex", "active-loglet-read-index", None, None),
     ("ActiveLogletReadIndex", "read-index-trusts-synced-predecessor",
      ('Mutation = "none"', 'Mutation = "synced_is_active"'), "BoundCoversAcknowledgements"),

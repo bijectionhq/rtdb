@@ -15,7 +15,7 @@ The second review revises the custody and erasure contracts and adds the placed 
 | R5 Recovery roots; collectable L0 | [R5-recovery-roots.md](R5-recovery-roots.md) | Multi recovery and checkpoint-metadata holds exist; roots not yet the recovery contract |
 | R6 Sealing with destroyable data keys | [R6-sealing.md](R6-sealing.md) | Multi seals under a per-deployment key; classic unsealed; no per-unit keys |
 | R7 History collection and privacy erasure | [R7-eraser.md](R7-eraser.md) | Contract and bounded custody model; runtime pending |
-| R8 Retention of receipts and transaction metadata | [R8-metadata-retention.md](R8-metadata-retention.md) | Not started |
+| R8 Retention of receipts and transaction metadata | [R8-metadata-retention.md](R8-metadata-retention.md) | Placed outcome witnesses have a logical receipt window. Physical expiry and transaction metadata retention remain open. |
 | R9 Capabilities and composed model | [R9-capabilities-and-composition.md](R9-capabilities-and-composition.md) | Pattern exists (replica admission witness, `IoRegion` lease scope) |
 
 Dependency order: R4 and R6 can proceed in parallel; R5 needs R4; R7 needs R5 and R6; R8 needs R7; R9 grows with each.
@@ -43,7 +43,7 @@ Dependency order: R4 and R6 can proceed in parallel; R5 needs R4; R7 needs R5 an
 
 | Change | Target | State |
 | --- | --- | --- |
-| Placed attempt receipts, fresh reads and loglet fences | [Authority boundaries](authority-boundaries.md) | Bounded serving protocol checked in TLA+. Opt-in subscriber reads use durable loglet indexes. Attempt receipts and retiring lease-based self-fencing remain open. |
+| Placed attempt receipts, fresh reads and loglet fences | [Authority boundaries](authority-boundaries.md) | Opt-in subscriber reads use durable loglet indexes. Resolved frames and checkpoints bind placed outcomes to attempt identities. Public receipts and retiring lease-based self-fencing remain open. |
 | CDC recoverability and upstream acknowledgement | [Authority boundaries](authority-boundaries.md#recovery-roots-and-upstream-acknowledgement) | Contract specified; gated on R5 and provider qualification |
 | Argument-defined search ranking | [Full-text search](../../dev/doc/fts.allium) | Implemented in native SQL and the rank accelerator |
 | Custody-scoped sealing, enrollment and erasure | [R6](R6-sealing.md) · [R7](R7-eraser.md) | Bounded custody protocol checked in TLA+; provider and runtime changes pending |

@@ -2290,6 +2290,26 @@ Skipping the apply wait and capturing the basis before confirmation each violate
 The previous activation and watermark controls still failed at their named bounds, and both reachability probes still found witnesses. link:../tla/ActiveLogletReadIndex.tla[Active loglet model]
 The full Gradle suite ran against the JNI library rebuilt on parent `f536956ed` and passed all 3,198 cases.
 
+=== Scoped placed attempt outcome witnesses
+
+Placed intake encodes the current replica history, writer epoch and a fresh nonce.
+Resolution combines that seed with the record's source position and authenticated principal.
+Every resolved placed result carries its attempt identity and its indexed outcome witness in the same delta.
+The witness uses the intake timestamp for its one-hour logical validity window.
+Copied fork tails omit the parent's attempt identity and witness.
+
+The native Multi replay checks a committed transaction and an abort, reads their identities from the sealed journal, and verifies their outcome witnesses after the checkpoint's prefix is trimmed and the deployment reopens.
+The skipped-transaction test archives a malformed operation stream and retains its scoped abort outcome.
+The selected Rust suites passed 628 cases.
+On parent `ab41896bc`, the expanded Rust run passed 737 cases, including Flight SQL and statement tests.
+Removing the outcome witness from the resolver failed the native test at its replica-frame assertion.
+The small TLC model covered 1,505 states and found a restored witness.
+It rejected an early witness, a witness lost at recovery, and lookups that disregard history, writer epoch or principal. link:../tla/PlacedAttemptOutcome.tla[Placed attempt outcome model]
+The model assumes distinct encoded identities and atomic resolved-delta application.
+The existing placed serving model checked 181,080 states and rejected the control that identifies two attempts by their reused intake slot.
+The combined Gradle run against the rebuilt JNI library on parent `d9eb3a115` passed 3,198 standard tests and 3,348 property cases.
+Public receipt issuance, redemption and physical expiry remain open.
+
 === Table metadata bindings in checkpoint roots
 
 The Rust block producer now writes an OID-keyed SHA-256 manifest in each new checkpoint root.

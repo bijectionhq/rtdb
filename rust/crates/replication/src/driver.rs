@@ -1121,7 +1121,8 @@ impl ReplicationDriver {
                             let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
                             let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
                             context.storage.object_store().put(&key, payload).await?;
-                            resolver.resolve_skipped(durable, position, metadata.timestamp, &context)
+                            let attempt = SourceTransaction::skipped_attempt(&message, position)?;
+                            resolver.resolve_skipped(durable, position, metadata.timestamp, attempt, &context)
                         }.await,
                     };
                     (resolver, result)

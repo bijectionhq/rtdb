@@ -172,7 +172,7 @@ async fn transaction_trace_contains_one_sql_span_per_operation_and_skipped_zero_
     let arguments = SqlArguments::from_rows(vec![vec![Value::Bool(true)], vec![Value::Bool(true)]], &context.memory).unwrap();
     let request = request(vec![TxOp::Sql { sql: "ASSERT ?".into(), args: Some(arguments) }], &context);
     assert!(resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request, &context).await.unwrap().result().committed());
-    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), &context).unwrap();
+    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).unwrap();
     tracer.close();
     let mut spans = Vec::new(); while let Some(span) = receiver.next().await { spans.push(span); }
     assert_eq!(spans.len(), 3);
@@ -196,7 +196,7 @@ async fn ingestion_metrics_count_abort_and_invalid_time_but_exclude_skipped_tran
     let metrics = Arc::new(Metrics::default()); let mut context = context(); context.execution_observer = Some(metrics.clone());
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![sql("ASSERT FALSE")], &context), &context).await.unwrap();
-    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), &context).unwrap();
+    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).unwrap();
     let request = SourceTransaction::new(vec![], SubmitOptions { system_time: Some(Timestamp(100)), ..Default::default() }, &context.memory).unwrap();
     resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(102), request, &context).await.unwrap();
     assert_eq!(metrics.0.load(std::sync::atomic::Ordering::Relaxed), 2);
@@ -234,7 +234,7 @@ async fn skipped_transaction_stages_only_its_aborted_row_and_smooths_time() {
     let context = context();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     let first = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![put(&context, 9, 0, i64::MAX)], &context), &context).await.unwrap();
-    let skipped = resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(50), &context).unwrap();
+    let skipped = resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(50), None, &context).unwrap();
     assert_eq!(skipped.result().error().unwrap().code, "xtdb/skipped-tx");
     assert_eq!(skipped.result().tx_key().system_time, Timestamp(101));
     assert_eq!(skipped.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);

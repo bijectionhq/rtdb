@@ -10,7 +10,7 @@ use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, Artefac
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
-use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
+use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, TableRef, Term};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +40,7 @@ pub struct Database {
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
     replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
+    pub(crate) placed_attempt_scope: Option<PlacedAttemptScope>,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
     submitted_bytes: AtomicU64,
     replica_read_sessions: AtomicUsize,
@@ -325,6 +326,7 @@ impl DatabaseFactory {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
             let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
+                placed_attempt_scope: opened_logs.placed_attempt_scope,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };

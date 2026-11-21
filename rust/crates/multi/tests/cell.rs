@@ -949,6 +949,69 @@ async fn a_draining_node_keeps_a_recently_used_deployment_until_a_target_is_avai
 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint() {
+    use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
+    use rtdb_storage::log::{Log, LogOffset};
+    use rtdb_types::{PlacedAttempt, PlacedAttemptScope, SourcePosition};
+
+    let cell = Cell::start_durable(2).await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let writer = cell.connect("shop").await;
+    writer.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    assert!(writer.simple_query("ASSERT FALSE").await.is_err());
+
+    let record = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let stream = record.stream("replica");
+    let scope = PlacedAttemptScope::new(&stream, record.epoch).unwrap();
+    let next_scope = PlacedAttemptScope::new(&stream, record.epoch + 1).unwrap();
+    let config = rtdb_logkeeper::StreamConfig {
+        servers: cell.logkeepers.iter().filter(|keeper| record.ensemble.contains(&keeper.lease.id())).map(|keeper| keeper.address.to_string()).collect(),
+        stream, write_quorum: 2, maximum_message_bytes: 4 << 20,
+    };
+    let replica = rtdb_logkeeper::open_reader(config.clone(), Default::default()).await.unwrap();
+    let material = cell.keys().existing(&record.key_id()).await.unwrap();
+    let replica = rtdb_multi::logs::SealedLog::new(replica, &material, &record.replica_seal_scope()).unwrap();
+    let mut tail = replica.tail(LogOffset(-1)).await.unwrap();
+    let outcomes = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut outcomes = Vec::new();
+        while outcomes.len() < 2 {
+            for record in tail.poll(Duration::from_millis(50)).await.unwrap() {
+                let Some(ReplicaEnvelope { message: ReplicaBody::ResolvedTx(tx), .. }) = ReplicaEnvelope::decode(&record.payload).unwrap() else { continue; };
+                let Some(encoded) = tx.placed_attempt.as_deref() else { continue; };
+                let position = SourcePosition(tx.src_msg_id.unwrap());
+                assert_eq!(tx.tx_id, Some(position.0));
+                let attempt = PlacedAttempt::decode(encoded).unwrap();
+                assert!(attempt.matches(scope, position, Some("xtdb")));
+                assert!(!attempt.matches(next_scope, position, Some("xtdb")));
+                assert!(tx.table_data.contains_key("xt/placed_attempt_outcomes"));
+                outcomes.push((attempt.outcome_key(), tx.committed.unwrap()));
+            }
+        }
+        outcomes
+    }).await.unwrap();
+    assert_eq!(outcomes.iter().map(|(_, committed)| *committed).collect::<Vec<_>>(), [true, false]);
+    let mut expected: Vec<String> = outcomes.into_iter().map(|(key, _)| key).collect();
+    expected.sort();
+    let receipt_query = "SELECT _id FROM xt.placed_attempt_outcomes";
+    assert_eq!(values(&writer, receipt_query).await, expected);
+
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    drop((writer, tail, replica));
+    cell.node(holder).agent.park("shop").await.unwrap();
+    let parked = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let boundary = parked.checkpoint.unwrap().boundary;
+    rtdb_logkeeper::trim(&config, LogOffset(boundary)).await.unwrap();
+    let reopened = cell.connect("shop").await;
+    let successor = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    assert!(successor.epoch > record.epoch);
+    assert!(successor.checkpoint.is_some());
+    assert_eq!(values(&reopened, receipt_query).await, expected);
+    drop(reopened);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_linearizable_subscriber_refuses_to_pin_a_basis_after_its_ensemble_is_sealed() {
     let cell = Cell::start_durable(2).await;
     let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

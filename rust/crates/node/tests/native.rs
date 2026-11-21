@@ -94,7 +94,7 @@ async fn an_implicit_basis_checks_the_replica_index_before_capturing_applied_his
         async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
             Ok(OpenedLogs {
                 source: Arc::new(MemoryLog::new(1024)), replica: self.replica.clone(), source_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0),
-                replica_read_index: Some(Box::new(ReadIndex(self.confirm.clone()))), drivers: Vec::new(),
+                replica_read_index: Some(Box::new(ReadIndex(self.confirm.clone()))), placed_attempt_scope: None, drivers: Vec::new(),
             })
         }
     }
@@ -1200,7 +1200,7 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
         }
         async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
             Ok(OpenedLogs { source: self.source.clone(), replica: self.replica.clone(), source_epoch: rtdb_types::StorageEpoch(0),
-                replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None, drivers: Vec::new() })
+                replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None, placed_attempt_scope: None, drivers: Vec::new() })
         }
     }
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -1298,7 +1298,8 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
             };
             Ok(OpenedLogs {
                 source: self.shared.source.clone(), replica,
-                source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None, drivers: Vec::new(),
+                source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None,
+                placed_attempt_scope: None, drivers: Vec::new(),
             })
         }
     }

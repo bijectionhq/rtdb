@@ -427,7 +427,8 @@ impl Node {
         options.user = identity.user().map(str::to_owned);
         options.default_tz = rtdb_expr::normalize_timezone(&options.default_tz)?;
         let sql_options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: self.factory.options.query.generate_series_end_exclusive, ..Default::default() };
-        let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
+        let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?
+            .with_placed_scope(database.placed_attempt_scope);
         let (source, submitted_at) = match replay {
             Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
             None => (source, None),

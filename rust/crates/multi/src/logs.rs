@@ -17,7 +17,7 @@ use rtdb_logkeeper::{QuorumLog, StreamConfig};
 use rtdb_node::{LogAccess, LogFactory, OpenedLogs, ReplicaReadIndex};
 use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
-use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, Timestamp};
+use rtdb_types::{Anomaly, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use crate::cipher::{Cipher, SEALED_OVERHEAD};
@@ -116,7 +116,8 @@ pub(crate) fn frozen_checkpoint(
         consumed: Arc::new(AtomicI64::new(start - 1)),
         start,
     });
-    Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, drivers: Vec::new() })
+    Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
+        placed_attempt_scope: None, drivers: Vec::new() })
 }
 
 #[async_trait]
@@ -129,6 +130,10 @@ impl LogFactory for LogkeeperLogFactory {
             return frozen_checkpoint(checkpoint, epoch, self.maximum_message_bytes);
         }
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
+        let placed_attempt_scope = match access {
+            LogAccess::ReadWrite => Some(PlacedAttemptScope::new(&stream.stream, config.epoch)?),
+            _ => None,
+        };
         let (quorum, key) = match access {
             LogAccess::ReadWrite => {
                 let key = self.holds.keys.existing(&config.key_id).await?;
@@ -172,7 +177,8 @@ impl LogFactory for LogkeeperLogFactory {
                 }
             }.boxed()
         };
-        Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index, drivers: vec![trimming] })
+        Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
+            replica_read_index, placed_attempt_scope, drivers: vec![trimming] })
     }
 }
 
@@ -255,11 +261,14 @@ pub async fn transactions_until(replica: &dyn Log, boundary: i64, system_time: r
 
 /// Gives a fork's copied transactions ids, and source positions, in the fork's log epoch, so they come after its block's and before its own.
 pub fn renumber_into(tail: &mut [ReplicaEnvelope], epoch: StorageEpoch) -> Result<()> {
+    let attempt_table = format!("xt/{PLACED_ATTEMPT_OUTCOME_TABLE}");
     for (offset, envelope) in tail.iter_mut().enumerate() {
         let ReplicaBody::ResolvedTx(tx) = &mut envelope.message else { continue };
         let position = rtdb_types::SourcePosition::from_epoch_offset(epoch, offset as i64)?.0;
         tx.tx_id = Some(position);
         tx.src_msg_id = Some(position);
+        tx.placed_attempt = None;
+        tx.table_data.remove(&attempt_table);
     }
     Ok(())
 }

@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
-use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptScope, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{ArrowDocuments, Documents, EntityIds, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::values::{DecodedDocumentLayout, contains_fixed_size_list};
@@ -28,6 +28,7 @@ pub struct SourceTransaction {
     pub(crate) operations: Vec<Operation>,
     pub options: SubmitOptions,
     pub(crate) guard: Option<SourceGuard>,
+    placed_seed: Option<PlacedAttemptSeed>,
     pub(crate) memory: Arc<MemoryBudget>,
     _reservation: Arc<MemoryReservation>,
 }
@@ -59,7 +60,7 @@ impl SourceTransaction {
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
         }
         let reservation = memory.reserve(bytes)?;
-        Ok(Self { operations, options, guard: None, memory: Arc::clone(memory), _reservation: reservation })
+        Ok(Self { operations, options, guard: None, placed_seed: None, memory: Arc::clone(memory), _reservation: reservation })
     }
 
     pub fn with_idempotency_guard(mut self, submitted_at: Timestamp, after_bootstrap: bool) -> Self {
@@ -72,6 +73,20 @@ impl SourceTransaction {
         self
     }
 
+    pub fn with_placed_scope(mut self, scope: Option<PlacedAttemptScope>) -> Self {
+        self.placed_seed = scope.map(PlacedAttemptScope::issue);
+        self
+    }
+
+    pub(crate) fn placed_attempt(&self, position: SourcePosition) -> Result<Option<PlacedAttempt>> {
+        self.placed_seed.map(|seed| seed.identify(position, self.options.user.as_deref())).transpose()
+    }
+
+    pub fn skipped_attempt(message: &SourceMessage, position: SourcePosition) -> Result<Option<PlacedAttempt>> {
+        let SourceMessage::Protobuf(SourceBody::Tx(tx)) = message else { return Ok(None); };
+        decode_placed_seed(tx)?.map(|seed| seed.identify(position, tx.user.as_deref())).transpose()
+    }
+
     /// Decodes current flat tx operations and the legacy one-row envelope without expanding SQL.
     pub fn decode(message: &SourceMessage, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let option_bytes = match message {
@@ -80,6 +95,10 @@ impl SourceTransaction {
             _ => 0,
         };
         let _option_scratch = memory.reserve(option_bytes)?;
+        let placed_seed = match message {
+            SourceMessage::Protobuf(SourceBody::Tx(tx)) => decode_placed_seed(tx)?,
+            _ => None,
+        };
         let (pages, mut options, guard, legacy, abort_on_legacy_resolver) = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
                 let bytes = tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
@@ -113,7 +132,9 @@ impl SourceTransaction {
         };
         if pages.is_empty() && !legacy {
             if guard.is_some() { return Err(invalid("A guarded transaction requires an operations batch")); }
-            return Self::from_operations(Vec::new(), options, memory);
+            let mut transaction = Self::from_operations(Vec::new(), options, memory)?;
+            transaction.placed_seed = placed_seed;
+            return Ok(transaction);
         }
         let first = pages.first().ok_or_else(|| invalid("Transaction IPC stream has no record batch"))?;
         let mut parsed_fields = memory.reserve(4096)?;
@@ -160,6 +181,7 @@ impl SourceTransaction {
         }
         let mut transaction = Self::from_operations(operations, options, memory)?;
         transaction.guard = guard;
+        transaction.placed_seed = placed_seed;
         Ok(transaction)
     }
 
@@ -217,6 +239,7 @@ impl SourceTransaction {
             user_metadata: metadata.as_ref().map(|bytes| bytes.as_slice().to_vec()), external_source_token: None,
             idempotency_guard,
             replay_submission,
+            placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec()),
         };
         let wire = rtdb_format::generated::xtdb::log::proto::SourceLogMessage { message: Some(SourceBody::Tx(tx)) };
         let reservation = self.memory.reserve(wire.encoded_len().checked_add(128).ok_or_else(overflow)?)?;
@@ -268,6 +291,10 @@ impl SourceTransaction {
         let batch = RecordBatch::try_new(schema, vec![union]).map_err(|error| invalid(error.to_string()))?;
         arrays.finish(batch)
     }
+}
+
+fn decode_placed_seed(tx: &rtdb_format::generated::xtdb::log::proto::Tx) -> Result<Option<PlacedAttemptSeed>> {
+    tx.placed_attempt_seed.as_deref().map(PlacedAttemptSeed::decode).transpose()
 }
 
 /// The scratch one operation's body takes while it is encoded, beside its documents, arguments or IDs.

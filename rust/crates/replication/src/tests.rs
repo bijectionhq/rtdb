@@ -264,8 +264,10 @@ async fn admitted_replica_fault_reaches_an_unmet_waiter_and_preserves_the_applie
 #[tokio::test]
 async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
     let fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;
+    let seed = rtdb_types::PlacedAttemptScope::new("deployment/1/replica", 7).unwrap().issue();
     let message = rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::Tx(proto::Tx {
-        tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()), system_time_micros: Some(-100), ..Default::default()
+        tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()), system_time_micros: Some(-100),
+        user: Some("alice".into()), placed_attempt_seed: Some(seed.encode().to_vec()), ..Default::default()
     }));
     let expected = message.encode().unwrap();
     let handle = fixture.handle.clone();
@@ -276,6 +278,15 @@ async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
     assert_eq!(result.error().unwrap().code, "xtdb/skipped-tx");
     assert_eq!(result.tx_key().system_time, Timestamp(100));
     assert_eq!(fixture.store.get(&rtdb_storage::ObjectKey::new("skipped-txs/00").unwrap()).await.unwrap().as_ref(), expected.as_slice());
+    let latest = fixture.replica.latest().unwrap().0;
+    let installed = fixture.replica.read_range(LogOffset(0), LogOffset(latest + 1)).await.unwrap().into_iter()
+        .find_map(|raw| match ReplicaEnvelope::decode(&raw.payload).unwrap().unwrap().message {
+            ReplicaBody::ResolvedTx(resolved) => Some(resolved),
+            _ => None,
+        }).unwrap();
+    let attempt = rtdb_types::PlacedAttempt::decode(installed.placed_attempt.as_deref().unwrap()).unwrap();
+    assert_eq!(attempt, seed.identify(position, Some("alice")).unwrap());
+    assert!(installed.table_data.contains_key("xt/placed_attempt_outcomes"));
     handle.shutdown();
     driver.await.unwrap().unwrap();
 }

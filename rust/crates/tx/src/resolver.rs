@@ -12,7 +12,7 @@ use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, LogicalType, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
@@ -56,10 +56,22 @@ impl ResolveContext {
 pub struct OwnedReplicaBody { body: ReplicaBody, _reservation: Arc<MemoryReservation> }
 impl OwnedReplicaBody { pub fn body(&self) -> &ReplicaBody { &self.body } }
 
+#[derive(Clone, Copy)]
+enum ResolvedInput {
+    Position(SourcePosition),
+    Placed(PlacedAttempt),
+}
+
+impl ResolvedInput {
+    fn position(self) -> SourcePosition {
+        match self { Self::Position(position) => position, Self::Placed(attempt) => attempt.position() }
+    }
+}
+
 pub struct ResolvedTx {
     writes: Arc<StagedWrite>,
     result: TransactionResult,
-    source_position: SourcePosition,
+    input: ResolvedInput,
     external_token: Option<Vec<u8>>,
     db_op: Option<DbOp>,
     _reservation: Arc<MemoryReservation>,
@@ -67,7 +79,7 @@ pub struct ResolvedTx {
 impl ResolvedTx {
     pub fn writes(&self) -> &Arc<StagedWrite> { &self.writes }
     pub fn result(&self) -> &TransactionResult { &self.result }
-    pub fn source_position(&self) -> SourcePosition { self.source_position }
+    pub fn source_position(&self) -> SourcePosition { self.input.position() }
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
 
@@ -87,10 +99,12 @@ impl ResolvedTx {
         bound = bound.checked_add(error.as_ref().map_or(0, |error| error.as_slice().len())).and_then(|bound| bound.checked_add(self.external_token.as_ref().map_or(0, Vec::capacity))).ok_or_else(overflow)?;
         let reservation = memory.reserve(bound)?;
         let key = self.result.tx_key();
+        let placed_attempt = match self.input { ResolvedInput::Placed(attempt) => Some(attempt.encode().to_vec()), ResolvedInput::Position(_) => None };
         let body = ReplicaBody::ResolvedTx(WireResolvedTx {
             tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
             table_data: tables.into_iter().map(|(name, bytes)| (name, bytes.as_slice().to_vec())).collect(),
-            db_op: self.db_op.clone(), external_source_token: self.external_token.clone(), src_msg_id: Some(self.source_position.0),
+            db_op: self.db_op.clone(), external_source_token: self.external_token.clone(), src_msg_id: Some(self.source_position().0),
+            placed_attempt,
         });
         Ok(OwnedReplicaBody { body, _reservation: reservation })
     }
@@ -137,7 +151,7 @@ impl TxResolver {
     }
 
     /// Stages the skipped transaction outcome after its source payload has been persisted for inspection.
-    pub fn resolve_skipped(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+    pub fn resolve_skipped(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, attempt: Option<PlacedAttempt>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         let _span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(0))]);
         context.check_cancelled()?;
         let base = self.resolving_snapshot(durable)?;
@@ -147,7 +161,8 @@ impl TxResolver {
         let error = crate::RetainedAnomaly::new(Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped"), &context.memory)?;
         let result = TransactionResult::Aborted { tx_key: key, error: Some(error) };
         tx.write_result(&result, None)?;
-        self.stage(tx.buffer.stage()?, result, position, None, None, context)
+        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time)?; }
+        self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
     }
 
     pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -248,8 +263,10 @@ impl TxResolver {
             Err(error) => return Err(error),
         };
         tx.write_result(&result, request.options.user_metadata.as_ref())?;
+        let attempt = request.placed_attempt(position)?;
+        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time)?; }
         context.check_cancelled()?;
-        self.stage(tx.buffer.stage()?, result, position, None, None, context)
+        self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
     }
 
     pub async fn resolve_external(&mut self, durable: Snapshot, now: Timestamp, system_time: Option<Timestamp>, token: Option<Vec<u8>>, writer: &mut dyn TransactionWriter, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -271,7 +288,7 @@ impl TxResolver {
         };
         tx.write_result(&result, metadata.as_ref())?;
         context.check_cancelled()?;
-        self.stage(tx.buffer.stage()?, result, self.source_position, token, None, context)
+        self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(self.source_position), token, None, context)
     }
 
     pub fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -286,7 +303,7 @@ impl TxResolver {
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
         tx.write_result(&result, None)?;
         context.check_cancelled()?;
-        self.stage(tx.buffer.stage()?, result, position, None, operation, context)
+        self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(position), None, operation, context)
     }
 
     fn smooth(&self, candidate: Timestamp) -> Result<Timestamp> {
@@ -297,9 +314,13 @@ impl TxResolver {
 
     fn previous_system_time(&self) -> Option<i64> { self.resolved_head.map(|key| key.system_time.0) }
 
-    fn stage(&mut self, writes: StagedWrite, result: TransactionResult, position: SourcePosition, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+    fn stage(&mut self, writes: StagedWrite, result: TransactionResult, input: ResolvedInput, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        let position = input.position();
         if position < self.source_position { return Err(Anomaly::fault("rtdb.tx/source-watermark", "Resolve-side source watermark moved backwards")); }
         let key = result.tx_key();
+        if matches!(input, ResolvedInput::Placed(_)) && key.tx_id.0 != position.0 {
+            return Err(Anomaly::fault("rtdb.tx/placed-attempt-position", "A placed attempt must match its transaction result"));
+        }
         if writes.tx_key() != key || !crate::system_time::advances(self.previous_system_time(), key.system_time.0) {
             return Err(Anomaly::fault("rtdb.tx/system-time", "Resolved transaction does not advance its predecessor's system time"));
         }
@@ -312,7 +333,7 @@ impl TxResolver {
             self.queue.reserve_exact(capacity - self.queue.len());
             self.queue_reservation = charge;
         }
-        let resolved = Arc::new(ResolvedTx { writes: Arc::new(writes), result, source_position: position, external_token: token, db_op, _reservation: reservation });
+        let resolved = Arc::new(ResolvedTx { writes: Arc::new(writes), result, input, external_token: token, db_op, _reservation: reservation });
         self.queue.push_back(Arc::clone(&resolved));
         self.resolved_head = Some(key);
         self.source_position = position;
@@ -420,6 +441,17 @@ impl<'a> OpenTransaction<'a> {
         ]);
         let expires = Timestamp(key.system_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
         self.buffer.put(receipts_table(), document, interval(key.system_time, expires)?)
+    }
+
+    fn write_attempt_outcome(&mut self, attempt: PlacedAttempt, log_time: Timestamp) -> Result<()> {
+        let key = self.tx_key();
+        let document = StructFields::from([
+            ("_id".into(), Value::Utf8(attempt.outcome_key())),
+            ("tx_id".into(), Value::I64(key.tx_id.0)),
+            ("tx_system_time".into(), time_value(key.system_time)),
+        ]);
+        let expires = Timestamp(log_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
+        self.buffer.put(TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE), document, interval(log_time, expires)?)
     }
 
     async fn index_exists(&self, catalog: &str, name: &str) -> Result<bool> {

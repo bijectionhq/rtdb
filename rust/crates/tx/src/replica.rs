@@ -5,12 +5,21 @@ use std::sync::Arc;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::generated::xtdb::log::proto::ResolvedTx;
 use rtdb_index::{IndexBatch, StagedWrite, TableWrite};
-use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, BlockIndex, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, TableRef, Timestamp, TransactionKey, TxId};
 
 use crate::{RetainedAnomaly, TransactionResult};
 
 /// Decodes every table before returning an applyable transaction; caller publishes it atomically.
 pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<(StagedWrite, TransactionResult)> {
+    if let Some(placed) = message.placed_attempt.as_deref() {
+        let attempt = PlacedAttempt::decode(placed).map_err(|_| invalid("Invalid placed attempt identity"))?;
+        let position = Some(attempt.position().0);
+        if message.src_msg_id != position || message.tx_id != position
+            || !message.table_data.contains_key(&format!("xt/{PLACED_ATTEMPT_OUTCOME_TABLE}"))
+        {
+            return Err(invalid("Placed attempt and transaction outcome disagree"));
+        }
+    }
     let key = TransactionKey { tx_id: TxId(message.tx_id.unwrap_or_default()), system_time: Timestamp(message.system_time_micros.unwrap_or_default()) };
     let result = if message.committed.unwrap_or_default() {
         TransactionResult::Committed { tx_key: key }

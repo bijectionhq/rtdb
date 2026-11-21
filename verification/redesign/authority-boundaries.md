@@ -10,6 +10,13 @@ Its positions can repeat after an epoch change because the new intake starts aft
 The current submit path returns that local number and the session uses it as an await basis.
 The progress monitor can therefore satisfy an old receipt after applying an unrelated transaction at the reused position.
 
+Placed intake records now carry the history and writer epoch of the opened log.
+The resolver binds that scope to the record's source position and authenticated principal and stages an outcome witness with both commits and aborts.
+The replica frame carries the full attempt identity, and the checkpointed outcome table indexes its digest to the transaction key.
+Each intake includes a fresh nonce so the indexed digest alone does not disclose the principal.
+The outcome witness has a logical receipt window beginning at the logged intake timestamp.
+Public receipt issuance, redemption and physical expiry remain open.
+
 The volatile intake assigns a typed attempt identity consisting of the database history identity, sealed writer epoch and local sequence.
 An asynchronous submit returns a provisional receipt carrying that identity.
 Apply publishes the mapping from attempt to durable outcome with the resolved replica frame, and preserves it through checkpoints for the declared receipt window.

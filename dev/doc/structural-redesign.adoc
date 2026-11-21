@@ -132,6 +132,8 @@ Renewal, recovery-root integration, identity-bound certification and timer remov
 
 link:../../verification/redesign/authority-boundaries.md[Authority boundaries] specifies placed attempt receipts, read indexes, logkeeper safety and CDC acknowledgement.
 The placed serving model checks receipt and freshness transitions on an abstract committed replica prefix.
+Placed resolution stages a history-, epoch- and principal-scoped outcome witness in the transaction's replica frame.
+The checkpoint carries that witness into recovery.
 Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
 An implicit read on a linearizable subscriber waits for the read-index bound to be applied before it captures its time basis.
 The gateway retries a subscriber refusal on the holder when the command is still unanswered and the backend reports an idle transaction state.
