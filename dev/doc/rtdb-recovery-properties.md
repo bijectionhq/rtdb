@@ -129,3 +129,35 @@ The first model should expose the actual assumptions of that selection and leave
 
 Turbopuffer is a reference for treating cache warmth separately from durability and minimizing the work on a cold read.
 For RTDB, keep Logkeeper quorum commits and use those ideas to guide bounded warming and cold-read measurements. [turbopuffer architecture](https://turbopuffer.com/docs/architecture) · [Warm cache](https://turbopuffer.com/docs/warm-cache)
+
+## First executable model
+
+[RTDBRecovery.tla](../tla/RTDBRecovery.tla) models a single deployment on a fixed three-Logkeeper ensemble.
+The journal, checkpoint, and volatile holder state are passive values, and `Next` exposes the actions that update them to TLC's scheduler.
+Append delivery represents a durable journal write in one action.
+The model tracks quorum commitment independently of the reply observed by the client.
+It preserves pending messages across holder crashes so that a delayed append can race a successor's seal.
+Checkpoint trim operates on transaction positions, with the production stream's extra boundary record folded into the checkpoint abstraction.
+The progress check assumes fair recovery steps, the available journal majority, and a replacement within the model's epoch bound.
+
+Run a configuration from the repository root using the [TLA+ 1.7.4 release jar](https://github.com/tlaplus/tlaplus/releases/tag/v1.7.4).
+
+```sh
+mkdir -p build/tla-tools build/tla-state
+curl --fail --location https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
+  --output build/tla-tools/tla2tools.jar
+java -XX:+UseParallelGC -jar build/tla-tools/tla2tools.jar -workers 2 \
+  -metadir build/tla-state/base -config dev/tla/RTDBRecovery.cfg dev/tla/RTDBRecovery.tla
+```
+
+| Configuration | TLC result |
+| --- | --- |
+| `RTDBRecovery.cfg` | Safety and eventual readiness hold across 342,407 distinct states with two write positions, two payloads, two epochs, and at most one lost journal. |
+| `RTDBRecoveryRepeatedRestart.cfg` | The same properties hold across 52,259 distinct states with up to three epochs, one write position, and one payload. |
+| `RTDBRecoveryEarlyTrim.cfg` | `TrimFollowsPublication` fails when an uploaded pack grants trim permission before its directory publication. |
+| `RTDBRecoveryPartialSync.cfg` | `SyncedHistoryIsComplete` fails when a partially copied replica advertises the recovering epoch as synced. |
+| `RTDBRecoveryLostQuorum.cfg` | `AcknowledgedWritesSurvive` fails when the only two journals with the acknowledged write are lost before the checkpoint covers it. |
+| `RTDBRecoveryWitness.cfg` | The deliberately false `NoPostRestartReadAndWrite` invariant gives a reachable trace with a read of a pre-crash acknowledged write and a successful new write. |
+
+Run the configurations serially and give each run a distinct `-metadir` to retain its output separately.
+The next model extensions are fork and stream-generation trim isolation, ensemble replacement and journal identity, and client retry semantics.
