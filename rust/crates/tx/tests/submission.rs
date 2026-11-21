@@ -172,7 +172,7 @@ fn coalescing_argument_batches_preserves_old_clones_and_joined_types() {
     let clone = args.clone();
     assert_eq!(memory.used_bytes(), used);
     args.append(SqlArguments::from_rows(vec![vec![Value::Utf8("two".into())]], &memory).unwrap()).unwrap();
-    assert_eq!(original.rows().collect::<Vec<_>>(), [vec![Value::I64(1)].as_slice()]);
+    assert_eq!(original.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [vec![Value::I64(1)]]);
     assert_eq!(args.row_count(), 2);
     assert_eq!(args.types()[0], LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8)));
     drop(args); drop(original); drop(clone);

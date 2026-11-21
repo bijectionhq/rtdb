@@ -126,7 +126,7 @@ impl SourceTransaction {
                     documents.array().len().checked_mul(64).ok_or_else(overflow)?
                 }
                 Operation::Public(TxOp::Sql { sql, args }) => {
-                    let rows = args.as_ref().map(|args| args.rows().flatten().try_fold(0usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))).transpose()?.unwrap_or(0);
+                    let rows = args.as_ref().map(SqlArguments::value_bytes).transpose()?.unwrap_or(0);
                     rows.checked_add(sql.capacity()).ok_or_else(overflow)?
                 }
                 Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => sql.capacity().checked_add(arg_bytes.as_slice().len()).ok_or_else(overflow)?,
@@ -518,15 +518,37 @@ impl SourceOperationReader<'_> {
 }
 
 pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
+    if let Some(pages) = arguments.uniform_arrow_pages() {
+        let first = pages[0];
+        let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
+            page.get_array_memory_size().checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+        })?)?;
+        let fields = first.schema_ref().fields().iter().enumerate().map(|(index, field)| {
+            field.as_ref().clone().with_name(format!("?_{index}"))
+        }).collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        let combined;
+        let page = if pages.len() == 1 {
+            first
+        } else {
+            combined = arrow_select::concat::concat_batches(first.schema_ref(), pages).map_err(|error| invalid(error.to_string()))?;
+            &combined
+        };
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.num_rows()));
+        let page = RecordBatch::try_new_with_options(Arc::clone(&schema), page.columns().to_vec(), &options)
+            .map_err(|error| invalid(error.to_string()))?;
+        return crate::ipc::encode(&schema, [&page], memory);
+    }
+    let rows = arguments.rows().collect::<Result<Vec<_>>>()?;
     let bound = arguments.types().iter().enumerate().try_fold(4096usize, |bytes, (index, ty)| {
-        bytes.checked_add(rtdb_columnar::estimate_builder_bytes_refs(ty, arguments.rows().map(|row| &row[index]))?).ok_or_else(overflow)
+        bytes.checked_add(rtdb_columnar::estimate_builder_bytes_refs(ty, rows.iter().map(|row| &row[index]))?).ok_or_else(overflow)
     })?;
     let reservation = memory.reserve(bound)?;
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
     for (index, ty) in arguments.types().iter().enumerate() {
         fields.push(to_field(&format!("?_{index}"), ty)?);
-        arrays.push(copy_array(ty, &arguments.rows().map(|row| row[index].clone()).collect::<Vec<_>>())?);
+        arrays.push(copy_array(ty, &rows.iter().map(|row| row[index].clone()).collect::<Vec<_>>())?);
     }
     let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(arguments.row_count()));
     let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), arrays, &options).map_err(|error| invalid(error.to_string()))?;
@@ -543,12 +565,16 @@ pub(crate) fn decode_arguments(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Resu
             return Err(Anomaly::incorrect("xtdb/invalid-param-names", "SQL argument fields must follow positional order"));
         }
     }
-    let types = schema.fields().iter().map(|field| from_field(field)).collect::<Result<_>>()?;
-    let mut arguments = SqlArguments::new(types, Vec::new(), memory)?;
-    for page in stream.pages() {
+    let mut pages = stream.pages().iter();
+    let Some(first) = pages.next() else {
+        let types = schema.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?;
+        return SqlArguments::new(types, Vec::new(), memory);
+    };
+    if first.batch().schema() != schema { return Err(invalid("SQL argument stream changes schema")); }
+    let mut arguments = SqlArguments::from_arrow(first.clone(), memory)?;
+    for page in pages {
         if page.batch().schema() != schema { return Err(invalid("SQL argument stream changes schema")); }
-        let rows = (0..page.batch().num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| read_value(field, page.batch().column(column).as_ref(), row)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
-        arguments.append_page(SqlArguments::new(arguments.types().to_vec(), rows, memory)?)?;
+        arguments.append_page(SqlArguments::from_arrow(page.clone(), memory)?)?;
     }
     Ok(arguments)
 }
@@ -632,6 +658,45 @@ mod tests {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         SourceTransaction::decode(&message, &source.memory).unwrap()
+    }
+
+    #[test]
+    fn arrow_sql_arguments_keep_their_buffers_and_replay_with_positional_fields() {
+        let memory = budget();
+        let schema = Arc::new(Schema::new(vec![Field::new("client_name", DataType::UInt64, true)]));
+        let arguments = |values| {
+            let column = Arc::new(arrow_array::UInt64Array::from(values));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap();
+            let data = batch.column(0).to_data();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let arguments = SqlArguments::from_arrow(batch, &memory).unwrap();
+            let pages = arguments.uniform_arrow_pages().unwrap();
+            assert_eq!(pages[0].column(0).to_data().buffers()[0].as_ptr(), data.buffers()[0].as_ptr());
+            arguments
+        };
+        let mut arguments = arguments(vec![Some(u64::MAX), None]);
+        let other = RecordBatch::try_new(schema, vec![Arc::new(arrow_array::UInt64Array::from(vec![5]))]).unwrap();
+        arguments.append(SqlArguments::from_arrow(OwnedBatch::new(other, &memory).unwrap(), &memory).unwrap()).unwrap();
+        let source = SourceTransaction::new(
+            vec![TxOp::Sql { sql: "UPDATE docs SET v = ?".into(), args: Some(arguments) }],
+            SubmitOptions::default(),
+            &memory,
+        ).unwrap();
+
+        let replayed = roundtrip(&source);
+
+        let [Operation::Public(TxOp::Sql { args: Some(arguments), .. })] = replayed.operations.as_slice() else {
+            panic!("Expected SQL arguments");
+        };
+        let pages = arguments.uniform_arrow_pages().unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].schema_ref().field(0).name(), "?_0");
+        assert_eq!(pages[0].schema_ref().field(0).data_type(), &DataType::UInt64);
+        let rows: Vec<_> = arguments.indexed_rows().map(|row| {
+            let (index, values) = row.unwrap();
+            (index, values[0].clone())
+        }).collect();
+        assert_eq!(rows, [(0, Value::U64(u64::MAX)), (1, Value::Null), (2, Value::U64(5))]);
     }
 
     #[test]
@@ -823,7 +888,7 @@ mod tests {
             let decoded = roundtrip(&source);
             let Operation::Public(TxOp::Sql { args: Some(args), .. }) = &decoded.operations[0] else { panic!("Expected SQL arguments") };
             assert_eq!(args.types(), &[value.logical_type()]);
-            assert_eq!(args.rows().collect::<Vec<_>>(), vec![std::slice::from_ref(&value)]);
+            assert_eq!(args.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), vec![std::slice::from_ref(&value)]);
         }
     }
 

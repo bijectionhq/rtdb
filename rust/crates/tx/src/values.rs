@@ -1,8 +1,8 @@
 use rtdb_types::StructFields;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
 use arrow_schema::{DataType, Fields, Schema};
 use rtdb_columnar::{ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
@@ -263,7 +263,58 @@ impl UserMetadata {
 }
 
 #[derive(Clone, Debug)]
-struct ArgumentChunk { rows: Vec<Vec<Value>>, _reservation: Arc<MemoryReservation> }
+enum ArgumentChunk {
+    Rows { rows: Vec<Vec<Value>>, _reservation: Arc<MemoryReservation> },
+    Arrow { batch: OwnedBatch, types: Arc<Vec<LogicalType>>, _reservation: Arc<MemoryReservation> },
+}
+
+impl ArgumentChunk {
+    fn len(&self) -> usize {
+        match self {
+            Self::Rows { rows, .. } => rows.len(),
+            Self::Arrow { batch, .. } => batch.batch().num_rows(),
+        }
+    }
+
+    fn row(&self, index: usize, memory: &Arc<MemoryBudget>) -> Result<ArgumentRow<'_>> {
+        match self {
+            Self::Rows { rows, .. } => Ok(ArgumentRow::borrowed(&rows[index])),
+            Self::Arrow { batch, types, .. } => {
+                let batch = batch.batch();
+                let schema = batch.schema_ref();
+                let columns = || schema.fields().iter().zip(batch.columns());
+                let base = types.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
+                let bound = columns().try_fold(base, |bytes, (field, column)| {
+                    bytes.checked_add(rtdb_columnar::estimate_read_value_bytes(field, column.as_ref(), index)?)
+                        .ok_or_else(overflow)
+                })?;
+                let reservation = memory.reserve(bound)?;
+                let mut values = types.iter().zip(columns()).map(|(ty, (field, column))| {
+                    rtdb_columnar::read_value_as(ty, field, column.as_ref(), index)
+                }).collect::<Result<Vec<_>>>()?;
+                values.iter_mut().for_each(Value::admit_object_dates);
+                Ok(ArgumentRow { values: Cow::Owned(values), _reservation: Some(reservation) })
+            }
+        }
+    }
+}
+
+pub struct ArgumentRow<'a> {
+    values: Cow<'a, [Value]>,
+    _reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl<'a> ArgumentRow<'a> {
+    pub(crate) fn borrowed(values: &'a [Value]) -> Self {
+        Self { values: Cow::Borrowed(values), _reservation: None }
+    }
+}
+
+impl Deref for ArgumentRow<'_> {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] { &self.values }
+}
 
 #[derive(Clone, Debug)]
 pub struct SqlArguments {
@@ -286,8 +337,16 @@ impl SqlArguments {
         }
         let schema_reservation = memory.reserve(schema_bytes(&types)?)?;
         let row_count = rows.len();
-        let chunk = Arc::new(ArgumentChunk { rows, _reservation: memory.reserve(bytes.checked_add(256).ok_or_else(overflow)?)? });
+        let chunk = Arc::new(ArgumentChunk::Rows { rows, _reservation: memory.reserve(bytes.checked_add(256).ok_or_else(overflow)?)? });
         Ok(Self { types: Arc::new(types), chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
+    }
+    pub fn from_arrow(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let schema = batch.batch().schema();
+        let schema_reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let types = Arc::new(schema.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?);
+        let row_count = batch.batch().num_rows();
+        let chunk = Arc::new(ArgumentChunk::Arrow { batch, types: Arc::clone(&types), _reservation: Arc::clone(&schema_reservation) });
+        Ok(Self { types, chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
     }
     pub fn from_rows(rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = rows.first().map_or(0, Vec::len);
@@ -302,8 +361,33 @@ impl SqlArguments {
     /// Opened-vector field types for query or DML binding; source payload fields remain available through `types`.
     pub fn execution_types(&self) -> impl Iterator<Item = LogicalType> + '_ { self.types.iter().map(rtdb_columnar::execution_type) }
     pub fn row_count(&self) -> usize { self.row_count }
-    pub fn rows(&self) -> impl Iterator<Item = &[Value]> { self.chunks.iter().flat_map(|(_, chunk)| chunk.rows.iter().map(Vec::as_slice)) }
-    pub(crate) fn indexed_rows(&self) -> impl Iterator<Item = (usize, &[Value])> { self.chunks.iter().flat_map(|(start, chunk)| chunk.rows.iter().enumerate().map(move |(index, row)| (*start + index, row.as_slice()))) }
+    pub fn rows(&self) -> impl Iterator<Item = Result<ArgumentRow<'_>>> {
+        self.indexed_rows().map(|row| row.map(|(_, values)| values))
+    }
+
+    pub(crate) fn indexed_rows(&self) -> impl Iterator<Item = Result<(usize, ArgumentRow<'_>)>> {
+        self.chunks.iter().flat_map(move |(start, chunk)| {
+            (0..chunk.len()).map(move |index| chunk.row(index, &self.memory).map(|row| (start + index, row)))
+        })
+    }
+
+    pub(crate) fn uniform_arrow_pages(&self) -> Option<Vec<&RecordBatch>> {
+        let pages = self.chunks.iter().map(|(_, chunk)| match chunk.as_ref() {
+            ArgumentChunk::Arrow { batch, .. } => Some(batch.batch()),
+            ArgumentChunk::Rows { .. } => None,
+        }).collect::<Option<Vec<_>>>()?;
+        let first = pages.first()?.schema_ref();
+        pages.iter().all(|page| page.schema_ref() == first).then_some(pages)
+    }
+
+    pub(crate) fn value_bytes(&self) -> Result<usize> {
+        self.chunks.iter().try_fold(0usize, |bytes, (_, chunk)| match chunk.as_ref() {
+            ArgumentChunk::Arrow { batch, .. } => bytes.checked_add(batch.batch().get_array_memory_size()).ok_or_else(overflow),
+            ArgumentChunk::Rows { rows, .. } => rows.iter().flatten().try_fold(bytes, |bytes, value| {
+                bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow)
+            }),
+        })
+    }
     /// Appends argument rows in order and widens each positional column's type.
     pub fn append(&mut self, other: Self) -> Result<()> {
         self.append_rows(other, self.row_count)
@@ -428,9 +512,9 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let mut args = SqlArguments::from_rows(vec![vec![Value::I64(1)], vec![Value::I64(2)]], &memory).unwrap();
         args.append_page(SqlArguments::from_rows(vec![vec![Value::I64(3)]], &memory).unwrap()).unwrap();
-        assert_eq!(args.indexed_rows().map(|(index, _)| index).collect::<Vec<_>>(), [0, 1, 0]);
+        assert_eq!(args.indexed_rows().map(|row| row.unwrap().0).collect::<Vec<_>>(), [0, 1, 0]);
         let mut coalesced = SqlArguments::from_rows(vec![vec![Value::I64(1)]], &memory).unwrap();
         coalesced.append(SqlArguments::from_rows(vec![vec![Value::I64(2)]], &memory).unwrap()).unwrap();
-        assert_eq!(coalesced.indexed_rows().map(|(index, _)| index).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(coalesced.indexed_rows().map(|row| row.unwrap().0).collect::<Vec<_>>(), [0, 1]);
     }
 }
