@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -6,6 +8,12 @@ use bytes::Bytes;
 use object_store::path::Path;
 use rtdb_storage::{Error, ObjectKey, remote::PublicationUploads};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
+
+fn collect_child(parent: &str, key: Option<&str>, children: &mut BTreeSet<String>) {
+    if let Some((child, _)) = key.and_then(|key| key.strip_prefix(parent)).and_then(|relative| relative.split_once('/')) {
+        children.insert(child.to_owned());
+    }
+}
 
 pub struct VersionedInventory {
     client: Client,
@@ -41,6 +49,51 @@ impl VersionedInventory {
         let prefix = self.prefix(deployment);
         if !self.multipart_batch(&prefix).await?.is_empty() { return Ok(false); }
         Ok(self.version_batch(&prefix).await?.is_empty())
+    }
+
+    /// Finds immediate directories even when every object under them is
+    /// represented only by a noncurrent version, a tombstone or an upload.
+    pub async fn child_directories(&self, parent: &ObjectKey) -> Result<BTreeSet<String>> {
+        let prefix = self.prefix(parent);
+        let mut directories = BTreeSet::new();
+        let mut marker = (None, None);
+        loop {
+            let page = self.client.list_object_versions().bucket(&self.bucket).prefix(&prefix)
+                .delimiter("/").max_keys(1000).set_key_marker(marker.0.clone())
+                .set_version_id_marker(marker.1.clone())
+                .set_request_payer(self.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Listing version directories failed: {error}")))?;
+            for entry in page.common_prefixes() {
+                collect_child(&prefix, entry.prefix(), &mut directories);
+            }
+            if page.is_truncated() != Some(true) { break; }
+            let next = (page.next_key_marker().map(str::to_owned), page.next_version_id_marker().map(str::to_owned));
+            if next.0.as_deref().is_none_or(str::is_empty) || next == marker {
+                return Err(unavailable("S3 returned a non-advancing version directory listing"));
+            }
+            marker = next;
+        }
+        let mut marker = (None, None);
+        loop {
+            let page = self.client.list_multipart_uploads().bucket(&self.bucket).max_uploads(1000)
+                .set_prefix(self.scope_multipart_listing.then(|| prefix.clone()))
+                .set_delimiter(self.scope_multipart_listing.then(|| "/".to_owned()))
+                .set_key_marker(marker.0.clone()).set_upload_id_marker(marker.1.clone())
+                .set_request_payer(self.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Listing multipart directories failed: {error}")))?;
+            for entry in page.common_prefixes() {
+                collect_child(&prefix, entry.prefix(), &mut directories);
+            }
+            for upload in page.uploads() {
+                collect_child(&prefix, upload.key(), &mut directories);
+            }
+            if page.is_truncated() != Some(true) { return Ok(directories); }
+            let next = (page.next_key_marker().map(str::to_owned), page.next_upload_id_marker().map(str::to_owned));
+            if next.0.as_deref().is_none_or(str::is_empty) || next == marker {
+                return Err(unavailable("S3 returned a non-advancing multipart directory listing"));
+            }
+            marker = next;
+        }
     }
 
     fn prefix(&self, deployment: &ObjectKey) -> String {
@@ -236,11 +289,14 @@ mod tests {
         assert_eq!(retained.body.collect().await.unwrap().into_bytes().as_ref(), b"sealed");
         inventory.purge(&ObjectKey::new("managed").unwrap()).await.unwrap();
 
-        let deployment = ObjectKey::new("deployment").unwrap();
-        let neighbor = ObjectKey::new("deployment-neighbor").unwrap();
+        let index = ObjectKey::new("index/generations").unwrap();
+        let deployment = ObjectKey::new(format!("{index}/old")).unwrap();
+        let neighbor = ObjectKey::new(format!("{index}/old-neighbor")).unwrap();
+        let pending_only = ObjectKey::new(format!("{index}/upload-without-version")).unwrap();
         let physical = |deployment: &ObjectKey| Path::from(format!("{}/{deployment}/data/~file", inventory.root)).to_string();
         let target = physical(&deployment);
         let sibling = physical(&neighbor);
+        let unpublished = physical(&pending_only);
         for (key, payload) in [(&target, b"first".as_slice()), (&target, b"second"), (&sibling, b"kept")] {
             client.put_object().bucket(&bucket).key(key).body(ByteStream::from_static(payload)).send().await.unwrap();
         }
@@ -249,7 +305,7 @@ mod tests {
         assert_eq!(before.versions().len(), 2);
         assert_eq!(before.delete_markers().len(), 1);
         let mut pending = Vec::new();
-        for key in [&target, &sibling] {
+        for key in [&target, &sibling, &unpublished] {
             let upload = client.create_multipart_upload().bucket(&bucket).key(key).send().await.unwrap();
             let id = upload.upload_id().unwrap();
             client.upload_part().bucket(&bucket).key(key).upload_id(id).part_number(1)
@@ -257,6 +313,9 @@ mod tests {
             pending.push(id.to_owned());
         }
 
+        assert_eq!(inventory.child_directories(&index).await.unwrap(), BTreeSet::from([
+            "old".into(), "old-neighbor".into(), "upload-without-version".into(),
+        ]));
         assert!(!inventory.is_empty(&deployment).await.unwrap());
         inventory.purge(&deployment).await.unwrap();
         inventory.purge(&deployment).await.unwrap();
@@ -266,13 +325,17 @@ mod tests {
         assert!(after.versions().is_empty());
         assert!(after.delete_markers().is_empty());
         let uploads = client.list_multipart_uploads().bucket(&bucket).send().await.unwrap();
-        assert_eq!(uploads.uploads().iter().map(|upload| upload.upload_id().unwrap()).collect::<Vec<_>>(), [pending[1].as_str()]);
+        assert_eq!(uploads.uploads().iter().map(|upload| upload.upload_id().unwrap()).collect::<Vec<_>>(), [pending[1].as_str(), pending[2].as_str()]);
+        assert_eq!(inventory.child_directories(&index).await.unwrap(), BTreeSet::from([
+            "old-neighbor".into(), "upload-without-version".into(),
+        ]));
         let parts = client.list_parts().bucket(&bucket).key(&target).upload_id(&pending[0]).send().await.unwrap_err();
         assert_eq!(parts.as_service_error().and_then(|error| error.code()), Some("NoSuchUpload"));
         let neighbor_body = client.get_object().bucket(&bucket).key(&sibling).send().await.unwrap().body.collect().await.unwrap();
         assert_eq!(neighbor_body.into_bytes().as_ref(), b"kept");
 
         inventory.purge(&neighbor).await.unwrap();
+        inventory.purge(&pending_only).await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     }
 }

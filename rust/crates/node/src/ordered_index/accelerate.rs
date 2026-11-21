@@ -546,8 +546,11 @@ async fn use_index(
     let directory = definition.directory()?;
     let through = source_frontier(request.snapshot, &definition.table);
     let checkpoint = checkpoint::latest(request.storage, &directory, request.memory, through).await?;
+    if checkpoint.is_none() && through >= 0 {
+        return Ok(None);
+    }
     let scope = checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.scope);
-    let tree = Tree::new(request.storage, &directory, request.memory, scope);
+    let tree = Tree::new(request.storage, &directory, request.memory, scope).await?;
     let system_at = request.bounds.system_time.lower();
     let Some(root) = read_root(
         &tree,

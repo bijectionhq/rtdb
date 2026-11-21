@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use prost_types::Any;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, HostedTask, StoragePublication, StorageRegion, now_ms};
 use rtdb_node::RemoteStorageFactory;
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject, remote::PublicationJournal};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::cipher::{Cipher, SEALED_OVERHEAD as OVERHEAD};
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
+use crate::ordered_index_storage::{self, HostedIndexPages};
 
 /// The protobuf type name the cell's storage factory is registered under.
 pub const CELL_STORAGE_TYPE: &str = "rtdb.multi.CellStorage";
@@ -180,7 +181,7 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
-        let (record, region, release) = self.admit_region(&config, io).await?;
+        let (record, region, owner, release) = self.admit_region(&config, io).await?;
         let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
             crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
         } else {
@@ -213,7 +214,12 @@ impl RemoteStorageFactory for CellStoreFactory {
             _release: Some(release),
         });
         check_root(root.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
-        Ok(open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?)
+        let pages = HostedIndexPages::new(
+            self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
+        );
+        let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?;
+        Arc::get_mut(&mut opened).expect("the new store has one owner").index_pages = Some(pages);
+        Ok(opened)
     }
 
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<std::borrow::Cow<'a, [u8]>> {
@@ -255,7 +261,7 @@ impl CellStoreFactory {
         &self,
         config: &CellStoreConfig,
         parent: Arc<IoRegion>,
-    ) -> Result<(DeploymentRecord, Arc<IoRegion>, oneshot::Sender<()>)> {
+    ) -> Result<(DeploymentRecord, Arc<IoRegion>, Uuid, oneshot::Sender<()>)> {
         let directory = self.directory.clone();
         let keys = self.keys.clone();
         let config = config.clone();
@@ -297,9 +303,9 @@ impl CellStoreFactory {
                     .filter(|repair| repair.completed_at_ms.is_some())
                     .map(|repair| repair.operation);
                 record.storage_regions.insert(id, if local {
-                    StorageRegion::Local { archive: repair }
+                    StorageRegion::Local { archive: repair, tracks_ordered_index_pages: true }
                 } else {
-                    StorageRegion::Remote { archive: None, repair_archive: repair, owner: hosted_task.clone(),
+                    StorageRegion::Remote { tracks_ordered_index_pages: true, archive: None, repair_archive: repair, owner: hosted_task.clone(),
                         closed: false, publications: BTreeMap::new() }
                 });
                 Ok(())
@@ -335,12 +341,12 @@ impl CellStoreFactory {
             "rtdb.multi/storage-admission",
             "The serving storage region could not be admitted",
         ))??;
-        Ok((record, region, release))
+        Ok((record, region, id, release))
     }
 }
 
 pub(crate) fn remote_storage_region(archive: Option<Uuid>, owner: Option<HostedTask>) -> StorageRegion {
-    StorageRegion::Remote { archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
+    StorageRegion::Remote { tracks_ordered_index_pages: true, archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
 }
 
 pub(crate) fn track_publications(
@@ -421,6 +427,9 @@ impl PublicationJournal for DirectoryPublications {
                 crate::archive::require_capture_open(record, *capture)?;
             }
             require_publication_key(record, *archive, key)?;
+            if matches!(self.owner, PublicationOwner::Serving) && archive.is_none() {
+                ordered_index_storage::require_page_publication(record, self.region, key)?;
+            }
             let Some(StorageRegion::Remote { publications, .. }) = record.storage_regions.get_mut(&self.region) else {
                 unreachable!("the publication region was just checked");
             };
@@ -725,6 +734,7 @@ fn plain(object: StoredObject) -> StoredObject { StoredObject { size: object.siz
 
 #[async_trait]
 impl ObjectStore for EncryptingStore {
+    fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { self.inner.index_page_lifecycle() }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?) }
@@ -760,6 +770,7 @@ pub struct GarbageRecord { pub key: String, pub released_at_ms: i64 }
 /// Only a listing needs to know what has been released, so the released set is read on the first one, not on open.
 pub struct GarbageStore {
     inner: Arc<dyn ObjectStore>,
+    index_pages: Option<HostedIndexPages>,
     loaded_releases: tokio::sync::OnceCell<()>,
     released: Mutex<BTreeSet<ObjectKey>>,
     clock: Clock,
@@ -768,7 +779,7 @@ pub struct GarbageStore {
 impl GarbageStore {
     pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> { Self::open_with_clock(inner, wall_clock()).await }
 
-    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeSet::new()), clock })) }
+    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, index_pages: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeSet::new()), clock })) }
 
     async fn load_releases(&self) -> rtdb_storage::Result<()> {
         self.loaded_releases.get_or_try_init(|| async {
@@ -787,6 +798,9 @@ impl GarbageStore {
 
 #[async_trait]
 impl ObjectStore for GarbageStore {
+    fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
+        self.index_pages.as_ref().map(|pages| pages as &dyn IndexPageLifecycle)
+    }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
@@ -939,13 +953,34 @@ pub async fn run_reaper(
                 if let Ok(deployments) = directory.deployments().await {
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
-                            if !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. })) {
+                            if record.ordered_indexes.is_empty()
+                                && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. }))
+                            {
                                 continue;
                             }
                             if cancellation.is_cancelled() { return; }
                             if let Err(error) = reconcile_storage_regions(directory.as_ref(), &storage, keys, record).await {
                                 eprintln!("Storage publications for {} are pending: {}", record.id, error.code);
                             }
+                        }
+                    }
+                    for record in &deployments {
+                        if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+                            || record.ordered_indexes.is_empty()
+                        {
+                            continue;
+                        }
+                        // Read again after process-death reconciliation confirmed its I/O drained.
+                        let Some(Ok(Some(current))) = cancellation.run_until_cancelled(directory.deployment(&record.id)).await else {
+                            if cancellation.is_cancelled() { return; }
+                            continue;
+                        };
+                        match cancellation.run_until_cancelled(
+                            ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &current)
+                        ).await {
+                            None => return,
+                            Some(Ok(())) => {}
+                            Some(Err(error)) => eprintln!("Ordered index pages for {} are retained: {}", record.id, error.code),
                         }
                     }
                     let now = wall_clock()();
@@ -1342,7 +1377,7 @@ mod tests {
             compactor: false,
             snapshot_block: None,
         };
-        let (admitted, region, attachment) = factory.admit_region(&config, IoRegion::new()).await.unwrap();
+        let (admitted, region, _, attachment) = factory.admit_region(&config, IoRegion::new()).await.unwrap();
         assert_eq!(admitted.storage_regions.len(), 1);
 
         let (entered, active) = oneshot::channel();
@@ -1390,6 +1425,7 @@ mod tests {
         journal.admit(&object, attempt, "upload").await.unwrap();
         let before = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(before.storage_regions[&region], StorageRegion::Remote {
+            tracks_ordered_index_pages: true,
             archive: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
@@ -1397,6 +1433,7 @@ mod tests {
         assert!(journal.admit(&object, Uuid::new_v4(), "upload").await.is_err());
         let retained = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(retained.storage_regions[&region], StorageRegion::Remote {
+            tracks_ordered_index_pages: true,
             archive: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
     }
@@ -1412,7 +1449,7 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
-        record.storage_regions.insert(region, StorageRegion::Local { archive: None });
+        record.storage_regions.insert(region, StorageRegion::Local { archive: None, tracks_ordered_index_pages: true });
         let record = directory.create_deployment(record).await.unwrap();
         crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
 

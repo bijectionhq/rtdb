@@ -2,7 +2,7 @@ use crate::{Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -80,8 +80,26 @@ impl RetainedBytes {
     pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
 }
 
+/// A derived ordered index's published page namespace.
+#[derive(Clone, Copy)]
+pub struct IndexPageScope<'a> {
+    pub index: &'a ObjectKey,
+    pub generation: u64,
+}
+
+/// The hosted store's authority over indexed page copies and their retirement.
+/// A retained permit covers decoded pages and provider requests spawned while
+/// holding it. The retirement operation records the obligation before returning.
+#[async_trait]
+pub trait IndexPageLifecycle: Send + Sync {
+    async fn retain(&self, scope: IndexPageScope<'_>) -> Result<Arc<dyn Send + Sync>>;
+    async fn retire_before(&self, scope: IndexPageScope<'_>) -> Result<()>;
+    async fn retire_dropped(&self, active: &BTreeSet<ObjectKey>, through: i64) -> Result<()>;
+}
+
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.

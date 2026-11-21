@@ -254,6 +254,9 @@ pub struct DeploymentRecord {
     /// drains its I/O and any ambiguous publications are confirmed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub storage_regions: BTreeMap<uuid::Uuid, StorageRegion>,
+    /// Page custody for ordered indexes, keyed by their physical index prefix.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ordered_indexes: BTreeMap<String, OrderedIndexStorage>,
     /// How many ranks of the affinity order may serve reads.
     pub read_width: u32,
     pub activation_crashes: u32,
@@ -363,8 +366,14 @@ impl HostedTask {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum StorageRegion {
-    Local { archive: Option<uuid::Uuid> },
+    Local {
+        archive: Option<uuid::Uuid>,
+        #[serde(default)]
+        tracks_ordered_index_pages: bool,
+    },
     Remote {
+        #[serde(default)]
+        tracks_ordered_index_pages: bool,
         archive: Option<uuid::Uuid>,
         /// Serving I/O can read its repair archive while writing its own prefix.
         repair_archive: Option<uuid::Uuid>,
@@ -375,6 +384,42 @@ pub enum StorageRegion {
         /// Written before a conditional provider mutation is submitted.
         publications: BTreeMap<uuid::Uuid, StoragePublication>,
     },
+}
+
+impl StorageRegion {
+    pub fn tracks_ordered_index_pages(&self) -> bool {
+        match self {
+            Self::Local { tracks_ordered_index_pages, .. } |
+            Self::Remote { tracks_ordered_index_pages, .. } => *tracks_ordered_index_pages,
+        }
+    }
+}
+
+/// Persistent fence and inventory of a derived index's physical generations.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderedIndexStorage {
+    pub oldest_generation: u64,
+    pub dropped: bool,
+    pub legacy_pages: LegacyIndexPages,
+    /// Lowest generation beyond the most recent discovery of closed prefixes.
+    #[serde(default)]
+    pub audited_before: u64,
+    /// Each generation maps a retained permit to its serving storage region.
+    pub generations: BTreeMap<u64, BTreeMap<uuid::Uuid, uuid::Uuid>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegacyIndexPages {
+    #[default]
+    Retained,
+    Retiring,
+    Removed,
+}
+
+impl OrderedIndexStorage {
+    pub fn admits(&self, generation: u64) -> bool {
+        !self.dropped && generation >= self.oldest_generation
+    }
 }
 
 /// The original archive's release fence, including IDs cancelled before copy.
@@ -553,7 +598,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), ordered_indexes: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
             cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(),
             checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }

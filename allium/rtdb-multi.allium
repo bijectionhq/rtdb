@@ -484,7 +484,7 @@ contract ObjectStorage {
 
     @invariant OnlyTheReaperDeletes
         -- No node, gateway or worker holds a credential that can delete.
-        -- The reaper deletes, and only objects the reachability rule (ReapUnreachable) has found unreachable for reaper_grace.
+        -- The reaper deletes objects after a reachability release or a completed ordered-page retirement fence.
 
     @invariant VisibilityIsByReference
         -- An object has effect only once a committed log record or a published manifest references it.
@@ -1440,6 +1440,24 @@ rule ReapUnreachable {
     ensures:
         ObjectStorage.delete_all_versions(candidate.object.key)
         candidate.deleted = true
+}
+
+rule RetireOrderedIndexPages {
+    -- An independently compacted index publishes its scrubbed replacement before closing earlier page scopes.
+    -- Drop closes the named index definition. A new definition has its own physical name.
+    -- Serving replicas register a scope before retaining any decoded page or starting provider I/O.
+    -- Each provider upload records its exact upload ID in the same directory authority that closes the scope.
+    -- Closure ends new replica registrations and upload admissions. Registered replicas stop taking
+    -- new work after seeing closure and release their permit only after their retained copies and I/O drain.
+    when: OrderedPageScopeClosed(scope)
+
+    requires:
+        EveryServingPermitReleasedOrOwnerStopped(scope)
+        and EveryAdmittedProviderUploadSettled(scope)
+
+    ensures:
+        EveryObjectVersionAndUploadRemoved(scope)
+        EmptyProviderInventoryRecorded(scope)
 }
 
 rule ScrubOrphans {

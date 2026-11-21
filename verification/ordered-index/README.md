@@ -131,16 +131,21 @@ It permits a provider upload admitted before closure to finish after closure.
 Erasure acknowledgement requires provider settlement and release of reader copies.
 A replacement generation carries replayed content only after the model's scrub condition is satisfied.
 
-With two publishers and two readers, TLC explored all 605 reachable states with the safety invariants holding.
-Setting `SettleUploads` to `FALSE` allowed a retired object to reappear after acknowledgement.
-Setting `DrainReaders` to `FALSE` allowed acknowledgement while an original reader still owned a copy.
-Setting `ScrubReplay` to `FALSE` allowed the replacement generation to carry erased content.
-`ScopeRetirementLiveness.cfg` checked eventual acknowledgement over the same 605 states under weak fairness for closing, settlement, reader release, deletion, and acknowledgement.
-Removing either upload settlement fairness or reader release fairness produced a liveness counterexample.
+TLC 2026.11.19.180144 explored all 540 reachable states with two publishers
+and two replica permits. The model allows an upload admitted before closure
+to finish afterward and requires the scrubbed replacement to be published
+before closing the earlier scope.
 
-The hosted implementation still needs a generation authority shared by read admission, the provider publication journal, and erasure completion.
-The authority must close the generation before inspecting the journal. It must settle each admitted upload by completion or confirmed abort, then verify deletion at the provider.
-Each replica must drain the old generation's operations and decoded pages before releasing its reader admission.
+| Control | First invariant violation |
+| --- | --- |
+| `SettleUploads = FALSE` | A retired object reappeared after acknowledgement. |
+| `DrainReaders = FALSE` | A retired scope was acknowledged while a replica still held a page. |
+| `ScrubReplay = FALSE` | The replacement scope carried erased content. |
+
+`ScopeRetirementLiveness.cfg` explored the same 540 states. After the
+replacement is published, acknowledgement eventually occurs under weak
+fairness for closing, settlement, reader release, deletion, and acknowledgement.
+
 Replay on consolidated RTDB discovers erase cuts from adopted L0 files before
 writing any replacement page. `Recovery.lean` checks
 `scrubbed_replay_preserves_points`: for one IID, filtering out strictly
@@ -156,8 +161,27 @@ scopes alone. Four ordered-index unit tests and eight native regressions
 passed on the consolidated engine. The regressions cover exact repair when
 an old dirty address cannot be reused, a same-revision erase and reinsertion,
 and preservation of an unpublished later scope. The PgWire declaration and
-keyset regression also passed. The hosted directory still needs to fence old
-admissions and record physical provider completion.
+keyset regression also passed.
+
+The hosted directory records replica permits and provider publications before
+page I/O. A watched replica shares its permit across concurrent operations
+and releases it after its decoded pages and provider I/O drain. The directory
+rejects new upload admissions immediately at closure. The reaper discovers old
+scope prefixes through the version and multipart inventories, settles exact
+journaled uploads, and purges all versions before removing the retirement
+obligation. The local regression retained a generation after a read caller
+was cancelled, then reclaimed it after I/O completed. It also exercised a
+preexisting unregistered prefix and an outstanding storage region from
+before index permits were tracked.
+
+The hosted PgWire regression exercised erase, replica permits, the production
+reaper, and the retained page against a version-enabled MinIO instance.
+A separate S3 runtime regression checked noncurrent versions, a delete marker,
+a prefix containing only a multipart upload, exact upload abort, and isolation
+from a neighboring generation. These tests cover the local provider
+implementation and the selected failure schedules. The model assumes the
+provider's confirmed abort and inventory contracts. Primary L0 files are a
+separate custody boundary.
 
 ## Execution
 
