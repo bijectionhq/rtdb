@@ -74,7 +74,9 @@ final class LeafMerge {
           @ loop_writes leftIndex, rightIndex, next, merged[*], fromLeft[*], fromRight[*], origins[*], order.scratch;
           @ decreases merged.length - next;
           @*/
+        //@ split;
         while (next < merged.length) {
+            //@ split;
             if (rightIndex == right.length || leftIndex < left.length && order.compare(left[leftIndex], right[rightIndex]) < 0) {
                 //@ assert rightIndex == right.length || order.rank(left[leftIndex]) < order.rank(right[rightIndex]);
                 //@ assert (\forall int j; rightIndex <= j && j < right.length; order.rank(left[leftIndex]) <= order.rank(right[j]));
