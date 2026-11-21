@@ -1,7 +1,7 @@
 //! A deployment's object store as a node sees it (contract `ObjectStorage`): fenced by the holder's epoch, encrypted under the deployment's key, and unable to delete.
 //!
 //! - `FencedStore` refuses every write once the directory has moved the deployment past the epoch the store was opened at (`ZombiesCannotDamageStorage`).
-//! - `EncryptingStore` seals every object with AES-256-GCM under the deployment's key, bound to the object's key, so destroying the key makes every copy unreadable.
+//! - `EncryptingStore` seals objects with AES-256-GCM under the deployment's key, bound to the object name.
 //! - `GarbageStore` turns a delete into a garbage record; only the reaper erases an object, once it has been garbage for the grace period (`OnlyTheReaperDeletes`, `ReapUnreachable`).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,10 +57,23 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
+        let record = self.directory.deployment(&config.deployment).await?.ok_or_else(|| {
+            Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {}", config.deployment))
+        })?;
+        if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+            || record.storage_prefix() != config.prefix
+            || config.writer_epoch.is_some_and(|epoch| epoch != record.epoch)
+        {
+            return Err(Anomaly::incorrect("rtdb.multi/storage-authority", format!("Installation {} no longer authorizes this store", config.deployment)));
+        }
         let bucket = config.storage.bucket(io).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        claim_root(&crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()), &config.deployment).await?;
-        let discovery = match self.checkpoint(&config).await? { Some(block) => crate::packing::PackDiscovery::From(block), None => crate::packing::PackDiscovery::List };
+        confirm_root(
+            &crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()),
+            &config.deployment,
+            config.writer_epoch.is_some(),
+        ).await?;
+        let discovery = match record.checkpoint { Some(checkpoint) => crate::packing::PackDiscovery::From(checkpoint.block), None => crate::packing::PackDiscovery::List };
         Ok(open_deployment_store(bucket, &store, discovery, wall_clock()).await?)
     }
 
@@ -72,14 +85,15 @@ impl RemoteStorageFactory for CellStoreFactory {
         Ok(match self.checkpoint(&config).await? { Some(block) => rtdb_replication::BlockDiscovery::From(rtdb_types::BlockIndex(block)), None => rtdb_replication::BlockDiscovery::List })
     }
 
-    /// Encryption sits above the node's disk cache, which therefore holds ciphertext only: destroying the key leaves no readable copy on any node.
+    /// Encryption sits above the node's disk cache, which therefore holds ciphertext.
     async fn wrap_cached(&self, configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let encrypted = EncryptingStore::new(cached, &self.keys.key(&config.deployment)?)?;
+        let watch = || rtdb_directory::watch_deployment(Arc::clone(&self.directory), config.deployment.clone(), self.fence_interval);
         let fence = match (config.writer_epoch, config.compactor) {
-            (Some(epoch), _) => Fence::Writer { epoch, record: rtdb_directory::watch_deployment(Arc::clone(&self.directory), config.deployment.clone(), self.fence_interval) },
-            (None, true) => Fence::Compactor,
+            (Some(epoch), _) => Fence::Writer { epoch, record: watch() },
+            (None, true) => Fence::Compactor { record: watch() },
             (None, false) => Fence::Reader,
         };
         Ok(Arc::new(FencedStore { inner: Arc::new(encrypted), fence }))
@@ -95,7 +109,7 @@ impl CellStoreFactory {
 enum Fence {
     Writer { epoch: u64, record: watch::Receiver<Option<DeploymentRecord>> },
     /// May write a compaction output, whose name its job fixes and whose effect waits on the holder's adoption.
-    Compactor,
+    Compactor { record: watch::Receiver<Option<DeploymentRecord>> },
     Reader,
 }
 
@@ -139,8 +153,10 @@ impl FencedStore {
     fn check(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         match &self.fence {
             Fence::Reader => Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))),
-            Fence::Compactor if compaction_output(key.as_str()) => Ok(()),
-            Fence::Compactor => Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))),
+            Fence::Compactor { record } if compaction_output(key.as_str())
+                && record.borrow().as_ref().is_none_or(|current| current.lifecycle == Lifecycle::Live)
+                => Ok(()),
+            Fence::Compactor { .. } => Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))),
             Fence::Writer { epoch, record } => match &*record.borrow() {
                 Some(current) if current.epoch != *epoch || current.lifecycle != Lifecycle::Live && current.lifecycle != Lifecycle::Quarantined =>
                     Err(Error::Deposed { epoch: *epoch, promised: current.epoch }),
@@ -160,7 +176,7 @@ impl ObjectStore for FencedStore {
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.check(key)?; self.inner.put_file(key, source).await }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        if matches!(self.fence, Fence::Compactor) { return Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))); }
+        if matches!(self.fence, Fence::Compactor { .. }) { return Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))); }
         self.check(key)?;
         self.inner.delete(key).await
     }
@@ -261,12 +277,12 @@ impl ObjectStore for GarbageStore {
 
 pub const ROOT_MARKER: &str = "~root";
 
-/// Marks a store as one deployment's, and refuses to open it for any other: a misconfiguration pointing two deployments at one prefix fails at once instead of corrupting both.
-async fn claim_root(store: &dyn ObjectStore, deployment: &str) -> Result<()> {
+/// Only a writer can create the ownership marker for a new store.
+async fn confirm_root(store: &dyn ObjectStore, deployment: &str, writer: bool) -> Result<()> {
     let marker = ObjectKey::new(ROOT_MARKER)?;
     let owner = match store.get(&marker).await {
         Ok(owner) => owner,
-        Err(Error::MissingObject(_)) => match store.put(&marker, Bytes::copy_from_slice(deployment.as_bytes())).await {
+        Err(Error::MissingObject(_)) if writer => match store.put(&marker, Bytes::copy_from_slice(deployment.as_bytes())).await {
             Ok(()) => return Ok(()),
             Err(Error::ConflictingObject(_)) => store.get(&marker).await?,
             Err(error) => return Err(error.into()),
@@ -444,9 +460,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_root_marker_write_is_returned_to_activation() {
         let inner = PutFailure { inner: MemoryStore::default(), fail: true.into() };
-        assert_eq!(claim_root(&inner, "shop").await.unwrap_err().code, "rtdb.storage/task");
+        assert_eq!(confirm_root(&inner, "shop", true).await.unwrap_err().code, "rtdb.storage/task");
         assert!(matches!(inner.get(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
-        claim_root(&inner, "shop").await.unwrap();
+        confirm_root(&inner, "shop", true).await.unwrap();
     }
 
     #[tokio::test]
@@ -552,6 +568,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_compactors_store_refuses_outputs_after_observing_disposal() {
+        let mut installation = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let (current, record) = watch::channel(Some(installation.clone()));
+        let store = FencedStore {
+            inner: Arc::new(MemoryStore::default()),
+            fence: Fence::Compactor { record },
+        };
+        let output = key("tables/t/data/l01-first.arrow");
+        store.put(&output, Bytes::from_static(b"first")).await.unwrap();
+
+        installation.lifecycle = Lifecycle::Deleting;
+        current.send_replace(Some(installation));
+        let late_output = key("tables/t/data/l01-late.arrow");
+        assert!(matches!(
+            store.put(&late_output, Bytes::from_static(b"late")).await,
+            Err(Error::ReadOnlyLog(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn the_reaper_erases_a_pack_once_every_object_in_it_is_released() {
         let directory = tempfile::tempdir().unwrap();
         let record = DeploymentRecord::new("shop", "acme", vec![], 0);
@@ -621,8 +657,10 @@ mod tests {
     async fn a_store_refuses_a_deployment_it_was_not_created_for() {
         let directory = tempfile::tempdir().unwrap();
         let store = LocalStore::open(directory.path()).unwrap();
-        claim_root(&store, "one").await.unwrap();
-        claim_root(&store, "one").await.unwrap();
-        assert_eq!(claim_root(&store, "two").await.unwrap_err().code, "rtdb.multi/foreign-root");
+        assert!(confirm_root(&store, "one", false).await.is_err());
+        assert!(matches!(store.get(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
+        confirm_root(&store, "one", true).await.unwrap();
+        confirm_root(&store, "one", false).await.unwrap();
+        assert_eq!(confirm_root(&store, "two", true).await.unwrap_err().code, "rtdb.multi/foreign-root");
     }
 }
