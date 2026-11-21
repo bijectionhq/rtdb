@@ -2,16 +2,16 @@
 
 The reference answer resolves the original captured event stream at the requested system and valid points, filters its rows, sorts by the complete order key, and takes the requested page.
 The proof sources in this directory decompose that specification.
-The proof and regression sources are source-reviewed and await execution on an authorized runner.
+The checker results and the remaining production obligations appear below.
 
 | Property | Proof source | Production refinement still required |
 | --- | --- | --- |
-| Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` specifies exact coverage for a recursive dyadic decomposition. | Connect RTDB's newest-first temporal resolver, coalescing, and greedy bucket iterator to the model. |
-| Signed timestamps and unbounded end | `domain.rs` includes the production timestamp conversion directly in the Verus harness. | Connect the admitted query point and the bucket iterator's shift and alignment to the conversion contract. |
+| Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` proves exact coverage for a recursive dyadic decomposition and for any left-to-right tiling. | Connect RTDB's newest-first temporal resolver, coalescing, and greedy bucket iterator to the model. |
+| Signed timestamps, unbounded end and bucket lookup | `domain.rs` checks the production timestamp conversion and aligned bucket lookup. | Connect the greedy iterator's width selection and progression to the tiling contract. |
 | Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` states ordered merge, filtering before limit, and keyset continuation. | Connect Arrow values and SQL comparisons to the order and filters, and the tree cursor and heap to the ordered streams. |
 | Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | Establish that the canonical flushed inputs and live offset are an ordered substream of the exact capture. |
 | Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | Prove the sharing rule for `Tree::persist` and `store_roots`, and connect reader retention, leadership and immutable writes to the protocol. |
-| Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Connect revision-directory scrubbing and physical collection across object and node caches to the model. `ErasureCleanup.tla` models the durable obligation across publication, crash, advancement and repair under a single fail-stop owner. |
+| Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Connect revision-directory scrubbing and physical collection across object and node caches to the model. `ErasureCleanup.tla` models the durable cleanup obligation under a single fail-stop owner. `ErasureRelease.tla` checks the requirement for fenced writes and replica eviction. |
 | Bijection page witnesses | `OrderedRead.lean` states how agreement over the consumed ordered prefix preserves the page, including a lookahead when it is observable. | Implement and prove the Bijection-to-RTDB refinement for world ancestry, labels, custody and range witnesses. The current RTDB accelerator serves SQL. |
 
 `CheckpointCountOnly.cfg` should produce a wrong answer when a replay substitutes an event with a duplicate while preserving the count.
@@ -40,12 +40,46 @@ In production, a worker's term cancellation and an object-store `put` are separa
 An end-to-end physical erasure argument must cover an already-admitted write by a superseded owner and stale contents on every replica.
 A proof of the cleanup marker under the fail-stop model establishes one step of that argument.
 
-The RTDB proof branch requires its own checker reports, with exact source identity and negative-control outcomes.
+## Checked evidence
+
+The owner-authorized MacBook Pro M1 run through Rex checked commit
+`3b3200da657a47f21cbf6442911dd9b34e15611f` on 2026-11-21. The five checkpoint and
+cleanup configurations ran at `be62820b550acba4917d56fafd0255dc441f1206`. Their
+input files are identical at the checked commit.
+
+- Lean 4.35.0 checked all six law modules with warnings promoted to errors.
+  `Axioms.lean` audited 13 exported theorems. Their dependencies are drawn from
+  `propext`, `Classical.choice`, and `Quot.sound`.
+- Verus 0.2026.09.13.671956e with Rust 1.98.1 checked 10 functions in the domain
+  harness and 6 in the seek harness. The harnesses include the production Rust
+  files directly. Replacing the open upper bound with `u64::MAX` and using a
+  forward slot for reverse seeks each failed the corresponding production
+  postcondition.
+- TLC 2.19 checked the following configurations. State counts for controls
+  reflect exploration through the first reported failure.
+
+| Configuration | Distinct states | Result |
+| --- | ---: | --- |
+| `Checkpoint` | 8,812,741 | All invariants held through depth 21 |
+| `CheckpointCountOnly` | 273,439 | `AnswersExact` failed after replay substituted a duplicate for the second event |
+| `CheckpointEarlyPublish` | 180 | `NewestReachable` failed after publication with missing objects |
+| `ErasureCleanup` | 18 | `NoLostCleanup` held |
+| `ErasureCleanupForgetOnAdvance` | 4 | `NoLostCleanup` failed after erase, publication, and advancement |
+| `ErasureRelease` | 14 | `NoResurrectedObject` and `NoRetainedReplica` held |
+| `ErasureReleaseSuperseded` | 15 | `NoResurrectedObject` failed when a write admitted before the fence completed after deletion and acknowledgement |
+| `ErasureReleaseReplica` | 15 | `NoRetainedReplica` failed when acknowledgement followed deletion while a replica still held the page |
+
+The release model's fence makes an already-admitted write from the old term
+incapable of storing bytes after the term advances. Its acknowledgement also
+requires eviction on the modeled replica. Production must establish these
+conditions across its object store and replicas to claim physical completion.
+The proof run checked the models and included Rust decision functions. The
+native RTDB and Bijection runtime regressions remain unexecuted.
 
 ## Execution
 
 Use Lean 4.35.0, Bijection's pinned Verus toolchain, and TLC from the authorized proof environment.
 Write generated proof products and TLC state under an ignored task target directory.
-Run each Lean module and compile `Temporal.lean` into the module search path before checking `Recovery.lean`.
+Run each Lean module and compile `Temporal.lean` into the module search path before checking `Recovery.lean`, then run `Axioms.lean` against the compiled modules.
 Run Verus on `domain.rs` and `seek.rs` in this directory so the included paths resolve to the source used by RTDB.
 Run TLC against each configuration, retaining the source identity, tool version, and each diagnostic trace.
