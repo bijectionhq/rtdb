@@ -10,6 +10,7 @@ pub(crate) mod batches;
 mod records;
 mod timsort;
 mod legacy;
+mod native_keys;
 pub(crate) use records::{RecordBuffer, RecordStore};
 use records::RecordCursor;
 

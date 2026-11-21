@@ -2552,6 +2552,7 @@ async fn arrow_probe_unions_sort_stably_in_memory_and_in_spill_runs() {
         {
             let mut trace = trace.0.lock().unwrap();
             assert_eq!(trace.get("sort_columnar"), Some(&1));
+            assert_eq!(trace.get("sort_arrow_keys"), Some(&1));
             assert_eq!(trace.get("union_all_columnar"), Some(&1));
             assert_eq!(trace.get("sort_columnar_spill"), Some(&spills));
             trace.clear();

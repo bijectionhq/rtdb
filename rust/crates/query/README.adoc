@@ -31,6 +31,8 @@ Executions made from the same context share its memory budget and spill quota.
 Dropping a cursor releases its operator state and spill files.
 For eligible Arrow queries, UNION ALL forwards its inputs' batches, preserving duplicates and input order.
 A sort over input columns retains the batches and orders their row positions using the SQL key comparator.
+Compatible signed integers, UTF-8 strings and UTC microsecond timestamps compare directly from Arrow buffers.
+Other key layouts use the scalar SQL comparator.
 The sort gathers payload columns in the new order and preserves input order for ties.
 When a sort spills, its runs and merge output use Arrow IPC under the query's spill quota.
 The passive Mark cursor completes its shared candidate build in memory or under the query spill quota before producing a nullable Boolean result.

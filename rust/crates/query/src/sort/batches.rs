@@ -15,11 +15,16 @@ use crate::{
     spill::{SpillFile, SpillReader, SpillWriter},
 };
 
-use super::{BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, size_error, timsort};
+use super::{
+    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::NativeOrder, size_error,
+    timsort,
+};
 
 pub(crate) struct BatchSort {
     plan: SortPlan,
     key_columns: Vec<usize>,
+    native: Option<NativeOrder>,
+    used_native: bool,
     projection: Vec<usize>,
     projected: bool,
     offset: u64,
@@ -53,6 +58,7 @@ impl BatchSort {
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| invalid("sort-state", "Expected sort key columns"))?;
         let projection = (0..schema.len()).collect();
+        let native = NativeOrder::bind(&schema, &key_columns);
         Ok(Self {
             plan: SortPlan {
                 schema,
@@ -61,6 +67,8 @@ impl BatchSort {
                 execution,
             },
             key_columns,
+            native,
+            used_native: false,
             projection,
             projected,
             offset,
@@ -72,7 +80,7 @@ impl BatchSort {
 
     async fn sort(&mut self, mut input: BoxBatchCursor) -> Result<Sorted> {
         let context = &self.plan.execution.context;
-        let mut block = Block::new(&context.memory)?;
+        let mut block = Block::new(&context.memory, self.native.is_some())?;
         let mut runs = Runs::new(&context.memory)?;
         let mut key_types = KeyTypes::declared(&self.plan)?;
         while let Some(batch) = input.next_batch().await? {
@@ -86,12 +94,16 @@ impl BatchSort {
                     || block.positions.len().saturating_add(batch.len) > BLOCK_ROWS)
             {
                 key_types.validate()?;
-                let full = std::mem::replace(&mut block, Block::new(&context.memory)?);
+                let full = std::mem::replace(
+                    &mut block,
+                    Block::new(&context.memory, self.native.is_some())?,
+                );
+                self.used_native |= full.keys.is_none();
                 runs.push(
                     Self::spill(
                         &self.plan,
                         &self.projection,
-                        full.order(&self.plan, self.key_columns.len())?,
+                        full.order(&self.plan, self.key_columns.len(), self.native.as_ref())?,
                     )
                     .await?,
                 )?;
@@ -99,6 +111,7 @@ impl BatchSort {
             block.append(
                 batch,
                 &self.key_columns,
+                self.native.as_ref(),
                 self.projected,
                 &mut key_types,
                 &self.plan,
@@ -109,7 +122,8 @@ impl BatchSort {
         if !block.positions.is_empty() || !runs.files.is_empty() {
             key_types.validate()?;
         }
-        let tail = block.order(&self.plan, self.key_columns.len())?;
+        self.used_native |= block.keys.is_none() && !block.positions.is_empty();
+        let tail = block.order(&self.plan, self.key_columns.len(), self.native.as_ref())?;
         if runs.files.is_empty() {
             return Ok(Sorted::Memory(tail));
         }
@@ -134,6 +148,7 @@ impl BatchSort {
                         &self.plan,
                         &self.projection,
                         &self.key_columns,
+                        self.native.as_ref(),
                         &files.as_slice()[..count],
                     )
                     .await?;
@@ -170,6 +185,7 @@ impl BatchSort {
         plan: &SortPlan,
         projection: &[usize],
         key_columns: &[usize],
+        native: Option<&NativeOrder>,
         files: &[Arc<SpillFile>],
     ) -> Result<Arc<SpillFile>> {
         let context = &plan.execution.context;
@@ -182,6 +198,7 @@ impl BatchSort {
                     batch: None,
                     row: 0,
                     key: None,
+                    native: false,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -195,7 +212,7 @@ impl BatchSort {
         )?;
         while remaining != 0 {
             for run in &mut runs {
-                run.fill(plan, key_columns)?;
+                run.fill(plan, key_columns, native)?;
             }
             let size = context
                 .options
@@ -204,20 +221,22 @@ impl BatchSort {
             let mut positions = Vec::with_capacity(size);
             while positions.len() < size {
                 context.check_cancelled()?;
-                let mut winner: Option<(usize, &Key)> = None;
-                for (lane, key) in runs
+                let mut winner: Option<usize> = None;
+                for (lane, run) in runs
                     .iter()
                     .enumerate()
-                    .filter_map(|(lane, run)| run.key.as_ref().map(|key| (lane, key)))
+                    .filter(|(_, run)| run.batch.is_some())
                 {
-                    if let Some((_, first)) = winner {
-                        if !plan.compare(&key.values, &first.values)?.is_lt() {
-                            continue;
-                        }
+                    if let Some(first) = winner
+                        && !run
+                            .compare(&runs[first], plan, key_columns, native)?
+                            .is_lt()
+                    {
+                        continue;
                     }
-                    winner = Some((lane, key));
+                    winner = Some(lane);
                 }
-                let Some((lane, _)) = winner else {
+                let Some(lane) = winner else {
                     break;
                 };
                 let run = &mut runs[lane];
@@ -281,6 +300,10 @@ impl BatchCursor for BatchSort {
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
         span.attribute("sort_columnar", rtdb_plan::TraceValue::Unsigned(1));
         span.attribute(
+            "sort_arrow_keys",
+            rtdb_plan::TraceValue::Unsigned(u64::from(self.used_native)),
+        );
+        span.attribute(
             "sort_columnar_spill",
             rtdb_plan::TraceValue::Unsigned(u64::from(self.spilled)),
         );
@@ -295,17 +318,17 @@ enum Sorted {
 struct Block {
     batches: Vec<ColumnBatch>,
     positions: Vec<(usize, usize)>,
-    keys: Vec<Value>,
+    keys: Option<Vec<Value>>,
     payload_bytes: usize,
     scratch: Arc<MemoryReservation>,
 }
 
 impl Block {
-    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+    fn new(memory: &Arc<MemoryBudget>, native: bool) -> Result<Self> {
         Ok(Self {
             batches: vec![],
             positions: vec![],
-            keys: vec![],
+            keys: (!native).then(Vec::new),
             payload_bytes: 0,
             scratch: memory.reserve(256)?,
         })
@@ -319,6 +342,7 @@ impl Block {
         &mut self,
         batch: ColumnBatch,
         columns: &[usize],
+        native: Option<&NativeOrder>,
         projected: bool,
         types: &mut KeyTypes,
         plan: &SortPlan,
@@ -328,39 +352,33 @@ impl Block {
             .checked_mul(size_of::<(usize, usize)>() + size_of::<usize>())
             .and_then(|size| size.checked_add(256))
             .ok_or_else(size_error)?;
-        let bound = (0..batch.len).try_fold(base, |bound, row| {
-            bound
-                .checked_add(key_bound(&batch, columns, row)?)
-                .ok_or_else(size_error)
-        })?;
         let scratch = Arc::get_mut(&mut self.scratch).expect("sort block owns its reservation");
-        scratch.grow_to(scratch.bytes().checked_add(bound).ok_or_else(size_error)?)?;
-        self.positions.reserve_exact(batch.len);
-        self.keys.reserve_exact(
-            batch
-                .len
-                .checked_mul(columns.len())
-                .ok_or_else(size_error)?,
-        );
-        for row in 0..batch.len {
-            plan.execution.context.check_cancelled_at(row)?;
-            let start = self.keys.len();
-            for &column in columns {
-                let mut value = batch.columns[column].value(row)?;
-                if projected {
-                    value.admit_expression_dates()?;
-                }
-                self.keys.push(value);
+        scratch.grow_to(scratch.bytes().checked_add(base).ok_or_else(size_error)?)?;
+        if self.keys.is_none() && !native.is_some_and(|native| native.accepts(&batch)) {
+            let mut keys = Vec::new();
+            for earlier in &self.batches {
+                append_scalar_keys(&mut keys, scratch, earlier, columns, projected, types, plan)?;
             }
-            types.observe(&self.keys[start..], plan)?;
-            self.positions.push((self.batches.len(), row));
+            self.keys = Some(keys);
         }
+        if let Some(keys) = &mut self.keys {
+            append_scalar_keys(keys, scratch, &batch, columns, projected, types, plan)?;
+        }
+        self.positions.reserve_exact(batch.len);
+        let source = self.batches.len();
+        self.positions
+            .extend((0..batch.len).map(|row| (source, row)));
         self.payload_bytes = self.payload_bytes.saturating_add(batch.charged());
         self.batches.push(batch);
         Ok(())
     }
 
-    fn order(self, plan: &SortPlan, key_width: usize) -> Result<MemoryRun> {
+    fn order(
+        self,
+        plan: &SortPlan,
+        key_width: usize,
+        native: Option<&NativeOrder>,
+    ) -> Result<MemoryRun> {
         let context = &plan.execution.context;
         let algorithm = context.options.object_sort;
         let len = self.positions.len();
@@ -370,10 +388,23 @@ impl Block {
         };
         let _temporary = context.memory.reserve(bytes)?;
         let mut order: Vec<_> = (0..len).collect();
-        let key = |index| &self.keys[index * key_width..(index + 1) * key_width];
         let compare = |left, right| {
             context.check_cancelled()?;
-            plan.compare(key(left), key(right))
+            if let Some(keys) = &self.keys {
+                let key = |index| &keys[index * key_width..(index + 1) * key_width];
+                return plan.compare(key(left), key(right));
+            }
+            let (left, left_row) = self.positions[left];
+            let (right, right_row) = self.positions[right];
+            Ok(native
+                .expect("only an admitted sort can borrow its keys")
+                .compare(
+                    &self.batches[left],
+                    left_row,
+                    &self.batches[right],
+                    right_row,
+                    &plan.order,
+                ))
         };
         match algorithm {
             ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
@@ -407,6 +438,42 @@ impl Block {
             _scratch: scratch,
         })
     }
+}
+
+fn append_scalar_keys(
+    keys: &mut Vec<Value>,
+    scratch: &mut MemoryReservation,
+    batch: &ColumnBatch,
+    columns: &[usize],
+    projected: bool,
+    types: &mut KeyTypes,
+    plan: &SortPlan,
+) -> Result<()> {
+    let bound = (0..batch.len).try_fold(0usize, |bound, row| {
+        bound
+            .checked_add(key_bound(batch, columns, row)?)
+            .ok_or_else(size_error)
+    })?;
+    scratch.grow_to(scratch.bytes().checked_add(bound).ok_or_else(size_error)?)?;
+    keys.reserve_exact(
+        batch
+            .len
+            .checked_mul(columns.len())
+            .ok_or_else(size_error)?,
+    );
+    for row in 0..batch.len {
+        plan.execution.context.check_cancelled_at(row)?;
+        let start = keys.len();
+        for &column in columns {
+            let mut value = batch.columns[column].value(row)?;
+            if projected {
+                value.admit_expression_dates()?;
+            }
+            keys.push(value);
+        }
+        types.observe(&keys[start..], plan)?;
+    }
+    Ok(())
 }
 
 struct MemoryRun {
@@ -518,10 +585,16 @@ struct Run {
     batch: Option<ColumnBatch>,
     row: usize,
     key: Option<Key>,
+    native: bool,
 }
 
 impl Run {
-    fn fill(&mut self, plan: &SortPlan, columns: &[usize]) -> Result<()> {
+    fn fill(
+        &mut self,
+        plan: &SortPlan,
+        columns: &[usize],
+        native: Option<&NativeOrder>,
+    ) -> Result<()> {
         if self
             .batch
             .as_ref()
@@ -533,28 +606,74 @@ impl Run {
         self.key = None;
         self.row = 0;
         self.batch = read_batch(&mut self.reader)?;
+        self.native = self
+            .batch
+            .as_ref()
+            .is_some_and(|batch| native.is_some_and(|native| native.accepts(batch)));
         self.read_key(plan, columns)
     }
 
     fn read_key(&mut self, plan: &SortPlan, columns: &[usize]) -> Result<()> {
-        let Some(batch) = &self.batch else {
-            return Ok(());
-        };
-        let reservation = plan
-            .execution
-            .context
-            .memory
-            .reserve(256 + key_bound(batch, columns, self.row)?)?;
-        let values = columns
-            .iter()
-            .map(|&column| batch.columns[column].value(self.row))
-            .collect::<Result<Vec<_>>>()?;
-        self.key = Some(Key {
-            values,
-            _reservation: reservation,
-        });
+        if !self.native
+            && let Some(batch) = &self.batch
+        {
+            self.key = Some(scalar_key(batch, self.row, plan, columns)?);
+        }
         Ok(())
     }
+
+    fn compare(
+        &self,
+        other: &Self,
+        plan: &SortPlan,
+        columns: &[usize],
+        native: Option<&NativeOrder>,
+    ) -> Result<std::cmp::Ordering> {
+        let left = self.batch.as_ref().expect("a selected run owns a batch");
+        let right = other.batch.as_ref().expect("a selected run owns a batch");
+        if self.native && other.native {
+            return Ok(native
+                .expect("only admitted runs borrow their keys")
+                .compare(left, self.row, right, other.row, &plan.order));
+        }
+        let left_key = if self.native {
+            Some(scalar_key(left, self.row, plan, columns)?)
+        } else {
+            None
+        };
+        let right_key = if other.native {
+            Some(scalar_key(right, other.row, plan, columns)?)
+        } else {
+            None
+        };
+        let left = self
+            .key
+            .as_ref()
+            .or(left_key.as_ref())
+            .expect("sort run has a key");
+        let right = other
+            .key
+            .as_ref()
+            .or(right_key.as_ref())
+            .expect("sort run has a key");
+        plan.compare(&left.values, &right.values)
+    }
+}
+
+fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize]) -> Result<Key> {
+    let reservation = plan
+        .execution
+        .context
+        .memory
+        .reserve(256 + key_bound(batch, columns, row)?)?;
+    let values = columns
+        .iter()
+        .map(|&column| batch.columns[column].value(row))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Key {
+        values,
+        _reservation: reservation,
+    })
 }
 
 fn write_batch(writer: &mut SpillWriter, batch: ColumnBatch, plan: &SortPlan) -> Result<()> {
