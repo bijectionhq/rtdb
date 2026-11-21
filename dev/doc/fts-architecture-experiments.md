@@ -436,3 +436,53 @@ The focused release run passed all 56 Rust cases.
 That run includes the end-to-end workload regression with a reduced candidate limit so it exercises both fallback decisions on a small fixture.
 The full Gradle unit rerun passed all 3,187 cases.
 The first Gradle run had one local health-check request fail to receive a response, and the case passed both in isolation and in the full rerun.
+
+## Ordered-index scope in ranked SQL
+
+Ranked MATCH now consumes the IID scope already supplied by the ordered index before it scores file and live events.
+It still visits matching postings, uses the full snapshot corpus, and verifies the resolved row against the scan predicates.
+After an unscoped candidate-budget miss, it skips the second narrowing pass only if pending and handed-out candidates already prove that the retry would exceed the distinct IID limit.
+Declines without that proof follow the ordinary MATCH narrowing path.
+
+The native SQL harness compares both policies on one captured context with the same SEARCH and `(status, cohort)` ordered indexes.
+The measurement branch was based on main at `5eba8e9ea`.
+Baseline applies the ordered scope after scoring, and the current route applies it before scoring.
+Both timings include acquiring the scope from the ordered index.
+The exhaustive SQL oracle resolves rows, evaluates MATCH from the result and uses the same full corpus for scores.
+All 348 result comparisons matched, including 36 temporal canaries across live and compacted state.
+The comparisons checked ordered IDs, scores, projected values and both time intervals.
+
+The measurements use the same Apple M4 Max and in-memory object storage as the earlier replay.
+The benchmark alternates policy order and uses 12 samples per policy for each large case.
+p95 uses nearest rank, which is the slowest of 12 samples here.
+The 4,000-document smoke run uses two samples per policy.
+
+| Documents | Query | Scope IIDs | Baseline p50 / p95, ms | Current p50 / p95, ms | Score evaluations, baseline → current |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 80,000 | Uniform scoring | — | 247.14 / 253.34 | 246.10 / 254.57 | 80,000 → 80,000 |
+| 80,000 | Rare winners | — | 1.25 / 1.64 | 1.25 / 1.33 | 7,680 → 7,680 |
+| 80,000 | Open, cohort < 2 | 82 | 25.12 / 25.76 | 3.13 / 3.28 | 80,000 → 80 |
+| 80,000 | Open, cohort < 20 | 816 | 26.39 / 26.87 | 4.11 / 4.38 | 80,000 → 814 |
+| 80,000 | Open, cohort < 200 | 7,942 | 9.12 / 10.06 | 6.12 / 6.31 | 80,000 → 7,940 |
+| 80,000 | Open, cohort < 1,000 | — | 13.31 / 14.47 | 13.32 / 13.51 | 80,000 → 80,000 |
+| 120,000 | Uniform scoring | — | 448.43 / 452.10 | 406.84 / 415.13 | 105,024 → 105,024 |
+| 120,000 | Rare winners | — | 5.29 / 5.48 | 5.18 / 5.48 | 10,752 → 10,752 |
+| 120,000 | Open, cohort < 2 | 113 | 86.24 / 89.08 | 6.02 / 6.30 | 120,000 → 111 |
+| 120,000 | Open, cohort < 20 | 1,196 | 97.04 / 99.80 | 9.48 / 9.82 | 120,000 → 1,194 |
+| 120,000 | Open, cohort < 200 | 11,949 | 123.97 / 161.89 | 16.21 / 16.89 | 120,000 → 11,947 |
+| 120,000 | Open, cohort < 1,000 | — | 240.56 / 248.14 | 197.88 / 202.84 | 120,000 → 120,000 |
+
+The two tightest scopes improved median latency by 6.4–14.3× across the two sizes.
+The widest filter exceeded the ordered seek's scope limit, so its only material gain came from the fallback shortcut at 120,000 documents.
+For that filter and the uniform-score query at 120,000 documents, the shortcut avoided all 120,000 events in the unranked retry.
+The rare-winner controls kept the same scoring work at both sizes.
+These measurements describe warmed synthetic point-in-time queries on local storage.
+
+```sh
+cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node --features fts-experiments --example fts_architecture_bench -- ranked-filter 80000 12
+cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node --features fts-experiments --example fts_architecture_bench -- ranked-filter 120000 12
+```
+
+The focused release run passed 61 Rust tests, including the SQL regression for both optimizations at a reduced candidate cap.
+The separate native ordered-index integration run passed all eight tests.
+The full Gradle unit run passed all 3,189 tests with a freshly built native library.
