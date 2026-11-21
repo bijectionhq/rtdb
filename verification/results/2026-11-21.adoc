@@ -1789,3 +1789,52 @@ The node, Multi and gateway resend tests now resend the same bodies and check th
 The affected suites passed 817 of 818 tests; `copy_to_arrow_stream_uses_the_original_read_transaction` times out on the base commit `c165a2a9d` without this change.
 Expired receipts remain in bitemporal history until the metadata-retention increment removes them physically.
 
+
+=== Exact file observations in trie retirement
+
+Production revision `966570ab5` records each retirement batch's logical file plan in the durable intent and installed receipt.
+It records an observed S3 provider namespace, physical key and version for each owned loose file where the backing store supplies a usable version.
+It includes a shared artefact with the final batch retiring members of its group.
+Packed, inherited and archive-backed entries and entries without a usable provider version carry their logical keys only.
+Legacy intents can still be read with no file plan.
+
+The selected Rust suites reported 131 passing cases in maintenance, Multi and S3.
+The native group test recorded its synthetic provider observation exactly once, in the final member batch, and the crash-and-reopen test preserved the file plan.
+The loopback HTTP fixture exercised the production S3 adapter across five HEAD responses.
+It checked the actual encoded request path and the identity returned for an opaque version.
+It observed no version evidence for a missing object or header, an empty version or S3's `null` sentinel.
+The two opt-in S3 integration cases returned at their environment guard.
+A local MinIO binary was unavailable, and no real provider was contacted.
+The isolated native mutation rerun was stopped when available disk space dropped below 4 GiB.
+The new native controls remain registered with the pinned runner. link:../run.py[Native mutation runner]
+
+Verus checked four functions in the exact production classifier and its laws.
+Dropping the empty or null check failed the production postcondition.
+Dropping either check and weakening its contract together failed the matching independent law. link:../verus/s3_object_version/area.json[Verus area and control declarations]
+
+Lean revision `29a5e51da` checked seven theorems with the standard axiom audit.
+Exact selection matching fixes the authorized publication, and exact provider deletion preserves every other identity.
+The witnesses show that logical keys and content digests can repeat across publications and that local keys and version identifiers can repeat across provider namespaces.
+In the alternative naming model, differing naming epochs and differing input digests give distinct names.
+Four controlled weakenings fail at their declared theorems.
+The model assumes that identity encoding is injective over the fields that matter and that the provider implements exact deletion.
+It covers the identity relation for arbitrary lists of publications.
+Reader and recovery coverage and concurrent admission are separate obligations. link:../lean/RetirementIdentity.lean[Lean reference]
+
+The runtime record attests to a provider observation at staging time.
+It does not yet establish that the selected catalog was published with that physical identity.
+The reaper still needs catalog-to-publication binding, reference exclusion, and one atomic installation of the certificate and admission floor.
+Physical erasure still follows the legacy release path.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --offline --locked \
+  -p rtdb-maintenance -p rtdb-multi -p rtdb-s3 --features rtdb-s3/versioning \
+  --lib --test gc --no-fail-fast
+----
+
+The retained Rust log is `/private/tmp/rtdb-formal.QMjPSJsX/version-observations-native-final2.log`, SHA-256 `d3840d34a8b33f5fbda2932d62c9cec810f71825b474b4d4784117bd8eb03598`.
+Raw proof evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/version-proof-862r1737/` and `/private/tmp/rtdb-formal.QMjPSJsX/identity-lean-geifh20n/`.
+The Lean source SHA-256 is `d3f14c0458d51852f015ecf34481b1da45b2b2de86b811e2eecb1f8301c98c4a`.
+The production Verus input SHA-256 is `9d29767a4279f9d4e022a7e88e7c1a8400dc4349a5c65c44c138bc7f9478a825`.
