@@ -1,0 +1,118 @@
+= Native kernel study results, 2026-11-21
+
+The combined local run used the production sources through commit `9f2311110` and the model and runner sources in this study commit.
+The command in link:../README.adoc[the runner instructions] used all six named tools and enabled the Rust boundary controls.
+Logs include input hashes, solver diagnostics, and bounded counterexample traces.
+
+== Checked results
+
+[cols="1,2,2",options="header"]
+|===
+|Tool |Positive evidence |Controls and limits
+
+|Lean 4.36.0
+|The one-pass history evaluator refines the independent point definition.
+Admitted answers survive later publication.
+Arbitrary older histories agree after an erase of the observed key.
+The model proves key projection, point constancy between valid and system boundaries, and an abstract strict cutoff bound.
+|Half-open interval, future ERASE and tied-cutoff mutations fail.
+The audited theorems use standard Lean axioms.
+These are theorems about the model.
+
+|Verus 0.2026.11.20.9da409b, Z3 4.16.0
+|Fourteen verified functions across the production search rectangle decisions, temporal admission and replica admission areas.
+|All seven declared mutations failed at the expected functions.
+The proofs cover the included decisions, including two joint controls.
+The actual partition publication transitions, scan coverage and token-to-effect composition need further proof.
+
+|TLC 2026.11.19.180144
+|The pin and copy variants reached 8,140 and 7,012 states.
+The serialized and validated resolver variants reached 9 and 24 states.
+The fair stable-service case reached 8,140 states.
+The cache generation check reached 9 states.
+|All ten negative configurations produce a violation.
+The protocol assumes atomic append to one durable log, two terms, two requests, two roots and one reader.
+Progress assumes stable availability and weak fairness for apply and acknowledgement.
+
+|Apalache 0.63.0
+|Serialized and validated resolution hold through eight transitions.
+|Blind publication loses an update at transition four.
+
+|Maude 3.5.1
+|Independent rewrite models of serialized and validated resolution explore 9 and 24 states with no lost update.
+|The blind variant reaches revision two with value one.
+
+|Alloy 6.2.0
+|The last-reference rule preserves reachability in scope four.
+A satisfying shared-file retention case witnesses a nonempty model.
+|Deleting on the first member's removal admits a counterexample.
+
+|Rust compiler
+|The admitted-record apply boundary compiles on the unchanged production copy.
+|Minting the token from the driver fails with E0423.
+Passing a raw decoded record to apply fails with E0308 at the actual call site.
+
+|Rust runtime
+|238 tests passed across search, temporal, replication, storage and maintenance, with one ignored benchmark.
+All 15 node search tests passed.
+Lean and the Rust resolver both matched all 13 shared trace observations.
+|The tests exercise the local database, logs, compaction, cache races and search.
+No hosted provider fault test is included in this result.
+|===
+
+== Counterexamples and amendments
+
+[cols="1,2,2",options="header"]
+|===
+|Property |Small trace |Amendment or surviving rule
+
+|Atomic batch
+|Resolve, then publish the debit alone.
+|Make the full batch the unit of the admitted log transition.
+
+|Durable acknowledgement
+|Resolve, then acknowledge without append.
+|In the model, only an applied batch can be acknowledged.
+
+|Term fencing
+|Resolve in an old term, hand over, then publish the pending batch.
+|Reject stale terms and preserve admission through deferred apply.
+
+|Retry identity
+|Resolve one identity, append, retry that identity, append again.
+|Preserve a durable receipt or refuse an ambiguous retry under the provider contract.
+The model checks uniqueness for its receipt policy.
+
+|Read basis
+|Pin, resolve a new request, append, apply and change the pinned read history.
+|Keep the captured observation stable.
+
+|Durable root
+|Publish a manifest before storing its replacement object.
+|Publish the durable replacement before retiring its predecessor.
+
+|Shared reclamation
+|Pin an old generation, store and publish its replacement, then collect the pinned generation.
+|Allow collection only after references reach zero.
+
+|Cache generation
+|Start loading, invalidate, publish a replacement and complete the old load.
+|An obsolete loader can publish only a private path.
+In production, cache invalidation and pathname publication share the state lock.
+
+|Search visibility and rank
+|Merge two historical writes across their system origins, or count a row whose second MATCH predicate fails.
+|Retain system origins, apply strictly later erases to older rectangles, and score only resolved rows that pass the scan restriction.
+
+|Compaction schema
+|Decode a spill page whose Arrow union has a null leg, then copy it into a writer whose declared field differs in nullability.
+|Re-encode the original rows to the declared schema when passthrough would violate that schema.
+|===
+
+== Remaining proof obligations
+
+The complete native temporal ceiling and rectangle emitter still need a refinement proof against the point evaluator.
+The search ranking proof still needs coverage of the production floating-point score frontier, alternate physical recency page layouts, and optional build failure under memory pressure.
+The durable protocol models assume provider behavior.
+Provider faults, object-store recovery, the full trie coverage transition and cross-node lease accounting need production refinement evidence.
+The observations here support specific component claims and bounded protocol claims.

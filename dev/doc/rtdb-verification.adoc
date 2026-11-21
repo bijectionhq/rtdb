@@ -114,11 +114,11 @@ The base and both negative controls must be run from the same source revision.
 
 |RTDB-FTS-01
 |A merge refuses rectangles with different originating system starts.
-|Proof source drafted.
+|Verified on the production merge function.
 
 |RTDB-FTS-02
 |After any one event cut allowed by the model, a point survives a successful merge exactly when it survives in either input.
-|Proof source drafted.
+|Verified for the production merge and declared event-cut predicate.
 |===
 
 The single control removes the system-start equality check from production.
@@ -128,12 +128,10 @@ The Rust regression case exercises file building and candidate selection over bo
 The study leaves the validity of the full `Cutter`, chronological precedence, artefact decoding and end-to-end scan equivalence as follow-on obligations.
 
 Study files live in `verification/verus/search_visibility/`.
-The proposed first run reuses Bijection's pinned Verus revision `31e44e600408242839ff456e84550e9f849344e3` with Z3 4.16.0 on the shared build core.
-From the RTDB root, the baseline command with that existing runtime is `verus --no-external-by-default --verify-module production --verify-module laws verification/verus/search_visibility/proof.rs`.
-Run each declared mutation in a disposable source copy and retain its diagnostics, tool identity and source revision.
-The baseline, mutations and regression case are pending execution.
+The baseline, both merge mutations and the Rust regression passed in the owner-authorized local run.
+See link:../../verification/README.adoc[the runner] and link:../../verification/results/2026-11-21.adoc[the evidence ledger] for tool identities and proof scope.
 
 The next bitemporal study should compare the direct pointwise reference to the scan ceiling and the search cut.
-The next ranking study should require every predicate to hold before an entity can raise the cutoff.
-The search review also identified outstanding obligations for memory refusal and scan fallback, historical pages with within-file recency branching, and cache invalidation during a shared-file load.
+The ranking path now verifies the full scan restriction before scoring a row, with a node regression for two independent MATCH predicates.
+The search review also identified outstanding obligations for memory refusal and scan fallback and for historical pages with within-file recency branching.
 Track counterexamples by law and amend the mechanism or the production code that owns it.
