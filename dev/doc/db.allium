@@ -371,6 +371,7 @@ variant TxMessage : SourceMessage {
     -- Compatible Arrow document vectors include nested lists and structs.
     -- Struct fields added across compatible uploads join in Arrow with typed nulls for earlier documents, including structs inside lists.
     -- Batches with compatible column types retain first-seen column order and represent missing columns as nulls without converting the documents to rows.
+    -- Source encoding retains compatible Arrow vectors when the same table's puts also contain row-backed documents.
     -- Differently typed columns can share a dense union in the source message and retain their Arrow representation on replay.
     -- Union children can be compatible nested containers such as lists and structs.
     -- Null and missing values use that union's null leg.
