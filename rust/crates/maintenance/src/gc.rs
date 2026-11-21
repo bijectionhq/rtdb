@@ -143,20 +143,28 @@ impl BlockCollector {
 #[async_trait]
 impl CycleWorker for BlockCollector {
     async fn collect(&self, cancellation: &CancellationToken) -> Result<()> {
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
         let snapshot = self.snapshots.snapshot();
         let Some(latest) = snapshot.table_catalog().block_index() else { return Ok(()); };
         let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
-        if let Err(error) = self.sweep("blocks", latest, false, cancellation, &deletes).await { self.observer.table_failed(None, &error); }
+        if let Err(error) = self.sweep("blocks", latest, false, cancellation, &deletes).await {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            self.observer.table_failed(None, &error);
+        }
         let entries: Vec<_> = snapshot.table_catalog().entries().cloned().collect();
         stream::iter(entries).map(|entry| {
             let deletes = Arc::clone(&deletes);
             async move {
-                if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), latest, false, cancellation, &deletes).await {
+                if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), latest, false, cancellation, &deletes).await
+                    && !cancellation.is_cancelled() {
                     self.observer.table_failed(Some(&entry.table), &error);
                 }
             }
         }).buffer_unordered(self.config.table_parallelism).for_each(|_| async {}).await;
-        if let Err(error) = self.sweep("oversized", latest, true, cancellation, &deletes).await { self.observer.table_failed(None, &error); }
+        if let Err(error) = self.sweep("oversized", latest, true, cancellation, &deletes).await
+            && !cancellation.is_cancelled() {
+            self.observer.table_failed(None, &error);
+        }
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 }
