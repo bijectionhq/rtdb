@@ -197,7 +197,7 @@ fn check_slice(offset: usize, length: usize, total: usize) -> Result<()> {
 
 struct RetainedAllocation {
     _buffer: Buffer,
-    _owner: Arc<dyn Send + Sync>,
+    _owner: std::panic::AssertUnwindSafe<Arc<dyn Send + Sync>>,
 }
 
 /// Retains an existing allocation and its charge through this exact byte view.
@@ -208,7 +208,10 @@ pub fn retain_buffer(buffer: &Buffer, reservation: &Arc<MemoryReservation>) -> B
 /// Retains an exact byte view along with a memory charge and any required custody.
 pub fn retain_buffer_with_owner(buffer: &Buffer, owner: Arc<dyn Send + Sync>) -> Buffer {
     let start = std::ptr::NonNull::from(buffer.as_slice()).cast();
-    let owner = Arc::new(RetainedAllocation { _buffer: buffer.clone(), _owner: owner });
+    // The erased owner only holds the allocation charge or permit until drop.
+    let owner = Arc::new(RetainedAllocation {
+        _buffer: buffer.clone(), _owner: std::panic::AssertUnwindSafe(owner),
+    });
     // SAFETY: the owner keeps the original immutable buffer alive for this slice's address and length.
     unsafe { Buffer::from_custom_allocation(start, buffer.len(), owner) }
 }

@@ -676,7 +676,7 @@ impl BatchCursor for BatchFilter {
 
 /// Computes selection in place so an ordered seek can keep row offsets into the original batch.
 pub(crate) async fn predicate_mask(
-    batch: &ColumnBatch, predicate: &Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
+    batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
 ) -> Result<Vec<bool>> {
     execution.context.check_cancelled()?;
     let truth = kernel::truth(predicate, schema, batch, execution.parameters.values())
@@ -687,16 +687,20 @@ pub(crate) async fn predicate_mask(
     let metadata = execution.scope()?;
     let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
     let scope = execution.scope()?;
+    let _slots = execution.context.memory.reserve(256 + schema.len().saturating_mul(std::mem::size_of::<Value>() + 32))?;
+    let fields = predicate.referenced_columns().into_iter().map(|id| {
+        schema.position(id).ok_or_else(|| invalid("column-filter", "Predicate refers to a missing column"))
+    }).collect::<Result<Vec<_>>>()?;
     let mut mask = Vec::with_capacity(batch.len);
-    let mut values = Vec::with_capacity(batch.columns.len());
+    let mut values = vec![Value::Null; batch.columns.len()];
     for row in 0..batch.len {
-        let bound = batch.columns.iter().try_fold(256usize, |bound, column| {
-            bound.checked_add(column.bound(row)?).ok_or_else(size_error)
+        let bound = fields.iter().try_fold(256usize, |bound, &column| {
+            bound.checked_add(batch.columns[column].bound(row)?).ok_or_else(size_error)
         })?;
         let _row = execution.context.memory.reserve(bound)?;
-        for column in &batch.columns { values.push(column.value(row)?); }
+        for &column in &fields { values[column] = batch.columns[column].value(row)?; }
         mask.push(rtdb_expr::is_true(&execution.evaluate_invocation(&scope, &invocation, &values).await?)?);
-        values.clear();
+        for &column in &fields { values[column] = Value::Null; }
         scope.reset()?;
     }
     Ok(mask)
