@@ -567,6 +567,26 @@ RTDB_PARKED_BENCH_DEPLOYMENTS=1000000 \
 The 516-byte JSON measurement exceeds the 300-byte record budget by itself.
 The staging run still needs the production directory, ten million records and an active Zipf workload.
 
+**Local durable pgwire measurement**
+
+Three release-build trials per worker count ran on an Apple M4 Max with one loopback gateway, three holders, and three fsync-enabled logkeepers on the same SSD.
+Each worker chose from 32 warm deployments using a fixed, seeded Zipf distribution with exponent 1 and issued 256 updates.
+One command could be in flight per deployment, so measured latency includes client queueing behind earlier updates to the same deployment.
+After each run the benchmark read every counter and matched its value to the number of commands sent to that deployment.
+
+| Workers | Updates per trial | Durable updates/s | p50 (ms) | p95 (ms) | p99 (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 256 | 1,194–1,241 | 0.746–0.786 | 1.157–1.269 | 1.629–1.834 |
+| 16 | 4,096 | 3,977–4,062 | 1.069–1.075 | 13.382–13.945 | 15.238–15.851 |
+
+```sh
+RTDB_CELL_BENCH_DEPLOYMENTS=32 RTDB_CELL_BENCH_WORKERS=16 RTDB_CELL_BENCH_COMMANDS=256 \
+  cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
+  durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
+```
+
+The scale and handoff acceptance run needs a production directory, lazy activation of parked deployments and live scale transitions.
+
 ## 6. Existing specs affected
 
 | Spec | Stage | Change |

@@ -59,6 +59,15 @@ impl Cell {
 
     /// A cell keeping its objects in `objects`, or in a directory of its own.
     pub async fn start_on(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>) -> Self {
+        Self::start_configured(objects, pools, park_after, watch, cells, false).await
+    }
+
+    pub async fn start_durable(nodes: usize) -> Self {
+        Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, true).await
+    }
+
+    async fn start_configured(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>,
+        watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
         let objects = objects.unwrap_or_else(|| CellStorage::Local { root: data.path().join("objects") });
@@ -66,7 +75,7 @@ impl Cell {
         let mut logkeepers = Vec::new();
         for index in 0..3 {
             logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {
-                listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("logkeeper-{index}")), fsync: false, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
+                listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("logkeeper-{index}")), fsync, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
                 availability_zone: format!("zone-{index}"), lease: lease(),
             }).await.unwrap());
         }
