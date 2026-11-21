@@ -6,6 +6,15 @@ use serde::Serialize;
 
 pub const CURRENT_STORAGE_VERSION: StorageVersion = StorageVersion(6);
 
+/// Independently derived ordered indexes belong to one source history.
+pub const ORDERED_INDEX_ROOT: &str = "ordered-index/v2";
+
+pub fn is_ordered_index_object(name: &str) -> bool {
+    name == ORDERED_INDEX_ROOT || name.strip_prefix(ORDERED_INDEX_ROOT)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+
 pub fn lex_hex(value: u64) -> String {
     let body = format!("{value:x}");
     format!("{:x}{body}", body.len() - 1)
@@ -40,16 +49,35 @@ fn invalid_key(value: &str) -> Anomaly {
 }
 
 pub fn storage_root(version: StorageVersion, epoch: StorageEpoch, partition: u32, partitions: u32) -> Result<String> {
-    if partitions == 0 || partition >= partitions {
-        return Err(Anomaly::incorrect("xtdb/invalid-partition", format!("Partition {partition} is outside 0..{partitions}")));
+    Ok(StorageRoot::partitioned(version, epoch, partition, partitions)?.key())
+}
+
+/// Where one partition's objects live in a store: the storage version and epoch, and the partition when there are several.
+/// Every object key a database writes is relative to its root, and a provider's configured prefix goes above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageRoot { version: u64, epoch: u64, partition: u32, partitions: u32 }
+
+impl StorageRoot {
+    pub fn new(version: StorageVersion, epoch: StorageEpoch) -> Result<Self> { Self::partitioned(version, epoch, 0, 1) }
+
+    pub fn partitioned(version: StorageVersion, epoch: StorageEpoch, partition: u32, partitions: u32) -> Result<Self> {
+        if partitions == 0 || partition >= partitions {
+            return Err(Anomaly::incorrect("xtdb/invalid-partition", format!("Partition {partition} is outside 0..{partitions}")));
+        }
+        Ok(Self { version: nonnegative(i64::from(version.0), "storage version")?, epoch: nonnegative(i64::from(epoch.0), "storage epoch")?, partition, partitions })
     }
-    let version = nonnegative(i64::from(version.0), "storage version")?;
-    let epoch = nonnegative(i64::from(epoch.0), "storage epoch")?;
-    let mut root = format!("v{}", lex_hex(version));
-    if epoch > 0 {
-        root.push_str(&format!("_e{}", lex_hex(epoch)));
+
+    /// The root as a key prefix: `v06`, `v06_e110`, `parts/2/v06`.
+    pub fn key(&self) -> String {
+        let mut root = format!("v{}", lex_hex(self.version));
+        if self.epoch > 0 { root.push_str(&format!("_e{}", lex_hex(self.epoch))); }
+        if self.partitions == 1 { root } else { format!("parts/{}/{root}", self.partition) }
     }
-    Ok(if partitions == 1 { root } else { format!("parts/{partition}/{root}") })
+
+    /// `root` (a root's key) under a provider's configured prefix, if it has a non-empty one.
+    pub fn under_prefix(prefix: Option<&str>, root: &str) -> String {
+        match prefix { Some(prefix) if !prefix.is_empty() => format!("{prefix}/{root}"), _ => root.to_owned() }
+    }
 }
 
 pub fn require_readable_version(version: StorageVersion) -> Result<()> {

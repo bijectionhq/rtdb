@@ -103,7 +103,7 @@ impl Provider {
         if response.status != 200 { return Err(forbidden("xtdb.authn/failed", format!("Failed to obtain user info from {}", self.userinfo_endpoint)).with_context("status", response.status.into())); }
         let user = string(&response.body, "sub")?;
         let reservation = self.memory.reserve(user.len().checked_add(std::mem::size_of::<Principal>()).ok_or_else(|| invalid("Principal identity is too large"))?)?;
-        Ok(Arc::new(Principal { user: Some(user.to_owned()), credentials: PrincipalCredentials::Oidc(Credentials { provider: Arc::clone(self), grant, token: Mutex::new(token) }), _reservation: reservation }))
+        Ok(Arc::new(Principal { user: Some(user.to_owned()), credentials: PrincipalCredentials::Oidc(Credentials { provider: Arc::clone(self), grant, token: Mutex::new(token) }), grants: None, _reservation: reservation }))
     }
     pub async fn password(self: &Arc<Self>, user: &str, password: &str) -> Result<Arc<Principal>> {
         let response = self.token(fields([("grant_type", "password"), ("scope", "openid"), ("username", user), ("password", password)])).await?;

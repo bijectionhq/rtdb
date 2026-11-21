@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use rtdb_columnar::MemoryReservation;
-use rtdb_format::keys::{CURRENT_STORAGE_VERSION, TrieKey, block_key, lex_hex, storage_root};
+use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, TrieKey, block_key, lex_hex};
 use rtdb_index::{CatalogTrie, TrieCatalog, TrieState};
 use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, StorageEpoch, TableRef, Timestamp};
@@ -140,7 +140,7 @@ impl Node {
         let second = date.second_of_day();
         let date = format!("{year}{month:02}{day:02}T{:02}{:02}{:02}Z", second / 3600, second / 60 % 60, second % 60);
         let directory = ObjectKey::new(format!("exports/b{}_{}", lex_hex(u64::try_from(block_index.0).map_err(invalid)?), date))?;
-        let root = ObjectKey::new(format!("{directory}/{}", storage_root(CURRENT_STORAGE_VERSION, StorageEpoch(0), 0, 1)?))?;
+        let root = ObjectKey::new(format!("{directory}/{}", StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key()))?;
         let mut bound = 4096usize;
         let mut table_count = 0;
         for table in value.trie_catalog().tables() {

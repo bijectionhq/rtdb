@@ -43,6 +43,22 @@ async fn block_gc_collects_old_blocks_and_offloaded_payloads() {
     assert!(observer.0.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn ending_the_leader_term_cancels_block_gc_without_recording_a_failure() {
+    let store = Arc::new(MemoryStore::default());
+    let oldest = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
+    store.put(&oldest, Bytes::from(block(1).encode())).await.unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), TableCatalog::load(Some(block(10)), &BTreeMap::new()).unwrap(), TrieConfig::default()).unwrap()));
+    let observer = Arc::new(Observer::default());
+    let collector = BlockCollector::new(store.clone(), state, observer.clone(), GarbageConfig { blocks_to_keep: 1, ..Default::default() }).unwrap();
+    let term = CancellationToken::new();
+    term.cancel();
+
+    assert_eq!(collector.collect(&term).await.unwrap_err().code, "rtdb.maintenance/closed");
+    assert!(observer.0.lock().unwrap().is_empty());
+    assert!(store.head(&oldest).await.is_ok());
+}
+
 struct DeletedPublisher { store: Arc<MemoryStore>, table: rtdb_format::catalog::TableEntry, commits: Mutex<Vec<Vec<TrieKey>>> }
 #[async_trait]
 impl TrieDeletionPublisher for DeletedPublisher {

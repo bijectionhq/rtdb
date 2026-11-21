@@ -9,7 +9,7 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
@@ -58,6 +58,23 @@ struct Portal {
     _bind_storage: Option<Arc<MemoryReservation>>,
 }
 
+#[derive(Clone, Copy)]
+struct PreparationSettings<'a> { search_path: &'a str, timezone: &'a str }
+
+fn search_path(value: &str) -> Vec<String> {
+    value.split(',').map(|name| name.trim().trim_matches('"').to_owned()).collect()
+}
+
+fn parse_frontend_definition(bytes: &[u8]) -> Result<(&str, &str, Vec<i32>)> {
+    let mut input = Input::new(bytes);
+    let name = input.string()?;
+    let sql = input.string()?;
+    let count = usize::from(input.short()?);
+    let oids = (0..count).map(|_| input.integer()).collect::<Result<_>>()?;
+    input.end()?;
+    Ok((name, sql, oids))
+}
+
 pub(crate) struct ProtocolSession {
     session: NativeSession,
     node: Node,
@@ -68,12 +85,18 @@ pub(crate) struct ProtocolSession {
     skip_until_sync: bool,
     implicit: bool,
     transaction_generation: u64,
+    reported_await_token: u64,
+    reported_settings: u64,
     statements: BTreeMap<String, RegisteredStatement>,
     portals: BTreeMap<String, Portal>,
     copy: Option<crate::copy::CopyInput>,
 }
 impl ProtocolSession {
-    pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self { Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None } }
+    pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self {
+        let reported_settings = session.state().settings_revision();
+        Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0,
+            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None }
+    }
     pub fn extended(&self) -> bool { self.extended }
     pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.session.state_mut().close(); }
     fn environment(&self) -> Result<SessionEnvironment> { SessionEnvironment::new(self.session.state().parameter_entries(), self.session.state().effective_timezone(), self.node.memory()) }
@@ -85,7 +108,24 @@ impl ProtocolSession {
         Ok(())
     }
     fn ready(&self) -> u8 { match self.session.state().status() { TransactionStatus::Idle | TransactionStatus::Closed => b'I', TransactionStatus::Failed => b'E', _ => b'T' } }
-    fn options(&self) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: self.session.state().parameter("search_path").unwrap_or("public").split(',').map(|name| name.trim().trim_matches('"').to_owned()).collect(), ..Default::default() } }
+    async fn report_ready<W: AsyncWrite + Unpin>(&mut self, writer: &mut Writer<W>) -> Result<()> {
+        let status = self.ready();
+        if status == b'I' && self.startup.gateway_session_state {
+            let (revision, token) = self.session.state().connection_await_token();
+            if revision != self.reported_await_token {
+                writer.gateway_await_token(token).await?;
+                self.reported_await_token = revision;
+            }
+            let revision = self.session.state().settings_revision();
+            if self.startup.gateway_settings && revision != self.reported_settings {
+                let (encoded, _reservation) = self.session.state().encode_gateway_settings()?;
+                writer.gateway_settings(&encoded).await?;
+                self.reported_settings = revision;
+            }
+        }
+        writer.ready(status).await
+    }
+    fn options(&self) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: search_path(self.session.state().parameter("search_path").unwrap_or("public")), ..Default::default() } }
     fn begin_implicit(&mut self, read_only: Option<bool>) -> Result<()> { if self.session.state().status() != TransactionStatus::Idle { return Ok(()); } let mut settings = rtdb_node::TransactionSettings::default(); settings.access = read_only.map(|read_only| if read_only { rtdb_node::AccessSettings::ReadOnly(Default::default()) } else { rtdb_node::AccessSettings::ReadWrite(Default::default()) }); self.session.state_mut().begin_with(settings)?; self.implicit = true; Ok(()) }
     fn end_transaction(&mut self) { self.portals.clear(); self.implicit = false; self.transaction_generation = self.transaction_generation.wrapping_add(1); }
     async fn commit(&mut self) -> Result<()> { let _sample = rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction); let result = self.session.state_mut().commit_tx(None).await; self.end_transaction(); if let CommitResult::Executed(tx) = result? { if let Some(error) = tx.error() { return Err(error.clone()); } } Ok(()) }
@@ -93,6 +133,7 @@ impl ProtocolSession {
 
     pub async fn handle<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
         if self.skip_until_sync && frame.tag != b'S' { return Ok(()); }
+        if self.copy.is_some() && matches!(frame.tag, b'S' | b'H') { return Ok(()); }
         let result = self.message(&frame, writer).await;
         if let Err(error) = result {
             if error.code == "xtdb.pgwire/connection-error" { return Err(error); }
@@ -109,11 +150,15 @@ impl ProtocolSession {
             b'Q' => { let sql = input.string()?; input.end()?; self.simple(sql, writer).await?; }
             b'P' => {
                 self.extended = true;
-                let name = input.string()?; let sql = input.string()?;
-                let count = usize::from(input.short()?); let oids = (0..count).map(|_| input.integer()).collect::<Result<Vec<_>>>()?; input.end()?;
-                let prepared = self.prepare_client(sql, oids).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
+                let (name, sql, oids) = parse_frontend_definition(&frame.body)?;
+                let prepared = self.prepare_client(sql, oids, None).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
                 Self::planning_warnings(&prepared, writer).await?;
-                self.register_statement(Cow::Borrowed(name), prepared)?; writer.empty(b'1').await?;
+                self.register_statement(Cow::Borrowed(name), prepared)?;
+                writer.empty(b'1').await?;
+                if self.startup.gateway_settings && !name.is_empty() {
+                    writer.gateway_named_parse(name, self.session.state().parameter("search_path").unwrap_or("public"),
+                        self.session.state().effective_timezone(), &frame.body).await?;
+                }
             }
             b'B' => {
                 self.extended = true;
@@ -164,23 +209,76 @@ impl ProtocolSession {
                 let name = input.string()?.to_owned(); let limit = input.integer()?; input.end()?; if limit < 0 { return Err(protocol("Execute row limit cannot be negative")); }
                 let generation = self.transaction_generation;
                 let mut portal = self.portals.remove(&name).ok_or_else(|| protocol("no such portal"))?;
-                let result = self.execute(&mut portal, limit as usize, writer).await;
+                let result = self.execute(&mut portal, limit as usize, false, writer).await;
                 if generation == self.transaction_generation { self.portals.insert(name, portal); }
                 result?;
             }
             b'C' => { let kind = input.byte()?; let name = input.string()?; input.end()?; match kind { b'P' => { self.portals.remove(name); }, b'S' => { if let Some(statement) = self.statements.remove(name) { self.portals.retain(|_, portal| !Arc::ptr_eq(&portal.prepared, &statement.prepared)); } }, _ => return Err(protocol("Invalid close target")) } writer.empty(b'3').await?; }
-            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit().await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; writer.ready(self.ready()).await?; }
+            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit().await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
             b'd' => { self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))?.append(input.remaining()).await?; }
-            b'c' => { input.end()?; let copy = self.copy.take().ok_or_else(|| protocol("COPY IN not in progress"))?; let token = self.token(); let result = copy.finish(&mut self.session, &self.node, &token).await; if self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); } match result { Ok(rows) => writer.string(b'C', &format!("COPY {rows}")).await?, Err(error) => writer.error(&error, self.environment()?.fallback(), false).await? } writer.ready(self.ready()).await?; }
-            b'f' => { self.copy = None; writer.ready(self.ready()).await?; }
+            b'c' => {
+                input.end()?;
+                let copy = self.copy.take().ok_or_else(|| protocol("COPY IN not in progress"))?;
+                let token = self.token();
+                let result = copy.finish(&mut self.session, &self.node, &token).await;
+                if self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); }
+                match result {
+                    Ok(rows) => writer.string(b'C', &format!("COPY {rows}")).await?,
+                    Err(error) if self.extended => return Err(error),
+                    Err(error) => writer.error(&error, self.environment()?.fallback(), false).await?,
+                }
+                if !self.extended { self.report_ready(writer).await?; }
+            }
+            b'f' => {
+                self.copy = None;
+                if self.extended { return Err(protocol("COPY input was cancelled")); }
+                self.report_ready(writer).await?;
+            }
+            GATEWAY_SESSION_STATE_TAG if self.startup.gateway_session_state => {
+                if self.copy.is_some() || self.ready() != b'I' {
+                    return Err(protocol("A gateway can restore state only on an idle session"));
+                }
+                match input.byte()? {
+                    0 => {
+                        input.end()?;
+                        self.session.state_mut().set_await_token(None)?;
+                        self.reported_await_token = self.session.state().connection_await_token().0;
+                    }
+                    1 => {
+                        let token = std::str::from_utf8(input.remaining()).map_err(|_| protocol("The gateway await token is not UTF-8"))?.to_owned();
+                        self.session.state_mut().set_await_token(Some(token))?;
+                        self.reported_await_token = self.session.state().connection_await_token().0;
+                    }
+                    GATEWAY_SETTINGS_KIND if self.startup.gateway_settings => {
+                        self.session.state_mut().restore_gateway_settings(input.remaining())?;
+                        self.reported_settings = self.session.state().settings_revision();
+                    }
+                    GATEWAY_SQL_PREPARE_KIND if self.startup.gateway_settings => {
+                        let name = input.string()?;
+                        let source = input.string()?;
+                        let settings = PreparationSettings { search_path: input.string()?, timezone: input.string()? };
+                        input.end()?;
+                        self.restore_sql_prepare(name, source, settings).await?;
+                    }
+                    GATEWAY_NAMED_PARSE_KIND if self.startup.gateway_settings => {
+                        let expected = input.string()?;
+                        let settings = PreparationSettings { search_path: input.string()?, timezone: input.string()? };
+                        let (name, sql, oids) = parse_frontend_definition(input.remaining())?;
+                        if name != expected || name.is_empty() { return Err(protocol("The gateway's Parse name does not match its definition")); }
+                        let prepared = self.prepare_client(sql, oids, Some(settings)).await?;
+                        self.register_statement(Cow::Borrowed(name), prepared)?;
+                    }
+                    _ => return Err(protocol("Invalid gateway session state")),
+                }
+            }
             b'p' => (),
             _ => return Err(Anomaly::unsupported("xtdb.pgwire/unknown-client-msg", format!("unknown client message: {}", frame.tag))),
         }
         Ok(())
     }
 
-    async fn prepare_client(&mut self, original: &str, oids: Vec<i32>) -> Result<Arc<Prepared>> {
+    async fn prepare_client(&mut self, original: &str, oids: Vec<i32>, settings: Option<PreparationSettings<'_>>) -> Result<Arc<Prepared>> {
         let input = rtdb_sql::parse_extended_statement(original, self.node.memory())?;
         let source = match input.statement {
             ExtendedStatement::Empty => "",
@@ -189,7 +287,8 @@ impl ProtocolSession {
             ExtendedStatement::Prepare(syntax) => return self.retain_sql_prepare(syntax, oids),
         };
         let source = replace_namespace_query(source, (source, ""));
-        let options = self.options();
+        let mut options = self.options();
+        if let Some(settings) = settings { options.search_path = search_path(settings.search_path); }
         let shape = if source.is_empty() {
             PreparedShape { kind: PreparedKind::Empty, columns: None, parameter_count: 0 }
         } else if legacy_keyword_probe(source) {
@@ -198,7 +297,7 @@ impl ProtocolSession {
             .map_err(|error| extended_syntax_error(source, original, error, self.node.memory()))? {
             self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?)
         } else {
-            let context = self.session.prepare_context(&self.token()).await?;
+            let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
             let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
             let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)
                 .map_err(|error| extended_syntax_error(source, original, error, &context.memory))?;
@@ -207,14 +306,15 @@ impl ProtocolSession {
         self.retain_prepared(source, oids, shape)
     }
 
-    async fn prepare_batch_command(&mut self, syntax: ExecutableSyntax<'_>, allocation: Arc<MemoryReservation>) -> Result<Arc<Prepared>> {
+    async fn prepare_batch_command(&mut self, syntax: ExecutableSyntax<'_>, allocation: Arc<MemoryReservation>, settings: Option<PreparationSettings<'_>>) -> Result<Arc<Prepared>> {
         let source = syntax.source();
-        let options = self.options();
+        let mut options = self.options();
+        if let Some(settings) = settings { options.search_path = search_path(settings.search_path); }
         let shape = match syntax {
             ExecutableSyntax::FrontendResponse(_) => keyword_shape(),
             ExecutableSyntax::Control(control) => self.execute_columns(control_shape(PreparedControl::Batch(control.bind(&options)?), 0)?),
             ExecutableSyntax::Sql(syntax) => {
-                let context = self.session.prepare_context(&self.token()).await?;
+                let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
                 sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
             }
         };
@@ -240,10 +340,26 @@ impl ProtocolSession {
         Ok(Arc::new(Prepared { body: PreparedBody::SqlPrepare(syntax), oids, columns: None, _reservation: reservation }))
     }
 
-    async fn install_sql_prepare<W: AsyncWrite + Unpin>(&mut self, name: Cow<'_, str>, prepared: Arc<Prepared>, writer: &mut Writer<W>) -> Result<()> {
+    async fn install_sql_prepare<W: AsyncWrite + Unpin>(&mut self, name: Cow<'_, str>, source: &str, prepared: Arc<Prepared>, writer: &mut Writer<W>) -> Result<()> {
         Self::planning_warnings(&prepared, writer).await?;
-        self.register_statement(name, prepared)?;
+        if self.startup.gateway_settings && !name.is_empty() {
+            self.register_statement(Cow::Borrowed(&name), prepared)?;
+            writer.gateway_sql_prepare(&name, source,
+                self.session.state().parameter("search_path").unwrap_or("public"), self.session.state().effective_timezone()).await?;
+        } else {
+            self.register_statement(name, prepared)?;
+        }
         writer.string(b'C', "PREPARE").await
+    }
+
+    async fn restore_sql_prepare(&mut self, name: &str, source: &str, settings: PreparationSettings<'_>) -> Result<()> {
+        let memory = Arc::clone(self.node.memory());
+        let parsed = rtdb_sql::parse_extended_statement(source, &memory)?;
+        let ExtendedStatement::Prepare(syntax) = parsed.statement else { return Err(protocol("The gateway's statement is not a PREPARE")); };
+        if syntax.name() != name { return Err(protocol("The gateway's PREPARE name does not match its definition")); }
+        let _admission = self.session.admit_frontend_prepare(&[], &self.token()).await?;
+        let prepared = self.prepare_sql_child(syntax.child(&memory)?, Some(settings)).await?;
+        self.register_statement(Cow::Borrowed(name), prepared)
     }
 
     async fn planning_warnings<W: AsyncWrite + Unpin>(prepared: &Prepared, writer: &mut Writer<W>) -> Result<()> {
@@ -298,7 +414,7 @@ impl ProtocolSession {
     fn record_transaction_error(&self) { if let Some(observer) = self.node.execution_observer() { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
     async fn description<W: AsyncWrite + Unpin>(columns: Option<&[Column]>, fallback: PgType, writer: &mut Writer<W>) -> Result<()> { match columns { Some(columns) => writer.columns(columns, fallback).await, None => writer.empty(b'n').await } }
 
-    async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, writer: &mut Writer<W>) -> Result<()> {
+    async fn execute<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, limit: usize, commit_dml_before_reply: bool, writer: &mut Writer<W>) -> Result<()> {
         let prepared = Arc::clone(&portal.prepared);
         let failed = self.session.state().status() == TransactionStatus::Failed;
         let control = prepared.control();
@@ -327,6 +443,7 @@ impl ProtocolSession {
                 let _arguments = self.node.memory().reserve(bound)?;
                 let args = if portal.arguments.is_empty() { None } else { Some(rtdb_tx::SqlArguments::from_rows(vec![portal.arguments.clone()], self.node.memory())?) };
                 self.session.state_mut().execute_operation(statement.dml_operation(args)?).await?;
+                if commit_dml_before_reply { self.commit().await?; }
                 match statement.ordered_index_command_tag() {
                     Some(tag) => writer.string(b'C', tag).await,
                     None => writer.string(b'C', &dml_tag(source)).await,
@@ -346,7 +463,14 @@ impl ProtocolSession {
                         if matches!(statement, ControlStatement::SetRole) { return Ok(()); }
                         writer.string(b'C', &tag).await
                     }
-                    ControlResult::CopyIn { table, format, allocation: _allocation } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
+                    ControlResult::CopyIn { table, format, allocation: _allocation } => {
+                        if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "COPY is not allowed on the READ ONLY server")); }
+                        let copy = crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?;
+                        let format = copy.wire_format().code() as u8;
+                        self.copy = Some(copy);
+                        writer.send(b'G', &[format, 0, 1, 0, format]).await?;
+                        writer.flush().await
+                    }
                     _ => Err(protocol("Unexpected control execution result")),
                 }
             }
@@ -358,14 +482,14 @@ impl ProtocolSession {
     ) -> Result<()> {
         let _allocation = self.session.admit_frontend_prepare(&portal.arguments, &portal.cancellation).await?;
         let memory = Arc::clone(self.node.memory());
-        let prepared = self.prepare_sql_child(syntax.child(&memory)?).await?;
-        self.install_sql_prepare(Cow::Borrowed(syntax.name()), prepared, writer).await
+        let prepared = self.prepare_sql_child(syntax.child(&memory)?, None).await?;
+        self.install_sql_prepare(Cow::Borrowed(syntax.name()), syntax.source(), prepared, writer).await
     }
 
-    async fn prepare_sql_child(&mut self, child: SqlPrepareChild<'_>) -> Result<Arc<Prepared>> {
+    async fn prepare_sql_child(&mut self, child: SqlPrepareChild<'_>, settings: Option<PreparationSettings<'_>>) -> Result<Arc<Prepared>> {
         match child {
             SqlPrepareChild::Prepare(child) => self.retain_sql_prepare(child, Vec::new()),
-            SqlPrepareChild::Command { syntax, allocation } => self.prepare_batch_command(syntax, allocation).await,
+            SqlPrepareChild::Command { syntax, allocation } => self.prepare_batch_command(syntax, allocation, settings).await,
         }
     }
 
@@ -413,7 +537,7 @@ impl ProtocolSession {
         self.extended = false; self.portals.remove("");
         let result = self.simple_statements(source, writer).await;
         if let Err(error) = result { writer.error(error.anomaly(), self.environment()?.fallback(), false).await?; }
-        if self.copy.is_none() { writer.ready(self.ready()).await?; }
+        if self.copy.is_none() { self.report_ready(writer).await?; }
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(
@@ -459,6 +583,7 @@ impl ProtocolSession {
             rtdb_sql::parse_statement_batch(&source, &memory)
         };
         let mut batch = parsed.map_err(|error| SimpleQueryFailure::from_batch(error, &source, original, &memory))?;
+        let single_autocommit = batch.len() == 1 && self.session.state().status() == TransactionStatus::Idle;
         while let Some(statement) = batch.next_for_execution() {
             let start_transaction = match &statement {
                 BatchExecution::Prepare(_) => true,
@@ -468,14 +593,14 @@ impl ProtocolSession {
                 },
             };
             if start_transaction { self.begin_implicit(None)?; }
-            let result = self.run_simple_statement(statement, writer).await;
+            let result = self.run_simple_statement(statement, single_autocommit, writer).await;
             self.simple_statement_result(result, writer).await?;
         }
         drop(batch);
         self.settle_simple_transaction().await.map_err(Into::into)
     }
 
-    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, writer: &mut Writer<W>) -> Result<()> {
+    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, commit_dml_before_reply: bool, writer: &mut Writer<W>) -> Result<()> {
         let (syntax, allocation) = match statement {
             BatchExecution::Command { syntax, allocation } => (syntax, allocation),
             BatchExecution::Prepare(statement) => {
@@ -484,17 +609,18 @@ impl ProtocolSession {
                 }
                 let token = self.token();
                 let _allocation = self.session.admit_frontend_prepare(&[], &token).await?;
+                let source = statement.source();
                 let (name, child) = statement.into_child()?;
-                let prepared = self.prepare_sql_child(child).await?;
-                return self.install_sql_prepare(name.into(), prepared, writer).await;
+                let prepared = self.prepare_sql_child(child, None).await?;
+                return self.install_sql_prepare(name.into(), source, prepared, writer).await;
             }
         };
-        let prepared = self.prepare_batch_command(syntax, allocation).await?;
+        let prepared = self.prepare_batch_command(syntax, allocation, None).await?;
         Self::planning_warnings(&prepared, writer).await?;
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
         let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
         if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
-        self.execute(&mut portal, 0, writer).await
+        self.execute(&mut portal, 0, commit_dml_before_reply, writer).await
     }
 
     async fn simple_statement_result<W: AsyncWrite + Unpin>(&mut self, result: Result<()>, writer: &mut Writer<W>) -> Result<()> {
@@ -893,9 +1019,32 @@ mod tests {
         let options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
         let (node, driver) = Node::open(options, services).await.unwrap();
         let session = node.session("xtdb", identity).unwrap();
-        let startup = Startup { parameters: BTreeMap::new(), _reservation: node.memory().reserve(0).unwrap() };
+        let startup = Startup { parameters: BTreeMap::new(), gateway_session_state: false, gateway_settings: false, _reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
+    }
+
+    #[tokio::test]
+    async fn a_single_autocommit_write_reports_success_only_after_commit() {
+        let (mut frontend, driver) = test_frontend().await;
+        let node = frontend.node.clone();
+        let memory = Arc::clone(node.memory());
+        let driver = tokio::spawn(driver.run());
+        for (sql, expected) in [
+            ("INSERT INTO docs (_id, value) VALUES (NULL, 'invalid')", b'E'),
+            ("INSERT INTO docs (_id, value) VALUES (1, 'valid')", b'C'),
+        ] {
+            let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+            frontend.simple(sql, &mut writer).await.unwrap();
+            let bytes = writer.into_inner();
+            let mut reader = crate::wire::Reader::new(bytes.as_slice(), Arc::clone(&memory));
+            assert_eq!(reader.read(1 << 20).await.unwrap().unwrap().tag, expected);
+            assert_eq!(reader.read(1 << 20).await.unwrap().unwrap().tag, b'Z');
+            assert!(reader.read(1 << 20).await.unwrap().is_none());
+        }
+        drop(frontend);
+        node.shutdown();
+        driver.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -941,7 +1090,7 @@ mod tests {
     async fn bind_argument_slots_are_admitted_before_publishing_a_portal() {
         let (mut frontend, driver) = test_frontend().await;
         let memory = Arc::clone(frontend.node.memory());
-        let prepared = frontend.prepare_client("SET TIME ZONE 'UTC'", Vec::new()).await.unwrap();
+        let prepared = frontend.prepare_client("SET TIME ZONE 'UTC'", Vec::new(), None).await.unwrap();
         frontend.register_statement(Cow::Borrowed("zone"), prepared).unwrap();
 
         let count = 1024u16;
@@ -1014,7 +1163,7 @@ mod tests {
         let calibration = memory.reserve(limit / 2 - baseline).unwrap();
         let calibration_floor = memory.used_bytes();
         assert!(calibration_floor > previous_peak);
-        let prepared = frontend.prepare_client(&padded, Vec::new()).await.unwrap();
+        let prepared = frontend.prepare_client(&padded, Vec::new(), None).await.unwrap();
         let successful_headroom = memory.peak_bytes() - calibration_floor;
         let retained = memory.used_bytes() - calibration_floor;
         assert!(successful_headroom >= plan_boundary);
@@ -1026,7 +1175,7 @@ mod tests {
         let retained_at_plan = memory.used_bytes() + before_plan;
         let expected = format!("Cannot reserve {plan_bytes} bytes from budget {limit} with {retained_at_plan} retained");
         for source in [padded.as_str(), original] {
-            let error = frontend.prepare_client(source, Vec::new()).await.err().unwrap();
+            let error = frontend.prepare_client(source, Vec::new(), None).await.err().unwrap();
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             assert_eq!(error.message.as_deref(), Some(expected.as_str()));
             assert_eq!(memory.used_bytes(), baseline + short.bytes());
@@ -1035,7 +1184,7 @@ mod tests {
 
         let exact = memory.reserve(limit - baseline - successful_headroom).unwrap();
         for source in [padded.as_str(), original] {
-            let prepared = frontend.prepare_client(source, Vec::new()).await.unwrap();
+            let prepared = frontend.prepare_client(source, Vec::new(), None).await.unwrap();
             assert!(matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(query)) if query.source() == rewritten));
             assert_eq!(memory.used_bytes(), baseline + exact.bytes() + retained);
             drop(prepared);
@@ -1142,7 +1291,7 @@ mod tests {
         let (mut frontend, driver) = test_frontend().await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
-        let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new()).await.unwrap();
+        let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new(), None).await.unwrap();
         let old_statement = Arc::downgrade(&old);
         frontend.register_statement(Cow::Borrowed("zone"), Arc::clone(&old)).unwrap();
         let portal = frontend.bind(old, Vec::new(), Vec::new(), &[]).await.unwrap();
@@ -1194,7 +1343,7 @@ mod tests {
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let leaf = "SET TIME ZONE 'UTC'";
-        let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new()).await.unwrap();
+        let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new(), None).await.unwrap();
         let old_statement = Arc::downgrade(&old);
         frontend.register_statement(Cow::Borrowed("target"), old).unwrap();
 
@@ -1221,7 +1370,7 @@ mod tests {
         let leaf_bytes = leaf.len() * 128 + 8192;
         let held = memory.reserve(memory.limit_bytes() - retained - arguments - leaf_bytes + 1).unwrap();
         let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
-        let error = frontend.execute(&mut portal, 0, &mut writer).await.unwrap_err();
+        let error = frontend.execute(&mut portal, 0, false, &mut writer).await.unwrap_err();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let request = format!("Cannot reserve {leaf_bytes} bytes");
         assert!(error.message.as_deref().unwrap().starts_with(request.as_str()));
@@ -1229,7 +1378,7 @@ mod tests {
         drop(held);
         assert_eq!(memory.used_bytes(), retained);
 
-        frontend.execute(&mut portal, 0, &mut writer).await.unwrap();
+        frontend.execute(&mut portal, 0, false, &mut writer).await.unwrap();
         assert!(old_statement.upgrade().is_none());
         frontend.portals.insert("portal".into(), portal);
         let mut body = vec![b'S'];

@@ -11,6 +11,25 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{config::NodeConfiguration, health::{HealthConfig, HealthDriver, HealthHandle}};
 
+/// What a node placed by an outside authority needs beyond its configuration.
+pub struct PlacedOptions {
+    /// Log factories for the placed databases' logs, by protobuf type name.
+    pub log_factories: Vec<(String, Arc<dyn rtdb_node::LogFactory>)>,
+    /// Storage factories for the placed databases' object stores, by protobuf type name.
+    pub storage_factories: Vec<(String, Arc<dyn rtdb_node::RemoteStorageFactory>)>,
+    /// Asked before every query whether the node may still serve its database.
+    pub read_fence: Option<Arc<dyn rtdb_node::ReadFence>>,
+    /// Splits the placed databases' large scans into fragments read by the nodes they belong to.
+    pub scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
+    /// Publishes compactions this node's read-only databases produce through their writers elsewhere.
+    pub compaction_relay: Option<Arc<dyn rtdb_node::CompactionRelay>>,
+    /// How long a placed holder waits on an empty replica read before claiming.
+    pub claim_wait: Duration,
+    /// Accepts capabilities minted by the cell's gateways in place of a password.
+    pub capabilities: Option<Arc<dyn rtdb_pgwire::CapabilityVerifier>>,
+    pub flight_peer: Option<Arc<dyn rtdb_flight_sql::FlightPeerVerifier>>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ListenerAddresses { pub pgwire: Option<SocketAddr>, pub read_only_pgwire: Option<SocketAddr>, pub flight_sql: Option<SocketAddr>, pub health: Option<SocketAddr> }
 
@@ -45,18 +64,24 @@ impl ServerDriver {
     /// Run exactly once; request shutdown through the handle and join this run before releasing dependencies.
     pub async fn open(config: NodeConfiguration, allocation_limit_bytes: usize) -> Result<(ServerHandle, Self)> {
         let memory = MemoryBudget::new(config.node_options(allocation_limit_bytes)?.execution_memory_bytes);
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None).await
     }
 
     /// The supplied execution budget must match the cache/execution split of the process allocation ceiling.
     /// Startup allocations retained by the caller may already hold reservations from this budget.
     pub async fn open_with_memory(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None).await
+    }
+
+    /// Opens a node whose databases an outside placement authority attaches and detaches, with no primary database.
+    /// Its holders claim as soon as they reach the tip and append nothing while idle.
+    pub async fn open_placed(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, placed: PlacedOptions) -> Result<(ServerHandle, Self)> {
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed)).await
     }
 
     /// Uses a host clock for transactions appended to in-memory and local source logs.
     pub async fn open_with_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None).await
     }
 
     /// Runs compaction while following the replica log, with no transaction listeners or leader election.
@@ -72,11 +97,18 @@ impl ServerDriver {
         config.flight_sql = None;
         config.indexer.enabled = true;
         config.garbage.enabled = false;
-        Self::open_mode(config, allocation_limit_bytes, memory, true, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None).await
     }
 
-    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>) -> Result<(ServerHandle, Self)> {
+    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>) -> Result<(ServerHandle, Self)> {
         let mut options = config.node_options(allocation_limit_bytes)?;
+        if let Some(placed) = &placed {
+            options.membership = rtdb_node::Membership::Placed;
+            options.replication.claim_wait = Some(placed.claim_wait);
+            options.replication.idle_heartbeat = false;
+            // A placed deployment's tail lives on its logkeepers, which keep tails short: no record waits longer than this for its block.
+            options.replication.flush_timeout = options.replication.flush_timeout.min(Duration::from_secs(15 * 60));
+        }
         if memory.limit_bytes() != options.execution_memory_bytes { return Err(Anomaly::incorrect("rtdb.server/invalid-memory-budget", "Supplied execution budget differs from the configured allocation split")); }
         if compactor_only { options.replication.may_lead = false; }
         let metrics = Registry::new(&config.node_id, Arc::clone(&memory))?;
@@ -88,11 +120,21 @@ impl ServerDriver {
         let http = Arc::new(NativeHttp::new(Arc::clone(&memory), Duration::from_secs(30), 4 * 1024 * 1024)?);
         let auth = Authenticator::open(config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), http).await?;
         let (resources, external_sources, mut registrations) = crate::resources::open(&config, &memory, &metrics)?;
-        let resources = match transaction_clock {
+        let mut resources = match transaction_clock {
             Some(clock) => resources.with_log_clock(clock),
             None => resources,
         };
-        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer,
+        let compaction_relay = placed.as_ref().and_then(|placed| placed.compaction_relay.clone());
+        let read_fence = placed.as_ref().and_then(|placed| placed.read_fence.clone());
+        let scan_fragmenter = placed.as_ref().and_then(|placed| placed.scan_fragmenter.clone());
+        let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());
+        let flight_peer = placed.as_ref().and_then(|placed| placed.flight_peer.clone());
+        let gateway_session_state = placed.is_some();
+        if let Some(placed) = placed {
+            for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
+            for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
+        }
+        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, read_fence, scan_fragmenter,
             ..NodeServices::local(auth.clone(), metrics.clone(), auth.clone(), metrics.clone()) };
         if !config.search.enabled { services.scan_accelerators.clear(); }
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;
@@ -106,7 +148,7 @@ impl ServerDriver {
             for (port, read_only) in [(settings.port, false), (settings.read_only_port, true)] {
                 if port < 0 { continue; }
                 let mut configuration = rtdb_pgwire::ServerConfig { address: address(&settings.host, port).await?, maximum_connections: settings.connections,
-                    pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), ..Default::default() };
+                    pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), capabilities: capabilities.clone(), gateway_session_state, ..Default::default() };
                 if let Some(zone) = &config.default_timezone {
                     configuration.parameters.insert("timezone".into(), zone.clone());
                 }
@@ -120,7 +162,8 @@ impl ServerDriver {
             Some(settings) if settings.port >= 0 => {
                 let configuration = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
                     transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
-                    session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground, ..Default::default() };
+                    session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
+                    forwarded_peer: flight_peer, ..Default::default() };
                 let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
                 addresses.flight_sql = Some(handle.address());
                 Some((handle, driver))

@@ -33,6 +33,18 @@ async fn local_objects_are_immutable_and_ranges_are_exact() {
     immutable_objects(store.clone()).await; store.close_and_wait().await;
 }
 
+#[tokio::test]
+async fn local_delete_requires_a_retained_namespace_even_for_an_absent_object() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("objects");
+    let store = LocalStore::open(&root).unwrap();
+    let key = ObjectKey::new("new/partition/absent").unwrap();
+    store.delete(&key).await.unwrap();
+    std::fs::remove_dir(&root).unwrap();
+    assert!(store.delete(&key).await.is_err());
+    store.close_and_wait().await;
+}
+
 async fn immutable_file_upload(store: Arc<dyn ObjectStore>) {
     let source = tempfile::tempdir().unwrap();
     let path = source.path().join("source.arrow");

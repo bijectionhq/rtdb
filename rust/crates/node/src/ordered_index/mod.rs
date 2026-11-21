@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) use accelerate::OrderedIndexAccelerator;
 pub(crate) use maintenance::OrderedIndexMaintenance;
 
-const INDEX_ROOT: &str = "ordered-index/v2";
+use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

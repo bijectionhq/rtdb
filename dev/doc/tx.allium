@@ -29,11 +29,23 @@
 --      pgwire parses them itself.
 --      BEGIN evaluates and validates its characteristics, then publishes the open transaction with those characteristics atomically.
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
+--      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
+--      The gateway restores the mutable settings and token before replaying prepared statements or resuming application work.
+--      The mutable settings include the timezone, session parameters and default transaction access mode.
+--      DISCARD ALL restores the original startup settings.
+--      SQL PREPARE keeps the search path and timezone at definition across a gateway reconnect.
 --   2. ADBC and Flight SQL: a caller handing the connection SQL text has BEGIN, START TRANSACTION, COMMIT and ROLLBACK rejected with xtdb.adbc/tx-control-as-sql, which names the transaction API.
 --      These callers open and end transactions through their API: ADBC autocommit / commit / rollback, Flight SQL BeginTransaction / EndTransaction, and Xtdb.Connection.begin / commitSync / commitAsync / rollbackTx.
 --      They set characteristics with SET TRANSACTION, which is accepted as SQL, or with Xtdb.Connection.setTransactionReadOnly / setTransactionReadWrite / setTransactionTimeZone.
 --
 --      SET TRANSACTION modes is accepted as SQL from every frontend, classified by the SqlParser, so access mode, read basis, commit-opts and the transaction's time zone are all expressible there.
+--
+-- SHOW rtdb_source_barrier waits for the current database to apply the durable source tip it samples during the command.
+-- It is an idle-session operation and does not open or pin a transaction.
+-- A subsequent read on that connection observes at least that applied cut, including submissions from other sessions.
+-- Databases with external transaction sources and nodes without indexing cannot serve this barrier.
+-- SHOW rtdb_hosted_source_barrier is the hosted variant and returns the confirmed deployment identity.
+-- It requires a current holder with linearizable reads, a recovered directory checkpoint, and a fresh quorum confirmation.
 --
 -- == Boundaries ==
 --
@@ -166,7 +178,9 @@ value CommitOpts {
     -- grammar). Their very presence implies the transaction is Writing.
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
     --   system_time   — the system-time to record the transaction at.
-    --   user_metadata — opaque per-transaction metadata.
+    --   user_metadata — per-transaction metadata.
+    --                   RTDB recognises the Boolean rtdb_ordered_system_time field as an opt-in to rejecting an explicit system time behind the source log.
+    --                   The PgWire SHOW rtdb_ordered_system_time value is 1 when the server supports this guard.
     --   async         — true: commit submits without awaiting; false: execute-and-await.
     --                    The begin-time default; a COMMIT SYNC / COMMIT ASYNC (see CommitMode)
     --                    overrides it for that one commit.
@@ -317,7 +331,8 @@ entity DmlBuffer {
 
 entity FlightSqlTransaction {
     -- The handle Flight SQL's BeginTransaction returns, naming a transaction on a connection of its own.
-    -- A call presenting the handle reaches that transaction, whichever Flight SQL session the call runs in.
+    -- An authorised call presenting the handle reaches that transaction from another Flight SQL session in the same scope.
+    -- Placed Flight SQL handles are further scoped to the local attachment.
     -- Closing or expiring a session does not end it: only EndTransaction or the idle timeout does.
     connection: Connection
     status: open | expired
@@ -869,6 +884,20 @@ rule FailedTransactionRejectsStatements {
 -- pgwire's SQL COMMIT / ROLLBACK act on the explicit transaction regardless of auto_commit.
 -- ADBC's programmatic commit() / rollback() are valid only when auto_commit is off.
 
+rule PgwireSingleAutocommitWriteCompletesAfterCommit {
+    when: SimpleQueryExecuted(frontend, connection, statement)
+
+    requires: frontend.protocol = pgwire
+    requires: SingleImplicitDml(statement, connection)
+
+    ensures:
+        let outcome = CommitOutcome(connection)
+        if outcome.committed:
+            CommandComplete(frontend, statement)
+        else:
+            StatementRejected(error_code: outcome.error_code)
+}
+
 rule TxControlAsSqlRejected {
     -- BEGIN, START TRANSACTION, COMMIT and ROLLBACK reach the connection as SQL text from ADBC and Flight SQL callers; the error names the transaction API those callers use.
     when: TxControlSubmittedAsSql(frontend, connection, statement)
@@ -1180,6 +1209,11 @@ surface PgwireTxControl {
         -- Option evaluation and validation complete before BEGIN publishes an open transaction.
         -- A suspended option evaluation belongs to its initiating command; cancellation ends it and leaves the connection idle.
         -- The published transaction includes every accepted characteristic.
+
+    @guarantee CopyInputRespectsListenerAndSync
+        -- A read-only listener refuses COPY input before accepting bytes.
+        -- Extended COPY can stream input and ignores Sync until the transfer ends.
+        -- The next Sync completes the extended query cycle.
 }
 
 surface SqlStatements {
@@ -1277,9 +1311,6 @@ open question "What isolation does a null partition time in a pinned read basis 
     -- A Reading transaction retains the token captured by its first query, including null entries for partitions with no completed transaction.
     -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, query.clj retains those entries and operator/scan.clj leaves their system-time dimension unconstrained.
     -- A later query can therefore observe transactions applied after the first query while retaining the same null token entry.
-
-open question "Does a read-only pgwire server reject COPY IN as well as DML?"
-    -- The pinned pgwire verify-permissibility checks the server flag for DML, while copy-exec-op checks the connection's transaction access mode.
 
 open question "Should pgwire cancellation require the BackendKeyData secret as well as the connection identifier?"
     -- The pinned frontend sends a zero secret and routes CancelRequest by connection identifier alone.

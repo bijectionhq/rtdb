@@ -45,7 +45,7 @@ impl Registry {
     /// Registry allocations and returned catalog snapshots share the supplied execution budget.
     /// Callbacks allocate no metric names or labels; source registrations retain their own charges until removed.
     pub fn new(node_id: &str, memory: Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let reservation = memory.reserve(std::mem::size_of::<Self>().checked_add(TIMERS.len() * std::mem::size_of::<histogram::Timer>()).and_then(|bytes| bytes.checked_add(node_id.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        let reservation = memory.reserve(std::mem::size_of::<Self>().checked_add(TIMERS.len() * histogram::Timer::RETAINED_BYTES).and_then(|bytes| bytes.checked_add(node_id.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
         let now = wall_time_millis();
         Ok(Arc::new(Self { node_id: node_id.to_owned(), memory,
             state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] } }), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
@@ -176,8 +176,8 @@ fn wall_time_millis() -> i64 { match SystemTime::now().duration_since(UNIX_EPOCH
 mod tests {
     use super::*;
     #[test]
-    fn registry_initialization_fits_a_java_thread_stack() {
-        std::thread::Builder::new().stack_size(1 << 20).spawn(|| {
+    fn registry_initialization_and_sampling_fit_a_small_worker_stack() {
+        std::thread::Builder::new().stack_size(128 << 10).spawn(|| {
             let memory = MemoryBudget::new(1 << 22);
             let registry = Registry::new("embedded", Arc::clone(&memory)).unwrap();
             registry.record_duration(ExecutionTimer::Query, Duration::from_millis(1));

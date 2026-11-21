@@ -55,9 +55,19 @@ fn startup_environment_resolves_inside_provider_properties_and_numeric_fields() 
 }
 
 #[test]
+fn a_user_list_grants_databases_per_user() {
+    let config = decode("authn: !UserList\n  users:\n    alice: !Argon2id encoded\n  grants:\n    alice:\n      '*': READ_WRITE\n      control: DENY\n      blog: READ").unwrap();
+    let AuthConfig::UserList { grants, .. } = config.auth else { panic!() };
+    assert_eq!(grants["alice"]["*"], rtdb_auth::GrantedAccess::Write);
+    assert_eq!(grants["alice"]["control"], rtdb_auth::GrantedAccess::Deny);
+    assert_eq!(grants["alice"]["blog"], rtdb_auth::GrantedAccess::Read);
+    assert!(decode("authn: !UserList\n  users: {}\n  grants:\n    alice:\n      shop: ADMIN").is_err());
+}
+
+#[test]
 fn startup_auth_rules_remain_ordered_and_default_oidc_to_reference_trust() {
     let config = decode("authn: !UserList\n  users:\n    alice: !Argon2id encoded\n  rules:\n    - user: alice\n      method: PASSWORD\n    - remoteAddress: 127.0.0.1\n      method: TRUST").unwrap();
-    let AuthConfig::UserList { users, rules } = config.auth else { panic!() };
+    let AuthConfig::UserList { users, rules, .. } = config.auth else { panic!() };
     assert_eq!(users["alice"].encoded(), "encoded");
     assert_eq!(rules[0].method, Method::Password);
     assert_eq!(rules[1].remote_address.as_deref(), Some("127.0.0.1"));

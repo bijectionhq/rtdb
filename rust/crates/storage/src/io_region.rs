@@ -7,26 +7,29 @@ tokio::task_local! {
     static RETAINED_OWNER: Arc<dyn Send + Sync>;
 }
 
-pub struct IoRegion { closed: Mutex<bool>, tasks: TaskTracker, parent: Option<Arc<IoRegion>> }
+pub struct IoRegion {
+    closed: Mutex<bool>,
+    tasks: TaskTracker,
+    parent: Option<Arc<IoRegion>>,
+    lifetime: Option<Arc<dyn Send + Sync>>,
+    #[cfg(feature = "remote")]
+    publication_journal: Option<Arc<dyn crate::remote::PublicationJournal>>,
+}
 pub(crate) struct IoAdmission {
-    retained: Option<Arc<dyn Send + Sync>>,
+    lifetimes: Vec<Arc<dyn Send + Sync>>,
     tokens: Vec<TaskTrackerToken>,
 }
 impl IoAdmission {
     pub(crate) fn and(mut self, other: Self) -> Self {
         self.tokens.extend(other.tokens);
-        if let Some(owner) = other.retained {
-            self.retained = Some(match self.retained {
-                Some(current) if Arc::ptr_eq(&current, &owner) => current,
-                Some(current) => Arc::new((current, owner)),
-                None => owner,
-            });
-        }
+        self.lifetimes.extend(other.lifetimes);
         self
     }
 }
 impl IoRegion {
-    pub fn new() -> Arc<Self> { Arc::new(Self { closed: Mutex::new(false), tasks: TaskTracker::new(), parent: None }) }
+    pub fn new() -> Arc<Self> {
+        Self::region(None, None)
+    }
     /// Extends the owner's lifetime through provider operations admitted while polling the work.
     /// A nested operation inherits the enclosing owners.
     pub async fn retaining<T>(
@@ -42,16 +45,37 @@ impl IoRegion {
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
     /// Idle child handles do not delay any drain.
     pub fn child(self: &Arc<Self>) -> Arc<Self> {
-        Arc::new(Self { closed: Mutex::new(false), tasks: TaskTracker::new(), parent: Some(Arc::clone(self)) })
+        self.child_holding(None)
+    }
+    /// Retain a provider lifetime in every admitted task. An unfinished task
+    /// keeps its authority witness even if the async region owner is dropped.
+    pub fn child_holding(self: &Arc<Self>, lifetime: Option<Arc<dyn Send + Sync>>) -> Arc<Self> {
+        Self::region(Some(Arc::clone(self)), lifetime)
+    }
+    fn region(parent: Option<Arc<IoRegion>>, lifetime: Option<Arc<dyn Send + Sync>>) -> Arc<Self> {
+        Arc::new(Self {
+            closed: Mutex::new(false), tasks: TaskTracker::new(), parent, lifetime,
+            #[cfg(feature = "remote")]
+            publication_journal: None,
+        })
+    }
+    /// Gives an unused region a durable owner for its provider writes.
+    #[cfg(feature = "remote")]
+    pub fn track_publications(&mut self, journal: Arc<dyn crate::remote::PublicationJournal>) {
+        assert!(self.publication_journal.is_none(), "a region has one publication journal");
+        self.publication_journal = Some(journal);
+    }
+    #[cfg(feature = "remote")]
+    pub fn publication_journal(&self) -> Option<&dyn crate::remote::PublicationJournal> {
+        self.publication_journal.as_deref()
     }
     pub(crate) fn admit(&self) -> Result<IoAdmission> {
         let closed = self.closed.lock();
         if *closed { return Err(Error::Closed("I/O region is closed".into())); }
-        let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?.unwrap_or_else(|| IoAdmission {
-            tokens: Vec::new(),
-            retained: RETAINED_OWNER.try_with(Arc::clone).ok(),
-        });
+        let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
+            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: RETAINED_OWNER.try_with(Arc::clone).into_iter().collect() });
         admission.tokens.push(self.tasks.token());
+        admission.lifetimes.extend(self.lifetime.iter().cloned());
         Ok(admission)
     }
     pub(crate) fn close(&self) { let mut closed = self.closed.lock(); *closed = true; self.tasks.close(); }

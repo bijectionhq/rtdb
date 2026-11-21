@@ -3,6 +3,7 @@
             [xtdb.api :as xt]
             [xtdb.basis :as basis]
             [xtdb.compactor :as c]
+            [xtdb.log :as xt-log]
             [xtdb.serde :as serde]
             [xtdb.test-util :as tu :refer [*conn*]]
             [xtdb.time :as time]
@@ -743,6 +744,8 @@ VALUES (2, DATE '2022-01-01', DATE '2021-01-01')"])
 (t/deftest processed-msg-ids-equal-to-submitted-msg-ids-4813
   (xt/execute-tx *conn* [[:put-docs :docs {:xt/id :foo, :name "Foo"}]])
   (tu/flush-block! tu/*node*)
+  (c/compact-all! tu/*node* #xt/duration "PT5S")
+  (xt-log/sync-node tu/*node* #xt/duration "PT5S")
 
   (let [{:keys [latest-submitted-msg-ids latest-processed-msg-ids]} (xt/status *conn*)]
     (t/is (seq latest-submitted-msg-ids))
