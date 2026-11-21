@@ -130,6 +130,9 @@ pub trait Log: Send + Sync {
     fn latest(&self) -> Result<LogOffset>;
     /// Observes a dense log's first retained offset without reserving its records.
     async fn retained_floor(&self) -> Result<Option<LogOffset>> { Ok(None) }
+    /// Opens a replay cursor whose starting position is checked before the driver starts.
+    /// A provider that defers cursor admission returns None.
+    async fn recovery_tail(&self, _after: LogOffset) -> Result<Option<Box<dyn LogTail>>> { Ok(None) }
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>>;
     /// Captures record starts in [from, to), bounded by the current durable tip.
     /// A missing start within the captured tip is an error; starts beyond the tip return an empty range.

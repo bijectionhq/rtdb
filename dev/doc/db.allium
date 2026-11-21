@@ -611,7 +611,8 @@ config {
 -- == Leader Startup ==
 --
 -- A writable restart restores the latest persisted block and reads the replica suffix from that block's boundary.
--- When the first required replay position precedes the observed retained floor, ordinary startup may select a strictly newer published checkpoint.
+-- Ordinary startup tries to admit a replica cursor at the selected checkpoint and hands that cursor to the driver when the provider supports early admission.
+-- When cursor admission reports that the required position precedes the retained prefix, ordinary startup may select a strictly newer published checkpoint.
 -- An exact checkpoint keeps its selected boundary. If ordinary startup has no newer checkpoint that can cover the missing prefix, startup fails.
 -- An admitted upload after a recovered boundary in the configured replica epoch confirms its checkpoint when the block index, storage version and epoch, source watermark, and external token match its recorded identity.
 -- An omitted upload storage epoch means zero.

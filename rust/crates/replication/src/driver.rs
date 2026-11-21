@@ -290,7 +290,7 @@ impl ReplicationDriver {
     /// Source submissions accept caller timestamps, and log providers determine the timestamps in records.
     /// Returns a handle and an idle driver after checking configuration, recovered progress, log boundaries and memory admission.
     pub fn new_with_clock(
-        config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, recovered: RecoveredPartition,
+        config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, mut recovered: RecoveredPartition,
         progress: Arc<ProgressMonitor>, resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>,
         cancellation: CancellationToken, clock: ReplicationClock,
     ) -> Result<(ReplicationHandle, Self)> {
@@ -313,9 +313,10 @@ impl ReplicationDriver {
         let recovered_confirmation = if config.enabled && config.may_lead {
             recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
         } else { None };
+        let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
         let result = self.run_inner().await;
@@ -337,7 +338,10 @@ impl ReplicationDriver {
         }
         let cancellation = self.cancellation.clone();
         if cancellation.is_cancelled() { return Ok(()); }
-        let tail = self.logs.replica_tail(self.read_position).await;
+        let tail = match self.replica_tail.take() {
+            Some(tail) => Ok(tail),
+            None => self.logs.replica_tail(self.read_position).await,
+        };
         if cancellation.is_cancelled() { return Ok(()); }
         let tail = tail?;
         let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };

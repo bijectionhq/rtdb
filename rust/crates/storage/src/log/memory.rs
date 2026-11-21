@@ -112,6 +112,10 @@ impl Log for MemoryLog {
         Ok(Some(self.first_retained()))
     }
 
+    async fn recovery_tail(&self, after: LogOffset) -> Result<Option<Box<dyn LogTail>>> {
+        self.tail(after).await.map(Some)
+    }
+
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         let next = after.0.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         read(&self.shared, next, next)?;

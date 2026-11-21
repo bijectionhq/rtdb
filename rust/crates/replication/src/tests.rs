@@ -870,8 +870,11 @@ async fn a_trimmed_replay_anchor_can_advance_only_for_latest_checkpoint_recovery
     produce_newer_memory_checkpoint(&fixture).await;
     fixture.replica.truncate_before(LogOffset(3)).unwrap();
 
-    let refreshed = fixture.blocks.recover_for_replay(before_trim, latest, &fixture.logs, config, now, &cancellation).await.unwrap();
-    assert_eq!(refreshed.block.unwrap().block_index(), BlockIndex(1));
+    let mut refreshed = fixture.blocks.recover_for_replay(before_trim, latest, &fixture.logs, config, now, &cancellation).await.unwrap();
+    assert_eq!(refreshed.block.as_ref().unwrap().block_index(), BlockIndex(1));
+    let after = refreshed.replica_start(&fixture.logs).unwrap();
+    assert!(refreshed.take_replay_tail(&fixture.logs, after).unwrap().is_some());
+    assert!(refreshed.take_replay_tail(&fixture.logs, after).unwrap().is_none());
 
     let fixed = fixture.blocks.recover_for_replay(exact_anchor, exact, &fixture.logs, config, now, &cancellation).await.unwrap();
     assert_eq!(fixed.block.unwrap().block_index(), BlockIndex(0));
