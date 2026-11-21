@@ -104,4 +104,14 @@ NoRetiredStorage == acknowledged => 0 \notin objects
 NoRetiredReaderCopy == acknowledged => \A reader \in copies : readers[reader] # 0
 NoRestoredErasedPayload == 1 \notin dirty
 
+ReleaseSpec ==
+  /\ Spec
+  /\ WF_Vars(Retire)
+  /\ \A writer \in Writers : WF_Vars(\E committed \in BOOLEAN : SettleUpload(writer, committed))
+  /\ \A reader \in Readers : WF_Vars(ReleaseRead(reader))
+  /\ WF_Vars(EraseObjects)
+  /\ WF_Vars(Acknowledge)
+
+CompletesRetirement == <>acknowledged
+
 =============================================================================

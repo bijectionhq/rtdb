@@ -7,7 +7,7 @@ The checker results and the remaining production obligations appear below.
 | Property | Proof source | Production refinement still required |
 | --- | --- | --- |
 | Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` proves exact coverage for a recursive dyadic decomposition and for any left-to-right tiling. | Connect RTDB's newest-first temporal resolver, coalescing, and greedy bucket iterator to the model. |
-| Signed timestamps, unbounded end and bucket lookup | `domain.rs` checks the production timestamp conversion and aligned bucket lookup. | Connect the greedy iterator's width selection and progression to the tiling contract. |
+| Signed timestamps, unbounded end and bucket lookup | `domain.rs` checks production timestamp conversion, aligned bucket lookup and the maximal aligned step used by the bucket iterator. | Relate the iterator state and termination to the complete tiling in `Buckets.lean`. |
 | Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` states ordered merge, filtering before limit, and keyset continuation. | Connect Arrow values and SQL comparisons to the order and filters, and the tree cursor and heap to the ordered streams. |
 | Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | Establish that the canonical flushed inputs and live offset are an ordered substream of the exact capture. |
 | Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | Prove the sharing rule for `Tree::persist` and `store_roots`, and connect reader retention, leadership and immutable writes to the protocol. |
@@ -81,6 +81,8 @@ The native `ordered_index` filter passed six cases on the merged engine with ord
 The cases cover idempotent declaration, ordered distinct limits, both scan directions, exact temporal reads, reopen, and primary compaction.
 Lean 4.35.0 checked seven law modules and audited 17 theorems.
 Verus 0.2026.11.05.31e44e6 on the MacBook Pro M1 checked ten domain functions and six seek functions using the included production sources.
+Verus 0.2026.11.20.9da409b checked 20 obligations after adding the production bucket step.
+Changing that step to choose a smaller bucket failed its maximal-width assertion.
 TLC reran the erasure models and reproduced the three expected failures in their weakened controls.
 
 The local Bijection PgWire fixture `registered_pages_agree_with_and_without_ordered_index` exercised hosted WorldStore authority and fixture custody against a local RTDB build using the traced query implementation recorded at `49bd0c804845235ab0721c95dda596b5ee4c68b6`.
@@ -99,6 +101,8 @@ With two publishers and two readers, TLC explored all 605 reachable states with 
 Setting `SettleUploads` to `FALSE` allowed a retired object to reappear after acknowledgement.
 Setting `DrainReaders` to `FALSE` allowed acknowledgement while an original reader still owned a copy.
 Setting `ScrubReplay` to `FALSE` allowed the replacement generation to carry erased content.
+`ScopeRetirementLiveness.cfg` checked eventual acknowledgement over the same 605 states under weak fairness for closing, settlement, reader release, deletion, and acknowledgement.
+Removing either upload settlement fairness or reader release fairness produced a liveness counterexample.
 
 The hosted implementation still needs a generation authority shared by read admission, the provider publication journal, and erasure completion.
 The authority must close the generation before inspecting the journal. It must settle each admitted upload by completion or confirmed abort, then verify deletion at the provider.
