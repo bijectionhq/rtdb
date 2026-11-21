@@ -377,6 +377,7 @@ async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
     let mut client = Client::connect(&running.server, None).await;
     let record = Value::Struct(StructFields::from([("a".into(), Value::I64(7))]));
     let list = Value::List(vec![Value::Utf8("list".into())]);
+    let fixed = Value::FixedSizeList(vec![Value::I64(13), Value::I64(21)]);
     let upload = |ids: Vec<i64>, logical: LogicalType, values: &[Value]| {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Int64, false),
@@ -396,7 +397,8 @@ async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
         vec![Arc::new(UInt64Array::from(vec![u64::MAX])), Arc::new(Int64Array::from(vec![9]))]).unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("v", aliases.data_type().clone(), false)]));
     let aliases = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![4, 5])), Arc::new(aliases)]).unwrap();
-    client.upload(command, vec![aliases]).await;
+    client.upload(command.clone(), vec![aliases]).await;
+    client.upload(command, vec![upload(vec![6], fixed.logical_type(), std::slice::from_ref(&fixed))]).await;
     client.end(tx, true).await.unwrap();
 
     let database = running.node.catalog().database("xtdb").unwrap();
@@ -419,7 +421,7 @@ async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
         (0..batch.num_rows()).map(|row| (integer(batch, 0, row), rtdb_columnar::read_value(field, array, row).unwrap())).collect::<Vec<_>>()
     }).collect();
     rows.sort_by_key(|(id, _)| *id);
-    assert_eq!(rows, [(1, record), (2, Value::Null), (3, list), (4, Value::I64(-1)), (5, Value::I64(9))]);
+    assert_eq!(rows, [(1, record), (2, Value::Null), (3, list), (4, Value::I64(-1)), (5, Value::I64(9)), (6, fixed)]);
     running.stop().await;
 }
 

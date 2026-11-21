@@ -9,7 +9,7 @@ Prepared updates retain uploaded Arrow parameter batches through transaction buf
 Separate uploads of the same statement can have different schemas when they are coalesced in a transaction.
 The source encoder aligns compatible argument vectors by position in Arrow and preserves the order of the argument rows.
 Bulk ingestion retains compatible Arrow document columns during source-log encoding, replay and transaction staging.
-This includes lists and structs with compatible child fields.
+This includes lists, fixed-size lists and structs with compatible child fields.
 When a struct gains fields between compatible Arrow uploads, source encoding joins those fields in Arrow, including structs inside lists.
 Arrow batches targeting the same table can share a source-log document layout when their common columns agree and other columns are absent.
 When the same transaction also contains compatible row-backed puts for that table, source encoding builds vectors from those rows and combines them with the uploaded vectors in transaction order.
