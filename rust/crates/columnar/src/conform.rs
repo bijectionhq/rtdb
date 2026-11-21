@@ -19,8 +19,8 @@ pub fn relayout_arrow_column(array: ArrayRef, source: &arrow_schema::Field, targ
 }
 
 /// Bounds the temporary and new allocations needed to relayout an already owned array.
-pub fn arrow_relayout_bound(array: &dyn arrow_array::Array, target: &arrow_schema::Field) -> Result<usize> {
-    add(multiply(target.size(), 8)?, physical::additional_bytes(&array.to_data(), target)?)
+pub fn arrow_relayout_bound(array: &dyn arrow_array::Array, source: &arrow_schema::Field, target: &arrow_schema::Field) -> Result<usize> {
+    add(multiply(target.size(), 8)?, physical::additional_bytes(&array.to_data(), source, target)?)
 }
 
 /// A page in a declared wire layout, retaining its schema and allocation charges.
@@ -70,7 +70,7 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         if input.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
         let ty = layout(&target, &source_type)?;
         if let Some((source_field, array)) = input {
-            let bound = arrow_relayout_bound(array.as_ref(), field)?;
+            let bound = arrow_relayout_bound(array.as_ref(), source_field, field)?;
             if let Ok(_scratch) = memory.reserve(bound)
                 && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field) {
                 output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;

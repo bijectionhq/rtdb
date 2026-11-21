@@ -4,24 +4,44 @@ use arrow_buffer::ScalarBuffer;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_types::{LogicalType as L, Result};
-use crate::{copy_array, from_field, leg_name, to_field};
+use crate::{from_field, leg_name, to_field};
 
-pub(super) fn additional_bytes(data: &ArrayData, target: &Field) -> Result<usize> {
+pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field) -> Result<usize> {
     let null_bytes = |target: &Field| {
         crate::estimate_builder_bytes_refs(&from_field(target)?.maybe(), std::iter::repeat_n(&rtdb_types::Value::Null, data.len()))
     };
-    match (data.data_type(), target.data_type()) {
-        (_, DataType::Union(..)) => super::add(super::multiply(data.len(), 64)?, data.get_slice_memory_size().map_err(crate::arrow_error)?),
+    match (source.data_type(), target.data_type()) {
+        (source_type, DataType::Union(targets, UnionMode::Dense)) => {
+            let tags = super::multiply(data.len(), 64)?;
+            let children = match source_type {
+                DataType::Union(sources, UnionMode::Dense) => {
+                    targets.iter().try_fold(0, |bytes, (_, target)| {
+                        let name = leg_name(&from_field(target)?)?;
+                        let Some((index, _, source)) = union_leg(sources, &name) else { return Ok(bytes) };
+                        super::add(bytes, additional_bytes(&data.child_data()[index], source, target)?)
+                    })?
+                }
+                _ => {
+                    let copy = data.get_slice_memory_size().map_err(crate::arrow_error)?;
+                    if let Some(name) = monomorphic_leg(source)?
+                        && let Some((_, _, target)) = union_leg(targets, &name) {
+                        super::add(copy, additional_bytes(data, source, target)?)?
+                    } else { copy }
+                }
+            };
+            super::add(tags, children)
+        }
         (DataType::Null, _) => null_bytes(target),
         (DataType::Struct(source), DataType::Struct(target)) => target.iter().try_fold(0, |bytes, field| {
             let extra = match source.iter().position(|original| original.name() == field.name()) {
-                Some(index) => additional_bytes(&data.child_data()[index], field)?,
+                Some(index) => additional_bytes(&data.child_data()[index], &source[index], field)?,
                 None => null_bytes(field)?,
             };
             super::add(bytes, extra)
         }),
-        (DataType::List(_), DataType::List(field)) | (DataType::FixedSizeList(..), DataType::FixedSizeList(field, _))
-        | (DataType::Map(..), DataType::Map(field, _)) => additional_bytes(&data.child_data()[0], field),
+        (DataType::List(source), DataType::List(target))
+        | (DataType::FixedSizeList(source, _), DataType::FixedSizeList(target, _))
+        | (DataType::Map(source, _), DataType::Map(target, _)) => additional_bytes(&data.child_data()[0], source, target),
         _ => Ok(0),
     }
 }
@@ -85,10 +105,8 @@ pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Resul
 fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields) -> Result<(Field, ArrayRef)> {
     let canonical = array.as_any().downcast_ref::<UnionArray>();
     let source_fields = match source.data_type() { DataType::Union(fields, UnionMode::Dense) => Some(fields), _ => None };
-    let source_type = if source_fields.is_none() { from_field(source)?.legs().into_iter().find(|leg| !matches!(leg, L::Null | L::Nothing)) } else { None };
-    let source_leg = source_type.as_ref().map(leg_name).transpose()?;
-    let scalar = matches!(source_type, Some(L::Scalar(_)));
-    let valid = array.nulls().filter(|nulls| scalar && nulls.null_count() > 0);
+    let source_leg = if source_fields.is_none() { monomorphic_leg(source)? } else { None };
+    let valid = array.nulls().filter(|nulls| source_leg.is_some() && nulls.null_count() > 0);
     let mut fields = Vec::with_capacity(targets.len());
     let mut children = Vec::with_capacity(targets.len());
     let mut mappings = Vec::with_capacity(targets.len());
@@ -98,10 +116,10 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
         let logical = from_field(target_field)?;
         let name = leg_name(&logical)?;
         let (source_field, child) = if let Some(sources) = source_fields {
-            if let Some((source_id, field)) = sources.iter().find(|(_, field)| from_field(field).and_then(|logical| leg_name(&logical)).is_ok_and(|source| source == name)) {
+            if let Some((_, source_id, field)) = union_leg(sources, &name) {
                 mappings.push((source_id, target_id));
                 (field.as_ref().clone(), Arc::clone(canonical.ok_or_else(incompatible)?.child(source_id)))
-            } else { (to_field(target_field.name(), &logical)?, copy_array(&logical, &[])?) }
+            } else { (target_field.as_ref().clone(), arrow_array::new_empty_array(target_field.data_type())) }
         } else if logical == L::Null {
             null_id = Some(target_id);
             (to_field(target_field.name(), &L::Null)?, Arc::new(NullArray::new(array.len())) as ArrayRef)
@@ -111,8 +129,8 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
                 Some(valid) => arrow_select::filter::filter(array.as_ref(), &BooleanArray::new(valid.inner().clone(), None)).map_err(crate::arrow_error)?,
                 None => Arc::clone(&array),
             };
-            (source.clone().with_nullable(source.is_nullable() && !scalar), child)
-        } else { (to_field(target_field.name(), &logical)?, copy_array(&logical, &[])?) };
+            (source.clone().with_nullable(false), child)
+        } else { (target_field.as_ref().clone(), arrow_array::new_empty_array(target_field.data_type())) };
         let (field, child) = relayout(child, &source_field, target_field)?;
         fields.push((target_id, field));
         children.push(child);
@@ -137,6 +155,16 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
     let fields = UnionFields::try_new(fields.iter().map(|(id, _)| *id), fields.iter().map(|(_, field)| field.clone())).map_err(crate::arrow_error)?;
     let array = Arc::new(UnionArray::try_new(fields.clone(), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(crate::arrow_error)?);
     Ok((target.clone().with_data_type(DataType::Union(fields, UnionMode::Dense)), array))
+}
+
+fn monomorphic_leg(field: &Field) -> Result<Option<String>> {
+    from_field(field)?.legs().into_iter().find(|leg| !matches!(leg, L::Null | L::Nothing)).as_ref().map(leg_name).transpose()
+}
+
+fn union_leg<'a>(fields: &'a UnionFields, name: &str) -> Option<(usize, i8, &'a Arc<Field>)> {
+    fields.iter().enumerate().find_map(|(index, (id, field))| {
+        from_field(field).and_then(|logical| leg_name(&logical)).is_ok_and(|leg| leg == name).then_some((index, id, field))
+    })
 }
 
 fn incompatible() -> rtdb_types::Anomaly { super::fault("page-outside-declared-type", "Page physical layout differs from its declared type") }
