@@ -906,15 +906,20 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
 An Apple M4 Max debug build created parked records directly in `MemoryDirectory` with three logkeeper IDs per record and one active keyed watch.
 The run includes the directory's deployment and name indexes and uses process resident-set change divided by the number of parked records.
 
-| Parked deployments | Directory inserts/s | Resident bytes per record | JSON bytes for the last record | Additional Tokio tasks |
-| ---: | ---: | ---: | ---: | ---: |
-| 100,000 | 175,214 | 1,548 | 515 | 0 |
-| 1,000,000 | 152,846 | 1,544 | 516 | 0 |
+| Build | Parked deployments | Directory inserts/s | Resident bytes per record | JSON bytes for the last record | Additional Tokio tasks |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before hosted recovery and custody | 100,000 | 175,214 | 1,548 | 515 | 0 |
+| Before hosted recovery and custody | 1,000,000 | 152,846 | 1,544 | 516 | 0 |
+| Hosted recovery and custody | 1,000,000 | 118,297 | 3,495 | 606 | 0 |
+| Hosted recovery and custody with boxed index values | 1,000,000 | 133,613 | 2,450 | 606 | 0 |
+
+The in-memory directory stores one boxed value for each deployment, so unused index slots reserve space for pointers instead of full records.
+The durable local directory file retains the same JSON shape.
 
 ```sh
 RTDB_PARKED_BENCH_DEPLOYMENTS=1000000 \
   cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --test footprint \
-  parked_directory_density -- --ignored --nocapture
+  parked_directory_density_with_an_active_watch -- --ignored --exact --nocapture
 ```
 
 **DynamoDB parked item size**

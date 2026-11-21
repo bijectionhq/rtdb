@@ -641,7 +641,7 @@ pub struct MemoryDirectory {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryState {
-    deployments: BTreeMap<String, DeploymentRecord>,
+    deployments: BTreeMap<String, Box<DeploymentRecord>>,
     names: BTreeMap<String, String>,
     #[serde(skip)]
     held: BTreeMap<MemberId, BTreeSet<String>>,
@@ -695,7 +695,7 @@ impl MemoryDirectory {
         if let Some(holder) = &record.holder {
             state.held.entry(holder.clone()).or_default().insert(record.id.clone());
         }
-        state.deployments.insert(record.id.clone(), record.clone());
+        state.deployments.insert(record.id.clone(), Box::new(record.clone()));
         self.persist(state)?;
         self.changes.publish(record.clone());
         Ok(record)
@@ -710,37 +710,38 @@ impl Directory for MemoryDirectory {
     }
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
         let mut state = self.state()?;
-        check_fork_parent(&child, state.deployments.get(fork_parent_id(&child)?), expected_parent)?;
+        check_fork_parent(&child, state.deployments.get(fork_parent_id(&child)?).map(Box::as_ref), expected_parent)?;
         self.insert_deployment(&mut state, child)
     }
-    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).cloned()) }
+    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).map(Box::as_ref).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
         let state = self.state()?;
-        Ok(state.names.get(name).and_then(|id| state.deployments.get(id)).cloned())
+        Ok(state.names.get(name).and_then(|id| state.deployments.get(id)).map(Box::as_ref).cloned())
     }
-    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state()?.deployments.values().cloned().collect()) }
+    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state()?.deployments.values().map(Box::as_ref).cloned().collect()) }
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> {
         let state = self.state()?;
-        Ok(state.held.get(member).into_iter().flatten().map(|id| state.deployments[id].clone()).collect())
+        Ok(state.held.get(member).into_iter().flatten().map(|id| state.deployments[id].as_ref().clone()).collect())
     }
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
         let mut state = self.state()?;
-        let Some(current) = state.deployments.get(&record.id) else { return Ok(Cas::Conflict(None)); };
-        if current.version != expected { return Ok(Cas::Conflict(Some(current.clone()))); }
+        let MemoryState { deployments, held, .. } = &mut *state;
+        let Some(current) = deployments.get_mut(&record.id) else { return Ok(Cas::Conflict(None)); };
+        if current.version != expected { return Ok(Cas::Conflict(Some(current.as_ref().clone()))); }
         if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
         if current.holder != record.holder {
             if let Some(previous) = current.holder.clone()
-                && let Some(held) = state.held.get_mut(&previous)
+                && let Some(existing) = held.get_mut(&previous)
             {
-                held.remove(&record.id);
-                if held.is_empty() { state.held.remove(&previous); }
+                existing.remove(&record.id);
+                if existing.is_empty() { held.remove(&previous); }
             }
             if let Some(holder) = &record.holder {
-                state.held.entry(holder.clone()).or_default().insert(record.id.clone());
+                held.entry(holder.clone()).or_default().insert(record.id.clone());
             }
         }
         record.version = expected + 1;
-        state.deployments.insert(record.id.clone(), record.clone());
+        **current = record.clone();
         self.persist(&mut state)?;
         self.changes.publish(record.clone());
         Ok(Cas::Applied(record))
