@@ -587,7 +587,10 @@ config {
 -- Those files remain required until follower adoption.
 -- A failed historical check or older candidate preparation discards the remaining older confirmations.
 -- The writer continues recovery of the selected checkpoint.
--- A follower that reopens loads the latest persisted checkpoint and applies its retained suffix.
+-- A follower that reopens loads the latest reported checkpoint and applies its retained suffix.
+-- Ordinary latest-block recovery refreshes discovery after a missing root or table block.
+-- It retries only when the refreshed listing reveals a strictly newer block.
+-- Exact-block and restored-archive discovery keep their own checkpoint requirements.
 --
 -- A new leader can always reconstruct correct state from the last persisted block and the follower's in-memory state, which has been built by processing replica messages.
 --

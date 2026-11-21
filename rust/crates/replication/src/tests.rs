@@ -1605,3 +1605,34 @@ async fn a_promotion_that_inherits_a_flushed_block_resumes_the_source_after_the_
     }).collect();
     assert_eq!(later_sources, vec![next.0], "the new term resolves each later source message once and nothing at or before the flush");
 }
+
+#[tokio::test]
+async fn exact_and_restored_recovery_require_the_selected_checkpoint() {
+    use rtdb_format::{block::proto::Block, catalog::{BlockCatalog, TableEntry}, keys::block_key};
+    use rtdb_storage::ObjectKey;
+    use rtdb_types::ReplicaPosition;
+
+    let fixture = fixture(ReplicationConfig::default(), 4096).await;
+    let old = ObjectKey::new(block_key(BlockIndex(0)).unwrap()).unwrap();
+    let latest = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
+    let incomplete = BlockCatalog::from_proto(Block {
+        block_index: Some(0),
+        tables: vec![TableEntry::new(16_384, TableRef::new("public", "docs")).unwrap().to_proto()],
+        ..Default::default()
+    }).unwrap();
+    let complete = BlockCatalog::from_proto(Block { block_index: Some(1), ..Default::default() }).unwrap();
+    fixture.store.put(&old, incomplete.encode().into()).await.unwrap();
+    fixture.store.put(&latest, complete.encode().into()).await.unwrap();
+
+    let exact = fixture.blocks.recover(
+        TrieConfig::default(), SourcePosition(-1), Timestamp(1000), BlockDiscovery::At(BlockIndex(0)),
+    ).await.err().unwrap();
+    assert_eq!(exact.code, "rtdb.storage/missing-object");
+
+    fixture.store.delete(&old).await.unwrap();
+    let restored = fixture.blocks.recover(
+        TrieConfig::default(), SourcePosition(-1), Timestamp(1000),
+        BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: ReplicaPosition(0) },
+    ).await.err().unwrap();
+    assert_eq!(restored.code, "rtdb.replication/block-gone");
+}

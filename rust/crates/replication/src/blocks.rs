@@ -109,7 +109,8 @@ pub enum BlockDiscovery {
     /// Lists the block catalogs.
     #[default]
     List,
-    /// Probes forward from a block known to have been published, one head per block, never listing; a hint naming a block that is gone falls back to listing.
+    /// Probes forward from a known block, one head per block.
+    /// Listing handles a missing hint or refreshes discovery after a missing metadata read.
     From(BlockIndex),
     /// A restored serving generation requires its archived checkpoint and suppresses
     /// physical compaction effects from the sealed history preceding restoration.
@@ -135,9 +136,8 @@ impl BlockStore {
             BlockDiscovery::FromRestored { compaction_cutoff, .. } => Some(compaction_cutoff),
             _ => None,
         };
-        let latest = self.latest_block(discovery).await?;
-        let (block, table_blocks) = match latest {
-            Some(index) => { let loaded = self.load(index).await?; (Some(loaded.0), loaded.1) }
+        let (block, table_blocks) = match self.load_selected_checkpoint(discovery).await? {
+            Some((catalog, tables)) => (Some(catalog), tables),
             None => (None, BTreeMap::new()),
         };
         let tables = TableCatalog::load(block.clone(), &table_blocks)?.with_system_tables()?;
@@ -151,6 +151,23 @@ impl BlockStore {
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff }.with_source_floor(source_floor))
     }
+    async fn load_selected_checkpoint(&self, discovery: BlockDiscovery) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
+        let Some(mut index) = self.latest_block(discovery).await? else { return Ok(None); };
+        let refresh = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_));
+        loop {
+            match self.load(index).await {
+                Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {
+                    let listed = self.latest_block(BlockDiscovery::List).await?.map(|index| index.0);
+                    let Some(next) = crate::checkpoint_discovery::newer_checkpoint(index.0, listed) else {
+                        return Err(error);
+                    };
+                    index = BlockIndex(next);
+                }
+                result => return result.map(Some),
+            }
+        }
+    }
+
     async fn latest_block(&self, discovery: BlockDiscovery) -> Result<Option<BlockIndex>> {
         let exists = |index: BlockIndex| async move {
             match self.store.head_fresh(&ObjectKey::new(block_key(index)?)?).await {
