@@ -1001,7 +1001,7 @@ mod tests {
         }
     }
 
-    async fn test_frontend() -> (ProtocolSession, rtdb_node::NodeDriver) {
+    async fn test_frontend(replication_enabled: bool) -> (ProtocolSession, rtdb_node::NodeDriver) {
         use rtdb_columnar::MemoryBudget;
 
         struct Services;
@@ -1027,7 +1027,8 @@ mod tests {
         ).await.unwrap();
         let identity = auth.authenticate_trusted("xtdb").unwrap();
         let services = rtdb_node::NodeServices::local(auth.clone(), fixtures.clone(), auth, fixtures);
-        let options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
+        let mut options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
+        options.replication.enabled = replication_enabled;
         let (node, driver) = Node::open(options, services).await.unwrap();
         let session = node.session("xtdb", identity).unwrap();
         let startup = Startup { parameters: BTreeMap::new(), gateway_session_state: false, gateway_settings: false, replica_read: false, _reservation: node.memory().reserve(0).unwrap() };
@@ -1037,7 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gateway_key_is_installed_without_a_reply_and_rejection_ends_the_session() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let key = "00000000000000000000000000000001";
         let frame = |key: &str| Frame {
@@ -1058,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn retried_writes_stay_keyed_through_session_reset_and_malformed_metadata() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(true).await;
         frontend.startup.gateway_session_state = true;
         let node = frontend.node.clone();
         let driver = tokio::spawn(driver.run());
@@ -1094,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_single_autocommit_write_reports_success_only_after_commit() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(true).await;
         let node = frontend.node.clone();
         let memory = Arc::clone(node.memory());
         let driver = tokio::spawn(driver.run());
@@ -1137,7 +1138,7 @@ mod tests {
             fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
         }
 
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let input = b"Q\0\0\0\x0cSELEC 1\0";
@@ -1156,7 +1157,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_argument_slots_are_admitted_before_publishing_a_portal() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let prepared = frontend.prepare_client("SET TIME ZONE 'UTC'", Vec::new(), None).await.unwrap();
         frontend.register_statement(Cow::Borrowed("zone"), prepared).unwrap();
@@ -1194,7 +1195,7 @@ mod tests {
 
     #[tokio::test]
     async fn extended_namespace_rewrite_holds_syntax_growth_through_plan_admission() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let original = DBEAVER_NAMESPACE_QUERY;
@@ -1304,7 +1305,7 @@ mod tests {
         assert!(parse_probe.peak_bytes() < portal_peak);
         assert!(batch_bytes + writer_probe.peak_bytes() < portal_peak);
 
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
 
         let initial_timezone = frontend.session.state().effective_timezone().to_owned();
@@ -1356,7 +1357,7 @@ mod tests {
         let (requested, _) = expected.message.as_deref().unwrap().split_once(" from budget ").unwrap();
         assert_eq!(short.used_bytes(), 0);
 
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new(), None).await.unwrap();
@@ -1407,7 +1408,7 @@ mod tests {
 
     #[tokio::test]
     async fn retained_prepare_outlives_parse_frame_and_retries_after_leaf_admission_failure() {
-        let (mut frontend, driver) = test_frontend().await;
+        let (mut frontend, driver) = test_frontend(false).await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let leaf = "SET TIME ZONE 'UTC'";
