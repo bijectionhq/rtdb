@@ -569,6 +569,23 @@ def verify_replica_trim_admission(args, scratch):
     verify_lean_model(args, scratch, path, "replica-trim-admission", controls, 3)
 
 
+def verify_replica_hold_close(args, scratch):
+    path = Path("verification/lean/ReplicaHoldClose.lean")
+    controls = {
+        "leave-revision-unchanged": (
+            "revision := registry.revision + 1",
+            "revision := registry.revision",
+            ["close_fences_prior_admissions"],
+        ),
+        "drop-every-hold": (
+            "else registry.holds current",
+            "else none",
+            ["close_consumes_only_its_hold"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "replica-hold-close", controls, 3)
+
+
 def verify_logkeeper(args, scratch):
     models = Path("verification/multi/lean")
     dependency = scratch / "lean-logkeeper-quorum"
@@ -746,6 +763,7 @@ def verify_lean(args, scratch):
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_replica_trim_admission(args, scratch)
+            verify_replica_hold_close(args, scratch)
             verify_compaction_projection(args, scratch, directory)
             verify_compaction_planner(args, scratch)
             verify_compaction_merge(args, scratch)
@@ -914,6 +932,16 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "ignore_nascent"'), "InstalledReadable"),
     ("InstalledCheckpoint", "installed-checkpoint-collection-witness",
      ("INVARIANTS TypeOK InstalledReadable ReaderReadable", "INVARIANT OldFilesNeverCollected"), "OldFilesNeverCollected"),
+    ("ReplicaHoldLifecycle", "replica-hold-lifecycle", None, None),
+    ("ReplicaHoldLifecycle", "replica-hold-release-on-cancel",
+     ('Mutation = "none"', 'Mutation = "close_on_cancel"'), "action:ReleaseAfterDrainOrStop"),
+    ("ReplicaHoldLifecycle", "replica-hold-timeout-as-stop",
+     ('Mutation = "none"', 'Mutation = "use_timeout_as_stop"'), "action:ReleaseAfterDrainOrStop"),
+    ("ReplicaHoldLifecycle", "replica-hold-skip-empty-close-cas",
+     ('Mutation = "none"', 'Mutation = "skip_empty_close_cas"'), "ClosedNeverRegainsHold"),
+    ("ReplicaHoldLifecycle", "replica-hold-trim-after-stop-witness",
+     ("INVARIANTS ActiveHoldCovered ClosedNeverRegainsHold", "INVARIANT NeverTrimsAfterConfirmedDeath"),
+     "NeverTrimsAfterConfirmedDeath"),
     ("ReplicaTrimAdmission", "replica-trim-admission", None, None),
     ("ReplicaTrimAdmission", "replica-trim-trust-physical-floor",
      ('Mutation = "none"', 'Mutation = "trust_physical_floor"'), "ActiveRecoveryCovered"),
@@ -965,10 +993,12 @@ def verify_tla(args, scratch):
             config.parent, args.evidence, case,
         )
         if invariant:
-            message = (
-                "Temporal property EventuallyAcknowledged was violated" if invariant == "temporal"
-                else f"Invariant {invariant} is violated"
-            )
+            if invariant == "temporal":
+                message = "Temporal property EventuallyAcknowledged was violated"
+            elif invariant.startswith("action:"):
+                message = f"Action property {invariant.removeprefix('action:')} is violated"
+            else:
+                message = f"Invariant {invariant} is violated"
             if not log.returncode or message not in log.stdout:
                 raise ValueError(f"{case}: expected a counterexample to {invariant}")
             print(f"{case}: {invariant} rejected the negative control")

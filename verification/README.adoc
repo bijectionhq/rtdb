@@ -168,6 +168,10 @@ It also exercises the Azure adapter against a loopback provider and separately m
   Multi startup checks the directory's certified trim boundary before admitting an ordinary recovery cursor.
   Verus checks the offset decision against the source Multi calls.
   Durable recovery holds remain a model obligation.
+* `tla/ReplicaHoldLifecycle.tla` separates an ambiguous admission, cancellation, provider drain, and confirmed owner death.
+  Its controls release during drain, substitute a timeout for death evidence, and skip the closing CAS when a delayed admission has not appeared yet.
+  The reachability case permits reclamation after confirmed owner death.
+  `lean/ReplicaHoldClose.lean` proves that a close changes only its own hold and fences every already-issued admission at the old revision or earlier, including when no hold is visible.
 * `tla/PreparedReplay.tla` models admitting a replica cursor before installing an ordinary checkpoint and transferring that cursor to the driver.
   Its controls check early installation, early refusal, and reopening an admitted cursor.
   The reachability witnesses show a successful refresh and a separate trim after admission.

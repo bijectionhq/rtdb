@@ -664,6 +664,35 @@ The trie collector snapshots that registry with the current state and excludes d
 I/O regions keep those references through provider completion, and an in-progress collection prevents a compactor reset from reopening its key allocation.
 Runtime coordination across separate partition owners, recovery holds, and failover remains open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:gc.allium[Trie collection contract]
 
+=== Multi replica recovery holds
+
+An ordinary recovery selects a checkpoint in one physical residence and opens a cursor on that residence's replica stream.
+The directory's certified replica prefix advances before a physical trim request can remove records.
+Recovery can refresh to a strictly newer checkpoint if the authorized prefix already covers its first required record.
+The cursor remains subject to subsequent trims until it owns a recovery hold.
+
+The candidate protocol registers each hold by a fresh identity on the same versioned deployment record that owns the certified prefix.
+Using one record makes registering the first required offset and authorizing a conflicting trim mutually exclusive.
+The record binds the hold to the residence and log epoch, so a writer handoff leaves protection in place and an unrelated stream cannot inherit it.
+A future implementation can use the existing storage-region machinery to record the owner and make retirement wait for outstanding holds.
+
+For an ambiguous registration, the closing operation needs a successful CAS even when the hold is absent in the latest observation.
+A delayed request issued against the old version then fails its precondition.
+Cancellation closes new admissions and preserves the hold until prior reads are drained.
+Confirmed owner death can substitute for a drain if the witness identifies the exact owner and recovery can no longer consume that owner's results.
+A local lock and a hosted task's recorded stop each need source and adapter evidence establishing that premise.
+Directory revision monotonicity, unique hold IDs, and writer fencing are explicit assumptions of the close model.
+
+The production replay contract must state the endpoint of the protected catch-up interval and who advances or drops the hold.
+A reader kept after catch-up must use the ordinary live-tail contract or acquire a new bounded obligation.
+Leaving an old required offset pinned throughout a long-lived subscription would prevent useful trimming.
+Whole-stream retirement, checkpoint object reclamation, ensemble movement, and a cell move each need separate refinement evidence.
+All deployed versions permitted to authorize trims must use the same hold contract before it can protect a recovery.
+
+The bounded model distinguishes a delayed CAS, locally observed cancellation, drained I/O, confirmed owner death, and completed physical trim.
+Lean proves that closing one modeled hold leaves the others alone and that the resulting monotone revision fences older requests.
+The next production test must pause a recovery after registration, publish and attempt a newer trim from another authority, complete or conclusively close the recovery, then observe trim progress and verify the recovered SQL state. link:../../verification/tla/ReplicaHoldLifecycle.tla[Hold lifecycle] · link:../../verification/lean/ReplicaHoldClose.lean[Close and fencing laws]
+
 == Production boundary and responsibilities
 
 Use the existing database and maintenance owners.
