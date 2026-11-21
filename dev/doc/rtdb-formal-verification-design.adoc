@@ -834,7 +834,12 @@ Recovery, inspection and fork readers also supply retention obligations.
 A currently installed serving catalog can exclude an object that a still-admissible checkpoint needs before replay.
 Retiring a packed entry must account for the other entries and for manifests that name the pack.
 An exact recovery or a shared-reference fork must establish its objects under its own authority before the source may remove them.
-Those premises require composition with the checkpoint, shared-reference and provider models before an ordinary hosted reaper may depend on serving-reader cuts.
+The composed residence model checks one checkpoint, one recovery cursor, one fork, one serving reader, and one provider request that can outlive its reader.
+Its three generations retain a shared file through an intermediate catalog and distinguish two physical incarnations of one logical key.
+It checks that an accepted intent survives until certification even when the writer crashes after installation.
+A reachable execution collects the older objects while the replacement stays readable.
+Crash releases the local holds only in the model transition that establishes their work has stopped.
+Pack views, independent residences, and runtime traces at the directory and provider boundaries remain open. link:../../verification/tla/ResidenceRetirement.tla[Composed residence retirement model] · link:structural-redesign.adoc#mechanisms[Residence ledger contract]
 
 A migration activates certified collection only where every serving owner enforces the same admission floor.
 The collector retains uncertified releases in that namespace until they can be matched to authoritative retirement evidence.

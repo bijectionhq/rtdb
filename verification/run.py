@@ -1365,6 +1365,30 @@ TLA_CASES = (
     ("RetirementPublication", "retirement-collection-and-reuse",
      ("INVARIANTS CertificateFollowsInstall CurrentCatalogReadable AdmittedReaderReadable",
       "INVARIANT NeverCollectsAndReuses"), "NeverCollectsAndReuses"),
+    ("ResidenceRetirement", "residence-retirement", None, None),
+    ("ResidenceRetirement", "residence-early-reply",
+     ('Mutation = "none"', 'Mutation = "reply_before_install"'), "ReceiptCoversInstalled"),
+    ("ResidenceRetirement", "residence-forget-intent",
+     ('Mutation = "none"', 'Mutation = "forget_intent"'), "CoveredIntent"),
+    ("ResidenceRetirement", "residence-forget-installed-intent",
+     ('Mutation = "none"', 'Mutation = "forget_installed_intent"'), "CoveredIntent"),
+    ("ResidenceRetirement", "residence-ignore-admission-floor",
+     ('Mutation = "none"', 'Mutation = "ignore_floor"'), "RetainedRootsReadable"),
+    ("ResidenceRetirement", "residence-forget-provider-io",
+     ('Mutation = "none"', 'Mutation = "forget_provider_io"'), "RetainedRootsReadable"),
+    ("ResidenceRetirement", "residence-forget-recovery",
+     ('Mutation = "none"', 'Mutation = "forget_recovery"'), "RetainedRootsReadable"),
+    ("ResidenceRetirement", "residence-forget-checkpoint",
+     ('Mutation = "none"', 'Mutation = "forget_checkpoint"'), "RetainedRootsReadable"),
+    ("ResidenceRetirement", "residence-forget-fork",
+     ('Mutation = "none"', 'Mutation = "forget_fork"'), "RetainedRootsReadable"),
+    ("ResidenceRetirement", "residence-erase-by-key",
+     ('Mutation = "none"', 'Mutation = "erase_by_key"'), "HeadReadable"),
+    ("ResidenceRetirement", "residence-early-shared-retirement",
+     ('Mutation = "none"', 'Mutation = "retire_shared_early"'), "HeadReadable"),
+    ("ResidenceRetirement", "residence-retirement-witness",
+     ("INVARIANTS CoveredIntent ReceiptCoversInstalled HeadReadable RetainedRootsReadable",
+      "INVARIANT RetirementWitness"), "RetirementWitness"),
     ("S3KeyCustody", "s3-acknowledge-conflict",
      ('Mutation = "none"', 'Mutation = "ack_conflict"'), "WithdrawalIsTerminal"),
     ("S3KeyCustody", "s3-reinstall-key",
@@ -1584,6 +1608,11 @@ def verify_apalache(args, scratch):
         ('Mutation = "none"', 'Mutation = "remote_status"'), "replica receipt ahead of catalog",
     )
     check_apalache(args, scratch, "RecoveryCollection", "recovery-collection", "RecoverySafe", 10)
+    check_apalache(args, scratch, "ResidenceRetirement", "residence-retirement", "Safety", 10)
+    check_apalache(
+        args, scratch, "ResidenceRetirement", "residence-retirement-forget-checkpoint", "RetainedRootsReadable", 10,
+        ('Mutation = "none"', 'Mutation = "forget_checkpoint"'), "collection across a retained checkpoint",
+    )
     check_apalache(
         args, scratch, "RecoveryCollection", "recovery-collection-trim-for-head", "RecoverySuffixAvailable", 10,
         ('Mutation = "none"', 'Mutation = "trim_for_head_only"'), "missing recovery suffix",

@@ -1688,6 +1688,44 @@ The native logs are `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-native.log
 `/private/tmp/rtdb-formal.QMjPSJsX/leaf-arrow-timing-focused.log`,
 and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-arrow-timing-sampled.log`.
 
+=== Installed trie removal receipts and residence retirement composition
+
+At `a8e16de4f`, the native replica driver binds a trie-removal receipt to its own matching read-back record.
+The driver completes the receipt only after its installed prefix reaches the record and one immutable partition value excludes the requested trie keys from both the current trie catalog and its checkpoint dependencies.
+Pending receipts stay with the owning term and fail on demotion.
+The receipt establishes logical exclusion at a replica position.
+Physical reclamation still requires durable intent tracking, the directory floor and grant, and a provider operation targeted to the certified physical identity.
+
+Verus 0.2026.11.20.9da409b checked five functions in the production decision area and rejected eight single and joint controls at their declared sites.
+The native read-back control sent the reply before prefix publication and failed at the test's pending-receipt assertion.
+The matching baseline and targeted control both ran after rebasing onto the current Arrow and transaction changes.
+The focused Rust suites passed 163 tests across replication, maintenance, and index, including the late reply, remaining live trie, and different read-back cases. link:../verus/trie_removal_receipt/area.json[Receipt proof and controls]
+
+The composed residence model checks one serving view, one admitted provider operation, one installed checkpoint, one recovery cursor, and one fork, over three catalog generations.
+It abstracts provider contents to physical identities, keeps one file shared across adjacent generations, and permits two versions of one logical key.
+TLC exhausts 3,081 reachable states of the baseline and rejects ten deliberate weakenings.
+Loss of an accepted intent before installation and loss after installation fail separately.
+The earliest reply control fails on the third trace state, and loss of an installed intent appears on the fourth.
+Ignoring the installed checkpoint fails on the seventh state. Omitting the fork hold and omitting admitted provider work each fail on the eleventh.
+The reachability check reaches successful collection with the replacement intact on the fourteenth state.
+Apalache 0.63.0 checks the composed safety predicates through ten transitions and independently rejects removal of the checkpoint hold in that bound.
+These are bounded design results. They assume that crash releases local holds only after their operations have stopped. link:../tla/ResidenceRetirement.tla[Composed residence model]
+
+The runner in link:../README.adoc#run-the-studies[the verification instructions] repeats the baseline and controls with the pinned tools.
+Use `--native-replay` to include the early-reply control.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --offline --locked \
+  -p rtdb-replication -p rtdb-maintenance -p rtdb-index --no-fail-fast
+----
+
+Local command outputs are in `/private/tmp/rtdb-formal.QMjPSJsX/trie-removal-prefix-verus/`,
+`/private/tmp/rtdb-formal.QMjPSJsX/trie-removal-native-control-a8e16de4f/`,
+`/private/tmp/rtdb-formal.QMjPSJsX/trie-removal-prefix-a8e16de4f-native.log`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/residence-retirement-composed-final/`.
+
 
 == Client system time bounded by the source log
 
