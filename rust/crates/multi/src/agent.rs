@@ -72,6 +72,7 @@ const IDLE_FLUSHES_PER_PASS: usize = 2;
 const HANDOFF_REPLAY_ROWS: u64 = 64;
 const HANDOFF_REPLAY_RECORDS: i64 = 16;
 const DRAIN_HANDOFFS_PER_PASS: usize = 8;
+const DRAIN_CONCURRENT_HANDOFFS: usize = 2;
 const ACTIVE_DRAIN_WINDOW: Duration = Duration::from_secs(60);
 
 struct LocalHolding {
@@ -742,12 +743,14 @@ impl NodeAgent {
             }
         }
         if !handoffs.is_empty() {
+            use futures::StreamExt;
+
             let control = crate::control::ControlKey(self.secret.clone());
             let control = &control;
             let source = &me;
-            futures::future::join_all(handoffs.into_iter().map(|(name, epoch, target)| async move {
+            futures::stream::iter(handoffs.into_iter().map(|(name, epoch, target)| async move {
                 let _ = crate::admin::move_from_holding(self.directory.as_ref(), &name, &target, Some((source, epoch)), control).await;
-            })).await;
+            })).buffer_unordered(DRAIN_CONCURRENT_HANDOFFS).for_each(|()| async {}).await;
         }
         if self.options.compaction_worker { self.reconcile_compaction().await; }
         if let Some(limit) = self.options.max_tail_rows { self.bound_tails(limit).await; }

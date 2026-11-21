@@ -55,19 +55,21 @@ struct BenchmarkDeployment {
     connections: Vec<Mutex<Option<Client>>>,
 }
 
-fn sample_write_latencies<'a>(phase: &str, samples: impl Iterator<Item = &'a WriteSample>) {
+fn sample_write_latencies<'a>(phase: &str, samples: impl Iterator<Item = &'a WriteSample>) -> Option<f64> {
     let (mut total, mut queue, mut wire) = (Vec::new(), Vec::new(), Vec::new());
     for sample in samples {
         total.push(sample.finished - sample.started);
         queue.push(sample.acquired - sample.started);
         wire.push(sample.finished - sample.sent);
     }
-    if total.is_empty() { return; }
+    if total.is_empty() { return None; }
     total.sort_unstable();
     queue.sort_unstable();
     wire.sort_unstable();
-    println!("phase={phase} commits={} p95_ms={:.3} p99_ms={:.3} queue_p99_ms={:.3} wire_p99_ms={:.3}",
-        total.len(), percentile(&total, 95), percentile(&total, 99), percentile(&queue, 99), percentile(&wire, 99));
+    let p99 = percentile(&total, 99);
+    println!("phase={phase} commits={} p95_ms={:.3} p99_ms={p99:.3} queue_p99_ms={:.3} wire_p99_ms={:.3}",
+        total.len(), percentile(&total, 95), percentile(&queue, 99), percentile(&wire, 99));
+    Some(p99)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -82,6 +84,9 @@ async fn exercise_zipf_activity() {
     let workers = setting("RTDB_CELL_BENCH_WORKERS", 16);
     let connections_per_deployment = setting("RTDB_CELL_BENCH_CONNECTIONS", 1).min(workers);
     let scale = std::env::var_os("RTDB_CELL_BENCH_SCALE").is_some();
+    let scale_p99_limit = std::env::var_os("RTDB_CELL_BENCH_SCALE_P99_LIMIT_MS")
+        .map(|_| setting("RTDB_CELL_BENCH_SCALE_P99_LIMIT_MS", 30) as f64);
+    assert!(scale_p99_limit.is_none() || scale, "the scale latency limit requires RTDB_CELL_BENCH_SCALE");
     let cold = std::env::var_os("RTDB_CELL_BENCH_COLD").is_some();
     let parked = setting("RTDB_CELL_BENCH_PARKED", 0);
     let commands = setting("RTDB_CELL_BENCH_COMMANDS", if scale { 2048 } else { 256 });
@@ -222,20 +227,24 @@ async fn exercise_zipf_activity() {
     if let Some(windows) = windows {
         let overlaps = |sample: &WriteSample, (first, last): (Instant, Instant)| sample.started <= last && sample.finished >= first;
         for (name, window) in [("scale_out", Some(windows[0])), ("scale_in", Some(windows[1])), ("outside_moves", None)] {
-            sample_write_latencies(name, samples.iter().filter(|sample| match window {
+            let observed = sample_write_latencies(name, samples.iter().filter(|sample| match window {
                 Some(window) => overlaps(sample, window),
                 None => windows.iter().all(|window| !overlaps(sample, *window)),
             }));
+            if let Some(limit) = scale_p99_limit.filter(|_| window.is_some()) {
+                let p99 = observed.expect("each scale transition needs latency samples");
+                assert!(p99 < limit, "{name} p99 was {p99:.3} ms, expected less than {limit} ms");
+            }
         }
     }
     for (phase, first, last) in [("first_third", started, started + elapsed / 3),
         ("second_third", started + elapsed / 3, started + elapsed * 2 / 3),
         ("last_third", started + elapsed * 2 / 3, started + elapsed)]
     {
-        sample_write_latencies(phase, samples.iter().filter(|sample| sample.started >= first && sample.started < last));
+        let _ = sample_write_latencies(phase, samples.iter().filter(|sample| sample.started >= first && sample.started < last));
     }
-    sample_write_latencies("hottest_deployment", samples.iter().filter(|sample| sample.rank == 0));
-    sample_write_latencies("other_deployments", samples.iter().filter(|sample| sample.rank > 0));
+    let _ = sample_write_latencies("hottest_deployment", samples.iter().filter(|sample| sample.rank == 0));
+    let _ = sample_write_latencies("other_deployments", samples.iter().filter(|sample| sample.rank > 0));
     let mut latencies: Vec<_> = samples.into_iter().map(|sample| sample.finished - sample.started).collect();
     assert_eq!(latencies.len(), workers * commands);
     latencies.sort_unstable();

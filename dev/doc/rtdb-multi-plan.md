@@ -833,8 +833,20 @@ The four-connection workload used up to 128 pgwire sessions on the cell.
 With four connections, scale-in send-to-reply p99 was 10.7–19.1 ms.
 The scale-in end-to-end p99 still exceeded 30 ms.
 
+Three subsequent paired release trials used the same 256-connection limit, four sessions per deployment, and 32,768 writes per run.
+Each run preserved the exact counter values through scale-out and scale-in.
+The next table compares how many handoffs a draining member could execute concurrently.
+
+| Concurrent handoffs | Durable updates/s | Overall p99 (ms) | Scale-out p99 (ms) | Scale-in p99 (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 2,958–4,953 | 14.0–23.7 | 12.7–119.7 | 18.4–208.3 |
+| 2 | 4,570–4,827 | 13.8–14.8 | 12.8–24.2 | 11.1–19.5 |
+
+The draining node now runs two handoffs at a time and still takes up to eight per pass.
+The optional latency limit fails a run when either scale transition reaches the specified p99.
+
 ```sh
-RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_COMMANDS=1024 RTDB_CELL_BENCH_SCALE=1 \
+RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_SCALE=1 RTDB_CELL_BENCH_SCALE_P99_LIMIT_MS=30 \
   cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
   durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
 ```
