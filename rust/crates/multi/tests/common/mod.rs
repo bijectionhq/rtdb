@@ -110,6 +110,10 @@ impl Cell {
         Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, true, |_| {}).await
     }
 
+    pub async fn start_without_log_fsync(nodes: usize) -> Self {
+        Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, false, |_| {}).await
+    }
+
     pub async fn start_rate_limited(limit: NonZeroUsize) -> Self {
         Self::start_configured(None, vec![MemberPool::General], None, None, None, false, |agent| agent.activations_per_second = limit).await
     }

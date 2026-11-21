@@ -869,6 +869,12 @@ impl SessionService for NativeSessionService {
         let time = database.partition.value().live().latest_completed_tx().map(|key| key.system_time.into());
         Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
+    async fn fresh_snapshot_basis(&self, cancellation: &CancellationToken) -> Result<TimeBasis> {
+        if self.node.catalog.is_placed() {
+            self.database()?.confirm_replica_snapshot(cancellation).await?;
+        }
+        self.snapshot_basis()
+    }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         if !self.node.catalog.is_placed() { return self.node.await_basis(basis, timeout, cancellation).await; }
         self.node.ensure_open()?;
@@ -930,6 +936,7 @@ fn is_historical_guard_abort(error: &Anomaly) -> bool {
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.
 pub const NOT_HELD: &str = "rtdb.node/database-not-held";
+pub const REPLICA_BEHIND: &str = "rtdb.node/replica-behind";
 
 fn lost_placement(database: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, NOT_HELD, format!("This node no longer holds {database}")).with_context("db-name", database.into())

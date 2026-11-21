@@ -13,8 +13,8 @@ use bytes::Bytes;
 use futures::FutureExt;
 use prost_types::Any;
 use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
-use rtdb_logkeeper::StreamConfig;
-use rtdb_node::{LogAccess, LogFactory, OpenedLogs};
+use rtdb_logkeeper::{QuorumLog, StreamConfig};
+use rtdb_node::{LogAccess, LogFactory, OpenedLogs, ReplicaReadIndex};
 use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, Timestamp};
@@ -28,6 +28,18 @@ use crate::recovery_holds::{RecoveryAdmission, RecoveryHolds, ReplayHold};
 const INTAKE_RETAINED_BEHIND: i64 = 1024;
 const SCAN_WINDOW: i64 = 256;
 const INTAKE_TIP_WINDOW: i64 = 8;
+const READ_INDEX_WITHIN: Duration = Duration::from_secs(2);
+
+struct LogletReadIndex { log: Arc<QuorumLog>, epoch: u64 }
+
+#[async_trait]
+impl ReplicaReadIndex for LogletReadIndex {
+    async fn confirm(&self) -> Result<LogOffset> {
+        tokio::time::timeout(READ_INDEX_WITHIN, self.log.read_index(self.epoch)).await
+            .map_err(|_| Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/read-index-timeout", "Logkeepers did not confirm a read index in time"))?
+            .map_err(Into::into)
+    }
+}
 
 /// The writers a node has opened, by deployment, for confirming leadership before a linearizable read.
 pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<rtdb_logkeeper::QuorumLog>>>>;
@@ -104,7 +116,7 @@ pub(crate) fn frozen_checkpoint(
         consumed: Arc::new(AtomicI64::new(start - 1)),
         start,
     });
-    Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, drivers: Vec::new() })
+    Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, drivers: Vec::new() })
 }
 
 #[async_trait]
@@ -117,7 +129,7 @@ impl LogFactory for LogkeeperLogFactory {
             return frozen_checkpoint(checkpoint, epoch, self.maximum_message_bytes);
         }
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
-        let (quorum, key): (Arc<dyn Log>, _) = match access {
+        let (quorum, key) = match access {
             LogAccess::ReadWrite => {
                 let key = self.holds.keys.existing(&config.key_id).await?;
                 // An interrupted copy can leave records even if the new
@@ -143,6 +155,9 @@ impl LogFactory for LogkeeperLogFactory {
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
+        let replica_read_index = config.require_read_index.then(|| Box::new(LogletReadIndex {
+            log: Arc::clone(&quorum), epoch: config.epoch,
+        }) as Box<dyn ReplicaReadIndex>);
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
         let next = next_source_offset(replica.as_ref(), epoch).await?;
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
@@ -157,7 +172,7 @@ impl LogFactory for LogkeeperLogFactory {
                 }
             }.boxed()
         };
-        Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, drivers: vec![trimming] })
+        Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index, drivers: vec![trimming] })
     }
 }
 
@@ -428,6 +443,7 @@ mod tests {
             replica_seal_scope: record.replica_seal_scope(),
             write_quorum: 1,
             epoch: record.epoch,
+            require_read_index: false,
             log_epoch: record.log_epoch,
             ensemble: vec![],
             frozen_at: None,
@@ -459,6 +475,7 @@ mod tests {
             previous_servers: None,
             ensemble: vec![],
             epoch: record.epoch,
+            require_read_index: true,
             frozen_at: None,
             log_epoch: record.log_epoch,
             write_quorum: 1,

@@ -2271,7 +2271,24 @@ The default native simulation suite passed 13 tests with four longer sweeps igno
 The logkeeper suite passed again after the rebase and all 85 native Multi cell tests passed.
 The serial Gradle run executed nine test tasks and passed all 3,198 tests without failures or skips.
 Gradle property testing passed all 3,348 cases without failures or skips.
-The placed query still needs to use the index and wait for the bound to apply.
+This increment supplied the bounds later used by subscriber reads.
+
+=== Linearizable subscriber basis capture
+
+The attached replica log supplies a read index for implicit bases on deployments with linearizable reads enabled.
+The subscriber waits for its installed replica prefix before capturing the time basis.
+Within an explicit read transaction the pinned basis is retained.
+The gateway recognizes a freshness refusal before a response and retries it on the holder when ReadyForQuery reports idle.
+
+The native Node and Multi suites passed 358 cases, including the installed-prefix wait, refusal after sealing, and holder fallback with an idle backend.
+After rebasing over `182eb4cdf`, the Node, Multi and Flight SQL selections passed 465 cases.
+The basis test also checks an explicit historical basis and a pinned read transaction.
+The fallback test checks that an open read transaction receives the freshness refusal.
+The native basis test failed both when it captured an older basis before logkeeper confirmation and when it treated an unapplied bound as ready.
+The extended TLC model explored 100,508 reachable states.
+Skipping the apply wait and capturing the basis before confirmation each violated the served-prefix invariant.
+The previous activation and watermark controls still failed at their named bounds, and both reachability probes still found witnesses. link:../tla/ActiveLogletReadIndex.tla[Active loglet model]
+The full Gradle suite ran against the JNI library rebuilt on parent `f536956ed` and passed all 3,198 cases.
 
 === Table metadata bindings in checkpoint roots
 

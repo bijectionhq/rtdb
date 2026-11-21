@@ -194,6 +194,9 @@ impl Drop for DeploymentTurn<'_> {
 /// `fragments` keeps a replica open for the fragments other nodes send it, whatever the deployment's read width.
 struct LocalSubscription { id: String, database: Weak<Database>, last_touch: Instant, opened: Instant, role: Role, fragments: bool }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubscriptionUse { Query, FreshQuery, Fragment }
+
 pub struct NodeAgent {
     storage_namespaces: rtdb_directory::StorageNamespaces,
     directory: Arc<dyn Directory>,
@@ -303,6 +306,7 @@ impl NodeAgent {
                 let mut holdings = self.holdings.lock();
                 let holding = holdings.get_mut(name).filter(|holding| locally_open(holding))?;
                 holding.last_touch = Instant::now();
+                holding.linearizable = record.linearizable_reads;
                 Some(Response::Held { epoch: record.epoch, address: self.address.clone() })
             };
             let can_reuse = record.holder.as_ref() == Some(&me) && self.holdings.lock().get(name).is_some_and(locally_open);
@@ -759,33 +763,40 @@ impl NodeAgent {
         }
     }
 
-    pub async fn subscribe(&self, name: &str) -> Result<Response> { self.subscribe_for(name, false).await }
+    pub async fn subscribe(&self, name: &str) -> Result<Response> { self.subscribe_for(name, SubscriptionUse::Query).await }
 
-    /// Opens a log-fed replica of `name` unless this node already serves it; `fragments` keeps it open for fragment reads.
-    async fn subscribe_for(&self, name: &str, fragments: bool) -> Result<Response> {
+    async fn subscribe_for(&self, name: &str, usage: SubscriptionUse) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
         let record = self.record(name).await?;
         if record.lifecycle != Lifecycle::Live { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/not-live", format!("{name} is not live"))); }
+        if usage == SubscriptionUse::FreshQuery && !record.linearizable_reads {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/read-policy-changed", format!("The read policy of {name} changed")));
+        }
         if record.move_from.is_some() {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/log-move-pending", format!("{name}'s holder has yet to adopt its log")));
         }
-        if self.holdings.lock().get(name).is_some_and(|holding| holding.id == record.id && holding.epoch == record.epoch) {
+        if let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == record.id && holding.epoch == record.epoch) {
+            holding.linearizable = record.linearizable_reads;
             return Ok(Response::Subscribed { address: self.address.clone() });
         }
+        let fragments = usage == SubscriptionUse::Fragment;
         let members = self.members().await?;
         if !fragments && !crate::deployment::read_replicas(&record, &members, now_ms()).iter().any(|member| member.id == self.member()) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/read-width", format!("This node is outside the read width of {name}")));
         }
+        let configuration = database_config(&record, ensemble_servers(&record, &members)?, &self.options.storage, Role::Subscriber);
         if let Some(subscription) = self.subscriptions.lock().get_mut(name) {
-            // A snapshot never advances, so it is replaced by a replica rather than served as one.
-            if subscription.id == record.id && !matches!(subscription.role, Role::Snapshot(_)) && self.node.catalog().database(name).is_ok() {
+            if subscription.id == record.id && !matches!(subscription.role, Role::Snapshot(_))
+                && self.node.catalog().database(name).is_ok_and(|database| {
+                    std::ptr::eq(subscription.database.as_ptr(), Arc::as_ptr(&database)) && database.configuration().log == configuration.log
+                })
+            {
                 subscription.last_touch = Instant::now();
                 subscription.fragments |= fragments;
                 return Ok(Response::Subscribed { address: self.address.clone() });
             }
         }
-        let configuration = database_config(&record, ensemble_servers(&record, &members)?, &self.options.storage, Role::Subscriber);
         self.stop_running(name).await;
         let database = self.node.database_or_attach(name.to_owned(), configuration).await?
             .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the replica"))?;
@@ -1007,7 +1018,7 @@ impl NodeAgent {
         let draining = local_member.state == MemberState::Draining;
         let target_engine = local_member.drain_target_engine.as_deref();
         let warming = std::mem::take(&mut *self.warming.lock());
-        if !draining { for name in warming { let _ = self.subscribe_for(&name, true).await; } }
+        if !draining { for name in warming { let _ = self.subscribe_for(&name, SubscriptionUse::Fragment).await; } }
         let me = self.member();
         let destinations = if draining { self.members().await.ok() } else { None };
         let active_within = self.options.park_after.map_or(ACTIVE_DRAIN_WINDOW, |after| after.min(ACTIVE_DRAIN_WINDOW));
@@ -1179,6 +1190,7 @@ impl Handler for NodeAgent {
             Request::FlightEndpoint => self.flight_endpoint.clone().map(|address| Response::FlightEndpoint { address })
                 .ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-flight-endpoint", "The holder does not have a Flight SQL endpoint")),
             Request::Subscribe { name } => self.subscribe(&name).await,
+            Request::SubscribeFresh { name } => self.subscribe_for(&name, SubscriptionUse::FreshQuery).await,
             Request::Snapshot { name } => self.snapshot(&name).await,
             Request::Flush { name } => self.flush(&name).await,
             Request::PublishCompaction { name, notification, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.publish_compaction(&name, &notification).await, Err(error) => Err(error) }

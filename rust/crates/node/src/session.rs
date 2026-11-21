@@ -21,6 +21,7 @@ pub trait SessionService: Send + Sync {
     /// Supplies the query clock; implementations with finer precision override the microsecond clock lift.
     fn query_instant(&self) -> Instant { self.now().into() }
     fn snapshot_basis(&self) -> Result<TimeBasis>;
+    async fn fresh_snapshot_basis(&self, _cancellation: &CancellationToken) -> Result<TimeBasis> { self.snapshot_basis() }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()>;
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx>;
     async fn submit_replay(&self, _database: &str, _operations: Vec<TxOp>, _options: SubmitOptions, _permit: ReplaySubmissionPermit, _cancellation: &CancellationToken) -> Result<SubmittedTx> {
@@ -452,7 +453,10 @@ impl Session {
     async fn pin(&self, options: &ReadOptions) -> Result<QueryBasis> {
         let token = options.await_token.as_deref().or(self.await_token.as_deref());
         self.service.await_basis(token.map(decode_tx_basis).transpose()?, Duration::from_secs(60), &self.cancellation).await?;
-        let snapshot = match &options.snapshot_token { Some(token) => decode_time_basis(token)?, None => self.service.snapshot_basis()? };
+        let snapshot = match &options.snapshot_token {
+            Some(token) => decode_time_basis(token)?,
+            None => self.service.fresh_snapshot_basis(&self.cancellation).await?,
+        };
         Ok(QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time: options.clock_time.unwrap_or_else(|| self.service.query_instant()), timezone: self.effective_timezone().to_owned() })
     }
     pub async fn read_basis(&mut self) -> Result<QueryBasis> {

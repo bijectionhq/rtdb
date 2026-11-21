@@ -211,7 +211,7 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         deployment: expected.map(|id| id.hyphenated().to_string()),
         read_only, snapshot, options: options.clone(), heartbeats, connection_index,
     };
-    let route_initial = tokio::time::timeout_at(startup_deadline, router.route_with_record()).await;
+    let route_initial = tokio::time::timeout_at(startup_deadline, router.route_with_record(false)).await;
     let (server, control, epoch, deployment) = match route_initial {
         Ok(Ok(route)) => route,
         Err(_) => return refuse(&mut client, "57P03", "Timed out routing startup to the deployment's holder").await,
@@ -303,15 +303,20 @@ impl Drop for Heartbeat {
 }
 
 impl GatewayRouter {
-    async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
-        control::retry_activation(self.options.control_timeout, || route(self)).await
+    async fn route_with_record(&self, prefer_holder: bool) -> Result<(TcpStream, Option<String>, u64, String)> {
+        control::retry_activation(self.options.control_timeout, || route(self, prefer_holder)).await
     }
 }
 
 #[async_trait::async_trait]
 impl crate::session::Router for GatewayRouter {
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
-        let (stream, control, epoch, _) = self.route_with_record().await?;
+        let (stream, control, epoch, _) = self.route_with_record(false).await?;
+        Ok((stream, control, epoch))
+    }
+
+    async fn route_holder(&self) -> Result<(TcpStream, Option<String>, u64)> {
+        let (stream, control, epoch, _) = self.route_with_record(true).await?;
         Ok((stream, control, epoch))
     }
 
@@ -321,7 +326,7 @@ impl crate::session::Router for GatewayRouter {
 }
 
 /// The open connection to the deployment's holder, and that holder's control address.
-async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64, String)> {
+async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream, Option<String>, u64, String)> {
     let directory = &router.directory;
     let name = router.name.as_str();
     let options = &router.options;
@@ -336,7 +341,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         Lifecycle::Restoring => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/restoring", format!("{name}'s checkpoint is being restored; retry shortly"))),
         Lifecycle::Deleting | Lifecycle::Deleted => return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} has been deleted"))),
     }
-    if !router.snapshot && (!router.read_only || record.read_width <= 1)
+    if (prefer_holder || !router.snapshot && (!router.read_only || record.read_width <= 1))
         && let Some(holder) = &record.holder
         && let Some(member) = directory.member(holder).await.ok().flatten()
         && record.may_hold_on(&member, now_ms())
@@ -346,7 +351,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         return Ok((connect_serving(&address, &confirmed, probe, options).await?, Some(confirmed), epoch, record.id));
     }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
-    if router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
+    if !prefer_holder && router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
         for reader in snapshot_readers(&record, &members) {
             let Some(control_address) = &reader.control_address else { continue; };
             if let Ok((Response::Subscribed { address }, probe)) = control::call_with_pgwire_probe(control_address,
@@ -355,7 +360,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
             { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
         }
     }
-    if router.read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
+    if !prefer_holder && router.read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
         let mut readers = crate::deployment::read_replicas(&record, &members, now_ms());
         let count = readers.len();
         if count > 1 {
@@ -364,8 +369,9 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         }
         for replica in readers {
             let Some(control_address) = &replica.control_address else { continue; };
+            let request = if record.linearizable_reads { Request::SubscribeFresh { name: name.to_owned() } } else { Request::Subscribe { name: name.to_owned() } };
             if let Ok((Response::Subscribed { address }, probe)) = control::call_with_pgwire_probe(control_address,
-                Request::Subscribe { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await
+                request, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await
                 && let Ok(stream) = connect_serving(&address, control_address, probe, options).await
             { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
         }
@@ -656,7 +662,7 @@ mod tests {
             read_only: false, snapshot: false, options: GatewayOptions::default(),
             heartbeats: Arc::new(Heartbeats::default()), connection_index: 0,
         };
-        let (server, control, epoch, _) = route(&router).await.unwrap();
+        let (server, control, epoch, _) = route(&router, false).await.unwrap();
         assert_eq!(server.peer_addr().unwrap(), ready.local_addr().unwrap());
         assert_eq!(control.as_deref(), Some(target_address.to_string().as_str()));
         assert_eq!(epoch, 7);

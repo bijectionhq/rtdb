@@ -65,6 +65,83 @@ struct PausedReadFence {
     resume: tokio::sync::Notify,
 }
 
+#[tokio::test]
+async fn an_implicit_basis_checks_the_replica_index_before_capturing_applied_history() {
+    use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto};
+    use rtdb_storage::log::{Log, LogOffset, MemoryLog};
+    use rtdb_types::{StorageEpoch, Term, TermSequence};
+
+    struct ReadIndex(Arc<Semaphore>);
+    #[async_trait]
+    impl ReplicaReadIndex for ReadIndex {
+        async fn confirm(&self) -> Result<LogOffset> {
+            self.0.acquire().await.unwrap().forget();
+            Ok(LogOffset(1))
+        }
+    }
+
+    struct Resources {
+        native: NativeResources,
+        replica: Arc<MemoryLog>,
+        confirm: Arc<Semaphore>,
+    }
+    #[async_trait]
+    impl ResourceFactory for Resources {
+        fn validate(&self, name: &str, config: &DatabaseConfig) -> Result<()> { self.native.validate(name, config) }
+        async fn open_storage(&self, name: &str, config: &DatabaseConfig) -> Result<DatabaseStorage> {
+            self.native.open_storage(name, config).await
+        }
+        async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
+            Ok(OpenedLogs {
+                source: Arc::new(MemoryLog::new(1024)), replica: self.replica.clone(), source_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0),
+                replica_read_index: Some(Box::new(ReadIndex(self.confirm.clone()))), drivers: Vec::new(),
+            })
+        }
+    }
+
+    let confirm = Arc::new(Semaphore::new(1));
+    let replica = Arc::new(MemoryLog::new(1024));
+    let providers = Arc::new(Resources { native: NativeResources::default(), replica: replica.clone(), confirm: confirm.clone() });
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, NodeServices { resources: providers, ..services() }).await;
+    let database = node.database_or_attach("shop".into(), DatabaseConfig { mode: Some(1), ..Default::default() }).await.unwrap().unwrap();
+    let historical_basis = node.snapshot_basis().unwrap();
+    let mut session = node.session("shop", Arc::new(Authority)).unwrap();
+    assert_eq!(session.state_mut().read_basis().await.unwrap_err().code, REPLICA_BEHIND);
+
+    session.state_mut().begin().unwrap();
+    let mut pending = Box::pin(session.state_mut().read_basis());
+    assert!(futures::poll!(&mut pending).is_pending());
+    let system_time = Timestamp(100);
+    for (sequence, message) in [
+        ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }),
+        ReplicaBody::ResolvedTx(proto::ResolvedTx {
+            tx_id: Some(0), system_time_micros: Some(system_time.0), committed: Some(true), src_msg_id: Some(0), ..Default::default()
+        }),
+    ].into_iter().enumerate() {
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence as i64)), message };
+        replica.enqueue(envelope.encode().into(), system_time).await.unwrap().durable().await.unwrap();
+    }
+    let mut applied = database.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), applied.wait_for(|status| status.installed_replica_position == Some(rtdb_types::ReplicaPosition(1)))).await.unwrap().unwrap();
+    confirm.add_permits(1);
+    let basis = tokio::time::timeout(Duration::from_secs(5), pending).await.unwrap().unwrap();
+    assert_eq!(basis.snapshot.databases["shop"], [Some(system_time.into())]);
+    assert_eq!(session.state_mut().read_basis().await.unwrap(), basis);
+    let mut historical = node.session("shop", Arc::new(Authority)).unwrap();
+    historical.state_mut().begin_with(TransactionSettings {
+        access: Some(AccessSettings::ReadOnly(ReadOnlySettings {
+            snapshot_token: OptionUpdate::Set(rtdb_format::basis::encode_time_basis(&historical_basis)),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }).unwrap();
+    let explicit = tokio::time::timeout(Duration::from_secs(5), historical.state_mut().read_basis()).await.unwrap().unwrap();
+    assert_eq!(explicit.snapshot, historical_basis);
+    stop(&node, driver).await;
+}
+
 #[async_trait]
 impl ReadFence for PausedReadFence {
     async fn confirm(&self, _: &str) -> Result<()> {
@@ -1122,7 +1199,8 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
             })
         }
         async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
-            Ok(OpenedLogs { source: self.source.clone(), replica: self.replica.clone(), source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new() })
+            Ok(OpenedLogs { source: self.source.clone(), replica: self.replica.clone(), source_epoch: rtdb_types::StorageEpoch(0),
+                replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None, drivers: Vec::new() })
         }
     }
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -1220,7 +1298,7 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
             };
             Ok(OpenedLogs {
                 source: self.shared.source.clone(), replica,
-                source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new(),
+                source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None, drivers: Vec::new(),
             })
         }
     }

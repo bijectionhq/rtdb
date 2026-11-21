@@ -1958,9 +1958,10 @@ rule ServeOnSubscriber {
     when: QueryArrived(subscription, query, session)
 
     ensures:
-        if session.freshness = linearizable:
+        if session.freshness = linearizable and NeedsImplicitBasis(query, session):
             let bound = ConfirmActiveLogletReadIndex(subscription.deployment)
             if bound != null and AwaitApplied(subscription, bound, within: config.subscriber_basis_wait):
+                CaptureImplicitBasis(query, from: subscription.applied_lsn)
                 Served(query, tier: subscriber, at: subscription.applied_lsn)
             else:
                 Replied(query, behind: true)
@@ -1972,6 +1973,16 @@ rule ServeOnSubscriber {
             else:
                 Replied(query, behind: true)
                 -- The gateway retries on the holder.
+}
+
+rule RetrySubscriberRefusalOnHolder {
+    when: SubscriberRefused(session, query, behind: true)
+
+    requires: NoResponseDelivered(query)
+    requires: BackendReportsIdle(session)
+
+    ensures:
+        RoutedToHolder(session.deployment, query)
 }
 
 rule ServeSnapshot {

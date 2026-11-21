@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
@@ -16,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ordered_index::OrderedIndexMaintenance;
 use crate::read_currency::ReadCurrency;
-use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
+use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, REPLICA_BEHIND, ReplicaReadIndex, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
 type OrderedIndexCycle = watch::Sender<Option<CycleHandle>>;
 
@@ -38,6 +39,7 @@ pub struct Database {
     pub(crate) storage: Arc<BufferPool>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
+    replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
     submitted_bytes: AtomicU64,
     replica_read_sessions: AtomicUsize,
@@ -59,6 +61,28 @@ impl Database {
     pub fn is_critical(&self) -> bool { self.name == "xtdb" || self.configuration.critical.unwrap_or(false) }
     pub fn startup_replica_target(&self) -> Result<Option<ReplicaPosition>> { self.logs.startup_replica_target() }
     pub fn latest_submitted_position(&self) -> Result<SourcePosition> { self.logs.latest_source_position() }
+    pub(crate) async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
+        let Some(read_index) = &self.replica_read_index else { return Ok(()); };
+        let behind = || Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
+            format!("This replica of {} could not establish a fresh snapshot", self.name));
+        let confirm = async {
+            let offset = read_index.confirm().await.map_err(|error| behind().with_context("cause", error.code.into()))?;
+            let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, offset.0)?;
+            let mut status = self.watch_status();
+            let applied = status.wait_for(|status| status.role == Role::Stopped
+                || status.installed_replica_position.is_some_and(|installed| installed >= position));
+            let status = tokio::time::timeout(Duration::from_millis(20), applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
+            if status.role == Role::Stopped { return Err(behind()); }
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
+            _ = self.cancellation.cancelled() => Err(behind()),
+            result = confirm => result,
+        }
+    }
+
     pub(crate) async fn await_durable_source(&self, cancellation: &CancellationToken) -> Result<()> {
         if self.external_source() {
             return Err(Anomaly::incorrect("rtdb/source-barrier", "The database ingests transactions outside its source log"));
@@ -300,7 +324,7 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication,
+            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };

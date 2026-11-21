@@ -18,7 +18,8 @@ Init ==
     /\ held = [server \in Servers |-> 0]
     /\ published = held
     /\ acknowledged = 0 /\ offered = 0 /\ applied = 0
-    /\ read = [phase |-> "idle", route |-> "old", epoch |-> 0, minimum |-> 0, bound |-> 0, served |-> 0]
+    /\ read = [phase |-> "idle", route |-> "old", epoch |-> 0,
+                minimum |-> 0, before_confirmation |-> 0, bound |-> 0, served |-> 0]
 
 Write(votes) ==
     /\ phase \in {"old", "new"} /\ votes \subseteq active /\ votes # {}
@@ -51,7 +52,7 @@ Activate(votes) ==
 Begin(route, epoch) ==
     /\ read.phase = "idle"
     /\ read' = [phase |-> "waiting", route |-> route, epoch |-> epoch,
-                 minimum |-> acknowledged, bound |-> 0, served |-> 0]
+                 minimum |-> acknowledged, before_confirmation |-> applied, bound |-> 0, served |-> 0]
     /\ UNCHANGED <<phase, prepared, active, held, published, acknowledged, offered, applied>>
 
 VotingJournals ==
@@ -75,8 +76,9 @@ Apply(server) ==
     /\ UNCHANGED <<phase, prepared, active, held, published, acknowledged, offered, read>>
 
 Serve ==
-    /\ read.phase = "confirmed" /\ applied >= read.bound
-    /\ read' = [read EXCEPT !.phase = "served", !.served = applied]
+    /\ read.phase = "confirmed" /\ (applied >= read.bound \/ Mutation = "skip_apply_wait")
+    /\ LET basis == IF Mutation = "basis_before_fence" THEN read.before_confirmation ELSE applied
+       IN read' = [read EXCEPT !.phase = "served", !.served = basis]
     /\ UNCHANGED <<phase, prepared, active, held, published, acknowledged, offered, applied>>
 
 Next ==

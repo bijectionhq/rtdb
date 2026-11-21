@@ -261,8 +261,10 @@ pub struct LogkeeperLogConfig {
     /// The members `servers` are, recorded as the deployment's ensemble once a move completes.
     #[serde(default)]
     pub ensemble: Vec<String>,
-    /// The writer epoch a holder opens its streams at; ignored by a subscriber.
+    /// The writer epoch for opening a stream and for confirming a read index.
     pub epoch: u64,
+    #[serde(default)]
+    pub require_read_index: bool,
     /// A snapshot reader's checkpoint: its logs end there and never advance, so it reads no logkeeper.
     #[serde(default)]
     pub frozen_at: Option<rtdb_directory::Checkpoint>,
@@ -331,6 +333,7 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Op
         replica_stream: record.stream("replica"),
         replica_seal_scope: record.replica_seal_scope(),
         epoch: record.epoch,
+        require_read_index: record.linearizable_reads && matches!(role, Role::Subscriber | Role::Compactor),
         log_epoch: record.log_epoch,
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
         previous_servers: None,

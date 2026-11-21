@@ -25,7 +25,7 @@ pub use resources::*;
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};
-pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, NativeSession, Node, NodeDriver, NodeServices, ReadFence};
+pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, ReadFence};
 
 mod statement;
 pub use statement::{PreparedSql, ResultSignaturePolicy};

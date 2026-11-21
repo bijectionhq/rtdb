@@ -91,8 +91,9 @@ fn pump(mut reader: impl AsyncRead + Unpin + Send + 'static, memory: Arc<MemoryB
 /// Where a session is connected, and how to reconnect it.
 #[async_trait::async_trait]
 pub trait Router: Send + Sync {
-    /// A connection to the deployment's current holder, the control address to touch it at, and the epoch it holds under.
+    /// A connection to an eligible backend, its control address, and its placement epoch.
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)>;
+    async fn route_holder(&self) -> Result<(TcpStream, Option<String>, u64)>;
     /// Keeps a routed backend warm for the duration of its connection.
     fn start_touching(&self, _address: String) -> Option<Arc<dyn Send + Sync>> { None }
 }
@@ -238,8 +239,7 @@ pub struct Session {
     answered: bool,
     /// Whether the pending command went to a backend lost before any reply reached the client, so that it may have run there.
     lost_unanswered: bool,
-    /// Discarding a refused command's replies through its ReadyForQuery, before resending it.
-    discarding: bool,
+    prefer_holder: bool,
     /// Whether the gateway assigns a command key on this route.
     keyed: bool,
     /// The key of the pending command, which began while the session was idle.
@@ -249,7 +249,7 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), replay_window: RECONNECT_WITHIN, command_key_age: COMMAND_KEY_AGE, expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None }
+        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), replay_window: RECONNECT_WITHIN, command_key_age: COMMAND_KEY_AGE, expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, prefer_holder: false, keyed, key: None }
     }
 
     pub(crate) fn with_frame_memory(mut self, memory: Arc<MemoryBudget>) -> Self {
@@ -294,7 +294,7 @@ impl Session {
     }
 
     async fn connect_once(&mut self, supersede: Option<u64>) -> Result<Backend> {
-        let (mut stream, control, epoch) = self.router.route().await?;
+        let (mut stream, control, epoch) = if self.prefer_holder { self.router.route_holder().await? } else { self.router.route().await? };
         if supersede.is_some_and(|previous| epoch <= previous) {
             return Err(lost("routing still points to the holder that closed storage"));
         }
@@ -359,6 +359,8 @@ impl Session {
         let (mut requests, mut client_reader) = pump(client_read, Arc::clone(&self.frame_memory));
         let mut copying_in = false;
         let mut replay_deadline = None;
+        enum Refusal { Placement, Replica(Frame) }
+        let mut refusal = None;
         let mut first = Backend::new(first, first_epoch, Arc::clone(&self.frame_memory));
         first.heartbeat = first_control.and_then(|address| self.router.start_touching(address));
         let mut backend = Some(first);
@@ -450,7 +452,7 @@ impl Session {
                             if !self.greeting.done {
                                 backend.as_mut().expect("greeting backend").keys.observe(&frame.body);
                             }
-                            if self.greeting.done && !self.discarding {
+                            if self.greeting.done && refusal.is_none() {
                                 match frame.body.first().copied() {
                                     Some(0) => self.await_token = None,
                                     Some(1) => self.await_token = Some(frame),
@@ -496,7 +498,7 @@ impl Session {
                             if frame.tag == b'E' { break Ok(()); }
                             continue;
                         }
-                        if !self.pending.is_empty() && !self.discarding && frame.tag == b'E' {
+                        if !self.pending.is_empty() && refusal.is_none() && frame.tag == b'E' {
                             let code = backend_error_code(&frame);
                             if matches!(code, Some("xtdb/ingestion-stopped" | "rtdb.storage/closed")) {
                                 if self.answered || !backend.as_ref().is_some_and(|current| self.replayable(current.keys)) {
@@ -509,26 +511,42 @@ impl Session {
                                     backend = Some(self.replay(Some(epoch), deadline).await?);
                                     continue;
                                 }
-                                self.discarding = true;
+                                refusal = Some(Refusal::Placement);
                             }
                         }
-                        if !self.pending.is_empty() && !self.answered && !self.discarding && frame.tag == b'E' && not_held(&frame) {
+                        if !self.pending.is_empty() && !self.answered && refusal.is_none() && frame.tag == b'E' && not_held(&frame) {
                             if self.keyed && !backend.as_ref().is_some_and(|current| self.replayable(current.keys)) {
                                 break Err(lost("the command cannot be safely replayed; its outcome is unknown"));
                             }
                             self.lost_unanswered = self.keyed;
                             self.start_replay(&mut replay_deadline);
-                            self.discarding = true;
+                            refusal = Some(Refusal::Placement);
                         }
-                        if self.discarding {
-                            if frame.tag == b'Z' {
-                                if self.keyed && !backend.as_ref().is_some_and(|current| self.replayable(current.keys)) {
-                                    break Err(lost("the command cannot be safely replayed; its outcome is unknown"));
-                                }
-                                self.discarding = false;
-                                backend = Some(self.replay(None, replay_deadline.expect("discarding has a deadline")).await?);
-                            }
+                        if !self.keyed && !self.pending.is_empty() && !self.answered && refusal.is_none()
+                            && frame.tag == b'E' && backend_error_code(&frame) == Some(rtdb_node::REPLICA_BEHIND)
+                        {
+                            self.start_replay(&mut replay_deadline);
+                            refusal = Some(Refusal::Replica(frame));
                             continue;
+                        }
+                        if let Some(rejected) = refusal.take() {
+                            if frame.tag != b'Z' {
+                                refusal = Some(rejected);
+                                continue;
+                            }
+                            match rejected {
+                                Refusal::Replica(error) if frame.body.first() != Some(&b'I') => {
+                                    client_write.write_all(&error.encode()).await.map_err(io)?;
+                                }
+                                rejected => {
+                                    if self.keyed && !backend.as_ref().is_some_and(|current| self.replayable(current.keys)) {
+                                        break Err(lost("the command cannot be safely replayed; its outcome is unknown"));
+                                    }
+                                    self.prefer_holder |= matches!(rejected, Refusal::Replica(_));
+                                    backend = Some(self.replay(None, replay_deadline.expect("a refused command has a deadline")).await?);
+                                    continue;
+                                }
+                            }
                         }
                         if self.lost_unanswered && frame.tag == b'E' {
                             break Err(lost("the command's outcome is unknown because its holder stopped and its successor could not confirm it"));
@@ -571,7 +589,9 @@ impl Session {
                         if !self.greeting.done { break Err(lost("the holder closed during session startup")); }
                         let protected = backend.take().is_some_and(|current| self.replayable(current.keys));
                         // A refusal whose ReadyForQuery never came is over with its backend: the resent command's replies are the client's.
-                        self.discarding = false;
+                        if matches!(refusal.take(), Some(Refusal::Replica(_))) {
+                            break Err(lost("the replica closed before confirming the transaction state"));
+                        }
                         if self.status != Status::Idle {
                             if !protected || self.answered {
                                 break Err(lost("the holder went away during a command, whose outcome is unknown"));
@@ -853,6 +873,7 @@ mod tests {
         async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
             Ok((self.0.lock().await.take().expect("routed once"), None, 0))
         }
+        async fn route_holder(&self) -> Result<(TcpStream, Option<String>, u64)> { self.route().await }
     }
 
     async fn pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
@@ -1406,6 +1427,7 @@ mod tests {
             let (stream, epoch) = self.0.lock().await.pop_front().expect("a route is available");
             Ok((stream, None, epoch))
         }
+        async fn route_holder(&self) -> Result<(TcpStream, Option<String>, u64)> { self.route().await }
     }
 
     async fn assert_retry_after_backend_error(failure: BackendFailure) {

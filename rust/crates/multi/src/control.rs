@@ -61,6 +61,8 @@ pub enum Request {
     Touch { name: String },
     /// Serve the deployment's reads from a log-fed replica on this node.
     Subscribe { name: String },
+    /// Serve a deployment using a read index before capturing an implicit basis.
+    SubscribeFresh { name: String },
     /// Serve the deployment's reads as of its checkpoint, from object storage alone.
     Snapshot { name: String },
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
@@ -207,7 +209,8 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
                             Response::Refused { code: "rtdb.multi/pgwire-relay-unavailable".into(), message: "This control endpoint cannot open a Pgwire connection".into() }
                         }
                         request => {
-                            let reports_probe = matches!(request, Request::Ping | Request::Activate { .. } | Request::Subscribe { .. } | Request::Snapshot { .. });
+                            let reports_probe = matches!(request, Request::Ping | Request::Activate { .. } | Request::Subscribe { .. }
+                                | Request::SubscribeFresh { .. } | Request::Snapshot { .. });
                             let response = handler.handle(request).await;
                             if reports_probe {
                                 startup_probe_overflows = pgwire.as_ref().map(|endpoint| endpoint.status.borrow().startup_probe_overflows);

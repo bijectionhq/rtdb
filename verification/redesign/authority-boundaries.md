@@ -1,7 +1,6 @@
 # Authority boundaries in placed RTDB
 
 This is the target design for the second structural review.
-The Multi transaction and read paths, the recovery changes, and the custody protocol below require implementation.
 The TLA+ models cover small transition protocols and isolate their assumptions from the underlying service contracts.
 
 ## Submission, outcome, and read basis
@@ -42,7 +41,6 @@ Current paths are [Multi intake](../../rust/crates/multi/src/logs.rs), [node sub
 
 The directory assigns writer epochs and locates an ensemble.
 Its current renewable member lease also stops local serving after a directory outage.
-A subscriber can be routed a linearizable session even though the current confirmation hook only checks holders.
 With heartbeats disabled a subscriber's locally observed tip cannot establish freshness.
 
 A sealed quorum loglet is the serving authority for an installed epoch.
@@ -78,9 +76,11 @@ The native logkeeper persists activation only on the writer's target ensemble af
 A read-index round requires matching stream, epoch, ensemble and write quorum and accepts a journal's held position only after its preceding journal work is durable.
 Journals without read-index support can still carry writes during rollout.
 A writer opened by an older binary establishes its activation when a supporting writer opens the stream.
-The query path still needs to invoke the round on the subscriber's attached log and wait for its committed apply position.
-An implicit query or read transaction must capture its system-time basis after that wait.
+The subscriber probes the replica log of its attached database and waits for its installed position before capturing an implicit query or transaction snapshot.
 An explicit or already pinned basis keeps the history and time selected by the caller or transaction.
+The gateway requests a subscriber that supports fresh reads for a deployment with linearizable reads enabled.
+A subscriber that cannot establish its basis refuses before the read.
+The gateway retries an unanswered command on the holder when the refusal leaves the backend idle.
 Logkeepers' active journal identity must follow the exclusive journal and the fencing protocol.
 All trim requests require a grant bound to the history, loglet, epoch and protected recovery frontier.
 

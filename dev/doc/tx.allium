@@ -42,6 +42,9 @@
 --      COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream') uses the connection's read basis.
 --      The connection streams Arrow IPC in CopyData frames and ends it before the CopyDone and command completion frames.
 --      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
+--      An implicit basis on a linearizable subscriber follows the installed replica prefix confirmed by its active loglet.
+--      A read transaction retains its captured basis across later statements.
+--      Each explicit snapshot token identifies the basis the caller selected.
 --      The gateway restores the mutable settings and token before replaying prepared statements or resuming application work.
 --      The mutable settings include the timezone, session parameters and default transaction access mode.
 --      DISCARD ALL restores the original startup settings.
