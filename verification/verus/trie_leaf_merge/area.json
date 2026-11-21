@@ -1,7 +1,7 @@
 {
-  "summary": "The production comparator realizes the leaf rank and the merge returns every occurrence from both sorted runs in order.",
+  "summary": "The production merge reads stable IIDs and returns every occurrence from both sorted runs in order or a reader error.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws", "--rlimit", "40"],
-  "min_verified_functions": 15,
+  "min_verified_functions": 17,
   "controls": {
     "take_larger_head": {
       "defect": "The merge selects the larger head before the smaller one.",
@@ -19,7 +19,7 @@
         "function": "merge_sorted_rows",
         "category": "precondition not satisfied"
       }],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     },
     "omit_right_tail": {
       "defect": "The unconsumed right run is omitted.",
@@ -33,7 +33,7 @@
         "function": "merge_sorted_rows",
         "category": "assertion failed"
       }],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     },
     "drop_right_head": {
       "defect": "An occurrence from the right run is consumed without being emitted.",
@@ -47,7 +47,35 @@
         "function": "merge_sorted_rows",
         "category": "assertion failed"
       }],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
+    },
+    "read_wrong_head": {
+      "defect": "The right head uses bytes read for the left head.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "find": "let read_right = read_iid(right_row);",
+        "replace": "let read_right = read_iid(left_row);"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "merge_sorted_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 16
+    },
+    "publish_partial_merge_on_error": {
+      "defect": "A failed left lookup returns the already merged prefix as a successful result.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "find": "return Err(error);\n            }\n        };\n        let read_right",
+        "replace": "return Ok(merged);\n            }\n        };\n        let read_right"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "merge_sorted_rows",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 16
     },
     "older_row_first": {
       "defect": "The production comparator orders older rows first when IIDs are equal.",
@@ -61,7 +89,7 @@
         "function": "compare_row_keys",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     },
     "reverse_iid_comparison": {
       "defect": "The production comparator orders IIDs in descending order.",
@@ -79,7 +107,7 @@
         "function": "compare_row_keys",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     },
     "reverse_within_iid_order": {
       "defect": "The reference rank sorts increasing row indices for the same IID.",
@@ -93,7 +121,7 @@
         "function": "rank_is_unsigned_iid_then_descending_index",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     }
   }
 }

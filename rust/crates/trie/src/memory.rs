@@ -189,7 +189,7 @@ fn sort<R: IidReader + ?Sized>(reader: &R, rows: impl Iterator<Item = u32>) -> R
 }
 
 fn merge<R: IidReader + ?Sized>(reader: &R, left: &[u32], right: &[u32]) -> Result<Vec<u32>> {
-    merge_sorted_rows(left, right, |left, right| compare(reader, left, right))
+    merge_sorted_rows(left, right, |row| reader.iid(row).map(|iid| iid.0))
 }
 
 fn insert_rows<R: IidReader + ?Sized>(
