@@ -426,6 +426,7 @@ contract LogService {
 
     @invariant DurabilityIsConfiguredNotHoped
         -- Expected of the operator: each ensemble spans three availability zones, and a server acknowledges only after fsync.
+        -- New assignments prefer distinct zones, and repair keeps surviving endpoints while using distinct zones for available slots.
 }
 
 contract ObjectStorage {

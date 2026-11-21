@@ -303,6 +303,7 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    A client in `loglet` holding one connection per ensemble member per node, multiplexing every deployment the node holds, with write quorum 2 of 3 across zones.
 3. **Ensemble assignment.**
    The directory records each loglet's ensemble; the controller balances writers across logkeepers.
+   Assignment spreads an ensemble across distinct declared zones where possible and retains surviving members during repair.
 4. **Deployment of the logkeepers.**
    The logkeeper is the first production loglet (decision 2, settled).
    Logkeepers run on EC2 instances with instance-store NVMe, at least one per availability zone per ensemble, with ensembles spread so that losing a host re-replicates its streams to the rest of the cell.

@@ -16,7 +16,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{Handler, MoveTicket, Request, Response};
-use crate::deployment::{CellStorage, Role, database_config, ensemble_servers};
+use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, select_logkeepers};
 use crate::lease::MemberLease;
 
 #[derive(Clone, Debug)]
@@ -213,9 +213,8 @@ impl NodeAgent {
         if let Some(previous) = &record.move_from {
             let logkeepers: Vec<_> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now)).collect();
             let count = record.ensemble.len();
-            let mut addresses = BTreeSet::new();
-            let mut selected: Vec<&MemberRecord> = rtdb_affinity::rank(&record.storage_identity(), &logkeepers, |member| member.id.as_str())
-                .into_iter().copied().filter(|member| addresses.insert(member.address.as_str())).take(count).collect();
+            let mut selected = select_logkeepers(&record.storage_identity(), count, Vec::new(), &logkeepers);
+            let mut addresses: BTreeSet<_> = selected.iter().map(|member| member.address.as_str()).collect();
             if selected.len() < crate::deployment::write_quorum(count) {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-log-quorum", "The destination cannot form a write quorum for the moved log"));
             }
@@ -239,13 +238,11 @@ impl NodeAgent {
             return Ok(database_config(record, servers, &self.options.storage, Role::Holder));
         }
         let candidates: Vec<&MemberRecord> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now) && !record.ensemble.contains(&member.id)).collect();
-        let mut ensemble = alive;
-        for member in rtdb_affinity::rank(&record.storage_identity(), &candidates, |member| member.id.as_str()) {
-            if ensemble.len() == record.ensemble.len() { break; }
-            ensemble.push(member.id.clone());
-        }
-        if ensemble.len() < record.ensemble.len() { return Ok(database_config(record, servers, &self.options.storage, Role::Holder)); }
-        let next: Vec<String> = ensemble.iter().map(|id| members[id].address.clone()).collect();
+        let live_members = alive.iter().map(|id| &members[id]).collect();
+        let selected = select_logkeepers(&record.storage_identity(), record.ensemble.len(), live_members, &candidates);
+        if selected.len() < record.ensemble.len() { return Ok(database_config(record, servers, &self.options.storage, Role::Holder)); }
+        let next = selected.iter().map(|member| member.address.clone()).collect();
+        let ensemble = selected.iter().map(|member| member.id.clone()).collect();
         Ok(crate::deployment::moving_config(record, next, Some((servers, ensemble)), &self.options.storage, Role::Holder))
     }
 

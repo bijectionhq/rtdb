@@ -1,6 +1,6 @@
 //! What a node opens for a deployment: the `DatabaseConfig` derived from its directory record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use rtdb_directory::{DeploymentRecord, MemberId, MemberRecord, MemberRole};
@@ -135,6 +135,25 @@ pub struct LogkeeperLogConfig {
 
 pub fn write_quorum(ensemble: usize) -> usize { ensemble / 2 + 1 }
 
+pub(crate) fn select_logkeepers<'a>(key: &str, width: usize, mut selected: Vec<&'a MemberRecord>, candidates: &[&'a MemberRecord]) -> Vec<&'a MemberRecord> {
+    let mut addresses: BTreeSet<_> = selected.iter().map(|member| member.address.as_str()).collect();
+    let mut zones: BTreeSet<_> = selected.iter().map(|member| member.availability_zone.as_str()).collect();
+    let mut same_zone = Vec::new();
+    for member in rtdb_affinity::rank(key, candidates, |member| member.id.as_str()).into_iter().copied() {
+        if selected.len() == width { return selected; }
+        if addresses.contains(member.address.as_str()) { continue; }
+        if zones.insert(member.availability_zone.as_str()) {
+            addresses.insert(member.address.as_str());
+            selected.push(member);
+        } else {
+            same_zone.push(member);
+        }
+    }
+    let unfilled = width.saturating_sub(selected.len());
+    selected.extend(same_zone.into_iter().filter(|member| addresses.insert(member.address.as_str())).take(unfilled));
+    selected
+}
+
 pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<String>> {
     record.ensemble.iter().map(|id| {
         members.get(id).filter(|member| member.role == MemberRole::Logkeeper).map(|member| member.address.clone())
@@ -172,6 +191,33 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ensemble_prefers_distinct_zones_and_keeps_its_existing_live_members() {
+        let member = |id: &str, address: &str, zone: &str| MemberRecord {
+            id: MemberId(id.into()), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
+            availability_zone: zone.into(), engine_version: "test".into(), lease_expires_at_ms: 100,
+            state: rtdb_directory::MemberState::Eligible, pool: Default::default(), version: 1,
+        };
+        let (a, alternative, b, c, reused) = (member("a", "a", "one"), member("a2", "a2", "one"),
+            member("b", "b", "two"), member("c", "c", "three"), member("reused", "a", "one"));
+        let candidates = [&a, &alternative, &b, &c, &reused];
+        for index in 0..50 {
+            let key = format!("deployment-{index}");
+            let selected = select_logkeepers(&key, 3, Vec::new(), &candidates);
+            assert_eq!(selected.iter().map(|member| &member.availability_zone).collect::<BTreeSet<_>>().len(), 3);
+            let replacement = select_logkeepers(&key, 3, vec![&a, &b], &candidates);
+            assert_eq!(replacement, [&a, &b, &c]);
+        }
+        let updated_zone = member("updated", "a2", "two");
+        for index in 0..50 {
+            let candidate = select_logkeepers(&format!("moving-{index}"), 2, vec![&a], &[&alternative, &updated_zone]);
+            assert_eq!(candidate, [&a, &updated_zone]);
+        }
+        let local = select_logkeepers("local", 3, Vec::new(), &[&a, &alternative, &reused]);
+        assert_eq!(local.len(), 2);
+        assert_ne!(local[0].address, local[1].address);
+    }
 
     #[test]
     fn a_holder_opens_its_streams_at_the_record_epoch_under_its_own_prefix() {

@@ -11,7 +11,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
-use crate::deployment::{CellStorage, ensemble_servers, write_quorum};
+use crate::deployment::{CellStorage, ensemble_servers, select_logkeepers, write_quorum};
 use crate::keys::KeyService;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
@@ -26,14 +26,13 @@ pub async fn create_deployment(directory: &dyn Directory, name: &str, org: &str,
 
 async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
     let now = now_ms();
-    let logkeepers: Vec<MemberRecord> = directory.members().await?.into_iter().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).collect();
-    let mut addresses = std::collections::BTreeSet::new();
-    let selected: Vec<_> = rtdb_affinity::rank(&record.storage_identity(), &logkeepers, |member| member.id.as_str())
-        .into_iter().filter(|member| addresses.insert(member.address.as_str())).take(replicas).map(|member| member.id.clone()).collect();
+    let members = directory.members().await?;
+    let logkeepers: Vec<_> = members.iter().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).collect();
+    let selected = select_logkeepers(&record.storage_identity(), replicas, Vec::new(), &logkeepers);
     if selected.len() < replicas {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/too-few-logkeepers", format!("{replicas} logkeeper addresses are needed and {} are live", selected.len())));
     }
-    Ok(selected)
+    Ok(selected.into_iter().map(|member| member.id.clone()).collect())
 }
 
 async fn members(directory: &dyn Directory) -> Result<BTreeMap<MemberId, MemberRecord>> {
