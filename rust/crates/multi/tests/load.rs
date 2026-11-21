@@ -3,11 +3,12 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{Cell, values};
 use rtdb_multi::admin;
-use tokio::sync::{Barrier, Mutex};
+use tokio::sync::{Barrier, Mutex, Notify};
 use tokio::task::JoinSet;
 
 fn setting(name: &str, default: usize) -> usize {
@@ -45,8 +46,9 @@ fn percentile(samples: &[Duration], percentile: usize) -> f64 {
 async fn durable_pgwire_updates_under_zipf_activity() {
     let deployments = setting("RTDB_CELL_BENCH_DEPLOYMENTS", 32);
     let workers = setting("RTDB_CELL_BENCH_WORKERS", 16);
-    let commands = setting("RTDB_CELL_BENCH_COMMANDS", 256);
-    let cell = Cell::start_durable(3).await;
+    let scale = std::env::var_os("RTDB_CELL_BENCH_SCALE").is_some();
+    let commands = setting("RTDB_CELL_BENCH_COMMANDS", if scale { 2048 } else { 256 });
+    let mut cell = Cell::start_durable(if scale { 2 } else { 3 }).await;
 
     let mut connections = Vec::with_capacity(deployments);
     for index in 0..deployments {
@@ -59,9 +61,12 @@ async fn durable_pgwire_updates_under_zipf_activity() {
     let connections = Arc::new(connections);
     let ranks = Arc::new(ranks(deployments));
     let ready = Arc::new(Barrier::new(workers + 1));
+    let first_write = Arc::new(Notify::new());
+    let completed = Arc::new(AtomicUsize::new(0));
     let mut tasks = JoinSet::new();
     for worker in 0..workers {
         let (connections, ranks, ready) = (connections.clone(), ranks.clone(), ready.clone());
+        let (first_write, completed) = (first_write.clone(), completed.clone());
         tasks.spawn(async move {
             let mut rng = (worker as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
             let mut totals = vec![0; ranks.len()];
@@ -73,6 +78,7 @@ async fn durable_pgwire_updates_under_zipf_activity() {
                 connections[rank].lock().await.simple_query("UPDATE counters SET n = n + 1 WHERE _id = 1").await.unwrap();
                 samples.push(started.elapsed());
                 totals[rank] += 1;
+                if scale && completed.fetch_add(1, Ordering::Relaxed) == 0 { first_write.notify_one(); }
             }
             (totals, samples)
         });
@@ -80,14 +86,43 @@ async fn durable_pgwire_updates_under_zipf_activity() {
 
     let started = Instant::now();
     ready.wait().await;
-    let mut totals = vec![0; deployments];
-    let mut latencies = Vec::with_capacity(workers * commands);
-    while let Some(result) = tasks.join_next().await {
-        let (updates, samples) = result.unwrap();
-        for (total, updated) in totals.iter_mut().zip(updates) { *total += updated; }
-        latencies.extend(samples);
-    }
-    let elapsed = started.elapsed();
+    let measurements = async {
+        let mut totals = vec![0; deployments];
+        let mut latencies = Vec::with_capacity(workers * commands);
+        while let Some(result) = tasks.join_next().await {
+            let (updates, samples) = result.unwrap();
+            for (total, updated) in totals.iter_mut().zip(updates) { *total += updated; }
+            latencies.extend(samples);
+        }
+        (totals, latencies, started.elapsed())
+    };
+    let scaling = async {
+        if !scale { return; }
+        tokio::time::timeout(Duration::from_secs(10), first_write.notified()).await.unwrap();
+        let before = completed.load(Ordering::Relaxed);
+        let start = Instant::now();
+        let added = cell.add_node().await;
+        let moved = admin::rebalance(cell.directory.as_ref(), deployments, &common::control()).await.unwrap();
+        assert!(moved > 0 && !cell.node(added).agent.held().is_empty());
+        let scale_out = start.elapsed();
+        let after_out = completed.load(Ordering::Relaxed);
+        assert!(after_out > before, "writes complete during scale-out");
+
+        let drained = cell.holder("bench-0").await.unwrap();
+        let draining = cell.node(drained);
+        let holdings = draining.agent.held().len();
+        let start = Instant::now();
+        admin::drain(cell.directory.as_ref(), &draining.lease.id()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !draining.agent.held().is_empty() { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        cell.nodes[drained].take().unwrap().shutdown().await.unwrap();
+        let after_in = completed.load(Ordering::Relaxed);
+        assert!(after_in > after_out && after_in < workers * commands, "writes continue through the start and end of scale-in");
+        println!("scale_out_moved={moved} scale_out_ms={:.3} commits_during_scale_out={} scale_in_drained={holdings} scale_in_ms={:.3} commits_during_scale_in={}",
+            scale_out.as_secs_f64() * 1000.0, after_out - before, start.elapsed().as_secs_f64() * 1000.0, after_in - after_out);
+    };
+    let ((totals, mut latencies, elapsed), ()) = tokio::join!(measurements, scaling);
 
     for (client, expected) in connections.iter().zip(&totals) {
         assert_eq!(values(&*client.lock().await, "SELECT n FROM counters").await, [expected.to_string()]);

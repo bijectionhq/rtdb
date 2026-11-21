@@ -552,6 +552,11 @@ The largest inter-commit gap overlapping each move had a median of 18.6–22.1 m
 After introducing the admission pause, five spaced release runs of the same workload matched all 412–432 acknowledged updates per run.
 The inter-commit gap was 14.8–16.0 ms at p50, 19.5–32.8 ms at p95, and 21.0–75.9 ms at p99.
 The continuous-write p99 stayed below 30 ms in two of the five runs.
+Five additional runs recorded both the client gap and the administration call.
+The worst client gap in those runs ranged from 34.3 to 100.9 ms, with the corresponding administration calls taking 30.1 to 76.8 ms.
+In the 100.9 ms case, the administration call finished in 39.0 ms.
+With the cold activation quota and the admission pause, one 1,000-deployment release run activated the deployments in 1.56 seconds.
+It measured a move-to-first-write p50 of 7.0 ms and p99 of 17.6 ms, then verified all counters and 342 new placements in 2.51 seconds after killing the busiest node.
 
 ```sh
 cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
@@ -730,7 +735,17 @@ RTDB_CELL_BENCH_DEPLOYMENTS=32 RTDB_CELL_BENCH_WORKERS=16 RTDB_CELL_BENCH_COMMAN
   durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
 ```
 
-The scale and handoff acceptance run needs a production directory, lazy activation of parked deployments and live scale transitions.
+Three release trials extended the workload to 32,768 durable updates apiece and ran through two-node to three-node scale-out, then drained and removed the holder of the hottest deployment.
+Each scale-out moved 10 deployments over 55–56 ms while 196–218 writes completed.
+Each scale-in drained 10–11 deployments over 275–385 ms while 751–1,328 writes completed.
+Every counter matched, with 1,488–2,965 updates/s and p99 of 27.7–97.7 ms across the trials.
+
+```sh
+RTDB_CELL_BENCH_SCALE=1 cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
+  durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
+```
+
+The staging acceptance run needs a production directory, lazy activation of parked deployments and repeatable p99 across live scale transitions.
 
 ## 6. Existing specs affected
 
