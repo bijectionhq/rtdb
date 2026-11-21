@@ -780,3 +780,36 @@ It checked 91 Verus obligations and 54 diagnostic controls, and completed 20 TLC
 The archived startup test passed. Skipping the prefix check failed at native replica startup with the same log-range error as the baseline.
 All other formal and native checks in the runner passed.
 The input manifest SHA-256 is `2ce24bf34cb8f4c64ac867d03350a300b784b071da96776dae0020c6fd3e3021`.
+
+== Production compaction page heap
+
+The link:../verus/compaction_heap/proof.rs[Verus area] includes the exact Rust source of the production page heap.
+The constructor accepts precisely the pages whose adjacent keys are ordered and initializes one coordinate for each nonempty page.
+Heap construction and sift preserve the coordinate multiset and establish parent-to-child order under the documented input conditions.
+Each extraction returns the root, proves it is a minimum, and advances the selected page by one row or removes its exhausted coordinate.
+The transition keeps every other occurrence, including distinct rows whose keys tie.
+The proofs apply at all representable page lengths under the length and key callback contracts.
+The native wrapper supplies these callbacks from one immutable set of decoded pages for the heap's lifetime.
+
+The area checks 20 obligations.
+Four production mutations reverse the timestamp ordering, choose the later child, skip page validation, or return row zero.
+The joint mutation returns row zero and changes the function's contract to match.
+The independent root and row-identity laws then fail at their declared sites.
+
+The native replay enumerates 54,241 batches and compares row order with an independent flatten and sort.
+It also checks exhaustion, per-page row identity, and rejection of pages inverted by IID or by system time.
+Its test keys distinguish byte order and signed timestamp comparison.
+Four native controls catch the wrong child, a missing final row, a repeated coordinate, and the wrong IID byte order.
+The selected maintenance suites passed 37 tests on `main` and 30 tests on `rtdb-multi` at `e6adada1a`.
+Both branches compile the same heap source and use the adapter for their respective decoded row representation.
+The scoped command is `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-maintenance --lib --tests`.
+
+The link:../lean/CompactionMerge.lean[Lean merge model] proves whole-input occurrence and ordering laws.
+The source proof ends at the coordinates exposed by the page heap.
+Metadata traversal, clipping, interpretation of same-time and bitemporal events, and preservation after encoding and publication remain separate obligations.
+
+The combined runner passed on `bce1ab43b` with mCRL2, AutoHyper, and both Rust options enabled.
+It checked 111 Verus obligations and rejected 59 Verus mutation cases at their declared sites.
+TLC completed 20 baselines and found 55 expected counterexamples or reachability witnesses.
+The other formal models, compiler controls, and native replays passed.
+The input manifest SHA-256 is `e89fb0d25f7ecaea1a10f349f80a0c21391fd55c333ab78e586193b62450b5f9`.
