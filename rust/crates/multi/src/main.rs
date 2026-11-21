@@ -290,18 +290,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&recovery).expect("a restore receipt serializes"));
             Ok(())
         }
-        "schedule-disposal" => {
-            let directory = directory(arguments.required("directory")?).await?;
-            let id = installation_id(&arguments)?;
-            let scheduled = admin::begin_disposal(directory.as_ref(), &id.to_string()).await?;
-            println!("{}", serde_json::json!({
-                "deployment": scheduled.id,
-                "incarnation": scheduled.incarnation,
-                "epoch": scheduled.epoch,
-                "lifecycle": scheduled.lifecycle,
-            }));
-            Ok(())
-        }
         "create" => {
             let directory = directory(arguments.required("directory")?).await?;
             let record = admin::create_deployment(directory.as_ref(), arguments.required("name")?, arguments.optional("org").unwrap_or("default"), arguments.number("replicas", 3usize)?).await?;

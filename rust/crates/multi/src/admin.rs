@@ -456,7 +456,7 @@ pub(crate) async fn begin_hosted_disposal(directory: &dyn Directory, id: uuid::U
             }
         }
     };
-    if installed.id != id || installed.parent.is_some() {
+    if installed.id != id || installed.org != org || installed.parent.is_some() {
         return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "The requested name belongs to another installation"));
     }
     begin_disposal(directory, &id).await
@@ -489,7 +489,7 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
     }
     let journals_retired_at_ms = now_ms();
     keys.destroy(&fenced.id).await?;
-    let key_withdrawn_at_ms = now_ms();
+    let key_withdrawn_at_ms = now_ms().max(journals_retired_at_ms);
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     // Its forks keep what they share with it: those objects are copied into them before it goes.
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
@@ -503,7 +503,7 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         journals: stream.servers.into_iter().collect(),
         journals_retired_at_ms,
         key_withdrawn_at_ms,
-        serving_prefix_observed_empty_at_ms: now_ms(),
+        serving_prefix_observed_empty_at_ms: now_ms().max(key_withdrawn_at_ms),
     };
     let deleted = update_installation(directory, id, |record| {
         if record.epoch != receipt.epoch || record.incarnation != receipt.incarnation {
