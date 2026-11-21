@@ -13,6 +13,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use prost_types::Any;
 use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
+use rtdb_directory::{DeploymentRecord, Lifecycle};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_node::{LogAccess, LogFactory, OpenedLogs};
 use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
@@ -23,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cipher::{Cipher, SEALED_OVERHEAD};
 use crate::deployment::LogkeeperLogConfig;
 use crate::keys::KeyService;
+use crate::replica_retention::excluded_replay_start;
 
 /// How many already-resolved intake records stay retained behind the holder's read position.
 const INTAKE_RETAINED_BEHIND: i64 = 1024;
@@ -37,6 +39,7 @@ pub trait EnsembleRecorder: Send + Sync {
     /// Records every endpoint a copy can touch before any bytes move.
     async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()>;
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
+    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
 }
 
 pub struct LogkeeperLogFactory { pub maximum_message_bytes: usize, pub keys: Arc<dyn KeyService>, pub writers: Writers, pub recorder: Arc<dyn EnsembleRecorder> }
@@ -49,6 +52,8 @@ pub struct DirectoryRecorder { pub directory: Arc<dyn rtdb_directory::Directory>
 
 #[async_trait]
 impl EnsembleRecorder for DirectoryRecorder {
+    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { self.directory.deployment(id).await }
+
     async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()> {
         for _ in 0..8 {
             let mut record = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
@@ -134,11 +139,7 @@ impl LogFactory for LogkeeperLogFactory {
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
-        let replica: Arc<dyn Log> = Arc::new(SealedLog::new(
-            quorum,
-            &key,
-            &config.replica_seal_scope,
-        )?);
+        let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.recorder))?);
         let next = next_source_offset(replica.as_ref(), epoch).await?;
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
         let trimming = {
@@ -242,11 +243,52 @@ pub fn renumber_into(tail: &mut [ReplicaEnvelope], epoch: StorageEpoch) -> Resul
     Ok(())
 }
 
+struct RecoveryAdmission {
+    directory: Arc<dyn EnsembleRecorder>,
+    deployment: String,
+    replica_stream: String,
+    log_epoch: i32,
+}
+
+impl RecoveryAdmission {
+    async fn check_start(&self, after: LogOffset) -> rtdb_storage::Result<()> {
+        use rtdb_storage::Error;
+        let record = self.directory.deployment(&self.deployment).await.map_err(|error| Error::Remote {
+            key: self.replica_stream.clone(), message: error.to_string(),
+        })?;
+        let record = record.filter(|record| {
+            record.log_epoch == self.log_epoch && record.stream("replica") == self.replica_stream
+                && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+        }).ok_or_else(|| Error::Closed(self.replica_stream.clone()))?;
+        if let Some(anchor) = record.replica_anchor
+            && let Some((requested, first_retained)) = excluded_replay_start(after.0, anchor.interval[1])
+        {
+            return Err(Error::UnavailableLogRange { requested, first_retained });
+        }
+        Ok(())
+    }
+}
+
 /// A log whose payloads are sealed under the deployment's key, so a logkeeper never holds a row in the clear.
-pub struct SealedLog { inner: Arc<dyn Log>, cipher: Arc<Cipher>, stream: Arc<str> }
+pub struct SealedLog {
+    inner: Arc<dyn Log>,
+    cipher: Arc<Cipher>,
+    stream: Arc<str>,
+    recovery: Option<RecoveryAdmission>,
+}
 
 impl SealedLog {
-    pub fn new(inner: Arc<dyn Log>, key: &[u8], stream: &str) -> Result<Self> { Ok(Self { inner, cipher: Arc::new(Cipher::new(key)?), stream: Arc::from(stream) }) }
+    pub fn new(inner: Arc<dyn Log>, key: &[u8], stream: &str) -> Result<Self> {
+        Ok(Self { inner, cipher: Arc::new(Cipher::new(key)?), stream: Arc::from(stream), recovery: None })
+    }
+
+    fn for_serving(inner: Arc<dyn Log>, key: &[u8], config: &LogkeeperLogConfig, directory: Arc<dyn EnsembleRecorder>) -> Result<Self> {
+        let mut log = Self::new(inner, key, &config.replica_seal_scope)?;
+        log.recovery = Some(RecoveryAdmission {
+            directory, deployment: config.deployment.clone(), replica_stream: config.replica_stream.clone(), log_epoch: config.log_epoch,
+        });
+        Ok(log)
+    }
 }
 
 fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
@@ -261,6 +303,7 @@ impl Log for SealedLog {
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
     async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.inner.retained_floor().await }
     async fn recovery_tail(&self, after: LogOffset) -> rtdb_storage::Result<Option<Box<dyn LogTail>>> {
+        if let Some(recovery) = &self.recovery { recovery.check_start(after).await?; }
         Ok(self.inner.recovery_tail(after).await?.map(|inner| {
             Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }) as Box<dyn LogTail>
         }))
@@ -397,6 +440,56 @@ mod tests {
         assert_eq!(refused.code, "rtdb.multi/key-missing");
         assert!(directory.deployment(&record.id).await.unwrap().unwrap().replica_journals.is_empty());
         assert!(keys.existing_key(&record.key_id()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_a_pending_trim_before_the_logkeeper_applies_it() {
+        use rtdb_directory::{Cas, Checkpoint, Directory, JournalAnchor, MemoryDirectory};
+        use rtdb_storage::Error;
+
+        let directory = MemoryDirectory::new();
+        let mut record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let config = LogkeeperLogConfig {
+            servers: vec![],
+            deployment: record.id.clone(),
+            key_id: record.key_id(),
+            replica_stream: record.stream("replica"),
+            replica_seal_scope: record.replica_seal_scope(),
+            previous_servers: None,
+            ensemble: vec![],
+            epoch: record.epoch,
+            frozen_at: None,
+            log_epoch: record.log_epoch,
+            write_quorum: 1,
+        };
+        let provider = Arc::new(MemoryLog::new(1024));
+        let replica = SealedLog::for_serving(provider.clone(), &[7; 32], &config, Arc::new(DirectoryRecorder { directory: directory.clone() })).unwrap();
+        for _ in 0..7 {
+            replica.enqueue(Bytes::from_static(b"entry"), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        }
+        assert!(replica.recovery_tail(LogOffset(3)).await.unwrap().is_some());
+
+        let version = record.version;
+        record.checkpoint = Some(Checkpoint { block: 1, boundary: 5, source: 1, system_time: 0 });
+        record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation: record.incarnation, interval: [0, 4], digest: [0; 32] }));
+        let Cas::Applied(mut record) = directory.replace_deployment(record, version).await.unwrap() else { panic!("failed to authorize trim"); };
+        assert_eq!(provider.first_retained(), LogOffset(0));
+        assert!(provider.recovery_tail(LogOffset(3)).await.unwrap().is_some());
+        assert!(matches!(replica.recovery_tail(LogOffset(3)).await,
+            Err(Error::UnavailableLogRange { requested: 4, first_retained: 5 })), "authorized trim must exclude the required record before it is removed");
+        assert!(replica.recovery_tail(LogOffset(4)).await.unwrap().is_some());
+
+        let version = record.version;
+        record.epoch += 1;
+        let Cas::Applied(mut record) = directory.replace_deployment(record, version).await.unwrap() else { panic!("failed to change writer epoch"); };
+        assert!(matches!(replica.recovery_tail(LogOffset(3)).await,
+            Err(Error::UnavailableLogRange { requested: 4, first_retained: 5 })));
+        assert!(replica.recovery_tail(LogOffset(5)).await.unwrap().is_some());
+
+        let version = record.version;
+        record.log_epoch += 1;
+        assert!(matches!(directory.replace_deployment(record, version).await.unwrap(), Cas::Applied(_)));
+        assert!(matches!(replica.recovery_tail(LogOffset(5)).await, Err(Error::Closed(_))));
     }
 
     async fn append(log: &MemoryLog, message: ReplicaBody) {

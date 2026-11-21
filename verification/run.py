@@ -1350,6 +1350,36 @@ def verify_replay_prefix(args, source):
     print("rust-replay-prefix: checkpoint selection and same-cursor replay passed, both controls rejected")
 
 
+def verify_multi_trim_admission(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "logs::tests::recovery_refuses_a_pending_trim_before_the_logkeeper_applies_it"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", test, "--", "--exact"]
+    label = "rust-multi-trim-admission"
+    baseline = run_case(command, source / "rust", args.evidence, f"{label}-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("native Multi recovery admission did not enforce the authorized trim")
+
+    logs = source / "rust/crates/multi/src/logs.rs"
+    original = logs.read_bytes()
+    try:
+        replace_once(logs, "if let Some(recovery) = &self.recovery { recovery.check_start(after).await?; }", "")
+        control = run_case(command, source / "rust", args.evidence, f"{label}-ignore-authorization", env)
+        if (
+            control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+            or "authorized trim must exclude the required record before it is removed" not in control.stdout
+            or "0 passed; 1 failed" not in control.stdout
+        ):
+            raise ValueError("ignoring Multi trim authorization did not fail at the native admission assertion")
+    finally:
+        logs.write_bytes(original)
+    print(f"{label}: directory floor enforced before physical trim, missing check rejected")
+
+
 def verify_catalog_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -1782,6 +1812,7 @@ def main():
             verify_checkpoint_replay(args, source)
             verify_checkpoint_trie_retention(args, source)
             verify_replay_prefix(args, source)
+            verify_multi_trim_admission(args, source)
             verify_catalog_replay(args, source)
             verify_system_time_replay(args, source)
             verify_merge_replay(args, source)

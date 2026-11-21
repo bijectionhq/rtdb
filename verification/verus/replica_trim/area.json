@@ -1,0 +1,54 @@
+{
+  "summary": "Multi recovery admits the first offset after a certified trim and refuses every covered requirement.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 3,
+  "controls": {
+    "exclude_the_first_retained_record": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/replica_retention.rs",
+        "find": "if after >= authorized_through",
+        "replace": "if after > authorized_through"
+      }],
+      "expect": [{
+        "file": "rust/crates/multi/src/replica_retention.rs",
+        "function": "excluded_replay_start",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 2
+    },
+    "exclude_the_first_retained_record_with_weakened_contract": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/replica_retention.rs",
+        "find": "if after >= authorized_through",
+        "replace": "if after > authorized_through"
+      }, {
+        "file": "rust/crates/multi/src/replica_retention.rs",
+        "find": "after < authorized_through < i64::MAX",
+        "replace": "after <= authorized_through < i64::MAX"
+      }],
+      "expect": [{
+        "file": "verification/verus/replica_trim/laws.rs",
+        "function": "a_cursor_may_start_on_the_first_retained_record",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 2
+    },
+    "ignore_the_authorization_with_weakened_contract": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/replica_retention.rs",
+        "find": "    if after >= authorized_through { return None; }\n    let first_retained = authorized_through.checked_add(1)?;\n    Some((after + 1, first_retained))",
+        "replace": "    let _ = (after, authorized_through);\n    None"
+      }, {
+        "file": "rust/crates/multi/src/replica_retention.rs",
+        "find": "out.is_some() <==> after < authorized_through < i64::MAX",
+        "replace": "out.is_none()"
+      }],
+      "expect": [{
+        "file": "verification/verus/replica_trim/laws.rs",
+        "function": "an_authorized_trim_excludes_every_required_record_it_covers",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 2
+    }
+  }
+}

@@ -24,5 +24,6 @@ pub mod recovery;
 pub mod reference;
 pub mod process;
 pub mod relay;
+mod replica_retention;
 pub mod session;
 pub mod store;

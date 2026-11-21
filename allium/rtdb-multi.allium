@@ -181,6 +181,11 @@ value Checkpoint {
     format_version: Integer
 }
 
+value CertifiedReplicaPrefix {
+    through: Lsn
+    digest: String
+}
+
 value Loglet {
     -- One epoch's segment of a deployment's log.
     epoch: Epoch
@@ -593,6 +598,7 @@ entity DeploymentRecord {
     -- Empty when the tail is sealed and flushed.
     loglets: List<Loglet>
     checkpoint: Checkpoint?
+    replica_anchor: CertifiedReplicaPrefix?
     -- A holder confirms its epoch with a quorum for reads.
     linearizable_reads: Boolean
     -- How many ranks of the affinity order may serve reads.
@@ -1346,9 +1352,32 @@ rule PublishCheckpoint {
             ),
             loglets: LogletsAbove(holding.deployment.loglets, record.through_lsn)
         })
-        LogTrimmed(holding.deployment.id, through: record.through_lsn)
         holding.tail_bytes = TailBytesAbove(holding, record.through_lsn)
         holding.oldest_unflushed_at = OldestAbove(holding, record.through_lsn)
+}
+
+rule TrimCertifiedReplicaPrefix {
+    -- The checkpoint's boundary record supplies the intake position on reopen.
+    when: ReplicaPrefixCertified(holding, through, digest)
+
+    requires: through < Directory.read(holding.deployment.id).checkpoint.lsn
+
+    ensures:
+        Directory.cas(holding.deployment.id, holding.epoch, change: {
+            replica_anchor: CertifiedReplicaPrefix.created(through: through, digest: digest)
+        })
+        LogTrimmed(holding.deployment.id, through: through)
+}
+
+rule AdmitLatestCheckpointReplay {
+    when: LatestCheckpointReplayRequested(deployment, after: Lsn)
+
+    ensures:
+        let replica_anchor = Directory.read(deployment.id).replica_anchor
+        if replica_anchor != null and after < replica_anchor.through:
+            RefreshCheckpointDiscovery(deployment, after: after)
+        else:
+            AdmitReplicaCursor(deployment, after: after)
 }
 
 ------------------------------------------------------------
