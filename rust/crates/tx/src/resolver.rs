@@ -181,8 +181,8 @@ impl TxResolver {
             Err(Anomaly::incorrect("rtdb/ordered-system-time", "specified system-time precedes the source-log timestamp")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
                 .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?))
-        } else if let Some(replay) = replay && let Some(original) = tx.find_replay_original(replay).await? {
-            Err(duplicate_replay(original))
+        } else if let Some(replay) = replay && let Err(error) = tx.check_replay_marker(replay).await {
+            Err(error)
         } else {
             let mut outcome = Ok(());
             for (index, operation) in request.operations.iter().enumerate() {
@@ -535,8 +535,8 @@ impl<'a> OpenTransaction<'a> {
         }
         Ok(())
     }
-    async fn find_replay_original(&self, replay: &ReplaySubmission) -> Result<Option<TransactionKey>> {
-        if !self.snapshot()?.contains_table(&replay_table()) { return Ok(None); }
+    async fn check_replay_marker(&self, replay: &ReplaySubmission) -> Result<()> {
+        if !self.snapshot()?.contains_table(&replay_table()) { return Ok(()); }
         let mut cursor = self.open_query(
             "SELECT original_tx_id, _system_from FROM xt.rtdb_replay_keys FOR VALID_TIME FROM ? TO NULL WHERE _id = ? ORDER BY _system_from DESC LIMIT 1",
             vec![time_value(replay.submitted_at()), Value::Utf8(replay.key().to_owned())],
@@ -549,9 +549,9 @@ impl<'a> OpenTransaction<'a> {
             let (Value::I64(id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (id, system) else {
                 return Err(Anomaly::fault("rtdb.tx/private-replay-marker", "Replay marker has no original transaction key"));
             };
-            return Ok(Some(TransactionKey { tx_id: TxId(id), system_time: Timestamp(value) }));
+            return Err(duplicate_replay(TransactionKey { tx_id: TxId(id), system_time: Timestamp(value) }));
         }
-        Ok(None)
+        Ok(())
     }
 
     fn write_replay_marker(&mut self, replay: &ReplaySubmission) -> Result<()> {

@@ -464,7 +464,9 @@ impl Node {
         let db = self.attached_database(database, placement)?;
         let latest = db.replication.await_tx(tx_id, cancellation).await?;
         if let Some(result) = &latest && !result.error().is_some_and(|error| error.code == "xtdb/assert-failed") {
-            if let Some(original) = result.error().map(rtdb_tx::private_replay_original).transpose()?.flatten() {
+            if !db.external_source()
+                && let Some(original) = result.error().map(rtdb_tx::private_replay_original).transpose()?.flatten()
+            {
                 return Ok(TransactionResult::Committed { tx_key: original });
             }
             return Ok(result.as_ref().clone());
@@ -494,7 +496,10 @@ impl Node {
                         _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")),
                     }
                 };
-                if let Some(error) = &error && let Some(original) = rtdb_tx::private_replay_original(error)? {
+                if !db.external_source()
+                    && let Some(error) = &error
+                    && let Some(original) = rtdb_tx::private_replay_original(error)?
+                {
                     return Ok(TransactionResult::Committed { tx_key: original });
                 }
                 if let Some(error) = &error

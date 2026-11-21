@@ -2370,6 +2370,120 @@ async fn private_replay_is_rejected_at_the_exclusive_cutoff_without_appending() 
 }
 
 #[tokio::test]
+async fn private_replay_lookup_budget_error_aborts_without_stopping_resolution() {
+    #[derive(Default)]
+    struct LookupBudget(AtomicBool);
+
+    #[async_trait]
+    impl rtdb_query::ScanAccelerator for LookupBudget {
+        async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<BTreeSet<rtdb_types::Iid>>> {
+            let table = &request.scan.table.name.table;
+            if table.schema == "xt" && table.table == "rtdb_replay_keys" && self.0.load(Ordering::Relaxed) {
+                return Err(Anomaly::incorrect("rtdb/memory-budget-exceeded", "Replay lookup test budget exhausted"));
+            }
+            Ok(None)
+        }
+    }
+
+    let budget = Arc::new(LookupBudget::default());
+    let mut services = services();
+    services.scan_accelerators.push(budget.clone());
+    let (node, driver) = running(options(), services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let key = "00112233445566778899aabbccddeeff/0";
+    let cutoff = Timestamp(7_200_000_000);
+    let original = commit_private(&mut session, put(&node, 1, 10), key, cutoff).await.unwrap();
+    let CommitResult::Executed(original) = original else { panic!("expected synchronous commit") };
+    assert!(original.committed());
+
+    budget.0.store(true, Ordering::Relaxed);
+    let failed = commit_private(&mut session, put(&node, 2, 20), key, cutoff).await.unwrap();
+    let CommitResult::Executed(failed) = failed else { panic!("expected synchronous abort") };
+    assert_eq!(failed.error().map(|error| error.code.as_str()), Some("rtdb/memory-budget-exceeded"));
+    assert!(failed.tx_key().tx_id > original.tx_key().tx_id);
+
+    budget.0.store(false, Ordering::Relaxed);
+    let retry = commit_private(&mut session, put(&node, 3, 30), key, cutoff).await.unwrap();
+    let CommitResult::Executed(retry) = retry else { panic!("expected synchronous retry") };
+    assert!(retry.committed());
+    assert_eq!(retry.tx_key(), original.tx_key());
+    assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await,
+        [vec![Value::I64(1)]]);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn external_source_aborts_keep_their_error_when_it_names_a_private_replay_receipt() {
+    #[derive(Clone)]
+    struct Source(tokio::sync::mpsc::UnboundedSender<TxId>);
+    struct Writer;
+
+    #[async_trait]
+    impl ExternalSourceFactory for Source {
+        fn validate(&self, _: &prost_types::Any) -> Result<()> { Ok(()) }
+        async fn open(&self, _: &prost_types::Any, _: &str, _: Arc<rtdb_storage::IoRegion>) -> Result<Box<dyn ExternalSource>> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl ExternalSource for Source {
+        async fn assign(&mut self) -> Result<Box<dyn ExternalSourceDriver>> { Ok(Box::new(self.clone())) }
+    }
+
+    #[async_trait]
+    impl ExternalSourceDriver for Source {
+        async fn run(self: Box<Self>, term: rtdb_replication::TermHandle, _: Option<Arc<[u8]>>,
+                     _: tokio::sync::watch::Receiver<rtdb_replication::DriverStatus>,
+                     cancellation: CancellationToken) -> Result<()> {
+            for _ in 0..2 {
+                let result = term.resolve_external(Box::new(Writer), None, None).await?;
+                assert!(!result.committed());
+                self.0.send(result.tx_key().tx_id).unwrap();
+            }
+            cancellation.cancelled().await;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl rtdb_tx::TransactionWriter for Writer {
+        async fn write(&mut self, _: &mut rtdb_tx::OpenTransaction<'_>) -> Result<rtdb_tx::WriterResult> {
+            let error = Anomaly::incorrect("rtdb.tx/private-replay-duplicate", "External source diagnostic")
+                .with_context("original-tx-id", 777.into())
+                .with_context("original-system-time-micros", 1000.into());
+            Ok(rtdb_tx::WriterResult::Aborted { error, user_metadata: None })
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (receipts, mut applied) = tokio::sync::mpsc::unbounded_channel();
+        let mut services = services();
+        services.external_sources.insert("test.PrivateReplayError".into(), Arc::new(Source(receipts)));
+        let mut settings = options();
+        settings.membership = Membership::Durable {
+            primary: DatabaseConfig {
+                external_source: Some(prost_types::Any { type_url: "test.PrivateReplayError".into(), value: vec![] }),
+                ..Default::default()
+            },
+            skipped: BTreeSet::new(),
+        };
+        let (node, driver) = running(settings, services).await;
+        let first = applied.recv().await.unwrap();
+        let second = applied.recv().await.unwrap();
+        assert!(first < second);
+        let cancellation = CancellationToken::new();
+        for id in [second, first] {
+            let result = node.await_transaction("xtdb", id, &Authority, &cancellation).await.unwrap();
+            assert_eq!(result.tx_key().tx_id, id);
+            assert_eq!(result.error().map(|error| error.message.as_deref().unwrap()), Some("External source diagnostic"));
+        }
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_private_replays_commit_one_effect_and_return_the_same_key() {
     let (node, driver) = running(options(), services()).await;
     let mut first = node.session("xtdb", Arc::new(Authority)).unwrap();
