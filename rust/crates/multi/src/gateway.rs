@@ -329,6 +329,17 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         Lifecycle::Restoring => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/restoring", format!("{name}'s checkpoint is being restored; retry shortly"))),
         Lifecycle::Deleting | Lifecycle::Deleted => return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} has been deleted"))),
     }
+    let key = control::ControlKey(options.capabilities.clone());
+    let activation = Request::Activate { name: name.into() };
+    if !router.snapshot && (!router.read_only || record.read_width <= 1)
+        && let Some(holder) = &record.holder
+        && let Some(member) = directory.member(holder).await.ok().flatten()
+        && record.may_hold_on(&member, now_ms())
+        && let Some(control_address) = member.control_address
+        && let Ok(Response::Held { address, epoch }) = control::call(&control_address, &activation, options.control_timeout, &key).await
+    {
+        return Ok((connect(&address).await?, Some(control_address), epoch, record.id));
+    }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
     if router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
         for reader in snapshot_readers(&record, &members) {
@@ -357,7 +368,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
     let mut refused = None;
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
-        match control::call(control_address, &Request::Activate { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
+        match control::call(control_address, &activation, options.control_timeout, &key).await {
             Ok(Response::Held { address, epoch }) => return Ok((connect(&address).await?, Some(control_address.clone()), epoch, record.id.clone())),
             Ok(Response::Redirect { holder, address }) => {
                 let control = members.get(&MemberId(holder)).and_then(|member| member.control_address.clone());

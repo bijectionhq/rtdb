@@ -85,7 +85,7 @@ async fn resident_idle_releases_the_writer_and_wakes_with_a_fresh_epoch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resident_idle_holder_can_later_park_from_the_idle_deadline() {
-    let directory = Arc::new(ObservedDirectory { inner: MemoryDirectory::new(), reads: Default::default(), holder_queries: Default::default() });
+    let directory = ObservedDirectory::new();
     let cell = Cell::start_with_resident_deadline(directory.clone(), Duration::from_millis(300), Duration::from_secs(2)).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
     let client = connect_eventually(&cell, "shop").await;
@@ -129,6 +129,13 @@ struct ObservedDirectory {
     inner: Arc<MemoryDirectory>,
     reads: std::sync::atomic::AtomicUsize,
     holder_queries: std::sync::atomic::AtomicUsize,
+    membership_scans: std::sync::atomic::AtomicUsize,
+}
+
+impl ObservedDirectory {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { inner: MemoryDirectory::new(), reads: Default::default(), holder_queries: Default::default(), membership_scans: Default::default() })
+    }
 }
 
 #[async_trait::async_trait]
@@ -148,14 +155,17 @@ impl Directory for ObservedDirectory {
     async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> { self.inner.replace_deployment(record, expected).await }
     async fn register_member(&self, member: rtdb_directory::MemberRecord) -> Result<rtdb_directory::MemberRecord> { self.inner.register_member(member).await }
     async fn member(&self, id: &MemberId) -> Result<Option<rtdb_directory::MemberRecord>> { self.inner.member(id).await }
-    async fn members(&self) -> Result<Vec<rtdb_directory::MemberRecord>> { self.inner.members().await }
+    async fn members(&self) -> Result<Vec<rtdb_directory::MemberRecord>> {
+        self.membership_scans.fetch_add(1, Ordering::Relaxed);
+        self.inner.members().await
+    }
     async fn replace_member(&self, member: rtdb_directory::MemberRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<rtdb_directory::MemberRecord>> { self.inner.replace_member(member, expected).await }
     fn change_feed(&self) -> Option<&rtdb_directory::ChangeFeed> { self.inner.change_feed() }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idle_holdings_follow_the_shared_feed_without_reconcile_point_reads() {
-    let directory = Arc::new(ObservedDirectory { inner: MemoryDirectory::new(), reads: Default::default(), holder_queries: Default::default() });
+    let directory = ObservedDirectory::new();
     let cell = Cell::start_with_directory(directory.clone()).await;
     let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
     assert!(matches!(cell.node(0).agent.activate("shop").await.unwrap(), Response::Held { .. }));
@@ -173,6 +183,24 @@ async fn idle_holdings_follow_the_shared_feed_without_reconcile_point_reads() {
     tokio::time::timeout(Duration::from_secs(2), async {
         while node.agent.held().contains_key("shop") { tokio::time::sleep(Duration::from_millis(20)).await; }
     }).await.expect("the holder observes the newer placement through the feed");
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_to_a_current_writer_does_not_scan_the_member_inventory() {
+    let directory = ObservedDirectory::new();
+    let cell = Cell::start_with_directory(directory.clone()).await;
+    admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let node = cell.node(0);
+    let Response::Held { epoch, .. } = node.agent.activate("shop").await.unwrap() else { panic!("expected the writer") };
+    let scans = directory.membership_scans.load(Ordering::Relaxed);
+    for _ in 0..4 {
+        assert!(matches!(node.agent.activate("shop").await.unwrap(), Response::Held { epoch: held, .. } if held == epoch));
+        let client = connect_eventually(&cell, "shop").await;
+        assert_eq!(values(&client, "SELECT 13").await, ["13"]);
+        drop(client);
+    }
+    assert_eq!(directory.membership_scans.load(Ordering::Relaxed), scans);
     cell.stop().await;
 }
 

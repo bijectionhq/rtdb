@@ -255,15 +255,27 @@ impl NodeAgent {
             if moving.is_some_and(|ticket| ticket.deployment != record.id) {
                 return Err(stale_handoff(name));
             }
+            let locally_open = |holding: &LocalHolding| {
+                holding.id == record.id && holding.epoch == record.epoch
+                    && self.node.catalog().database(name).is_ok_and(|database| std::ptr::eq(holding.database.as_ptr(), Arc::as_ptr(&database)))
+            };
+            let reuse_local = || {
+                let mut holdings = self.holdings.lock();
+                let holding = holdings.get_mut(name).filter(|holding| locally_open(holding))?;
+                holding.last_touch = Instant::now();
+                Some(Response::Held { epoch: record.epoch, address: self.address.clone() })
+            };
+            let can_reuse = record.holder.as_ref() == Some(&me) && self.holdings.lock().get(name).is_some_and(locally_open);
+            if can_reuse
+                && self.directory.member(&me).await.ok().flatten().is_some_and(|member| record.may_hold_on(&member, now_ms()))
+                && let Some(held) = reuse_local()
+            {
+                return Ok(held);
+            }
             let members = self.members().await?;
             let now = now_ms();
             let holder = effective_holder(&record, &members, now);
-            if let Some(holding) = self.holdings.lock().get_mut(name) {
-                if holding.id == record.id && holding.epoch == record.epoch && holder == Some(&me) && self.node.catalog().database(name).is_ok() {
-                    holding.last_touch = Instant::now();
-                    return Ok(Response::Held { epoch: record.epoch, address: self.address.clone() });
-                }
-            }
+            if holder == Some(&me) && let Some(held) = reuse_local() { return Ok(held); }
             if moving.is_some_and(|ticket| !record.active_move(now).is_some_and(|intent| intent.request == ticket.request && intent.target == me)) {
                 return Err(stale_handoff(name));
             }

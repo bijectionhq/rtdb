@@ -833,6 +833,7 @@ entity Session {
 entity GatewayRoute {
     -- A gateway's cached view of one active deployment: its holder and epoch, pushed for the active set.
     -- A wrong view costs one redirect; a gateway never authorises a write by its view.
+    -- A route to a running writer can check that member by ID before considering the eligible fleet.
     deployment: DeploymentId
     holder: MemberId?
     epoch: Epoch
