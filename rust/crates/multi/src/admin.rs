@@ -16,6 +16,7 @@ use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_st
 use crate::keys::KeyService;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
+const CONCURRENT_SUSPICION_PROBES: usize = 16;
 
 /// Binds an object namespace for a cell before nodes using scoped writes start.
 pub async fn initialize_storage(storage: &CellStorage, keys: &dyn KeyService) -> Result<StorageNamespaces> {
@@ -1603,23 +1604,40 @@ impl Default for ControllerOptions {
     fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default() } }
 }
 
+pub struct FailedMemberProbe { endpoint: String, consecutive: u32 }
+
 /// Probes every live node's agent, and confirms dead those that failed `suspicion_probes` probes in a row (`ConfirmSuspicion`).
 /// Safety never depends on the verdict: a wrongly confirmed node's writes are already fenced by the epoch its successor claims.
-pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeMap<MemberId, u32>, options: &ControllerOptions) -> Result<usize> {
+pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeMap<MemberId, FailedMemberProbe>, options: &ControllerOptions) -> Result<usize> {
+    use futures::StreamExt;
+
     let now = now_ms();
-    let mut confirmed = 0;
-    for member in directory.members().await? {
-        if member.role != MemberRole::Node || !member.is_live(now) { failures.remove(&member.id); continue; }
-        let Some(address) = &member.control_address else { continue };
+    let mut members = directory.members().await?;
+    members.retain(|member| {
+        let probe = member.role == MemberRole::Node && member.is_live(now) && member.control_address.is_some();
+        if !probe || failures.get(&member.id).is_some_and(|failure| Some(&failure.endpoint) != member.control_address.as_ref()) {
+            failures.remove(&member.id);
+        }
+        probe
+    });
+    let mut probes = std::pin::pin!(futures::stream::iter(members).map(|member| async move {
+        let address = member.control_address.as_deref().expect("members without control addresses were filtered");
         let answered = matches!(control::call(address, &Request::Ping, options.probe_timeout, &options.control).await, Ok(Response::Done));
+        (member, answered)
+    }).buffer_unordered(CONCURRENT_SUSPICION_PROBES));
+    let mut confirmed = 0;
+    while let Some((member, answered)) = probes.next().await {
         if answered { failures.remove(&member.id); continue; }
-        let count = failures.entry(member.id.clone()).or_default();
-        *count += 1;
-        if *count >= options.suspicion_probes {
+        let failure = failures.entry(member.id.clone()).or_insert_with(|| FailedMemberProbe {
+            endpoint: member.control_address.clone().expect("the member was probed at this address"),
+            consecutive: 0,
+        });
+        failure.consecutive = failure.consecutive.saturating_add(1);
+        if failure.consecutive >= options.suspicion_probes {
             // The suspect may still be renewing its lease, so the confirmation re-reads and retries rather than losing to a renewal.
             let mut current = member.clone();
             for _ in 0..8 {
-                if matches!(current.state, MemberState::Dead | MemberState::Retired) { break; }
+                if matches!(current.state, MemberState::Dead | MemberState::Retired) || current.control_address != member.control_address { break; }
                 let mut dead = current.clone();
                 dead.state = MemberState::Dead;
                 match directory.replace_member(dead, current.version).await? {

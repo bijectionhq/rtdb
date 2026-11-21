@@ -954,6 +954,15 @@ rule ConfirmSuspicion {
         member.state = dead
 }
 
+rule ProbeMemberLiveness {
+    -- A controller pass issues up to sixteen member probes at a time.
+    -- Missing replies count against the endpoint that was probed.
+    when: ControllerProbeDue(cell)
+
+    ensures:
+        LiveNodeEndpointsProbed(cell)
+}
+
 rule AdmitMember {
     when: MemberPrewarmed(member)
 

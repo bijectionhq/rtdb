@@ -1181,6 +1181,68 @@ async fn a_compaction_worker_compacts_a_deployment_its_holder_does_not() {
     cell.stop().await;
 }
 
+#[tokio::test]
+async fn controller_probes_can_progress_before_another_member_replies() {
+    use rtdb_directory::{Directory, MemberId, MemberRecord, MemberRole, MemberState, MemoryDirectory};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let directory = MemoryDirectory::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    for id in ["first", "second"] {
+        directory.register_member(MemberRecord {
+            id: MemberId(id.into()), role: MemberRole::Node, address: address.clone(), control_address: Some(address.clone()),
+            availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
+            state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
+        }).await.unwrap();
+    }
+    let answer = async {
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(stream);
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            assert!(line.contains("\"op\":\"ping\""));
+            peers.push(peer.into_inner());
+        }
+        for mut peer in peers {
+            let _ = peer.write_all(b"{\"outcome\":\"done\"}\n").await;
+        }
+    };
+    let options = admin::ControllerOptions { suspicion_probes: 1, probe_timeout: Duration::from_millis(500), ..Default::default() };
+    let mut failures = std::collections::BTreeMap::new();
+    let (confirmed, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(admin::confirm_suspicions(directory.as_ref(), &mut failures, &options), answer)
+    }).await.unwrap();
+    assert_eq!(confirmed.unwrap(), 0);
+    assert!(failures.is_empty());
+}
+
+#[tokio::test]
+async fn the_controller_counts_failures_at_each_endpoint_independently() {
+    use rtdb_directory::{Directory, MemberId, MemberRecord, MemberRole, MemberState, MemoryDirectory};
+
+    let directory = MemoryDirectory::new();
+    let original = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replacement = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = original.local_addr().unwrap().to_string();
+    let mut member = directory.register_member(MemberRecord {
+        id: MemberId("node".into()), role: MemberRole::Node, address: address.clone(), control_address: Some(address),
+        availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
+    }).await.unwrap();
+    let options = admin::ControllerOptions { suspicion_probes: 2, probe_timeout: Duration::from_millis(20), ..Default::default() };
+    let mut failures = std::collections::BTreeMap::new();
+    assert_eq!(admin::confirm_suspicions(directory.as_ref(), &mut failures, &options).await.unwrap(), 0);
+
+    member.control_address = Some(replacement.local_addr().unwrap().to_string());
+    let version = member.version;
+    assert!(directory.replace_member(member, version).await.unwrap().applied().is_some());
+    assert_eq!(admin::confirm_suspicions(directory.as_ref(), &mut failures, &options).await.unwrap(), 0);
+    assert_eq!(admin::confirm_suspicions(directory.as_ref(), &mut failures, &options).await.unwrap(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_controller_confirms_a_silent_node_dead_before_its_lease_runs_out() {
     let cell = Cell::start(2, None).await;

@@ -681,6 +681,9 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 **Changes.**
 
 1. Crate `controller`: suspicion confirmation from corroborated gateway reports; admission of prewarmed members; drain (`DrainMember`); rebalancing on `LoadVector` watermarks (`Rebalance`); the drainer for orphaned tails (`DrainOrphanedTails`); quarantine (`CountActivationCrash`); engine rollouts (`RollEngine`).
+   The controller probes at most 16 live node endpoints concurrently.
+   An unanswered probe contributes to confirmation only while the membership record still names the endpoint that was probed.
+   The running controller uses periodic probes and does not consume gateway reports.
    A draining node hands off up to eight recently used deployments per pass and parks its idle deployments.
    It runs the handoffs one at a time.
    The source's identity and epoch must still match at reservation.
