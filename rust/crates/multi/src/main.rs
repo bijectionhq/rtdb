@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rtdb_directory::{Directory, MemoryDirectory, RemoteDirectory};
+use rtdb_multi::cells::{CellMap, MemoryCellMap, RemoteCellMap};
 use rtdb_multi::{admin, agent::AgentOptions, deployment::CellStorage, gateway, lease::LeaseOptions, process};
 use rtdb_server::config::NodeConfiguration;
 use rtdb_types::{Anomaly, Result};
@@ -16,9 +17,9 @@ const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
-       rtdb-multi gateway --directory DIR --listen ADDR [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
-       rtdb-multi cell-map --listen ADDR\n\
-       rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
+       rtdb-multi gateway --directory DIR --listen ADDR [--cell NAME --cell-map MAP] [--cell-secret FILE]\n\
+       rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
+       rtdb-multi move-cell --cell-map MAP --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--grace SECONDS]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
@@ -32,7 +33,8 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --name NAME\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
-(RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n";
+MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
+DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n";
 
 #[tokio::main]
 async fn main() {
@@ -117,7 +119,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             eprintln!("gateway listening on {}", listener.local_addr().map_err(io)?);
             let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, ..Default::default() };
             if let (Some(cell), Some(map)) = (arguments.optional("cell"), arguments.optional("cell-map")) {
-                let map: Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::RemoteCellMap::new(map);
+                let map = cell_map(map).await?;
                 let advertised = arguments.optional("advertise").map(str::to_owned).unwrap_or(listener.local_addr().map_err(io)?.to_string());
                 map.register_cell(cell, &advertised).await?;
                 options.cells = Some((map, cell.to_owned()));
@@ -132,11 +134,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "cell-map" => {
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:7000")?).await.map_err(io)?;
+            let map: Arc<dyn CellMap> = match arguments.optional("dynamodb-prefix") {
+                Some(prefix) => dynamo_cell_map(prefix).await?,
+                None => MemoryCellMap::new(),
+            };
             eprintln!("cell map listening on {}", listener.local_addr().map_err(io)?);
-            rtdb_multi::cells::serve(listener, rtdb_multi::cells::MemoryCellMap::new(), cancellation).await
+            rtdb_multi::cells::serve(listener, map, cancellation).await
         }
         "move-cell" => {
-            let map = rtdb_multi::cells::RemoteCellMap::new(arguments.required("cell-map")?);
+            let map = cell_map(arguments.required("cell-map")?).await?;
             let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
             let from_storage = CellStorage::parse(arguments.required("from-storage-root")?)?;
             let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
@@ -237,6 +243,30 @@ fn cell_secret(arguments: &Arguments) -> Result<Option<Arc<rtdb_multi::capabilit
 
 fn keys(arguments: &Arguments) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
     Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(arguments.required("keys")?)?))
+}
+
+async fn cell_map(spec: &str) -> Result<Arc<dyn CellMap>> {
+    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamo_cell_map(prefix).await; }
+    Ok(RemoteCellMap::new(spec))
+}
+
+#[cfg(feature = "dynamodb")]
+async fn dynamo_cell_map(prefix: &str) -> Result<Arc<dyn CellMap>> {
+    use rtdb_multi::cells::DynamoCellMap;
+    let map = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
+        Ok(endpoint) => {
+            let map = DynamoCellMap::new(rtdb_directory::DynamoDirectory::local_client(&endpoint), prefix);
+            map.create_tables().await?;
+            map
+        }
+        Err(_) => DynamoCellMap::new(aws_sdk_dynamodb::Client::new(&aws_config::load_from_env().await), prefix),
+    };
+    Ok(Arc::new(map))
+}
+
+#[cfg(not(feature = "dynamodb"))]
+async fn dynamo_cell_map(_: &str) -> Result<Arc<dyn CellMap>> {
+    Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
 }
 
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {

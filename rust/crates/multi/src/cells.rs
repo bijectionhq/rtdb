@@ -13,6 +13,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "dynamodb")]
+mod dynamo;
+#[cfg(feature = "dynamodb")]
+pub use dynamo::DynamoCellMap;
+
 #[async_trait]
 pub trait CellMap: Send + Sync {
     async fn register_cell(&self, cell: &str, gateway: &str) -> Result<()>;
@@ -142,13 +147,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         tokio::spawn(serve(listener, map, CancellationToken::new()));
-        let remote = RemoteCellMap::new(address);
-        remote.register_cell("eu-1", "127.0.0.1:1").await.unwrap();
-        assert!(remote.assign("shop", "eu-1", None).await.unwrap());
-        assert!(!remote.assign("shop", "eu-2", None).await.unwrap(), "a new assignment refuses an existing deployment");
-        assert!(!remote.assign("shop", "eu-2", Some("us-1")).await.unwrap(), "a move must name the cell the deployment is in");
-        assert!(remote.assign("shop", "eu-2", Some("eu-1")).await.unwrap());
-        assert_eq!(remote.cell_of("shop").await.unwrap().as_deref(), Some("eu-2"));
-        assert_eq!(remote.gateway("eu-1").await.unwrap().as_deref(), Some("127.0.0.1:1"));
+        contract(RemoteCellMap::new(address).as_ref()).await;
+    }
+
+    pub(super) async fn contract(map: &dyn CellMap) {
+        assert_eq!(map.cell_of("eu-1").await.unwrap(), None);
+        map.register_cell("eu-1", "127.0.0.1:1").await.unwrap();
+        assert_eq!(map.cells().await.unwrap().get("eu-1").map(String::as_str), Some("127.0.0.1:1"));
+        assert!(map.assign("eu-1", "eu-1", None).await.unwrap());
+        assert!(!map.assign("eu-1", "eu-2", None).await.unwrap());
+        assert!(!map.assign("eu-1", "eu-2", Some("us-1")).await.unwrap());
+        assert!(map.assign("eu-1", "eu-2", Some("eu-1")).await.unwrap());
+        assert_eq!(map.cell_of("eu-1").await.unwrap().as_deref(), Some("eu-2"));
+        assert_eq!(map.gateway("eu-1").await.unwrap().as_deref(), Some("127.0.0.1:1"));
     }
 }

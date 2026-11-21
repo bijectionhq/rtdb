@@ -326,6 +326,7 @@ config {
 
 contract CellMap {
     -- The only global state: which cell a deployment lives in.
+    -- A placement change is conditional on the currently assigned cell, and the committed placement survives a cell-map process restart.
     -- Near-immutable: a row changes only when a deployment moves cells.
     -- Encoded in the deployment's hostname where the client protocol allows, so the request path makes no global lookup.
     cell_of: (deployment: DeploymentId) -> CellId
