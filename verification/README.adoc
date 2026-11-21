@@ -113,6 +113,8 @@ The same option runs the local checkpoint interruption, partial compaction, over
 The production controls publish the root too early and stop on a missing checkpoint without refreshing discovery.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
+The catalog clock test commits a transaction at an explicit system time, issues an attach and a refused detach, and reopens the same local log.
+Its control feeds raw log time into the catalog resolver and must fail at attach.
 The merge replay compares the native page heap with a flatten-and-sort reference and checks that each page is consumed in order.
 Its controls reverse the system-time ordering and omit a final row.
 It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
@@ -127,6 +129,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/PartitionedTopK.lean` proves that conservative partition pruning preserves the ordered global prefix and the SQL page for any offset and fetch.
   `lean/CatalogRecovery.lean` checks that rebuilding the pending historical-trie index gives the same promotion as scanning the durable catalog.
   `lean/CheckpointDiscovery.lean` proves that any chain of metadata retries advances strictly and fits within the remaining index range.
+  `lean/SystemTime.lean` proves strict system-time order over arbitrary mixed resolver histories and proves that a completed prefix's last assigned time suffices to resume its clock trace.
   `lean/CompactionMerge.lean` proves that taking minimum heads from ordered input pages emits all occurrences in key order.
   Every finite input admits a complete execution, and equal keys can preserve different payload orders across input pages.
   The merge replay checks the native heap on finite batches. Individual heap updates, temporal resolution and compaction layout have separate refinement obligations.
@@ -134,6 +137,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   It assumes durable append is atomic and does not implement a consensus provider.
 * `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.
   Apalache checks the same TLA+ transitions symbolically and `maude/Resolution.maude` gives an independent rewrite model.
+* `tla/SystemClock.tla` explores timestamp assignment across staged transactions, ordered publication, crash and restart.
+  Its bounds admit two pending outcomes and four timestamps. TLC exhausts the model and Apalache checks the order law through eight transitions.
 * `tla/CacheGeneration.tla` models the cache pathname ownership race independently from the shared artefact reference counts.
 * `tla/ReadBack.tla` separates append, record delivery, apply, and acknowledgement across a crash and restart.
 * `tla/Checkpoint.tla` separates durable object publication, lost replies, listing, and log replay across a restart.
@@ -163,6 +168,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The catalog reclamation area checks the latest-block rule and the last-held-sibling predicate.
   The tiered publication area checks that all four serving siblings for the same block exist before the catalog retires the parent.
   The checkpoint discovery area checks the production retry decision and its decreasing distance from the maximum index.
+  The system time area checks the production assignment and admission decisions, including exhaustion and rejection of equal or earlier timestamps.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.
   The rank cutoff area checks the production decision given the two maximum frontier bounds.
   The search window area checks the native functions that assign postings, set the scan endpoints, and combine frequency and length extrema.

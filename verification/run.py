@@ -349,6 +349,18 @@ def verify_compaction_merge(args, scratch):
     verify_lean_model(args, scratch, path, "compaction-merge", controls, 5)
 
 
+def verify_system_time(args, scratch):
+    path = Path("verification/lean/SystemTime.lean")
+    controls = {
+        "raw-catalog-clock": (
+            "| .catalog clock => automatic maximum previous clock",
+            "| .catalog clock => some clock",
+            ["chosen_time_advances", "catalog_and_explicit_refusals_use_the_same_clock"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "system-time", controls, 5)
+
+
 def verify_reader_retention(args, scratch):
     path = Path("verification/lean/ReaderRetention.lean")
     controls = {
@@ -429,6 +441,7 @@ def verify_lean(args, scratch):
         if not mutation:
             env = os.environ | {"LEAN_PATH": str(directory)}
             verify_ceiling(args, scratch, directory)
+            verify_system_time(args, scratch)
             verify_reader_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
             verify_compaction_merge(args, scratch)
@@ -533,6 +546,12 @@ TLA_CASES = (
     ("ReadBack", "readback", None, None),
     ("ReadBack", "apply-before-readback", ('Mutation = "none"', 'Mutation = "skip_readback"'), "AppliedAfterReadBack"),
     ("ReadBack", "ack-after-append", ('Mutation = "none"', 'Mutation = "ack_on_append"'), "AckAfterApply"),
+    ("SystemClock", "system-clock", None, None),
+    ("SystemClock", "system-clock-raw-catalog", ('Mutation = "none"', 'Mutation = "raw_catalog"'), "StrictSystemTime"),
+    ("SystemClock", "system-clock-durable-head", ('Mutation = "none"', 'Mutation = "durable_head"'), "StrictSystemTime"),
+    ("SystemClock", "system-clock-empty-restart", ('Mutation = "none"', 'Mutation = "empty_restart"'), "StrictSystemTime"),
+    ("SystemClock", "system-clock-recovery-witness",
+     ("INVARIANT StrictSystemTime", "INVARIANT NoCatalogAfterRestart"), "NoCatalogAfterRestart"),
     ("LeaseAdmission", "validated-reader-lease", None, None),
     ("LeaseAdmission", "coordinated-reader-pin", ('Mode = "validated_lease"', 'Mode = "pin"'), None),
     ("LeaseAdmission", "age-only-collection", ('Mode = "validated_lease"', 'Mode = "age_only"'), "LiveReaderHasObject"),
@@ -661,6 +680,11 @@ def verify_apalache(args, scratch):
         mutation = None if mode == "validated" else ('Mode = "validated"', f'Mode = "{mode}"')
         counterexample = "lost-update" if mode == "blind" else None
         check_apalache(args, scratch, "Resolution", mode, "NoLostUpdates", 8, mutation, counterexample)
+    check_apalache(args, scratch, "SystemClock", "system-clock", "StrictSystemTime", 8)
+    check_apalache(
+        args, scratch, "SystemClock", "system-clock-empty-restart", "StrictSystemTime", 8,
+        ('Mutation = "none"', 'Mutation = "empty_restart"'), "regressing restart clock",
+    )
     check_apalache(args, scratch, "RecoveryCollection", "recovery-collection", "RecoverySafe", 10)
     check_apalache(
         args, scratch, "RecoveryCollection", "recovery-collection-trim-for-head", "RecoverySuffixAvailable", 10,
@@ -949,6 +973,37 @@ def verify_catalog_replay(args, source):
     print("rust-catalog-replay: checkpoint and promotion tests passed, both production mutations rejected")
 
 
+def verify_system_time_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "catalog_transactions_advance_system_time_and_replay_in_order"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-system-time-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("native catalog clock and replay baseline failed")
+
+    resolver = source / "rust/crates/tx/src/resolver.rs"
+    original = resolver.read_bytes()
+    decision = "system_time: self.smooth(log_time)? };\n        let (result, operation) = match verdict {"
+    try:
+        replace_once(resolver, decision, decision.replace("self.smooth(log_time)?", "log_time"))
+        checked = run_case(command, source / "rust", args.evidence, "rust-system-time-raw-catalog-clock", env)
+        if (
+            checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or "catalog attach must advance past the previous transaction's time" not in checked.stdout
+            or "Transaction key does not advance its predecessor" not in checked.stdout
+            or "0 passed; 1 failed" not in checked.stdout
+        ):
+            raise ValueError("raw catalog clock mutation did not fail at the native attach")
+    finally:
+        resolver.write_bytes(original)
+    print("rust-system-time-replay: catalog outcomes survive restart and the raw clock mutation is rejected")
+
+
 def verify_merge_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -1148,6 +1203,8 @@ def main():
         "rust/crates/conformance/src/faults.rs",
         "rust/crates/conformance/tests/node_faults.rs",
         "rust/crates/conformance/tests/recovery.rs",
+        "rust/crates/node/tests/native.rs",
+        "rust/crates/tx/src/resolver.rs",
         "rust/crates/azure/src/copy.rs",
         "rust/crates/azure/src/lib.rs",
         "rust/crates/azure/tests/copy_completion.rs",
@@ -1186,6 +1243,7 @@ def main():
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
             verify_catalog_replay(args, source)
+            verify_system_time_replay(args, source)
             verify_merge_replay(args, source)
             verify_azure_replay(args, source)
 

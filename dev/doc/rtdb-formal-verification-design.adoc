@@ -1031,6 +1031,13 @@ For a timeout or tool limitation, retain the failing step and observable result 
 The seeded trace agreed with both native resolvers and unbounded visibility on 4,096 point observations.
 |Complete end-to-end contracts for event order, resource and visitor shells, and observable range decomposition.
 
+|System-time assignment
+|Verus checks the exact Rust admission and clock decisions over signed timestamps.
+Lean proves that every modeled mixed history is strictly ordered and that a completed prefix supplies the clock seed for the rest of that history.
+TLC and Apalache check bounded staging over a private resolved prefix, publication, and restart.
+A local node test observes a successful attach and a refused detach advance past an explicit later time, then replays their outcomes.
+|Establish the durable-to-resolved handoff across all providers and identify which imported histories satisfy strict system-time ordering.
+
 |Exact Rust decisions
 |The runner checks temporal and interval decisions, replica admission, one-event search visibility, catalog reclamation, and base-four IID bucketing in exact production source.
 Compiler controls reject forging and raw use of the replica admission witness.
