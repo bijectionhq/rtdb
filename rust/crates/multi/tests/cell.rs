@@ -507,8 +507,17 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     cell.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority() {
+#[test]
+fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority() {
+    // Drive both the restore caller and query workers on the runtime's stack budget.
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(4)
+            .thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build().unwrap()
+            .block_on(exercise_current_archive_restore());
+    }).unwrap().join().unwrap();
+}
+
+async fn exercise_current_archive_restore() {
     let mut cell = Cell::start(2, None).await;
     let id = uuid::Uuid::new_v4();
     admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
