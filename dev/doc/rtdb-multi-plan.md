@@ -122,7 +122,7 @@ cross-cell transfer and same-history recovery wait for those admissions to
 clear after fencing. On a standalone local disk, each provider operation
 retains a lock in the independent key directory. After a node exits, the
 reaper can recover its recorded region only by acquiring that same persisted lock.
-The serving node performs key opens and storage-region witness file I/O on the blocking pool.
+Asynchronous local key opens use the blocking pool so a competing filesystem lock cannot stall the runtime thread.
 A missing lock witness keeps the region pending. For remote
 storage, a producer that exits without acknowledging drain keeps cleanup
 pending until the provider's outstanding work can be accounted for.
@@ -777,6 +777,12 @@ Serial drains held scale-out p99 between 10.1 and 17.1 ms and scale-in p99 betwe
 With two concurrent moves, scale-out p99 ranged from 10.4 to 18.3 ms and scale-in p99 ranged from 18.3 to 35.9 ms.
 The tested build preceded the hosted transfer and archive integration.
 
+After integrating hosted transfer and archive, four more alternating comparisons each verified all 32,768 writes against their final counters.
+The checkpoint build measured scale-out p99 from 32.0 to 1,992.6 ms and scale-in p99 from 58.1 to 145.2 ms, at 2,275–4,608 writes/s overall.
+The variant that sent both key opens and storage-region witness I/O to the blocking pool measured scale-out p99 from 52.3 to 120.9 ms and scale-in p99 from 130.3 to 270.8 ms, at 2,140–3,211 writes/s overall.
+The comparisons leave the 30 ms acceptance gate open.
+The implementation offloads only the key opens, which have a regression test for holding a filesystem lock while the runtime services a timer.
+
 ### Stage 12: encryption, lineages, forks and deletion
 
 **Why.**
@@ -915,10 +921,13 @@ The run includes the directory's deployment and name indexes and uses process re
 | Hosted recovery and custody | 1,000,000 | 118,297 | 3,495 | 606 | 0 |
 | Hosted recovery and custody with boxed index values | 1,000,000 | 133,613 | 2,450 | 606 | 0 |
 | Hosted recovery and custody with operation history allocated on demand | 1,000,000 | 136,052 | 1,406 | 606 | 0 |
+| Hosted recovery and custody with operation history allocated on demand | 10,000,000 | 132,558 | 829 | 607 | 0 |
 
 The in-memory directory stores one boxed value for each deployment, so unused index slots reserve space for pointers instead of full records.
 Transfer records, restore records and disposal receipts allocate their larger values only when an operation creates them.
 The durable local directory file retains the same JSON shape.
+The ten-million-record run measured resident pages at the end of the load and verified the keyed watch.
+It used a single in-memory directory with no concurrent SQL workload.
 
 ```sh
 RTDB_PARKED_BENCH_DEPLOYMENTS=1000000 \
