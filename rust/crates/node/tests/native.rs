@@ -3145,6 +3145,44 @@ async fn ordered_index_pages_zoned_instants_at_head_and_at_a_retained_system_tim
 }
 
 #[tokio::test]
+async fn ordered_float_keys_sort_signed_zeros_and_keep_nan_out_of_comparisons() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_amount ON orders (amount, _id)").await;
+    let input = [
+        (1, 0.0), (2, -0.0), (3, f64::NAN), (4, -f64::NAN),
+        (5, 0.5), (6, f64::NEG_INFINITY), (7, f64::INFINITY),
+    ].into_iter().map(|(id, amount)| StructFields::from([
+        ("_id".into(), Value::I64(id)), ("amount".into(), Value::F64(amount)),
+    ])).collect();
+    let commit = session.state_mut().execute_tx(
+        vec![put_rows(&node, "orders", input, None, None)],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(commit.committed());
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let ids = |ids: &[i64]| ids.iter().map(|&id| vec![Value::I64(id)]).collect::<Vec<_>>();
+    let all = "SELECT _id FROM orders ORDER BY amount, _id LIMIT 7";
+    assert_eq!(rows(session.query_sql(all, vec![]).await.unwrap()).await, ids(&[6, 2, 1, 5, 7, 3, 4]));
+    assert!(observer.take().is_empty(), "the ordered seek should select the rows");
+
+    let above = "SELECT _id FROM orders WHERE amount > ? ORDER BY amount DESC, _id DESC LIMIT 1";
+    assert_eq!(rows(session.query_sql(above, vec![Value::F64(0.25)]).await.unwrap()).await, ids(&[7]));
+    assert!(observer.take().is_empty(), "NaN cannot occupy an indexed limit slot");
+
+    let zeros = "SELECT _id FROM orders WHERE amount = ? ORDER BY amount, _id LIMIT 2";
+    assert_eq!(rows(session.query_sql(zeros, vec![Value::F64(0.0)]).await.unwrap()).await, ids(&[2, 1]));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_index_gathers_projected_table_columns_at_the_original_basis() {
     let observer = Arc::new(OrderedIndexReads::default());
     let mut services = services();

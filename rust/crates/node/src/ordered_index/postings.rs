@@ -38,9 +38,10 @@ enum Kind {
     Unordered = 6,
     Null = 7,
     InstantMicros = 8,
+    FloatOrder = 9,
 }
 
-const KINDS: [Kind; 9] = [
+const KINDS: [Kind; 10] = [
     Kind::Bool,
     Kind::Integer,
     Kind::Text,
@@ -50,6 +51,7 @@ const KINDS: [Kind; 9] = [
     Kind::Unordered,
     Kind::Null,
     Kind::InstantMicros,
+    Kind::FloatOrder,
 ];
 const VALID_LAYOUT_BITS: u16 = (1 << KINDS.len()) - 1;
 
@@ -63,6 +65,7 @@ impl Kind {
             AtomRef::Uuid(_) => Self::Uuid,
             AtomRef::Day(_) => Self::Day,
             AtomRef::InstantMicros(_) => Self::InstantMicros,
+            AtomRef::FloatOrder(_) => Self::FloatOrder,
             AtomRef::Unordered => Self::Unordered,
             AtomRef::Null => Self::Null,
         }
@@ -80,6 +83,7 @@ impl Kind {
             Self::Binary => DataType::Binary,
             Self::Uuid => DataType::FixedSizeBinary(16),
             Self::Day | Self::InstantMicros => DataType::Int64,
+            Self::FloatOrder => DataType::UInt64,
             Self::Unordered | Self::Null => DataType::Null,
         }
     }
@@ -109,6 +113,7 @@ impl Kind {
             Self::Bool => primitive!(BooleanArray, Bool),
             Self::Day => primitive!(Int64Array, Day),
             Self::InstantMicros => primitive!(Int64Array, InstantMicros),
+            Self::FloatOrder => primitive!(UInt64Array, FloatOrder),
             Self::Integer => {
                 let values = cells
                     .map(|cell| match cell {
@@ -179,6 +184,7 @@ impl Kind {
             Self::Uuid => AtomRef::Uuid(fixed(array, row)),
             Self::Day => cell!(Int64Array, Day),
             Self::InstantMicros => cell!(Int64Array, InstantMicros),
+            Self::FloatOrder => cell!(UInt64Array, FloatOrder),
             Self::Unordered => AtomRef::Unordered,
             Self::Null => AtomRef::Null,
         }
@@ -760,6 +766,11 @@ mod tests {
             [Atom::Uuid([255; 16]), Atom::Text("x".into()), Atom::Null],
             [Atom::Day(-1), Atom::Text("x".into()), Atom::Unordered],
             [Atom::InstantMicros(-1), Atom::Text("x".into()), Atom::Null],
+            [
+                Atom::FloatOrder(u64::MAX),
+                Atom::Text("x".into()),
+                Atom::Null,
+            ],
             [Atom::Unordered, Atom::Text("x".into()), Atom::Null],
             [Atom::Null, Atom::Text("x".into()), Atom::Unordered],
         ];

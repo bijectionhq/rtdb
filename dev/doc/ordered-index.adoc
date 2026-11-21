@@ -26,7 +26,10 @@ The primary scan applies the remaining predicates to the resolved row and SEARCH
 `SELECT DISTINCT key ... ORDER BY key LIMIT n` can use an ordered index when the key is a stored text column and the preceding index columns are fixed by equality predicates.
 The ordered seek applies index-covered predicates before counting distinct keys.
 
-The index orders signed integers, Booleans, text, binary values, UUIDs, calendar dates, and zoned timestamps at microsecond precision.
+The index orders signed integers, Booleans, text, binary values, UUIDs, calendar dates, zoned timestamps at microsecond precision, and single- and double-precision floating-point values.
+Float keys preserve signed zero order and group NaNs at the end, as SQL sorting does.
+A zero or NaN comparison remains a row predicate. NaN rows cannot satisfy an indexed comparison to an ordinary float value.
+The index reads float results from their original rows to preserve payload bits.
 Zoned timestamp comparisons use the instant even when a bound has a different zone.
 Ascending order places nulls last and reversing the order places them first.
 The normal SQL executor covers unsupported sort directions, types, temporal intervals and query shapes.

@@ -1,7 +1,7 @@
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Int8Array,
-    Int16Array, Int32Array, Int64Array, RunArray, StringArray, TimestampMicrosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RunArray, StringArray,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray,
     types::{Int16Type, Int32Type, Int64Type},
 };
 use arrow_schema::{DataType, Field, TimeUnit as ArrowTimeUnit, UnionMode};
@@ -22,6 +22,7 @@ pub(super) enum Scalar<Text, Binary> {
     Uuid([u8; 16]),
     Day(i64),
     InstantMicros(i64),
+    FloatOrder(u64),
     Unordered,
     Null,
 }
@@ -38,6 +39,7 @@ pub(super) enum Family {
     Uuid,
     Day,
     InstantMicros,
+    Float,
 }
 
 impl Atom {
@@ -53,6 +55,14 @@ impl Atom {
             Value::U16(value) => Self::Integer((*value).into()),
             Value::U32(value) => Self::Integer((*value).into()),
             Value::U64(value) => Self::Integer((*value).into()),
+            // SQL equality groups signed zeros and refuses to equate NaNs.
+            // A single ordered key cannot witness those equality bounds.
+            Value::F32(value) if *value != 0.0 && !value.is_nan() => {
+                Self::FloatOrder(float_order(f64::from(*value)))
+            }
+            Value::F64(value) if *value != 0.0 && !value.is_nan() => {
+                Self::FloatOrder(float_order(*value))
+            }
             Value::Utf8(value) => Self::Text(value.clone()),
             Value::Binary(value) => Self::Binary(value.clone()),
             Value::Uuid(value) => Self::Uuid(*value),
@@ -77,6 +87,7 @@ impl Atom {
             Self::Uuid(value) => Scalar::Uuid(*value),
             Self::Day(value) => Scalar::Day(*value),
             Self::InstantMicros(value) => Scalar::InstantMicros(*value),
+            Self::FloatOrder(value) => Scalar::FloatOrder(*value),
             Self::Unordered => Scalar::Unordered,
             Self::Null => Scalar::Null,
         }
@@ -93,6 +104,7 @@ impl<'a> AtomRef<'a> {
             Self::Uuid(value) => Scalar::Uuid(value),
             Self::Day(value) => Scalar::Day(value),
             Self::InstantMicros(value) => Scalar::InstantMicros(value),
+            Self::FloatOrder(value) => Scalar::FloatOrder(value),
             Self::Unordered => Scalar::Unordered,
             Self::Null => Scalar::Null,
         }
@@ -156,6 +168,8 @@ impl<'a> AtomRef<'a> {
             DataType::UInt16 => Self::Integer(value!(UInt16Array).into()),
             DataType::UInt32 => Self::Integer(value!(UInt32Array).into()),
             DataType::UInt64 => Self::Integer(value!(UInt64Array).into()),
+            DataType::Float32 => Self::FloatOrder(float_order(f64::from(value!(Float32Array)))),
+            DataType::Float64 => Self::FloatOrder(float_order(value!(Float64Array))),
             DataType::Utf8 => Self::Text(value!(StringArray)),
             DataType::Binary => Self::Binary(value!(BinaryArray)),
             DataType::Date32 => Self::Day(value!(Date32Array).into()),
@@ -166,6 +180,19 @@ impl<'a> AtomRef<'a> {
             _ => Self::Unordered,
         })
     }
+}
+
+pub(super) const FLOAT_NAN_ORDER: u64 = u64::MAX;
+
+// SQL sorting distinguishes signed zeros and places every NaN in one last
+// equivalence class. Float payloads still come from the original row.
+fn float_order(value: f64) -> u64 {
+    const SIGN: u64 = 1 << 63;
+    if value.is_nan() {
+        return FLOAT_NAN_ORDER;
+    }
+    let bits = value.to_bits();
+    if bits & SIGN == 0 { bits ^ SIGN } else { !bits }
 }
 
 pub(super) fn arrow<T: 'static>(array: &dyn Array) -> Result<&T> {
@@ -186,6 +213,7 @@ impl<Text, Binary> Scalar<Text, Binary> {
             Self::Uuid(_) => Family::Uuid,
             Self::Day(_) => Family::Day,
             Self::InstantMicros(_) => Family::InstantMicros,
+            Self::FloatOrder(_) => Family::Float,
         })
     }
 }
@@ -210,6 +238,7 @@ pub(super) fn family(logical: &LogicalType) -> Option<Family> {
             LogicalType::Scalar(
                 S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64,
             ) => Family::Integer,
+            LogicalType::Scalar(S::F32 | S::F64) => Family::Float,
             LogicalType::Scalar(S::Utf8) => Family::Text,
             LogicalType::Scalar(S::Binary) => Family::Binary,
             LogicalType::Scalar(S::Uuid) => Family::Uuid,

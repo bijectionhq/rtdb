@@ -562,7 +562,13 @@ impl Predicate {
             Self::Compare { slot, op, value } => {
                 let cell = tuple.cell(*slot);
                 let value = value.borrowed();
-                if matches!(cell, AtomRef::Null | AtomRef::Unordered) || value == AtomRef::Null {
+                if matches!(
+                    cell,
+                    AtomRef::Null
+                        | AtomRef::Unordered
+                        | AtomRef::FloatOrder(super::key::FLOAT_NAN_ORDER)
+                ) || value == AtomRef::Null
+                {
                     return false;
                 }
                 match op {
