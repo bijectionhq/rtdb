@@ -41,6 +41,7 @@ tokio-util.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+bytes.workspace = true
 rtdb-metrics.workspace = true
 
 [lints]

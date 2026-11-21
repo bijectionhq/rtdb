@@ -7,11 +7,12 @@ use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use rtdb_columnar::{MemoryBudget, build_array, read_value, to_field};
 use rtdb_plan::{Scan, TemporalFilter};
+use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::columnar::{Column, ColumnBatch};
-use crate::context::{Execution, OuterRows, QueryContext};
+use crate::context::{Execution, OuterRows, QueryContext, cancelled};
 use crate::invalid;
 
 /// The deepest split: 4^4 = 256 fragments.
@@ -106,7 +107,7 @@ impl ScanFragment {
         // The reader filters by the predicates it would evaluate as the coordinator does; the coordinator filters its rows by all of them again.
         let predicates = scan.predicates.iter().filter(|predicate| portable(predicate)).cloned().collect();
         let scan = Scan { predicates, iids: None, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default, ..scan.clone() };
-        // A reader ahead of the basis holds later transactions too; bounds ending at the basis keep them out of what it reads.
+        // The wire bounds are limited by the coordinator's admitted transaction head.
         let upper = Timestamp(basis.system_time.0.saturating_add(1));
         if bounds.system_time.upper() > upper {
             bounds.system_time = Interval::new(bounds.system_time.lower().min(basis.system_time), upper).expect("a nonempty interval up to the basis");
@@ -125,13 +126,19 @@ pub trait ScanFragmenter: Send + Sync {
     async fn dispatch(&self, fragment: &ScanFragment) -> Result<Option<Vec<u8>>>;
 }
 
-/// Evaluates `fragment` over the context's snapshot of its database, which must be at or past the fragment's basis: its bounds end at the basis.
-/// An erasure since the basis is the one difference a reader ahead can show: what it erased is gone from every snapshot.
+/// Evaluates a delegated scan at the coordinator's exact captured transaction head.
 pub async fn evaluate_fragment(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<Vec<u8>> {
+    let cancellation = context.cancellation.clone();
+    let owner = context.owner_cancellation.clone();
+    let work = owner.run_until_cancelled(cancellation.run_until_cancelled(evaluate_retained_fragment(Arc::clone(&context), fragment)));
+    IoRegion::retaining(context, work).await.flatten().ok_or_else(cancelled)?
+}
+
+async fn evaluate_retained_fragment(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<Vec<u8>> {
     let database = context.catalog.database(fragment.database())?.clone();
     let [snapshot] = database.partitions.as_slice() else { return Err(invalid("fragment-partitions", "A fragment reads a database of one partition")) };
-    if snapshot.tx_basis().is_none_or(|head| head.tx_id < fragment.basis.tx_id) {
-        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.query/fragment-basis", format!("This node's snapshot is at {:?}, behind the fragment's basis {:?}", snapshot.tx_basis(), fragment.basis)));
+    if snapshot.tx_basis() != Some(fragment.basis) || snapshot.has_overlays() {
+        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.query/fragment-basis", format!("This node cannot serve the fragment's basis {:?}", fragment.basis)));
     }
     let memory = Arc::clone(&context.memory);
     let execution = Execution { parameters: Arc::new(crate::parameters::BoundParameters::new(Vec::new(), Vec::new(), &memory)?), outer: OuterRows::empty(&memory)?, context, bindings: None, analysis: None };

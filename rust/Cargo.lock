@@ -5014,6 +5014,7 @@ dependencies = [
  "arrow-select",
  "async-stream",
  "async-trait",
+ "bytes",
  "chrono",
  "datafusion-common",
  "datafusion-expr",

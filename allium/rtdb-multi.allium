@@ -1999,6 +1999,9 @@ rule PrewarmOnJoin {
 
 rule RefineKeyForLargeDeployments {
     -- A deployment whose data exceeds one member's cache distributes scan fragments by (storage identity, table, trie prefix), so each member keeps a stable slice warm.
+    -- The coordinator keeps its captured snapshot for a local fallback.
+    -- A delegated executor must capture the requested transaction head with no private overlays.
+    -- The executor holds the captured snapshot until admitted provider reads have completed.
     when: ScanPlanned(deployment, scan)
 
     requires: deployment.cache_bytes > PerMemberCacheShare()

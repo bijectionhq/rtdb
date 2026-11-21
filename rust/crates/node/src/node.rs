@@ -341,8 +341,8 @@ impl Node {
             .map(|context| context.with_query_cpu(query_cpu))
     }
 
-    /// Reads a fragment another node's scan dispatched here, once this node's copy of its database has applied the fragment's basis.
-    /// Waits up to `catch_up` for that; a copy already past the basis cannot read it, and is refused like one that never reaches it.
+    /// Waits for this node's copy to reach the delegated fragment's transaction basis.
+    /// The evaluator checks the exact snapshot it captures after the wait.
     pub async fn scan_fragment(&self, fragment: &rtdb_query::ScanFragment, catch_up: Duration, cancellation: &CancellationToken) -> Result<Vec<u8>> {
         self.ensure_open()?;
         let database = self.catalog.database(fragment.database())?;

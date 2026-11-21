@@ -571,6 +571,29 @@ def verify_explicit_session(args, scratch):
     verify_lean_model(args, scratch, path, "explicit-session", controls, 9)
 
 
+def verify_delegated_scan(args, scratch, history):
+    path = Path("verification/lean/DelegatedScan.lean")
+    controls = {
+        "allow-later-head": (
+            "if worker = coordinator ∧ privateEvents = [] then",
+            "if coordinator ≤ worker ∧ privateEvents = [] then",
+            ["successful_fragment_agrees_with_capture"],
+        ),
+        "accept-private-overlay": (
+            "if worker = coordinator ∧ privateEvents = [] then",
+            "if worker = coordinator then",
+            ["successful_fragment_agrees_with_capture"],
+        ),
+        "erase-witness-without-advance": (
+            "point (admit [correction, original] 2) 1 0 3",
+            "point (admit [correction, original] 1) 1 0 3",
+            ["advancing_only_worker_can_change_a_historical_answer"],
+        ),
+    }
+    env = os.environ | {"LEAN_PATH": str(history)}
+    verify_lean_model(args, scratch, path, "delegated-scan", controls, 3, env)
+
+
 def verify_residence_reader_retention(args, scratch):
     path = Path("verification/lean/ResidenceReaderRetention.lean")
     controls = {
@@ -840,6 +863,7 @@ def verify_lean(args, scratch):
             verify_replica_hold_close(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
             verify_residence_reader_retention(args, scratch)
+            verify_delegated_scan(args, scratch, directory)
             verify_compaction_projection(args, scratch, directory)
             verify_compaction_planner(args, scratch)
             verify_compaction_merge(args, scratch)
@@ -1001,6 +1025,19 @@ TLA_CASES = (
      ("INVARIANTS TypeOK AttemptsAdvance NoEmptyAfterMissing UsesNewerListing CorruptionIsTerminal MissingFailureHasRefreshed",
       "INVARIANT NeverRecoveredAfterRefresh"),
      "NeverRecoveredAfterRefresh"),
+    ("DelegatedScan", "delegated-scan-ahead",
+     ('Mutation = "none"', 'Mutation = "admit_ahead"'), "ExactAnswer"),
+    ("DelegatedScan", "delegated-scan-trust-probe",
+     ('Mutation = "none"', 'Mutation = "trust_probe"'), "ExactAnswer"),
+    ("DelegatedScan", "delegated-scan-forget-drain",
+     ('Mutation = "none"', 'Mutation = "forget_drain"'), "InFlightReadable"),
+    ("DelegatedScan", "delegated-scan", None, None),
+    ("DelegatedScan", "delegated-scan-matching-reply",
+     ("INVARIANTS ExactAnswer InFlightReadable", "INVARIANT NoMatchingReply"), "NoMatchingReply"),
+    ("DelegatedScan", "delegated-scan-fallback-witness",
+     ("INVARIANTS ExactAnswer InFlightReadable", "INVARIANT NoFallbackAfterErase"), "NoFallbackAfterErase"),
+    ("DelegatedScan", "delegated-scan-collection-witness",
+     ("INVARIANTS ExactAnswer InFlightReadable", "INVARIANT NoCollectionAfterDrain"), "NoCollectionAfterDrain"),
     ("InstalledCheckpoint", "installed-checkpoint", None, None),
     ("InstalledCheckpoint", "installed-checkpoint-follows-current",
      ('Mutation = "none"', 'Mutation = "follow_current"'), "InstalledReadable"),
@@ -1562,6 +1599,49 @@ def verify_multi_trim_admission(args, source):
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
 
 
+def verify_delegated_scan_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    command = ["cargo", "test", "--locked", "-p", "rtdb-query", "-p", "rtdb-multi",
+               "-p", "rtdb-node", "-p", "rtdb-replication", "--test", "scan"]
+    label = "rust-delegated-scan"
+    fragment = source / "rust/crates/query/src/fragment.rs"
+    original = fragment.read_bytes()
+    controls = {
+        "allow-later-head": (
+            "snapshot.tx_basis() != Some(fragment.basis)",
+            "snapshot.tx_basis().is_none_or(|head| head.tx_id < fragment.basis.tx_id)",
+            "delegated_scan_refuses_a_later_erase_horizon_and_falls_back",
+            "local fallback must preserve the coordinator's captured row",
+        ),
+        "release-on-cancel": (
+            "IoRegion::retaining(context, work).await.flatten().ok_or_else(cancelled)?",
+            "work.await.flatten().ok_or_else(cancelled)?",
+            "delegated_scan_keeps_its_snapshot_until_cancelled_provider_reads_drain",
+            "the admitted provider read must retain the fragment snapshot",
+        ),
+    }
+    baseline = run_case([*command, "delegated_scan_"], source / "rust", args.evidence, f"{label}-baseline", env)
+    if (baseline.returncode or "2 passed; 0 failed" not in baseline.stdout
+        or any(f"{test} ... ok" not in baseline.stdout for _, _, test, _ in controls.values())):
+        raise ValueError("delegated scan baselines did not both pass")
+    try:
+        for name, (find, replacement, test, assertion) in controls.items():
+            fragment.write_bytes(original)
+            replace_once(fragment, find, replacement)
+            control = run_case([*command, test, "--", "--exact"], source / "rust", args.evidence, f"{label}-{name}", env)
+            if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+                or assertion not in control.stdout or "0 passed; 1 failed" not in control.stdout):
+                raise ValueError(f"{label}-{name}: expected the named fragment assertion")
+    finally:
+        fragment.write_bytes(original)
+    print(f"{label}: both baseline cases passed and both source controls failed at their expected assertions")
+
+
 def verify_checkpoint_metadata_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -2001,6 +2081,10 @@ def main():
         "rust/crates/maintenance/tests/gc.rs",
         "rust/crates/index/src/partition.rs",
         "rust/crates/query/src/cursor.rs",
+        "rust/crates/query/src/fragment.rs",
+        "rust/crates/query/src/scan.rs",
+        "rust/crates/query/tests/scan.rs",
+        "rust/crates/node/src/node.rs",
         "rust/crates/storage/src/io_region.rs",
         "rust/crates/maintenance/src/merge.rs",
         "rust/crates/maintenance/src/merge/planner.rs",
@@ -2066,6 +2150,7 @@ def main():
             verify_multi_trim_admission(args, source)
             verify_recovery_hold_replay(args, source)
             verify_checkpoint_metadata_replay(args, source)
+            verify_delegated_scan_replay(args, source)
             verify_catalog_replay(args, source)
             verify_system_time_replay(args, source)
             verify_merge_replay(args, source)

@@ -748,6 +748,27 @@ These results concern candidate protocols in one residence.
 For production, identify the authoritative cut and receipt producers, connect storage admission and I/O draining for all query paths, and verify the garbage adapter and physical delete's identity.
 Exact historical admission, recovery dependencies, mixed-version deployments, and forks that share physical files require composition with their respective authorities. link:../../verification/tla/ResidenceReaderRetention.tla[Comparable model] · link:../../verification/lean/ResidenceReaderRetention.lean[General safety and comparison laws]
 
+=== Delegated scans keep the coordinator's captured view
+
+A delegated prefix scan is an optimization of a query the coordinator already admitted.
+The worker must answer from a capture of the same transaction head, including the system timestamp, within the same database history.
+It checks the snapshot it actually captured after any catch-up wait.
+The coordinator evaluates the fragment against its own held snapshot if the worker cannot supply that capture.
+A scan with private transaction overlays uses local execution.
+
+An earlier upper bound on system time does not recreate an earlier admission horizon.
+A worker with a later ERASE can return an empty answer where the coordinator's earlier capture still has a row.
+The fragment protocol distinguishes a refusal from a successful empty result so the coordinator can fall back.
+
+The delegated evaluator owns its query context across the whole fragment.
+The provider admission inherits this context, including its captured snapshot, until the read completes and any undelivered result is dropped.
+Local collection therefore accounts for a delegated snapshot even when the executor's caller has cancelled.
+Physical collection by other nodes still needs the shared residence authority described above.
+
+Lean proves that delegation plus local fallback preserves the reference point observation for a common committed history.
+TLC checks the timing between catching up, capturing, cancelling and draining.
+Native replays exercise the actual coordinator fallback and a cancelled read at the delegated storage boundary. link:../../verification/lean/DelegatedScan.lean[Observation laws] · link:../../verification/tla/DelegatedScan.tla[Interleaving model]
+
 === Multi replica recovery holds
 
 An ordinary recovery selects a checkpoint in one physical residence and opens a cursor on that residence's replica stream.
