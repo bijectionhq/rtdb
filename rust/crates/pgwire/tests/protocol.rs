@@ -1433,7 +1433,11 @@ async fn a_user_limited_by_grants_uses_only_the_databases_it_is_granted() {
     use rtdb_auth::{GrantedAccess, Method, MethodRule};
     let grants = BTreeMap::from([
         ("reader".to_owned(), BTreeMap::from([("xtdb".to_owned(), GrantedAccess::Read)])),
-        ("outsider".to_owned(), BTreeMap::from([("elsewhere".to_owned(), GrantedAccess::Write)])),
+        ("outsider".to_owned(), BTreeMap::from([
+            ("*".to_owned(), GrantedAccess::Write),
+            ("xtdb".to_owned(), GrantedAccess::Deny),
+        ])),
+        ("ordinary".to_owned(), BTreeMap::from([("*".to_owned(), GrantedAccess::Read)])),
     ]);
     let running = Running::start_with(ServerConfig::default(), AuthConfig::UserList { users: BTreeMap::new(), rules: vec![MethodRule::any(Method::Trust)], grants }).await;
     let mut writer = start_as(&running.server, "xtdb").await.unwrap();
@@ -1442,8 +1446,10 @@ async fn a_user_limited_by_grants_uses_only_the_databases_it_is_granted() {
     assert_eq!(rows(&reader.query("SELECT _id FROM docs").await).len(), 1, "a read grant reads");
     let refused = reader.query("INSERT INTO docs (_id) VALUES (2)").await;
     assert!(refused.iter().any(|(tag, body)| *tag == b'E' && String::from_utf8_lossy(body).contains("read-only-grant")), "and does not write: {refused:?}");
-    let outsider = start_as(&running.server, "outsider").await.err().expect("a user with no grant on a database cannot open a session on it");
+    let mut ordinary = start_as(&running.server, "ordinary").await.unwrap();
+    assert_eq!(rows(&ordinary.query("SELECT _id FROM docs").await).len(), 1);
+    let outsider = start_as(&running.server, "outsider").await.err().expect("explicit denial takes precedence over a default write grant");
     assert!(outsider.contains("database-not-granted"), "{outsider}");
-    drop((writer, reader));
+    drop((writer, reader, ordinary));
     running.stop().await;
 }

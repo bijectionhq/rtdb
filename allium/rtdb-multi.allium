@@ -1888,6 +1888,7 @@ invariant ObjectsStayInTheirLineage {
 invariant OneDatabasePerSession {
     -- A session's catalog contains exactly its capability's deployment; the planner cannot name another.
     -- Cross-deployment reads exist only through an explicit grant, served on the snapshot tier.
+    -- For a configured user grant list, an exact database rule takes precedence over the user's default rule, including during gateway reconnection.
     for session in Sessions:
         Catalog(session) = { session.capability.deployment } + GrantedSnapshots(session)
 }

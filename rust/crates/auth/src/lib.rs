@@ -60,14 +60,30 @@ pub fn method_for(rules: &[MethodRule], user: Option<&str>, remote_address: Opti
 #[derive(Clone, Debug)]
 pub enum AuthConfig {
     SingleRootUser { password: Option<Secret> },
-    /// `grants` limits the users it names to the databases it grants them; a user it does not name may use every database.
+    /// A named user's exact database rule takes priority over its `*` default.
     UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule>, grants: Grants },
     OpenIdConnect(OidcConfig),
 }
 
 /// For each user limited to some databases, the access granted on each.
-pub type Grants = BTreeMap<String, BTreeMap<String, DatabaseAccess>>;
-pub use rtdb_node::DatabaseAccess as GrantedAccess;
+pub type Grants = BTreeMap<String, BTreeMap<String, GrantedAccess>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantedAccess {
+    Deny,
+    Read,
+    Write,
+}
+
+impl GrantedAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "DENY",
+            Self::Read => "READ",
+            Self::Write => "READ_WRITE",
+        }
+    }
+}
 
 impl Default for AuthConfig {
     fn default() -> Self { Self::SingleRootUser { password: std::env::var("XTDB_PASSWORD").ok().map(Secret::new) } }
@@ -172,11 +188,11 @@ pub struct Principal {
     user: Option<String>,
     credentials: Credentials,
     /// The databases this principal may use and how, if it is limited to some.
-    grants: Option<BTreeMap<String, DatabaseAccess>>,
+    grants: Option<BTreeMap<String, GrantedAccess>>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Principal {
-    fn static_user(user: Option<&str>, grants: Option<BTreeMap<String, DatabaseAccess>>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+    fn static_user(user: Option<&str>, grants: Option<BTreeMap<String, GrantedAccess>>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let granted = grants.iter().flatten().try_fold(0usize, |bytes, (database, _)| bytes.checked_add(database.len() + 64));
         let bytes = granted.and_then(|granted| user.map_or(0, str::len).checked_add(granted)?.checked_add(std::mem::size_of::<Self>())).ok_or_else(|| Anomaly::incorrect("rtdb.auth/principal-allocation", "Principal allocation exceeds addressable memory"))?;
         let reservation = memory.reserve(bytes)?;
@@ -193,10 +209,10 @@ impl SessionIdentity for Principal {
     fn delegable(&self) -> bool { matches!(self.credentials, Credentials::Static) }
     fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()> {
         let Some(grants) = &self.grants else { return Ok(()) };
-        match (grants.get(database), access) {
-            (Some(DatabaseAccess::Write), _) | (Some(DatabaseAccess::Read), DatabaseAccess::Read) => Ok(()),
-            (Some(DatabaseAccess::Read), DatabaseAccess::Write) => Err(forbidden("xtdb.authz/read-only-grant", format!("{} may only read database '{database}'", self.user.as_deref().unwrap_or_default()))),
-            (None, _) => Err(forbidden("xtdb.authz/database-not-granted", format!("{} has no access to database '{database}'", self.user.as_deref().unwrap_or_default()))),
+        match (grants.get(database).or_else(|| grants.get("*")), access) {
+            (Some(GrantedAccess::Write), _) | (Some(GrantedAccess::Read), DatabaseAccess::Read) => Ok(()),
+            (Some(GrantedAccess::Read), DatabaseAccess::Write) => Err(forbidden("xtdb.authz/read-only-grant", format!("{} may only read database '{database}'", self.user.as_deref().unwrap_or_default()))),
+            (Some(GrantedAccess::Deny) | None, _) => Err(forbidden("xtdb.authz/database-not-granted", format!("{} has no access to database '{database}'", self.user.as_deref().unwrap_or_default()))),
         }
     }
 }
