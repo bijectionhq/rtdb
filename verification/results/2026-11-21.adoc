@@ -926,5 +926,13 @@ It also checks that reset is refused while a collection is held.
 The storage test checks that cancelled I/O retains its reference until the worker and its undelivered result finish.
 Run the selected suites with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-index -p rtdb-maintenance -p rtdb-storage -p rtdb-query -p rtdb-node -p rtdb-replication --lib --test gc --test native --test catalogs`.
 
+The combined formal runner passed on `b4b5001ec`, including 114 Verus obligations, 61 Verus controls, and the Lean, TLC, Apalache, Alloy, Maude, mCRL2, AutoHyper, and SMT studies.
+The replay options were omitted for this invocation.
+Its input manifest SHA-256 is `8cdc8277a31e53e99eb508db2be62aea3840116d4cab2aedd306d4591044d7f2`.
+The follow-up collection test composes the storage and collector checks.
+The last query catalog moves into a running I/O operation, and the test confirms that collection preserves its objects even after cancelling the waiter.
+It then waits for the I/O region to drain and verifies that collection reclaims them.
+All five tests in the maintenance `gc` suite passed with that follow-up.
+
 This deployment boundary covers one installed partition authority and its trie collector.
 Coordination between nodes, other physical deletion paths, and checkpoint and log retention during recovery remain open.

@@ -5,7 +5,7 @@ use bytes::Bytes;
 use rtdb_format::{block::proto as pb, catalog::BlockCatalog, keys::{TrieKey, block_key, oversized_key}};
 use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog, TrieState};
 use rtdb_maintenance::{BlockCollector, CollectionObserver, CycleWorker, GarbageConfig, TrieCollector, TrieDeletionPublisher, block_is_garbage};
-use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
+use rtdb_storage::{IoRegion, MemoryStore, ObjectKey, ObjectStore};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -90,7 +90,7 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
 }
 
 #[tokio::test]
-async fn collection_preserves_open_readers_and_can_reclaim_unreferenced_tries() {
+async fn collection_preserves_open_readers_and_their_inflight_io() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let entry = tables.entry(&table).unwrap().clone();
@@ -127,12 +127,28 @@ async fn collection_preserves_open_readers_and_can_reclaim_unreferenced_tries() 
     collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap().as_slice(), &[vec![unreferenced.key.clone()]]);
     state.delete_tries(&BTreeMap::from([(table, [unreferenced.key].into())]));
+
+    let region = IoRegion::new();
+    let worker = region.clone();
+    let (started, in_flight) = tokio::sync::oneshot::channel();
+    let (finish, release) = std::sync::mpsc::channel();
+    let caller = tokio::spawn(IoRegion::retaining(Arc::new(second), async move {
+        worker.run_blocking(move || {
+            started.send(()).unwrap();
+            release.recv().unwrap();
+            Ok(())
+        }).await
+    }));
+    in_flight.await.unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
     drop(first);
     collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap().len(), 1);
     for key in &pinned_objects { assert!(store.get(key).await.is_ok()); }
 
-    drop(second);
+    finish.send(()).unwrap();
+    region.close_and_wait().await;
     collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap()[1], vec![preserved.key]);
     for key in &pinned_objects { assert!(store.head(key).await.is_err()); }
