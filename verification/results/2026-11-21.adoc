@@ -489,3 +489,33 @@ The native SQL search suite exercises ranked reads across multiple partitions an
 The theorem starts with the resolved, qualifying reference rows and their scores.
 It assumes the implementation retains every row admitted by the modeled predicate and reproduces the reference tie order in the final sort.
 The Rust candidate verification and scan planner still need this refinement proof.
+
+== Combined search verification and native replay
+
+The combined formal suite passed on `bd1de1b76` with 68 Verus obligations in nine areas and 36 rejected Verus controls.
+It included sixteen TLC baselines and 33 mutation or reachability controls.
+Its input manifest SHA-256 is `9503cda16e08665372e47daff7e88007e83667230a432cc6edd0b181f6fb02a1`.
+
+The Rust source was identical to `3899a0bda`, whose combined run passed the replica compile controls, rank witness and mutation, and 4,096 native temporal observations before the checkpoint build ran out of disk space.
+After removal of completed build outputs, the checkpoint and Azure portions passed in a fresh archive of that same revision.
+The retried cases included four native checkpoint tests and the root-first mutation, two native loopback Azure tests, and two rejected Azure source mutations.
+The input manifest for that Rust source is `f271f14e6a4355837c4a34b210ccc464a13608234e83ccd0443cc0c57a8094a5`.
+
+== Recovery across checkpoint publication and collection
+
+TLC explored all 53 states of link:../tla/RecoveryCollection.tla[the two-generation model].
+Each generation has a root and one private trie, and both use a shared object.
+One recovery invocation can select either advertised root whose basis is still covered by the log.
+Selecting a root takes a reference that persists through successful open or confirmed abandonment.
+Deletion authorization protects the union of advertised and recovery-held dependency sets.
+The authorized deletion can complete in a later step.
+Log trimming preserves the suffix required by the selected root even after a complete replacement is published.
+
+The five altered transition rules each violate their targeted invariant.
+They admit incomplete publication, omit the recovery reference, forget the replacement's shared object, trim using only the head, or admit recovery below the log floor.
+A reachability control opens the replacement after collection of the old private trie and advancement of the log floor.
+Apalache checked the same safety conditions up to ten transitions and independently found the missing suffix when trimming used only the current head.
+
+This is bounded model evidence under synchronized selection and deletion authorization, immutable identities, atomic durable head publication, and truthful durability.
+The model represents suffix retention with an ordered floor and assumes recovery can consult the advertised roots.
+It abstracts object discovery failures, concurrent recoveries, exact writes and log offsets, and the production implementation of a recovery reference.

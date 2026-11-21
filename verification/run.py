@@ -516,6 +516,16 @@ TLA_CASES = (
     ("Checkpoint", "checkpoint-trim-with-stale-listing", ('Mutation = "none"', 'Mutation = "trim_with_unvalidated_listing"'), "RecoveryHasRepresentation"),
     ("Checkpoint", "checkpoint-check-copy-completion", ('Mutation = "none"', 'Mutation = "check_copy_completion"'), None),
     ("Checkpoint", "checkpoint-trust-copy-acceptance", ('Mutation = "none"', 'Mutation = "trust_copy_acceptance"'), "CompletePublishedRoot"),
+    ("RecoveryCollection", "recovery-collection", None, None),
+    ("RecoveryCollection", "recovery-collection-incomplete-root", ('Mutation = "none"', 'Mutation = "publish_incomplete"'), "AdvertisedRootsReadable"),
+    ("RecoveryCollection", "recovery-collection-ignores-selection", ('Mutation = "none"', 'Mutation = "ignore_selected_root"'), "RecoveryReadSetAvailable"),
+    ("RecoveryCollection", "recovery-collection-shared-data", ('Mutation = "none"', 'Mutation = "forget_shared_dependency"'), "AdvertisedRootsReadable"),
+    ("RecoveryCollection", "recovery-collection-trim-for-head", ('Mutation = "none"', 'Mutation = "trim_for_head_only"'), "RecoverySuffixAvailable"),
+    ("RecoveryCollection", "recovery-collection-select-below-floor", ('Mutation = "none"', 'Mutation = "select_below_floor"'), "RecoverySuffixAvailable"),
+    ("RecoveryCollection", "recovery-collection-reachable",
+     ("INVARIANTS TypeOK AdvertisedRootsReadable RecoveryReadSetAvailable RecoverySuffixAvailable UsableHead",
+      "INVARIANT NoReplacementOpenAfterCollection"),
+     "NoReplacementOpenAfterCollection"),
 )
 
 
@@ -566,28 +576,39 @@ def verify_alloy(args, scratch):
     print("alloy: last-reference invariant holds in scope 4, control and shared-file witness found")
 
 
+def check_apalache(args, scratch, module, name, invariant, length, mutation=None, counterexample=None):
+    case = f"apalache-{name}"
+    directory = scratch / case
+    source = clone_file(Path(f"verification/tla/{module}.tla"), directory)
+    config = clone_file(Path(f"verification/tla/{module}.cfg"), directory)
+    if mutation:
+        replace_once(config, *mutation)
+    env = os.environ | {"JAVA_HOME": str(Path(args.java).resolve().parent.parent)}
+    log = run_case(
+        [args.apalache, f"--out-dir={args.evidence / case}", "check", f"--config={config.name}",
+         f"--length={length}", f"--inv={invariant}", source.name],
+        source.parent, args.evidence, case, env,
+    )
+    if counterexample:
+        if log.returncode != 12 or "state invariant 0 violated" not in log.stdout:
+            raise ValueError(f"{case}: expected the {counterexample} counterexample")
+        print(f"{case}: {counterexample} counterexample found")
+    else:
+        if log.returncode or f"no error up to computation length {length}" not in log.stdout:
+            raise ValueError(f"{case}: symbolic check failed")
+        print(f"{case}: holds up to {length} transitions")
+
+
 def verify_apalache(args, scratch):
     for mode in ("validated", "serialized", "blind"):
-        case = f"apalache-{mode}"
-        directory = scratch / case
-        module = clone_file(Path("verification/tla/Resolution.tla"), directory)
-        config = clone_file(Path("verification/tla/Resolution.cfg"), directory)
-        if mode != "validated":
-            replace_once(config, 'Mode = "validated"', f'Mode = "{mode}"')
-        env = os.environ | {"JAVA_HOME": str(Path(args.java).resolve().parent.parent)}
-        log = run_case(
-            [args.apalache, f"--out-dir={args.evidence / case}", "check", f"--config={config.name}",
-             "--length=8", "--inv=NoLostUpdates", module.name],
-            module.parent, args.evidence, case, env,
-        )
-        if mode == "blind":
-            if log.returncode != 12 or "state invariant 0 violated" not in log.stdout:
-                raise ValueError(f"{case}: expected the lost-update counterexample")
-            print(f"{case}: lost-update counterexample found")
-        else:
-            if log.returncode or "no error up to computation length 8" not in log.stdout:
-                raise ValueError(f"{case}: symbolic check failed")
-            print(f"{case}: holds up to 8 transitions")
+        mutation = None if mode == "validated" else ('Mode = "validated"', f'Mode = "{mode}"')
+        counterexample = "lost-update" if mode == "blind" else None
+        check_apalache(args, scratch, "Resolution", mode, "NoLostUpdates", 8, mutation, counterexample)
+    check_apalache(args, scratch, "RecoveryCollection", "recovery-collection", "RecoverySafe", 10)
+    check_apalache(
+        args, scratch, "RecoveryCollection", "recovery-collection-trim-for-head", "RecoverySuffixAvailable", 10,
+        ('Mutation = "none"', 'Mutation = "trim_for_head_only"'), "missing recovery suffix",
+    )
 
 
 def verify_maude(args, scratch):
@@ -821,6 +842,8 @@ def main():
     source_paths.extend(ROOT / path for path in (
         "rust/crates/text/src/lib.rs",
         "rust/crates/search/src/file.rs",
+        "rust/crates/search/src/lib.rs",
+        "rust/crates/query/src/optimize.rs",
         "rust/crates/search/src/accelerate.rs",
         "rust/crates/expr/src/search.rs",
         "rust/crates/expr/src/evaluate.rs",

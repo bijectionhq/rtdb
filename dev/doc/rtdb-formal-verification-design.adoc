@@ -1051,8 +1051,9 @@ The native score witness passes and the unpadded mutation fails.
 Relate the native postings iterator and persisted sidecar to the modeled complete term-window summaries.
 
 |Recovery and Azure
-|Four native checkpoint tests and their root-first control, and two loopback Azure tests and their two source controls, passed as specified in the combined run.
-|Check object closure under concurrent compaction and collection.
+|Four native checkpoint tests and their root-first control, and two loopback Azure tests and their two source controls, passed.
+TLC and Apalache check two overlapping checkpoint generations, one recovery reference, protected objects, and its required log suffix under delayed collection.
+|Generalize object closure, recovery selection and log retirement to production compaction and collection.
 Establish supported remote configurations and any eventual retry and staging cleanup guarantees.
 
 |Retention
