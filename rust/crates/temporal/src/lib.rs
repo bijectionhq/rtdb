@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 mod event_step;
 mod ceiling_step;
 
+#[allow(unexpected_cfgs)]
+#[cfg(kani)]
+mod proofs;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "PolygonParts", into = "PolygonParts")]
 pub struct Polygon {

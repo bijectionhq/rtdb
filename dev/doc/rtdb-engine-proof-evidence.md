@@ -191,7 +191,8 @@ The native run passed 503 tests with `cargo test --manifest-path rust/Cargo.toml
 
 The multi models describe the separate `e86af7f12` branch baseline and its directory, Logkeeper, and object-store assumptions.
 The standalone Lean and TLA+ artifacts are available under [verification/multi](../../verification/multi).
-The multi Rust checks and integration fixtures are recorded at [verification revision `b1e41f938`](https://github.com/bijectionhq/rtdb/blob/b1e41f938919f68d452a94a4ec493ebec7e6be50/dev/doc/rtdb-engine-proof-evidence.md).
+The branch evidence describes the native SQL oracle and Kani runs on their original revision. [Verification revision `b1e41f938`](https://github.com/bijectionhq/rtdb/blob/b1e41f938919f68d452a94a4ec493ebec7e6be50/dev/doc/rtdb-engine-proof-evidence.md)
+The temporal and recency models and their local runner are also available on main. [Temporal projection](../lean/TemporalProjection.lean) · [Recency](../lean/Recency.lean) · [Reproduction](../check-rtdb-proof-models.sh)
 The [recovery study](https://github.com/bijectionhq/rtdb/blob/e86af7f121b10fb9832c93fbeafdf9a85a5b7f6a/dev/doc/rtdb-recovery-properties.md#proof-status) enumerates S1–S7, the liveness assumptions, model bounds, and the outstanding production refinements.
 
 | Catalog targets | Scoped evidence | Open implementation boundary |
