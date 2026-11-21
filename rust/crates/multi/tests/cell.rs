@@ -1774,10 +1774,14 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
-    let preceding = tokio::time::timeout(Duration::from_secs(5), async {
+    let (preceding, through) = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let report = admin::audit(east.directory.as_ref(), &east_keys, "shop", 4 << 20).await.unwrap();
-            if report.transactions >= 2 && let Some(digest) = report.replica_continued_digest { break digest; }
+            if report.transactions >= 2
+                && let (Some(digest), Some([_, through])) = (report.replica_continued_digest, report.replica_interval)
+            {
+                break (digest, through);
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.unwrap();
@@ -1795,8 +1799,18 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let replay = admin::audit(west.directory.as_ref(), &west_keys, "shop", 4 << 20).await.unwrap();
     assert!(replay.transactions >= 2 && replay.violations.is_empty());
     assert_eq!(pending.replica_anchor.as_deref(), Some(&anchor));
-    assert_eq!(replay.replica_continued_digest.as_deref(), Some(preceding.as_str()));
-    assert_eq!(replay.replica_anchor.unwrap().stream, pending.stream("replica"));
+    let stream = pending.stream("replica");
+    assert_eq!(replay.replica_anchor.unwrap().stream, stream);
+    let members: BTreeMap<_, _> = west.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member.address)).collect();
+    let servers = pending.ensemble.iter().map(|id| members[id].clone()).collect::<Vec<_>>();
+    let config = rtdb_logkeeper::StreamConfig {
+        write_quorum: rtdb_multi::deployment::write_quorum(servers.len()), servers, stream: stream.clone(), maximum_message_bytes: 4 << 20,
+    };
+    let prefix = rtdb_logkeeper::JournalDigest::from_digest_bytes(stream, anchor.interval, anchor.digest);
+    assert_eq!(
+        rtdb_logkeeper::certify_committed_prefix(&config, through, Some(&prefix)).await.unwrap().digest,
+        preceding,
+    );
 
     let arrived = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20, None).await.unwrap();
     assert_eq!(arrived.epoch, fenced.epoch);
