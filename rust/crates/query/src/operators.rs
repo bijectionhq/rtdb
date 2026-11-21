@@ -131,7 +131,14 @@ fn batch_shape(runtime: &Arc<EmittedRelation>) -> Result<Option<bool>> {
     })
 }
 
-fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<crate::pages::BoxPageCursor>> { Box::pin(async move {
+fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<BoxPageCursor>> {
+    let mut build = Box::pin(build_pages_at(runtime, execution, constraints, pushdowns));
+    Box::pin(std::future::poll_fn(move |context| {
+        stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || build.as_mut().poll(context))
+    }))
+}
+
+async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<BoxPageCursor> {
     execution.context.check_cancelled()?;
     let relation = Arc::clone(runtime.relation());
     let state_reservation = state_reservation(&runtime, &execution)?;
@@ -383,7 +390,7 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         }
         RelationNode::PatchGaps { .. } => unreachable!(),
     }
-}) }
+}
 
 async fn row_limit(expr: Option<&Expr>, execution: &Execution) -> Result<Option<u64>> {
     let Some(expr) = expr else { return Ok(None); };
