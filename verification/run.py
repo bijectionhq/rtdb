@@ -89,15 +89,16 @@ def verify_verus(args, scratch):
             )
             observed = verus_errors(output.stderr, directory)
             floor = (control or config)["min_verified_functions"]
+            expected_failed_functions = {(file, function) for file, function, _ in expected}
             if (
                 bool(output.returncode) != bool(control)
                 or result["encountered-vir-error"]
-                or result["errors"] != len(expected)
+                or result["errors"] != len(expected_failed_functions)
                 or result["verified"] < floor
                 or observed != expected
             ):
                 raise ValueError(f"{case}: {result}, observed {observed}, expected {expected}")
-            print(f"{case}: {result['verified']} verified, {len(expected)} expected errors")
+            print(f"{case}: {result['verified']} verified, {len(expected)} expected diagnostics")
 
 
 def verify_rank_bound(args, scratch):
@@ -426,7 +427,8 @@ def verify_maude(args, scratch):
 def capture_production(source):
     source.mkdir()
     subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", "rust"], cwd=ROOT, check=True)
-    with subprocess.Popen(["git", "archive", "--format=tar", "HEAD"], cwd=ROOT, stdout=subprocess.PIPE) as git:
+    paths = ["rust", "core", "api", "modules", "src", "verification"]
+    with subprocess.Popen(["git", "archive", "--format=tar", "HEAD", *paths], cwd=ROOT, stdout=subprocess.PIPE) as git:
         with tarfile.open(fileobj=git.stdout, mode="r|") as archive:
             archive.extractall(source, filter="data")
         if git.wait():

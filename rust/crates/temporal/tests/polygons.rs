@@ -70,6 +70,46 @@ fn ceiling_replaces_ranges_with_exact_reference_breakpoints() {
 }
 
 #[test]
+fn ceiling_windows_agree_with_pointwise_overwrites_at_sentinels_and_interior_points() {
+    let endpoints = [i64::MIN, -3, 0, 1, 4, i64::MAX];
+    let intervals: Vec<_> = endpoints.iter().enumerate()
+        .flat_map(|(index, &lower)| endpoints[index..].iter().map(move |&upper| interval(lower, upper)))
+        .collect();
+    let points = [i64::MIN, i64::MIN + 1, -4, -3, -2, -1, 0, 1, 2, 4, 5, i64::MAX - 1, i64::MAX].map(Timestamp);
+    for &first in &intervals {
+        for &second in &intervals {
+            let mut ceiling = Ceiling::default();
+            ceiling.apply_event(Timestamp(20), first);
+            ceiling.apply_event(Timestamp(10), second);
+            assert!(ceiling.valid_times().windows(2).all(|bounds| bounds[0] < bounds[1]));
+            for &requested in &intervals {
+                let polygon = ceiling.polygon(requested);
+                assert_eq!(polygon.valid_times().first(), Some(&requested.lower()));
+                assert_eq!(polygon.valid_times().last(), Some(&requested.upper()));
+                if requested.is_empty() {
+                    let point = Timestamp(requested.lower().0.min(i64::MAX - 1));
+                    let upper = if second.contains(point) { Timestamp(10) }
+                        else if first.contains(point) { Timestamp(20) }
+                        else { Timestamp::MAX };
+                    assert_eq!(polygon.system_time_ceilings(), &[upper]);
+                }
+                for point in points {
+                    let expected = requested.contains(point).then(|| {
+                        if second.contains(point) { Timestamp(10) }
+                        else if first.contains(point) { Timestamp(20) }
+                        else { Timestamp::MAX }
+                    });
+                    let mut visible = polygon.valid_times().windows(2).zip(polygon.system_time_ceilings())
+                        .filter_map(|(bounds, &upper)| (bounds[0] <= point && point < bounds[1]).then_some(upper));
+                    assert_eq!(visible.next(), expected, "{first:?}, {second:?}, {requested:?} at {point:?}");
+                    assert!(visible.next().is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn polygon_intersections_preserve_each_upstream_overlap_case() {
     for (new_from, new_to, old_from, old_to, expected_times, expected_ceilings) in [
         (2005, 2009, 2010, 2020, vec![2010, 2020], vec![i64::MAX]),
@@ -86,6 +126,23 @@ fn polygon_intersections_preserve_each_upstream_overlap_case() {
         let mut ceiling = Ceiling::default();
         ceiling.apply_event(Timestamp(1), interval(new_from, new_to));
         assert_eq!(ceiling.polygon(interval(old_from, old_to)), polygon(&expected_times, &expected_ceilings));
+    }
+}
+
+#[test]
+fn fragment_admission_checks_both_axes_and_clips_only_valid_time() {
+    let bounds = TemporalBounds { valid_time: interval(6, 9), system_time: interval(5, 10) };
+    for clamp_valid in [false, true] {
+        let mut resolver = HistoryResolver::new(bounds, clamp_valid);
+        let mut fragments = Vec::new();
+        for system in [8, 3, 1] {
+            resolver.resolve_fragments(&event(1, system, 4, 12, EventOp::Put), |valid, system| {
+                fragments.push((valid, system));
+                Ok(())
+            }).unwrap();
+        }
+        let valid = if clamp_valid { interval(6, 9) } else { interval(4, 12) };
+        assert_eq!(fragments, [(valid, interval(8, i64::MAX)), (valid, interval(3, 8))]);
     }
 }
 

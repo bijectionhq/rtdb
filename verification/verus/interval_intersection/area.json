@@ -1,7 +1,7 @@
 {
-  "summary": "Half-open rectangle selection uses a shared interval decision that admits exactly the points held by both input ranges.",
+  "summary": "Shared half-open interval intersection and rectangle admission preserve validity at every point in the query.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 3,
+  "min_verified_functions": 6,
   "controls": {
     "admit_touching_ranges": {
       "defect": "A zero-width overlap is returned as an intersection.",
@@ -15,7 +15,7 @@
         "function": "intersect",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 2
+      "min_verified_functions": 5
     },
     "admit_touching_ranges_with_weakened_contract": {
       "defect": "Both the implementation and local contract admit an empty overlap.",
@@ -32,8 +32,12 @@
         "file": "verification/verus/interval_intersection/laws.rs",
         "function": "adjacent_validity_ranges_never_intersect",
         "category": "postcondition not satisfied"
+      }, {
+        "file": "verification/verus/interval_intersection/laws.rs",
+        "function": "a_disjoint_system_span_cannot_emit_a_fragment",
+        "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 2
+      "min_verified_functions": 4
     },
     "use_lesser_lower_endpoint": {
       "defect": "A result can include points from just one input interval.",
@@ -54,8 +58,38 @@
         "file": "verification/verus/interval_intersection/laws.rs",
         "function": "intersection_preserves_point_membership",
         "category": "postcondition not satisfied"
+      }, {
+        "file": "verification/verus/interval_intersection/laws.rs",
+        "function": "a_disjoint_system_span_cannot_emit_a_fragment",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "verification/verus/interval_intersection/laws.rs",
+        "function": "admission_preserves_the_answer_inside_the_query",
+        "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 1
+      "min_verified_functions": 2
+    },
+    "ignore-system-with-weakened-contract": {
+      "defect": "The implementation and local contract admit a fragment solely on valid-time overlap.",
+      "mutate": [{
+        "file": "rust/crates/types/src/interval_step.rs",
+        "find": "    if intersect(system, requested_system).is_none() { return None; }\n",
+        "replace": ""
+      }, {
+        "file": "rust/crates/types/src/interval_step.rs",
+        "find": "    ensures out == if expected_intersection(system, requested_system).is_some() {\n        match",
+        "replace": "    ensures out == match"
+      }, {
+        "file": "rust/crates/types/src/interval_step.rs",
+        "find": "        }\n    } else { None },\n",
+        "replace": "    },"
+      }],
+      "expect": [{
+        "file": "verification/verus/interval_intersection/laws.rs",
+        "function": "a_disjoint_system_span_cannot_emit_a_fragment",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
     }
   }
 }

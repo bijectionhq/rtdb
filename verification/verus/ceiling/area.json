@@ -1,0 +1,84 @@
+{
+  "summary": "Checks the production ceiling mutation, clipping window and cell geometry against half-open pointwise semantics.",
+  "flags": ["--no-external-by-default", "--no-cheating"],
+  "min_verified_functions": 18,
+  "controls": {
+    "split-uses-unbounded-ceiling": {
+      "mutate": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "find": "let ceiling = ceilings[index - 1];",
+        "replace": "let ceiling = Timestamp(i64::MAX);"
+      }],
+      "expect": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "function": "split_at",
+        "category": "precondition not satisfied"
+      }],
+      "min_verified_functions": 17
+    },
+    "discard-stale-suffix": {
+      "mutate": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "find": "values[cursor] = values[cursor + gap];",
+        "replace": "values[cursor] = values[cursor + gap - 1];"
+      }],
+      "expect": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "function": "discard_span",
+        "category": "invariant not satisfied at end of loop body"
+      }],
+      "min_verified_functions": 17
+    },
+    "skip-write-with-weakened-contract": {
+      "mutate": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "find": "    if lower.0 == upper.0 { return; }",
+        "replace": "    if lower.0 <= upper.0 { return; }"
+      }, {
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "find": "        forall|point: i64, j: int| lower.0 <= point < upper.0 && #[trigger] covers(final(bounds)@, j, point)\n            ==> final(ceilings)@[j] == system_from,\n",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "verification/verus/ceiling/laws.rs",
+        "function": "applying_a_write_sets_the_ceiling_at_every_covered_point",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 17
+    },
+    "include-upper-cell": {
+      "mutate": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "find": "let upper_cut = boundary_index(bounds, upper, false);",
+        "replace": "let upper_cut = boundary_index(bounds, upper, true);"
+      }],
+      "expect": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "function": "cell_window",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "function": "cell_window",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 17
+    },
+    "clip-widens-cell": {
+      "mutate": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "find": "let lower = if cell_lower.0 > query_lower.0 { cell_lower } else { query_lower };",
+        "replace": "let lower = query_lower;"
+      }],
+      "expect": [{
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "function": "clip_cell",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "rust/crates/temporal/src/ceiling_step.rs",
+        "function": "clip_cell",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 17
+    }
+  }
+}

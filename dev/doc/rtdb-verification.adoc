@@ -236,8 +236,14 @@ Reordering three concrete inputs reopens the ceiling after an emission and can e
 Controls remove the ceiling update and make its upper edge inclusive.
 
 The native replay compares the same fixture with the ordinary resolver, its memory-admitted version and the unbounded visibility rectangles.
-The formal argument works with the projected ceiling for one coordinate.
-The correspondence between that projected ceiling and the complete Rust vector split, replacement, and rectangle emission remains open.
-Verus checks the shared interval intersection used by the Rust rectangle selection.
-Its laws preserve point membership on both inputs and exclude zero-width overlaps.
-A pair of controls also weakens the local contract, so accepting empty intersections or choosing the lesser lower endpoint fails the independent law.
+The Lean result is for a projected ceiling at one coordinate.
+The Rust ceiling stores a strictly ordered vector of valid-time boundaries and one system-time ceiling for each adjacent pair.
+Verus proves that the executable split and overwrite preserve this representation, update exactly the requested span, and retain each ceiling outside it.
+The same proof area checks binary search, the cell window, and clipping, including empty windows at the sentinels.
+The scan uses the checked intersection and fragment admission to select overlaps on both axes and preserves point membership with either valid-time clipping mode.
+The system-time interval is returned in full.
+Controls exercise copying the wrong ceiling or stale suffix, skipping a write, including an upper-endpoint cell, widening a clip, and admitting a disjoint system interval.
+
+The proof uses the standard Verus contracts for Rust vectors and slices.
+The native replay supplies evidence for allocation, setup and handoff in the resolver, including the lazy initial ceiling and reused buffers.
+The remaining end-to-end obligation is to connect that stateful event and allocation shell to the point model for arbitrary histories.

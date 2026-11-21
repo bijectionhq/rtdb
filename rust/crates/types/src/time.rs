@@ -1,4 +1,4 @@
-use crate::{Anomaly, Iid, Result, interval_step};
+use crate::{Anomaly, Iid, Result, Timestamp, interval_step};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -33,10 +33,6 @@ impl From<Timestamp> for Instant {
         Self { seconds, nanos: nanos as u32 }
     }
 }
-
-/// Signed microseconds since the Unix epoch; the extrema are unbounded sentinels.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct Timestamp(pub i64);
 
 impl Timestamp {
     pub const MIN: Self = Self(i64::MIN);
@@ -92,9 +88,10 @@ impl Interval {
         self.intersection(other).is_some()
     }
     pub fn intersection(self, other: Self) -> Option<Self> {
-        interval_step::intersect((self.lower.0, self.upper.0), (other.lower.0, other.upper.0))
+        interval_step::intersect(self.endpoints(), other.endpoints())
             .map(|(lower, upper)| Self { lower: Timestamp(lower), upper: Timestamp(upper) })
     }
+    fn endpoints(self) -> (i64, i64) { (self.lower.0, self.upper.0) }
 }
 
 impl TryFrom<IntervalParts> for Interval {
@@ -112,6 +109,15 @@ pub struct TemporalBounds { pub valid_time: Interval, pub system_time: Interval 
 impl TemporalBounds {
     pub fn intersects(self, other: Self) -> bool {
         self.valid_time.intersects(other.valid_time) && self.system_time.intersects(other.system_time)
+    }
+
+    /// Admits a history fragment that overlaps both requested axes, optionally clipping its valid time.
+    pub fn admit_fragment(self, fragment: Self, clamp_valid: bool) -> Option<Self> {
+        let (lower, upper) = interval_step::admit_fragment(
+            fragment.valid_time.endpoints(), fragment.system_time.endpoints(),
+            self.valid_time.endpoints(), self.system_time.endpoints(), clamp_valid,
+        )?;
+        Some(Self { valid_time: Interval { lower: Timestamp(lower), upper: Timestamp(upper) }, system_time: fragment.system_time })
     }
 }
 
