@@ -4,12 +4,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow_array::{Array, UInt32Array};
+use arrow_array::Array;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{BinaryOp, Expr};
 use rtdb_types::{Result, Value};
 
-use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch};
+use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows};
 use crate::context::Execution;
 use crate::invalid;
 use crate::join_key::JoinLayout;
@@ -166,36 +166,41 @@ impl Spec {
         }
         let Matches { pairs, probes, charge: matches } = matched;
         if pairs.is_empty() { return Ok(None); }
-        let mut reservation = self.execution.context.memory.reserve(256)?;
-        let mut columns = Vec::with_capacity(table.batches.first().map_or(0, |batch| batch.columns.len()) + probe.columns.len());
+        let memory = &self.execution.context.memory;
+        let mut reservation = memory.reserve(256)?;
         let build_width = table.batches.first().map_or(0, |batch| batch.columns.len());
-        let indices = UInt32Array::from(probes);
-        if self.swapped { for column in &probe.columns { columns.push(taken(column, &indices)?); } }
-        for position in 0..build_width { columns.push(gathered(&table.batches, position, &pairs)?); }
-        if !self.swapped { for column in &probe.columns { columns.push(taken(column, &indices)?); } }
-        for column in &columns {
-            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("join-size", "A join output charge is shared"))?;
-            lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
-        }
+        let mut columns = Vec::with_capacity(build_width + probe.columns.len());
+        let mut append = |batches: &[ColumnBatch], rows: &[(usize, usize)], width| -> Result<()> {
+            for position in 0..width {
+                let (column, _scratch) = gather_column_rows(|batch| &batches[batch], rows, position, memory)?;
+                let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("join-size", "A join output charge is shared"))?;
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column);
+            }
+            Ok(())
+        };
+        if self.swapped { append(std::slice::from_ref(probe), &probes, probe.columns.len())?; }
+        append(&table.batches, &pairs, build_width)?;
+        if !self.swapped { append(std::slice::from_ref(probe), &probes, probe.columns.len())?; }
         drop(matches);
         ColumnBatch::settled(columns, pairs.len(), reservation).map(Some)
     }
 }
 
 /// The build and probe rows a probe batch matched, in probe order, charged as they grow.
-struct Matches { pairs: Vec<(usize, usize)>, probes: Vec<u32>, charge: Arc<MemoryReservation> }
+struct Matches { pairs: Vec<(usize, usize)>, probes: Vec<(usize, usize)>, charge: Arc<MemoryReservation> }
 impl Matches {
     fn push(&mut self, table: &Table, build: usize, row: usize) -> Result<()> {
         if self.pairs.len() == self.pairs.capacity() {
             let capacity = self.pairs.capacity().saturating_mul(2).max(1024);
             let lease = Arc::get_mut(&mut self.charge).ok_or_else(|| invalid("join-size", "A join match charge is shared"))?;
-            lease.grow_to(capacity.checked_mul(std::mem::size_of::<(usize, usize)>() + std::mem::size_of::<u32>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?)?;
+            lease.grow_to(capacity.checked_mul(2 * std::mem::size_of::<(usize, usize)>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?)?;
             self.pairs.reserve_exact(capacity - self.pairs.len());
             self.probes.reserve_exact(capacity - self.probes.len());
         }
         let batch = table.starts.partition_point(|start| *start <= build) - 1;
         self.pairs.push((batch, build - table.starts[batch]));
-        self.probes.push(u32::try_from(row).map_err(|_| size_error())?);
+        self.probes.push((0, row));
         Ok(())
     }
 }
@@ -268,27 +273,6 @@ pub(crate) fn int_cells(array: &dyn Array) -> Option<Vec<Option<i64>>> {
         }
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => (0..array.len()).map(|row| scalar(array, row)).collect(),
         _ => None,
-    }
-}
-
-/// A build column across the batches the matches come from, as one array where every batch stores it alike.
-fn gathered(batches: &[ColumnBatch], position: usize, pairs: &[(usize, usize)]) -> Result<Column> {
-    let arrow = batches.iter().map(|batch| match &batch.columns[position] { Column::Arrow { array, field, logical } => Some((array, field, logical)), _ => None }).collect::<Option<Vec<_>>>();
-    if let Some(arrow) = arrow && let Some((_, field, logical)) = arrow.first()
-        && crate::columnar::flat(field.data_type()) && arrow.iter().all(|(_, other, other_logical)| other == field && other_logical == logical) {
-        let arrays: Vec<&dyn Array> = arrow.iter().map(|(array, ..)| array.as_ref()).collect();
-        let array = crate::columnar::interleave(&arrays, pairs)?;
-        return Ok(Column::Arrow { array, field: Arc::clone(field), logical: (*logical).clone() });
-    }
-    pairs.iter().map(|&(batch, row)| batches[batch].columns[position].value(row)).collect::<Result<Vec<_>>>().map(Column::Values)
-}
-
-/// A probe column at the probe rows that matched, in match order.
-fn taken(column: &Column, indices: &UInt32Array) -> Result<Column> {
-    match column {
-        Column::Arrow { array, field, logical } if crate::columnar::flat(field.data_type()) =>
-            Ok(Column::Arrow { array: arrow_select::take::take(array.as_ref(), indices, None).map_err(|error| invalid("join-gather", error))?, field: Arc::clone(field), logical: logical.clone() }),
-        column => indices.values().iter().map(|row| column.value(*row as usize)).collect::<Result<Vec<_>>>().map(Column::Values),
     }
 }
 

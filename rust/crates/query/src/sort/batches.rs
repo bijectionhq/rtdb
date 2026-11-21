@@ -88,8 +88,9 @@ impl BatchSort {
             if batch.len == 0 {
                 continue;
             }
+            let payload_bytes = batch.working_set_bytes(&context.memory)?;
             if !block.positions.is_empty()
-                && (block.charged().saturating_add(batch.charged())
+                && (block.charged().saturating_add(payload_bytes)
                     > context.options.sort_memory_bytes
                     || block.positions.len().saturating_add(batch.len) > BLOCK_ROWS)
             {
@@ -110,6 +111,7 @@ impl BatchSort {
             }
             block.append(
                 batch,
+                payload_bytes,
                 &self.key_columns,
                 self.native.as_ref(),
                 self.projected,
@@ -341,6 +343,7 @@ impl Block {
     fn append(
         &mut self,
         batch: ColumnBatch,
+        payload_bytes: usize,
         columns: &[usize],
         native: Option<&NativeOrder>,
         projected: bool,
@@ -368,7 +371,7 @@ impl Block {
         let source = self.batches.len();
         self.positions
             .extend((0..batch.len).map(|row| (source, row)));
-        self.payload_bytes = self.payload_bytes.saturating_add(batch.charged());
+        self.payload_bytes = self.payload_bytes.saturating_add(payload_bytes);
         self.batches.push(batch);
         Ok(())
     }

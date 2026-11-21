@@ -33,6 +33,7 @@ entity Checkpoint {
 -- A covered point read streams typed batches of the requested columns from those postings after applying every predicate.
 -- A payload seek applies remaining predicates to batches resolved at the captured basis, then gathers the qualifying batch and row offsets in index order.
 -- Filtering and output use the same resolved payload batches.
+-- Gathering nested payloads preserves their source Arrow vectors and composes their selected positions in index order.
 -- A contiguous forward run of plain text or binary cells may share its selected value bytes.
 -- Hosted shared buffers retain the page permit through synchronous wire encoding and drop before transport waits.
 -- Hosted APIs returning Arrow arrays to callers use independent result buffers.
