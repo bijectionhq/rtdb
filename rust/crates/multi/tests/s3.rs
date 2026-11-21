@@ -220,6 +220,8 @@ struct PackUpload {
     resume: tokio::sync::Notify,
     completed: tokio::sync::Notify,
     reply_status: std::sync::atomic::AtomicU16,
+    drop_completion_reply: std::sync::atomic::AtomicBool,
+    dropped_reply_status: std::sync::atomic::AtomicU16,
     observe_writes: std::sync::atomic::AtomicBool,
     scoped_publications: std::sync::atomic::AtomicUsize,
     unscoped_writes: std::sync::atomic::AtomicUsize,
@@ -268,6 +270,12 @@ async fn pause_pack_upload(upstream: hyper::Uri) -> (std::net::SocketAddr, std::
                                 gate.unconditional_publications.fetch_add(1, Ordering::Relaxed);
                             }
                         }
+                        if commits_object && block_pack && gate.drop_completion_reply.swap(false, Ordering::Relaxed) {
+                            let response = client.request(request).await.map_err(std::io::Error::other)?;
+                            gate.dropped_reply_status.store(response.status().as_u16(), Ordering::Relaxed);
+                            drop(response.into_body().collect().await.map_err(std::io::Error::other)?);
+                            return Err(std::io::Error::other("S3 completion reply was discarded by the fixture"));
+                        }
                         if commits_object && block_pack && gate.armed.swap(false, Ordering::Relaxed) {
                             // The complete request remains deliverable even if the deposed holder closes its socket.
                             let delayed = tokio::spawn(async move {
@@ -288,6 +296,44 @@ async fn pause_pack_upload(upstream: hyper::Uri) -> (std::net::SocketAddr, std::
         }
     });
     (address, upload, proxy)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_recovers_a_pack_whose_s3_completion_reply_was_lost() {
+    use std::sync::atomic::Ordering;
+
+    let Some(CellStorage::S3 { mut config }) = storage() else { return; };
+    let endpoint: hyper::Uri = config.endpoint.as_deref().unwrap().parse().unwrap();
+    if endpoint.scheme_str() != Some("http") { return; }
+    let (address, fault, proxy) = pause_pack_upload(endpoint).await;
+    config.endpoint = Some(format!("http://{address}"));
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let cell = Cell::start_on(Some(CellStorage::S3 { config }), vec![MemberPool::General; 2], None, None, None).await;
+        let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+        let client = cell.connect("shop").await;
+        client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+
+        fault.drop_completion_reply.store(true, Ordering::Relaxed);
+        let holder = cell.holder("shop").await.unwrap();
+        cell.node(holder).agent.flush("shop").await.unwrap();
+        assert_eq!(fault.dropped_reply_status.load(Ordering::Relaxed), 200);
+        let published = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        assert_eq!(published.checkpoint.unwrap().block, 0);
+        let catalog = rtdb_format::keys::block_key(rtdb_types::BlockIndex(0)).unwrap();
+        let pack = format!("/{}", rtdb_multi::packing::block_pack(&catalog));
+        assert!(!published.storage_regions.is_empty());
+        assert!(published.storage_regions.values().all(|region| {
+            matches!(region, rtdb_directory::StorageRegion::Remote { publications, .. }
+                if publications.values().all(|upload| !upload.key.ends_with(&pack)))
+        }));
+
+        admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(1 - holder).lease.id(), &control()).await.unwrap();
+        assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+        drop(client);
+        cell.stop().await;
+    }).await.expect("the lost completion reply stalled the deployment");
+    proxy.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
