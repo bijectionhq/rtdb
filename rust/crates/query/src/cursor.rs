@@ -114,7 +114,8 @@ fn uses_search_score(relation: &Relation) -> bool {
     for expression in relation.expressions() {
         let mut found = false;
         expression.visit(&mut |expr| {
-            found |= matches!(expr, rtdb_plan::Expr::Call { name, .. } if name.eq_ignore_ascii_case("search_score"));
+            found |= matches!(expr, rtdb_plan::Expr::Call { name, args, .. }
+                if name.eq_ignore_ascii_case("search_score") && args.len() == 2);
         });
         if found { return true; }
     }

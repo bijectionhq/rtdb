@@ -500,6 +500,55 @@ async fn a_ranked_cutoff_counts_only_rows_that_pass_every_match() {
 }
 
 #[tokio::test]
+async fn explicit_search_statistics_rank_the_admitted_corpus() {
+    let (node, driver) = Node::open(options(), services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let committed = session.state_mut().execute_tx(vec![
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+        sql("INSERT INTO docs RECORDS {_id: 1, body: 'invoice paid invoice', admitted: TRUE}"),
+        sql("INSERT INTO docs RECORDS {_id: 2, body: 'paid', admitted: TRUE}"),
+        sql("INSERT INTO docs RECORDS {_id: 3, body: 'invoice paid secret', admitted: FALSE}"),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(committed.committed());
+    let ranked = "
+        WITH MATERIALIZED admitted_docs AS (SELECT _id, body FROM docs WHERE admitted),
+        counts AS (
+            SELECT COUNT(SEARCH_LENGTH(body)) AS n, SUM(SEARCH_LENGTH(body)) AS tokens,
+                   COUNT(CASE WHEN MATCH(body, 'invoice') THEN 1 END) AS invoices,
+                   COUNT(CASE WHEN MATCH(body, 'paid') THEN 1 END) AS paid
+            FROM admitted_docs
+        )
+        SELECT d._id, SEARCH_SCORE(d.body, 'invoice paid', c.n, c.tokens, ARRAY[c.invoices, c.paid]) AS score
+        FROM admitted_docs AS d CROSS JOIN counts AS c
+        WHERE MATCH(d.body, 'invoice paid')
+        ORDER BY score DESC, d._id LIMIT 1";
+    let first = rows(session.query_sql(ranked, vec![]).await.unwrap()).await;
+    let corpus = rtdb_text::Corpus {
+        documents: 2,
+        tokens: 4,
+        frequencies: std::collections::BTreeMap::from([("invoice".into(), 1), ("paid".into(), 2)]),
+    };
+    let scorer = rtdb_text::Scorer::new(rtdb_text::Query::parse("invoice paid"), Some(&corpus));
+    let score = scorer.bm25(&rtdb_text::tokens("invoice paid invoice"));
+    assert_eq!(first, [vec![Value::I64(1), Value::F64(score)]]);
+    let terms = rows(session.query_sql(
+        r#"SELECT SEARCH_TERMS('"Invoice paid" invoice')"#,
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(terms, [vec![Value::List(vec![Value::Utf8("invoice".into()), Value::Utf8("paid".into())])]]);
+
+    let changed = session.state_mut().execute_tx(vec![
+        sql("INSERT INTO docs RECORDS {_id: 3, body: 'public list archived', admitted: FALSE}"),
+        sql("INSERT INTO docs RECORDS {_id: 4, body: 'invoice paid another secret', admitted: FALSE}"),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(changed.committed());
+    assert_eq!(rows(session.query_sql(ranked, vec![]).await.unwrap()).await, first);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_the_first() {
     let mut options = options();
     options.file_size_target = 1;
