@@ -149,8 +149,8 @@ impl SnapshotCorpus {
                 }
             }
         }
-        // The scan reads live rows ahead of tries for events at one instant, and so does this.
-        events.sort_by_key(|(origin, event)| (std::cmp::Reverse(event.system_from), match origin { Origin::Live(index, row) => (0, *index, *row), Origin::File(index, row) => (1, *index, *row) }));
+        // Preserve the scan's source and row order when events share a system time.
+        events.sort_by_key(|(_, event)| std::cmp::Reverse(event.system_from));
         let headers = events.iter().map(|(_, event)| Ok(EventHeader { iid: Iid(*iid), system_from: Timestamp(event.system_from), valid_time: Interval::from_micros(event.valid_from, event.valid_to)?, op: event.op })).collect::<Result<Vec<_>>>()?;
         let at = self.at;
         let winner = rtdb_temporal::visibility(headers.iter().enumerate().map(|(index, header)| (header, index)))?.into_iter()

@@ -238,6 +238,7 @@ rule CorpusAsOfTheSnapshot {
     -- It is a function of the snapshot's data, not of which search files exist: a node builds the search file of every trie visible at the instant, whatever max_unindexed_bytes allows narrowing.
     -- Each file's runs that its own events leave visible at every instant from its latest event on are counted once per file and kept; those visible over a bounded valid interval are checked at the instant.
     -- An entity with events in more than one file, or in the live index, is resolved across all of them as the scan resolves, live rows first at one instant, and its one visible row replaces what its runs counted file by file.
+    -- Within one live segment, a later appended event takes precedence over earlier rows at the same system time.
     -- A shared file contributes only the runs and row keys of the members the snapshot selects.
     -- A node keeps the corpus for those files, member selections and live segments.
     when: ScoreAsked(column, snapshot)

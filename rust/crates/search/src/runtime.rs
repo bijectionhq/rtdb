@@ -273,13 +273,13 @@ impl SearchRuntime {
         Ok(keys.events.iter().filter(|(_, events)| events.iter().any(|(row, _)| *row < visible)).map(|(iid, _)| *iid).collect())
     }
 
-    /// Every event of an entity a live segment holds, with its row, system time descending.
+    /// Every event of an entity in descending system time and descending live row order.
     pub fn live_rows_of(&self, database: &str, segment: &rtdb_index::LiveTable, iid: &[u8; 16]) -> Result<Vec<(u32, crate::file::KeyedEvent)>> {
         let keys = self.live_keys_of(database, segment)?;
         let visible = segment.row_count();
         let keys = keys.lock();
         let mut events: Vec<(u32, crate::file::KeyedEvent)> = keys.events.get(iid).map_or_else(Vec::new, |events| events.iter().filter(|(row, _)| *row < visible).copied().collect());
-        events.sort_by_key(|(row, event)| (std::cmp::Reverse(event.system_from), *row));
+        events.sort_by_key(|(row, event)| (std::cmp::Reverse(event.system_from), std::cmp::Reverse(*row)));
         Ok(events)
     }
 

@@ -672,3 +672,43 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn same_transaction_writes_count_only_the_visible_terms_in_bm25() {
+    let mut options = options();
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+
+    let operations = vec![
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+        sql("INSERT INTO docs RECORDS {_id: 1, body: 'superseded alpha'}"),
+        sql("INSERT INTO docs RECORDS {_id: 1, body: 'visible beta beta'}"),
+        sql("INSERT INTO docs RECORDS {_id: 2, body: 'other alpha'}"),
+    ];
+    let result = session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap();
+    assert!(result.committed(), "{result:?}");
+
+    let scoring = rtdb_text::Query::parse("beta");
+    let corpus = rtdb_text::Corpus {
+        documents: 2,
+        tokens: 5,
+        frequencies: std::collections::BTreeMap::from([("beta".into(), 1)]),
+    };
+    let statement = "SELECT _id, SEARCH_SCORE(body, 'beta') AS score FROM docs WHERE MATCH(body, 'visible') ORDER BY score DESC LIMIT 1";
+    let expected = vec![vec![
+        Value::I64(1),
+        Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens("visible beta beta"), Some(&corpus))),
+    ]];
+
+    assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, expected);
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, expected);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
