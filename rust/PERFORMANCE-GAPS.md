@@ -4,6 +4,75 @@ See the [performance comparison](XTDB-VS-RTDB.md) for a summary and the [design 
 
 ## Latest matched results
 
+Packaged RTDB `c2fda4a53` met or exceeded XTDB `c84f9334e` on 107 of 110 medians on Mac mini 2.
+The median speed ratio across 100 equally weighted throughput and latency comparisons was 2.46×.
+The engines used 4 CPUs, a 4 GiB memory limit with no swap, local logs and storage, a 768 MiB cache, and two compaction workers.
+Flight SQL followed pgwire on the same node.
+The tables use two full runs per engine at 100,000 rows and four at 1,000,000 rows, with alternating engine order within each group of runs.
+All 12 full runs passed their row-count checks.
+
+### Architecture candidate at 100,000 rows
+
+Host load at the start of those runs ranged from 9.72 to 16.13 over one minute.
+RTDB met or exceeded XTDB on all 55 medians at this size.
+
+| Metric | RTDB median [range] | XTDB median [range] |
+| --- | ---: | ---: |
+| pgwire ingest | 61.7k [61.4k, 62.0k] rows/s | 39.3k [37.4k, 41.1k] rows/s |
+| Flight prepared INSERT | 138.1k [135.4k, 140.8k] rows/s | 102.9k [102.6k, 103.2k] rows/s |
+| pgwire concurrent INSERT | 2,592 [2,291, 2,894] tx/s | 1,773 [1,705, 1,840] tx/s |
+| Flight concurrent INSERT | 1,303 [1,303, 1,303] tx/s | 930 [786, 1,073] tx/s |
+| Flight single INSERT p50 | 1.734 [1.675, 1.793] ms | 2.042 [1.975, 2.109] ms |
+| pgwire UPDATE of 10% of orders | 51 [47, 56] ms | 130 [129, 131] ms |
+| Flight full-scan fetch p50 | 259 [243, 275] ms | 272 [272, 272] ms |
+| Flight full-scan fetch p95 | 267 [248, 285] ms | 277 [275, 279] ms |
+| Peak working set during pgwire | 122 [120, 124] MiB | 713 [712, 713] MiB |
+| Peak working set during Flight | 174 [170, 178] MiB | 670 [642, 697] MiB |
+
+### Architecture candidate at 1,000,000 rows
+
+Host load at the start of those runs ranged from 5.61 to 9.74 over one minute.
+RTDB met or exceeded XTDB on 52 of 55 medians at this size.
+
+| Metric | RTDB median [range] | XTDB median [range] |
+| --- | ---: | ---: |
+| pgwire ingest | 54.4k [47.3k, 64.1k] rows/s | 53.0k [49.1k, 63.5k] rows/s |
+| Flight prepared INSERT | 136.9k [108.7k, 148.5k] rows/s | 144.5k [118.7k, 151.8k] rows/s |
+| pgwire concurrent INSERT | 2,225 [1,701, 2,445] tx/s | 1,494 [1,305, 1,569] tx/s |
+| Flight concurrent INSERT | 1,379 [1,132, 1,472] tx/s | 1,167 [1,036, 1,515] tx/s |
+| Flight single INSERT p50 | 1.657 [1.516, 8.945] ms | 2.074 [1.425, 3.645] ms |
+| pgwire UPDATE of 10% of orders | 667 [484, 802] ms | 770 [702, 1,137] ms |
+| Flight full-scan fetch p50 | 2,500 [2,273, 2,736] ms | 2,446 [1,985, 2,509] ms |
+| Flight full-scan fetch p95 | 2,531 [2,292, 2,771] ms | 2,471 [1,986, 2,729] ms |
+| Peak working set during pgwire | 580 [517, 630] MiB | 785 [732, 890] MiB |
+| Peak working set during Flight | 559 [546, 600] MiB | 865 [847, 946] MiB |
+
+The initial two pairs put RTDB ahead on 108 of 110 medians overall.
+The million-row Flight fetch p50 and p95 trailed by about 2%, which prompted two more full million-row pairs starting with XTDB.
+Across all four pairs, XTDB led on three medians at one million rows.
+RTDB had 5.2% lower Flight ingest throughput, 2.2% longer full-scan fetch p50, and 2.4% longer full-scan fetch p95.
+The run ranges overlapped in all three cases.
+Million-row pgwire ingest finished 2.6% ahead in the pooled comparison, and the two groups of pairs favored different engines.
+
+During the eight million-row Flight ingest phases, RTDB used 7.9–9.5 seconds of sampled container CPU and XTDB used 13.1–18.1 seconds.
+Peak anonymous memory during those phases ranged from 472 to 533 MiB for RTDB and 774 to 865 MiB for XTDB.
+Neither engine recorded CPU quota throttling during those samples.
+
+Raw reports and samples are in `mini2-architecture-c2fda4a53` and `mini2-architecture-repeat-c2fda4a53` under `~/.cache/rtdb-parity-ff72d7394/build/bench-followup` on Mac mini 2.
+
+### Isolated Flight diagnostic
+
+One fresh million-row Flight run per engine measured 201.2k rows/s for RTDB and 117.1k for XTDB with compaction enabled.
+Three alternating scans per fetch mode checked that each result contained one million rows.
+Median Arrow delivery took 350 ms for RTDB and 485 ms for XTDB, with 977 batches from RTDB and 2,048–3,072 from XTDB.
+Median Python row fetch took 2,072 ms for RTDB and 3,159 ms for XTDB, with median client CPU of 2,104 and 3,204 ms.
+The signs of the throughput and latency differences changed between this fresh-node pair and the full sequence.
+The fresh run used an empty node and ran Flight before any pgwire workload, so the full-sequence Flight medians above use the 12 full runs exclusively.
+An earlier diagnostic stopped after a Docker storage I/O error.
+The complete rerun is in `mini2-architecture-flight-split-retry-c2fda4a53`.
+
+## Previous matched package
+
 On Mac mini 2, packaged RTDB `55277dbf3` met or exceeded XTDB `c84f9334e` on all 110 evaluated throughput, latency and memory medians.
 The count covers 55 measurements per size across pgwire and Flight SQL, including startup, query and write latencies, concurrent throughput, and memory.
 Each engine ran twice at each size with reversed engine order across repetitions.
@@ -69,8 +138,8 @@ These directories are under `~/.cache/rtdb-parity-ff72d7394/build/bench-followup
 
 ## Architecture parity
 
-The architecture changes below postdate the measured package `55277dbf3`.
-The performance tables above apply to that exact package.
+Packaged candidate `c2fda4a53` contains the changes below.
+The detailed runtime and memory audit uses the earlier `55277dbf3` samples, and the latest matched tables record the candidate’s working set.
 
 | Area | Work in this branch | Remaining difference |
 | --- | --- | --- |
@@ -364,6 +433,21 @@ During the set-based UPDATE, 474 samples put 2.3% self time in the Arrow cell al
 Repeated document maps and live-trie lookups add work even without the compactor.
 
 ## Correctness checks
+
+### Architecture candidate
+
+The final Rust checks passed 1,316 tests across the affected crates, replication, maintenance and search.
+The search suite recorded one ignored test.
+The standard Gradle suites passed 3,187 tests including all 398 native binding tests.
+The reference pgwire cancellation timing test exceeded its bound in the combined run and passed in the serial rerun.
+The property suites passed 3,348 tests.
+The module integration tasks passed 5,580 cases and skipped one PostgreSQL source case.
+The standalone root integration suite passed 45 of 49 cases, with four JVM Kafka assertions missing expected rows.
+Three of those failures reproduced in a focused serial rerun, including implicit connection awaiting, cleared-topic recovery, and stale-log recovery.
+Those fixtures start JVM nodes through `xtn/start-node`.
+The release tooling passed 55 tests, and the Linux arm64 package passed both build-information checks.
+
+### Previous measured build
 
 The Gradle test and property suites passed all 6,535 tests after the watermark check changed, including 398 native binding tests.
 The 398 native binding tests also passed against a rebuilt library containing the write-path candidates.

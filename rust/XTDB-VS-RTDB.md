@@ -4,29 +4,31 @@ RTDB is the Rust port of XTDB in `rust/`.
 
 ## Latest performance results
 
-Packaged RTDB `55277dbf3` met or exceeded XTDB `c84f9334e` on all 110 evaluated medians across the 100,000-row and 1,000,000-row workloads on Mac mini 2.
-The engines ran in Colima with 4 CPUs, a 4 GiB container memory limit, local logs and storage, a 768 MiB cache, and two compaction workers.
-Each engine ran twice at each size with alternating engine order, and Flight SQL followed pgwire on the same node.
+Packaged RTDB `c2fda4a53` met or exceeded XTDB `c84f9334e` on 107 of 110 medians across the 100,000-row and 1,000,000-row workloads on Mac mini 2.
+Its median speed ratio was 2.46× across the 100 equally weighted latency and throughput comparisons.
+The engines ran in Colima with 4 CPUs, a 4 GiB memory limit, local logs and storage, a 768 MiB cache, and two compaction workers.
+Each engine ran twice at 100,000 rows and four times at 1,000,000 rows, with alternating engine order and Flight SQL following pgwire on the same node.
 The benchmarks use psycopg for pgwire and ADBC for Flight SQL. [Benchmark clients](bench/)
 
 | Workload | 100k RTDB / XTDB | 1M RTDB / XTDB |
 | --- | ---: | ---: |
-| pgwire ingest | 67.7k / 51.2k rows/s | 46.5k / 43.9k rows/s |
-| Flight prepared INSERT | 163.1k / 104.7k rows/s | 125.0k / 77.7k rows/s |
-| pgwire concurrent INSERT | 2,685 / 2,313 tx/s | 1,825 / 1,473 tx/s |
-| Flight concurrent INSERT | 1,520 / 717 tx/s | 1,429 / 922 tx/s |
-| Flight single INSERT p50 | 1.471 / 1.979 ms | 2.148 / 3.202 ms |
-| pgwire UPDATE of 10% of orders | 43 / 121 ms | 631 / 780 ms |
-| Flight full-scan fetch p50 | 216 / 247 ms | 2,379 / 3,006 ms |
-| Peak working set during pgwire | 126 / 736 MiB | 655 / 885 MiB |
-| Peak working set during Flight | 185 / 667 MiB | 583 / 868 MiB |
+| pgwire ingest | 61.7k / 39.3k rows/s | 54.4k / 53.0k rows/s |
+| Flight prepared INSERT | 138.1k / 102.9k rows/s | 136.9k / 144.5k rows/s |
+| pgwire concurrent INSERT | 2,592 / 1,773 tx/s | 2,225 / 1,494 tx/s |
+| Flight concurrent INSERT | 1,303 / 930 tx/s | 1,379 / 1,167 tx/s |
+| Flight single INSERT p50 | 1.734 / 2.042 ms | 1.657 / 2.074 ms |
+| pgwire UPDATE of 10% of orders | 51 / 130 ms | 667 / 770 ms |
+| Flight full-scan fetch p50 | 259 / 272 ms | 2,500 / 2,446 ms |
+| Flight full-scan fetch p95 | 267 / 277 ms | 2,531 / 2,471 ms |
+| Peak working set during pgwire | 122 / 713 MiB | 580 / 785 MiB |
+| Peak working set during Flight | 174 / 670 MiB | 559 / 865 MiB |
 
-The million-row pgwire ingest median pools two full runs and two matching ingest-only runs per engine.
-In the full runs alone, the medians were 46.5k for RTDB and 56.0k for XTDB.
-XTDB's fastest individual run reached 67.0k rows/s. [Run ranges and diagnostics](PERFORMANCE-GAPS.md#1000000-rows)
+At one million rows, RTDB’s Flight ingest throughput was 5.2% lower, and its full-scan fetch latency was about 2% longer.
+The ranges overlapped on these metrics. [Run ranges](PERFORMANCE-GAPS.md#latest-matched-results)
 
-The measured build uses fewer temporary allocations in Flight parameter binding and SQL submission, reuses IIDs during trie merges, and reduces compaction work through direct local reads and faster Bloom construction.
-The packaged allocator returns unused heap pages through jemalloc's background purge. [Changes included in the measured build](PERFORMANCE-GAPS.md#changes-included-in-the-measured-build)
+In a separate fresh-node Flight diagnostic, RTDB reached 201k rows/s versus 117k for XTDB and delivered the million-row Arrow table in 350 ms versus 485 ms. [Isolated Flight diagnostic](PERFORMANCE-GAPS.md#isolated-flight-diagnostic)
+
+The candidate adds shared query and static mutation plans, mapped range reads for Arrow batches, live-index publication without reader locking, and eligible DataFusion filters, projections and limits. [Architecture parity inventory](PERFORMANCE-GAPS.md#architecture-parity)
 
 ## Historical correctness run
 
