@@ -23,11 +23,15 @@ impl Upload {
         let mut arguments: Option<SqlArguments> = None;
         while let Some(batch) = self.next().await? {
             if batch.batch().num_columns() == 0 { return Ok(None); }
-            let next = wire::arguments(batch.batch(), self.service.memory())?;
+            let next = SqlArguments::from_arrow(batch, self.service.memory()).map_err(status)?;
             match &mut arguments { Some(arguments) => arguments.append(next).map_err(status)?, None => arguments = Some(next) }
         }
         if arguments.is_none() {
-            if let Some(schema) = self.decoder.schema() { if !schema.fields().is_empty() { arguments = Some(wire::arguments(&RecordBatch::new_empty(Arc::clone(schema)), self.service.memory())?); } }
+            if let Some(schema) = self.decoder.schema().filter(|schema| !schema.fields().is_empty()) {
+                let memory = self.service.memory();
+                let batch = OwnedBatch::new(RecordBatch::new_empty(Arc::clone(schema)), memory).map_err(status)?;
+                arguments = Some(SqlArguments::from_arrow(batch, memory).map_err(status)?);
+            }
         }
         Ok(arguments)
     }

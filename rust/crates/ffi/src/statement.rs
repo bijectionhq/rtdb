@@ -208,9 +208,16 @@ impl StatementHandle {
                     let Some(bound) = state.bound.take() else { return Ok(0); };
                     let count = i64::try_from(bound.arguments.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
                     let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;
-                    let bytes = bound.arguments.rows().try_fold(4096, |bytes, row| bound.names.iter().zip(row).try_fold(bytes, |bytes, (name, value)| super::add(bytes, super::add(super::add(value.retained_bytes()?, name.len())?, node)?)))?;
+                    let bytes = bound.arguments.rows().try_fold(4096, |bytes, row| {
+                        bound.names.iter().zip(row?.iter()).try_fold(bytes, |bytes, (name, value)| {
+                            super::add(bytes, super::add(super::add(value.retained_bytes()?, name.len())?, node)?)
+                        })
+                    })?;
                     let _scratch = self.session.region.memory().reserve(super::mul(bytes, 2)?)?;
-                    let rows = bound.arguments.rows().map(|row| bound.names.iter().cloned().zip(row.iter().cloned().map(|mut value| { rtdb_columnar::admit_execution_value(&mut value); value })).collect::<StructFields<_>>()).collect();
+                    let rows = bound.arguments.rows().map(|row| Ok(bound.names.iter().cloned().zip(row?.iter().cloned().map(|mut value| {
+                        rtdb_columnar::admit_execution_value(&mut value);
+                        value
+                    })).collect::<StructFields<_>>())).collect::<Result<_>>()?;
                     let operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, self.session.region.memory())?, valid_from: None, valid_to: None };
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(count)
@@ -222,7 +229,7 @@ impl StatementHandle {
 fn argument_row(arguments: Option<&SqlArguments>, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<(Vec<Value>, Arc<MemoryReservation>)> {
     let Some(arguments) = arguments else { return Ok((Vec::new(), memory.reserve(0)?)); };
     if arguments.row_count() != 1 { return Err(Anomaly::incorrect("xtdb/incorrect-arg-count", "A query or SET requires one argument row")); }
-    let row = arguments.rows().next().ok_or_else(|| super::invalid("Argument row is missing"))?;
+    let row = arguments.rows().next().ok_or_else(|| super::invalid("Argument row is missing"))??;
     let bound = row.iter().try_fold(1024, |bytes, value| super::add(bytes, value.retained_bytes()?))?;
     let reservation = memory.reserve(bound)?;
     Ok((row.to_vec(), reservation))

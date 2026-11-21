@@ -209,7 +209,7 @@ async fn consecutive_sql_argument_batches_coalesce_without_collapsing_an_absent_
     let state = service.state.lock(); let ops = &state.submissions[0].1;
     assert_eq!(ops.len(), 3);
     let TxOp::Sql { args: Some(args), .. } = &ops[0] else { panic!("coalesced arguments absent"); };
-    assert_eq!(args.rows().collect::<Vec<_>>(), vec![&[Value::I64(1)][..], &[Value::I64(2)][..]]);
+    assert_eq!(args.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), vec![&[Value::I64(1)][..], &[Value::I64(2)][..]]);
     let TxOp::Sql { args: Some(args), .. } = &ops[2] else { panic!("empty arguments absent"); };
     assert_eq!(args.row_count(), 0);
 }

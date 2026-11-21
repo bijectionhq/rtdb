@@ -444,7 +444,11 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
                 Some(arguments) => {
                     let mut planned = None;
-                    for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types()), &mut planned).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                    for row in arguments.indexed_rows() {
+                        let (index, row) = row?;
+                        self.execute_sql_typed(sql, Some(&row), Some(arguments.types()), &mut planned)
+                            .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
+                    }
                     Ok(())
                 }
                 None => self.execute_sql(sql, None).await,
@@ -453,7 +457,11 @@ impl<'a> OpenTransaction<'a> {
                 if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
                 let arguments = decode_arguments(arg_bytes.as_slice(), &self.context.memory)?;
                 let mut planned = None;
-                for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types()), &mut planned).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                for row in arguments.indexed_rows() {
+                    let (index, row) = row?;
+                    self.execute_sql_typed(sql, Some(&row), Some(arguments.types()), &mut planned)
+                        .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
+                }
                 Ok(())
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),

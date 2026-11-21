@@ -11,6 +11,8 @@ The crate starts no tasks.
 `prepare_submission` expands literal and parameter INSERT VALUES/RECORDS and PATCH RECORDS through SQL-owned binding.
 Submission reserves temporary SQL syntax work before lexing and holds the reservation until the static plan has been consumed or discarded.
 It preserves raw SQL for data-dependent statements and distinguishes absent arguments from an explicitly empty argument batch.
+Compatible Arrow arguments retain their typed columns in the source log and through replay.
+Scalar evaluation reads and charges one argument row at a time.
 INSERT, UPDATE, and DELETE RETURNING clauses are syntax-checked and ignored by shared SQL preparation, including during static INSERT expansion.
 `tests/returning.rs` maps `ignore-returning-keys-3668` through staged mutation, parameter binding, committed reads, and static source encoding; its assertions have not run.
 Source replay decodes its recorded operations without repeating submit-time expansion.

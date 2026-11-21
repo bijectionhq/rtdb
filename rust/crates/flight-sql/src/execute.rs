@@ -127,7 +127,10 @@ impl Service {
                 let context = native.query_context_at(&basis.read()?, &token).await.map_err(status)?;
                 let prepared = PreparedSql::prepare(&sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
                 if prepared.is_dml() { return Err(invalid("ticket query cannot execute an update")); }
-                let row = match &arguments { None => &[][..], Some(arguments) => arguments.rows().next().ok_or_else(|| invalid("Query parameter batch has no rows"))? };
+                let row = arguments.as_ref().map(|arguments| {
+                    arguments.rows().next().ok_or_else(|| invalid("Query parameter batch has no rows"))?.map_err(status)
+                }).transpose()?;
+                let row = row.as_deref().unwrap_or_default();
                 let bound = row.iter().try_fold(wire::add(1024, wire::mul(row.len(), std::mem::size_of::<rtdb_types::Value>())?)?, |bytes, value| wire::add(bytes, value.retained_bytes().map_err(status)?))?;
                 let _values = self.memory().reserve(bound).map_err(status)?;
                 let values = row.to_vec();
@@ -154,7 +157,8 @@ impl Service {
     }
 }
 async fn execute_control_update(native: &mut NativeSession, control: &ControlStatement, arguments: Option<&SqlArguments>, token: &CancellationToken) -> Result<(), Status> {
-    let params = arguments.and_then(|arguments| arguments.rows().next()).unwrap_or(&[]);
+    let params = arguments.and_then(|arguments| arguments.rows().next()).transpose().map_err(status)?;
+    let params = params.as_deref().unwrap_or_default();
     match native.execute_control_with(control, params, token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
         ControlResult::Command { .. } => Ok(()),
         _ => Err(invalid("Statement is not supported by Flight SQL executeUpdate")),
