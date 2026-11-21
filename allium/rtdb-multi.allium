@@ -1599,6 +1599,17 @@ rule Rebalance {
 -- Rules: reads
 ------------------------------------------------------------
 
+rule BoundInitialGreeting {
+    when: StartupDeadlineElapsed(connection)
+
+    requires: connection.ready = false
+
+    ensures:
+        if connection.startup_received:
+            ClientMayRetryStartup(connection)
+        ConnectionClosed(connection)
+}
+
 rule RouteRead {
     -- The gateway walks the deployment's affinity order within its read width.
     -- The holder is normally rank 1, so the first choice is usually the writer.

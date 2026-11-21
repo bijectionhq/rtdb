@@ -482,6 +482,8 @@ Moves are invisible to clients only if the gateway owns connections and session 
 3. **Crate `affinity`**, ported from Bijection's `crates/affinity` with its score vectors, and routing by it (`RouteRead`), with per-key in-flight bounds and pressure.
 4. **Redirects**: `NotHolder`, `Moved`, `Behind`, followed by the gateway without the client noticing.
    The gateway renews a deployment's idle protection at the backend connected to the session, including after a move.
+   Local pgwire startup, including routing and the holder's greeting, has a 35-second deadline.
+   If a holder accepts a socket but stalls before `ReadyForQuery`, the gateway closes startup with SQLSTATE `57P03` so the client can retry.
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
    A driver that stops during execution can leave the outcome unknown.
    The gateway replays the command under its original key when the client has received no answer.

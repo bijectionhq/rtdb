@@ -27,6 +27,7 @@ pub struct GatewayOptions {
     /// The cell map and this gateway's cell, so a connection for a deployment living elsewhere is forwarded there.
     pub cells: Option<(Arc<dyn crate::cells::CellMap>, String)>,
     pub control_timeout: Duration,
+    pub startup_timeout: Duration,
     /// How often an open connection tells its holder it is in use.
     pub touch_interval: Duration,
     /// The cell's secret, with which the gateway mints a capability for each reconnection of an authenticated session.
@@ -34,7 +35,7 @@ pub struct GatewayOptions {
 }
 
 impl Default for GatewayOptions {
-    fn default() -> Self { Self { cells: None, control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10), capabilities: None } }
+    fn default() -> Self { Self { cells: None, control_timeout: Duration::from_secs(35), startup_timeout: crate::session::STARTUP_WITHIN, touch_interval: Duration::from_secs(10), capabilities: None } }
 }
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
@@ -46,7 +47,12 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         let directory = Arc::clone(&directory);
         let options = options.clone();
         let cancellation = cancellation.child_token();
-        tokio::spawn(async move { let _ = connection(client, directory, options, cancellation).await; });
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {}
+                _ = connection(client, directory, options) => {}
+            }
+        });
     }
 }
 
@@ -71,31 +77,39 @@ impl Startup {
     }
 }
 
-async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
-    let Some(startup) = read_startup(&mut client).await? else { return Ok(()); };
+async fn connection(mut client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions) -> Result<()> {
+    let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
+    let Ok(startup) = tokio::time::timeout_at(startup_deadline, read_startup(&mut client)).await else { return Ok(()); };
+    let Some(startup) = startup? else { return Ok(()); };
     let Some(name) = startup.parameters.get("database").or_else(|| startup.parameters.get("user")).cloned() else {
         return refuse(&mut client, "3D000", "The startup message names no database").await;
     };
-    if let Some(gateway) = elsewhere(&directory, &name, &options).await {
-        let mut forward = match connect(&gateway).await { Ok(forward) => forward, Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await };
-        forward.write_all(&startup.bytes).await.map_err(io)?;
-        return tokio::select! {
-            _ = cancellation.cancelled() => Ok(()),
-            copied = tokio::io::copy_bidirectional(&mut client, &mut forward) => copied.map(|_| ()).map_err(io),
+    let Ok(remote_gateway) = tokio::time::timeout_at(startup_deadline, elsewhere(&directory, &name, &options)).await else {
+        return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await;
+    };
+    if let Some(gateway) = remote_gateway {
+        let forward = tokio::time::timeout_at(startup_deadline, async {
+            let mut forward = connect(&gateway).await?;
+            forward.write_all(&startup.bytes).await.map_err(io)?;
+            Ok::<_, Anomaly>(forward)
+        }).await;
+        let mut forward = match forward {
+            Ok(Ok(forward)) => forward,
+            Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await,
+            Err(_) => return refuse(&mut client, "57P03", "Timed out forwarding startup to the deployment's cell").await,
         };
+        return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
     }
     let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), read_only: startup.read_only(), snapshot: startup.snapshot(), options: options.clone() });
-    let (server, control, epoch, deployment) = match router.route_with_record().await {
-        Ok(route) => route,
-        Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
+    let (server, control, epoch, deployment) = match tokio::time::timeout_at(startup_deadline, router.route_with_record()).await {
+        Ok(Ok(route)) => route,
+        Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
+        Err(_) => return refuse(&mut client, "57P03", "Timed out routing startup to the deployment's holder").await,
     };
     let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
     let keyed = !startup.read_only();
     let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed);
-    tokio::select! {
-        _ = cancellation.cancelled() => Ok(()),
-        outcome = session.run(client, server, control, epoch) => outcome,
-    }
+    session.run_before(client, server, control, epoch, startup_deadline).await
 }
 
 /// The gateway of the cell a deployment lives in, when that is not this gateway's cell.
