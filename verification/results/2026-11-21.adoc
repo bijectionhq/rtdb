@@ -1170,5 +1170,6 @@ Use `java -cp tla2tools.jar tlc2.TLC -config verification/tla/CheckpointMetadata
 Lean checked `plans_survive_interleavings`, `reachable_plans_are_safe`, and `admitted_metadata_cannot_be_deleted` for finite histories with arbitrary reader identities and block indices.
 The axiom audit reports `propext` and `Quot.sound` only.
 Replay the positive proof with `lean verification/lean/CheckpointMetadataRetention.lean` on Lean 4.36.0.
-The standard local Lean control run hit its wall-clock timeout under host contention, so this entry establishes the positive proof and the TLC controls.
-The registered combined-run cases specify the bounded witnesses and the three Lean controls. link:../lean/CheckpointMetadataRetention.lean[Lean laws] · link:../tla/CheckpointMetadataRetention.tla[TLA+ model]
+The standard local Lean run reached its wall-clock timeout during host contention.
+A focused rerun with `lean -j 1` and the default proof budgets verified the same baseline and rejected all three controls at `plans_survive_interleavings`.
+The registered runner cases specify the bounded witnesses, mutations, and expected failure sites. link:../lean/CheckpointMetadataRetention.lean[Lean laws] · link:../tla/CheckpointMetadataRetention.tla[TLA+ model]
