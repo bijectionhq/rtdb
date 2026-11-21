@@ -509,9 +509,10 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    A planned move reserves a target for a bounded interval and releases the reservation if activation fails.
    The target can retry temporary memory pressure or directory write contention under the same reservation.
    The source park verifies the holding epoch and reservation, and a delayed target activation requires the reservation at its claim.
-   When the source observes at most 64 live rows and 16 replica records since its last adopted boundary, with the intake processed through its latest position, it can park without uploading a block.
+   Before releasing the placement, the source pauses transaction admission and waits for all admitted writes to apply.
+   When the drained source has at most 64 live rows and 16 replica records since its last adopted boundary, it can park without uploading a block.
    The successor seals the quorum and recovers the durable tail before it confirms leadership.
-   Larger or still-processing tails use the source's flush path.
+   Larger tails use the source's flush path, and the source stops serving before it resumes admission.
    A placed writer waits 2 ms at the committed log tip before its claim.
    Control requests observe the replication driver's leadership and block-adoption updates directly.
 3. Autoscaling signals per pool, published as metrics through `metrics` and `server/src/metric_export`: nodes by the binding `LoadVector` dimension, logkeepers by ingest, workers by queue depth, gateways by connections.
@@ -544,7 +545,9 @@ A third back-to-back run hit a local `EADDRNOTAVAIL` on connection setup, and th
 With a connection issuing writes continuously, three release runs moved its deployment 48 times each.
 The final counter matched all 316–398 acknowledged updates per run.
 The largest inter-commit gap overlapping each move had a median of 18.6–22.1 ms, p95 of 25.8–27.3 ms, and p99 of 31.4–41.1 ms.
-The continuous-write tail latency remains above the 30 ms target.
+After introducing the admission pause, five spaced release runs of the same workload matched all 412–432 acknowledged updates per run.
+The inter-commit gap was 14.8–16.0 ms at p50, 19.5–32.8 ms at p95, and 21.0–75.9 ms at p99.
+The continuous-write p99 stayed below 30 ms in two of the five runs.
 
 ```sh
 cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \

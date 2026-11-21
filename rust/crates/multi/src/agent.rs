@@ -322,10 +322,14 @@ impl NodeAgent {
 
     /// Stops running `name` on this node, waiting for its resources to drain so the name can be opened again.
     async fn stop_running(&self, name: &str) {
+        self.stop_serving(name).await;
+        while self.node.catalog().is_draining(name) { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }
+
+    async fn stop_serving(&self, name: &str) {
         self.holdings.lock().remove(name);
         self.subscriptions.lock().remove(name);
         if self.node.catalog().database(name).is_ok() { let _ = self.node.detach_local(name.to_owned()).await; }
-        while self.node.catalog().is_draining(name) { tokio::time::sleep(Duration::from_millis(5)).await; }
     }
 
     /// Flushes `database` and waits until the block that was open is adopted.
@@ -386,16 +390,27 @@ impl NodeAgent {
             Some(StorageEpoch(record.log_epoch))
         } else { None };
 
-        if let Ok(database) = self.node.catalog().database(name)
-            && !log_epoch.is_some_and(|epoch| short_handoff_tail(&database, epoch)) {
-            self.flush_and_adopt(&database, &id, epoch, flush_wait).await?;
-        }
+        let database = self.node.catalog().database(name).ok();
+        let deadline = tokio::time::Instant::now() + flush_wait;
+        let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+        let write_pause = match (database.as_ref(), log_epoch) {
+            (Some(database), Some(log_epoch)) => {
+                if !short_handoff_tail(database, log_epoch) { self.flush_and_adopt(database, &id, epoch, remaining()).await?; }
+                let pause = tokio::time::timeout_at(deadline, database.pause_transactions()).await.map_err(|_| {
+                    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/handoff-drain-timeout", "The holder could not drain its admitted writes in time")
+                })??;
+                if !short_handoff_tail(database, log_epoch) { self.flush_and_adopt(database, &id, epoch, remaining()).await?; }
+                Some(pause)
+            }
+            (Some(database), None) => { self.flush_and_adopt(database, &id, epoch, remaining()).await?; None }
+            (None, _) => None,
+        };
         for _ in 0..8 {
             let Some(record) = self.directory.deployment(&id).await? else { break };
             if !is_requested(&record) { return Err(stale_handoff(name)); }
             let Some(parked) = park(&record, &self.member(), epoch) else { break };
             if let Cas::Applied(_) = self.directory.replace_deployment(parked, record.version).await? {
-                self.stop_running(name).await;
+                if write_pause.is_some() { self.stop_serving(name).await; } else { self.stop_running(name).await; }
                 return Ok(Response::Done);
             }
         }
@@ -695,9 +710,8 @@ fn short_handoff_tail(database: &Database, log_epoch: StorageEpoch) -> bool {
     let boundary = status.adopted_block.as_ref().and_then(|block| block.boundary_replica_position())
         .map_or(-1, |position| position.after_offset(log_epoch));
     matches!(status.role, DriverRole::Leading(_))
-        && status.replica_position.after_offset(log_epoch) - boundary <= HANDOFF_REPLAY_RECORDS
+        && (0..=HANDOFF_REPLAY_RECORDS).contains(&(status.replica_position.after_offset(log_epoch) - boundary))
         && database.live_rows() <= HANDOFF_REPLAY_ROWS
-        && database.latest_submitted_position().is_ok_and(|latest| latest <= database.progress().current().source_position)
 }
 
 fn stale_handoff(name: &str) -> Anomaly {

@@ -10,7 +10,7 @@ use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDr
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
 use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +24,7 @@ pub struct Database {
     pub(crate) storage: Arc<BufferPool>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
+    transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
     compaction: Option<CompactionHandle>,
     cancellation: CancellationToken,
     io: Arc<IoRegion>,
@@ -51,6 +52,20 @@ impl Database {
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
     /// Rows applied since the last block, held in the live index until the next flush.
     pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }
+    /// Pauses new user submissions and waits for the admitted ones to apply.
+    pub async fn pause_transactions(&self) -> Result<PausedTransactions<'_>> {
+        let paused = self.transaction_admission.write().await;
+        let latest = *paused.lock();
+        if let Some(latest) = latest { self.replication.await_source(latest, &self.cancellation).await?; }
+        Ok(PausedTransactions { _admission: paused })
+    }
+    pub(crate) async fn admit_transaction(&self) -> Result<RwLockReadGuard<'_, parking_lot::Mutex<Option<SourcePosition>>>> {
+        let permit = self.transaction_admission.read().await;
+        if self.cancellation.is_cancelled() {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, crate::node::NOT_HELD, format!("This node no longer holds {}", self.name)));
+        }
+        Ok(permit)
+    }
     /// Publishes a compaction produced elsewhere, as this database's writer.
     pub async fn publish_compaction(&self, notification: TriesAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
         self.require_writable()?;
@@ -71,6 +86,8 @@ impl Database {
         Ok(())
     }
 }
+
+pub struct PausedTransactions<'a> { _admission: RwLockWriteGuard<'a, parking_lot::Mutex<Option<SourcePosition>>> }
 
 pub(crate) struct DatabaseFactory {
     pub options: NodeOptions,
@@ -165,7 +182,7 @@ impl DatabaseFactory {
             } else { None };
             let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source };
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, cancellation: cancellation.clone(), io: Arc::clone(&io) });
+            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), compaction, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         }.await;

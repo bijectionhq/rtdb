@@ -296,6 +296,9 @@ impl Node {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
         let key = idempotency_key(&options);
         let database = self.catalog.database(database)?;
+        let admission = if self.catalog.is_placed() {
+            Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
+        } else { None };
         if let Some(key) = &key {
             if key == IDEMPOTENCY_SENTINEL { return Err(Anomaly::incorrect("rtdb.node/reserved-idempotency-key", format!("'{IDEMPOTENCY_SENTINEL}' is reserved and cannot be an idempotency key"))); }
             // A transaction carrying a key that already committed within the window aborts on its assertion, and awaiting it answers with the original's outcome.
@@ -324,6 +327,10 @@ impl Node {
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
         let payload = source.encode()?.into_bytes();
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
+        if let Some(admission) = &admission {
+            let mut latest = admission.lock();
+            *latest = (*latest).max(Some(position));
+        }
         if let Some(key) = key {
             let mut keyed = self.keyed.lock();
             keyed.insert(TxId(position.0), key);

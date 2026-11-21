@@ -445,6 +445,28 @@ async fn a_planned_move_replays_a_short_tail_and_flushes_a_large_one() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_admission_holds_new_transactions_outside_the_intake_log() {
+    let cell = Cell::start_durable(1).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 0)").await.unwrap();
+    let database = cell.node(0).server.node().catalog().database("shop").unwrap();
+    let paused = database.pause_transactions().await.unwrap();
+    let previously_admitted = database.latest_submitted_position().unwrap();
+    {
+        let write = client.simple_query("UPDATE orders SET total = total + 1 WHERE _id = 1");
+        tokio::pin!(write);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut write).await.is_err());
+        assert_eq!(database.latest_submitted_position().unwrap(), previously_admitted);
+        drop(paused);
+        tokio::time::timeout(Duration::from_secs(5), write).await.unwrap().unwrap();
+    }
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["1"]);
+    drop((database, client));
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_small_flush_writes_one_pack_and_its_catalog() {
     let cell = Cell::start(1, None).await;
     let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

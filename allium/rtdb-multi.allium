@@ -1515,9 +1515,12 @@ rule ParkForReservedMove {
     requires: record.active_move = reservation
 
     ensures:
-        if not (IntakeCaughtUp(record) and ShortLocalTail(record)):
+        AdmissionPaused(record)
+        AdmittedWritesApplied(record)
+        if not ShortLocalTail(record):
             FlushAndAdopt(record)
         ParkPlacement(record, preserving: reservation)
+        SourceStopsServing(record)
         RecoverFromReplicaLog(record, reservation.target)
 }
 

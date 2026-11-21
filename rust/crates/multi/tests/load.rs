@@ -232,12 +232,17 @@ async fn writes_keep_progress_during_repeated_handoffs() {
     assert_eq!(values(&verifier, "SELECT n FROM counters").await, [commits.len().to_string()]);
 
     let mut gaps: Vec<_> = windows.into_iter().map(|(start, end)| {
-        commits.windows(2).filter(|pair| pair[0] <= end && pair[1] >= start)
-            .map(|pair| pair[1] - pair[0]).max().expect("commits bracket the handoff")
+        let peak = commits.windows(2).filter(|pair| pair[0] <= end && pair[1] >= start)
+            .map(|pair| pair[1] - pair[0]).max().expect("commits bracket the handoff");
+        (peak, end - start)
     }).collect();
-    gaps.sort_unstable();
+    gaps.sort_unstable_by_key(|(gap, _)| *gap);
+    let slowest = gaps.last().copied().expect("at least one handoff");
+    let gaps: Vec<_> = gaps.into_iter().map(|(gap, _)| gap).collect();
     println!("moves={moves} acknowledged_updates={} peak_commit_gap_p50_ms={:.3} peak_commit_gap_p95_ms={:.3} peak_commit_gap_p99_ms={:.3}",
         commits.len(), percentile(&gaps, 50), percentile(&gaps, 95), percentile(&gaps, 99));
+    println!("worst_commit_gap_ms={:.3} admin_handoff_for_worst_gap_ms={:.3}",
+        slowest.0.as_secs_f64() * 1000.0, slowest.1.as_secs_f64() * 1000.0);
     drop(verifier);
     cell.stop().await;
 }
