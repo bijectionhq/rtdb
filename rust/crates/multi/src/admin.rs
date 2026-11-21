@@ -224,6 +224,9 @@ async fn fork_from(directory: &dyn Directory, storage: &CellStorage, keys: &dyn 
 
 async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
     let source = record(directory, parent).await?;
+    if source.checkpoint_recovery.as_ref().is_some_and(|recovery| recovery.completed_at_ms.is_some()) {
+        return Err(Anomaly::unsupported("rtdb.multi/fork-recovered", "Materialize the recovered checkpoint before making a physical deployment fork"));
+    }
     let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
     child.lineage = source.lineage.clone();
     child.parent = Some(source.id.clone());
@@ -379,7 +382,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     }).await
 }
 
-async fn update_installation(
+pub(crate) async fn update_installation(
     directory: &dyn Directory,
     id: &str,
     change: impl Fn(&mut DeploymentRecord) -> Result<()>,
@@ -400,7 +403,7 @@ async fn update_installation(
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/installation-contended", format!("Installation {id} kept changing")))
 }
 
-async fn administration_stream(directory: &dyn Directory, record: &DeploymentRecord, maximum_message_bytes: usize) -> Result<StreamConfig> {
+pub(crate) async fn administration_stream(directory: &dyn Directory, record: &DeploymentRecord, maximum_message_bytes: usize) -> Result<StreamConfig> {
     let members = members(directory).await?;
     let servers: Vec<String> = record.ensemble.iter().map(|id| {
         members.get(id).map(|member| member.address.clone()).ok_or_else(|| {

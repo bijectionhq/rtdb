@@ -214,7 +214,7 @@ impl Session {
                     tokio::select! {
                         biased;
                         _ = self.record.wait_for(|record| record.as_ref().is_some_and(|record| {
-                            record.lifecycle == rtdb_directory::Lifecycle::Deleting
+                            matches!(record.lifecycle, rtdb_directory::Lifecycle::Deleting | rtdb_directory::Lifecycle::Restoring)
                                 || record.lifecycle == rtdb_directory::Lifecycle::Deleted && record.moved_at_ms.is_none()
                         })) => Event::Retired,
                         event = async {

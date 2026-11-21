@@ -37,7 +37,8 @@ Usage: rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --id UUID\n\
        rtdb-multi schedule-disposal --directory DIR --id UUID\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
-       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
+       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
+       rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
 For `--keys` use a private local directory or dynamodb:TABLE with an independently installed key table.\n";
@@ -275,6 +276,30 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 installation_id(&arguments)?, required_uuid(&arguments, "operation")?,
             ).await?;
             println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));
+            Ok(())
+        }
+        "restore" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let archive = CellStorage::parse(arguments.required("archive-root")?)?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let recovery = rtdb_multi::archive::restore(
+                directory.as_ref(), &storage, &archive, keys.as_ref(),
+                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, 4 << 20,
+            ).await?;
+            println!("{}", serde_json::to_string_pretty(&recovery).expect("a restore receipt serializes"));
+            Ok(())
+        }
+        "schedule-disposal" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let id = installation_id(&arguments)?;
+            let scheduled = admin::begin_disposal(directory.as_ref(), &id.to_string()).await?;
+            println!("{}", serde_json::json!({
+                "deployment": scheduled.id,
+                "incarnation": scheduled.incarnation,
+                "epoch": scheduled.epoch,
+                "lifecycle": scheduled.lifecycle,
+            }));
             Ok(())
         }
         "create" => {

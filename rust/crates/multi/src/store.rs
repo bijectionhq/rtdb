@@ -64,6 +64,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         {
             return Err(Anomaly::incorrect("rtdb.multi/storage-authority", format!("Installation {} no longer authorizes this store", config.deployment)));
         }
+        let recovery = crate::archive::ArchivedCheckpoint::load(&record, Arc::clone(&io)).await?;
         let bucket = config.storage.bucket(io).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
         let root = FencedStore {
@@ -74,7 +75,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         };
         confirm_root(&root, &config.deployment, config.writer_epoch.is_some()).await?;
         let discovery = match record.checkpoint { Some(checkpoint) => crate::packing::PackDiscovery::From(checkpoint.block), None => crate::packing::PackDiscovery::List };
-        Ok(open_deployment_store(bucket, &store, discovery, wall_clock()).await?)
+        Ok(open_deployment_store_with_archive(bucket, &store, discovery, wall_clock(), recovery).await?)
     }
 
     /// A deployment with a published checkpoint recovers from it without listing its store.
@@ -151,11 +152,25 @@ pub fn wall_clock() -> Clock {
 
 /// One store of a deployment in the cell's `bucket` (a prefix and a storage version), as a node opens it below its disk cache: its own objects and those its manifest references, packed, with deletes as releases.
 pub async fn open_deployment_store(bucket: crate::reference::Bucket, store: &str, discovery: crate::packing::PackDiscovery, clock: Clock) -> Result<Arc<GarbageStore>> {
+    open_deployment_store_with_archive(bucket, store, discovery, clock, None).await
+}
+
+pub(crate) async fn open_deployment_store_with_archive(
+    bucket: crate::reference::Bucket,
+    store: &str,
+    discovery: crate::packing::PackDiscovery,
+    clock: Clock,
+    archive: Option<crate::archive::ArchivedCheckpoint>,
+) -> Result<Arc<GarbageStore>> {
     let local: Arc<dyn ObjectStore> = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.to_owned()));
     let base = crate::reference::Base::load(bucket.as_ref(), store).await?;
     let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { local } else { Arc::new(crate::reference::ReferencingStore::new(local, bucket, base)) };
     let packed = crate::packing::PackingStore::open_with_clock(own, discovery, Arc::clone(&clock)).await?;
-    GarbageStore::open_with_clock(packed, clock).await
+    let store = match archive {
+        Some(archive) => archive.with_serving(packed),
+        None => packed,
+    };
+    GarbageStore::open_with_clock(store, clock).await
 }
 
 struct FencedStore {
@@ -455,7 +470,7 @@ pub async fn finish_moves(bucket: &dyn ObjectStore, deployments: &[DeploymentRec
 pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration) -> Result<Vec<Result<Reaped>>> {
     let references = crate::reference::References::scan(bucket, deployments).await?;
     let mut reaped = Vec::new();
-    for record in deployments.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) { reaped.push(reap_as_of(bucket, record, now_ms, grace, &references).await); }
+    for record in deployments.iter().filter(|record| !matches!(record.lifecycle, Lifecycle::Deleted | Lifecycle::Restoring)) { reaped.push(reap_as_of(bucket, record, now_ms, grace, &references).await); }
     Ok(reaped)
 }
 
