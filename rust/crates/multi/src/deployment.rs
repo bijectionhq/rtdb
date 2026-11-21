@@ -88,7 +88,14 @@ impl CellStorage {
     pub(crate) fn custody_namespace(&self) -> rtdb_types::Result<[u8; 32]> {
         let location = match self {
             Self::Local { root } => format!("local:{:?}", Self::local_root(root)?),
-            Self::S3 { config } => format!("s3:{:?}", (&config.bucket, &config.endpoint, Self::s3_root(config)?)),
+            // The placement owner verifies this fingerprint without reading
+            // credentials or opening the bucket.
+            Self::S3 { config } => format!(
+                "rtdb.cell.s3/v1\0{}\0{}\0{}",
+                config.bucket,
+                Self::s3_root(config)?,
+                config.endpoint.as_deref().unwrap_or_default(),
+            ),
         };
         let digest = ring::digest::digest(&ring::digest::SHA256, location.as_bytes());
         Ok(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
@@ -360,6 +367,22 @@ mod tests {
         let moved = directory.replace_deployment(moved, active.version).await.unwrap().applied().unwrap();
         assert!(directory.deployments_held_by(&MemberId("node".into())).await.unwrap().is_empty());
         assert_eq!(live_holdings(directory.as_ref(), &members, 10).await.unwrap(), [moved]);
+    }
+
+    #[test]
+    fn the_s3_custody_fingerprint_is_stable_and_independent_of_credentials() {
+        let mut config = rtdb_s3::S3Config::new("rtdb-fixture");
+        config.prefix = Some("cell-prefix".into());
+        config.endpoint = Some("https://s3.example.test".into());
+        let initial = CellStorage::S3 { config: config.clone() }.custody_namespace().unwrap();
+        let encoded: String = initial.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(encoded, "ad7ca5b2df452a10a1e838fb3041ef12f1fb8dd08107ee80a195e363961676d9");
+
+        config.credentials = Some(rtdb_s3::S3Credentials { access_key: "fixture".into(), secret_key: "fixture".into() });
+        assert_eq!(CellStorage::S3 { config: config.clone() }.custody_namespace().unwrap(), initial);
+
+        config.prefix = Some("another-cell".into());
+        assert_ne!(CellStorage::S3 { config }.custody_namespace().unwrap(), initial);
     }
 
     #[test]
