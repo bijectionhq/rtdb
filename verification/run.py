@@ -34,10 +34,24 @@ def run_case(command, directory, evidence, case, env=None):
     if command[:2] == ["cargo", "test"] and "--no-run" not in command:
         # A fresh source copy rebuilds the workspace; the build gets its own limit so the case limit bounds only the run.
         split = command.index("--") if "--" in command else len(command)
+        exact = command[split + 1:] == ["--exact"]
         build_command = [*command[:split], "--no-run"]
+        if exact:
+            build_command.append("--message-format=json")
         build = run_case_with_timeout(build_command, directory, evidence, f"{case}-build", env, 3600)
         if build.returncode:
             return build
+        if exact:
+            artifacts = [json.loads(line) for line in build.stdout.splitlines() if line.startswith("{")]
+            binaries = [artifact for artifact in artifacts if artifact.get("reason") == "compiler-artifact"
+                        and artifact["profile"]["test"] and artifact.get("executable")]
+            if len(binaries) == 1:
+                # Use Cargo's package working directory. A second cargo invocation can wait
+                # on another build's lock instead of running the already-built test.
+                binary = binaries[0]
+                test_command = [binary["executable"], command[split - 1], "--exact"]
+                package = Path(binary["manifest_path"]).parent
+                return run_case_with_timeout(test_command, package, evidence, case, env, 300)
     return run_case_with_timeout(command, directory, evidence, case, env, 300 if command[0] == "cargo" else 120)
 
 
