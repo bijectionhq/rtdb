@@ -219,7 +219,12 @@ impl PartitionState {
     pub fn add_tries(&self, additions: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<()> {
         let mut value = self.value.write();
         let mut trie_catalog = value.trie_catalog.as_ref().clone();
-        for (table, tries) in additions { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
+        let epoch = trie_catalog.naming_epoch();
+        for (table, tries) in additions {
+            // A completed job can reach the replica journal after a compactor reset.
+            let current = tries.iter().filter(|trie| trie.key.level() == 0 || trie.key.epoch() == epoch);
+            trie_catalog = trie_catalog.with_tries(table.clone(), current.cloned(), as_of)?;
+        }
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(trie_catalog);
         *value = Arc::new(next);
@@ -272,8 +277,16 @@ impl PartitionState {
         if block.block_index() != value.live.block_index() || block.latest_completed_tx() != value.live.latest_completed_tx() {
             return Err(invalid("Durable block does not describe the prepared live boundary"));
         }
-        let mut trie_catalog = value.trie_catalog.as_ref().clone();
-        for (table, tries) in tries { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
+        let epoch = block.naming_epoch();
+        let trie_catalog = if value.trie_catalog.naming_epoch() == epoch {
+            let mut current = value.trie_catalog.as_ref().clone();
+            for (table, tries) in tries { current = current.with_tries(table.clone(), tries.clone(), as_of)?; }
+            current
+        } else {
+            // A reset checkpoint replaces the catalog, including for a node that
+            // did not perform the reset or that is recovering an interrupted reset.
+            durable_tries.with_naming_epoch(epoch)
+        };
         let table_catalog = value.table_catalog.adopt(block, &prepared.metadata)?;
         if !table_catalog.tables().keys().eq(table_blocks.keys()) {
             return Err(invalid("Table blocks do not match the adopted checkpoint registry"));

@@ -242,7 +242,7 @@ impl TrieCatalog {
             for key in keys {
                 if key.level() == 0 { continue; }
                 if let Some(shard) = table.shards.get_mut(&Shard::of(key)) {
-                    if shard.tries.get(&key.block_index()).is_some_and(|trie| matches!(trie.state, TrieState::Garbage { .. })) {
+                    if shard.tries.get(&key.block_index()).is_some_and(|trie| trie.key == *key && matches!(trie.state, TrieState::Garbage { .. })) {
                         shard.tries.remove(&key.block_index());
                     }
                 }
