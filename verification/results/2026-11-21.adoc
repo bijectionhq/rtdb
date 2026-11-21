@@ -1059,3 +1059,51 @@ The combined formal runner passed on `17ad591d6` with 23 TLC baseline configurat
 Its input manifest SHA-256 is `eb714e7df2ca08815f25ccd5c8c84491cb06e43486a56c36dae22498ea185a4a`.
 The Kafka adapter passed `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo check --offline --locked --manifest-path rust/Cargo.toml -p rtdb-kafka --lib` with the pinned CMake 4.5.1 on `PATH`.
 This adapter check did not connect to a broker.
+
+=== Multi recovery admission against an authorized trim
+
+Commit `e0192fdfd` makes the serving Multi log read the directory's certified replica prefix when admitting an ordinary recovery cursor.
+An outdated start reports the first required offset and the first offset outside the authorized prefix, allowing the checkpoint-discovery loop to seek a strictly newer root.
+The decision is scoped to the physical replica stream and log epoch, and the writer epoch may change without resetting the boundary.
+The provider still validates its own cursor.
+
+Verus checks three obligations on the actual offset decision in `rust/crates/multi/src/replica_retention.rs`.
+The controls exclude the first retained record, weaken the specification to match that behavior, and jointly drop the authorization rule and its contract.
+Each control reports its declared failure.
+The native test witnesses the directory refusing an outdated start while the backing log still has the requested record and accepts a start at the first retained record.
+The backing provider for that test is `MemoryLog`.
+The separate `cell` suite exercises real local logkeepers and cold recovery after their physical trim.
+`1dd4b2a42` passed 96 Multi library tests and 75 cell tests.
+
+[source,sh]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_TARGET_DIR=../target \
+  CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 cargo test --offline --locked -p rtdb-multi --lib --test cell
+----
+
+The `verify_multi_trim_admission` case in the formal runner's `--native-replay` lane reruns the focused test and a source control that omits the directory check.
+The focused baseline and expected assertion failure were both observed at `1dd4b2a42`.
+The native control's original `logs.rs` SHA-256 is `9e29de26443852521f5fc1a494b368884738950c1cdf6391a9037071e179a56e`.
+
+=== Recovery hold closure and owner loss
+
+TLC explored 22,494 reachable states with two hold identities, three offsets, a delayed directory admission, and independently delayed physical trim.
+The safety checks cover closure after a drain or confirmed stop, retention through an active or draining read, and the inability of a delayed admission to recreate a released hold.
+The three controls reject premature closure on cancellation, treating timeout as stop evidence, and skipping the closing CAS when no hold is visible.
+A fourth case reaches a physical trim after an owner's stop is confirmed and the hold is removed. link:../tla/ReplicaHoldLifecycle.tla[Lifecycle model]
+
+Lean proves `close_consumes_only_its_hold`, `close_fences_prior_admissions`, and `a_missing_hold_still_fences_its_ambiguous_admission` for arbitrary reader identities with decidable equality.
+The proofs use `propext` and `Quot.sound` and assume a monotone directory revision and a successful atomic close.
+The controls keep the revision unchanged and drop another reader's hold. link:../lean/ReplicaHoldClose.lean[Close and fencing laws]
+
+The admission check covers trims authorized before the directory read.
+A later trim is still possible because the production cursor does not register a durable hold.
+The models leave provider drain and conclusive owner death as refinement premises, and they abstract the release schedule and provider protocol.
+
+The combined formal runner passed at `1dd4b2a42` with Lean, Verus, Z3, TLC, Apalache, Alloy, Maude, mCRL2, and AutoHyper.
+It checked 24 TLC baseline configurations and the registered controls and witnesses.
+The native replay and Rust boundary flags were omitted in this combined run.
+Its input manifest SHA-256 is `9db36db755083ddc52a18203d897c48d7771710baef0854202f4a7311affd4f1`.
+See the link:../README.adoc#_run_the_studies[runner command and tool versions].
