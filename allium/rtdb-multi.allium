@@ -560,6 +560,7 @@ entity DeploymentRecord {
     -- The KeyService key wrapping this deployment's object data keys.
     key_id: String
     lifecycle: Lifecycle
+    deletion_observation: DeletionObservation?
     deletion_record: DeletionRecord?
     isolation_class: IsolationClass
     -- Members permitted when isolation_class is pinned or dedicated.
@@ -816,6 +817,12 @@ entity GarbageCandidate {
     object: ObjectRef
     lineage: LineageId
     released_at: Timestamp
+}
+
+value DeletionObservation {
+    leases_expire_at: Timestamp?
+    first_empty_at: Timestamp?
+    second_empty_at: Timestamp?
 }
 
 entity DeletionRecord {
@@ -1817,6 +1824,8 @@ rule BeginDeletion {
             holder: null,
             lifecycle: deleting
         })
+        if RecordUsesS3(record):
+            RecordLeaseHorizon(record, now + config.credential_ttl)
         for loglet in record.loglets:
             SealSent(loglet, epoch: Epoch(value: record.epoch.value + 1))
         StreamDropped(record.id)
@@ -1900,11 +1909,32 @@ rule PublishInventoryReceipt {
     requires: record.lifecycle = deleting
     requires: record.storage_namespaces = namespaces
     requires: RecordedWriteLeasesExpired(record)
+    requires: LocalStorage(record) or record.deletion_observation.second_empty_at != null
 
     ensures:
         KeyService.destroy(record.key_id)
         let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, namespaces: namespaces, inventory_scope: inventory_scope, signature: SignedByCell())
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
+}
+
+rule ObserveS3Inventory {
+    when: S3DeletionContinued(record)
+
+    requires: record.lifecycle = deleting
+    requires: RecordUsesS3(record)
+    requires: RecordedWriteLeasesExpired(record)
+    requires: S3LeaseHorizonElapsed(record)
+    requires: StreamDropped(record.id)
+
+    ensures:
+        if record.deletion_observation.first_empty_at = null:
+            EraseS3Inventory(record.storage_root.prefix)
+            Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(first_empty_at: now, second_empty_at: null) })
+        else if record.deletion_observation.second_empty_at = null and now >= record.deletion_observation.first_empty_at + config.credential_ttl:
+            if S3InventoryIsEmpty(record.storage_root.prefix):
+                Directory.cas(record.id, record.version, change: { deletion_observation.second_empty_at: now })
+            else:
+                Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(leases_expire_at: now) })
 }
 
 ------------------------------------------------------------

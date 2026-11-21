@@ -56,11 +56,12 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, storage_generation,
-        storage_namespaces, s3_write_lease_until_ms, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms, source_cleanup, deletion_record, version: _,
+        storage_namespaces, s3_write_lease_until_ms, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms, source_cleanup,
+        deletion_observation, deletion_record, version: _,
     } = record;
     if holder.is_some() || !matches!(lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
         || move_intent.is_some() || placement_move.is_some() || move_from.is_some() || cell_move.is_some()
-        || moved_at_ms.is_some() || source_cleanup.is_some() || deletion_record.is_some() || !log_copy_servers.is_empty()
+        || moved_at_ms.is_some() || source_cleanup.is_some() || deletion_observation.is_some() || deletion_record.is_some() || !log_copy_servers.is_empty()
     {
         return None;
     }
@@ -150,6 +151,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         storage_generation,
         storage_namespaces,
         s3_write_lease_until_ms: packed.s3_write_lease_until_ms,
+        deletion_observation: None,
         deletion_record: None,
         version,
     })

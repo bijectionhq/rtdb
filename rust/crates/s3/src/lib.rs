@@ -1,6 +1,6 @@
 mod credential;
 mod scoped;
-pub use scoped::{SCOPED_S3_CLOCK_ALLOWANCE, ScopedS3Writes, WriteAuthorization};
+pub use scoped::{SCOPED_S3_CLOCK_ALLOWANCE, SCOPED_S3_WRITE_TTL, ScopedS3Writes, WriteAuthorization};
 #[cfg(feature = "versioning")]
 mod versions;
 

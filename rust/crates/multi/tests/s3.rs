@@ -58,7 +58,7 @@ async fn exercise_cell(storage: CellStorage) {
     cell.node(holder).agent.park("shop-preview").await.unwrap();
 
     eprintln!("S3 phase: delete parent");
-    let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
+    let deletion = prove_s3_erasure(&cell, &parent.id, false).await;
     assert!(deletion.facts.verified_empty, "the parent's current objects are gone from S3");
     assert_eq!(deletion.facts.inventory, rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads);
     let prefix = rtdb_storage::ObjectKey::new(parent.storage_prefix()).unwrap();
@@ -113,8 +113,76 @@ async fn a_cell_flushes_and_moves_with_deployment_scoped_s3_writes() {
     assert_eq!(deletion.code, "rtdb.multi/storage-lease-active");
     assert_eq!(cell.directory.deployment(&deployed.id).await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleting);
     assert!(rtdb_multi::keys::KeyService::existing(&keys, &deployed.id).is_ok());
+    prove_s3_erasure(&cell, &deployed.id, true).await;
     cell.stop().await;
     proxy.abort();
+}
+
+async fn prove_s3_erasure(cell: &Cell, id: &str, inject_late_object: bool) -> rtdb_directory::DeletionRecord {
+    use bytes::Bytes;
+    use rtdb_directory::{DeletionInventory, DeletionObservation, now_ms};
+    use rtdb_multi::keys::{KeyService, verify_deletion};
+    use rtdb_storage::{IoRegion, ObjectKey};
+
+    let storage = cell.storage();
+    let keys = cell.keys();
+    let directory = cell.directory.as_ref();
+    let update = |record: rtdb_directory::DeploymentRecord| async move {
+        let version = record.version;
+        directory.replace_deployment(record, version).await.unwrap().applied().unwrap()
+    };
+    let delete = || admin::delete_deployment(directory, &storage, &keys, "shop", 4 << 20);
+    let age = (rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE).as_millis() as i64;
+
+    assert_eq!(delete().await.unwrap_err().code, "rtdb.multi/storage-lease-active");
+    let mut record = directory.deployment(id).await.unwrap().unwrap();
+    let namespace = ObjectKey::new(record.storage_prefix()).unwrap();
+    let arrival = ObjectKey::new(format!("{namespace}/late-object")).unwrap();
+    let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+    assert!(matches!(record.deletion_observation, Some(DeletionObservation::Fenced { leases_expire_at_ms }) if leases_expire_at_ms > now_ms()));
+    assert!(keys.existing(id).is_ok());
+    record.s3_write_lease_until_ms = record.s3_write_lease_until_ms.map(|_| now_ms() - 1);
+    record.deletion_observation = Some(DeletionObservation::Fenced { leases_expire_at_ms: now_ms() - 1 });
+    update(record).await;
+    assert_eq!(delete().await.unwrap_err().code, "rtdb.multi/deletion-verification-pending");
+    let mut record = directory.deployment(id).await.unwrap().unwrap();
+    assert!(matches!(record.deletion_observation, Some(DeletionObservation::Empty { .. })));
+    assert!(record.deletion_record.is_none());
+    assert!(keys.existing(id).is_ok());
+    assert_eq!(delete().await.unwrap_err().code, "rtdb.multi/deletion-verification-pending");
+
+    if inject_late_object {
+        bucket.put(&arrival, Bytes::from_static(b"arrived after first pass")).await.unwrap();
+        record.deletion_observation = Some(DeletionObservation::Empty { observed_at_ms: now_ms() - age });
+        update(record).await;
+        assert_eq!(delete().await.unwrap_err().code, "rtdb.multi/deletion-incomplete");
+        let mut record = directory.deployment(id).await.unwrap().unwrap();
+        assert!(matches!(record.deletion_observation, Some(DeletionObservation::Fenced { .. })));
+        assert!(bucket.head(&arrival).await.is_ok());
+        assert!(keys.existing(id).is_ok());
+
+        record.deletion_observation = Some(DeletionObservation::Verified { first_empty_at_ms: now_ms(), last_empty_at_ms: now_ms() });
+        let mut record = update(record).await;
+        assert_eq!(delete().await.unwrap_err().code, "rtdb.multi/deletion-observation");
+        assert!(keys.existing(id).is_ok());
+        record.deletion_observation = Some(DeletionObservation::Fenced { leases_expire_at_ms: now_ms() - 1 });
+        update(record).await;
+        assert_eq!(delete().await.unwrap_err().code, "rtdb.multi/deletion-verification-pending");
+    }
+    let mut record = directory.deployment(id).await.unwrap().unwrap();
+    assert!(matches!(record.deletion_observation, Some(DeletionObservation::Empty { .. })));
+    assert!(bucket.list(Some(&namespace)).await.unwrap().is_empty());
+    let first_empty = now_ms() - age;
+    record.deletion_observation = Some(DeletionObservation::Empty { observed_at_ms: first_empty });
+    update(record).await;
+    let receipt = delete().await.unwrap();
+    assert_eq!(receipt.facts.first_empty_observed_at_ms, Some(first_empty));
+    assert!(receipt.facts.objects_erased_at_ms >= first_empty + age);
+    assert_eq!(receipt.facts.inventory, DeletionInventory::AllVersionsAndMultipartUploads);
+    assert_eq!(keys.existing(id).unwrap_err().code, "rtdb.multi/key-destroyed");
+    verify_deletion(&receipt, &keys.deletion_verification_key().unwrap()).unwrap();
+    assert_eq!(delete().await.unwrap(), receipt);
+    receipt
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

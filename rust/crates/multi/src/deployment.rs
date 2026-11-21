@@ -50,6 +50,11 @@ pub enum CellStorage {
 pub(crate) const S3_CELL_ROOT: &str = "cell";
 const STORAGE_NAMESPACE_MARKER: &str = "~cell-namespace";
 
+pub(crate) fn s3_write_lease_horizon(at_ms: i64) -> i64 {
+    let interval = rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE;
+    at_ms.saturating_add(interval.as_millis() as i64)
+}
+
 impl CellStorage {
     /// The cell's objects as one store, keyed relative to the cell's storage root.
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {

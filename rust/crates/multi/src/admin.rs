@@ -5,14 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use rtdb_directory::DeletionRecord;
-use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeletionInventory, DeletionObservation, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::Log;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
-use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_storage_namespaces, select_logkeepers, storage_namespaces, write_quorum};
+use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
@@ -590,33 +590,47 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
                 record.lifecycle = Lifecycle::Deleting;
                 record.epoch += 1;
                 record.holder = None;
-                Ok(())
             }
             Lifecycle::Deleting => {
                 if record.storage_namespaces.is_none() { record.storage_namespaces = legacy_namespace; }
-                require_storage_namespaces(record, namespaces)
+                require_storage_namespaces(record, namespaces)?;
             }
-            Lifecycle::Moving => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} is moving between cells"))),
-            Lifecycle::Deleted => Ok(()),
+            Lifecycle::Moving => return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} is moving between cells"))),
+            Lifecycle::Deleted => return Ok(()),
         }
+        if matches!(storage, CellStorage::S3 { .. }) && record.deletion_observation.is_none() {
+            record.deletion_observation = Some(DeletionObservation::Fenced { leases_expire_at_ms: s3_write_lease_horizon(now_ms()) });
+        }
+        Ok(())
     }).await?;
     if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
-    if let Some(deadline) = fenced.active_s3_write_lease(now_ms()) {
+    let wait_until = match fenced.deletion_observation {
+        Some(DeletionObservation::Fenced { leases_expire_at_ms }) => Some(leases_expire_at_ms),
+        _ => None,
+    }.max(fenced.s3_write_lease_until_ms);
+    if let Some(deadline) = wait_until.filter(|&deadline| now_ms() < deadline) {
         return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/storage-lease-active", format!("The storage write lease expires at Unix milliseconds {deadline}")));
     }
-    let mut servers = ensemble_servers(&fenced, &members(directory).await?)?;
-    if let Some(previous) = &fenced.move_from {
-        for server in previous {
-            if !servers.contains(server) { servers.push(server.clone()); }
+    if matches!(fenced.deletion_observation, None | Some(DeletionObservation::Fenced { .. })) {
+        let mut servers = ensemble_servers(&fenced, &members(directory).await?)?;
+        if let Some(previous) = &fenced.move_from {
+            servers.extend(previous.iter().cloned());
         }
+        servers.extend(fenced.log_copy_servers.iter().cloned());
+        servers.sort_unstable();
+        servers.dedup();
+        let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
+        rtdb_logkeeper::drop_stream(&stream, fenced.epoch).await?;
     }
-    servers.extend(fenced.log_copy_servers.iter().cloned());
-    servers.sort_unstable();
-    servers.dedup();
-    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
-    rtdb_logkeeper::drop_stream(&stream, fenced.epoch).await?;
-    let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-    let receipt = finish_deletion(storage, bucket.as_ref(), &fenced, &others, keys).await?;
+    let (inventory, first_empty_at_ms, last_empty_at_ms) = if let CellStorage::S3 { config } = storage {
+        let (first, last) = observe_s3_inventory(directory, storage, config, bucket.as_ref(), &fenced).await?;
+        (DeletionInventory::AllVersionsAndMultipartUploads, Some(first), last)
+    } else {
+        let others = deletion_neighbors(directory, &fenced).await?;
+        let inventory = erase_inventory(storage, bucket.as_ref(), &fenced, &others).await?;
+        (inventory, None, now_ms())
+    };
+    let receipt = sign_deletion(&fenced, keys, inventory, first_empty_at_ms, last_empty_at_ms)?;
     let deleted = update(directory, name, |record| {
         if record.id != fenced.id || record.epoch != fenced.epoch || record.storage_prefix() != receipt.facts.storage_prefix {
             return Err(deletion_changed(name));
@@ -624,6 +638,8 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
         require_storage_namespaces(record, namespaces)?;
         if record.lifecycle == Lifecycle::Deleted { return Ok(()); }
         if record.lifecycle != Lifecycle::Deleting { return Err(deletion_changed(name)); }
+        let observation = first_empty_at_ms.map(|first_empty_at_ms| DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms });
+        if record.deletion_observation != observation { return Err(deletion_changed(name)); }
         record.deletion_record = Some(receipt.clone());
         record.lifecycle = Lifecycle::Deleted;
         Ok(())
@@ -648,25 +664,96 @@ fn deletion_receipt(mut tombstone: DeploymentRecord) -> Result<DeletionRecord> {
     let receipt = tombstone.deletion_record.take()
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/deleted", format!("{} is already deleted", tombstone.name)))?;
     let facts = &receipt.facts;
+    let observation_matches = match tombstone.deletion_observation {
+        None => facts.first_empty_observed_at_ms.is_none(),
+        Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms }) => {
+            facts.first_empty_observed_at_ms == Some(first_empty_at_ms) && facts.objects_erased_at_ms == last_empty_at_ms
+                && last_empty_at_ms >= first_empty_at_ms
+        }
+        Some(DeletionObservation::Empty { .. } | DeletionObservation::Fenced { .. }) => false,
+    };
     if tombstone.lifecycle != Lifecycle::Deleted || !facts.verified_empty || facts.deployment != tombstone.id
         || facts.name != tombstone.name || facts.epoch != tombstone.epoch || facts.storage_prefix != tombstone.storage_prefix()
-        || Some(facts.namespaces) != tombstone.storage_namespaces
+        || Some(facts.namespaces) != tombstone.storage_namespaces || !observation_matches
     {
         return Err(Anomaly::fault("rtdb.multi/deletion-receipt-mismatch", format!("The stored receipt for {} does not match its tombstone", tombstone.name)));
     }
     Ok(receipt)
 }
 
-async fn finish_deletion(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord], keys: &dyn KeyService) -> Result<DeletionRecord> {
+async fn deletion_neighbors(directory: &dyn Directory, deployment: &DeploymentRecord) -> Result<Vec<DeploymentRecord>> {
+    Ok(directory.deployments().await?.into_iter().filter(|record| record.id != deployment.id).collect())
+}
+
+fn observation_pending(first_empty_at_ms: i64) -> Anomaly {
+    let deadline = s3_write_lease_horizon(first_empty_at_ms);
+    Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/deletion-verification-pending", format!("The second empty inventory is due at Unix milliseconds {deadline}"))
+}
+
+async fn advance_observation(directory: &dyn Directory, deployment: &DeploymentRecord, observation: Option<DeletionObservation>) -> Result<()> {
+    update(directory, &deployment.name, |current| {
+        if current.id != deployment.id || current.epoch != deployment.epoch || current.lifecycle != Lifecycle::Deleting
+            || current.storage_namespaces != deployment.storage_namespaces || current.storage_prefix() != deployment.storage_prefix()
+            || current.deletion_observation != deployment.deletion_observation
+        {
+            return Err(deletion_changed(&deployment.name));
+        }
+        current.deletion_observation = observation;
+        Ok(())
+    }).await?;
+    Ok(())
+}
+
+async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, config: &rtdb_s3::S3Config,
+                             bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord) -> Result<(i64, i64)> {
+    let first_empty_at_ms = match deployment.deletion_observation {
+        Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms }) => {
+            if first_empty_at_ms < 0 || last_empty_at_ms < s3_write_lease_horizon(first_empty_at_ms) || last_empty_at_ms > now_ms() {
+                return Err(Anomaly::fault("rtdb.multi/deletion-observation", "The stored empty inventory timestamps are inconsistent"));
+            }
+            return Ok((first_empty_at_ms, last_empty_at_ms));
+        }
+        Some(DeletionObservation::Empty { observed_at_ms }) => observed_at_ms,
+        Some(DeletionObservation::Fenced { .. }) => {
+            let others = deletion_neighbors(directory, deployment).await?;
+            erase_inventory(storage, bucket, deployment, &others).await?;
+            let observed_at_ms = now_ms();
+            advance_observation(directory, deployment, Some(DeletionObservation::Empty { observed_at_ms })).await?;
+            return Err(observation_pending(observed_at_ms));
+        }
+        None => return Err(deletion_changed(&deployment.name)),
+    };
+    if now_ms() < s3_write_lease_horizon(first_empty_at_ms) { return Err(observation_pending(first_empty_at_ms)); }
+
+    let cell = rtdb_storage::ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
+    let inventory = config.versioned_inventory(&cell, &BTreeMap::new()).await?;
+    let prefix = rtdb_storage::ObjectKey::new(deployment.storage_prefix())?;
+    if !inventory.is_empty(&prefix).await? {
+        advance_observation(directory, deployment, Some(DeletionObservation::Fenced { leases_expire_at_ms: now_ms() })).await?;
+        return Err(deletion_incomplete(deployment));
+    }
+    let last_empty_at_ms = now_ms();
+    if last_empty_at_ms < s3_write_lease_horizon(first_empty_at_ms) { return Err(observation_pending(first_empty_at_ms)); }
+    advance_observation(directory, deployment, Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms })).await?;
+    Ok((first_empty_at_ms, last_empty_at_ms))
+}
+
+fn deletion_incomplete(deployment: &DeploymentRecord) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name))
+}
+
+async fn erase_inventory(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord]) -> Result<DeletionInventory> {
+    let storage_prefix = deployment.storage_prefix();
+    if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? { return Err(deletion_incomplete(deployment)); }
+    storage.purge_inventory(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await
+}
+
+fn sign_deletion(deployment: &DeploymentRecord, keys: &dyn KeyService, inventory: DeletionInventory,
+                 first_empty_observed_at_ms: Option<i64>, objects_erased_at_ms: i64) -> Result<DeletionRecord> {
     let storage_prefix = deployment.storage_prefix();
     let namespaces = deployment.storage_namespaces.ok_or_else(|| {
         Anomaly::fault("rtdb.multi/storage-binding-missing", format!("{} has no storage binding", deployment.name))
     })?;
-    if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? {
-        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name)));
-    }
-    let inventory = storage.purge_inventory(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await?;
-    let objects_erased_at_ms = now_ms();
     keys.destroy(&deployment.id)?;
     keys.sign_deletion(DeletionFacts {
         deployment: deployment.id.clone(),
@@ -677,6 +764,7 @@ async fn finish_deletion(storage: &CellStorage, bucket: &dyn rtdb_storage::Objec
         inventory,
         key_destroyed_at_ms: now_ms(),
         objects_erased_at_ms,
+        first_empty_observed_at_ms,
         verified_empty: true,
     })
 }
@@ -873,7 +961,7 @@ mod tests {
     use rtdb_directory::MemoryDirectory;
     use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 
-    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, create_deployment, delete_deployment, finish_deletion};
+    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, create_deployment, delete_deployment, erase_inventory, sign_deletion};
     use crate::keys::LocalKeyService;
 
     #[tokio::test]
@@ -910,11 +998,12 @@ mod tests {
         let object = ObjectKey::new(format!("{}/v06/rows", deployment.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
 
-        let error = finish_deletion(&storage, &RetainingStore(&bucket), &deployment, &[], &keys).await.unwrap_err();
+        let error = erase_inventory(&storage, &RetainingStore(&bucket), &deployment, &[]).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/deletion-incomplete");
         assert_eq!(keys.key(&deployment.id).unwrap(), key);
 
-        let proof = finish_deletion(&storage, &bucket, &deployment, &[], &keys).await.unwrap();
+        let inventory = erase_inventory(&storage, &bucket, &deployment, &[]).await.unwrap();
+        let proof = sign_deletion(&deployment, &keys, inventory, None, super::now_ms()).unwrap();
         assert!(proof.facts.verified_empty);
         assert!(bucket.list(Some(&ObjectKey::new(deployment.storage_prefix()).unwrap())).await.unwrap().is_empty());
         assert_eq!(keys.existing(&deployment.id).unwrap_err().code, "rtdb.multi/key-destroyed");

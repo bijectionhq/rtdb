@@ -494,7 +494,8 @@ pub async fn finish_moves(directory: &dyn Directory, storage: &crate::deployment
     let completion = if keys.is_some() { SourceCleanup::ObjectsAndKeyErased } else { SourceCleanup::ObjectsErased };
     let grace = grace.as_millis().min(i64::MAX as u128) as i64;
     let pending = |record: &DeploymentRecord| record.lifecycle == Lifecycle::Deleted
-        && record.moved_at_ms.is_some_and(|moved| now_ms.saturating_sub(moved) >= grace)
+        && record.moved_at_ms.is_some_and(|moved| now_ms.saturating_sub(moved) >= grace
+            && (!matches!(storage, crate::deployment::CellStorage::S3 { .. }) || now_ms >= crate::deployment::s3_write_lease_horizon(moved)))
         && record.active_s3_write_lease(now_ms).is_none()
         && record.source_cleanup.is_none_or(|done| done == SourceCleanup::ObjectsErased && keys.is_some());
     let mut moved = deployments.iter().filter(|record| pending(record)).peekable();

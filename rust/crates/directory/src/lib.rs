@@ -181,6 +181,14 @@ pub enum DeletionInventory {
     AllVersionsAndMultipartUploads,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionObservation {
+    Fenced { leases_expire_at_ms: i64 },
+    Empty { observed_at_ms: i64 },
+    Verified { first_empty_at_ms: i64, last_empty_at_ms: i64 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeletionFacts {
@@ -192,6 +200,8 @@ pub struct DeletionFacts {
     pub inventory: DeletionInventory,
     pub key_destroyed_at_ms: i64,
     pub objects_erased_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_empty_observed_at_ms: Option<i64>,
     pub verified_empty: bool,
 }
 
@@ -263,6 +273,8 @@ pub struct DeploymentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_write_lease_until_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_observation: Option<DeletionObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_record: Option<DeletionRecord>,
     pub version: Version,
 }
@@ -282,7 +294,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, s3_write_lease_until_ms: None, deletion_record: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, s3_write_lease_until_ms: None, deletion_observation: None, deletion_record: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {

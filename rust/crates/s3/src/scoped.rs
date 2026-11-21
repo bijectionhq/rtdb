@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::{S3Authorization, S3Config};
 
-const SESSION_SECONDS: i32 = 15 * 60;
+pub const SCOPED_S3_WRITE_TTL: Duration = Duration::from_secs(15 * 60);
 pub const SCOPED_S3_CLOCK_ALLOWANCE: Duration = Duration::from_secs(1);
 
 #[async_trait]
@@ -62,7 +62,7 @@ impl ScopedS3Writes {
     fn provider(&self, storage: &S3Config, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>) -> Result<SharedCredentialsProvider> {
         let policy = write_policy(storage, root, &self.partition, self.require_conditional_put)?;
         let request = self.sts.assume_role().role_arn(&self.role).role_session_name("rtdb-deployment-write")
-            .duration_seconds(SESSION_SECONDS).policy(policy);
+            .duration_seconds(SCOPED_S3_WRITE_TTL.as_secs() as i32).policy(policy);
         Ok(SharedCredentialsProvider::new(AuthorizedRole { request, authorization }))
     }
 }
@@ -169,7 +169,7 @@ impl ProvideCredentials for AuthorizedRole {
             let credentials = response.credentials().ok_or_else(|| CredentialsError::provider_error("STS returned no credentials"))?;
             let expires = SystemTime::try_from(*credentials.expiration()).map_err(CredentialsError::provider_error)?;
             let now = SystemTime::now();
-            let maximum = now + Duration::from_secs(SESSION_SECONDS as u64) + SCOPED_S3_CLOCK_ALLOWANCE;
+            let maximum = now + SCOPED_S3_WRITE_TTL + SCOPED_S3_CLOCK_ALLOWANCE;
             if credentials.session_token().is_empty() || expires <= now || expires > maximum {
                 return Err(CredentialsError::provider_error("STS returned invalid session credentials"));
             }

@@ -612,21 +612,27 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    The current deletion path keeps a deployment in `deleting` for retry if objects remain.
    Deletion fences the deployment and waits for recorded S3 write sessions to expire before touching its object inventory or key.
    While the lease is active the delete command reports the earliest retry time and the deployment stays fenced.
-   During an upgrade from a writer that issued scoped credentials without recording them, wait 15 minutes and one second after every such writer has stopped before running deletion or source-cell cleanup.
+   S3 deletion also waits 15 minutes and one second from fencing to cover credentials issued before lease tracking was enabled.
+   Source-cell cleanup on S3 waits until the same interval has passed since cutover as well as for the configured reaper grace and any recorded write lease.
    Ordinary garbage collection skips a deployment once its lifecycle reaches `deleting`.
-   After an empty current inventory and local key destruction, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
+   After verifying the inventory and destroying the local key, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
    Retrying a completed deletion returns the stored receipt.
    Export the trusted public key with `rtdb-multi deletion-key --keys PATH` and verify the JSON from `delete` with `rtdb-multi verify-deletion --record PATH --public-key KEY`.
    The signed `facts` name the deployment, its fencing epoch, prefix, object and key namespaces, and the inventory scope.
    A local receipt has scope `current_objects`.
    Below the slash-delimited deployment prefix, S3 deletion aborts incomplete multipart uploads and verifies that their parts are gone, then removes retained versions and delete markers by version ID.
-   It confirms both inventories are empty during the attempt before signing scope `all_versions_and_multipart_uploads`.
+   It stores the first empty version and multipart inventories in the directory and reports the next retry time.
+   Retry `delete` at least 15 minutes and one second after the first observation for a read-only second inventory.
+   If the second inventory finds an object version or multipart upload, it resets the observation and keeps the key.
+   A further `delete` attempt erases and starts the observation interval again.
+   Once both empty observations are durable, the key service destroys the key and the signed receipt includes `first_empty_observed_at_ms` and `objects_erased_at_ms`.
    The S3 deletion role needs `s3:ListBucketVersions` and `s3:DeleteObjectVersion` alongside its current-object permissions. [ListObjectVersions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html) [DeleteObjects](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html)
    Multipart cleanup uses `s3:ListBucketMultipartUploads`, `s3:AbortMultipartUpload` and `s3:ListMultipartUploadParts`. [Multipart upload permissions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html#mpuAndPermissions)
    MinIO's multipart prefix query returns exact key matches.
    Custom S3 endpoints use a paged bucket listing for multipart uploads and abort only entries under the deployment prefix.
    Upgrade all directory readers before an S3 deletion writes the new scope to its tombstone.
-   The timestamps record successful observations during the attempt that publishes the receipt.
+   Upgrade directory readers, writers, and receipt verifiers before an S3 deletion writes the observation journal and its signed timestamps.
+   The earlier single-observation receipt remains verifiable with upgraded tools.
    A new deployment or fork uses an organisation identifier that fits one storage path component.
    Prefix erasure rejects overlap with another recorded deployment's prefix, including legacy records with older organisation identifiers.
    A holder binds its deployment to the node's configured namespaces in its first claim, and forks and cell moves carry the binding into their destination records.
@@ -637,7 +643,7 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    Upgrade directory writers before relying on recorded copy history for new ensemble changes.
    An existing deployment without a binding acquires one from a configured holder before forking or moving.
    An older deletion already in progress can adopt the binding when all live nodes publish the same configuration.
-   Credential expiry, provider KMS erasure and the second observation are still required for the full proof.
+   The full proof also requires a separately trusted, epoch-scoped storage credential issuer, provider KMS erasure and exclusion of concurrent administrative writers such as earlier reaper or lineage-transfer passes.
    A deployment moving between cells keeps ownership of its source tail until cutover.
 
 **Tests.**
