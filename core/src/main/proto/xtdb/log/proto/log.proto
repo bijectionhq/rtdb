@@ -30,6 +30,12 @@ message Tx {
     string user = 4;
     bytes user_metadata = 5;
     bytes external_source_token = 6;
+    IdempotencyGuard idempotency_guard = 7;
+}
+
+message IdempotencyGuard {
+    int64 submitted_at_micros = 1;
+    bool after_bootstrap = 2;
 }
 
 message BlockUploaded {

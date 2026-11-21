@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, decode_arguments, is_reserved_write_schema, table_name}};
 
+pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
+
 pub trait TransactionAuthorization: Send + Sync {
     /// Rejects an absent principal or a principal without the reference superuser authority.
     fn check_role_membership(&self, database: &str, principal: Option<&str>) -> Result<()>;
@@ -187,6 +189,10 @@ impl TxResolver {
                         Some(table) if !error.context.contains_key("table") => error.with_transit_context("table", &T::table_ref(table))?,
                         _ => error,
                     };
+                    let error = if let Some(guard) = &request.idempotency_guard && error.code == "xtdb/assert-failed" {
+                        let guard_time = crate::guard_attribution::guard_time_at(index, guard.after_bootstrap, guard.submitted_at.0);
+                        error.with_context(IDEMPOTENCY_GUARD_RESULT, guard_time.map_or(false.into(), Into::into))
+                    } else { error };
                     outcome = Err(error.with_context("tx-op-idx", index.into()).with_context("tx-key", tx_key_context(key)?));
                     break;
                 }

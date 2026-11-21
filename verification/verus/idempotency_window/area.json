@@ -1,0 +1,83 @@
+{
+  "summary": "The checked helpers compute a finite one-hour endpoint and recognize the recorded duplicate guard position.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "guard_attribution"
+  ],
+  "min_verified_functions": 3,
+  "controls": {
+    "expire_one_microsecond_early": {
+      "mutate": [
+        {
+          "file": "rust/crates/node/src/idempotency_window.rs",
+          "find": "submitted_at.checked_add(HOUR_MICROS)?",
+          "replace": "submitted_at.checked_add(HOUR_MICROS - 1)?"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/node/src/idempotency_window.rs",
+          "function": "expiration",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "admit_the_infinite_endpoint": {
+      "mutate": [
+        {
+          "file": "rust/crates/node/src/idempotency_window.rs",
+          "find": "if expiry == i64::MAX { None } else { Some(expiry) }",
+          "replace": "Some(expiry)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/node/src/idempotency_window.rs",
+          "function": "expiration",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "attribute_user_assertion_after_guard": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/guard_attribution.rs",
+          "find": "if after_bootstrap { 1 } else { 0 }",
+          "replace": "if after_bootstrap { 1 } else { 1 }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/guard_attribution.rs",
+          "function": "guard_time_at",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "erase_bootstrap_offset": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/guard_attribution.rs",
+          "find": "if after_bootstrap { 1 } else { 0 }",
+          "replace": "0"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/guard_attribution.rs",
+          "function": "guard_time_at",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    }
+  }
+}

@@ -124,6 +124,18 @@ cargo build --locked --manifest-path rust/Cargo.toml -p rtdb-server --features k
 RTDB_CLASSIC_BIN="$PWD/rust/target/debug/rtdb" bash verification/classic-kafka-s3.sh
 ```
 
+### Submission clock and durable retry attribution
+
+Native submissions with an application idempotency key use a finite one-hour marker interval measured from submission.
+The resolver identifies the generated duplicate guard by its recorded position in the source transaction.
+An assertion failure elsewhere in the same operation sequence keeps its own aborted result.
+The outcome lookup uses the retry's historical system-time view of the key marker.
+The new reader still recognizes earlier source records and looks up their duplicate outcomes using the older guard convention.
+Verus checks the exact expiration boundary and operation-position helpers, with four mutation controls.
+Native regressions cover a system-time jump, a user assertion at the next position, concurrent submissions, and old and new outcome lookup after local restart.
+The application marker table remains writable through ordinary DML.
+This evidence covers the checked helpers and the tested recovery trace. [Native tests](../../rust/crates/node/tests/native.rs) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Source transaction contract](db.allium)
+
 ## Multi evidence
 
 The multi models describe the separate `e86af7f12` branch baseline and its directory, Logkeeper, and object-store assumptions.

@@ -24,8 +24,14 @@ pub(crate) enum Operation {
 pub struct SourceTransaction {
     pub(crate) operations: Vec<Operation>,
     pub options: SubmitOptions,
+    pub(crate) idempotency_guard: Option<IdempotencyGuard>,
     pub(crate) memory: Arc<MemoryBudget>,
     _reservation: Arc<MemoryReservation>,
+}
+
+pub(crate) struct IdempotencyGuard {
+    pub(crate) submitted_at: Timestamp,
+    pub(crate) after_bootstrap: bool,
 }
 
 impl SourceTransaction {
@@ -45,7 +51,12 @@ impl SourceTransaction {
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
         }
         let reservation = memory.reserve(bytes)?;
-        Ok(Self { operations, options, memory: Arc::clone(memory), _reservation: reservation })
+        Ok(Self { operations, options, idempotency_guard: None, memory: Arc::clone(memory), _reservation: reservation })
+    }
+
+    pub fn with_idempotency_guard(mut self, submitted_at: Timestamp, after_bootstrap: bool) -> Self {
+        self.idempotency_guard = Some(IdempotencyGuard { submitted_at, after_bootstrap });
+        self
     }
 
     /// Decodes current flat tx operations and the legacy one-row envelope without expanding SQL.
@@ -56,16 +67,24 @@ impl SourceTransaction {
             _ => 0,
         };
         let _option_scratch = memory.reserve(option_bytes)?;
-        let (pages, mut options, legacy) = match message {
+        let (pages, mut options, idempotency_guard, legacy) = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
                 let bytes = tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
                 let options = SubmitOptions { default_tz: tx.default_tz.clone().ok_or_else(|| invalid("Transaction has no default timezone"))?, system_time: tx.system_time_micros.map(Timestamp), user: tx.user.clone(), user_metadata: tx.user_metadata.as_deref().filter(|bytes| !bytes.is_empty()).map(|bytes| decode_metadata(bytes, memory)).transpose()? };
-                (crate::ipc::decode(bytes, memory)?, options, false)
+                let idempotency_guard = tx.idempotency_guard.as_ref().map(|guard| {
+                    let submitted_at = Timestamp(guard.submitted_at_micros.ok_or_else(|| invalid("Idempotency guard has no submission timestamp"))?);
+                    let after_bootstrap = guard.after_bootstrap.ok_or_else(|| invalid("Idempotency guard has no operation position"))?;
+                    Ok::<_, Anomaly>(IdempotencyGuard { submitted_at, after_bootstrap })
+                }).transpose()?;
+                (crate::ipc::decode(bytes, memory)?, options, idempotency_guard, false)
             }
-            SourceMessage::LegacyTransaction(bytes) => (crate::ipc::decode(bytes, memory)?, SubmitOptions::default(), true),
+            SourceMessage::LegacyTransaction(bytes) => (crate::ipc::decode(bytes, memory)?, SubmitOptions::default(), None, true),
             _ => return Err(invalid("Source message is not a transaction")),
         };
-        if pages.is_empty() && !legacy { return Self::from_operations(Vec::new(), options, memory); }
+        if pages.is_empty() && !legacy {
+            if idempotency_guard.is_some() { return Err(invalid("Idempotency guard has no operation")); }
+            return Self::from_operations(Vec::new(), options, memory);
+        }
         let first = pages.first().ok_or_else(|| invalid("Transaction IPC stream has no record batch"))?;
         let mut parsed_fields = memory.reserve(4096)?;
         let parsed_fields = Arc::get_mut(&mut parsed_fields).expect("source decoding owns its reservation");
@@ -96,7 +115,15 @@ impl SourceTransaction {
             let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Transaction operations are not a union"))?;
             for row in 0..union.len() { operations.push(reader.operation(union, row)?); }
         }
-        Self::from_operations(operations, options, memory)
+        if let Some(guard) = &idempotency_guard {
+            let operation = operations.get(usize::from(guard.after_bootstrap));
+            if !matches!(operation, Some(Operation::Public(TxOp::Sql { args: None, .. }))) {
+                return Err(invalid("Idempotency guard does not name a SQL operation without arguments"));
+            }
+        }
+        let mut transaction = Self::from_operations(operations, options, memory)?;
+        transaction.idempotency_guard = idempotency_guard;
+        Ok(transaction)
     }
 
     /// Encodes the operations as supplied; submit-time SQL expansion is a separate caller operation.
@@ -110,6 +137,10 @@ impl SourceTransaction {
             tx_ops: Some(bytes.as_slice().to_vec()), system_time_micros: self.options.system_time.map(|time| time.0),
             default_tz: Some(self.options.default_tz.clone()), user: self.options.user.clone(),
             user_metadata: metadata.as_ref().map(|bytes| bytes.as_slice().to_vec()), external_source_token: None,
+            idempotency_guard: self.idempotency_guard.as_ref().map(|guard| rtdb_format::generated::xtdb::log::proto::IdempotencyGuard {
+                submitted_at_micros: Some(guard.submitted_at.0),
+                after_bootstrap: Some(guard.after_bootstrap),
+            }),
         };
         let wire = rtdb_format::generated::xtdb::log::proto::SourceLogMessage { message: Some(SourceBody::Tx(tx)) };
         let reservation = self.memory.reserve(wire.encoded_len().checked_add(128).ok_or_else(overflow)?)?;

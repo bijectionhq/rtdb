@@ -2164,6 +2164,159 @@ async fn duplicate_transaction_outcomes_are_deployment_local_and_repeatable() {
 }
 
 #[tokio::test]
+async fn system_time_advances_do_not_expire_a_recent_transaction_key() {
+    let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+    let services = NodeServices {
+        resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)),
+        clock: clock.clone(),
+        ..services()
+    };
+    let (node, driver) = running(options(), services).await;
+    let key = rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([
+        ("idempotency_key".into(), Value::Utf8("charge-7".into())),
+    ])), node.memory()).unwrap();
+    let keyed = || AutonomousTxOptions { user_metadata: Some(key.clone()), ..Default::default() };
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let original = session.state_mut().execute_tx(vec![put(&node, 1, 10)], keyed()).await.unwrap();
+    assert!(original.committed());
+
+    clock.0.fetch_add(900_000_000, Ordering::Relaxed);
+    for (id, advance) in [(2, 3_900_000_000), (3, 7_200_000_000)] {
+        let later_system_time = Timestamp(original.tx_key().system_time.0 + advance);
+        let advanced = session.state_mut().execute_tx(Vec::new(), AutonomousTxOptions {
+            system_time: Some(later_system_time), ..Default::default()
+        }).await.unwrap();
+        assert_eq!(advanced.tx_key().system_time, later_system_time);
+        assert!(advanced.committed());
+
+        let replay = session.state_mut().execute_tx(vec![put(&node, id, 20)], keyed()).await.unwrap();
+        assert!(replay.committed(), "{replay:?}");
+        assert_eq!(replay.tx_key(), original.tx_key());
+    }
+    assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn a_user_assertion_cannot_report_an_expired_commit_as_its_outcome() {
+    let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+    let services = NodeServices {
+        resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)),
+        clock: clock.clone(),
+        ..services()
+    };
+    let (node, driver) = running(options(), services).await;
+    let key = rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([
+        ("idempotency_key".into(), Value::Utf8("charge-7".into())),
+    ])), node.memory()).unwrap();
+    let keyed = || AutonomousTxOptions { user_metadata: Some(key.clone()), ..Default::default() };
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let original = session.state_mut().execute_tx(vec![put(&node, 1, 10)], keyed()).await.unwrap();
+    assert!(original.committed());
+
+    clock.0.fetch_add(3_601_000_000, Ordering::Relaxed);
+    let user_assert = TxOp::Sql {
+        sql: "ASSERT NOT EXISTS (SELECT 1 FROM public.rtdb_idempotency_keys FOR VALID_TIME FROM TIMESTAMP '1970-01-01T00:00:02Z' TO NULL WHERE _id = 'charge-7')".into(),
+        args: None,
+    };
+    let attempted = session.state_mut().submit_tx(vec![user_assert, put(&node, 2, 20)], keyed()).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let result = node.await_transaction("xtdb", attempted.tx_id, &Authority, &cancellation).await.unwrap();
+    assert_eq!(result.tx_key().tx_id, attempted.tx_id);
+    assert_eq!(result.error().map(|error| error.code.as_str()), Some("xtdb/assert-failed"));
+    assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn legacy_source_and_typed_duplicate_outcomes_survive_recovery() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let config = DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog {
+                path: Some(directory.path().join("log").to_string_lossy().into_owned()), epoch: Some(0),
+            })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage {
+                path: Some(directory.path().join("store").to_string_lossy().into_owned()), epoch: Some(0),
+            })),
+            ..Default::default()
+        };
+        let runtime = services();
+        let resources = NativeResources::default().with_local_log_clock(Arc::clone(&runtime.clock), false);
+        let cancellation = CancellationToken::new();
+        let mut seeded = resources.open("xtdb", &config, LogAccess::ReadWrite, cancellation.clone()).await.unwrap();
+        let drivers: Vec<_> = std::mem::take(&mut seeded.logs.drivers).into_iter().map(tokio::spawn).collect();
+        let memory = rtdb_columnar::MemoryBudget::new(16 * 1024 * 1024);
+        let key = rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([
+            ("idempotency_key".into(), Value::Utf8("legacy-charge".into())),
+        ])), &memory).unwrap();
+        let put_doc = |table, id, valid_to| TxOp::PutDocs {
+            table: TableRef::new("public", table),
+            documents: Documents::new(vec![StructFields::from([("_id".into(), id)])], &memory).unwrap(),
+            valid_from: None, valid_to,
+        };
+        let old_guard = || TxOp::Sql {
+            sql: "ASSERT NOT EXISTS (SELECT 1 FROM rtdb_idempotency_keys WHERE _id = 'legacy-charge')".into(),
+            args: None,
+        };
+        let marker = || put_doc(IDEMPOTENCY_TABLE, Value::Utf8("legacy-charge".into()), Some(Timestamp(3_601_000_000)));
+        let mut ids = Vec::new();
+        for operations in [
+            vec![put_doc(IDEMPOTENCY_TABLE, Value::Utf8("~table".into()), None), old_guard(),
+                 put_doc("docs", Value::I64(1), None), marker()],
+            vec![old_guard(), put_doc("docs", Value::I64(2), None), marker()],
+        ] {
+            let request = rtdb_tx::SourceTransaction::new(operations, rtdb_tx::SubmitOptions {
+                user_metadata: Some(key.clone()), ..Default::default()
+            }, &memory).unwrap();
+            let encoded = request.encode().unwrap();
+            let Some(rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::Tx(wire))) =
+                rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap()
+            else { panic!("expected a structured source transaction") };
+            assert!(wire.idempotency_guard.is_none());
+            let appended = seeded.logs.source.enqueue(encoded.into_bytes(), runtime.clock.now()).await.unwrap().durable().await.unwrap();
+            ids.push(TxId(appended.offset.0));
+        }
+        cancellation.cancel();
+        for driver in drivers { driver.await.unwrap().unwrap(); }
+        seeded.io.close_and_wait().await;
+        drop(seeded);
+        resources.close().await.unwrap();
+
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary: config, skipped: BTreeSet::new() };
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+        let cancellation = CancellationToken::new();
+        let original = node.await_transaction("xtdb", ids[0], &Authority, &cancellation).await.unwrap();
+        assert!(original.committed());
+        let legacy_retry = node.await_transaction("xtdb", ids[1], &Authority, &cancellation).await.unwrap();
+        assert_eq!(legacy_retry.tx_key(), original.tx_key());
+
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let typed_retry = session.state_mut().submit_tx(vec![put(&node, 3, 30)], AutonomousTxOptions {
+            user_metadata: Some(key), ..Default::default()
+        }).await.unwrap();
+        let latest = node.await_transaction("xtdb", typed_retry.tx_id, &Authority, &cancellation).await.unwrap();
+        assert_eq!(latest.tx_key(), original.tx_key());
+        drop(session);
+        stop(&node, driver).await;
+
+        let (reopened, driver) = running(settings, fresh_local_services(&runtime)).await;
+        for id in [ids[1], typed_retry.tx_id] {
+            let result = reopened.await_transaction("xtdb", id, &Authority, &cancellation).await.unwrap();
+            assert!(result.committed());
+            assert_eq!(result.tx_key(), original.tx_key());
+        }
+        let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+        drop(session);
+        stop(&reopened, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn a_keyed_transaction_rejected_before_its_duplicate_guard_keeps_its_error() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();

@@ -1,6 +1,7 @@
 mod values;
 mod ipc;
 mod source;
+mod guard_attribution;
 mod resolver;
 mod system_time;
 mod replica;
