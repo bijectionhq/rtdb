@@ -30,7 +30,15 @@ def clone_file(relative, directory):
 
 
 def run_case(command, directory, evidence, case, env=None):
-    result = subprocess.run(command, cwd=directory, text=True, capture_output=True, timeout=120, env=env)
+    try:
+        result = subprocess.run(
+            command, cwd=directory, text=True, capture_output=True,
+            timeout=300 if command[0] == "cargo" else 120, env=env,
+        )
+    except subprocess.TimeoutExpired as error:
+        (evidence / f"{case}.stdout").write_bytes(error.stdout or b"")
+        (evidence / f"{case}.stderr").write_bytes(error.stderr or b"")
+        raise TimeoutError(f"{case} timed out after {error.timeout} seconds") from error
     (evidence / f"{case}.stdout").write_text(result.stdout)
     (evidence / f"{case}.stderr").write_text(result.stderr)
     return result
