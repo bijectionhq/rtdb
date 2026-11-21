@@ -1234,6 +1234,40 @@ RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_TIMEOUT_SECONDS=240 RTDB_TEST_PGWI
   durable_pgwire_updates_under_zipf_activity -- --ignored --exact --nocapture
 ```
 
+**Three-availability-zone recovery and startup**
+
+The AWS qualification ran a release build on one C7g.4xlarge and two C7g.large instances in three us-east-1 availability zones.
+Each zone hosted a logkeeper with fsync enabled, and the directory used durable file-backed TCP service.
+The cells used AWS S3 for data and a separate AWS S3 key vault.
+The gateway and controller ran in separate zones.
+The release builds used the `s3-key-vault` feature and disabled link-time optimization.
+
+Both default-block runs allocated 89 deployments, seeded 25, ran 2,048 acknowledged updates over 16 persistent sessions, and checked the final total.
+The recovery run explicitly checkpointed 24 installations and acknowledged another update on each immediately before it killed the writer.
+A burst admitted up to 24 clients at a time across 24 recovered installations and 64 previously unopened ones.
+Each recovered installation returned the checkpoint and acknowledged tail, then accepted another write.
+
+| Phase | Serial preparation `572d72d81f` | Parallel preparation `27590505d0` |
+| --- | ---: | ---: |
+| Warm update p99 | 320 ms | 320 ms |
+| Gateway-only partition startup p99, 24 sessions | 1.14 s | 1.14 s |
+| Recovered startup and verification query p99, 24 sessions | 8.53 s | 3.57 s |
+| Cold startup and verification query p99, 64 sessions | 7.43 s | 1.30 s |
+| End of the combined recovery and cold-start burst | 22.51 s | 5.37 s |
+
+Per-client measurements start when the benchmark admits the request.
+Burst duration includes time waiting for admission.
+The parallel build also includes the upstream checkpoint table manifest change.
+Both partition trials blocked the gateway's direct Pgwire port to the only writer and allowed the controller's path.
+All 24 clients reached that writer through its control relay.
+
+A second workload forced a checkpoint after 64 rows or six seconds.
+The serial build hit the startup deadline during the combined burst.
+On the parallel build all 88 startups completed and all 24 recovered deployments accepted another write.
+Recovery p99 was 9.91 s, cold-start p99 was 3.09 s, and the full burst took 10.69 s.
+Warm update p99 in that forced-flush run was 2.23 s.
+
+
 **DynamoDB parked item size**
 
 For an unheld deployment with three UUID logkeeper IDs, the prepared DynamoDB item uses the following estimated storage from attribute names and values.
