@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 
 use rtdb_directory::{Directory, MemberId, effective_holder, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HolderObservation {
     pub authority: uuid::Uuid,
     pub incarnation: u64,

@@ -41,6 +41,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi roll-engine --directory DIR --version VERSION\n\
        rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
        rtdb-multi observe-holder --directory DIR --id UUID --incarnation N\n\
+       rtdb-multi move-observed-holder --directory DIR --observation FILE --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
@@ -587,6 +588,22 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "move" => {
             let directory = directory(arguments.required("directory")?).await?;
             admin::move_deployment(directory.as_ref(), arguments.required("name")?, &rtdb_directory::MemberId(arguments.required("to")?.into()), &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await
+        }
+        "move-observed-holder" => {
+            let file = std::fs::File::open(arguments.required("observation")?).map_err(io)?;
+            let mut bytes = Vec::new();
+            file.take(16_385).read_to_end(&mut bytes).map_err(io)?;
+            if bytes.len() > 16_384 {
+                return Err(usage("Holder observation exceeds 16 KiB".into()));
+            }
+            let original = serde_json::from_slice::<admin::HolderObservation>(&bytes)
+                .map_err(|_| usage("Invalid holder observation".into()))?;
+            let directory = directory(arguments.required("directory")?).await?;
+            let target = rtdb_directory::MemberId(arguments.required("to")?.into());
+            let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
+            let successor = admin::move_observed_holder(directory.as_ref(), &original, &target, &control).await?;
+            println!("{}", serde_json::to_string(&successor).expect("a holder observation serializes"));
+            Ok(())
         }
         "pin-engine" => {
             let version = match (arguments.present("clear"), arguments.present("version")) {

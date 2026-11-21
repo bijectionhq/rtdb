@@ -215,7 +215,55 @@ pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &Mem
 
 pub(crate) async fn move_from_holding(directory: &dyn Directory, name: &str, target: &MemberId,
                                       source: Option<(&MemberId, u64)>, control: &ControlKey) -> Result<()> {
-    let members = members(directory).await?;
+    move_placement(directory, name, target, source, None, control).await
+}
+
+/// Move only the installation named by an actual holder observation.
+/// The source identity and epoch are checked inside the reservation CAS.
+pub async fn move_observed_holder(
+    directory: &dyn Directory,
+    original: &HolderObservation,
+    target: &MemberId,
+    control: &ControlKey,
+) -> Result<HolderObservation> {
+    let changed = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-source-changed",
+        "The commissioned writer or its database placement changed");
+    if original.authority.is_nil() || original.incarnation == 0 || original.epoch == 0
+        || original.directory_version == 0 || original.member_version == 0
+        || original.observed_at_ms <= 0 || original.lease_expires_at_ms <= original.observed_at_ms
+        || &original.holder == target
+    {
+        return Err(changed());
+    }
+    let name = directory.deployment(&original.authority.to_string()).await?
+        .ok_or_else(changed)?.name;
+    move_placement(
+        directory, &name, target, Some((&original.holder, original.epoch)), Some(original), control,
+    ).await?;
+    let successor = observe_holder(directory, original.authority, original.incarnation).await?;
+    if &successor.holder != target || successor.log_epoch != original.log_epoch
+        || successor.epoch <= original.epoch || successor.directory_version <= original.directory_version
+        || successor.engine_version != original.engine_version
+    {
+        return Err(changed());
+    }
+    Ok(successor)
+}
+
+async fn move_placement(directory: &dyn Directory, name: &str, target: &MemberId,
+                        source: Option<(&MemberId, u64)>, observed: Option<&HolderObservation>,
+                        control: &ControlKey) -> Result<()> {
+    let members = if let Some(observed) = observed {
+        let mut selected = BTreeMap::new();
+        for id in [&observed.holder, target] {
+            if let Some(record) = directory.member(id).await? {
+                selected.insert(record.id.clone(), record);
+            }
+        }
+        selected
+    } else {
+        members(directory).await?
+    };
     let address = control_address(&members, target)?;
     let reservation = PlacementMove {
         request: uuid::Uuid::new_v4(),
@@ -228,11 +276,25 @@ pub(crate) async fn move_from_holding(directory: &dyn Directory, name: &str, tar
         if source.is_some_and(|(member, epoch)| record.epoch != epoch || holder != Some(member)) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-source-changed", format!("{name} has already changed holders")));
         }
+        if observed.is_some_and(|observed| {
+            record.id != observed.authority.to_string()
+                || record.incarnation != observed.incarnation
+                || record.log_epoch != observed.log_epoch
+                || record.version < observed.directory_version
+                || [&observed.holder, target].into_iter().any(|member| {
+                    members.get(member).is_none_or(|member| member.engine_version != observed.engine_version)
+                })
+        }) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-source-changed",
+                "The observed installation or commissioned engine no longer matches"));
+        }
         if !members.get(target).is_some_and(|member| record.may_place_on(member, now)) {
             return Err(Anomaly::incorrect("rtdb.multi/not-placeable", format!("{target} may not take placements of {name}")));
         }
         if holder == Some(target) { return Ok(()); }
-        if record.active_move(now).is_some_and(|intent| members.get(&intent.target).is_some_and(|member| record.may_place_on(member, now))) {
+        if record.active_move(now).is_some_and(|intent| observed.is_some()
+            || members.get(&intent.target).is_some_and(|member| record.may_place_on(member, now)))
+        {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} already has a reserved placement")));
         }
         record.move_intent = None;
