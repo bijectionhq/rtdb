@@ -1348,3 +1348,23 @@ Both tools run these cases through the combined runner.
 The finite study assumes the directory's retirement floor already has a valid producer.
 The Rust driver facts used in the refinement brief are its separate receive and apply boundaries and its independently published status watch.
 The storage receipt and reader admission adapter still need an installed catalog cut in production. link:../tla/CatalogCutPublication.tla[Comparison and controls]
+
+=== Delegated scan storage and journal identity
+
+At `65b86e478`, a Multi fragment carries the namespace and prefix of the coordinator's opened store and the epoch of its opened replica journal.
+The router compares that receipt with the current directory record.
+The receiver compares the receipt again against the immutable database handle used to capture the worker's snapshot.
+The wire tag distinguishes the scoped operation so an older worker cannot accept it through the earlier operation.
+
+TLC explored 26 reachable states and found that the accepted worker response always belongs to the captured history in the model.
+It rejected binding a request to the latest route, trusting the routing check at the worker, and ignoring the replica epoch.
+The witnesses covered a matching read and a worker-side refusal after replacement.
+The model uses distinct namespace, prefix and epoch values for distinct histories.
+Storage and log providers remain responsible for that identity premise.
+
+The selected Rust suites passed 564 tests, including 79 Multi cell tests and 23 query scan tests.
+The new cell case exercises a matching request, a different storage residence, a different epoch, a missing scope and decoding of the earlier wire tag.
+The two source controls independently ignore the namespace-qualified storage receipt and the epoch in the production worker comparison.
+They failed at the expected assertions.
+The clean `node.rs` SHA-256 is `8e94e7e29f59a8554ac4f6904b5e78e2759a11f6bc5b796cf769dfc48aa6fed0`.
+The new controls run with `--native-replay`. link:../tla/FragmentResidence.tla[Residence transition model]
