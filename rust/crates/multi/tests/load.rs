@@ -56,19 +56,21 @@ struct BenchmarkDeployment {
 }
 
 fn sample_write_latencies<'a>(phase: &str, samples: impl Iterator<Item = &'a WriteSample>) -> Option<f64> {
-    let (mut total, mut queue, mut wire) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut total, mut queue, mut startup, mut wire) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for sample in samples {
         total.push(sample.finished - sample.started);
         queue.push(sample.acquired - sample.started);
+        startup.push(sample.sent - sample.acquired);
         wire.push(sample.finished - sample.sent);
     }
     if total.is_empty() { return None; }
     total.sort_unstable();
     queue.sort_unstable();
+    startup.sort_unstable();
     wire.sort_unstable();
     let p99 = percentile(&total, 99);
-    println!("phase={phase} commits={} p95_ms={:.3} p99_ms={p99:.3} queue_p99_ms={:.3} wire_p99_ms={:.3}",
-        total.len(), percentile(&total, 95), percentile(&queue, 99), percentile(&wire, 99));
+    println!("phase={phase} commits={} p95_ms={:.3} p99_ms={p99:.3} queue_p99_ms={:.3} startup_p99_ms={:.3} wire_p99_ms={:.3}",
+        total.len(), percentile(&total, 95), percentile(&queue, 99), percentile(&startup, 99), percentile(&wire, 99));
     Some(p99)
 }
 

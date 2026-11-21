@@ -976,6 +976,7 @@ The workload verified every final counter across 32,768 writes, seven scale-out 
 The process peaked at 8.61 GiB of sampled RSS.
 It sustained 3,766 writes/s with overall p99 of 18.9 ms and p99 of 16.4 ms outside scale transitions.
 Scale-out and scale-in p99 reached 279.5 ms and 105.5 ms respectively.
+Phase output reports connection startup and initialization separately from waiting for a connection slot and from the wire round trip.
 The provider staging run still needs equivalent evidence from the production directory and storage.
 
 ```sh
