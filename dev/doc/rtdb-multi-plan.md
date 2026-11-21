@@ -757,6 +757,7 @@ Moves are invisible to clients only if the gateway owns connections and session 
    If a holder accepts a socket but stalls before `ReadyForQuery`, the gateway closes startup with SQLSTATE `57P03` so the client can retry.
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
    A gateway routing directly to a known writer reads that member by ID before considering other candidates.
+   A redirect is followed through the replacement node’s control endpoint so pgwire connects after the replacement confirms its endpoint and epoch.
    The writer checks its own membership by ID when it reuses a running placement.
    If a placed database detaches or changes while a query checks authority, the node refuses before planning so the gateway can retry.
    A direct Flight SQL session on a placed node supplies `x-xtdb-database` on its first authenticated request.
@@ -967,6 +968,14 @@ Baseline p99 ranged from 68.8 to 188.2 ms during scale-out and from 119.7 to 253
 The completed prefetch trials measured 169.7–686.4 ms during scale-out and 97.1–138.8 ms during scale-in.
 The 48-move gap p99 ranged from 100.3 to 2,358.4 ms on the baseline and from 129.2 to 3,032.8 ms with the prefetch.
 The branch keeps the existing handoff path while the prefetch strategy is evaluated.
+
+A second comparison ran three paired release trials with the same 32,768-update Zipf workload and 48 continuous handoffs per build.
+In this experiment, opening the checkpoint and quorum log overlapped after authorizing the storage region.
+All six Zipf counters and all six handoff counters verified on a shared development host.
+Baseline scale-out p99 ranged from 105.8 to 255.9 ms and scale-in p99 ranged from 74.0 to 292.9 ms.
+With overlapping opens, those ranges were 148.4–2,304.7 ms and 111.8–3,734.8 ms.
+The 48-move gap p99 ranged from 122.3 to 182.2 ms on the baseline and from 133.8 to 212.5 ms with overlapping opens.
+Checkpoint and quorum-log opens remain sequential.
 
 ### Stage 12: encryption, lineages, forks and deletion
 
