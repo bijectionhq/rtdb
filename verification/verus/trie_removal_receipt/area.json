@@ -1,0 +1,177 @@
+{
+  "summary": "A trie removal receipt requires a recognized installed prefix and exclusion from the live catalog and checkpoint.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 5,
+  "controls": {
+    "unrecognized": {
+      "defect": "The driver encountered an unrecognized prefix.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "    recognized && installed >= removal && !required\n}",
+          "replace": "    installed >= removal && !required\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "function": "confirms_removal",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "unrecognized_and_contract": {
+      "defect": "The function and contract change together. The driver encountered an unrecognized prefix.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "    recognized && installed >= removal && !required\n}",
+          "replace": "    installed >= removal && !required\n}"
+        },
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "out <==> (recognized && installed >= removal && !required)",
+          "replace": "out <==> (installed >= removal && !required)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/trie_removal_receipt/laws.rs",
+          "function": "an_unrecognized_prefix_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "not_installed": {
+      "defect": "The installed prefix stops before the removal record.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "    recognized && installed >= removal && !required\n}",
+          "replace": "    recognized && !required\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "function": "confirms_removal",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "not_installed_and_contract": {
+      "defect": "The function and contract change together. The installed prefix stops before the removal record.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "    recognized && installed >= removal && !required\n}",
+          "replace": "    recognized && !required\n}"
+        },
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "out <==> (recognized && installed >= removal && !required)",
+          "replace": "out <==> (recognized && !required)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/trie_removal_receipt/laws.rs",
+          "function": "a_prefix_before_the_removal_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "retained_trie": {
+      "defect": "The current catalog or its checkpoint still holds a trie from the batch.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "    recognized && installed >= removal && !required\n}",
+          "replace": "    recognized && installed >= removal\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "function": "confirms_removal",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "retained_trie_and_contract": {
+      "defect": "The function and contract change together. The current catalog or its checkpoint still holds a trie from the batch.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "    recognized && installed >= removal && !required\n}",
+          "replace": "    recognized && installed >= removal\n}"
+        },
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "out <==> (recognized && installed >= removal && !required)",
+          "replace": "out <==> (recognized && installed >= removal)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/trie_removal_receipt/laws.rs",
+          "function": "a_required_trie_refuses",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "exclusive_prefix": {
+      "defect": "The driver incorrectly requires a later record after the removal.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "    recognized && installed >= removal && !required\n}",
+          "replace": "    recognized && installed > removal && !required\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "function": "confirms_removal",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "exclusive_prefix_and_contract": {
+      "defect": "The function and contract change together. The driver incorrectly requires a later record after the removal.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "    recognized && installed >= removal && !required\n}",
+          "replace": "    recognized && installed > removal && !required\n}"
+        },
+        {
+          "file": "rust/crates/replication/src/retirement_receipt.rs",
+          "find": "out <==> (recognized && installed >= removal && !required)",
+          "replace": "out <==> (recognized && installed > removal && !required)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/trie_removal_receipt/laws.rs",
+          "function": "an_installed_removal_confirms",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

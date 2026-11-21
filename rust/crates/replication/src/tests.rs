@@ -389,6 +389,69 @@ async fn catalog_cut_advances_when_resolution_releases_deferred_records() {
     drop(receipt);
 }
 
+async fn queued_trie_removal(key: &str) -> (Fixture, TableRef, rtdb_format::keys::TrieKey, oneshot::Receiver<Result<Applied>>, LogRecord) {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }));
+    fixture.replica.enqueue(opening.payload.clone(), opening.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    fixture.driver.consume(opening).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+    let table = TableRef::new("public", "docs");
+    fixture.driver.partition.add_tries(&BTreeMap::from([(table.clone(), ["l01-rc-b00", "l01-rc-b01"].into_iter().map(|key| {
+        rtdb_index::CatalogTrie::notification(key.parse().unwrap(), 1, None).unwrap()
+    }).collect())]), Timestamp(100)).unwrap();
+    let key: rtdb_format::keys::TrieKey = key.parse().unwrap();
+    let (completion, receiver) = oneshot::channel();
+    fixture.driver.command(super::Command::Delete {
+        term: Term(1), table: table.clone(), keys: vec![key.clone()], completion,
+    }).await.unwrap();
+    let mut tail = fixture.replica.tail(LogOffset(0)).await.unwrap();
+    let mut records = tail.poll(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(records.len(), 1);
+    (fixture, table, key, receiver, records.pop().unwrap())
+}
+
+#[tokio::test]
+async fn trie_removal_receipt_waits_for_the_installed_catalog_cut() {
+    let (mut fixture, table, key, mut receipt, readback) = queued_trie_removal("l01-rc-b00").await;
+    let record = fixture.logs.decode_replica(readback).unwrap().unwrap();
+    let position = record.metadata.position;
+    let (_, admitted) = fixture.driver.fence.admit_record(record).unwrap();
+    fixture.driver.apply_admitted(admitted.unwrap()).await.unwrap();
+
+    let view = fixture.driver.partition.value();
+    assert!(!view.retains_trie(&table, &key));
+    assert_eq!(view.snapshot().catalog_cut().unwrap().through, ReplicaPosition(0));
+    assert!(matches!(receipt.try_recv(), Err(Empty)), "trie removal replied before the installed prefix");
+
+    fixture.driver.read_position = position;
+    fixture.driver.update_installed_prefix().unwrap();
+    assert!(matches!(receipt.try_recv().unwrap().unwrap(), Applied::TrieRemoval(through) if through == position));
+    assert_eq!(fixture.driver.partition.value().snapshot().catalog_cut().unwrap().through, position);
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn trie_removal_receipt_refuses_a_remaining_live_trie() {
+    let (mut fixture, table, key, receipt, readback) = queued_trie_removal("l01-rc-b01").await;
+    fixture.driver.consume(readback).await.unwrap();
+    assert_eq!(receipt.await.unwrap().unwrap_err().code, "rtdb.replication/trie-removal-unconfirmed");
+    assert!(fixture.driver.partition.value().retains_trie(&table, &key));
+    fixture.driver.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn trie_removal_receipt_refuses_a_different_readback() {
+    let (mut fixture, table, key, receipt, mut readback) = queued_trie_removal("l01-rc-b00").await;
+    let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
+    let ReplicaBody::TriesDeleted(message) = &mut envelope.message else { panic!("expected a trie removal"); };
+    message.trie_keys = vec!["l01-rc-b09".into()];
+    readback.payload = envelope.encode().into();
+    fixture.driver.consume(readback).await.unwrap();
+    assert_eq!(receipt.await.unwrap().unwrap_err().code, "rtdb.replication/trie-removal-unconfirmed");
+    assert!(fixture.driver.partition.value().retains_trie(&table, &key));
+    fixture.driver.demote().await.unwrap();
+}
+
 #[tokio::test]
 async fn wrong_epoch_upload_is_held_and_record_overflow_stops_apply() {
     let config = ReplicationConfig { may_lead: false, pending_block_records: 1, ..Default::default() };
@@ -1267,7 +1330,7 @@ async fn demotion_fails_queued_gc_publication_without_failing_the_progress_monit
     fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
     fixture.driver.promote().await.unwrap();
     let (completion, result) = tokio::sync::oneshot::channel();
-    fixture.driver.command(super::Command::Delete { term: Term(1), table: TableRef::new("public", "docs"), keys: vec![rtdb_format::keys::TrieKey::l0(BlockIndex(0)).unwrap()], completion }).await.unwrap();
+    fixture.driver.command(super::Command::Delete { term: Term(1), table: TableRef::new("public", "docs"), keys: vec!["l01-rc-b00".parse().unwrap()], completion }).await.unwrap();
     fixture.driver.consume(raw(0, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
     assert_eq!(result.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert!(fixture.handle.progress().fault().is_none());

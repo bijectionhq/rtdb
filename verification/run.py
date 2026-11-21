@@ -1864,6 +1864,33 @@ def verify_checkpoint_trie_retention(args, source):
     print("rust-checkpoint-trie-retention: native dependency test passed, ignoring the checkpoint failed")
 
 
+def verify_trie_removal_readback(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "driver::tests::trie_removal_receipt_waits_for_the_installed_catalog_cut"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-replication", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-trie-removal-readback-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("native acknowledgement did not wait for the installed prefix")
+
+    driver = source / "rust/crates/replication/src/driver.rs"
+    original = driver.read_bytes()
+    try:
+        replace_once(driver,
+                     "leader.trie_removals.push(AppliedTrieRemoval { sequence, position: record.metadata.position, deletions, _record: record });",
+                     "complete_record(&mut leader.pending, Some(sequence), Ok(Applied::TrieRemoval(record.metadata.position)));")
+        checked = run_case(command, source / "rust", args.evidence, "rust-trie-removal-readback-early", env)
+        if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or "trie removal replied before the installed prefix" not in checked.stdout
+            or "0 passed; 1 failed" not in checked.stdout):
+            raise ValueError("an early receipt did not fail at the installed-prefix assertion")
+    finally:
+        driver.write_bytes(original)
+    print("rust-trie-removal-readback: installed receipt passed, early receipt failed")
+
+
 def verify_replay_prefix(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -2454,8 +2481,10 @@ def main():
         "rust/crates/expr/src/evaluate.rs",
         "rust/crates/query/src/accelerate.rs",
         "rust/crates/replication/src/blocks.rs",
+        "rust/crates/replication/src/appender.rs",
         "rust/crates/replication/src/driver.rs",
         "rust/crates/replication/src/logs.rs",
+        "rust/crates/replication/src/tests.rs",
         "rust/crates/format/src/keys.rs",
         "rust/crates/index/src/trie_catalog.rs",
         "rust/crates/index/tests/catalogs.rs",
@@ -2541,6 +2570,7 @@ def main():
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
             verify_checkpoint_trie_retention(args, source)
+            verify_trie_removal_readback(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
             verify_recovery_hold_replay(args, source)

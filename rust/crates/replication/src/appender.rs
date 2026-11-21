@@ -14,7 +14,7 @@ use crate::{PartitionLogs, ReplicaMetadata, ReplicationClock, progress::term_end
 
 pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>), Message(ReplicaBody) }
 #[derive(Clone, Debug)]
-pub(crate) enum Applied { Transaction(Arc<TransactionResult>), Replica(ReplicaPosition) }
+pub(crate) enum Applied { Transaction(Arc<TransactionResult>), Control, TrieRemoval(ReplicaPosition) }
 
 pub(crate) struct PendingWrite {
     pub body: WriteBody,

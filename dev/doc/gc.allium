@@ -33,6 +33,9 @@
 -- A node whose catalog cannot be confirmed current waits up to the margin for its log processor, then holds an expired lease.
 -- The native collector deletes an eligible trie only once `reader_lease` has passed on its own monotonic clock since it first observed that trie as eligible.
 -- In Multi, that deletion records a release, which the cell reaper erases only after its grace.
+-- The native leader acknowledges a trie removal after its known installed replica prefix covers the removal record.
+-- The immutable partition value at acknowledgement contains neither a requested key nor a checkpoint dependency on that key.
+-- A skipped replay record or an unrecognized prefix cannot supply this acknowledgement.
 -- A new collector, after restart or failover, observes afresh.
 -- Both sides measure elapsed time, so clocks need no synchronization; the margin covers twice the rate drift over one lease plus the longest provider request.
 --

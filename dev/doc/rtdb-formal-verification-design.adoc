@@ -821,6 +821,11 @@ An adapter that lacks either capability cannot execute a certified deletion.
 Keep retirement intent durable before recording the catalog transition so a replacement writer can resume both before and after installation.
 The installed prefix proves which transition took effect.
 The post-transition catalog must exclude the same immutable identity, including every member reference to a shared artefact.
+The native driver now defers the trie-removal reply until the installed prefix covers its read-back position.
+It checks the requested trie keys against the current catalog and the installed checkpoint in one immutable partition value before returning a position.
+An unrecognized prefix or a removal skipped under the recovery cutoff cannot produce the reply.
+This reply is evidence of logical exclusion for the requested trie keys.
+The retirement protocol also needs persistent intent, identity evidence for the files, and the atomic directory publication. link:../../verification/verus/trie_removal_receipt/area.json[Native receipt proof and mutation controls]
 Publishing the certificate and its admission floor belongs in one directory CAS for that residence.
 The effect can be retried against the same certified identity after loss of a provider reply.
 A checkpoint can retain the intent or its completion through a journal trim only when the new recovery anchor supplies the same evidence.

@@ -209,6 +209,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/CatalogCutPublication.tla` compares a jointly captured installed catalog cut with progress inferred from replica delivery, a later sample or a transaction basis.
   It checks the claim that an admitted snapshot can still read its dependencies when collection moves ahead.
 * `tla/RetirementPublication.tla` checks a certificate published after installation with a matching admission floor and an identity-scoped provider deletion.
+  `verus/trie_removal_receipt` checks the native decision to acknowledge a removal after installed read-back and exclusion of its trie keys.
+  The native replay checks include a control that sends the acknowledgement during application, before the prefix is published.
   Its reachability check collects and reuses a physical key.
 * `tla/S3KeyCustody.tla` checks conditional provisioning, withdrawal, and confirmation for one S3 vault key.
   It distinguishes a successful withdrawal from a conditional conflict and separately checks the provider's no-historical-version premise.

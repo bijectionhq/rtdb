@@ -39,6 +39,11 @@ impl PartitionValue {
     pub fn live(&self) -> &Arc<LiveIndex> { &self.live }
     pub fn snapshot(&self) -> Snapshot { self.snapshot_with_live(&self.live) }
 
+    pub fn retains_trie(&self, table: &TableRef, key: &TrieKey) -> bool {
+        self.trie_catalog.trie(table, key).is_some()
+            || self.checkpoint_tries.as_ref().is_some_and(|checkpoint| checkpoint.requires(table, key))
+    }
+
     fn snapshot_with_live(&self, live: &Arc<LiveIndex>) -> Snapshot {
         let cut = match self.catalog_publication {
             CatalogPublication::Installed(cut) => Some(cut),

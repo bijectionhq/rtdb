@@ -8,6 +8,7 @@ mod replay_floor;
 mod driver;
 mod logs;
 mod progress;
+mod retirement_receipt;
 mod state;
 
 pub use admission::{Admission, TermFence, TermPosition, Verdict};

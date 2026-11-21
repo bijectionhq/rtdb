@@ -138,7 +138,10 @@ impl TermHandle {
     pub async fn publish_deletions(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> {
         let (sender, receiver) = oneshot::channel();
         self.handle.commands.send(Command::Delete { term: self.term, table, keys, completion: sender }).await.map_err(|_| term_ended())?;
-        match receiver.await.map_err(|_| term_ended())?? { Applied::Replica(position) => Ok(position), Applied::Transaction(_) => Err(invalid("Deletion received a transaction result")) }
+        match receiver.await.map_err(|_| term_ended())?? {
+            Applied::TrieRemoval(position) => Ok(position),
+            Applied::Transaction(_) | Applied::Control => Err(invalid("Deletion received a different result")),
+        }
     }
     pub async fn submit_external(&self, writer: Box<dyn TransactionWriter>, system_time: Option<Timestamp>, token: Option<Vec<u8>>) -> Result<ExternalReceipt> {
         let (sender, receiver) = oneshot::channel();
@@ -153,7 +156,10 @@ impl TermHandle {
 pub struct ExternalReceipt { receiver: oneshot::Receiver<Result<Applied>> }
 impl ExternalReceipt {
     pub async fn applied(self) -> Result<Arc<TransactionResult>> {
-        match self.receiver.await.map_err(|_| term_ended())?? { Applied::Transaction(result) => Ok(result), Applied::Replica(_) => Err(invalid("External transaction received a control result")) }
+        match self.receiver.await.map_err(|_| term_ended())?? {
+            Applied::Transaction(result) => Ok(result),
+            Applied::Control | Applied::TrieRemoval(_) => Err(invalid("External transaction received a control result")),
+        }
     }
 
 }
@@ -260,6 +266,14 @@ struct LeaderState {
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
     deferred_commands: VecDeque<Command>,
     compactor_reset: Option<CompactorReset>,
+    trie_removals: Vec<AppliedTrieRemoval>,
+}
+
+struct AppliedTrieRemoval {
+    sequence: TermSequence,
+    position: ReplicaPosition,
+    deletions: BTreeMap<TableRef, BTreeSet<TrieKey>>,
+    _record: AdmittedReplica,
 }
 impl LeaderState {
     fn resolver(&self) -> Result<&TxResolver> { self.resolver.as_ref().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
@@ -583,7 +597,7 @@ impl ReplicationDriver {
         let job = pump.with_heartbeat(self.config.idle_heartbeat).run(recovery_write.clone());
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed, recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
+            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new() });
         if produce_inherited {
             self.produce_pending()?;
         }
@@ -631,7 +645,29 @@ impl ReplicationDriver {
             }
             self.installed_replica_position = Some(through);
         }
+        self.complete_trie_removals();
         Ok(())
+    }
+
+    fn complete_trie_removals(&mut self) {
+        let Some(leader) = &mut self.leader else { return; };
+        if leader.trie_removals.is_empty() { return; }
+        let view = self.partition.value();
+        let recognized = self.recognized_prefix;
+        let installed = self.installed_replica_position;
+        let pending = &mut leader.pending;
+        leader.trie_removals.retain(|receipt| {
+            if recognized && installed.is_none_or(|through| through < receipt.position) { return true; }
+            let required = receipt.deletions.iter().any(|(table, keys)| {
+                keys.iter().any(|key| view.retains_trie(table, key))
+            });
+            let confirmed = crate::retirement_receipt::confirms_removal(
+                recognized, installed.map_or(i64::MIN, |through| through.0), receipt.position.0, required,
+            );
+            let outcome = if confirmed { Ok(Applied::TrieRemoval(receipt.position)) } else { Err(trie_removal_unconfirmed()) };
+            complete_record(pending, Some(receipt.sequence), outcome);
+            false
+        });
     }
     fn record_block_upload(&self) {
         let upload_time = (self.clock)().0.div_euclid(1_000_000);
@@ -651,6 +687,7 @@ impl ReplicationDriver {
             // The protobuf body can be omitted or too new for this reader to recognize.
             self.recognized_prefix = false;
             self.read_position = position;
+            self.complete_trie_removals();
             return Ok(());
         };
         let observed_term = record.envelope.term;
@@ -773,7 +810,7 @@ impl ReplicationDriver {
                 adopted = true;
                 if let Some(leader) = &mut self.leader {
                     leader.cycle.adopted();
-                    complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Replica(record.metadata.position)));
+                    complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Control));
                 }
                 if self.leader.is_some() && !tries.is_empty() {
                     self.logs.append_source(&SourceMessage::Protobuf(SourceBody::TriesAdded(proto::TriesAdded {
@@ -891,11 +928,23 @@ impl ReplicationDriver {
                         let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
                         let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
                         let cached = cached_objects(&self.partition.value(), &table, &keys);
-                        self.partition.delete_tries(&BTreeMap::from([(table, keys)]));
+                        let deletions = BTreeMap::from([(table, keys)]);
+                        self.partition.delete_tries(&deletions);
                         // Every node holds its own cached copies, and the leader's delete reached only the remote store.
                         for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
+                        if let Some(leader) = &mut self.leader && leader.term == record.envelope.term
+                            && let Some(sequence) = record.envelope.term_sequence
+                            && let Some(write) = leader.pending.iter().find(|write| write.sequence() == Some(sequence))
+                        {
+                            if matches!(&write.body, WriteBody::Message(ReplicaBody::TriesDeleted(expected)) if expected == message) {
+                                leader.trie_removals.push(AppliedTrieRemoval { sequence, position: record.metadata.position, deletions, _record: record });
+                            } else {
+                                complete_record(&mut leader.pending, Some(sequence), Err(trie_removal_unconfirmed()));
+                            }
+                        }
+                    } else if let Some(leader) = &mut self.leader && leader.term == record.envelope.term {
+                        complete_record(&mut leader.pending, record.envelope.term_sequence, Err(trie_removal_unconfirmed()));
                     }
-                    self.complete_control(&record);
                 }
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("Unresolved oversized body reached apply")),
             }
@@ -936,7 +985,7 @@ impl ReplicationDriver {
     }
     fn complete_control(&mut self, record: &ReplicaRecord) {
         if let Some(leader) = &mut self.leader {
-            if leader.term == record.envelope.term { complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Replica(record.metadata.position))); }
+            if leader.term == record.envelope.term { complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Control)); }
         }
     }
     fn produce_pending(&mut self) -> Result<()> {
@@ -1140,6 +1189,10 @@ impl ReplicationDriver {
                 self.cut().await
             }
             Command::Delete { table, keys, completion, .. } => {
+                if keys.is_empty() || keys.iter().any(|key| key.level() == 0) {
+                    let _ = completion.send(Err(Anomaly::incorrect("rtdb.replication/invalid-trie-removal", "A trie removal requires at least one non-L0 trie and contains no L0 trie")));
+                    return Ok(());
+                }
                 let message = proto::TriesDeleted { table_name: Some(table.schema_and_table()), trie_keys: keys.into_iter().map(|key| key.to_string()).collect() };
                 leader.enqueue(WriteBody::Message(ReplicaBody::TriesDeleted(message)), self.partition.value().live().block_index(), Some(completion), &self.resolve.memory)
             }
@@ -1223,6 +1276,10 @@ fn check_db_op(effects: &dyn DatabaseEffects, resolver: &TxResolver, operation: 
     }
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::fault("rtdb.replication/invalid-transition", message) }
+
+fn trie_removal_unconfirmed() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.replication/trie-removal-unconfirmed", "The installed catalog and checkpoint do not confirm this trie removal")
+}
 
 #[cfg(test)]
 #[path = "tests.rs"]

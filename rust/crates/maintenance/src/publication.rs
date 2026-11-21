@@ -20,7 +20,7 @@ pub trait CompactionPublisher: Send + Sync {
 
 #[async_trait]
 pub trait TrieDeletionPublisher: Send + Sync {
-    /// Completes after this leader term reads back and applies the removal.
+    /// Confirms the removal from this term's installed replica prefix and checkpoint view.
     /// Term teardown must fail both queued and appended requests that have not completed.
     async fn publish(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition>;
 }
