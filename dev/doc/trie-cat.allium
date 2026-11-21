@@ -44,6 +44,8 @@ value ArtefactRecord {
     stats: Bytes
     -- A record without one is its trie's.
     scope: ArtefactScope
+    -- Published object length. A shared group object is counted once.
+    file_size: Long?
 }
 
 -- trie: derived from its trie's data file alone, and stored under the trie's artefact prefix.

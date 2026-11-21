@@ -145,7 +145,7 @@ fn table_oid_allocation_is_sorted_and_recorded_slugs_stay_frozen() {
 }
 
 fn artefact(definition_id: &str, version: i64, stats: u8) -> rtdb_format::log::proto::ArtefactRecord {
-    rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]), scope: None }
+    rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]), scope: None, file_size: None }
 }
 
 #[test]

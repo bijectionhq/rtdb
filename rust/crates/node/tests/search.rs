@@ -200,6 +200,28 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
     let groups: std::collections::BTreeSet<_> = shared.iter().filter_map(|key| key.part_group()).collect();
     assert_eq!(shared.len(), groups.len() * 4, "every member of a group shares its file: {shared:?}");
     assert!(shared.iter().any(|key| key.level() == 2 && key.recency().is_none()), "the level-2 partition group's members share one search file: {shared:?}");
+    let docs = TableRef::new("public", "docs");
+    let snapshot = database.snapshot();
+    let slug = &snapshot.table_entry(&docs).unwrap().slug;
+    let mut expected_files = std::collections::BTreeMap::new();
+    for trie in snapshot.trie_catalog().current_tries(&docs) {
+        for record in trie.artefacts.iter().filter(|record| record.kind() == "search") {
+            let key = slug.recorded_artefact_key(&trie.key, record).unwrap();
+            expected_files.insert(key, record.file_size.unwrap());
+        }
+    }
+    let files = rows(session.query_sql(
+        "SELECT object_key, file_size FROM xt.live_trie_artefacts WHERE schema_name = 'public' AND table_name = 'docs' AND kind = 'search'",
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(files.len(), expected_files.len(), "each live file is charged once");
+    for file in files {
+        let [Value::Utf8(key), Value::I64(size)] = file.as_slice() else { panic!("invalid file usage: {file:?}") };
+        assert_eq!(expected_files.remove(key), Some(*size));
+        let object = rtdb_storage::ObjectKey::new(key.clone()).unwrap();
+        assert_eq!(database.object_store().head_fresh(&object).await.unwrap().size, u64::try_from(*size).unwrap());
+    }
+    assert!(expected_files.is_empty());
     let mut compared = 0;
     let mut answers = std::collections::BTreeMap::<&str, std::collections::BTreeSet<Vec<i64>>>::new();
     for query in ["overdue", "invoice overdue", "red blue", "paid book", "absent", "\"red blue\"", "overdue \"late book\""] {
@@ -368,6 +390,54 @@ async fn live_rows_written_between_queries_are_found_as_the_live_index_grows() {
     }
     assert!(session.state_mut().execute_tx(vec![sql("INSERT INTO docs RECORDS {_id: 0, body: 'now paid'}")], AutonomousTxOptions::default()).await.unwrap().committed());
     assert_eq!(ids(rows(session.query_sql(accelerated, vec![]).await.unwrap()).await), [2, 4], "a later version that no longer matches hides the earlier one");
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn explicit_search_statistics_rank_the_admitted_corpus() {
+    let (node, driver) = Node::open(options(), services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let committed = session.state_mut().execute_tx(vec![
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+        sql("INSERT INTO docs RECORDS {_id: 1, body: 'invoice paid invoice', admitted: TRUE}"),
+        sql("INSERT INTO docs RECORDS {_id: 2, body: 'paid', admitted: TRUE}"),
+        sql("INSERT INTO docs RECORDS {_id: 3, body: 'invoice paid secret', admitted: FALSE}"),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(committed.committed());
+    let ranked = "
+        WITH MATERIALIZED admitted_docs AS (SELECT _id, body FROM docs WHERE admitted),
+        counts AS (
+            SELECT COUNT(SEARCH_LENGTH(body)) AS n, SUM(SEARCH_LENGTH(body)) AS tokens,
+                   COUNT(CASE WHEN MATCH(body, 'invoice') THEN 1 END) AS invoices,
+                   COUNT(CASE WHEN MATCH(body, 'paid') THEN 1 END) AS paid
+            FROM admitted_docs
+        )
+        SELECT d._id, SEARCH_SCORE(d.body, 'invoice paid', c.n, c.tokens, ARRAY[c.invoices, c.paid]) AS score
+        FROM admitted_docs AS d CROSS JOIN counts AS c
+        WHERE MATCH(d.body, 'invoice paid')
+        ORDER BY score DESC, d._id LIMIT 1";
+    let first = rows(session.query_sql(ranked, vec![]).await.unwrap()).await;
+    let corpus = rtdb_text::Corpus {
+        documents: 2,
+        tokens: 4,
+        frequencies: std::collections::BTreeMap::from([("invoice".into(), 1), ("paid".into(), 2)]),
+    };
+    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice paid"), &rtdb_text::tokens("invoice paid invoice"), Some(&corpus));
+    assert_eq!(first, [vec![Value::I64(1), Value::F64(score)]]);
+    let terms = rows(session.query_sql(
+        r#"SELECT SEARCH_TERMS('"Invoice paid" invoice')"#,
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(terms, [vec![Value::List(vec![Value::Utf8("invoice".into()), Value::Utf8("paid".into())])]]);
+
+    let changed = session.state_mut().execute_tx(vec![
+        sql("INSERT INTO docs RECORDS {_id: 3, body: 'public list archived', admitted: FALSE}"),
+        sql("INSERT INTO docs RECORDS {_id: 4, body: 'invoice paid another secret', admitted: FALSE}"),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(changed.committed());
+    assert_eq!(rows(session.query_sql(ranked, vec![]).await.unwrap()).await, first);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

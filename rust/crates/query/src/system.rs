@@ -1,7 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rtdb_format::log::proto::ArtefactRecord;
+use rtdb_index::TrieState;
 use rtdb_plan::{Catalog, CatalogMetric, CatalogRows, CatalogUser, Scan, TableBinding};
 use rtdb_types::{Anomaly, LogicalType, PgType, Result, TableRef, TimeUnit, Value, pg_name_oid, pg_table_oid};
 
@@ -32,7 +34,7 @@ impl SystemCursor {
             _ => RuntimeRows::None,
         };
         context.check_cancelled()?;
-        let needs_tables = matches!(table.table.as_str(), "tables" | "columns" | "pg_tables" | "pg_class" | "pg_attribute" | "pg_stat_user_tables" | "live_tables" | "live_columns" | "trie_stats");
+        let needs_tables = matches!(table.table.as_str(), "tables" | "columns" | "pg_tables" | "pg_class" | "pg_attribute" | "pg_stat_user_tables" | "live_tables" | "live_columns" | "trie_stats" | "live_trie_artefacts");
         let tables = if needs_tables { context.catalog.tables(&self.scan.table.name.database)?.into_iter().filter(|binding| definition(&binding.name.table).is_none_or(|definition| definition.schema != "xt")).collect::<Vec<_>>() } else { vec![] };
         let reservation = context.memory.reserve(allocation_bound(&tables, &runtime_rows, &self.execution, &table.table)?)?;
         let records = self.records(&tables, &runtime_rows)?;
@@ -115,12 +117,54 @@ impl SystemCursor {
                 let RuntimeRows::Metrics(metrics) = runtime else { return Err(invalid("catalog-runtime", "Telemetry snapshot is absent")); };
                 metrics.rows().iter().filter_map(|metric| metric_record(&table.table, metric)).collect()
             }
+            ("xt", "live_trie_artefacts") => self.live_trie_artefacts(tables)?,
             ("xt", "live_tables" | "live_columns" | "trie_stats") => self.snapshot_records(&table.table, tables)?,
             ("information_schema", "table_constraints" | "key_column_usage" | "constraint_column_usage")
             | ("pg_catalog", "pg_description" | "pg_views" | "pg_matviews" | "pg_depend" | "pg_enum" | "pg_constraint" | "pg_extension" | "pg_attrdef" | "pg_sequence" | "pg_collation" | "pg_opclass" | "pg_index") => vec![],
             _ => return Err(Anomaly::fault("rtdb.query/catalog-table", "Declared system catalog has no row producer")),
         };
         Ok(rows)
+    }
+
+    fn live_trie_artefacts(&self, tables: &[TableBinding]) -> Result<Vec<Record>> {
+        let database = self.execution.context.catalog.database(&self.scan.table.name.database)?;
+        let mut files: BTreeMap<(&TableRef, String), (bool, &ArtefactRecord)> = BTreeMap::new();
+        for snapshot in &database.partitions {
+            for binding in tables {
+                let table = &binding.name.table;
+                let Some(entry) = snapshot.table_entry(table) else { continue; };
+                for trie in snapshot.trie_catalog().iter_tries(table).filter(|trie| trie.state == TrieState::Live) {
+                    let historical = trie.key.recency().is_some();
+                    for artefact in &trie.artefacts {
+                        self.execution.context.check_cancelled()?;
+                        let object = entry.slug.recorded_artefact_key(&trie.key, artefact)?;
+                        if artefact.file_size.is_some_and(|size| size < 0) {
+                            return Err(invalid("artefact-size", "A published artefact has a negative file size"));
+                        }
+                        match files.entry((table, object)) {
+                            Entry::Vacant(file) => { file.insert((historical, artefact)); }
+                            Entry::Occupied(mut file) => match (file.get().1.file_size, artefact.file_size) {
+                                (Some(first), Some(next)) if first != next => {
+                                    return Err(invalid("artefact-size", "Published sizes disagree for one artefact"));
+                                }
+                                (None, Some(_)) => { file.insert((historical, artefact)); }
+                                _ => {}
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        Ok(files.into_iter().map(|((table, object), (historical, artefact))| record([
+            ("schema_name", text(&table.schema)),
+            ("table_name", text(&table.table)),
+            ("object_key", Value::Utf8(object)),
+            ("kind", text(artefact.kind())),
+            ("definition_id", text(artefact.definition_id())),
+            ("definition_version", Value::I64(artefact.definition_version())),
+            ("historical", Value::Bool(historical)),
+            ("file_size", artefact.file_size.map(Value::I64).unwrap_or(Value::Null)),
+        ])).collect())
     }
 
     fn snapshot_records(&self, name: &str, tables: &[TableBinding]) -> Result<Vec<Record>> {
@@ -208,6 +252,7 @@ fn metric_record(table: &str, metric: &CatalogMetric) -> Option<Record> {
 fn allocation_bound(tables: &[TableBinding], runtime: &RuntimeRows, execution: &Execution, table: &str) -> Result<usize> {
     let mut bytes = if table == "pg_type" { checked(16384, PgType::ALL.len() * 16384)? } else { 16384 };
     for name in execution.context.catalog.databases() { bytes = checked(bytes, checked(name.len().checked_mul(32).ok_or_else(size_error)?, 4096)?)?; }
+    let needs_artefacts = table == "live_trie_artefacts";
     for table in tables {
         let names = checked(table.name.database.len(), checked(table.name.table.schema.len(), table.name.table.table.len())?)?;
         bytes = checked(bytes, checked(names.checked_mul(64).ok_or_else(size_error)?, 32768)?)?;
@@ -219,6 +264,14 @@ fn allocation_bound(tables: &[TableBinding], runtime: &RuntimeRows, execution: &
                 for (name, ty) in segment.column_types() { bytes = checked(bytes, checked(checked(name.len(), ty.retained_bytes()?)?.checked_mul(32).ok_or_else(size_error)?, 16384)?)?; }
             }
             bytes = checked(bytes, snapshot.trie_catalog().iter_tries(&table.name.table).count().checked_mul(32768).ok_or_else(size_error)?)?;
+            if needs_artefacts {
+                for trie in snapshot.trie_catalog().iter_tries(&table.name.table).filter(|trie| trie.state == TrieState::Live) {
+                    for artefact in &trie.artefacts {
+                        let names = checked(names, checked(artefact.kind().len(), artefact.definition_id().len())?)?;
+                        bytes = checked(bytes, checked(names.checked_mul(64).ok_or_else(size_error)?, 16384)?)?;
+                    }
+                }
+            }
         }
     }
     let mut add_name = |name: &str| -> Result<()> { bytes = checked(bytes, checked(name.len().checked_mul(32).ok_or_else(size_error)?, 16384)?)?; Ok(()) };
