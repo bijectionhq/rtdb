@@ -19,6 +19,9 @@ use tokio_util::sync::CancellationToken;
 mod corpus_checkpoint;
 #[path = "support/fts_generations.rs"]
 mod generations;
+#[cfg(feature = "fts-experiments")]
+#[path = "support/fts_same_files.rs"]
+mod same_files;
 
 struct Identity;
 
@@ -176,6 +179,11 @@ async fn main() {
     }
     if workload == "generations" {
         generations::run(args.next().unwrap().parse().unwrap(), args.next().unwrap().parse().unwrap()).await;
+        return;
+    }
+    #[cfg(feature = "fts-experiments")]
+    if workload == "same-files" {
+        same_files::run(args.next().unwrap().parse().unwrap(), args.next().unwrap().parse().unwrap()).await;
         return;
     }
     let document_count: i64 = workload.parse().unwrap();

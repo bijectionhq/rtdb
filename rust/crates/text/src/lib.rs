@@ -123,9 +123,14 @@ impl Scorer {
 
     /// The document's score from its stored length and frequencies in query-term order.
     pub fn score(&self, frequencies: &[u32], length: u32) -> f64 {
-        self.idfs.iter().zip(frequencies).map(|(&idf, &frequency)| {
-            if frequency == 0 { 0.0 } else { rounded_term_score(frequency, length, self.average, idf) }
+        frequencies.iter().take(self.idfs.len()).enumerate().map(|(term, &frequency)| {
+            self.term_score(term, frequency, length)
         }).fold(-0.0, |total, term| total + term)
+    }
+
+    /// The contribution of one term at its index in query-term order.
+    pub fn term_score(&self, term: usize, frequency: u32, length: u32) -> f64 {
+        if frequency == 0 { 0.0 } else { rounded_term_score(frequency, length, self.average, self.idfs[term]) }
     }
 
     pub fn bm25(&self, document: &[String]) -> f64 {

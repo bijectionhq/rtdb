@@ -9,6 +9,7 @@ publish.workspace = true
 [features]
 default = ["search"]
 search = ["dep:rtdb-search"]
+fts-experiments = ["search", "rtdb-search/experiments"]
 kafka = ["dep:rtdb-kafka"]
 kafka-connect = ["kafka"]
 s3 = ["dep:rtdb-s3"]
