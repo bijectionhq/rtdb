@@ -7,6 +7,7 @@ Maintenance steps must preserve that history's observable answers and the availa
 
 See link:../dev/doc/rtdb-formal-verification-design.adoc[the full design] and link:../dev/doc/rtdb-verification.adoc[the individual studies].
 The first combined run is recorded in link:results/2026-11-21.adoc[the evidence ledger].
+The link:../dev/doc/rtdb-engine-verification-ledger.md[engine-wide catalog ledger] tracks the status of individual properties across the classic and multi-mode baselines.
 
 == Independent derivations
 
