@@ -93,6 +93,13 @@ the receipt. Gateway sessions close when they observe retirement. Object
 versions, external backups and key copies in other cells have separate
 physical custody.
 
+On the private hosted lifecycle listener, every request includes its operation.
+The optional disposal credential authorizes `schedule_disposal` and
+`inspect_disposal` for a named root with an exact authority UUID. Scheduling
+also fences an empty identity if retirement arrives before installation.
+Inspection reads the directory without fencing. A settled response identifies
+the retired writer epoch and hashes the receipt retained by the directory.
+
 `rtdb-multi capture --id UUID --operation UUID` retains the selected
 published checkpoint and copies its catalog, table metadata and referenced
 tries as ciphertext to the independent archive. The receipt fixes the

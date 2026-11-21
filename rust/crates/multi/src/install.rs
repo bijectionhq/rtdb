@@ -1,4 +1,4 @@
-//! The private installation endpoint of a hosted gateway.
+//! The hosted gateway's private installation and retirement endpoint.
 
 use std::{
     path::Path,
@@ -7,7 +7,7 @@ use std::{
 };
 
 use ring::hmac;
-use rtdb_directory::Directory;
+use rtdb_directory::{DeploymentRecord, Directory, DisposalReceipt, Lifecycle};
 use rtdb_types::{
     Anomaly,
     AnomalyCategory,
@@ -46,80 +46,115 @@ const TOKEN_LENGTH: usize = 64;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
+    operation: Operation,
     token: String,
     name: String,
     authority: Uuid,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Operation {
+    Install,
+    ScheduleDisposal,
+    InspectDisposal,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum Reply {
-    Installed { name: String, authority: Uuid },
+    Installed {
+        name: String,
+        authority: Uuid,
+    },
+    Scheduled {
+        name: String,
+        authority: Uuid,
+        epoch: u64,
+    },
+    Disposed {
+        name: String,
+        authority: Uuid,
+        epoch: u64,
+        evidence: [u8; 32],
+    },
     Refused,
     Deferred,
 }
 
 pub struct Installer {
-    expected: hmac::Tag,
-    verifier: hmac::Key,
+    install: Token,
+    disposal: Option<Token>,
     org: String,
     replicas: usize,
 }
 
-impl Installer {
-    pub fn from_file(path: &Path, org: String, replicas: usize) -> Result<Self> {
+struct Token {
+    expected: hmac::Tag,
+    verifier: hmac::Key,
+}
+
+impl Token {
+    fn read(path: &Path) -> Result<String> {
         let token = std::fs::read_to_string(path)
-            .map_err(|_| invalid("Cannot read the installation token"))?;
+            .map_err(|_| invalid("Cannot read the hosted lifecycle credential"))?;
         let token = token.trim_end_matches('\n');
-        if token.len() != TOKEN_LENGTH
-            || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || replicas == 0
-        {
-            return Err(invalid(
-                "Installation requires a 32-byte hexadecimal token and a positive replica count",
-            ));
+        if token.len() != TOKEN_LENGTH || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(invalid("Lifecycle tokens must contain 32 hexadecimal bytes"));
         }
+        Ok(token.to_owned())
+    }
+
+    fn new(token: &str) -> Result<Self> {
         let verifier = hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
-            .map_err(|_| invalid("Cannot initialize the installation token verifier"))?;
+            .map_err(|_| invalid("Cannot initialize the hosted lifecycle credential verifier"))?;
         let expected = hmac::sign(&verifier, token.as_bytes());
+        Ok(Self { expected, verifier })
+    }
+
+    fn accepts(&self, token: &str) -> bool {
+        hmac::verify(&self.verifier, token.as_bytes(), self.expected.as_ref()).is_ok()
+    }
+}
+
+impl Installer {
+    pub fn from_file(
+        path: &Path,
+        disposal_path: Option<&Path>,
+        org: String,
+        replicas: usize,
+    ) -> Result<Self> {
+        if replicas == 0 {
+            return Err(invalid("Installation requires a positive replica count"));
+        }
+        let install = Token::new(&Token::read(path)?)?;
+        let disposal = disposal_path
+            .map(|path| {
+                let token = Token::read(path)?;
+                if install.accepts(&token) {
+                    return Err(invalid("Installation and disposal require separate credentials"));
+                }
+                Token::new(&token)
+            })
+            .transpose()?;
         Ok(Self {
-            expected,
-            verifier,
+            install,
+            disposal,
             org,
             replicas,
         })
     }
 
-    async fn install(&self, directory: &dyn Directory, line: &str) -> Reply {
+    async fn handle(&self, directory: &dyn Directory, line: &str) -> Reply {
         let Ok(request) = serde_json::from_str::<Request>(line) else {
             return Reply::Refused;
         };
-        if hmac::verify(
-            &self.verifier,
-            request.token.as_bytes(),
-            self.expected.as_ref(),
-        )
-        .is_err()
-        {
-            return Reply::Refused;
-        }
-        match admin::install_deployment(
-            directory,
-            request.authority,
-            &request.name,
-            &self.org,
-            self.replicas,
-        )
-        .await
-        {
-            Ok(record) => Reply::Installed {
-                name: record.name,
-                authority: request.authority,
-            },
+        match self.dispatch(directory, request).await {
+            Ok(reply) => reply,
             Err(error)
                 if matches!(
                     error.category,
-                    AnomalyCategory::Incorrect | AnomalyCategory::Conflict
+                    AnomalyCategory::Incorrect | AnomalyCategory::Forbidden | AnomalyCategory::Conflict
                 ) =>
             {
                 Reply::Refused
@@ -127,6 +162,71 @@ impl Installer {
             Err(_) => Reply::Deferred,
         }
     }
+
+    async fn dispatch(&self, directory: &dyn Directory, request: Request) -> Result<Reply> {
+        let token = match request.operation {
+            Operation::Install => Some(&self.install),
+            Operation::ScheduleDisposal | Operation::InspectDisposal => self.disposal.as_ref(),
+        };
+        if !token.is_some_and(|token| token.accepts(&request.token)) {
+            return Ok(Reply::Refused);
+        }
+        match request.operation {
+            Operation::Install => {
+                let record = admin::install_deployment(
+                    directory,
+                    request.authority,
+                    &request.name,
+                    &self.org,
+                    self.replicas,
+                )
+                .await?;
+                Ok(Reply::Installed {
+                    name: record.name,
+                    authority: request.authority,
+                })
+            }
+            Operation::ScheduleDisposal => {
+                let installation =
+                    admin::begin_hosted_disposal(directory, request.authority, &request.name, &self.org)
+                        .await?;
+                disposal_reply(installation, request.authority)
+            }
+            Operation::InspectDisposal => {
+                let Some(installation) = directory.deployment_by_name(&request.name).await? else {
+                    return Ok(Reply::Deferred);
+                };
+                if installation.id != request.authority.to_string() || installation.parent.is_some() {
+                    return Ok(Reply::Refused);
+                }
+                disposal_reply(installation, request.authority)
+            }
+        }
+    }
+}
+
+fn disposal_reply(installation: DeploymentRecord, authority: Uuid) -> Result<Reply> {
+    match (installation.lifecycle, installation.disposal) {
+        (Lifecycle::Deleted, Some(receipt)) => Ok(Reply::Disposed {
+            name: installation.name,
+            authority,
+            epoch: receipt.epoch,
+            evidence: receipt_evidence(&receipt)?,
+        }),
+        (Lifecycle::Deleting, None) => Ok(Reply::Scheduled {
+            name: installation.name,
+            authority,
+            epoch: installation.epoch,
+        }),
+        _ => Ok(Reply::Deferred),
+    }
+}
+
+fn receipt_evidence(receipt: &DisposalReceipt) -> Result<[u8; 32]> {
+    let bytes = serde_json::to_vec(receipt)
+        .map_err(|_| invalid("Cannot encode the serving disposal receipt"))?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    Ok(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
 }
 
 pub async fn serve(
@@ -174,7 +274,7 @@ async fn exchange(
     if !line.ends_with('\n') {
         return Ok(());
     }
-    let reply = installer.install(directory.as_ref(), &line).await;
+    let reply = installer.handle(directory.as_ref(), &line).await;
     let mut bytes = serde_json::to_vec(&reply).expect("installation response serializes");
     bytes.push(b'\n');
     socket.write_all(&bytes).await?;
@@ -183,4 +283,58 @@ async fn exchange(
 
 fn invalid(message: &'static str) -> Anomaly {
     Anomaly::incorrect("rtdb.multi/installation-endpoint", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_directory::MemoryDirectory;
+
+    #[tokio::test]
+    async fn retirement_credentials_fence_the_exact_vacant_installation() {
+        let directory = MemoryDirectory::new();
+        let install = "a".repeat(TOKEN_LENGTH);
+        let disposal = "b".repeat(TOKEN_LENGTH);
+        let installer = Installer {
+            install: Token::new(&install).unwrap(),
+            disposal: Some(Token::new(&disposal).unwrap()),
+            org: "cell".into(),
+            replicas: 3,
+        };
+        let authority = Uuid::new_v4();
+        let request = |operation: &str, token: &str, authority: Uuid| {
+            serde_json::json!({
+                "operation": operation, "token": token, "name": "tenant", "authority": authority
+            })
+            .to_string()
+        };
+        for (operation, token) in [
+            ("schedule_disposal", install.as_str()),
+            ("install", disposal.as_str()),
+        ] {
+            assert!(matches!(
+                installer.handle(directory.as_ref(), &request(operation, token, authority)).await,
+                Reply::Refused
+            ));
+        }
+        assert!(matches!(
+            installer.handle(directory.as_ref(), &request("inspect_disposal", &disposal, authority)).await,
+            Reply::Deferred
+        ));
+        assert!(directory.deployment_by_name("tenant").await.unwrap().is_none());
+        for operation in ["schedule_disposal", "schedule_disposal", "inspect_disposal"] {
+            assert!(matches!(
+                installer.handle(directory.as_ref(), &request(operation, &disposal, authority)).await,
+                Reply::Scheduled { authority: confirmed, epoch: 1, .. } if confirmed == authority
+            ));
+        }
+        assert!(matches!(
+            installer.handle(directory.as_ref(), &request("schedule_disposal", &disposal, Uuid::new_v4())).await,
+            Reply::Refused
+        ));
+        assert!(matches!(
+            installer.handle(directory.as_ref(), &request("install", &install, authority)).await,
+            Reply::Refused
+        ));
+    }
 }
