@@ -654,6 +654,7 @@ Moves are invisible to clients only if the gateway owns connections and session 
    COPY input continues to stream before ReadyForQuery. [PostgreSQL protocol flow](https://www.postgresql.org/docs/current/protocol-flow.html)
    Extended COPY ignores Sync while consuming input and reports readiness on the Sync that follows completion or cancellation.
    A read-only pgwire listener rejects COPY input before accepting payload bytes.
+   A successful DISCARD ALL clears the gateway's prepared statements before a later reconnect.
    A single pgwire autocommit write sends `CommandComplete` after the commit succeeds.
    PGwire carries stable placement interruption codes independently of the configured error detail format. [PostgreSQL ErrorResponse format](https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ERRORRESPONSE)
 5. **Suspicion reports** to the controller on connection failure.

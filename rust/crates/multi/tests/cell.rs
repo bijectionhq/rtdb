@@ -1840,6 +1840,24 @@ async fn extended_copy_keeps_the_same_gateway_session_available_for_later_writes
     cell.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_planned_move_does_not_restore_statements_cleared_by_discard_all() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    let stale = client.prepare("SELECT 42 AS n").await.unwrap();
+    assert!(client.query_one(&stale, &[]).await.is_ok());
+    client.batch_execute("DISCARD ALL").await.unwrap();
+
+    let holder = cell.holder("shop").await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(1 - holder).lease.id(), &common::control()).await.unwrap();
+    let error = client.query_one(&stale, &[]).await.unwrap_err();
+    assert_eq!(error.as_db_error().unwrap().message(), "no prepared statement");
+    assert_eq!(values(&client, "SELECT 7 AS n").await, ["7"]);
+    drop(client);
+    cell.stop().await;
+}
+
 /// Every column of every row `sql` returns, sorted.
 async fn rows(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
     let mut rows: Vec<String> = client.simple_query(sql).await.unwrap().into_iter().filter_map(|message| match message {

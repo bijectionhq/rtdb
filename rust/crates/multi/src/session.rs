@@ -350,6 +350,7 @@ impl Session {
                         self.answered = true;
                         match frame.tag {
                             b'1' | b'3' => self.confirm_prepared_change(frame.tag),
+                            b'C' if frame.body.as_ref() == b"DISCARD ALL\0" => self.prepared.clear(),
                             b'G' => {
                                 copying_in = true;
                                 if self.pending.last().is_some_and(|frame| frame.tag == b'S') {
