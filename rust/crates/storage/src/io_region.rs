@@ -51,7 +51,7 @@ impl IoRegion {
         self.publication_journal = Some(journal);
     }
     #[cfg(feature = "remote")]
-    pub(crate) fn publication_journal(&self) -> Option<&dyn crate::remote::PublicationJournal> {
+    pub fn publication_journal(&self) -> Option<&dyn crate::remote::PublicationJournal> {
         self.publication_journal.as_deref()
     }
     pub(crate) fn admit(&self) -> Result<IoAdmission> {

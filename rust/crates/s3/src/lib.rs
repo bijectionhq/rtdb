@@ -101,11 +101,19 @@ impl S3Config {
         }
         let client = builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
         let client = Arc::new(client);
-        Ok(Arc::new(if cell {
-            RemoteStore::new_single_put(client, prefix, io)
-        } else {
-            RemoteStore::new_in(client, Some(prefix), io)
-        }))
+        if !cell {
+            return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io)));
+        }
+        if io.publication_journal().is_some() {
+            #[cfg(feature = "versioning")]
+            {
+                let uploads = self.versioned_inventory(storage_root, remotes).await?;
+                return Ok(Arc::new(RemoteStore::new_managed(client, prefix, io, Arc::new(uploads))));
+            }
+            #[cfg(not(feature = "versioning"))]
+            return Err(Anomaly::incorrect("xtdb.aws/managed-uploads", "Managed cell publications require S3 inventory support"));
+        }
+        Ok(Arc::new(RemoteStore::new_single_put(client, prefix, io)))
     }
 
     #[cfg(feature = "versioning")]

@@ -224,8 +224,15 @@ pub enum StorageRegion {
         /// no further requests. Uncertain publications still need evidence.
         closed: bool,
         /// Written before a conditional provider mutation is submitted.
-        publications: BTreeMap<uuid::Uuid, String>,
+        publications: BTreeMap<uuid::Uuid, StoragePublication>,
     },
+}
+
+/// An exact provider upload, admitted before it received payload bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoragePublication {
+    pub key: String,
+    pub upload_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

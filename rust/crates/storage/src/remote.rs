@@ -6,13 +6,24 @@ use object_store::{Attribute, GetOptions, ObjectStore as ProviderStore, ObjectSt
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-/// The storage-region owner records a provider write before it can take effect.
+/// The storage-region owner records an empty provider upload before bytes
+/// may be submitted. The identity is retained until completion or abort.
 #[async_trait]
 pub trait PublicationJournal: Send + Sync {
-    async fn admit(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<()>;
-    /// Records terminal provider evidence, or cancels an admission that did
-    /// not reach the provider. A lost admit reply still needs a cancellation.
-    async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, submitted: bool) -> Result<()>;
+    async fn admit(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str) -> Result<()>;
+    /// A lost admit reply needs cancellation even if no bytes were sent.
+    async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str, submitted: bool) -> Result<()>;
+}
+
+/// A provider with a durable, independently abortable upload capability.
+#[async_trait]
+pub trait PublicationUploads: Send + Sync {
+    /// Reserves an empty upload for a provider-encoded key.
+    async fn reserve(&self, path: &Path, attempt: uuid::Uuid) -> Result<String>;
+    /// Makes the upload visible only if no object already holds that key.
+    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> Result<bool>;
+    /// Cancels this upload and confirms that it retains no parts.
+    async fn abort(&self, path: &Path, upload: &str) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -32,27 +43,29 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix }), io, single_put: false }
+        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None }), io, single_put: false }
     }
 
     /// Cell storage publishes a final object with one conditional provider
-    /// write. The underlying client must not retry that request automatically.
-    /// A lost reply can be recovered only by observing this write's unique
-    /// metadata on the resulting object.
+    /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix) }), io, single_put: true }
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None }), io, single_put: true }
+    }
+
+    /// Opens a cell store with abortable, journaled publication.
+    pub fn new_managed(
+        client: Arc<dyn ProviderStore>,
+        prefix: ObjectKey,
+        io: Arc<IoRegion>,
+        uploads: Arc<dyn PublicationUploads>,
+    ) -> Self {
+        let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads) });
+        Self { objects, io, single_put: true }
     }
 
     /// Rejects new requests and waits for admitted operations, including requests whose callers were cancelled.
     /// This closes the complete shared region when the store was opened with `new_in`.
     pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
-
-    /// Checks whether a fresh provider observation is the result of this
-    /// exact conditional publication. An absent object is still uncertain.
-    pub async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<bool> {
-        let (objects, key) = (Arc::clone(&self.objects), key.clone());
-        self.io.run_async(async move { objects.publication_confirmed(&key, attempt).await }).await
-    }
 
     /// Copies between explicit roots backed by the same provider client.
     /// Distinct client instances are rejected before I/O, even when they name the same bucket.
@@ -126,6 +139,7 @@ impl ObjectStore for RemoteStore {
 struct RemoteObjects {
     client: Arc<dyn ProviderStore>,
     prefix: Option<ObjectKey>,
+    uploads: Option<Arc<dyn PublicationUploads>>,
 }
 
 impl RemoteObjects {
@@ -218,38 +232,54 @@ impl RemoteObjects {
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<()> {
-        let mut options = PutOptions { mode: PutMode::Create, ..Default::default() };
-        let journal = authority.and_then(IoRegion::publication_journal);
-        let attempt = if authority.is_some() {
-            let attempt = uuid::Uuid::new_v4();
-            if let Some(journal) = journal
-                && let Err(error) = journal.admit(key, attempt).await
-            {
-                journal.settle(key, attempt, false).await?;
-                return Err(error);
-            }
-            options.attributes.insert(publication_attribute(), attempt.to_string().into());
-            Some(attempt)
-        } else {
-            None
-        };
-        let response = self.client.put_opts(&self.path(key), bytes.clone().into(), options).await;
-        if let Some(attempt) = attempt {
-            let terminal = matches!(&response, Ok(_) | Err(object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } | object_store::Error::PermissionDenied { .. }));
-            let recovered = !terminal && matches!(self.publication_confirmed(key, attempt).await, Ok(true));
-            if (terminal || recovered) && let Some(journal) = journal {
-                journal.settle(key, attempt, true).await?;
-            }
-            if recovered { return Ok(()); }
+        if let Some(journal) = authority.and_then(IoRegion::publication_journal) {
+            return self.put_journaled(key, bytes, journal).await;
         }
-        match response {
+        let options = PutOptions { mode: PutMode::Create, ..Default::default() };
+        match self.client.put_opts(&self.path(key), bytes.clone().into(), options).await {
             Ok(_) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
-                if self.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) }
+                self.compare_existing(key, bytes).await
             }
             Err(error) => Err(provider_error(key, error)),
         }
+    }
+
+    async fn put_journaled(&self, key: &ObjectKey, bytes: Bytes, journal: &dyn PublicationJournal) -> Result<()> {
+        let uploads = self.uploads.as_ref().ok_or_else(|| Error::Remote {
+            key: key.to_string(), message: "The cell store has no abortable publication capability".into(),
+        })?;
+        let attempt = uuid::Uuid::new_v4();
+        let path = self.path(key);
+        let upload = uploads.reserve(&path, attempt).await?;
+        if let Err(error) = journal.admit(key, attempt, &upload).await {
+            uploads.abort(&path, &upload).await?;
+            journal.settle(key, attempt, &upload, false).await?;
+            return Err(error);
+        }
+
+        let result = uploads.complete(&path, &upload, bytes.clone()).await;
+        if !matches!(&result, Ok(true)) {
+            // A conflict leaves uploaded parts behind. An uncertain
+            // completion must also be fenced before clearing the admission.
+            uploads.abort(&path, &upload).await?;
+        }
+        journal.settle(key, attempt, &upload, true).await?;
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) => self.compare_existing(key, bytes).await,
+            Err(error) => {
+                if matches!(self.publication_confirmed(key, attempt).await, Ok(true)) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+        if self.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) }
     }
 
     async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<bool> {

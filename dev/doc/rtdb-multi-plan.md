@@ -127,20 +127,22 @@ reaper can recover its recorded region only by acquiring that same
 persisted lock. A missing lock witness keeps the region pending. For remote
 storage, a producer that exits without acknowledging drain keeps cleanup
 pending until the provider's outstanding work can be accounted for.
-Each remote serving object is published with one conditional PUT of its
-sealed bytes directly to its final key. Serving and checkpoint writers
-record the exact object key and a unique publication identity in the
-directory before sending the PUT. The PUT carries that identity in its
-metadata. An acknowledged success or definite refusal clears the attempt.
-For an ambiguous response, only a fresh HEAD returning that exact identity
-can confirm the publication. When the owner closes its I/O, a reaper can
-release the closed admission after checking every retained attempt.
-Ordinary serving collection preserves those object keys. On ECS, a cell
-records the exact task ARN when opening a region. The independent ECS event
-delivery retains terminal STOPPED observations in the cell directory. The
-reaper may settle an open region only after observing its exact owning task
-stop and confirming every recorded publication. A task stop alone does not
-settle provider work.
+Remote serving and checkpoint writers reserve an empty S3 multipart upload
+and record its exact ID and object key in the directory before uploading
+payload bytes. They complete the upload with `If-None-Match: *`. On
+failure, the writer aborts the exact upload and confirms its ID is gone
+before clearing the admission. The retained publication marker recovers
+the success reply if S3 completed the object before a lost response.
+A reservation interrupted before admission carries no payload, and the
+bucket's incomplete-upload lifecycle rule collects it if it was created.
+
+When the owner closes its I/O, a reaper can retire the region's remaining
+upload IDs. On ECS, the region records the exact task ARN. An independent
+ECS event delivery retains terminal STOPPED observations in the cell
+directory. The observation authorizes the reaper to retire an open
+region's upload IDs. Disposal continues only once the provider rejects
+part inspection for every retained ID and the cell's object inventory can
+be checked after cleanup.
 
 `rtdb-multi capture --id UUID --operation UUID` retains the selected
 published checkpoint and copies its catalog, table metadata and referenced

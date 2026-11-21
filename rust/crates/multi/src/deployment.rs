@@ -39,6 +39,14 @@ impl CellStorage {
         config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
     }
 
+    pub(crate) async fn s3_inventory(
+        config: &rtdb_s3::S3Config,
+    ) -> rtdb_types::Result<rtdb_s3::VersionedInventory> {
+        let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+        let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
+        config.versioned_inventory(&root, &remotes).await
+    }
+
     pub(crate) async fn purge_serving_inventory(
         &self,
         deployment: &rtdb_storage::ObjectKey,
@@ -46,9 +54,7 @@ impl CellStorage {
         match self {
             Self::Local { .. } => Ok(rtdb_directory::ServingInventory::LocalDirectory),
             Self::S3 { config } => {
-                let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
-                let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
-                config.versioned_inventory(&root, &remotes).await?.purge(deployment).await?;
+                Self::s3_inventory(config).await?.purge(deployment).await?;
                 Ok(rtdb_directory::ServingInventory::S3VersionsAndUploads)
             }
         }
