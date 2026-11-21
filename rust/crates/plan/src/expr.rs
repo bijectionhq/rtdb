@@ -28,6 +28,12 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
     if let Some(result) = crate::comparison::signature(&name, arguments) { return result; }
     if let Some(result) = crate::period::predicate_type(&name, arguments) { return result; }
     if let Some(result) = crate::search::signature(&name, arguments) { return result; }
+    if name == "cosine_distance" {
+        if arguments.len() != 2 {
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "cosine_distance requires two arguments"));
+        }
+        return Ok(LogicalType::Scalar(S::F64).maybe());
+    }
     if let Some(result) = crate::string::signature(&name, arguments) { return result; }
     if let Some(result) = crate::regex::signature(&name, arguments) { return result; }
     if let Some(result) = crate::session_info::signature(&name, arguments) { return result; }

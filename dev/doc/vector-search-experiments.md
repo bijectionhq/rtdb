@@ -5,8 +5,17 @@ The primary scan remains the authority for row visibility and SQL predicates.
 
 ## Exact retrieval
 
-The first implementation will expose cosine distance over dense numeric vectors in SQL.
+The native SQL function `COSINE_DISTANCE(left, right)` accepts numeric lists with the same positive dimension and returns a distance between 0 and 2.
+A null input produces null, and either vector with a zero norm or a non-finite or non-numeric component raises an error.
 The exact path resolves rows at the read basis, applies predicates, and selects the nearest eligible rows.
+
+```sql
+SELECT _id, COSINE_DISTANCE(embedding, ARRAY[1, 0, 0]) AS distance
+FROM documents
+WHERE status = 'open' AND embedding IS NOT NULL
+ORDER BY distance, _id
+LIMIT 10;
+```
 It will serve as the oracle for approximate retrieval.
 The ordered secondary index can provide a bounded IID scope for selective predicates before the query reads embeddings.
 

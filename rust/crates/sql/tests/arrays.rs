@@ -63,3 +63,29 @@ async fn list_concatenation_is_not_a_matching_concat_clause() {
     let error = query("SELECT [1, 2] || [3]").await.unwrap_err();
     assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.error/illegal-arg", Some("No matching clause: [<List> <Int(64, true)>]")));
 }
+
+#[tokio::test]
+async fn cosine_distance_accepts_sql_lists_and_propagates_nulls() {
+    let output = query("SELECT COSINE_DISTANCE(ARRAY[1,0], ARRAY[3,0]), COSINE_DISTANCE(ARRAY[1,0], ARRAY[0,3]), COSINE_DISTANCE(ARRAY[1,0], ARRAY[-3,0]), COSINE_DISTANCE(NULL, ARRAY[1])").await.unwrap();
+    assert_eq!(output, [vec![V::F64(0.0), V::F64(1.0), V::F64(2.0), V::Null]]);
+
+    let output = query("SELECT COSINE_DISTANCE(ARRAY[1E300,1E300], ARRAY[1E-300,-1E-300])").await.unwrap();
+    assert_eq!(output, [vec![V::F64(1.0)]]);
+}
+
+#[tokio::test]
+async fn cosine_distance_rejects_inputs_without_a_defined_distance() {
+    for (arguments, code) in [
+        ("ARRAY[1], ARRAY[1,2]", "rtdb.vector/dimensions"),
+        ("ARRAY[], ARRAY[]", "rtdb.vector/dimensions"),
+        ("ARRAY[1], ARRAY[0]", "rtdb.vector/zero-norm"),
+        ("ARRAY[NULL], ARRAY[1]", "rtdb.vector/component"),
+        ("ARRAY['vector'], ARRAY[1]", "rtdb.vector/component"),
+        ("ARRAY[CAST('Infinity' AS DOUBLE PRECISION)], ARRAY[1]", "rtdb.vector/component"),
+        ("1, ARRAY[1]", "rtdb.vector/type"),
+        ("ARRAY[1]", "xtdb/sql-error"),
+    ] {
+        let statement = format!("SELECT COSINE_DISTANCE({arguments})");
+        assert_eq!(query(&statement).await.unwrap_err().code, code, "{statement}");
+    }
+}
